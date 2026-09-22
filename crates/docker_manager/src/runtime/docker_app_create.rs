@@ -296,6 +296,7 @@ impl DockerRuntime {
                                 .and_then(|ns| ns.ports.clone());
                             crate::deploy_host_ports::register_from_inspect(
                                 &container_name,
+                                inspect.name.as_deref(),
                                 &ports_ref,
                             )
                             .map_err(|e| {

@@ -90,6 +90,30 @@ pub fn resolve_map() -> DockerResult<BTreeMap<PathBuf, PathBuf>> {
     Ok(map)
 }
 
+/// 纯同步解析：容器路径经映射表最长前缀匹配到宿主机路径（无 Docker IO，
+/// 供引擎侧同步路径构造出口复用）。表外路径返回 None（调用方回退容器常量）。
+pub fn resolve_host_path(
+    map: &BTreeMap<PathBuf, PathBuf>,
+    container_path: &Path,
+) -> Option<PathBuf> {
+    let mut best: Option<(&PathBuf, &PathBuf)> = None;
+    for (container_root, host_root) in map {
+        if container_path.starts_with(container_root)
+            && best.is_none_or(|(current, _)| {
+                current.as_os_str().len() < container_root.as_os_str().len()
+            })
+        {
+            best = Some((container_root, host_root));
+        }
+    }
+    let (container_root, host_root) = best?;
+    let rest = container_path.strip_prefix(container_root).ok()?;
+    if rest.as_os_str().is_empty() {
+        return Some(host_root.clone());
+    }
+    Some(host_root.join(rest))
+}
+
 /// 启动期 ensure 全表宿主目录存在（workspace/构建产物/logs 落位）。
 pub fn ensure_host_roots(map: &BTreeMap<PathBuf, PathBuf>) -> DockerResult<()> {
     for (container_root, host_root) in map {

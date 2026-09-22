@@ -427,7 +427,17 @@ pub(super) async fn apply_auto_mounts(
                     String::new()
                 };
 
-                // 构建容器内可访问的路径
+                // 构建预创建路径。容器形态：容器内路径（compose bind 双向同步
+                // 宿主机，rcoder 进程经挂载卷可写）。deploy-host：rcoder 进程即
+                // 宿主机进程，直接在 bind 源（resolved_host_path + 相对部分）
+                // 创建——容器常量路径在宿主机常为只读根。
+                #[cfg(feature = "deploy-host")]
+                let create_path = if shared_types::is_deploy_host() {
+                    format!("{}{}", resolved_host_path, relative_part)
+                } else {
+                    format!("{}{}", resolve_from_path, relative_part)
+                };
+                #[cfg(not(feature = "deploy-host"))]
                 let create_path = format!("{}{}", resolve_from_path, relative_part);
                 debug!(
                     "Creating directory using container path: {} (resolve_from: {}, relative: {})",

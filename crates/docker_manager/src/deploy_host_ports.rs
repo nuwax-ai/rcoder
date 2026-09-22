@@ -56,11 +56,17 @@ pub fn published_ports_for(service_type: &ServiceType) -> Vec<u16> {
 /// 注册表缺项在拨号时回退 loopback:容器端口并 warn，可归因。
 pub fn register_from_inspect(
     container_name: &str,
+    inspect_name: Option<&str>,
     network_ports: &Option<HashMap<String, Option<Vec<bollard::models::PortBinding>>>>,
 ) -> DockerResult<()> {
     let Some(ports) = network_ports else {
         return Ok(());
     };
+    // 双键注册：identifier（starter 的 container_id 键）+ Docker 真实容器名
+    // （inspect .Name 去前导 '/'——get_agent_info 查询键）。两键指向同一端口表，
+    // 查询侧无论用哪个身份都命中（2026-09-22 宿主机实测：单键不匹配导致健康
+    // 检查回退 127.0.0.1:容器端口 60s 超时）。
+    let docker_name = inspect_name.map(|name| name.trim_start_matches('/').to_owned());
     let mut map = HashMap::new();
     for (container_port_spec, bindings) in ports {
         let Some(container_port) = container_port_spec
@@ -83,12 +89,21 @@ pub fn register_from_inspect(
     }
     // 整表替换（非逐端口合并）：同名容器重建时旧映射不残留
     let registered = map.len();
+    let summary = ports.keys().cloned().collect::<Vec<_>>().join(", ");
+    if let Some(docker_name) = docker_name
+        .as_deref()
+        .filter(|name| *name != container_name)
+    {
+        shared_types::published::register(docker_name, map.clone());
+        info!(
+            "[deploy-host] published ports registered: container={}, entries={} ({})",
+            docker_name, registered, summary
+        );
+    }
     shared_types::published::register(container_name, map);
     info!(
         "[deploy-host] published ports registered: container={}, entries={} ({})",
-        container_name,
-        registered,
-        ports.keys().cloned().collect::<Vec<_>>().join(", ")
+        container_name, registered, summary
     );
     Ok(())
 }

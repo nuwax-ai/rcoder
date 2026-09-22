@@ -429,6 +429,7 @@ impl<'a> AgentContainerStarter<'a> {
                 })?;
             crate::deploy_host_ports::register_from_inspect(
                 &container_id,
+                inspect.name.as_deref(),
                 &inspect.network_settings.and_then(|ns| ns.ports),
             )?;
         }

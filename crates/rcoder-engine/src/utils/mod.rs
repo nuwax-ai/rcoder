@@ -7,6 +7,7 @@
 pub mod agent_diagnostic;
 pub mod grpc_addr;
 pub mod paths;
+pub use paths::workspace_root_path;
 
 // 重新导出 docker_manager 的路径解析实现
 #[allow(unused_imports)] // 导出供外部使用

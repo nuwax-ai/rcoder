@@ -341,7 +341,7 @@ impl ComputerContainerManager {
     ///
     /// 创建 `/app/computer-project-workspace/{user_id}` 目录
     pub async fn create_user_workspace(user_id: &str) -> Result<PathBuf, AppError> {
-        let workspace_root = PathBuf::from(COMPUTER_WORKSPACE_ROOT);
+        let workspace_root = crate::utils::workspace_root_path(COMPUTER_WORKSPACE_ROOT);
 
         // 确保根目录存在
         tokio::fs::create_dir_all(&workspace_root)

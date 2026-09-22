@@ -326,7 +326,7 @@ mod tests {
 
         assert_eq!(
             ctx.install_dir,
-            PathBuf::from("/app/computer-project-workspace/user-456/acp-agent")
+            PathBuf::from(format!("{}/user-456/acp-agent", expect_computer_root()))
         );
     }
 
@@ -344,7 +344,7 @@ mod tests {
 
         assert_eq!(
             ctx.install_dir,
-            PathBuf::from("/app/computer-project-workspace/pod-789/acp-agent")
+            PathBuf::from(format!("{}/pod-789/acp-agent", expect_computer_root()))
         );
     }
 
@@ -356,6 +356,20 @@ mod tests {
 
         let result = strategy.resolve_install_context(&project, &routing);
         assert!(result.is_err());
+    }
+
+    /// 期望根随编译形态分叉：deploy-host 下 build_workspace_path 经映射产生
+    /// ~/.rcoder 路径，容器形态为常量——与生产出口同一分叉。
+    fn expect_ws_root() -> String {
+        rcoder_engine::utils::workspace_root_path("/app/project_workspace")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn expect_computer_root() -> String {
+        rcoder_engine::utils::workspace_root_path("/app/computer-project-workspace")
+            .to_string_lossy()
+            .into_owned()
     }
 
     #[test]
@@ -370,7 +384,7 @@ mod tests {
 
         assert_eq!(
             ctx.install_dir,
-            PathBuf::from("/app/project_workspace/proj-123/acp-agent")
+            PathBuf::from(format!("{}/proj-123/acp-agent", expect_ws_root()))
         );
     }
 
@@ -391,7 +405,7 @@ mod tests {
 
         assert_eq!(
             ctx.install_dir,
-            PathBuf::from("/app/project_workspace/t1/s1/proj-123/acp-agent")
+            PathBuf::from(format!("{}/t1/s1/proj-123/acp-agent", expect_ws_root()))
         );
     }
 

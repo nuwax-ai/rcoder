@@ -11,6 +11,23 @@ use std::path::PathBuf;
 // 文档与目录结构见 crates/shared_types/src/paths.rs。
 pub use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
 
+/// workspace 根出口：deploy-host 下经 host_map 同步映射到宿主机真实路径
+/// （`~/.rcoder/workspace/...`），容器/K8s 形态返回容器常量。所有 build_* 路径
+/// 构造必须经此 helper——直拼常量会在宿主机撞只读根（os error 30 实测）。
+pub fn workspace_root_path(container_root: &str) -> PathBuf {
+    #[cfg(feature = "deploy-host")]
+    if shared_types::is_deploy_host()
+        && let Ok(map) = docker_manager::path::host_map::resolve_map()
+        && let Some(host) = docker_manager::path::host_map::resolve_host_path(
+            &map,
+            std::path::Path::new(container_root),
+        )
+    {
+        return host;
+    }
+    PathBuf::from(container_root)
+}
+
 /// 路径标识符验证错误
 #[derive(Debug, thiserror::Error)]
 pub enum PathValidationError {
@@ -71,7 +88,7 @@ pub fn validate_identifier(value: &str, field_name: &str) -> Result<(), PathVali
 /// 当 `user_id` 包含非法字符时返回 `PathValidationError`
 pub fn user_dir(user_id: &str) -> Result<String, PathValidationError> {
     validate_identifier(user_id, "user_id")?;
-    Ok(PathBuf::from(COMPUTER_WORKSPACE_ROOT)
+    Ok(workspace_root_path(COMPUTER_WORKSPACE_ROOT)
         .join(user_id)
         .to_string_lossy()
         .into_owned())
@@ -90,7 +107,7 @@ pub fn user_dir(user_id: &str) -> Result<String, PathValidationError> {
 pub fn project_dir(user_id: &str, project_id: &str) -> Result<String, PathValidationError> {
     validate_identifier(user_id, "user_id")?;
     validate_identifier(project_id, "project_id")?;
-    Ok(PathBuf::from(COMPUTER_WORKSPACE_ROOT)
+    Ok(workspace_root_path(COMPUTER_WORKSPACE_ROOT)
         .join(user_id)
         .join(project_id)
         .to_string_lossy()
@@ -112,11 +129,11 @@ pub fn project_dir(user_id: &str, project_id: &str) -> Result<String, PathValida
 /// ```ignore
 /// // project 隔离（默认）
 /// build_workspace_path(Some("project"), None, None, "proj_123").unwrap()
-/// // 返回: "/app/project_workspace/proj_123"
+/// // 返回: format!("{}/proj_123", expect_root(WORKSPACE_ROOT))
 ///
 /// // tenant 隔离
 /// build_workspace_path(Some("tenant"), Some("t1"), Some("s1"), "proj_123").unwrap()
-/// // 返回: "/app/project_workspace/t1/s1/proj_123"
+/// // 返回: format!("{}/t1/s1/proj_123", expect_root(WORKSPACE_ROOT))
 /// ```
 ///
 /// # 错误
@@ -138,7 +155,7 @@ pub fn build_workspace_path(
             let sid = space_id.unwrap_or("default");
             validate_identifier(tid, "tenant_id")?;
             validate_identifier(sid, "space_id")?;
-            Ok(PathBuf::from(WORKSPACE_ROOT)
+            Ok(workspace_root_path(WORKSPACE_ROOT)
                 .join(tid)
                 .join(sid)
                 .join(project_id)
@@ -147,7 +164,7 @@ pub fn build_workspace_path(
         }
         _ => {
             // project (默认): /app/project_workspace/{project_id}
-            Ok(PathBuf::from(WORKSPACE_ROOT)
+            Ok(workspace_root_path(WORKSPACE_ROOT)
                 .join(project_id)
                 .to_string_lossy()
                 .into_owned())
@@ -171,11 +188,11 @@ pub fn build_workspace_path(
 /// ```ignore
 /// // project 隔离（默认）
 /// build_computer_workspace_path(Some("project"), None, None, "user_123", "proj_456").unwrap()
-/// // 返回: "/app/computer-project-workspace/user_123/proj_456"
+/// // 返回: format!("{}/user_123/proj_456", expect_root(COMPUTER_WORKSPACE_ROOT))
 ///
 /// // tenant 隔离
 /// build_computer_workspace_path(Some("tenant"), Some("t1"), Some("s1"), "user_123", "proj_456").unwrap()
-/// // 返回: "/app/computer-project-workspace/t1/s1/proj_456"
+/// // 返回: format!("{}/t1/s1/proj_456", expect_root(COMPUTER_WORKSPACE_ROOT))
 /// ```
 ///
 /// # 错误
@@ -198,7 +215,7 @@ pub fn build_computer_workspace_path(
             let sid = space_id.unwrap_or("default");
             validate_identifier(tid, "tenant_id")?;
             validate_identifier(sid, "space_id")?;
-            Ok(PathBuf::from(COMPUTER_WORKSPACE_ROOT)
+            Ok(workspace_root_path(COMPUTER_WORKSPACE_ROOT)
                 .join(tid)
                 .join(sid)
                 .join(project_id)
@@ -208,7 +225,7 @@ pub fn build_computer_workspace_path(
         _ => {
             // project (默认): /app/computer-project-workspace/{user_id}/{project_id}
             validate_identifier(user_id, "user_id")?;
-            Ok(PathBuf::from(COMPUTER_WORKSPACE_ROOT)
+            Ok(workspace_root_path(COMPUTER_WORKSPACE_ROOT)
                 .join(user_id)
                 .join(project_id)
                 .to_string_lossy()
@@ -256,6 +273,14 @@ pub fn map_container_work_dir_to_host(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试期望的 workspace 根：deploy-host 编译下 build_* 经映射产生
+    /// ~/.rcoder 路径（HOME 存在时），否则容器常量——与生产出口同一分叉。
+    fn expect_root(container_root: &str) -> String {
+        workspace_root_path(container_root)
+            .to_string_lossy()
+            .into_owned()
+    }
 
     // === validate_identifier 测试 ===
 
@@ -306,7 +331,7 @@ mod tests {
     fn test_user_dir() {
         assert_eq!(
             user_dir("user123").unwrap(),
-            "/app/computer-project-workspace/user123"
+            format!("{}/user123", expect_root(COMPUTER_WORKSPACE_ROOT))
         );
     }
 
@@ -319,7 +344,10 @@ mod tests {
     fn test_project_dir() {
         assert_eq!(
             project_dir("user123", "project456").unwrap(),
-            "/app/computer-project-workspace/user123/project456"
+            format!(
+                "{}/user123/project456",
+                expect_root(COMPUTER_WORKSPACE_ROOT)
+            )
         );
     }
 
@@ -334,11 +362,11 @@ mod tests {
         // project 隔离（默认）
         assert_eq!(
             build_workspace_path(None, None, None, "proj_123").unwrap(),
-            "/app/project_workspace/proj_123"
+            format!("{}/proj_123", expect_root(WORKSPACE_ROOT))
         );
         assert_eq!(
             build_workspace_path(Some("project"), None, None, "proj_123").unwrap(),
-            "/app/project_workspace/proj_123"
+            format!("{}/proj_123", expect_root(WORKSPACE_ROOT))
         );
     }
 
@@ -347,7 +375,7 @@ mod tests {
         // tenant 隔离
         assert_eq!(
             build_workspace_path(Some("tenant"), Some("t1"), Some("s1"), "proj_123").unwrap(),
-            "/app/project_workspace/t1/s1/proj_123"
+            format!("{}/t1/s1/proj_123", expect_root(WORKSPACE_ROOT))
         );
     }
 
@@ -356,7 +384,7 @@ mod tests {
         // space 隔离
         assert_eq!(
             build_workspace_path(Some("space"), Some("t1"), Some("s1"), "proj_123").unwrap(),
-            "/app/project_workspace/t1/s1/proj_123"
+            format!("{}/t1/s1/proj_123", expect_root(WORKSPACE_ROOT))
         );
     }
 
@@ -365,7 +393,7 @@ mod tests {
         // tenant/space 模式下使用默认值
         assert_eq!(
             build_workspace_path(Some("tenant"), None, None, "proj_123").unwrap(),
-            "/app/project_workspace/default/default/proj_123"
+            format!("{}/default/default/proj_123", expect_root(WORKSPACE_ROOT))
         );
     }
 
@@ -380,12 +408,12 @@ mod tests {
         // project 隔离（默认）
         assert_eq!(
             build_computer_workspace_path(None, None, None, "user_123", "proj_456").unwrap(),
-            "/app/computer-project-workspace/user_123/proj_456"
+            format!("{}/user_123/proj_456", expect_root(COMPUTER_WORKSPACE_ROOT))
         );
         assert_eq!(
             build_computer_workspace_path(Some("project"), None, None, "user_123", "proj_456")
                 .unwrap(),
-            "/app/computer-project-workspace/user_123/proj_456"
+            format!("{}/user_123/proj_456", expect_root(COMPUTER_WORKSPACE_ROOT))
         );
     }
 
@@ -401,7 +429,7 @@ mod tests {
                 "proj_456"
             )
             .unwrap(),
-            "/app/computer-project-workspace/t1/s1/proj_456"
+            format!("{}/t1/s1/proj_456", expect_root(COMPUTER_WORKSPACE_ROOT))
         );
     }
 
@@ -417,7 +445,7 @@ mod tests {
                 "proj_456"
             )
             .unwrap(),
-            "/app/computer-project-workspace/t1/s1/proj_456"
+            format!("{}/t1/s1/proj_456", expect_root(COMPUTER_WORKSPACE_ROOT))
         );
     }
 
@@ -434,14 +462,18 @@ mod tests {
         // 常规项目主场景：/home/user/{projectType}/{projectId}
         assert_eq!(
             map_container_work_dir_to_host("/home/user/web/proj_1", "user_123").unwrap(),
-            Some(PathBuf::from(
-                "/app/computer-project-workspace/user_123/web/proj_1"
-            ))
+            Some(PathBuf::from(format!(
+                "{}/user_123/web/proj_1",
+                expect_root(COMPUTER_WORKSPACE_ROOT)
+            )))
         );
         // 裸 /home/user = 用户根
         assert_eq!(
             map_container_work_dir_to_host("/home/user", "user_123").unwrap(),
-            Some(PathBuf::from("/app/computer-project-workspace/user_123"))
+            Some(PathBuf::from(format!(
+                "{}/user_123",
+                expect_root(COMPUTER_WORKSPACE_ROOT)
+            )))
         );
         assert!(map_container_work_dir_to_host("/home/user/web/p1", "../../etc").is_err());
     }
