@@ -28,8 +28,9 @@ enum ParentStep {
 /// 坏修订表达式（`HEAD~x`）与歧义前缀 → `AppError::validation`；其余错误传播。
 ///
 /// 不经 rev_parse_single：其错误经 gix-error 类型擦除无法结构化分类。
-/// 明确不支持 revspec 的 `@{}`、`:/`、`rev:path` 等表达式（Java/TS 契约均未承诺，
-/// 会按 ref 名走缺席/非法名路径）。
+/// 明确不支持 revspec 的 `^{}`（peel）、`@{}`、`:/`、`rev:path` 等表达式
+/// （Java/TS 契约均未承诺）：含 `~`/`^` 的非法链 → Validation 显式报错，
+/// 其余按 ref 名走缺席/非法名路径。
 pub(crate) fn resolve_rev(repo: &Repository, spec: &str) -> AppResult<Option<ObjectId>> {
     let (base, steps) = split_revision_chain(spec)?;
     let Some(mut oid) = resolve_base_rev(repo, base)? else {

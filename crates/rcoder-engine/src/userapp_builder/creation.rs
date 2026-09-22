@@ -1493,6 +1493,7 @@ pub(crate) mod fence_settler_tests {
             ready_replicas: replicas,
             phase: phase.into(),
             message: None,
+            reason: None,
             pod_ip: None,
             node: None,
             restart_count: 0,
