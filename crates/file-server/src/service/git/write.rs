@@ -211,17 +211,23 @@ pub fn commit_indexed(
 // ── init / unstage / discard ───────────────────────────────────────────────────
 
 /// 初始化仓库 (对齐 nuwax init): 已存在返回 already=true; 否则 init + .gitignore + initial commit。
+///
+/// 幂等门是"已有提交"而非"仓库已存在": 此前 initial commit 失败 (仓库停留在
+/// unborn) 时重试会真正补提交, 失败不再被吞 (fail-fast, 落盘工作区必须带提交)。
 pub fn init_repo(path: &Path, author_name: &str, author_email: &str) -> AppResult<bool> {
-    let already = super::is_git_repo(path);
+    let existed = super::is_git_repo(path);
     let repo = super::ensure_repo(path)?;
     super::ensure_gitignore(path)?;
-    if !already {
+    if !has_any_commit(&repo) {
         stage_path(&repo, ".gitignore")?;
-        if let Err(e) = commit_indexed(&repo, "Initial commit", author_name, author_email) {
-            tracing::warn!(error = %e, "initial commit failed (best-effort, skipping)");
-        }
+        commit_indexed(&repo, "Initial commit", author_name, author_email)?;
     }
-    Ok(already)
+    Ok(existed)
+}
+
+/// 仓库是否已有至少一个提交 (unborn → false)。
+fn has_any_commit(repo: &Repository) -> bool {
+    repo.head_id().is_ok()
 }
 
 /// 公开 `/api/git/init` 使用：只初始化仓库并维护 .gitignore，不创建提交。
@@ -245,10 +251,9 @@ pub fn init_and_commit(
     super::ensure_gitignore(path)?;
     // stage 全部变更 (addAll: modified + untracked + deleted)
     stage_files(&repo, &[])?;
-    // 提交 (无变更也会产生提交, 与 nuwax 一致; commit 失败 best-effort 不阻断业务)
-    if let Err(e) = commit_indexed(&repo, message, author_name, author_email) {
-        tracing::warn!(error = %e, "commit failed (best-effort, skipping)");
-    }
+    // 提交 (无变更也会产生提交, 与 nuwax 一致); 失败传播——nuwax initProjectTemplate
+    // 的 init+commit 组合同样不 catch, 吞错是移植自创且会留下 unborn 工作区。
+    commit_indexed(&repo, message, author_name, author_email)?;
     Ok(())
 }
 
@@ -542,5 +547,54 @@ mod tests {
                 .is_some(),
             "checkout overlay must not stage deletion of paths absent from target"
         );
+    }
+
+    fn commit_count(repo: &Repository) -> usize {
+        crate::service::git::read::log_history(repo, 50, 0, None, None)
+            .expect("log count")
+            .len()
+    }
+
+    #[test]
+    fn init_repo_is_idempotent_and_leaves_born_repo() {
+        // 不变量: 走 provisioning 的工作区必须带着初始提交落地
+        let test = TestRepo::new();
+        let repo = test.open();
+        assert!(
+            repo.head_id().is_ok(),
+            "全新目录 init_repo 后必须已有初始提交"
+        );
+        let before = commit_count(&repo);
+        let existed = init_repo(&test.0, "Test", "test@example.com").expect("re-init");
+        assert!(existed, "已存在仓库的第二次调用应返回 already=true");
+        assert_eq!(
+            commit_count(&repo),
+            before,
+            "已有提交的仓库不得重复补 Initial commit"
+        );
+    }
+
+    #[test]
+    fn init_repo_retries_initial_commit_on_unborn_repo() {
+        // 粘性失败回归: 仓库已存在但无提交 (初始提交曾失败 / init-only) 时,
+        // 修复前的 already=is_git_repo 门会跳过提交, unborn 状态永远无法自愈
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "file-server-git-test-unborn-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create unborn repo dir");
+        crate::service::git::ensure_repo(&path).expect("init only (no commit)");
+        let existed = init_repo(&path, "Test", "test@example.com").expect("retry init_repo");
+        assert!(existed, "仓库已存在, 返回值语义保持 already=true");
+        let repo = open(&path).expect("open after retry");
+        assert!(
+            repo.head_id().is_ok(),
+            "unborn 仓库上的 init_repo 必须补出初始提交"
+        );
+        drop(std::fs::remove_dir_all(&path));
     }
 }

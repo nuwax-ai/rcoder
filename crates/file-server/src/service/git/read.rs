@@ -8,7 +8,41 @@ use gix::diff::index::ChangeRef as IndexChange;
 use gix::progress::Discard;
 use gix::status::index_worktree::Item as WorktreeItem;
 use gix::status::{Item as StatusItem, UntrackedFiles};
-use gix::{Commit, Repository};
+use gix::{Commit, ObjectId, Repository};
+
+/// refspec → ObjectId。spec 为分支/tag 名（gix 部分名展开，与 revparse delegate
+/// 内部解析 ref 名同路径）或完整 OID；"HEAD" 走 gix 的 unborn 状态判定。
+///
+/// `Ok(None)` = 空仓库（unborn HEAD）或 ref/OID 不存在——两类"缺席"由调用方
+/// 按"无数据"契约映射（log → 空列表，file-content → None/空串）；其余错误传播。
+/// 不经 rev_parse_single：其错误经 gix-error 类型擦除无法结构化分类。
+pub(crate) fn resolve_rev(repo: &Repository, spec: &str) -> AppResult<Option<ObjectId>> {
+    if spec == "HEAD" {
+        let head = repo.head().map_err(|e| map_git_err(e, "git head"))?;
+        return if head.is_unborn() {
+            Ok(None)
+        } else {
+            Ok(Some(
+                head.into_peeled_id()
+                    .map_err(|e| map_git_err(e, "git head_id"))?
+                    .detach(),
+            ))
+        };
+    }
+    match repo.find_reference(spec) {
+        Ok(mut r) => Ok(Some(
+            r.peel_to_id()
+                .map_err(|e| map_git_err(e, "git peel ref"))?
+                .detach(),
+        )),
+        Err(gix::reference::find::existing::Error::NotFound { .. }) => {
+            Ok(ObjectId::from_hex(spec.as_bytes())
+                .ok()
+                .filter(|oid| repo.find_object(*oid).is_ok()))
+        }
+        Err(e) => Err(map_git_err(e, "git find_reference")),
+    }
+}
 
 /// 列本地分支 + 当前分支名 (对齐 nuwax listBranches + currentBranch)。
 pub fn list_branches(repo: &Repository) -> AppResult<(Vec<String>, Option<String>)> {
@@ -63,7 +97,8 @@ pub struct CommitInfo {
 /// 提交历史 (对齐 nuwax logHistory; first-parent)。
 /// `branch` 非空 → 从该 ref 起 walk (对齐 nuwax git.log({ ref: branch })); 默认 HEAD。
 ///
-/// 仓库刚 init 尚无任何 commit 时 (HEAD 无法解析) → 返回空列表 (对齐 TS d1e5c8a)。
+/// 仓库刚 init 尚无任何 commit (unborn) 或 ref 不存在时 → 返回空列表
+/// (结构化判定: [`resolve_rev`] 返回 None; 对齐 TS d1e5c8a 的"无数据"契约)。
 pub fn log_history(
     repo: &Repository,
     max_count: usize,
@@ -71,26 +106,10 @@ pub fn log_history(
     branch: Option<&str>,
     file_path: Option<&str>,
 ) -> AppResult<Vec<CommitInfo>> {
-    // 解析起始 ref; 失败时若是"无 commit"场景 (空仓库), 返回空列表而非报错。
-    let start_id = match branch {
-        Some(b) if !b.trim().is_empty() => match repo.rev_parse_single(b) {
-            Ok(id) => id.detach(),
-            Err(e) => {
-                if is_no_commit_error(&e) {
-                    return Ok(Vec::new());
-                }
-                return Err(map_git_err(e, "git rev_parse branch"));
-            }
-        },
-        _ => match repo.head_id() {
-            Ok(id) => id.detach(),
-            Err(e) => {
-                if is_no_commit_error(&e) {
-                    return Ok(Vec::new());
-                }
-                return Err(map_git_err(e, "git head_id"));
-            }
-        },
+    // 解析起始 ref; "缺席"(空仓库/ref 不存在)返回空列表而非报错。
+    let spec = branch.filter(|b| !b.trim().is_empty()).unwrap_or("HEAD");
+    let Some(start_id) = resolve_rev(repo, spec)? else {
+        return Ok(Vec::new());
     };
     let walk = repo
         .rev_walk([start_id])
@@ -174,15 +193,16 @@ fn iso_from_secs(secs: i64) -> String {
 }
 
 /// 读 ref 处的文件内容 (对齐 nuwax fileContent)。
+/// ref 缺席 (空仓库 unborn / ref 不存在) → `Ok(None)`，handler 既有契约映射为空串。
 pub fn file_content_at_ref(
     repo: &Repository,
     ref_spec: &str,
     file_path: &str,
     max_bytes: u64,
 ) -> AppResult<Option<String>> {
-    let oid = repo
-        .rev_parse_single(ref_spec)
-        .map_err(|e| map_git_err(e, "git rev_parse"))?;
+    let Some(oid) = resolve_rev(repo, ref_spec)? else {
+        return Ok(None);
+    };
     let commit = repo
         .find_commit(oid)
         .map_err(|e| map_git_err(e, "git find_commit"))?;
@@ -298,16 +318,6 @@ pub fn get_status(repo: &Repository) -> AppResult<StatusResult> {
     Ok(r)
 }
 
-/// 判断 gix 错误是否为"空仓库无 commit" (HEAD 无法解析)。
-/// 对齐 TS d1e5c8a: hasGitHead 预检 + catch 兜底 "does not have any commits"。
-fn is_no_commit_error(e: &impl std::fmt::Display) -> bool {
-    let msg = e.to_string().to_lowercase();
-    msg.contains("does not have any commits yet")
-        || msg.contains("unborn")
-        || msg.contains("could not find")
-        || msg.contains("not found")
-}
-
 #[cfg(test)]
 mod tests {
     //! git 读服务回归网（read.rs 此前 0 测试）。
@@ -316,6 +326,8 @@ mod tests {
     //! - 超限 blob = Validation（防整库读爆内存）
     //! - get_status 的 5-bucket 分派（客户端按 bucket 渲染状态列表）
     //! - log_history 尊重 max_count（handler 层 clamp 后传值）
+    //! - unborn 仓库/缺席 ref = 空数据而非报错（app-169 事故反例；
+    //!   结构化判定 resolve_rev，不匹配错误文案）
 
     use super::*;
     use crate::service::git::write::{commit_indexed, init_repo, stage_path};
@@ -325,17 +337,29 @@ mod tests {
 
     impl TestRepo {
         fn new() -> Self {
+            let path = Self::fresh_dir("born");
+            init_repo(&path, "Test", "test@example.com").expect("init test repo");
+            Self(path)
+        }
+
+        /// 只 init 不提交: unborn HEAD → refs/heads/main (与生产 app-169 同形)。
+        fn new_unborn() -> Self {
+            let path = Self::fresh_dir("unborn");
+            crate::service::git::ensure_repo(&path).expect("init unborn repo");
+            Self(path)
+        }
+
+        fn fresh_dir(kind: &str) -> std::path::PathBuf {
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock after epoch")
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "file-server-git-read-test-{}-{nonce}",
+                "file-server-git-read-test-{kind}-{}-{nonce}",
                 std::process::id()
             ));
             std::fs::create_dir_all(&path).expect("create test repo");
-            init_repo(&path, "Test", "test@example.com").expect("init test repo");
-            Self(path)
+            path
         }
 
         fn open(&self) -> Repository {
@@ -437,5 +461,57 @@ mod tests {
 
         let limited = log_history(&repo, 2, 0, None, None).expect("受限 log");
         assert_eq!(limited.len(), 2, "service 必须尊重传入的 max_count 上限");
+    }
+
+    #[test]
+    fn log_history_on_unborn_repo_returns_empty() {
+        // 修复前反例 (app-169 事故): 兜底谓词匹配不上 gix 真实文案 → 500
+        let t = TestRepo::new_unborn();
+        let repo = t.open();
+        let head = log_history(&repo, 50, 0, None, None).expect("unborn HEAD 必须空列表而非报错");
+        assert!(head.is_empty(), "unborn HEAD: {head:?}");
+        let branch =
+            log_history(&repo, 50, 0, Some("main"), None).expect("unborn 分支必须空列表而非报错");
+        assert!(branch.is_empty(), "unborn main 分支: {branch:?}");
+    }
+
+    #[test]
+    fn log_history_missing_branch_returns_empty() {
+        let t = TestRepo::new();
+        commit_file(&t, "a.txt", "1", "c1");
+        let repo = t.open();
+        let r = log_history(&repo, 50, 0, Some("no-such-branch"), None)
+            .expect("缺分支必须空列表而非报错");
+        assert!(r.is_empty(), "缺失分支: {r:?}");
+    }
+
+    #[test]
+    fn log_history_branch_full_oid_resolves_and_missing_oid_is_empty() {
+        let t = TestRepo::new();
+        let oid = commit_file(&t, "a.txt", "1", "c1");
+        let repo = t.open();
+        // 完整 40 位 OID 作为 branch 保持既有解析能力
+        let r = log_history(&repo, 50, 0, Some(&oid), None).expect("OID 起点应可解析");
+        assert!(!r.is_empty(), "OID walk 必须有历史: {r:?}");
+        let missing = "0".repeat(40);
+        let r = log_history(&repo, 50, 0, Some(&missing), None).expect("缺 OID 必须空列表而非报错");
+        assert!(r.is_empty(), "不存在 OID: {r:?}");
+    }
+
+    #[test]
+    fn file_content_at_ref_on_unborn_or_missing_ref_returns_none() {
+        let t = TestRepo::new_unborn();
+        let repo = t.open();
+        assert_eq!(
+            file_content_at_ref(&repo, "HEAD", "any.txt", 1024)
+                .expect("unborn HEAD 必须 Ok(None) 而非报错"),
+            None,
+            "unborn HEAD 走 handler 既有空串契约"
+        );
+        assert_eq!(
+            file_content_at_ref(&repo, "refs/heads/nope", "any.txt", 1024)
+                .expect("缺席 ref 必须 Ok(None) 而非报错"),
+            None
+        );
     }
 }

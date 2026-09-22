@@ -129,17 +129,16 @@ pub async fn create_project(
         }
         return Err(error);
     }
-    // GIT_ENABLED → git init + commit("init project: {id}") (对齐 nuwax createProject)
-    if config.git_enabled
-        && let Err(e) = crate::service::git::write::init_and_commit_offloaded(
+    // GIT_ENABLED → git init + commit("init project: {id}") (对齐 nuwax createProject);
+    // 失败传播——nuwax 不 catch, 吞错会留下无提交的 unborn 工作区 (重试经幂等门可自愈)
+    if config.git_enabled {
+        crate::service::git::write::init_and_commit_offloaded(
             project_path.clone(),
             format!("init project: {project_id}"),
             config.git_default_author_name.clone(),
             config.git_default_author_email.clone(),
         )
-        .await
-    {
-        tracing::warn!(error = %e, "git init/commit after create failed (skipping)");
+        .await?;
     }
 
     Ok(CreateResult {
@@ -199,17 +198,16 @@ pub async fn copy_project(
         }
         return Err(error);
     }
-    // GIT_ENABLED → git init + commit("copy project: {src} -> {tgt}") (对齐 nuwax copyProject)
-    if config.git_enabled
-        && let Err(e) = crate::service::git::write::init_and_commit_offloaded(
+    // GIT_ENABLED → git init + commit("copy project: {src} -> {tgt}") (对齐 nuwax copyProject);
+    // 失败传播——吞错会留下无提交的 unborn 工作区
+    if config.git_enabled {
+        crate::service::git::write::init_and_commit_offloaded(
             target_path.to_path_buf(),
             format!("copy project: {source_id} -> {target_id}"),
             config.git_default_author_name.clone(),
             config.git_default_author_email.clone(),
         )
-        .await
-    {
-        tracing::warn!(error = %e, "git init/commit after copy failed (skipping)");
+        .await?;
     }
 
     Ok(CopyResult {
@@ -350,17 +348,15 @@ pub async fn upload_project(
         tracing::warn!(error = %cleanup_err, "cleanup rollback backup after upload failed (skipping)");
     }
 
-    // 4. GIT_ENABLED → init + commit
-    if config.git_enabled
-        && let Err(e) = crate::service::git::write::init_and_commit_offloaded(
+    // 4. GIT_ENABLED → init + commit; 失败传播——吞错会留下无提交的 unborn 工作区
+    if config.git_enabled {
+        crate::service::git::write::init_and_commit_offloaded(
             project_path.clone(),
             format!("upload project v{version}"),
             config.git_default_author_name.clone(),
             config.git_default_author_email.clone(),
         )
-        .await
-    {
-        tracing::warn!(error = %e, "git init/commit after upload failed (skipping)");
+        .await?;
     }
 
     Ok(UploadProjectResult {

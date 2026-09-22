@@ -27,10 +27,9 @@ pub async fn init_project_template_core(
     if state.config.git_enabled && enable_git {
         let an = state.config.git_default_author_name.clone();
         let ae = state.config.git_default_author_email.clone();
-        // init_repo 内部已含 initial commit (ensure_repo + ensure_gitignore + commit_indexed)
-        if let Err(e) = crate::service::git::init_repo(&ws, &an, &ae) {
-            tracing::warn!(error = %e, "git init_repo after template init failed (skipping)");
-        }
+        // init_repo 内部已含 initial commit; 失败传播——nuwax initProjectTemplate 的
+        // init+commit 组合同样不 catch, 吞错会留下无提交的 unborn 工作区
+        crate::service::git::init_repo(&ws, &an, &ae)?;
     }
     Ok(ws)
 }
