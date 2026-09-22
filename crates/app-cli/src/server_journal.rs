@@ -114,21 +114,66 @@ impl Journal {
             if !has_records {
                 continue;
             }
-            anyhow::ensure!(
-                journal.receipt.is_none()
-                    && journal.previous_owner.is_none()
-                    && journal.legacy_root.is_none(),
-                "deployment journal exists in multiple authority domains; explicit recovery required"
-            );
+            if journal.receipt.is_none()
+                && journal.previous_owner.is_none()
+                && journal.legacy_root.is_none()
+            {
+                let mut old = Self::open_root(legacy.clone())?;
+                journal.receipt = old.receipt.take();
+                journal.previous_owner = old.previous_owner.take();
+                let lease = old
+                    .lease
+                    .take()
+                    .context("legacy deployment lease missing")?;
+                journal.legacy_leases.push(lease);
+                journal.legacy_root = Some(legacy);
+                continue;
+            }
+            // 双权威域（2026-09-22 app-105 死锁修复）：权威根已有记录且 legacy
+            // 也残留记录时，旧守卫一律拒绝——但"权威侧是一笔 failed 待重部署
+            // + legacy 是被取代的陈旧记录"恰恰是升级窗口被中断部署的必然产
+            // 物，此时 serve 起不来则重部署（journal 自己要求的恢复方式）永
+            // 远无法发生：守卫死锁自己的补救路径。改为状态感知收束：
+            // - 双侧均无在途交接（coordinator quiescent ∧ boundary 终态）且
+            //   权威记录不旧于 legacy → 陈旧侧改名归档（不删除、可回滚），
+            //   serve 正常启动，重部署路径恢复；
+            // - 任一侧在途、或 legacy 反而更新（旧运行时在新布局之后又跑过，
+            //   降级混跑）→ 仍显式拒绝，文案给出两侧路径。
             let mut old = Self::open_root(legacy.clone())?;
-            journal.receipt = old.receipt.take();
-            journal.previous_owner = old.previous_owner.take();
-            let lease = old
-                .lease
-                .take()
-                .context("legacy deployment lease missing")?;
-            journal.legacy_leases.push(lease);
-            journal.legacy_root = Some(legacy);
+            let legacy_settled = domain_settled(
+                old.receipt.as_ref().map(|receipt| &receipt.boundary),
+                old.previous_owner.as_ref(),
+            );
+            let authority_settled = domain_settled(
+                journal.receipt.as_ref().map(|receipt| &receipt.boundary),
+                journal.previous_owner.as_ref(),
+            );
+            anyhow::ensure!(
+                authority_settled && legacy_settled,
+                "deployment journal conflict: in-flight records in authority {} or legacy {} \
+                 (settle the interrupted deployment, then restart)",
+                journal.root.display(),
+                legacy.display()
+            );
+            anyhow::ensure!(
+                authority_covers_legacy(&journal.root, &legacy),
+                "legacy deployment records at {} are newer than authority {} \
+                 (old runtime ran after the state-root migration); explicit recovery required",
+                legacy.display(),
+                journal.root.display()
+            );
+            archive_superseded_records(&legacy)?;
+            tracing::warn!(
+                legacy = %legacy.display(),
+                authority = %journal.root.display(),
+                "archived superseded legacy deployment journal (both domains settled, \
+                 authority records newer); startup continues"
+            );
+            // 保留 legacy 锁到 owner 生命周期结束（与迁移路径同理）：归档后旧
+            // 二进制不得在 legacy 路径上以全新记录启动。
+            if let Some(lease) = old.lease.take() {
+                journal.legacy_leases.push(lease);
+            }
         }
         Ok(journal)
     }
@@ -395,6 +440,67 @@ impl Journal {
     }
 }
 
+/// A record domain is settled when no deployment handoff is mid-flight:
+/// the coordinator is quiescent (or absent) and the receipt sits at a
+/// terminal boundary (or is absent). Preparing/Switching/Activated mean an
+/// interrupted handoff the owner may still reconcile — such records stay
+/// untouchable by automatic supersession.
+fn domain_settled(boundary: Option<&Boundary>, owner: Option<&CoordinatorOwner>) -> bool {
+    owner.is_none_or(|owner| owner.state == OwnerState::Quiescent)
+        && boundary.is_none_or(|boundary| {
+            !matches!(
+                boundary,
+                Boundary::Preparing | Boundary::Switching | Boundary::Activated
+            )
+        })
+}
+
+/// Authority records must be at least as new as the legacy ones before the
+/// legacy set may be treated as superseded. Any unprovable mtime refuses.
+fn authority_covers_legacy(authority: &Path, legacy: &Path) -> bool {
+    let newest = |root: &Path| {
+        [".deploy-operation.json", ".deploy-coordinator.json"]
+            .into_iter()
+            .filter_map(|name| {
+                std::fs::metadata(root.join(name))
+                    .ok()
+                    .and_then(|meta| meta.modified().ok())
+            })
+            .max()
+    };
+    match (newest(authority), newest(legacy)) {
+        (Some(authority_time), Some(legacy_time)) => authority_time >= legacy_time,
+        _ => false,
+    }
+}
+
+/// Archive (rename, never delete) the superseded legacy record set. The
+/// `.deploy-operation.lock` stays in place and stays held by the caller so an
+/// old binary cannot start fresh against the archived legacy paths.
+fn archive_superseded_records(legacy: &Path) -> Result<()> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    for name in [
+        ".deploy-operation.json",
+        ".deploy-coordinator.json",
+        ".deploy-state.toml",
+    ] {
+        let source = legacy.join(name);
+        let archived = legacy.join(format!("{name}.superseded-{stamp}"));
+        match std::fs::metadata(&source) {
+            Ok(_) => std::fs::rename(&source, &archived)
+                .with_context(|| format!("archive legacy record {name}"))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("stat legacy record"),
+        }
+    }
+    #[cfg(unix)]
+    File::open(legacy)?.sync_all()?;
+    Ok(())
+}
+
 /// A new Linux PID namespace proves that processes from the previous container
 /// cannot still own this workspace. A process restart in the same namespace does not.
 fn process_scope() -> Option<String> {
@@ -460,23 +566,139 @@ mod tests {
         );
     }
 
+    /// 双权威域·放行（2026-09-22 app-105 死锁修复的正例）：权威根记录更新且
+    /// 双侧均无在途交接（coordinator quiescent ∧ boundary 终态）→ 陈旧 legacy
+    /// 记录改名归档（不删除）、权威记录原样保留、serve 可正常启动。修复前该
+    /// 形态恒拒绝，"failed 待重部署"的自我补救（重新部署）永远无法发生。
     #[test]
-    fn dual_journal_authority_is_rejected_without_overwrite() {
+    fn superseded_legacy_records_are_archived_when_authority_newer_and_settled() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("project");
         std::fs::create_dir_all(&source).unwrap();
         let root = runtime_state_layout::ensure_state_root(&source, None, None).unwrap();
-        for path in [dir.path(), root.as_path()] {
-            let mut journal = Journal::open_root(path.to_path_buf()).unwrap();
-            journal.write(receipt(Boundary::Active)).unwrap();
-        }
-        let before = std::fs::read(root.join(".deploy-operation.json")).unwrap();
-        assert!(Journal::open_with_root(&source, root.clone()).is_err());
+        // legacy 先落（settled：quiescent + 终态 boundary + 遗留 state.toml）
+        let mut legacy = Journal::open_root(dir.path().to_path_buf()).unwrap();
+        legacy.commit_coordinator().unwrap();
+        legacy.write(receipt(Boundary::Active)).unwrap();
+        legacy.commit_quiescent().unwrap();
+        std::fs::write(dir.path().join(".deploy-state.toml"), "legacy").unwrap();
+        drop(legacy);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // 权威根后落（app-105 形态：一笔 failed 待重部署 + quiescent）
+        let mut authority = Journal::open_root(root.clone()).unwrap();
+        authority.commit_coordinator().unwrap();
+        authority.write(receipt(Boundary::Failed)).unwrap();
+        authority.commit_quiescent().unwrap();
+        let authority_bytes = std::fs::read(root.join(".deploy-operation.json")).unwrap();
+        drop(authority);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let journal = Journal::open_with_root(&source, root.clone()).unwrap();
+        // 权威记录原样保留；journal 直接可用（重部署路径恢复）
         assert_eq!(
-            before,
-            std::fs::read(root.join(".deploy-operation.json")).unwrap()
+            std::fs::read(root.join(".deploy-operation.json")).unwrap(),
+            authority_bytes
         );
+        assert_eq!(
+            journal.receipt.as_ref().unwrap().operation.operation_id,
+            "hot-b"
+        );
+        // legacy 三类记录全部改名归档；锁文件原样保留（旧二进制不得在 legacy
+        // 路径以全新记录启动）
+        assert!(!dir.path().join(".deploy-operation.json").exists());
+        assert!(!dir.path().join(".deploy-coordinator.json").exists());
+        assert!(!dir.path().join(".deploy-state.toml").exists());
+        assert!(dir.path().join(".deploy-operation.lock").exists());
+        let archived = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.contains(".superseded-"))
+            })
+            .count();
+        assert!(archived >= 3, "archived records: {archived}");
+    }
+
+    /// 双权威域·拒绝（任一侧在途）：legacy 侧 coordinator 从未 quiescent
+    /// （可能在跑/被中断未收束）→ 归档不生效，记录原样保留。
+    #[test]
+    fn dual_domain_with_in_flight_legacy_records_still_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("project");
+        std::fs::create_dir_all(&source).unwrap();
+        let root = runtime_state_layout::ensure_state_root(&source, None, None).unwrap();
+        let mut legacy = Journal::open_root(dir.path().to_path_buf()).unwrap();
+        legacy.commit_coordinator().unwrap();
+        legacy.write(receipt(Boundary::Active)).unwrap();
+        // 不 commit_quiescent：owner 仍 Active
+        drop(legacy);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut authority = Journal::open_root(root.clone()).unwrap();
+        authority.commit_coordinator().unwrap();
+        authority.write(receipt(Boundary::Failed)).unwrap();
+        authority.commit_quiescent().unwrap();
+        drop(authority);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        assert!(Journal::open_with_root(&source, root.clone()).is_err());
         assert!(dir.path().join(".deploy-operation.json").exists());
+        assert!(root.join(".deploy-operation.json").exists());
+    }
+
+    /// 双权威域·拒绝（权威侧在途）：权威 boundary 处于交接中
+    /// （Switching）→ 不允许自动归档 legacy。
+    #[test]
+    fn dual_domain_with_in_flight_authority_records_still_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("project");
+        std::fs::create_dir_all(&source).unwrap();
+        let root = runtime_state_layout::ensure_state_root(&source, None, None).unwrap();
+        let mut legacy = Journal::open_root(dir.path().to_path_buf()).unwrap();
+        legacy.commit_coordinator().unwrap();
+        legacy.write(receipt(Boundary::Active)).unwrap();
+        legacy.commit_quiescent().unwrap();
+        drop(legacy);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut authority = Journal::open_root(root.clone()).unwrap();
+        authority.commit_coordinator().unwrap();
+        authority.write(receipt(Boundary::Switching)).unwrap();
+        authority.commit_quiescent().unwrap();
+        drop(authority);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        assert!(Journal::open_with_root(&source, root.clone()).is_err());
+        assert!(dir.path().join(".deploy-operation.json").exists());
+    }
+
+    /// 双权威域·拒绝（legacy 反而更新）：旧运行时在新布局迁移之后又写过
+    /// legacy 记录（降级混跑）——真相有争议，必须显式恢复。
+    #[test]
+    fn legacy_records_newer_than_authority_rejected_as_downgrade_mixing() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("project");
+        std::fs::create_dir_all(&source).unwrap();
+        let root = runtime_state_layout::ensure_state_root(&source, None, None).unwrap();
+        // 权威先落（settled）
+        let mut authority = Journal::open_root(root.clone()).unwrap();
+        authority.commit_coordinator().unwrap();
+        authority.write(receipt(Boundary::Failed)).unwrap();
+        authority.commit_quiescent().unwrap();
+        drop(authority);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // legacy 后落（settled 但更新）
+        let mut legacy = Journal::open_root(dir.path().to_path_buf()).unwrap();
+        legacy.commit_coordinator().unwrap();
+        legacy.write(receipt(Boundary::Active)).unwrap();
+        legacy.commit_quiescent().unwrap();
+        drop(legacy);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        assert!(Journal::open_with_root(&source, root.clone()).is_err());
+        assert!(dir.path().join(".deploy-operation.json").exists());
+        assert!(root.join(".deploy-operation.json").exists());
     }
 
     fn receipt(boundary: Boundary) -> Receipt {
