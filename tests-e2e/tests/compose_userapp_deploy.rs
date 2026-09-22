@@ -690,56 +690,6 @@ async fn deploy_and_verify_traffic(
         format!("HTTP {qs}, body 截断: {}", trunc(&qb, 160)),
     );
 
-    // D″：裸 restart（无 url/env）= 平台镜像升级通道。Docker 形态经容器重建
-    // 落地：Id 更换 + Config.Image == 平台默认；随后流量七路在重建后的容器上
-    // 复验（证明业务经 env/挂载保真重建后仍可用）。
-    let (rs2, rb2) = post_json(
-        env,
-        &format!("/api/v1/userapp/{app}/restart?user_id={user}"),
-        json!({}),
-    )
-    .await;
-    report.assert_hard(
-        "bare restart 受理（镜像滚动通道）",
-        rs2.is_success() && http_ok(&rb2),
-        format!("HTTP {rs2}, body 截断: {}", trunc(&rb2, 160)),
-    );
-    let platform_image = env_or("RCODER_RUNTIME_IMAGE_DIGEST", "dev-app-runtime:latest");
-    let prod_container = format!("rcoder-app-{app}");
-    let mut rolled = false;
-    let mut rolled_detail = String::new();
-    let t0 = Instant::now();
-    while t0.elapsed() < ready_budget() {
-        if docker_container_running(&prod_container) {
-            match (
-                docker_inspect_image(&prod_container),
-                docker_inspect_id(&prod_container),
-            ) {
-                (Some(image), Some(id)) if image == platform_image => {
-                    rolled = container_id_after.as_deref() != Some(id.as_str());
-                    rolled_detail = format!(
-                        "image={image}, id_changed={}",
-                        container_id_after.as_deref() != Some(id.as_str())
-                    );
-                    break;
-                }
-                (image, id) => {
-                    rolled_detail = format!(
-                        "image={image:?}（期望 {platform_image}）, id={:?}",
-                        id.as_deref().map(|value| &value[..12.min(value.len())])
-                    );
-                }
-                _ => {}
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(3)).await;
-    }
-    report.assert_hard(
-        "bare restart 滚动到平台默认镜像（容器重建，Id 更换）",
-        rolled,
-        rolled_detail,
-    );
-
     // 七路流量：next=/、react=/react、vue=/vue、四后端 readiness（strip_prefix 后路径）
     let probes: &[(&str, &str)] = &[
         ("next /", "/"),
@@ -825,7 +775,103 @@ async fn deploy_and_verify_traffic(
             },
         );
     }
-    pending.is_empty()
+
+    // D″：裸 restart（无 url/env）= 平台镜像升级通道。必须在业务就绪之后触发——
+    // 部署受理返回时编排仍在异步进行（"成功 ≠ 立即接流量"），窗口内重启会打断
+    // migration → app-cli 按设计 fail-closed 进恢复保持（迁移结果未知不静默重启）。
+    // Docker 形态经容器重建落地：Id 更换 + Config.Image == 平台默认；随后流量
+    // 七路在重建后的容器上复验（证明业务经 env/挂载保真重建后仍可用）。
+    let deployed = pending.is_empty();
+    let (rs2, rb2) = post_json(
+        env,
+        &format!("/api/v1/userapp/{app}/restart?user_id={user}"),
+        json!({}),
+    )
+    .await;
+    report.assert_hard(
+        "bare restart 受理（镜像滚动通道）",
+        rs2.is_success() && http_ok(&rb2),
+        format!("HTTP {rs2}, body 截断: {}", trunc(&rb2, 160)),
+    );
+    let platform_image = env_or("RCODER_RUNTIME_IMAGE_DIGEST", "dev-app-runtime:latest");
+    let prod_container = format!("rcoder-app-{app}");
+    let mut rolled = false;
+    let mut rolled_detail = String::new();
+    let t_roll = Instant::now();
+    while t_roll.elapsed() < ready_budget() {
+        if docker_container_running(&prod_container) {
+            match (
+                docker_inspect_image(&prod_container),
+                docker_inspect_id(&prod_container),
+            ) {
+                (Some(image), Some(id)) if image == platform_image => {
+                    rolled = container_id_after.as_deref() != Some(id.as_str());
+                    rolled_detail = format!(
+                        "image={image}, id_changed={}",
+                        container_id_after.as_deref() != Some(id.as_str())
+                    );
+                    break;
+                }
+                (image, id) => {
+                    rolled_detail = format!(
+                        "image={image:?}（期望 {platform_image}）, id={:?}",
+                        id.as_deref().map(|value| &value[..12.min(value.len())])
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    report.assert_hard(
+        "bare restart 滚动到平台默认镜像（容器重建，Id 更换）",
+        rolled,
+        rolled_detail,
+    );
+
+    // 重启后业务恢复复验：重建容器重新编排既有 release，七路流量必须再次可达。
+    let mut pending2: Vec<(&str, &str)> = probes.to_vec();
+    let t_recheck = Instant::now();
+    while !pending2.is_empty() && t_recheck.elapsed() < ready_budget() {
+        let mut still_pending = Vec::new();
+        for (name, path) in pending2 {
+            let ok = match env
+                .http
+                .get(format!("{base}{path}"))
+                .timeout(Duration::from_secs(15))
+                .send()
+                .await
+            {
+                Ok(resp) => resp.status().is_success(),
+                Err(_) => false,
+            };
+            if ok {
+                report.assert_hard(
+                    &format!("镜像滚动重启后流量恢复[{name}]"),
+                    true,
+                    format!("{:.0}s 起再次可达", t_recheck.elapsed().as_secs_f64()),
+                );
+            } else {
+                still_pending.push((name, path));
+            }
+        }
+        pending2 = still_pending;
+        if !pending2.is_empty() {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+    for (name, _) in probes {
+        if pending2.iter().any(|(n, _)| n == name) {
+            report.assert_hard(
+                &format!("镜像滚动重启后流量恢复[{name}]"),
+                false,
+                format!(
+                    "重启后 {:.0}s 内未恢复（重建容器编排失败？502=pingap 后端未重注册）",
+                    t_recheck.elapsed().as_secs_f64()
+                ),
+            );
+        }
+    }
+    deployed && pending2.is_empty()
 }
 
 /// 轻量部署不传请求 release_id；请求身份与 manifest 身份不同源也必须完成。
