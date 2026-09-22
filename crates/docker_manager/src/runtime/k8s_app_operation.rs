@@ -436,6 +436,12 @@ impl KubernetesRuntime {
                     "Captured operation lease identity changed".into(),
                 ));
             }
+            // TTL 过期 = 不再被有效持有：Lease 对象过期后并不消失，缺此判定
+            // 会让 holder 死亡兜底把"过期未接管"的租约永远当活持有——而接管
+            // 只发生在 acquire，新操作正被围栏挡着 = 死锁回归。
+            if lease_expired_at(k8s_openapi::jiff::Timestamp::now(), &current) {
+                return Ok(false);
+            }
             return Ok(true);
         }
         self.validate_captured_configmap(context, service_type, name, receipt)

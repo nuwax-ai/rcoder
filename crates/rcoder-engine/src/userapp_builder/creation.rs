@@ -710,11 +710,24 @@ async fn observe_fence_evidence(
 }
 
 /// holder 死亡兜底的收束留痕说明。
-const HOLDER_EXPIRED_RELEASE_NOTE: &str = "holder expired, outcome unverifiable; retry the operation";
+const HOLDER_EXPIRED_RELEASE_NOTE: &str =
+    "holder expired, outcome unverifiable; retry the operation";
 /// 物理状态确定性观察收束的留痕说明。
 const DEFINITE_RELEASE_NOTE: &str = "physical state verified definite by recovery scanner";
 /// 围栏 holder 死亡兜底的默认超龄门槛（秒）：≫ 操作 deadline + 租约 TTL 60s。
 const DEFAULT_FENCE_SETTLE_GRACE_SECS: u64 = 900;
+
+/// validate 判定 → holder 是否已死：`Ok(false)` = 非持有（缺失/TTL 过期/
+/// 后端不支持）；`Err(Conflict)` = 身份已变（租约被接管——旧持有者确定性
+/// 死亡，不能保守当活）；其余 `Err`（查询/传输失败）保守视作存活。
+fn validate_verdict_means_dead(
+    outcome: container_runtime_api::ContainerRuntimeResult<bool>,
+) -> bool {
+    matches!(
+        outcome,
+        Ok(false) | Err(container_runtime_api::ContainerRuntimeError::Conflict(_))
+    )
+}
 
 /// holder 死亡兜底判定（围栏有界保证）：**围栏超龄 ∧ 持有者已死**。
 ///
@@ -742,13 +755,11 @@ async fn holder_expired(state: &AppState, record: &UserAppOperationRecord) -> bo
     {
         Ok(None) => true,
         Ok(Some(binding)) => {
-            matches!(
-                state
-                    .runtime()
-                    .validate_app_operation_receipt(&binding.context, &binding.receipt)
-                    .await,
-                Ok(false)
-            )
+            let outcome = state
+                .runtime()
+                .validate_app_operation_receipt(&binding.context, &binding.receipt)
+                .await;
+            validate_verdict_means_dead(outcome)
         }
         Err(error) => {
             tracing::warn!(
@@ -2229,8 +2240,12 @@ pub(crate) mod fence_settler_tests {
     async fn unsupported_kind_fence_kept_even_when_running() {
         let operation_id = "op-destroy-storage";
         let runtime = FenceRuntime::scenario(Some(status_of("Running", 1)), Some(operation_id));
-        let (state, _dir) =
-            fence_state(runtime, UserAppOperationKind::DestroyDevStorage, operation_id).await;
+        let (state, _dir) = fence_state(
+            runtime,
+            UserAppOperationKind::DestroyDevStorage,
+            operation_id,
+        )
+        .await;
         let snapshot = settled(&state, operation_id).await;
         reconcile_fenced_ensure(&state, &snapshot)
             .await
@@ -2266,8 +2281,7 @@ pub(crate) mod fence_settler_tests {
     async fn create_fence_settles_no_trace_when_nothing_created() {
         let operation_id = "op-create-no-trace";
         let runtime = FenceRuntime::scenario(None, None);
-        let (state, _dir) =
-            fence_state(runtime, UserAppOperationKind::Create, operation_id).await;
+        let (state, _dir) = fence_state(runtime, UserAppOperationKind::Create, operation_id).await;
         let snapshot = settled(&state, operation_id).await;
         reconcile_fenced_ensure(&state, &snapshot)
             .await
@@ -2291,8 +2305,12 @@ pub(crate) mod fence_settler_tests {
         status.idle_timeout_seconds = Some(7200);
         status.wake_on_traffic = Some(true);
         let runtime = FenceRuntime::scenario(Some(status), None);
-        let (state, _dir) =
-            fence_state(runtime, UserAppOperationKind::SetRecyclePolicy, operation_id).await;
+        let (state, _dir) = fence_state(
+            runtime,
+            UserAppOperationKind::SetRecyclePolicy,
+            operation_id,
+        )
+        .await;
         let snapshot = settled(&state, operation_id).await;
         reconcile_fenced_ensure(&state, &snapshot)
             .await
@@ -2344,6 +2362,20 @@ pub(crate) mod fence_settler_tests {
     /// Step A 反例（修复前必挂，app-166 事故类）：创建报错落围栏后什么都没
     /// 建出来（无 workload、无租约绑定）——持有者已死（0 绑定）且超龄
     /// （grace=0）时必须兜底收束为 Failed，不再永久占受理 slot。
+    /// 判定表锁：被接管（Err(Conflict)）与非持有（Ok(false)）都是 holder
+    /// 死亡证明；查询/传输失败保守视作存活。
+    #[test]
+    fn validate_verdict_dead_mapping() {
+        assert!(validate_verdict_means_dead(Ok(false)));
+        assert!(validate_verdict_means_dead(Err(
+            ContainerRuntimeError::Conflict("taken over".into())
+        )));
+        assert!(!validate_verdict_means_dead(Ok(true)));
+        assert!(!validate_verdict_means_dead(Err(
+            ContainerRuntimeError::K8sError("io".into())
+        )));
+    }
+
     #[tokio::test]
     async fn holder_expired_fence_without_binding_settles() {
         let operation_id = "op-holder-expired";
