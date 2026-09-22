@@ -5,12 +5,21 @@
 
 选择套件：`make test-e2e E2E_SUITE=compose_userapp_faults`。
 选择场景：`make test-e2e E2E_FILTER=userapp_hot_deployment_builtin_contract`。
+场景清单（含每场景最近一次 verdict 与耗时）：`make test-e2e-list`。
+三份登记一致性秒级校验（写完登记立即验证，不必等整轮跑红）：`make test-e2e-check`。
+报告目录修剪（默认 dry-run；`APPLY=1 DAYS=3 KEEP=30` 可调）：`make test-e2e-prune`；
+`APPLY=1 DEDUPE=1` 时额外把各 run 的冻结二进制副本收敛为 `_bin/` 内容寻址硬链接。
 选择未命中、必要环境缺失、skip、aborted、缺报告、硬断言失败均返回非零。
 基础设施用例不要求 LLM key；真实 chat 场景仍需有效模型配置。
 
 每次调用使用唯一 run ID，报告固定写入 `tests-e2e/reports/<run-id>/`。
 `manifest.json` 保存计划，`summary.json` 聚合实际结果；每个 libtest 场景独立进程与目录。
+每个 result 含 `duration_s`（场景墙钟耗时），summary 另含 `total_duration_s` 与
+`slowest_cases` top-N——迭代定位慢场景直接读 summary，不必翻 jsonl 时间戳。
 源码指纹覆盖 tracked 和未忽略的 untracked 文件内容；镜像记录不包含容器环境变量。
+冻结测试二进制按内容寻址存 `reports/_bin/<sha256>/`，run 目录内为硬链接——
+`test_binary_sha256` 仍是实际执行二进制的内容指纹，同源码复跑不再重复占空间
+（历史各轮源码不同则二进制唯一，磁盘回收靠 `make test-e2e-prune` 按龄修剪）。
 独立执行 `cargo test --workspace` 仍采用环境门控，不代表严格 E2E 验收通过。
 
 `hot_contract.py` 使用真实本地 Docker 镜像 `dev-app-runtime:latest`，启动本次 run 标签限定的容器。

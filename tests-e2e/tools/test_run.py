@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import tempfile
 import subprocess
@@ -276,6 +277,84 @@ class ReportTests(unittest.TestCase):
             self.assertTrue(validate_reports(path.parent))
             path.write_text(end + '\n' + end)
             self.assertTrue(validate_reports(path.parent))
+
+
+
+class CheckRegistryTests(unittest.TestCase):
+    def consistent(self, **overrides):
+        args = dict(
+            catalog={'suite_a': ['case_one', 'case_two']},
+            required={'case_one': set(), 'case_two': set()},
+            identities={'case_one': [{'scenario': 'case_one', 'backend': 'b'}],
+                        'case_two': [{'scenario': 'case_two', 'backend': 'b'}]},
+            groups={'grp': ['suite_a']})
+        args.update(overrides)
+        return run.check_registry(**args)
+
+    def test_consistent_registry_passes(self):
+        self.assertEqual(self.consistent(), [])
+
+    def test_case_missing_from_contracts_or_identities_reports_suite(self):
+        broken_contracts = self.consistent(required={'case_one': set()})
+        self.assertIn('suite_a: incomplete acceptance registration: case_two', broken_contracts)
+        broken_identities = self.consistent(identities={'case_one': [{'scenario': 'case_one', 'backend': 'b'}]})
+        self.assertIn('suite_a: incomplete acceptance registration: case_two', broken_identities)
+
+    def test_duplicate_registration_is_rejected(self):
+        errors = self.consistent(catalog={'suite_a': ['case_one', 'case_one']})
+        self.assertTrue(any('duplicate suite contract' in error for error in errors))
+
+    def test_orphan_contract_or_identity_outside_every_suite(self):
+        errors = self.consistent(required={'case_one': set(), 'case_two': set(), 'ghost': set()})
+        self.assertIn('acceptance contract not in any suite: ghost', errors)
+        errors = self.consistent(identities={'case_one': [{'scenario': 'case_one', 'backend': 'b'}],
+                                             'case_two': [{'scenario': 'case_two', 'backend': 'b'}],
+                                             'ghost': []})
+        self.assertIn('report identity not in any suite: ghost', errors)
+
+    def test_group_referencing_unknown_suite(self):
+        errors = self.consistent(groups={'grp': ['suite_a'], 'other': ['missing_suite']})
+        self.assertIn('group other references unknown suite: missing_suite', errors)
+
+    def test_live_registry_is_consistent(self):
+        self.assertEqual(run.check_registry(), [])
+
+
+class RecentOutcomesTests(unittest.TestCase):
+    def write_summary(self, root, name, results, mtime):
+        run = Path(root) / name
+        run.mkdir()
+        summary = run / 'summary.json'
+        summary.write_text(json.dumps({'results': results}))
+        os.utime(summary, (mtime, mtime))
+
+    def test_newest_summary_wins_and_missing_cases_absent(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_summary(root, 'older',
+                               [{'suite': 's', 'test': 'a', 'verdict': 'fail', 'duration_s': 1.0}], 100)
+            self.write_summary(root, 'newer',
+                               [{'suite': 's', 'test': 'a', 'verdict': 'pass', 'duration_s': 2.5}], 200)
+            outcomes = run.recent_outcomes(root, {('s', 'a'), ('s', 'b')})
+        self.assertEqual(outcomes[('s', 'a')]['verdict'], 'pass')
+        self.assertEqual(outcomes[('s', 'a')]['duration_s'], 2.5)
+        self.assertNotIn(('s', 'b'), outcomes)
+
+    def test_private_dirs_and_manifest_only_runs_are_ignored(self):
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / '_bin').mkdir()
+            (Path(root) / 'partial').mkdir()
+            (Path(root) / 'partial' / 'manifest.json').write_text('{}')
+            outcomes = run.recent_outcomes(root, {('s', 'a')})
+        self.assertEqual(outcomes, {})
+
+    def test_scan_budget_stops_before_exhausting_history(self):
+        with tempfile.TemporaryDirectory() as root:
+            for index in range(5):
+                self.write_summary(root, f'r{index}',
+                                   [{'suite': 's', 'test': 'a', 'verdict': 'pass'}], 100 + index)
+            outcomes = run.recent_outcomes(root, {('s', 'a')}, scan_limit=2)
+        self.assertEqual(outcomes[('s', 'a')]['run_id'], 'r4')
+
 
 if __name__ == '__main__':
     unittest.main()

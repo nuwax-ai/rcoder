@@ -64,6 +64,102 @@ def select_registered_cases(suite, discovered, case_filter='', *, catalog=None,
     return sorted(expected)
 
 
+def check_registry(catalog=None, required=None, identities=None, groups=None):
+    """Static three-registration consistency check (suite_cases / contracts /
+    report identities + GROUPS references). Runs in milliseconds; catches
+    registration drift at write time instead of mid acceptance run."""
+    root = Path(__file__).parent
+    catalog = catalog if catalog is not None else json.loads(
+        (root / 'suite_cases.json').read_text())
+    required = required if required is not None else REQUIRED
+    identities = identities if identities is not None else json.loads(
+        (root / 'report_identities.json').read_text())
+    groups = groups if groups is not None else GROUPS
+    errors = []
+    for suite, registered in catalog.items():
+        if not registered:
+            errors.append(f'suite contract is empty: {suite}')
+            continue
+        # discovered=registered：单套件内部的自洽（必经断言 + 报告身份 + 去重）
+        try:
+            select_registered_cases(suite, registered, catalog=catalog,
+                                    required=required, identities=identities)
+        except ValueError as error:
+            errors.append(f'{suite}: {error}')
+    catalog_cases = {name for names in catalog.values() for name in names}
+    for name in required:
+        if name not in catalog_cases:
+            errors.append(f'acceptance contract not in any suite: {name}')
+    for name in identities:
+        if name not in catalog_cases:
+            errors.append(f'report identity not in any suite: {name}')
+    for group, suites in groups.items():
+        for suite in suites:
+            if suite not in catalog:
+                errors.append(f'group {group} references unknown suite: {suite}')
+    return errors
+
+
+def recent_outcomes(reports_root, wanted, scan_limit=200):
+    """Last verdict/duration per (suite, test) from newest summaries.
+
+    Scans newest-first and stops once every wanted case has an outcome or the
+    scan budget is spent; missing cases map to None instead of forcing a full
+    historical sweep of every archived run.
+    """
+    outcomes = {}
+    root = Path(reports_root)
+    if not root.is_dir():
+        return outcomes
+    candidates = []
+    for entry in root.iterdir():
+        if not entry.is_dir() or entry.name.startswith('_'):
+            continue
+        summary = entry / 'summary.json'
+        marker = summary if summary.exists() else entry / 'manifest.json'
+        if marker.exists():
+            candidates.append((marker.stat().st_mtime, entry))
+    candidates.sort(reverse=True)
+    for _mtime, entry in candidates[:scan_limit]:
+        summary = entry / 'summary.json'
+        if not summary.exists():
+            continue
+        try:
+            rows = json.loads(summary.read_text()).get('results') or []
+        except (OSError, ValueError):
+            continue
+        for row in rows:
+            key = (row.get('suite'), row.get('test'))
+            if key in wanted and key not in outcomes:
+                outcomes[key] = {
+                    'verdict': row.get('verdict'),
+                    'duration_s': row.get('duration_s'),
+                    'run_id': entry.name,
+                }
+        if all(key in outcomes for key in wanted):
+            break
+    return outcomes
+
+
+def print_case_listing(catalog, groups, outcomes):
+    """Suite→case listing for --list, newest group order preserved."""
+    order = {suite: index for index, suites in enumerate(groups.values()) for suite in suites}
+    for suite in sorted(catalog, key=lambda name: (order.get(name, len(order)), name)):
+        if suite in order:
+            group = next(g for g, suites in groups.items() if suite in suites)
+            print(f'[{group}] {suite}')
+        else:
+            print(f'[unlisted] {suite}')
+        for name in catalog[suite]:
+            last = outcomes.get((suite, name))
+            if last:
+                duration = last.get('duration_s')
+                duration_text = f"{duration:6.1f}s " if isinstance(duration, (int, float)) else '   -    '
+                print(f'    {duration_text} {str(last.get("verdict") or "-"):5s}  {name}')
+            else:
+                print(f'        -        {name}')
+
+
 def validate_reports(directory, scenario=None, run_id=None, case_id=None):
     files = list(directory.glob('*.jsonl'))
     errors = []
@@ -284,7 +380,29 @@ def main():
     parser.add_argument('--filter', default=os.environ.get('E2E_FILTER', ''))
     parser.add_argument('--ignored', action='store_true')
     parser.add_argument('--remote-k8s', action='store_true', help='Dedicated owned namespace; no Docker inventory or cleanup')
+    parser.add_argument('--list', action='store_true',
+                        help='Print suite→case registry with last verdict/duration; no run started')
+    parser.add_argument('--check-registry', action='store_true',
+                        help='Validate the three registrations are mutually consistent; no run started')
     args = parser.parse_args()
+    if args.list or args.check_registry:
+        catalog = json.loads(Path(__file__).with_name('suite_cases.json').read_text())
+        if args.check_registry:
+            registry_errors = check_registry(catalog=catalog)
+            if registry_errors:
+                print('REGISTRY DRIFT:', file=sys.stderr)
+                for error in registry_errors:
+                    print(f'  {error}', file=sys.stderr)
+                return 2
+            print(f'registry OK: {len(catalog)} suites / '
+                  f'{sum(len(v) for v in catalog.values())} cases consistent')
+            if not args.list:
+                return 0
+        if args.list:
+            wanted = {(suite, name) for suite, names in catalog.items() for name in names}
+            outcomes = recent_outcomes(RUN_ROOT, wanted)
+            print_case_listing(catalog, GROUPS, outcomes)
+            return 0
     if args.remote_k8s:
         if args.group != 'k8s':
             parser.error('--remote-k8s requires --group k8s')
@@ -297,6 +415,7 @@ def main():
     if args.remote_k8s and any(s not in GROUPS['k8s'] for s in suites):
         parser.error('--remote-k8s only accepts K8s suites')
     run_id = uuid.uuid4().hex
+    run_started = time.monotonic()
     run = RUN_ROOT / run_id
     run.mkdir(parents=True)
     env = dict(os.environ, E2E_RUN_ID=run_id, E2E_STRICT='1')
@@ -311,7 +430,15 @@ def main():
     def persist():
         completed = {(row['suite'], row['test']) for row in manifest['results']}
         unfinished = [{**case, 'verdict': 'aborted', 'errors': ['no completed process result']} for case in manifest['planned'] if (case['suite'], case['test']) not in completed]
-        snapshot = {**manifest, 'results': manifest['results'] + unfinished}
+        # 迭代定位瓶颈的基础数据：每 case 墙钟耗时随结果落盘，快照层聚合
+        # 总耗时与 top-N 慢场景（abort 未完成的 case 无 duration_s，跳过）
+        timed = [(row['test'], row['suite'], row['duration_s']) for row in manifest['results'] if isinstance(row.get('duration_s'), (int, float))]
+        snapshot = {**manifest,
+                    'results': manifest['results'] + unfinished,
+                    'total_duration_s': round(time.monotonic() - run_started, 1),
+                    'slowest_cases': sorted(
+                        ({'test': t, 'suite': s, 'duration_s': d} for t, s, d in timed),
+                        key=lambda row: row['duration_s'], reverse=True)[:5]}
         (run / 'summary.json').write_text(json.dumps(snapshot, indent=2))
     atexit.register(persist)
     persist()
@@ -337,11 +464,30 @@ def main():
         event = json.loads(line)
         if event.get('reason') == 'compiler-artifact' and event.get('executable'):
             name = event['target']['name']
+            # 内容寻址共享：二进制按 sha256 存 RUN_ROOT/_bin/<sha>/，各 run
+            # 目录内放硬链接——同源码多轮 run 不再各留一份 150MB+ 副本
+            # （938 轮曾累积 32.6GB）。证据语义不变：test_binary_sha256 仍是
+            # 实际执行二进制的内容指纹，冻结副本内容逐字节一致。
+            digest = hashlib.sha256()
+            with open(event['executable'], 'rb') as binary:
+                for chunk in iter(lambda: binary.read(1 << 20), b''):
+                    digest.update(chunk)
+            sha = digest.hexdigest()
+            canonical_dir = RUN_ROOT / '_bin' / sha
+            canonical = canonical_dir / name
+            if not canonical.exists():
+                canonical_dir.mkdir(parents=True, exist_ok=True)
+                staging = canonical_dir / f'.{name}.{run_id}.tmp'
+                shutil.copy2(event['executable'], staging)
+                os.replace(staging, canonical)
             frozen = run / 'bin' / name
             frozen.parent.mkdir(exist_ok=True)
-            shutil.copy2(event['executable'], frozen)
+            try:
+                os.link(canonical, frozen)
+            except OSError:
+                shutil.copy2(canonical, frozen)
             executables[name] = str(frozen)
-            manifest.setdefault('test_binary_sha256', {})[name] = hashlib.sha256(frozen.read_bytes()).hexdigest()
+            manifest.setdefault('test_binary_sha256', {})[name] = sha
     for suite in suites:
         executable = executables[suite]
         listing = subprocess.check_output([executable, '--list', '--format=terse'], text=True)
@@ -369,6 +515,7 @@ def main():
     for case in manifest['planned']:
         case_dir = run / case['suite'] / case['test']
         case_dir.mkdir(parents=True)
+        case_started = time.monotonic()
         case_id = uuid.uuid4().hex
         case['case_id'] = case_id
         persist()
@@ -398,7 +545,8 @@ def main():
         if exit_code:
             errors.append(f'libtest exit {exit_code}')
         verdict = 'fail' if errors else 'pass'
-        manifest['results'].append({**case, 'verdict': verdict, 'errors': errors})
+        manifest['results'].append({**case, 'verdict': verdict, 'errors': errors,
+                                    'duration_s': round(time.monotonic() - case_started, 1)})
         persist()
         print(f'{verdict}: {case["suite"]}::{case["test"]}', flush=True)
         if interrupted:

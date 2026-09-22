@@ -85,3 +85,17 @@ test-e2e-host-direct:
 .PHONY: test-e2e-host-k8s
 test-e2e-host-k8s:
 	python3 tests-e2e/tools/run.py --group host_k8s
+
+# e2e 可用性辅助：场景清单（含最近一次 verdict/耗时）/ 三份登记一致性秒级校验
+.PHONY: test-e2e-list test-e2e-check
+test-e2e-list:
+	python3 tests-e2e/tools/run.py --list
+test-e2e-check:
+	python3 tests-e2e/tools/run.py --check-registry
+
+# e2e 报告目录修剪：默认 dry-run 只列清单；APPLY=1 执行删除。
+# DAYS/KEEP 可覆盖（默认 14 天 / 至少保留 30 个最新 run）；DEDUPE=1 额外把
+# 各 run 的 bin/ 副本收敛为 _bin/ 内容寻址硬链接；_bin 按剩余 run 引用 GC。
+.PHONY: test-e2e-prune
+test-e2e-prune:
+	python3 tests-e2e/tools/prune_reports.py --days "$${DAYS:-14}" --keep "$${KEEP:-30}" $(if $(APPLY),--apply) $(if $(DEDUPE),--dedupe)
