@@ -46,9 +46,11 @@ rcoder（转 SSE）
 
 - 正文与思考：`agent_message_chunk`、`agent_thought_chunk`
 - 工具：`tool_call`、`tool_call_update`
-- 回合结束：`end_turn`、`cancelled`、`error`、`refusal`
+- 回合结束：`end_turn`、`error`、`cancelled`、`refusal`、`stream_ended`（rcoder 合成的关流信号）
 - 状态同步：`usage_update`、`session_info_update`、`available_commands_update`、`current_mode_update`、`config_option_update`、`max_turn_requests`
 - 保活：`ping`
+
+回合终态（end_turn / error / stream_ended）后服务端关闭流；`cancelled` 是正常终止而非连接错误。
 
 ## 断线续传
 
@@ -57,7 +59,7 @@ rcoder（转 SSE）
 - 每条 SSE 消息带 `id:<seq>`，从 0 递增。
 - 客户端断线重连时携带 `Last-Event-ID` 请求头，服务端从该序号之后增量重放，不丢事件、不重复。
 - agent 侧重启会重置事件流（`cursor_reset`/`StreamReset` 类事件），客户端应整体重建展示状态。
-- 回合结束（end_turn 等）后服务端关闭流；`cancelled` 不等于连接错误。
+- 回合终态关流后重连不会得到新事件；新一轮对话需要新的订阅。
 
 ## 会话控制
 

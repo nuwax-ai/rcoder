@@ -90,7 +90,7 @@ UnifiedSessionMessage
 SSE Event（外部 HTTP SSE）
 ```
 
-外部 SSE 事件名与 oneof 分支一一对应（`log` / `thinking` / `chunk` / `completion` / `error` / `ask_confirmation` / `progress_notification` / `tool_use`），无事件的流间隙以 comment heartbeat 保活。
+SSE 桥接以统一消息的**子类型（sub_type）作为事件名**（如 `agent_message_chunk`、`tool_call`），前端按 sub_type 监听；事件信封结构与断线续传见[会话与 SSE](../concepts/agent-sessions.md)。
 
 ## 连接池（GrpcChannelPool）
 

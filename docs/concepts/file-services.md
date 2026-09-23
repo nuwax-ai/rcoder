@@ -12,7 +12,7 @@ file-server 的接口按域组织（路由组装在 `crates/file-server/src/rout
 | `/api/git` | Git 域：读（分支/标签/日志/文件内容/状态）+ 写（init/add/commit/discard/diff/reset/checkout/revert）+ 引用管理 |
 | `/api/build` | 构建与开发服务：dev server 生命周期（start/stop/restart/list/keep-alive）、构建执行、构建错误解析、日志获取 |
 | `/api/computer` | Computer Agent 工作区：文件浏览/检索/执行命令/包管理/归档下载/workspace 创建与模板初始化/静态托管 |
-| `/api/page/static` | 预览页静态文件服务 |
+| `/api/page` | 预览页静态文件服务 |
 
 UserApp 专属域拆分在独立 crate `file-server-userapp`（`/api/v1/userapp/*` 子树）：UserApp 构建任务（含 SSE 事件流与取消）、文件族、dev server 管理、日志查询/流、构建制品下载——详见[UserApp 应用管理](userapp.md)。
 

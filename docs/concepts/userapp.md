@@ -42,7 +42,7 @@ dev 与 prod 各有独立的存储：删除 prod 运行容器默认保留数据�
 
 ## 访问方式
 
-- **路径代理**（内置）：`GET /proxy/app/{stage}/{user_id}/{app_id}/{*path}` 经 Pingora 反向代理直达应用，`stage` 区分 dev/prod。
+- **路径代理**（内置，两种形态同一路由契约）：真实流量走 Pingora 数据面 `GET /proxy/app/{stage}/{user_id}/{app_id}/{*path}`（`stage` 区分 dev/prod，prod 流量会触发唤醒）；HTTP API 侧登记的文档接口为 `/api/v1/userapp/proxy/app/...` 同形态。
 - **子域名**：由外部网关/前端层实现（host → app 解析后转发到 rcoder 的代理路径），rcoder 后端本身是路径代理。
 - dev 环境支持开发模式（Vite 等热更新预览），构建期间的日志与事件可实时获取。
 
@@ -58,7 +58,7 @@ dev 与 prod 各有独立的存储：删除 prod 运行容器默认保留数据�
 | `POST /{app_id}/delete/app` | 彻底删除：dev+prod 容器、两侧 PVC 与元数据一步收敛（幂等） |
 | `GET /{app_id}/{app_stage}/storage` 等存储族 | 存储查询/清空/销毁 |
 | `POST /{app_id}/{app_stage}/upload` 等文件族 | 文件上传/列表/删除 |
-| `GET /proxy/app/{stage}/{user_id}/{app_id}/{*path}` | Pingora 应用访问代理 |
+| `GET /api/v1/userapp/proxy/app/{stage}/{user_id}/{app_id}/{*path}` | 应用访问代理（文档接口；数据面见下） |
 
 ## 相关文档
 
