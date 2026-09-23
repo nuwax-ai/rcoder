@@ -12,9 +12,14 @@
 ### 业务概念
 
 - [UserApp 应用管理](concepts/userapp.md) —— dev/prod 双环境、构建发布链、闲置回收与流量唤醒、存储与删除语义
+- [会话与 SSE 进度流](concepts/agent-sessions.md) —— chat 主链、事件信封结构、断线续传、Computer Agent 会话
+- [权限审批](concepts/permissions.md) —— 决策链、审批事件流转、tool_approval_rules 配置、yolo 语义
+- [文件服务（file-server）](concepts/file-services.md) —— 五个能力域、三种消费形态、workspace manifest 两级模型
 
 ### 部署形态
 
+- [Docker Compose 形态](deployment/docker.md) —— 本地开发推荐：dev-hot 秒级热编译、可观测栈常开
+- [Kubernetes 形态](deployment/kubernetes.md) —— STS + PVC 资源模型、devspace 本地开发、生产部署要点
 - [宿主机单机形态（deploy-host）](deployment/host.md) —— 控制平面直接跑在宿主机，"有 Docker 就能跑"的桌面基座形态
 
 ### 运维与排障

@@ -23,8 +23,8 @@ RCoder 是一个基于 Rust 构建的现代化 AI 驱动开发平台，通过 **
 
 - [架构总览](docs/architecture/overview.md) —— 主链路、核心组件、crate 地图与三种部署形态
 - [gRPC 内部通信](docs/architecture/grpc.md)
-- [UserApp 应用管理](docs/concepts/userapp.md)
-- [宿主机单机形态（deploy-host）](docs/deployment/host.md)
+- 业务概念：[UserApp 应用管理](docs/concepts/userapp.md) · [会话与 SSE](docs/concepts/agent-sessions.md) · [权限审批](docs/concepts/permissions.md) · [文件服务](docs/concepts/file-services.md)
+- 部署形态：[Docker Compose](docs/deployment/docker.md) · [Kubernetes](docs/deployment/kubernetes.md) · [宿主机单机 deploy-host](docs/deployment/host.md)
 - [可观测性指南](docs/observability.md)
 
 ## 🏠 架构概览
@@ -150,65 +150,16 @@ cargo run --bin rcoder -- --help
 
 ## 📚 API 文档
 
-启动后访问 Swagger UI（`/api/docs`，主文档 + file-server 双面）或 Scalar 文档查看全部接口。以下为代表性端点。
+接口的**权威定义**是运行时自动生成的 OpenAPI 文档：启动服务后访问 `/api/docs`（Swagger UI 与 Scalar 双面，含主文档与 file-server 双文档），全部端点的参数、响应与错误契约都在其中。
 
-### 🏥 核心端点
+核心入口（各域概念见文档）：
 
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/health` | GET | 健康检查 |
-| `/chat` | POST | 发送聊天消息给 AI 代理 |
-| `/agent/progress/{session_id}` | GET (SSE) | 获取实时进度流 |
-| `/agent/session/cancel` | POST | 取消正在执行的任务 |
-| `/agent/stop` | POST | 停止 Agent |
-| `/agent/status/{project_id}` | GET | 查询 Agent 状态 |
-| `/api/docs` | GET | Swagger UI API 文档 |
-
-### 📦 UserApp 应用管理（`/api/v1/userapp/*`）
-
-UserApp 是面向用户的应用托管面，每个 app 具备 **dev 开发环境**（UserappBuilder 容器，常驻自愈）与 **prod 运行环境**（Deployment + per-app PVC）：
-
-| 端点（节选） | 说明 |
+| 入口 | 域 |
 |------|------|
-| `POST /{app_id}/start` | 部署/启动应用（url 部署自动创建） |
-| `POST /{app_id}/stop` / `restart` | 停止（scale-to-zero，支持流量唤醒）/ 重启 |
-| `POST /{app_id}/{app_stage}/delete` | 删除 prod 运行容器（默认保留存储，purge=true 连数据面） |
-| `POST /{app_id}/delete/app` | **彻底删除**：dev+prod 容器、两侧 PVC 与元数据一步收敛（幂等） |
-| `GET /{app_id}/{app_stage}/storage` 等存储族 | 存储查询/清空/销毁 |
-| `POST /{app_id}/{app_stage}/upload` 等文件族 | 文件上传/列表/删除 |
-| `GET /proxy/app/{stage}/{user_id}/{app_id}/{*path}` | Pingora 应用访问代理 |
-
-配套工具链：`app-cli`（应用构建 CLI，npm 分发 `@nuwax-ai/app-cli`）、`file-server`（文件/构建服务，npm 分发 `@nuwax-ai/file-server`）。闲置应用自动回收（scale-to-zero），可配置流量自动唤醒。
-
-### 🖥️ Computer Agent 端点
-
-Computer Agent 提供容器化的 AI 代理环境，支持 VNC 远程桌面、音频流和 IME 输入。每个用户对应独立的容器/Pod，多个项目可共享。
-
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/computer/chat` | POST | 发送聊天消息到 Computer Agent |
-| `/computer/progress/{session_id}` | GET (SSE) | 获取实时进度流 |
-| `/computer/agent/stop` | POST | 停止指定项目的 Agent（不销毁容器） |
-| `/computer/agent/status` | POST | 查询 Agent 状态（alive/idle/busy） |
-| `/computer/agent/session/cancel` | POST | 取消正在执行的会话 |
-| `/computer/pod/ensure` | POST | 确保容器/Pod 存在（幂等） |
-| `/computer/pod/list` / `count` / `restart` | GET/POST | 容器管理 |
-| `/computer/vnc/{user_id}/{project_id}/{*path}` | GET | VNC/noVNC 桌面代理 |
-| `/computer/audio/...`、`/computer/ime/...` | GET | 音频流 / 输入法代理 |
-
-### gRPC 服务（Agent Runner，proto 见 `crates/shared_types_grpc/proto/agent.proto`）
-
-| 方法 | 类型 | 说明 |
-|------|------|------|
-| `Chat` | Unary | 发送聊天请求 |
-| `SubscribeProgress` | Server Streaming | 订阅进度事件流 |
-| `CancelSession` | Unary | 取消会话任务 |
-| `ResolvePermission` | Unary | 权限请求裁决 |
-| `GetStatus` | Unary | 查询 Agent 状态 |
-| `StopAgent` | Unary | 停止 Agent |
-| `GetContainerStatus` / `GetVncStatus` | Unary | 容器 / VNC 状态 |
-| `ListAgents` / `GetAgent` / `CheckAgent` | Unary | Agent 清单与探测 |
-| `InstallAgent` / `UninstallAgent` | Streaming/Unary | Agent 安装/卸载 |
+| `POST /chat` + `GET /agent/progress/{session_id}` (SSE) | AI 会话主链（[会话与 SSE](docs/concepts/agent-sessions.md)） |
+| `/api/v1/userapp/*` | UserApp 应用管理（[概念](docs/concepts/userapp.md)） |
+| `/computer/*` | Computer Agent：VNC/音频/IME 容器化代理环境 |
+| gRPC `AgentService` | rcoder ↔ agent_runner 内部通信（[gRPC](docs/architecture/grpc.md)），proto 在 `crates/shared_types_grpc/proto/agent.proto` |
 
 ### 💬 使用示例
 
@@ -377,41 +328,21 @@ RUST_LOG=debug cargo run --bin rcoder -- --port 8087
 
 ## 🚀 部署指南
 
-### Docker 镜像
+三种部署形态的完整说明见文档：[Docker Compose](docs/deployment/docker.md)（本地推荐，含 dev-hot 秒级热编译）、[Kubernetes](docs/deployment/kubernetes.md)（生产：Agent Runner 为 STS + per-agent PVC 停止不删卷、OOM 容器级自愈；UserApp prod 为 Deployment + per-app PVC）、[宿主机单机 deploy-host](docs/deployment/host.md)（有 Docker 就能跑的桌面基座形态）。
 
 ```bash
-make docker-build                 # 全量
-make docker-build-master          # 主服务镜像
-make docker-build-agent-runner    # Agent Runner 镜像
+# 镜像构建
+make docker-build                  # 全量
+make docker-build-master           # 主服务镜像
+make docker-build-agent-runner     # Agent Runner 镜像
 make docker-build-agent-production # 生产镜像（无调试工具）
-make docker-build-app-runtime     # UserApp 运行时镜像（统一 5 语言）
-```
+make docker-build-app-runtime      # UserApp 运行时镜像（统一多语言）
 
-### Kubernetes
-
-K8s 模式核心概念：
-
-- **Agent Runner**：StatefulSet（STS）+ per-agent PVC（**停止不删 PVC**，数据复用下次重建挂回；OOM 自动容器级重启自愈）
-- **UserApp prod**：Deployment + per-app PVC（删除默认保留存储，销毁走显式接口）
-- **dev 开发环境**：UserappBuilder STS，空闲自动回收
-- 本地集群用 devspace（Envoy Gateway），生产用 Cilium 网关
-
-```bash
 # 本地 K8s 开发
 make devspace-dev
-
-# 生产部署（Helm，配置见独立部署仓库）
 ```
 
-### dial9 事件级 Tokio tracing
-
-```bash
-make dial9-on         # 启用记录（trace 落 docker/logs/dial9）
-make dial9-off        # 关闭（默认关，零开销）
-make dial9-view       # 单二进制离线 viewer
-```
-
-详见 [docs/observability.md](docs/observability.md)。
+性能诊断（dial9 事件级 Tokio tracing）：`make dial9-on` / `dial9-off` / `dial9-view`，详见[可观测性指南](docs/observability.md)。
 
 ## 🐛 问题排查
 

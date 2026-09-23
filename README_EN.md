@@ -23,8 +23,8 @@ Full documentation lives in [docs/](docs/README.md):
 
 - [Architecture Overview](docs/architecture/overview.md) - main request chain, core components, crate map, deployment forms
 - [gRPC Internal Communication](docs/architecture/grpc.md)
-- [UserApp Application Management](docs/concepts/userapp.md)
-- [Host Machine Form (deploy-host)](docs/deployment/host.md)
+- Concepts: [UserApp Management](docs/concepts/userapp.md) · [Sessions & SSE](docs/concepts/agent-sessions.md) · [Permission Approval](docs/concepts/permissions.md) · [File Services](docs/concepts/file-services.md)
+- Deployment: [Docker Compose](docs/deployment/docker.md) · [Kubernetes](docs/deployment/kubernetes.md) · [Host Machine (deploy-host)](docs/deployment/host.md)
 - [Observability Guide](docs/observability.md)
 
 ## 🏠 Architecture Overview
@@ -150,65 +150,16 @@ cargo run --bin rcoder -- --help
 
 ## 📚 API Reference
 
-After startup, visit Swagger UI (`/api/docs`, main docs + file-server dual view) or the Scalar docs for the full API. Representative endpoints below.
+The **authoritative** API definition is the runtime-generated OpenAPI documentation: after startup, visit `/api/docs` (Swagger UI and Scalar views, main + file-server docs) for the full contract of every endpoint.
 
-### 🏥 Core Endpoints
+Core entry points (see the concept docs for each domain):
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/chat` | POST | Send a chat message to the AI agent |
-| `/agent/progress/{session_id}` | GET (SSE) | Real-time progress stream |
-| `/agent/session/cancel` | POST | Cancel a running task |
-| `/agent/stop` | POST | Stop the Agent |
-| `/agent/status/{project_id}` | GET | Query Agent status |
-| `/api/docs` | GET | Swagger UI API documentation |
-
-### 📦 UserApp Management (`/api/v1/userapp/*`)
-
-UserApp is the user-facing application hosting surface. Each app has a **dev environment** (UserappBuilder container, self-healing) and a **prod environment** (Deployment + per-app PVC):
-
-| Endpoint (selection) | Description |
-|------|------|
-| `POST /{app_id}/start` | Deploy/start an app (auto-created on URL deployment) |
-| `POST /{app_id}/stop` / `restart` | Stop (scale-to-zero, supports traffic-based wake-up) / restart |
-| `POST /{app_id}/{app_stage}/delete` | Delete the prod runtime container (storage kept by default; `purge=true` includes the data plane) |
-| `POST /{app_id}/delete/app` | **Full deletion**: dev+prod containers, both PVCs and metadata converge in one step (idempotent) |
-| `GET /{app_id}/{app_stage}/storage` etc. | Storage query/clear/destroy |
-| `POST /{app_id}/{app_stage}/upload` etc. | File upload/list/delete |
-| `GET /proxy/app/{stage}/{user_id}/{app_id}/{*path}` | Pingora application access proxy |
-
-Toolchain: `app-cli` (build CLI, distributed on npm as `@nuwax-ai/app-cli`), `file-server` (file/build service, `@nuwax-ai/file-server`). Idle apps are recycled automatically (scale-to-zero) with configurable traffic-based wake-up.
-
-### 🖥️ Computer Agent Endpoints
-
-Computer Agent provides a containerized AI agent environment with VNC remote desktop, audio streaming, and IME input. Each user gets a dedicated container/Pod, shared across projects.
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/computer/chat` | POST | Send a chat message to the Computer Agent |
-| `/computer/progress/{session_id}` | GET (SSE) | Real-time progress stream |
-| `/computer/agent/stop` | POST | Stop the Agent for a project (container stays alive) |
-| `/computer/agent/status` | POST | Query Agent status (alive/idle/busy) |
-| `/computer/agent/session/cancel` | POST | Cancel a running session |
-| `/computer/pod/ensure` | POST | Ensure container/Pod exists (idempotent) |
-| `/computer/pod/list` / `count` / `restart` | GET/POST | Container management |
-| `/computer/vnc/{user_id}/{project_id}/{*path}` | GET | VNC/noVNC desktop proxy |
-| `/computer/audio/...`, `/computer/ime/...` | GET | Audio stream / IME proxies |
-
-### gRPC Services (Agent Runner, proto at `crates/shared_types_grpc/proto/agent.proto`)
-
-| Method | Type | Description |
-|--------|------|-------------|
-| `Chat` | Unary | Send a chat request |
-| `SubscribeProgress` | Server Streaming | Subscribe to progress events |
-| `CancelSession` | Unary | Cancel a session task |
-| `ResolvePermission` | Unary | Permission request resolution |
-| `GetStatus` | Unary | Query Agent status |
-| `StopAgent` | Unary | Stop the Agent |
-| `GetContainerStatus` / `GetVncStatus` | Unary | Container / VNC status |
-| `ListAgents` / `GetAgent` / `CheckAgent` | Unary | Agent listing and probing |
-| `InstallAgent` / `UninstallAgent` | Streaming/Unary | Agent install/uninstall |
+| Entry | Domain |
+|--------|--------|
+| `POST /chat` + `GET /agent/progress/{session_id}` (SSE) | AI session main chain ([Sessions & SSE](docs/concepts/agent-sessions.md)) |
+| `/api/v1/userapp/*` | UserApp management ([concepts](docs/concepts/userapp.md)) |
+| `/computer/*` | Computer Agent: VNC/audio/IME containerized environment |
+| gRPC `AgentService` | rcoder ↔ agent_runner internal communication ([gRPC](docs/architecture/grpc.md)); proto at `crates/shared_types_grpc/proto/agent.proto` |
 
 ### 💬 Usage Examples
 
@@ -374,41 +325,21 @@ RUST_LOG=debug cargo run --bin rcoder -- --port 8087
 
 ## 🚀 Deployment
 
-### Docker Images
+Full guides for the three deployment forms: [Docker Compose](docs/deployment/docker.md) (recommended locally, incl. `dev-hot` hot recompile), [Kubernetes](docs/deployment/kubernetes.md) (production: Agent Runner as STS + per-agent PVC — stopping never deletes the volume, OOM self-heals at container level; UserApp prod as Deployment + per-app PVC), [Host machine deploy-host](docs/deployment/host.md) (single-machine desktop base form).
 
 ```bash
-make docker-build                 # Full
-make docker-build-master          # Main service image
-make docker-build-agent-runner    # Agent Runner image
+# Image builds
+make docker-build                  # Full
+make docker-build-master           # Main service image
+make docker-build-agent-runner     # Agent Runner image
 make docker-build-agent-production # Production image (no debug tools)
-make docker-build-app-runtime     # UserApp runtime image (5 languages unified)
-```
+make docker-build-app-runtime      # UserApp runtime image (multi-language unified)
 
-### Kubernetes
-
-Key K8s concepts:
-
-- **Agent Runner**: StatefulSet (STS) + per-agent PVC (**stopping never deletes the PVC**; data is reused on rebuild; OOM triggers container-level restart self-healing)
-- **UserApp prod**: Deployment + per-app PVC (deletion keeps storage by default; destruction goes through an explicit interface)
-- **dev environment**: UserappBuilder STS, idle auto-reclaim
-- Local clusters use devspace (Envoy Gateway); production uses Cilium networking
-
-```bash
 # Local K8s development
 make devspace-dev
-
-# Production deployment (Helm; see the separate deployment repository)
 ```
 
-### dial9 Event-level Tokio Tracing
-
-```bash
-make dial9-on         # Enable recording (traces land in docker/logs/dial9)
-make dial9-off        # Disable (off by default, zero overhead)
-make dial9-view       # Single-binary offline viewer
-```
-
-See the [Observability Guide](docs/observability.md).
+For performance diagnostics (dial9 event-level Tokio tracing): `make dial9-on` / `dial9-off` / `dial9-view` — see the [Observability Guide](docs/observability.md).
 
 ## 🐛 Troubleshooting
 
