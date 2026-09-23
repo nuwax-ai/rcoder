@@ -127,6 +127,7 @@ cargo nextest run --manifest-path crates/app-cli/Cargo.toml --no-fail-fast --all
 | 远端全部套件 | `make remote-k8s-verify SUITE=all` |
 
 - K8s 默认使用远端工作流；原 DevSpace 与 `test-e2e-k8s` 入口保留。先读 [远端 K8s 使用说明](specs/remote-k8s-dev/README.md)，工具版本、资源预算、同步/构建/诊断步骤以该文档及配置为准。
+- `specs/` 是仅本地保留的内部工作目录（spec/plan/tasks/verification、问题记录等，已 gitignore，不随开源仓库发布）：本地开发照常读写；对公众可见的说明一律放 `docs/`。
 - 复用未提交的 `.env.local`，缺项参考 [配置示例](tools/remote_k8s/env.example)，不覆盖已有无关配置。主机、目录、context、namespace、registry、访问地址从配置读取；不把真实凭据写入源码、文档或日志。
 - `remote-k8s-verify` 校验并构建当前源码、部署后测试；`remote-k8s-test` 仅测试已部署版本，不能证明本地新修改有效。同步不会自动构建或部署；远端接收目录不是编辑源。
 - 同一环境构建、部署、测试串行；测试时不替换被测部署。`userapp/chat/all` 期间保持本地源码稳定，遵守启动器的源码漂移检查。

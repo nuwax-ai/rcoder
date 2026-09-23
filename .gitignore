@@ -65,3 +65,7 @@ target-tssync/
 target-check/
 /target-appcli/
 target_DIR_PLACEHOLDER/
+
+# 内部工作文档（spec/plan/tasks/verification、问题记录、handoff 等）仅本地保留，不随仓库发布。
+# 位置仍为 ./specs/，本地开发流程不变；新文件不会误提交。
+/specs/
