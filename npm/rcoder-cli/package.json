@@ -22,7 +22,7 @@
     "x64",
     "arm64"
   ],
-  "license": "MIT",
+  "license": "Apache-2.0",
   "homepage": "https://github.com/nuwax-ai/rcoder",
   "keywords": [
     "rcoder",

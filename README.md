@@ -17,6 +17,16 @@ RCoder 是一个基于 Rust 构建的现代化 AI 驱动开发平台，通过 **
 - 📊 **可观测性**：Tracing + OpenTelemetry 链路追踪 + dial9 事件级 Tokio tracing
 - 🔒 **安全红线**：workspace 级 lint 禁止 `unsafe` 代码、禁止 `unwrap/expect` 进生产路径
 
+## 📚 文档
+
+完整文档见 [docs/](docs/README.md)：
+
+- [架构总览](docs/architecture/overview.md) —— 主链路、核心组件、crate 地图与三种部署形态
+- [gRPC 内部通信](docs/architecture/grpc.md)
+- [UserApp 应用管理](docs/concepts/userapp.md)
+- [宿主机单机形态（deploy-host）](docs/deployment/host.md)
+- [可观测性指南](docs/observability.md)
+
 ## 🏠 架构概览
 
 ### 整体架构
@@ -455,6 +465,8 @@ cargo run -p rcoder-cli
 本项目采用 Apache-2.0 许可证。详见 [LICENSE](LICENSE) 文件。
 
 ## 🤝 贡献
+
+欢迎贡献！参与方式见 [CONTRIBUTING.md](CONTRIBUTING.md)，安全漏洞报告见 [SECURITY.md](SECURITY.md)。
 
 1. Fork 项目
 2. 创建特性分支 (`git checkout -b feature/amazing-feature`)
