@@ -110,10 +110,8 @@ impl AppService {
                     return Err(error);
                 }
             }
-            if previous.replicas == 0
-                && let Some(wake) = policy.wake_on_traffic
-            {
-                self.restore_activity_state(app_id, &previous, wake);
+            if previous.replicas == 0 {
+                self.restore_activity_state(app_id, &previous);
             }
             self.invalidate_deploy_cache().await;
             self.get_app(app_id).await

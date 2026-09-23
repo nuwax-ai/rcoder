@@ -71,7 +71,8 @@ pub struct AppActivityRegistry {
     pub(super) last_accessed: DashMap<String, DateTime<Utc>>,
     /// app_id → 已 stopped(scale0)标记;stop/start/wake/重启重建 共同维护
     pub(super) stopped: DashSet<String>,
-    /// app_id → 用户主动停止或发布切换中的应用；流量不得自动唤醒。
+    /// app_id → 删除围栏中的应用（待清理/对账）；流量不得唤醒。
+    /// 拍板 2026-09-23 统一唤醒语义后，手动停止不再进入本集合。
     pub(super) wake_blocked: DashSet<String>,
     /// app_id → 待持久化脏行(flusher 周期 collect_dirty 落库)
     pub(super) dirty: DashSet<String>,
@@ -152,31 +153,23 @@ impl AppActivityRegistry {
         })
     }
 
-    /// 标记 app 为 stopped(scale0)。AppService::stop_app / 回收扫描器调用。
+    /// 标记 app 为 stopped(scale0，可被流量唤醒)。手动 stop 与闲置回收
+    /// 统一使用本档（拍板 2026-09-23）。
     pub fn mark_stopped(&self, app_id: &str) {
         self.wake_blocked.remove(app_id);
         self.stopped.insert(app_id.to_string());
         self.note_dirty(app_id);
         self.remote_state
-            .insert(app_id.to_string(), RemoteState::WAKEABLE_STOPPED);
+            .insert(app_id.to_string(), RemoteState::STOPPED);
     }
 
-    /// 主动停止/发布切换：记录 scale0，但禁止流量自动拉起。
+    /// 删除围栏：应用进入删除/待清理流程，阻止流量唤醒路由与回收扫描。
     pub fn mark_wake_blocked(&self, app_id: &str) {
         self.stopped.remove(app_id);
         self.wake_blocked.insert(app_id.to_string());
         self.note_dirty(app_id);
         self.remote_state
-            .insert(app_id.to_string(), RemoteState::MANUAL_STOPPED);
-    }
-
-    /// 闲置回收完成后把停止状态转换为可由流量唤醒。
-    pub fn mark_recycled(&self, app_id: &str) {
-        self.wake_blocked.remove(app_id);
-        self.stopped.insert(app_id.to_string());
-        self.note_dirty(app_id);
-        self.remote_state
-            .insert(app_id.to_string(), RemoteState::WAKEABLE_STOPPED);
+            .insert(app_id.to_string(), RemoteState::STOPPED);
     }
 
     /// 是否有进行中的唤醒(回收扫描器据此跳过,避免与 in-flight wake 竞态)

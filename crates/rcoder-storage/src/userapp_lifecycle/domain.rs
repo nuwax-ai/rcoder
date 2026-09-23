@@ -278,11 +278,11 @@ pub(super) fn advance(
                 wake_on_traffic: Some(true),
                 ..Default::default()
             }),
-            Some(shared_types::UserAppControlCommand::Stop { wake_on_traffic }) => {
-                Some(shared_types::UserAppRuntimePolicy {
-                    wake_on_traffic: Some(*wake_on_traffic),
-                    ..Default::default()
-                })
+            Some(shared_types::UserAppControlCommand::Stop { .. }) => {
+                // 拍板 2026-09-23：手动 stop 与闲置回收统一——stop 完成不再把
+                // 持久 wake_on_traffic 翻成 false（停止一律可被流量唤醒）；
+                // 该字段仅由 SetRecyclePolicy 显式变更。
+                None
             }
             Some(
                 shared_types::UserAppControlCommand::DeleteResources { .. }

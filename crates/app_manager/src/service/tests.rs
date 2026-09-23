@@ -1327,7 +1327,7 @@ async fn pending_control_recovery_does_not_take_over_a_running_executor() {
 }
 
 #[tokio::test]
-async fn traffic_rechecks_stale_local_block_but_respects_committed_manual_stop() {
+async fn traffic_rechecks_stale_local_block_and_wakes_committed_manual_stop() {
     let directory = tempfile::tempdir().expect("directory");
     let (service, runtime) = created_app_service(directory.path(), "stalewakeblock").await;
     let service = Arc::new(service);
@@ -1357,17 +1357,27 @@ async fn traffic_rechecks_stale_local_block_but_respects_committed_manual_stop()
     let result =
         shared_types::AppWakeControl::ensure_running(service.activity.as_ref(), "stalewakeblock")
             .await;
-    assert!(matches!(result, shared_types::WakeOutcome::Failed(_)));
-    assert!(service.activity.is_wake_blocked("stalewakeblock"));
+    // 拍板 2026-09-23：手动 stop 与闲置回收统一——流量照常唤醒已提交的手动停止。
+    assert!(
+        matches!(
+            result,
+            shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning
+        ),
+        "{result:?}"
+    );
+    assert!(!shared_types::AppWakeControl::is_stopped(
+        service.activity.as_ref(),
+        "stalewakeblock"
+    ));
     assert_eq!(
         runtime.scale_calls.load(Ordering::SeqCst),
-        before,
-        "committed manual stop is never overridden by traffic"
+        before + 1,
+        "traffic wakes a committed manual stop"
     );
 }
 
 #[tokio::test]
-async fn pending_traffic_recovery_cannot_override_a_manual_stop() {
+async fn pending_traffic_recovery_completes_over_a_manual_stop() {
     let directory = tempfile::tempdir().expect("directory");
     let (service, runtime) = created_app_service(directory.path(), "recovermanual").await;
     service
@@ -1387,22 +1397,28 @@ async fn pending_traffic_recovery_cannot_override_a_manual_stop() {
         shared_types::UserAppControlCommand::Start { traffic: true },
     )
     .await;
-    assert!(service.resume_pending_control(&pending).await.is_err());
+    // 拍板 2026-09-23：手动 stop 与闲置回收统一——恢复已受理的流量唤醒
+    // 不再被手动停止意图否决，照常完成拉起。
+    assert!(
+        service
+            .resume_pending_control(&pending)
+            .await
+            .expect("resume admitted traffic wake")
+    );
     assert_eq!(
         runtime.scale_calls.load(Ordering::SeqCst),
-        prior_scale_calls,
-        "traffic recovery does not start an intentionally stopped application"
+        prior_scale_calls + 1,
+        "traffic recovery starts a manually stopped application"
     );
-    let failed = service
+    let done = service
         .metadata
         .store
         .get_operation("recovermanual", &pending.operation_id)
         .await
         .expect("operation query")
         .expect("operation");
-    assert_eq!(failed.state, shared_types::UserAppOperationState::Failed);
-    assert!(service.activity.is_wake_blocked("recovermanual"));
-    assert!(failed.checkpoint.is_null());
+    assert_eq!(done.state, shared_types::UserAppOperationState::Succeeded);
+    assert!(!service.activity.is_wake_blocked("recovermanual"));
 }
 
 #[tokio::test]
@@ -1439,7 +1455,10 @@ async fn stop_rejection_releases_ownership_but_uncertain_result_retains_it() {
                 shared_types::UserAppOperationState::RecoveryRequired
             }
         );
-        assert_eq!(service.activity.is_wake_blocked("stopoutcome"), !rejected);
+        assert_eq!(
+            shared_types::AppWakeControl::is_stopped(service.activity.as_ref(), "stopoutcome"),
+            !rejected
+        );
         let next = service
             .try_acquire_process_release_lock("stopoutcome")
             .await;
@@ -1710,7 +1729,7 @@ async fn update_commits_a_durable_operation_matching_runtime_context() {
 }
 
 #[tokio::test]
-async fn explicit_stop_is_durable_idempotent_and_blocks_traffic_wake() {
+async fn explicit_stop_is_durable_idempotent_and_traffic_wakeable() {
     let root = tempfile::tempdir().expect("directory");
     let (service, runtime) = created_app_service(root.path(), "durablestop").await;
     let request = shared_types::UserAppControlRequest {
@@ -1723,7 +1742,12 @@ async fn explicit_stop_is_durable_idempotent_and_blocks_traffic_wake() {
         .await
         .expect("stop");
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), before + 1);
-    assert!(service.activity.is_wake_blocked("durablestop"));
+    // 拍板 2026-09-23：手动 stop 与闲置回收统一——stopped 档可被流量唤醒。
+    assert!(shared_types::AppWakeControl::is_stopped(
+        service.activity.as_ref(),
+        "durablestop"
+    ));
+    assert!(!service.activity.is_wake_blocked("durablestop"));
     service
         .stop_app_controlled("durablestop", request.clone())
         .await

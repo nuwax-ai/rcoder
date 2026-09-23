@@ -228,11 +228,9 @@ impl AppService {
                 continue;
             }
             if s.replicas == 0 {
-                if s.wake_on_traffic == Some(false) {
-                    self.activity.mark_wake_blocked(&s.app_id);
-                } else {
-                    self.activity.mark_stopped(&s.app_id);
-                }
+                // 拍板 2026-09-23：手动 stop 与闲置回收统一——stopped 一律
+                // 可被流量唤醒（含历史注解为 false 的部署）。
+                self.activity.mark_stopped(&s.app_id);
                 stopped += 1;
             } else {
                 // M5：PG 持久化加载（apply_loaded）先于本 rebuild 执行时，

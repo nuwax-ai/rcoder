@@ -508,3 +508,13 @@ supervisord 启动阶段的控制消费尚未补齐；历史未知写核验等�
 - [x] R6 java-compute-control.md 补 Docker 分支与四项新恢复入口。
 - [x] Qoder 遗留：StartupFailed 显式恢复已确认制品（Stop 后 Start 拉起业务，fresh-scope 护栏）。
 - [ ] T7/T8/T9（测试/部署/发布验收）：等用户统一测试阶段——Compose test-e2e、remote-k8s 套件、app129 恢复入口实测均未执行。
+
+## 2026-09-23 拍板修订：手动 stop 与闲置回收统一——流量即唤醒
+
+用户拍板（取代 2026-09-22 的显式入口语义）：外部 stop 后不再要求"显式启动 / pod/ensure 显式入口"才能拉起，任何 prod 流量（应用代理与 ttyd/dbx 工具族）到达即唤醒。落地要点：
+
+- 唤醒闸门移除：`wake_app_on_traffic` preflight 不再因 `wake_on_traffic==Some(false)` 拒绝被动流量；恢复路径 replay `Start{traffic:true}` 同步放开。
+- 档位合并：`wake_blocked` 内存档仅保留删除围栏语义；rebuild/backfill 对注解为 false 的历史停止一律回填可唤醒 stopped 档。
+- 持久 policy：stop 完成（domain.rs）与 stop 受理（compute.rs）不再把 `runtime_policy.wake_on_traffic` 落 false；该字段仅由 SetRecyclePolicy 显式变更（存量行中的 false 为历史展示值，不参与闸门）。
+- `ensure_running_explicit` 双入口合流删除；pod/ensure 与被动流量共用 `ensure_running`。
+- 保留：wake-on-traffic 注解仍由 start 写回 true / 外部 stop 写 false，仅用于唤醒观察期间的中途 stop 识别与状态展示；删除围栏、操作锁、物理身份核验等防护不变。

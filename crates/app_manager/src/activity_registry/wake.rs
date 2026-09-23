@@ -30,34 +30,21 @@ pub(super) const REMOTE_STATE_TTL: Duration = Duration::from_secs(30);
 pub(super) const REMOTE_STATE_MAX_ENTRIES: u64 = 10_000;
 
 /// `get_deployment_status` 的兜底判定快照（多副本 stopped 事实源 = 集群 replicas）。
+/// 拍板 2026-09-23：手动 stop 与闲置回收统一——stopped 一律可被流量唤醒，
+/// wake-on-traffic 注解不再参与档位区分。
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct RemoteState {
     pub(super) stopped: bool,
-    /// K8s `wake_on_traffic==Some(false)` 注解：手动停档（回填 `wake_blocked` 而非 `stopped`，
-    /// 对齐 rebuild_stopped_apps 档位区分；Docker 形态恒 false）
-    pub(super) manual_stop: bool,
 }
 
 impl RemoteState {
-    /// 已停、可被流量唤醒（闲置回收/软停档）
-    pub(super) const WAKEABLE_STOPPED: Self = Self {
-        stopped: true,
-        manual_stop: false,
-    };
-    /// 手动停止档（K8s wake-on-traffic 注解为 false）
-    pub(super) const MANUAL_STOPPED: Self = Self {
-        stopped: true,
-        manual_stop: true,
-    };
+    /// 已停、可被流量唤醒（含手动 stop 与闲置回收）
+    pub(super) const STOPPED: Self = Self { stopped: true };
 }
 
 /// 进行中的唤醒句柄(leader 持有 `tx`,follower `subscribe` 后等结果)
 pub(super) struct WakeHandle {
     pub(super) tx: watch::Sender<Option<WakeOutcome>>,
-    /// 显式升级位：显式调用方（pod/ensure）加入在途流量 flight 时置位；
-    /// leader 在策略判定点读取。晚于判定点到达时本次仍按流量语义结束，
-    /// 下一次 ensure 以 leader 身份带显式语义重试（UI 本就重试）。
-    pub(super) explicit: std::sync::atomic::AtomicBool,
 }
 
 /// RAII 守卫:leader 路径持有。drop 时(含 panic unwind)做两件事:
@@ -105,7 +92,6 @@ impl AppActivityRegistry {
             .ok_or_else(|| format!("Application runtime not found: {app_id}"))?;
         let state = RemoteState {
             stopped: status.replicas <= 0,
-            manual_stop: status.wake_on_traffic == Some(false),
         };
         self.remote_state.insert(app_id.to_string(), state);
         Ok(state)
@@ -114,8 +100,9 @@ impl AppActivityRegistry {
     /// Called under the admitted lifecycle operation lock after checking the
     /// authoritative wake policy. Starting replicas are not readiness evidence:
     /// keep traffic routed through the coordinator until completion is confirmed.
-    /// Only this pre-mutation boundary may clear an older manual-stop hint;
-    /// late failure paths must not overwrite a newer control's local state.
+    /// Only this pre-mutation boundary may clear an older stale local flag
+    /// (e.g. a deletion fence resolved by reconciliation); late failure paths
+    /// must not overwrite a newer control's local state.
     pub(crate) fn prepare_traffic_wake(&self, app_id: &str) {
         self.wake_blocked.remove(app_id);
         self.stopped.insert(app_id.to_string());
@@ -123,8 +110,9 @@ impl AppActivityRegistry {
         self.note_dirty(app_id);
     }
 
-    /// Traffic wake never clears a manual stop, including a stop arriving during
-    /// completion. Only an explicit control operation may remove that block.
+    /// Traffic wake never clears a deletion fence (or a stop landing during
+    /// completion). Manual stops no longer set `wake_blocked` (unified wake,
+    /// 2026-09-23), so this guard only fences deletion and mid-wake stops.
     pub(crate) fn try_mark_woken(&self, app_id: &str) -> bool {
         if self.wake_blocked.contains(app_id) {
             return false;
@@ -137,38 +125,27 @@ impl AppActivityRegistry {
         true
     }
 
-    /// 集群快照为 stopped 时回填内存标记（幂等；manual_stop 档区分，对齐
-    /// rebuild_stopped_apps 语义）。不 note_dirty：多副本 PG 行本就存在
-    /// flush 互覆盖窗口，事实源已转集群；启动恢复由 rebuild_stopped_apps
-    /// 从集群注解重建，无需依赖本回填落库。
+    /// 集群快照为 stopped 时回填内存标记（幂等）。拍板 2026-09-23：手动
+    /// stop 与闲置回收统一——stopped 一律可被流量唤醒，不再区分注解档位。
+    /// 不 note_dirty：多副本 PG 行本就存在 flush 互覆盖窗口，事实源已转
+    /// 集群；启动恢复由 rebuild_stopped_apps 从集群重建，无需依赖本回填落库。
     fn backfill_remote_state(&self, app_id: &str, state: RemoteState) -> bool {
         if !state.stopped {
             return false;
         }
-        if state.manual_stop {
-            self.stopped.remove(app_id);
-            self.wake_blocked.insert(app_id.to_string());
-        } else {
-            self.wake_blocked.remove(app_id);
-            self.stopped.insert(app_id.to_string());
-        }
-        debug!(
-            "[ACTIVITY] remote stopped backfilled: app_id={app_id}, manual_stop={}",
-            state.manual_stop
-        );
+        self.wake_blocked.remove(app_id);
+        self.stopped.insert(app_id.to_string());
+        debug!("[ACTIVITY] remote stopped backfilled: app_id={app_id}");
         true
     }
 
     /// The registry only merges callers. Durable admission, runtime identity and
     /// wake policy are checked by the lifecycle coordinator under its operation lock.
-    async fn wake_leader(&self, app_id: &str, explicit: bool) -> WakeOutcome {
+    async fn wake_leader(&self, app_id: &str) -> WakeOutcome {
         let Some(service) = self.coordinator.get().and_then(std::sync::Weak::upgrade) else {
             return WakeOutcome::Failed("Activity lifecycle coordinator is unavailable".into());
         };
-        match service
-            .wake_app_on_traffic(app_id, self.wake_timeout, explicit)
-            .await
-        {
+        match service.wake_app_on_traffic(app_id, self.wake_timeout).await {
             Ok(outcome) => outcome,
             Err(crate::models::AppOperationError::ConflictBlocked { message, blocker }) => {
                 WakeOutcome::Blocked { message, blocker }
@@ -185,8 +162,7 @@ impl AppActivityRegistry {
             handle: handle.clone(),
             outcome: None,
         };
-        let explicit = handle.explicit.load(std::sync::atomic::Ordering::Acquire);
-        let r = self.wake_leader(app_id, explicit).await;
+        let r = self.wake_leader(app_id).await;
         // 写入 outcome；guard 在函数返回/panic unwind 时 drop → 广播给 follower + 移除 waking 条目。
         guard.outcome = Some(r.clone());
         r
@@ -232,19 +208,14 @@ impl AppWakeControl for AppActivityRegistry {
     }
 
     async fn ensure_running(&self, app_id: &str) -> WakeOutcome {
-        self.ensure_running_with_policy(app_id, false).await
-    }
-
-    /// 显式入口（pod/ensure）：可拉起显式停止的应用（拍板 2026-09-22）。
-    async fn ensure_running_explicit(&self, app_id: &str) -> WakeOutcome {
-        self.ensure_running_with_policy(app_id, true).await
+        self.ensure_running_inner(app_id).await
     }
 }
 
 impl AppActivityRegistry {
-    /// 单一入口：`explicit=false` 被动流量语义（不得复活手动停档）；
-    /// `explicit=true` 用户显式动作语义。
-    async fn ensure_running_with_policy(&self, app_id: &str, explicit: bool) -> WakeOutcome {
+    /// 单一入口。拍板 2026-09-23：被动流量与显式动作（pod/ensure）语义统一
+    /// ——有请求即唤醒，不再有手动停档区分。
+    async fn ensure_running_inner(&self, app_id: &str) -> WakeOutcome {
         // 回收过渡期的请求必须等 scale0 完成,再由唤醒 single-flight scale1。
         self.wait_for_recycle_transition(app_id).await;
         // Local stop flags may outlive an operation completed by another replica.
@@ -268,25 +239,13 @@ impl AppActivityRegistry {
             dashmap::mapref::entry::Entry::Occupied(e) => WakeRole::Follower(e.get().clone()),
             dashmap::mapref::entry::Entry::Vacant(e) => {
                 let (tx, _rx) = watch::channel(None::<WakeOutcome>);
-                let handle = Arc::new(WakeHandle {
-                    tx,
-                    explicit: std::sync::atomic::AtomicBool::new(explicit),
-                });
+                let handle = Arc::new(WakeHandle { tx });
                 e.insert(handle.clone());
                 WakeRole::Leader(handle)
             }
         };
         match role {
-            WakeRole::Follower(handle) => {
-                if explicit {
-                    // 尽力升级在途 flight 的语义；leader 已过判定点则本次按
-                    // 流量语义结束，下一次 ensure 以 leader 身份带显式语义。
-                    handle
-                        .explicit
-                        .store(true, std::sync::atomic::Ordering::Release);
-                }
-                self.join_as_follower(handle).await
-            }
+            WakeRole::Follower(handle) => self.join_as_follower(handle).await,
             WakeRole::Leader(handle) => self.become_leader(app_id, handle).await,
         }
     }

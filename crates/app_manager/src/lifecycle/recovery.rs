@@ -1000,13 +1000,6 @@ impl AppService {
             }
             operation.bind_lease(&guard).await?;
             let previous = self.fetch_runtime_status_or_err(&snapshot.app_id).await?;
-            if matches!(command, Command::Start { traffic: true })
-                && previous.wake_on_traffic == Some(false)
-            {
-                return Err(AppOperationError::InvalidState(
-                    "Traffic recovery cannot override an intentional stop".into(),
-                ));
-            }
             let context = operation.execution_context();
             let target = self
                 .capture_bound_app_target(&context, previous.resource_version.as_deref())
@@ -1018,7 +1011,7 @@ impl AppService {
                 )
                 .await?;
             if matches!(command, Command::Start { traffic: true }) {
-                self.restore_activity_state(&snapshot.app_id, &previous, true);
+                self.restore_activity_state(&snapshot.app_id, &previous);
             }
             operation.authorize_mutation().await?;
             match &command {
@@ -1131,11 +1124,9 @@ impl AppService {
                         self.activity.mark_running(&snapshot.app_id)
                     }
                     Command::Stop { .. } => {}
-                    Command::SetRecyclePolicy { policy } => {
-                        if previous.replicas == 0
-                            && let Some(wake) = policy.wake_on_traffic
-                        {
-                            self.restore_activity_state(&snapshot.app_id, &previous, wake);
+                    Command::SetRecyclePolicy { .. } => {
+                        if previous.replicas == 0 {
+                            self.restore_activity_state(&snapshot.app_id, &previous);
                         }
                     }
                 }

@@ -316,8 +316,10 @@ async fn wake_timeout_when_never_ready() {
     );
 }
 
+/// 删除围栏档（拍板 2026-09-23 统一唤醒后，wake_blocked 仅表示删除围栏）：
+/// 流量唤醒被拒且零 runtime 写（无协调器挂接 → Failed）。
 #[tokio::test]
-async fn manually_stopped_app_rejects_traffic_without_runtime_write() {
+async fn deletion_fenced_app_rejects_traffic_without_runtime_write() {
     let reg = AppActivityRegistry::new_with(Duration::from_millis(50), Duration::from_millis(1));
     let runtime = Arc::new(MockRuntime::new(true));
     let scale_calls = runtime.scale_calls.clone();
@@ -458,7 +460,7 @@ async fn remote_stopped_negative_cache_avoids_extra_queries() {
 }
 
 #[tokio::test]
-async fn cached_running_state_cannot_bypass_a_remote_manual_stop() {
+async fn traffic_wakes_a_remote_manual_stop() {
     let runtime = Arc::new(MockRuntime::new(true));
     *runtime.phase.lock().expect("phase") = "Running".into();
     let registry = Arc::new(AppActivityRegistry::new(Duration::from_secs(2)));
@@ -468,25 +470,25 @@ async fn cached_running_state_cannot_bypass_a_remote_manual_stop() {
     assert_eq!(runtime.status_calls.load(Ordering::SeqCst), 1);
 
     // Another replica commits a manual stop while this replica retains its
-    // negative probe cache and has no local stopped flag.
+    // negative probe cache and has no local stopped flag. 拍板 2026-09-23：
+    // 手动 stop 与闲置回收统一——兜底探查到 stopped 后照常唤醒。
     *runtime.phase.lock().expect("phase") = "Stopped".into();
     *runtime.wake_on_traffic.lock().expect("policy") = Some(false);
     let outcome = registry.ensure_running("cachedstop").await;
     assert!(
-        matches!(&outcome, WakeOutcome::Failed(message) if message.contains("intentionally stopped")),
+        matches!(outcome, WakeOutcome::Ready | WakeOutcome::AlreadyRunning),
         "{outcome:?}"
     );
     assert!(runtime.status_calls.load(Ordering::SeqCst) > 1);
-    assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
+    assert!(runtime.scale_calls.load(Ordering::SeqCst) >= 1);
     assert!(registry.waking.is_empty());
 }
 
-/// 拍板 2026-09-22（app 177 事故类）：pod/ensure 是用户显式动作，**可以**
-/// 拉起显式停止的应用——平台不做业务限制；被动流量唤醒仍不得复活
-/// （`cached_running_state_cannot_bypass_a_remote_manual_stop` 钉住）。
-/// 修复前必红：显式入口与流量入口同语义 → Failed("intentionally stopped")。
+/// 拍板 2026-09-23（手动 stop 与闲置回收统一）：被动流量与显式入口
+/// （pod/ensure）共用 ensure_running 语义——有请求即唤醒；历史注解
+/// wake-on-traffic=false 不再作为闸门（start 写回 true 后观察循环放行）。
 #[tokio::test]
-async fn explicit_ensure_starts_intentionally_stopped_app() {
+async fn traffic_wakes_intentionally_stopped_app() {
     let runtime = Arc::new(MockRuntime::new(true));
     *runtime.phase.lock().expect("phase") = "Stopped".into();
     *runtime.wake_on_traffic.lock().expect("policy") = Some(false);
@@ -494,25 +496,17 @@ async fn explicit_ensure_starts_intentionally_stopped_app() {
     registry.set_runtime(runtime.clone());
     let _fixture = attach_coordinator(&registry, runtime.clone(), "manualstart").await;
 
-    // 流量语义回归锚：同一状态下被动唤醒仍被拒、零 scale。
-    assert!(matches!(
-        registry.ensure_running("manualstart").await,
-        WakeOutcome::Failed(message) if message.contains("intentionally stopped")
-    ));
-    assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
-
-    // 显式语义：拉起并就绪。
-    let outcome = registry.ensure_running_explicit("manualstart").await;
+    let outcome = registry.ensure_running("manualstart").await;
     assert!(
         matches!(outcome, WakeOutcome::Ready | WakeOutcome::AlreadyRunning),
-        "显式 ensure 必须拉起显式停止的应用: {outcome:?}"
+        "流量必须能唤醒显式停止的应用: {outcome:?}"
     );
     assert!(
         runtime.scale_calls.load(Ordering::SeqCst) >= 1,
-        "显式 ensure 必须发生 scale up"
+        "唤醒必须发生 scale up"
     );
     assert!(registry.waking.is_empty());
-    assert!(!registry.is_wake_blocked("manualstart"), "手动停档必须解除");
+    assert!(!registry.is_wake_blocked("manualstart"));
 }
 
 #[tokio::test]
@@ -552,9 +546,10 @@ async fn remote_stopped_err_not_cached_retries_next_call() {
     assert_eq!(rt.status_calls.load(Ordering::SeqCst), 2);
 }
 
-/// K8s wake_on_traffic==Some(false) 注解：回填 wake_blocked 档（非 stopped 档）。
+/// 拍板 2026-09-23：手动 stop 与闲置回收统一——注解为 false 的远程停止
+/// 同样回填 stopped 档（可被流量唤醒），不再有 wake_blocked 档位。
 #[tokio::test]
-async fn remote_stopped_manual_stop_backfills_wake_blocked_tier() {
+async fn remote_manual_stop_backfills_wakeable_stopped_tier() {
     let rt = Arc::new(MockRuntime::new(true));
     *rt.phase.lock().unwrap() = "Stopped".to_string();
     *rt.wake_on_traffic.lock().unwrap() = Some(false);
@@ -563,9 +558,10 @@ async fn remote_stopped_manual_stop_backfills_wake_blocked_tier() {
 
     assert!(reg.remote_stopped("appm").await);
     assert!(
-        reg.is_wake_blocked("appm"),
-        "manual_stop 档回填 wake_blocked"
+        reg.is_stopped("appm"),
+        "manual_stop 统一回填 stopped（可唤醒）档"
     );
+    assert!(!reg.is_wake_blocked("appm"));
 }
 
 /// 本副本状态写点即时刷新兜底缓存（防 TTL 窗口旧值）。
@@ -577,7 +573,7 @@ async fn mark_writes_refresh_remote_cache_immediately() {
     assert!(!reg.remote_stopped("appc").await); // 查一次（Running）缓存 false
     assert_eq!(rt.status_calls.load(Ordering::SeqCst), 1);
 
-    reg.mark_wake_blocked("appc"); // 本副本 stop → 缓存即时刷新
+    reg.mark_stopped("appc"); // 本副本 stop → 缓存即时刷新
     assert!(
         reg.remote_stopped("appc").await,
         "mark 后缓存立即为 stopped"
@@ -650,10 +646,7 @@ fn loaded_activity_never_restores_wake_policy_or_regresses_epoch() {
 async fn guard_broadcasts_failed_on_drop_when_leader_did_not_finish() {
     let map: Arc<DashMap<String, Arc<WakeHandle>>> = Arc::new(DashMap::new());
     let (tx, _) = watch::channel(None::<WakeOutcome>);
-    let handle = Arc::new(WakeHandle {
-        tx,
-        explicit: AtomicBool::new(false),
-    });
+    let handle = Arc::new(WakeHandle { tx });
     map.insert("appg".to_string(), handle.clone());
 
     // follower 先 subscribe(模拟并发请求 join 到 leader)
@@ -712,10 +705,7 @@ fn completed_wake_is_retained_for_follower_that_has_not_subscribed_yet() {
         let map = Arc::new(DashMap::new());
         let (tx, initial_rx) = watch::channel(None::<WakeOutcome>);
         drop(initial_rx);
-        let handle = Arc::new(WakeHandle {
-            tx,
-            explicit: AtomicBool::new(false),
-        });
+        let handle = Arc::new(WakeHandle { tx });
         map.insert("latefollower".into(), handle.clone());
         // The follower selected its role but has not subscribed yet.
         let follower_handle = handle.clone();
@@ -738,10 +728,7 @@ fn deletion_outcome_is_retained_for_a_late_wake_subscriber() {
     let registry = AppActivityRegistry::new(Duration::from_secs(2));
     let (tx, receiver) = watch::channel(None);
     drop(receiver);
-    let handle = Arc::new(WakeHandle {
-        tx,
-        explicit: AtomicBool::new(false),
-    });
+    let handle = Arc::new(WakeHandle { tx });
     registry
         .waking
         .insert("deletedlatesubscriber".into(), handle.clone());
@@ -808,20 +795,29 @@ async fn cancelled_wake_after_scale_started_retains_lease() {
     assert!(rt.acquire_app_operation("cancelledwake").await.is_err());
 }
 
+/// 拍板 2026-09-23：手动 stop 与闲置回收统一——兜底观察到远程手动停止
+/// （注解 false）的流量也照常唤醒并就绪。
 #[tokio::test]
-async fn traffic_observing_remote_manual_stop_does_not_start_the_application() {
+async fn traffic_observing_remote_manual_stop_starts_the_application() {
     let runtime = Arc::new(MockRuntime::new(true));
     *runtime.phase.lock().expect("phase") = "Stopped".into();
     *runtime.wake_on_traffic.lock().expect("wake policy") = Some(false);
-    let registry = AppActivityRegistry::new_with(Duration::from_secs(1), Duration::from_millis(1));
+    let registry = Arc::new(AppActivityRegistry::new_with(
+        Duration::from_secs(1),
+        Duration::from_millis(1),
+    ));
     registry.set_runtime(runtime.clone());
+    let _fixture = attach_coordinator(&registry, runtime.clone(), "remotemanualstop").await;
     let outcome = registry.ensure_running("remotemanualstop").await;
-    assert!(matches!(outcome, WakeOutcome::Failed(_)), "{outcome:?}");
-    assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
-    assert!(registry.is_wake_blocked("remotemanualstop"));
+    assert!(
+        matches!(outcome, WakeOutcome::Ready | WakeOutcome::AlreadyRunning),
+        "{outcome:?}"
+    );
+    assert!(runtime.scale_calls.load(Ordering::SeqCst) >= 1);
+    assert!(!registry.is_wake_blocked("remotemanualstop"));
     assert!(
         registry.waking.is_empty(),
-        "rejected traffic must not retain a wake flight"
+        "completed traffic wake must not retain a wake flight"
     );
 }
 

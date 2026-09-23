@@ -176,13 +176,14 @@ impl AppService {
         result
     }
 
-    /// 停止应用（scale replicas = 0）
+    /// 停止应用（scale replicas = 0）。拍板 2026-09-23：手动 stop 与闲置回收
+    /// 统一——停止后流量即唤醒；参数仅区分外部快失败与回收器排队两种受理模式。
     #[instrument(skip(self))]
     pub async fn stop_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         self.scale_to_zero(app_id, false).await
     }
 
-    /// 闲置回收使用：scale0 后允许后续流量自动唤醒。
+    /// 闲置回收使用：排队受理（等锁）的 scale0。
     #[instrument(skip(self))]
     pub async fn recycle_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
         self.scale_to_zero(app_id, true).await
@@ -326,11 +327,10 @@ impl AppService {
         operation: &crate::service::AppOperationGuard,
     ) -> AppResult<()> {
         let app_id = &target.context.app_id;
-        let previous_wake = previous
-            .wake_on_traffic
-            .unwrap_or_else(|| !self.activity.is_wake_blocked(app_id));
         operation.mark_mutating()?;
-        self.activity.mark_wake_blocked(app_id);
+        // 拍板 2026-09-23：手动 stop 与闲置回收统一——scale0 后一律可被
+        // 流量唤醒；wake_on_traffic 参数只决定锁模式与注解/命令记录值。
+        self.activity.mark_stopped(app_id);
         if let Err(error) = self.runtime.stop_app_target(target, wake_on_traffic).await {
             // This target operation makes exactly one remote stop/scale request.
             // A structured rejection therefore proves this stop had no effects.
@@ -339,32 +339,22 @@ impl AppService {
                 container_runtime_api::ContainerRuntimeError::RequestRejected(_)
             ) {
                 operation.mark_rejected_before_mutation();
-                self.restore_activity_state(app_id, previous, previous_wake);
+                self.restore_activity_state(app_id, previous);
             }
             // Do not issue a compensating name-based patch after an uncertain
             // response or version conflict. It could modify a replacement.
-            // Keep traffic wake blocked until recovery resolves the stop outcome.
+            // Recovery resolves an uncertain stop outcome from durable state.
             return Err(map_runtime_error("Stop captured application", error));
-        }
-        if wake_on_traffic {
-            self.activity.mark_recycled(app_id);
         }
         info!(app_id, operation_id = %target.context.operation_id, "Application stopped using captured resource identity");
         Ok(())
     }
 
-    pub(crate) fn restore_activity_state(
-        &self,
-        app_id: &str,
-        previous: &DeploymentStatus,
-        previous_wake_on_traffic: bool,
-    ) {
+    pub(crate) fn restore_activity_state(&self, app_id: &str, previous: &DeploymentStatus) {
         if previous.replicas > 0 {
             self.activity.mark_running(app_id);
-        } else if !previous_wake_on_traffic {
-            self.activity.mark_wake_blocked(app_id);
         } else {
-            self.activity.mark_recycled(app_id);
+            self.activity.mark_stopped(app_id);
         }
     }
 

@@ -217,23 +217,9 @@ pub(super) async fn admit(
         toasty::sql::statement(repo::sql(backend,"INSERT INTO userapp_compute_intents (app_id,scope,lifecycle_id,generation,revision,desired_state,control_operation_id,updated_at_us) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"))
             .bind(&request.app_id).bind(scope).bind(&request.lifecycle_id).bind(generation).bind(revision).bind(desired).bind(&request.operation_id).bind(now).exec(tx).await.map_err(storage)?;
     }
-    if request.scope == UserAppOperationScope::Prod && request.action == ComputeControlAction::Stop
-    {
-        let mut stopped = app.clone();
-        stopped.runtime_policy.wake_on_traffic = Some(false);
-        stopped.metadata_revision = stopped
-            .metadata_revision
-            .checked_add(1)
-            .ok_or_else(|| invalid("Metadata revision exhausted"))?;
-        repo::save_app(
-            tx,
-            backend,
-            &stopped,
-            &app.lifecycle_id,
-            app.metadata_revision,
-        )
-        .await?;
-    }
+    // 拍板 2026-09-23：手动 stop 与闲置回收统一——有请求即唤醒。stop 不再
+    // 把持久 runtime_policy.wake_on_traffic 翻成 false（历史行中的 false 仅
+    // 为存量展示值，不参与唤醒闸门）。
     get(tx, &request.app_id, &request.operation_id)
         .await?
         .ok_or(Error::NotFound)
@@ -605,9 +591,6 @@ pub(super) async fn restore_identity(
     } else {
         let mut proposed = domain::identity(&found.app_id)?;
         proposed.lifecycle_id = found.lifecycle_id.clone();
-        if found.prod_stopped {
-            proposed.runtime_policy.wake_on_traffic = Some(false);
-        }
         repo::ensure_with_created(tx, backend, &proposed).await?
     };
     domain::validate_active(&app)?;

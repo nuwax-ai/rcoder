@@ -79,8 +79,8 @@ pub async fn start_app(
 把运行容器缩到 0 副本停止应用：**数据卷 / 元数据全部保留**，随时可 `start` 重启
 （区别于 delete 后的 storage 面）。
 
-- 显式停止会阻断流量唤醒，后续需要显式 start；
-- 闲置回收保留流量唤醒能力，与显式 stop 的策略不同；
+- 拍板 2026-09-23：手动 stop 与闲置回收统一——停止后到达的 prod 流量
+  （应用代理与 ttyd/dbx 工具族）会自动唤醒拉起，也可随时显式 `start`；
 - 需要"彻底销毁"走 delete → （可选）storage/clear | destroy。
 
 - If another operation holds the lock, this request is rejected without waiting
@@ -202,7 +202,8 @@ pub async fn restart_app(
 动态设置应用的闲置自动回收与流量唤醒策略，免重启、下个扫描 tick 生效：
 - `recycle_enabled`：开关闲置回收
 - `idle_timeout_seconds`：闲置阈值秒数
-- `wake_on_traffic`：流量唤醒开关
+- `wake_on_traffic`：流量唤醒注解（拍板 2026-09-23 统一唤醒后仅作展示，
+  不再阻断任何停止档位的流量唤醒）
 
 三字段全 None → 400。
 

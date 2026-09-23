@@ -48,22 +48,14 @@ pub trait AppWakeControl: Send + Sync {
     /// app 是否处于 stopped（scale replicas==0）。读内存表，O(1)，供 Pingora 快速短路。
     fn is_stopped(&self, app_id: &str) -> bool;
 
-    /// Ensure a stopped application is running, subject to durable lifecycle and
-    /// current wake policy. Traffic cannot override an intentional stop. Local
-    /// flags are advisory across replicas; the coordinator validates ownership
-    /// and policy under the operation lock before mutation. Concurrent callers
-    /// share the same bounded wake result.
+    /// Ensure a stopped application is running, subject to durable lifecycle
+    /// admission and physical identity fences. 拍板 2026-09-23：手动 stop 与
+    /// 闲置回收统一——被动流量（rcoder-proxy/文件转发）与显式动作
+    /// （pod/ensure）共用本语义，有请求即唤醒。Local flags are advisory
+    /// across replicas; the coordinator validates ownership under the
+    /// operation lock before mutation. Concurrent callers share the same
+    /// bounded wake result.
     async fn ensure_running(&self, app_id: &str) -> WakeOutcome;
-
-    /// Explicit variant of [`Self::ensure_running`]: the caller acts on a
-    /// user-driven control action (pod/ensure opening an app page) and MAY
-    /// start an intentionally stopped application — the platform imposes no
-    /// business-level block there. Passive traffic callers keep
-    /// `ensure_running` and never override a manual stop. The default falls
-    /// back to traffic semantics for implementors that do not distinguish.
-    async fn ensure_running_explicit(&self, app_id: &str) -> WakeOutcome {
-        self.ensure_running(app_id).await
-    }
 
     /// 内存无 stopped 记录时的兜底判定（多副本：其他副本 stop 后本副本内存
     /// 不知情；或本副本重启后未覆盖的场景）。查集群真实 replicas（实现方以

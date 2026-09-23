@@ -11,15 +11,14 @@ use crate::service::{AppService, OwnedOperation};
 use crate::utils::{map_runtime_error, validate_app_id};
 
 impl AppService {
-    /// `explicit=true`：调用方是用户显式动作（pod/ensure 打开应用页），
-    /// 拍板 2026-09-22 —— 可以拉起显式停止的应用（start 会把
-    /// wake-on-traffic 注解写回 true，手动停档随之解除）；被动流量唤醒
-    /// （`explicit=false`，rcoder-proxy/文件转发）仍不得复活手动停档。
+    /// 流量唤醒（rcoder-proxy 被动流量与 pod/ensure 共用同一语义）。拍板
+    /// 2026-09-23：手动 stop 与闲置回收统一——有请求即唤醒；wake-on-traffic
+    /// 注解不再作为唤醒闸门（start 会写回 true；注解=false 仅用于识别唤醒
+    /// 观察期间新落地的 stop，以及状态展示）。
     pub(crate) async fn wake_app_on_traffic(
         &self,
         app_id: &str,
         budget: Duration,
-        explicit: bool,
     ) -> AppResult<WakeOutcome> {
         validate_app_id(app_id)?;
         let deadline = Instant::now() + budget;
@@ -44,17 +43,6 @@ impl AppService {
                 .validate_request_lifecycle(app_id, Some(&identity.lifecycle_id))
                 .await?;
             let status = self.fetch_runtime_status_or_err(app_id).await?;
-            if status.wake_on_traffic == Some(false) {
-                if !explicit {
-                    return Err(AppOperationError::InvalidState(
-                        "Application is intentionally stopped".into(),
-                    ));
-                }
-                tracing::info!(
-                    app_id,
-                    "Explicit ensure starts an intentionally stopped application"
-                );
-            }
             Ok::<_, AppOperationError>((guard, identity, status))
         };
         let (guard, identity, previous) = match timeout_at(deadline, preflight).await {
@@ -194,6 +182,8 @@ impl AppService {
                 ));
             }
             let status = self.fetch_runtime_status_or_err(app_id).await?;
+            // start 已把注解写回 true；此处再观察到 Some(false) 只可能是
+            // 唤醒观察期间新落地的 stop（多副本/竞态），终止本次唤醒。
             if status.wake_on_traffic == Some(false) {
                 return Err(AppOperationError::InvalidState(
                     "Application was stopped during traffic wake".into(),
