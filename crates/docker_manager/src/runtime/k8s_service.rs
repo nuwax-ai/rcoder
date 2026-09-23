@@ -1,7 +1,7 @@
 //! Kubernetes Service 生命周期管理
 //!
-//! 为每个 agent_runner Pod 创建对应的 K8s ClusterIP Service，
-//! 提供稳定的 DNS 名，用于 Envoy Gateway 路由发现。
+//! 为每个 agent_runner Pod 创建对应的 K8s Service（集群内用 ClusterIP，
+//! deploy-host 用 NodePort），提供稳定的 DNS 名及宿主机可达地址。
 //! 使用 trait extension 模式为 `KubernetesRuntime` 添加 Service 操作方法。
 
 #[cfg(feature = "kubernetes")]
@@ -103,7 +103,7 @@ pub(super) fn agent_service_object(
         },
         spec: Some(ServiceSpec {
             // deploy-host：NodePort（server 分配 nodePort，apply 后读回登记注册表，
-            // rcoder 进程在集群外经 127.0.0.1:{nodePort} 触达 agent）
+            // rcoder 进程经 RCODER_K8S_NODE_IP 指定的节点地址触达 agent）
             #[cfg(feature = "deploy-host")]
             type_: Some(
                 if shared_types::is_deploy_host() {
@@ -126,13 +126,20 @@ pub(super) fn agent_service_object(
 /// deploy-host：从 Service 读回 nodePort 并登记注册表（键 = identifier，
 /// 与 funnel 的 container_name 同源）。非 NodePort/未分配的端口跳过。
 #[cfg(feature = "deploy-host")]
-pub(super) fn register_service_node_ports(identifier: &str, svc: &Service) {
+pub(super) fn register_service_node_ports(
+    identifier: &str,
+    svc: &Service,
+) -> ContainerRuntimeResult<()> {
     if !shared_types::is_deploy_host() {
-        return;
+        return Ok(());
     }
     let Some(ports) = svc.spec.as_ref().and_then(|spec| spec.ports.as_ref()) else {
-        return;
+        return Err(ContainerRuntimeError::ConnectionError(
+            "NodePort Service has no ports".into(),
+        ));
     };
+    let host = shared_types::published::k8s_node_port_host()
+        .map_err(ContainerRuntimeError::ConfigurationError)?;
     let mut map = std::collections::HashMap::new();
     for port in ports {
         if let Some(node_port) = port.node_port {
@@ -140,8 +147,12 @@ pub(super) fn register_service_node_ports(identifier: &str, svc: &Service) {
             map.insert(container_port, node_port as u16);
         }
     }
-    if map.is_empty() {
-        return;
+    if map.len() != ports.len() {
+        return Err(ContainerRuntimeError::ConnectionError(format!(
+            "NodePort Service has {} of {} port assignments",
+            map.len(),
+            ports.len()
+        )));
     }
     let entries = map.len();
     // 双键注册：identifier（create_agent_service 的短名键）+ 完整 STS 名
@@ -156,17 +167,18 @@ pub(super) fn register_service_node_ports(identifier: &str, svc: &Service) {
         .filter(|pod_name| *pod_name != identifier)
         .map(str::to_owned);
     if let Some(pod_name) = &pod_key {
-        shared_types::published::register(pod_name, map.clone());
+        shared_types::published::register_node_ports(pod_name, host, map.clone());
         info!(
             "[deploy-host] NodePorts registered: identifier={}, entries={}",
             pod_name, entries
         );
     }
-    shared_types::published::register(identifier, map);
+    shared_types::published::register_node_ports(identifier, host, map);
     info!(
         "[deploy-host] NodePorts registered: identifier={}, entries={}",
         identifier, entries
     );
+    Ok(())
 }
 
 /// deploy-host：Service 的任一端口已分配 nodePort（创建瞬间常为 None）。
@@ -175,7 +187,37 @@ fn node_ports_assigned(svc: &Service) -> bool {
     svc.spec
         .as_ref()
         .and_then(|spec| spec.ports.as_ref())
-        .is_some_and(|ports| ports.iter().any(|p| p.node_port.is_some()))
+        .is_some_and(|ports| !ports.is_empty() && ports.iter().all(|p| p.node_port.is_some()))
+}
+
+#[cfg(feature = "deploy-host")]
+async fn register_service_node_ports_when_ready(
+    services: &Api<Service>,
+    svc_name: &str,
+    identifier: &str,
+    mut service: Service,
+) -> ContainerRuntimeResult<()> {
+    if !shared_types::is_deploy_host() {
+        return Ok(());
+    }
+    for attempt in 0..=10u32 {
+        if node_ports_assigned(&service) {
+            return register_service_node_ports(identifier, &service);
+        }
+        if attempt == 10 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        service = services.get(svc_name).await.map_err(|error| {
+            crate::runtime::builder_completion::k8s_error(
+                format!("Read NodePort Service '{svc_name}' after creation: {error}"),
+                error,
+            )
+        })?;
+    }
+    Err(ContainerRuntimeError::ConnectionError(format!(
+        "NodePort Service '{svc_name}' has incomplete port assignments"
+    )))
 }
 
 /// Service 是否已声明某端口（端口值口径；ClusterIP 只路由已声明的端口）
@@ -193,6 +235,12 @@ fn has_missing_expected_ports(svc: &Service, service_type: &ServiceType) -> bool
     agent_service_ports(service_type)
         .iter()
         .any(|p| !service_exposes_port(svc, p.port as u16))
+}
+
+#[cfg(feature = "deploy-host")]
+fn host_requires_node_port(svc: &Service) -> bool {
+    shared_types::is_deploy_host()
+        && svc.spec.as_ref().and_then(|spec| spec.type_.as_deref()) != Some("NodePort")
 }
 
 /// K8s 标准标签前缀
@@ -428,10 +476,16 @@ impl K8sServiceOps for KubernetesRuntime {
                 // `{svc}:{port}` 拨上游必超时）——条件 patch 写入期望端口
                 // 补齐（范式对齐 apply_app_service）。条件按期望清单逐端口
                 // 比对而非点名端口：后续清单再加端口，存量 svc 访问即自愈。
+                // 宿主机模式也将已有 ClusterIP 转为 NodePort，避免同一
+                // namespace 切换部署形态时失去可达地址。
                 // 仅 UserappBuilder 触发：读路径自愈（get_container_info 每次
                 // 经过这里）不对其他 agent 类型写放大。
+                #[cfg(feature = "deploy-host")]
+                let needs_node_port = host_requires_node_port(&existing);
+                #[cfg(not(feature = "deploy-host"))]
+                let needs_node_port = false;
                 if matches!(service_type, ServiceType::UserappBuilder)
-                    && has_missing_expected_ports(&existing, service_type)
+                    && (has_missing_expected_ports(&existing, service_type) || needs_node_port)
                 {
                     let desired =
                         agent_service_object(&self.namespace, &svc_name, identifier, service_type);
@@ -458,8 +512,12 @@ impl K8sServiceOps for KubernetesRuntime {
                             "Builder Service desired ports missing".into(),
                         )
                     })?;
-                    let body = serde_json::json!({"metadata": {"uid": uid, "resourceVersion": version}, "spec": {"ports": ports}});
-                    services
+                    let mut spec = serde_json::json!({"ports": ports});
+                    if needs_node_port {
+                        spec["type"] = serde_json::Value::String("NodePort".into());
+                    }
+                    let body = serde_json::json!({"metadata": {"uid": uid, "resourceVersion": version}, "spec": spec});
+                    let patched = services
                         .patch(
                             &svc_name,
                             &kube::api::PatchParams::default(),
@@ -473,22 +531,22 @@ impl K8sServiceOps for KubernetesRuntime {
                             )
                         })?;
                     info!(
-                        "[K8S] Service {} patched to converge expected ports (was missing some)",
+                        "[K8S] Service {} patched to converge ports and host reachability",
                         svc_name
                     );
                     // deploy-host：patch 新增端口的 nodePort 由 apiserver 异步分配，
                     // patch 前的 existing 拿不到——re-get 后注册（复用下方轮询）
                     #[cfg(feature = "deploy-host")]
-                    if shared_types::is_deploy_host()
-                        && let Ok(refetched) = services.get(&svc_name).await
-                    {
-                        register_service_node_ports(identifier, &refetched);
-                    }
+                    register_service_node_ports_when_ready(
+                        &services, &svc_name, identifier, patched,
+                    )
+                    .await?;
                     return Ok(());
                 }
                 debug!("[K8S] Service {} already exists", svc_name);
                 #[cfg(feature = "deploy-host")]
-                register_service_node_ports(identifier, &existing);
+                register_service_node_ports_when_ready(&services, &svc_name, identifier, existing)
+                    .await?;
                 return Ok(());
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {}
@@ -502,7 +560,7 @@ impl K8sServiceOps for KubernetesRuntime {
 
         let service = agent_service_object(&self.namespace, &svc_name, identifier, service_type);
 
-        let created_svc = services
+        let _created_svc = services
             .create(&PostParams::default(), &service)
             .await
             .map_err(|e| {
@@ -511,32 +569,11 @@ impl K8sServiceOps for KubernetesRuntime {
                     e,
                 )
             })?;
-        // deploy-host：nodePort 由 apiserver 异步分配——create 响应里常为 None，
-        // 直接注册会得到空表（宿主机实测回退 127.0.0.1:容器端口的根因）。
-        // re-get 轮询直至分配（有界 10×500ms），再登记注册表。
+        // deploy-host：NodePort 可能在 create 响应后才分配，必须等全量
+        // 端口到齐并登记，才能把 Service 创建视作完成。
         #[cfg(feature = "deploy-host")]
-        if shared_types::is_deploy_host() {
-            let mut svc = created_svc;
-            if !node_ports_assigned(&svc) {
-                for attempt in 0..10u32 {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    match services.get(&svc_name).await {
-                        Ok(refetched) => {
-                            svc = refetched;
-                            if node_ports_assigned(&svc) {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "[deploy-host] re-get Service '{svc_name}' for nodePort attempt {attempt}: {e}"
-                            );
-                        }
-                    }
-                }
-            }
-            register_service_node_ports(identifier, &svc);
-        }
+        register_service_node_ports_when_ready(&services, &svc_name, identifier, _created_svc)
+            .await?;
 
         info!(
             "[K8S] Service {} created for {} ({})",
@@ -706,6 +743,25 @@ mod tests {
             &base,
             &ServiceType::ComputerAgentRunner
         ));
+    }
+
+    #[cfg(feature = "deploy-host")]
+    #[test]
+    fn complete_cluster_ip_builder_still_requires_host_reachability() {
+        let mut service = agent_service_object(
+            "ns",
+            "rcoder-app-builder-1-svc",
+            "1",
+            &ServiceType::UserappBuilder,
+        );
+        service.spec.as_mut().expect("service spec").type_ = Some("ClusterIP".into());
+        assert!(!has_missing_expected_ports(
+            &service,
+            &ServiceType::UserappBuilder
+        ));
+        assert!(host_requires_node_port(&service));
+        service.spec.as_mut().expect("service spec").type_ = Some("NodePort".into());
+        assert!(!host_requires_node_port(&service));
     }
 
     #[test]

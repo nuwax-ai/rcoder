@@ -135,12 +135,8 @@ impl AppService {
             dev_locator: std::sync::RwLock::new(None),
             builder_recovery: std::sync::RwLock::new(None),
         };
-        // K8s Pingora 模式：启动时从集群重建 Pingora backends——修复 pingora_ports 内存态
-        // 丢失导致的重启 silent 404（list_deployments 的 expose_type 已由 Deployment annotation
-        // 准确还原）。重建失败时不能对外声称就绪。
-        if svc.config.access_mode == AppAccessMode::Kubernetes
-            && svc.config.http_expose == HttpExpose::Pingora
-        {
+        // Rebuild routes from the actual runtime in both Docker and K8s.
+        if svc.config.http_expose == HttpExpose::Pingora {
             svc.rebuild_pingora_backends().await?;
         }
         // 重建活动状态内存态(rcoder 重启后 last_accessed/stopped 丢失):

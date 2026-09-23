@@ -26,6 +26,58 @@ pub(crate) fn create_request(app_id: &str) -> CreateAppRequest {
 }
 
 #[tokio::test]
+async fn docker_startup_restores_only_current_running_http_backends() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runtime = Arc::new(MockRuntime::default());
+    let mut service = test_service(root.path(), runtime.clone()).await;
+    service.config.http_expose = HttpExpose::Pingora;
+    let pingora = Arc::new(PingoraProxyService::new(
+        rcoder_proxy::ProxyConfig::default(),
+    ));
+    service.pingora = Some(pingora.clone());
+    for (app_id, running, matching) in [
+        ("runningapp", true, true),
+        ("stoppedapp", false, true),
+        ("foreignapp", true, false),
+    ] {
+        let identity = service
+            .metadata
+            .store
+            .ensure_identity(app_id)
+            .await
+            .expect("application identity");
+        runtime.deployments.insert(
+            app_id.into(),
+            DeploymentStatus {
+                app_id: app_id.into(),
+                lifecycle_id: Some(if matching {
+                    identity.lifecycle_id
+                } else {
+                    "oldlifecycle".into()
+                }),
+                replicas: i32::from(running),
+                pod_ip: running.then(|| "10.0.0.7".into()),
+                ports: vec![AppPortStatus {
+                    name: "http".into(),
+                    port: 9080,
+                    expose_type: container_runtime_api::ExposeType::Http,
+                    external_port: None,
+                }],
+                ..Default::default()
+            },
+        );
+    }
+    service
+        .rebuild_pingora_backends()
+        .await
+        .expect("rebuild routes");
+    assert!(pingora.remove_app_backend("runningapp", 9080));
+    assert!(!pingora.remove_app_backend("stoppedapp", 9080));
+    assert!(!pingora.remove_app_backend("foreignapp", 9080));
+    assert_eq!(service.registered_http_ports("stoppedapp"), vec![9080]);
+}
+
+#[tokio::test]
 async fn failed_update_restores_registered_ports_not_drifted_live_ports() {
     let root = tempfile::tempdir().expect("tempdir");
     let runtime = Arc::new(MockRuntime::default());
@@ -3138,6 +3190,22 @@ fn restart_image_env() {
             "registry.test/app-runtime:ut",
         );
     }
+}
+
+#[tokio::test]
+async fn bare_start_rolls_existing_app_to_platform_image() {
+    restart_image_env();
+    let root = tempfile::tempdir().expect("directory");
+    let (service, runtime) = created_app_service(root.path(), "imagestart").await;
+    service
+        .start_app_enhanced("imagestart", StartAppRequest::default())
+        .await
+        .expect("bare start");
+    assert_eq!(runtime.restart_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        runtime.restart_images.lock().expect("images").as_slice(),
+        &[Some("registry.test/app-runtime:ut".to_string())]
+    );
 }
 
 /// 裸 restart（无 url/env）把平台默认镜像传给运行时，且保持单次定向写：

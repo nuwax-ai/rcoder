@@ -419,6 +419,7 @@ mod builder_retry_tests {
                             context: context.clone(),
                             resource_binding: None,
                             pod: None,
+                            restart_image: None,
                             workload: Some(shared_types::AppResourceIdentity {
                                 kind: shared_types::AppResourceKind::Container,
                                 name: "builder".into(),

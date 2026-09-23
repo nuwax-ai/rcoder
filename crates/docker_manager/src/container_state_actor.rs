@@ -57,6 +57,13 @@ pub enum ContainerStateCommand {
         updated_info: DockerContainerInfo,
         reply: oneshot::Sender<bool>,
     },
+    /// Apply an inspect result only to the physical container that was queried.
+    UpdateIfContainerId {
+        key: String,
+        container_id: String,
+        updated_info: DockerContainerInfo,
+        reply: oneshot::Sender<bool>,
+    },
     /// 条件移除：只有当 container_id 匹配时才移除
     RemoveIfContainerId {
         key: String,
@@ -182,6 +189,24 @@ impl ContainerStateActor {
                 self.bump_epoch();
                 if reply.send(existed).is_err() {
                     warn!("[ACTOR] UpdateWith reply channel closed");
+                }
+            }
+            ContainerStateCommand::UpdateIfContainerId {
+                key,
+                container_id,
+                updated_info,
+                reply,
+            } => {
+                let updated = match self.containers.get_mut(&key) {
+                    Some(current) if current.container_id == container_id => {
+                        *current = updated_info;
+                        self.bump_epoch();
+                        true
+                    }
+                    _ => false,
+                };
+                if reply.send(updated).is_err() {
+                    warn!("[ACTOR] UpdateIfContainerId reply channel closed");
                 }
             }
             ContainerStateCommand::RemoveIfContainerId {
@@ -408,6 +433,33 @@ impl ContainerStateHandle {
         })
     }
 
+    pub async fn update_if_container_id(
+        &self,
+        key: &str,
+        container_id: &str,
+        info: DockerContainerInfo,
+    ) -> bool {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .sender
+            .send(ContainerStateCommand::UpdateIfContainerId {
+                key: key.to_owned(),
+                container_id: container_id.to_owned(),
+                updated_info: info,
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            error!("[HANDLE] Failed to send UpdateIfContainerId command - actor stopped");
+            return false;
+        }
+        rx.await.unwrap_or_else(|_| {
+            error!("[HANDLE] UpdateIfContainerId reply failed - actor task died");
+            false
+        })
+    }
+
     /// 条件移除：只有当 container_id 匹配时才移除
     ///
     /// 防止在清理时误删刚重启的容器（CAS 操作）
@@ -527,5 +579,26 @@ mod tests {
         // 只读操作不递增
         assert!(handle.get("missing").await.is_none());
         assert_eq!(handle.list_epoch(), after_conditional, "get 不改变代次");
+    }
+
+    #[tokio::test]
+    async fn late_inspect_cannot_replace_new_physical_container() {
+        let (actor, handle) = ContainerStateActor::new();
+        tokio::spawn(actor.run());
+        let old = minimal_info("builder");
+        let mut replacement = old.clone();
+        replacement.container_id = "replacement-id".into();
+        let old_id = old.container_id.clone();
+        handle.insert("builder".into(), old.clone()).await;
+        handle.insert("builder".into(), replacement.clone()).await;
+        assert!(!handle.update_if_container_id("builder", &old_id, old).await);
+        assert_eq!(
+            handle
+                .get("builder")
+                .await
+                .expect("replacement")
+                .container_id,
+            replacement.container_id
+        );
     }
 }

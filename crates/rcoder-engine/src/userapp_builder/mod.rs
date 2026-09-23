@@ -8,6 +8,7 @@
 
 pub mod adoption;
 pub mod app_adoption;
+pub(crate) mod auto_repair;
 pub mod compute_control;
 pub mod control;
 mod creation;
@@ -155,6 +156,13 @@ async fn ensure_builder_target_until(
         Some(identity) => identity,
         None => state.userapp_store.ensure_identity(app_id).await?,
     };
+    if let Some(repair) = auto_repair::repair_if_needed(state, app_id, None).await? {
+        return Err(anyhow!(
+            "Published builder address unavailable; automatic repair operation={} state={:?}",
+            repair.operation_id,
+            repair.state
+        ));
+    }
     if !builder_fenced_by_current_operation(state, &identity).await?
         && let Some(info) = registered_or_discovered_builder(state, instance).await?
         && let Some(verified) = cross_verify_registration(state, app_id, instance, &info).await?
@@ -222,6 +230,13 @@ async fn ensure_userapp_builder_probed_until(
         Some(identity) => identity,
         None => state.userapp_store.ensure_identity(app_id).await?,
     };
+    if let Some(repair) = auto_repair::repair_if_needed(state, app_id, None).await? {
+        return Err(anyhow!(
+            "Published builder address unavailable; automatic repair operation={} state={:?}",
+            repair.operation_id,
+            repair.state
+        ));
+    }
     let fenced = builder_fenced_by_current_operation(state, &identity).await?;
 
     /// 就绪裁决后创建（lifecycle admit 路径）。`lease`：进程内互斥，
@@ -237,7 +252,7 @@ async fn ensure_userapp_builder_probed_until(
     }
 
     if !fenced && let Some(info) = registered_or_discovered_builder(state, instance).await? {
-        let addr = dev_file_server_addr(state, &info);
+        let addr = dev_file_server_addr(state, &info)?;
         if probe_file_server(&addr).await {
             // 探活过 ≠ 归属正确：跨族污染形态下生产容器的 file-server 同样在
             // 60000 应答（探活恒过、remediation 永不触发）——追加归属交叉校验
@@ -436,15 +451,15 @@ async fn probe_file_server(addr: &str) -> bool {
 }
 
 /// 开发容器 file-server 地址（`http://{host}:60000`）。
-pub fn dev_file_server_addr(state: &AppState, info: &ContainerBasicInfo) -> String {
+pub fn dev_file_server_addr(state: &AppState, info: &ContainerBasicInfo) -> Result<String> {
     let addr = shared_types::build_container_port_addr(
         &info.container_name,
         &info.container_ip,
         &state.config.app_manager.namespace,
         &state.cluster_domain,
         AGENT_FILE_SERVER_PORT,
-    );
-    format!("http://{addr}")
+    )?;
+    Ok(format!("http://{addr}"))
 }
 
 /// 纯解析:只查 state.projects,无副作用（短路语义 peek 复用——只读判定
@@ -454,6 +469,77 @@ pub(crate) fn registered_builder(state: &AppState, instance: &str) -> Option<Con
         .projects
         .get(instance)
         .and_then(|p| p.container_info())
+}
+
+/// Physical state for `/computer/pod/ensure`. The management file server and
+/// app-cli may still be starting or failed; they are not a reason to report a
+/// running container as absent or to block an explicit compute restart.
+pub enum BuilderComputeState {
+    Running(ContainerBasicInfo),
+    /// The controller/container still exists and can be started in place.
+    StoppedRetained,
+    /// Docker AutoRemove removed the container after a confirmed Stop.
+    StoppedRemoved,
+    Missing,
+}
+
+pub async fn inspect_builder_compute(
+    state: &AppState,
+    app_id: &str,
+) -> Result<BuilderComputeState> {
+    let app = adoption::discover_missing_identity(state, app_id).await?;
+    let Some(app) = app else {
+        return Ok(BuilderComputeState::Missing);
+    };
+    if let Some(actual) = state
+        .runtime()
+        .find_container(app_id, &ServiceType::UserappBuilder)
+        .await?
+    {
+        validate_builder_identity(app_id, &actual)?;
+        if actual.status == container_runtime_api::ContainerRuntimeStatus::Running {
+            adoption::verify_live_builder(state, app_id, app_id, &actual.container_id).await?;
+            state
+                .userapp_store
+                .check_compute_access(app_id, shared_types::UserAppOperationScope::Dev, false)
+                .await?;
+            return Ok(BuilderComputeState::Running(ContainerBasicInfo {
+                container_id: actual.container_id,
+                container_name: actual.container_name,
+                container_ip: actual.container_ip,
+                internal_port: AGENT_FILE_SERVER_PORT,
+                external_port: 0,
+                project_id: app_id.into(),
+                status: String::from(actual.status),
+                created_at: actual.created_at,
+                service_url: String::new(),
+                workload_uid: actual.workload_uid,
+            }));
+        }
+    }
+    let context = shared_types::UserAppExecutionContext {
+        app_id: app_id.to_owned(),
+        lifecycle_id: app.lifecycle_id.clone(),
+        operation_id: "physical-compute-observation".into(),
+        executor_id: "reader".into(),
+        request_fingerprint: "0".repeat(64),
+    };
+    let target = adoption::capture_bound_target(state, &context).await?;
+    let stopped_intent = state
+        .userapp_store
+        .compute_desired_stopped(
+            app_id,
+            &app.lifecycle_id,
+            shared_types::UserAppOperationScope::Dev,
+        )
+        .await?;
+    Ok(if target.workload.is_some() {
+        BuilderComputeState::StoppedRetained
+    } else if stopped_intent {
+        BuilderComputeState::StoppedRemoved
+    } else {
+        BuilderComputeState::Missing
+    })
 }
 
 /// Registry misses perform an authoritative read before creating anything.
@@ -549,7 +635,7 @@ async fn confirm_builder_ready_inner(
                 if actual.container_id != info.container_id {
                     return Err(anyhow!("Builder resource replaced before readiness"));
                 }
-                if probe_file_server(&dev_file_server_addr(state, &actual)).await {
+                if probe_file_server(&dev_file_server_addr(state, &actual)?).await {
                     return Ok(actual);
                 }
             }

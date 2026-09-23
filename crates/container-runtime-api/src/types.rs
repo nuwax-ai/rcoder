@@ -741,6 +741,10 @@ impl std::fmt::Display for ContainerFailureReason {
 pub struct DeploymentStatus {
     /// 应用 ID（app_id）
     pub app_id: String,
+    /// Docker owner label, used when restoring in-memory routes after a
+    /// controller restart. Older/unlabelled containers remain untrusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_id: Option<String>,
     /// 期望副本数
     pub replicas: i32,
     /// 就绪副本数

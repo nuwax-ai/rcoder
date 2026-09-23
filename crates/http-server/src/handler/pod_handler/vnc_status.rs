@@ -230,7 +230,7 @@ async fn probe_vnc_via_grpc(
         target.ip,
         &state.config.app_manager.namespace,
         &state.cluster_domain,
-    );
+    )?;
 
     match state.grpc_pool.get_client(&grpc_addr).await {
         Ok(mut client) => {

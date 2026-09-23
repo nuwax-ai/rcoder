@@ -120,7 +120,8 @@ async fn resolve_existing_dev(
         namespace,
         cluster_domain,
         shared_types::AGENT_FILE_SERVER_PORT,
-    );
+    )
+    .map_err(|error| HttpResultError::bad_gateway(error.to_string()))?;
     Ok(Some(format!("http://{addr}")))
 }
 
@@ -481,6 +482,24 @@ mod authoritative_lookup_tests {
 
     #[tokio::test]
     async fn replica_without_registry_resolves_runtime_and_preserves_query_failure() {
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            assert!(
+                resolve_existing_dev(
+                    async { Ok(Some(builder())) },
+                    "appa",
+                    "test",
+                    "cluster.local",
+                )
+                .await
+                .is_err(),
+                "host reach must not guess a local container port"
+            );
+            shared_types::published::register(
+                "rcoder-app-builder-app-a",
+                std::collections::HashMap::from([(60000, 36000)]),
+            );
+        }
         let resolved = resolve_existing_dev(
             async { Ok(Some(builder())) },
             "appa",
@@ -492,8 +511,7 @@ mod authoritative_lookup_tests {
         // Use the shared crate's effective feature selection, including Cargo
         // feature unification, while asserting the complete address contract.
         let expected = if shared_types::is_deploy_host() {
-            // 容器未登记发布端口：回退 loopback:容器端口（运行期 warn 可归因）
-            "http://127.0.0.1:60000"
+            "http://127.0.0.1:36000"
         } else if shared_types::is_kubernetes_runtime() {
             "http://rcoder-app-builder-app-a-svc.test.svc.cluster.local:60000"
         } else {

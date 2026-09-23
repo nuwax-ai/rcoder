@@ -127,7 +127,7 @@ impl AgentMgmtForwardCtx {
             &container.container_ip,
             &self.namespace,
             &self.cluster_domain,
-        );
+        )?;
 
         self.pool.get_mgmt_client(&addr).await.map_err(|e| {
             warn!("[agent_mgmt_forward] gRPC connect failed: addr={addr}, err={e}");

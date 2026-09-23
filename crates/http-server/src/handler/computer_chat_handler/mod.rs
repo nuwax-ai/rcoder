@@ -343,7 +343,13 @@ async fn run_userapp_dev_chat_flow(
     state.update_activity(&instance_key);
 
     // 3. workspace 就绪（容器内幂等建目录；userapp_forward 公共调用）
-    let addr = crate::userapp_builder::dev_file_server_addr(&state, &container_info);
+    let addr =
+        crate::userapp_builder::dev_file_server_addr(&state, &container_info).map_err(|error| {
+            ChatFlowExit::response(HttpResult::error(
+                shared_types::error_codes::ERR_CONTAINER_ERROR,
+                &error.to_string(),
+            ))
+        })?;
     if let Err(e) = crate::userapp_forward::ensure_workspace_via_dev(&addr, &project_id).await {
         error!("[USERAPP_DEV_CHAT] {e}: app_id={project_id}");
         return Err(ChatFlowExit::response(HttpResult::error_with_locale(

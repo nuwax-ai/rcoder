@@ -575,6 +575,7 @@ mod tests {
                     resource_version: Some("9".into()),
                 }),
                 pod: None,
+                restart_image: None,
             })
         }
         async fn capture_bound_builder_control(
@@ -596,6 +597,7 @@ mod tests {
                     resource_version: Some("9".into()),
                 }),
                 pod: None,
+                restart_image: None,
             })
         }
         async fn apply_builder_control(
@@ -749,6 +751,7 @@ mod tests {
                 request_id: "prioritystop".into(),
                 request_fingerprint: "a".repeat(64),
                 action: shared_types::ComputeControlAction::Stop,
+                restart_image_roll: false,
             })
             .await
             .unwrap();

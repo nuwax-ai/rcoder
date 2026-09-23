@@ -148,7 +148,8 @@ async fn resolve_dev_addr_inner(
             }
         }
     };
-    let mut addr = dev_file_server_addr(state, &info);
+    let mut addr = dev_file_server_addr(state, &info)
+        .map_err(|error| HttpResultError::bad_gateway(error.to_string()).into_boxed_response())?;
     // 探活正缓存(30s): 每次转发都探活会给高频文件操作(批量列表/读写)平添一个
     // RTT; 成功后窗口内免探。失败路径(自愈重建)不受缓存影响; 窗口内死容器漏检
     // 可接受——send 失败仍会 502, 下一请求自愈。
@@ -182,7 +183,9 @@ async fn resolve_dev_addr_inner(
                 // probe 超时+inspect 一次。窗口内容器真死漏检与既有语义一致
                 // （send 失败 502，下一请求自愈）。
                 cache.insert(probe_key, std::time::Instant::now());
-                return Ok(dev_file_server_addr(state, &info));
+                return dev_file_server_addr(state, &info).map_err(|error| {
+                    HttpResultError::bad_gateway(error.to_string()).into_boxed_response()
+                });
             }
             crate::userapp_builder::RegistryRemediation::Gone => {
                 // Re-enter coordinated ensure, which rechecks the latest registry
@@ -194,7 +197,9 @@ async fn resolve_dev_addr_inner(
                         warn!("[USERAPP_FORWARD] re-ensure dev container failed: app_id={app_id}: {e:#}");
                         builder_control_response(&e)
                     })?;
-                addr = dev_file_server_addr(state, &info);
+                addr = dev_file_server_addr(state, &info).map_err(|error| {
+                    HttpResultError::bad_gateway(error.to_string()).into_boxed_response()
+                })?;
                 // 重建的新容器可能仍在启动(agent_runner+file-server+PG 全套)——不写探活
                 // 缓存, 由本次 send 定成败; 下一请求重新探活
                 return Ok(addr);
@@ -214,7 +219,9 @@ async fn resolve_dev_addr_inner(
                 })?
         {
             cache.insert(probe_key, std::time::Instant::now());
-            return Ok(dev_file_server_addr(state, &updated));
+            return dev_file_server_addr(state, &updated).map_err(|error| {
+                HttpResultError::bad_gateway(error.to_string()).into_boxed_response()
+            });
         }
         return Err(
             HttpResultError::bad_gateway("Builder is no longer running").into_boxed_response()

@@ -14,9 +14,35 @@ use toasty_core::schema::db::Type;
 pub(super) fn sql(backend: Backend, source: &str) -> String {
     match backend {
         Backend::Postgres => source.to_owned(),
-        Backend::Turso => source.replace('$', "?"),
+        Backend::Turso => {
+            let mut translated = String::with_capacity(source.len());
+            let mut chars = source.chars().peekable();
+            let mut quote = None;
+            while let Some(ch) = chars.next() {
+                if let Some(delimiter) = quote {
+                    translated.push(ch);
+                    if ch == delimiter {
+                        if chars.peek() == Some(&delimiter) {
+                            chars.next();
+                            translated.push(delimiter);
+                        } else {
+                            quote = None;
+                        }
+                    }
+                } else if ch == '\'' || ch == '"' {
+                    quote = Some(ch);
+                    translated.push(ch);
+                } else if ch == '$' && chars.peek().is_some_and(char::is_ascii_digit) {
+                    translated.push('?');
+                } else {
+                    translated.push(ch);
+                }
+            }
+            translated
+        }
     }
 }
+
 pub(super) fn strings(rows: Vec<toasty_core::stmt::Value>) -> Result<Vec<String>, Error> {
     use toasty_core::stmt::Value;
     rows.into_iter()
@@ -82,6 +108,7 @@ pub(super) async fn claim_app(
     }
     Ok(())
 }
+
 pub(super) async fn app(
     tx: &mut dyn Executor,
     app_id: &str,
@@ -299,4 +326,19 @@ pub(super) async fn save_operation(
         return Err(Error::VersionConflict);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod sql_tests {
+    use super::*;
+
+    #[test]
+    fn turso_placeholders_preserve_json_paths_and_quoted_text() {
+        let source = "SELECT json_extract(checkpoint_json, '$.builder_restart_template'), 'it''s $2', \"$3\" FROM controls WHERE operation_id=$1";
+        assert_eq!(
+            sql(Backend::Turso, source),
+            "SELECT json_extract(checkpoint_json, '$.builder_restart_template'), 'it''s $2', \"$3\" FROM controls WHERE operation_id=?1"
+        );
+        assert_eq!(sql(Backend::Postgres, source), source);
+    }
 }

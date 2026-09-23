@@ -86,21 +86,23 @@ pub fn start_container_sync_task(
                                                 &container.container_name,
                                                 shared_types::GRPC_DEFAULT_PORT,
                                             )
-                                            .to_string()
+                                            .ok().map(|addr| addr.to_string())
                                         } else {
-                                            format!(
+                                            Some(format!(
                                                 "{}:{}",
                                                 container.container_ip,
                                                 shared_types::GRPC_DEFAULT_PORT
-                                            )
+                                            ))
                                         };
                                         #[cfg(not(feature = "deploy-host"))]
-                                        let grpc_addr = format!(
+                                        let grpc_addr = Some(format!(
                                             "{}:{}",
                                             container.container_ip,
                                             shared_types::GRPC_DEFAULT_PORT
-                                        );
-                                        grpc_pool.remove(&grpc_addr).await;
+                                        ));
+                                        if let Some(grpc_addr) = grpc_addr {
+                                            grpc_pool.remove(&grpc_addr).await;
+                                        }
                                     }
                                 }
                             }

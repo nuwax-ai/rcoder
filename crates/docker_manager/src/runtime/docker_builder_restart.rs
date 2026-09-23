@@ -68,16 +68,15 @@ fn sha256_hex(payload: &[u8]) -> String {
         .collect()
 }
 
-fn archive_path(context: &UserAppExecutionContext, name: &str) -> Result<PathBuf> {
+async fn archive_path(context: &UserAppExecutionContext, name: &str) -> Result<PathBuf> {
     context
         .validate_identity(&context.app_id)
         .map_err(Error::ConfigurationError)?;
-    Ok(
-        PathBuf::from(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
-            .join(".app-operation-receipts")
-            .join(&context.app_id)
-            .join(format!("{name}.json")),
-    )
+    Ok(super::docker_compute_receipt::receipts_base()
+        .await?
+        .join(".app-operation-receipts")
+        .join(&context.app_id)
+        .join(format!("{name}.json")))
 }
 
 /// Resolved bind mounts as comparable witnesses. `name` is the container
@@ -386,7 +385,7 @@ impl DockerRuntime {
         }
         let digest = sha256_hex(&payload);
         let name = format!("builder-restart-{}.{}", &digest[..32], &digest[32..]);
-        let path = archive_path(&target.context, &name)?;
+        let path = archive_path(&target.context, &name).await?;
         persist_exclusive(path, payload).await?;
         Ok(Some(BuilderRestartTemplate {
             source: target.clone(),
@@ -414,7 +413,7 @@ impl DockerRuntime {
         {
             return Err(conflict("Invalid restart archive identity"));
         }
-        let path = archive_path(&template.source.context, &template.archive.name)?;
+        let path = archive_path(&template.source.context, &template.archive.name).await?;
         let payload = read_archive(path)
             .await?
             .ok_or_else(|| conflict("Restart archive payload is missing"))?;
@@ -442,6 +441,14 @@ impl DockerRuntime {
         .is_some()
         {
             return Err(conflict("Original builder still exists"));
+        }
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            shared_types::published::unregister_if_physical(&original.name, &original.uid);
+            shared_types::published::unregister_if_physical(
+                &template.source.context.app_id,
+                &original.uid,
+            );
         }
         // Idempotent re-entry: an interrupted restore may have created the
         // replacement already. Accept only this archive's marker, never a
@@ -529,21 +536,8 @@ impl DockerRuntime {
         if bind_witness(&inspect)? != template.volumes {
             return Err(conflict("Restart workspace binds changed"));
         }
-        // deploy-host：replacement 容器是新物理实例，刷新寻址登记（与
-        // compute_mode 钩子可能双触发——整条目幂等替换，无害）
-        #[cfg(feature = "deploy-host")]
-        if shared_types::is_deploy_host()
-            && let Err(error) = crate::deploy_host_ports::register_reach_from_inspect(
-                &resource.name,
-                None,
-                &inspect,
-            )
-        {
-            tracing::warn!(
-                "[deploy-host] builder restart reach refresh {} failed: {error}",
-                resource.name
-            );
-        }
+        // Replacement is deliberately stopped here. Its Direct IP and
+        // published ports are not available until start_builder_compute.
         Ok(restored)
     }
 
@@ -554,7 +548,7 @@ impl DockerRuntime {
         if template.archive.kind != AppResourceKind::File || template.archive.uid.is_empty() {
             return Err(conflict("Invalid restart archive identity"));
         }
-        let path = archive_path(&template.source.context, &template.archive.name)?;
+        let path = archive_path(&template.source.context, &template.archive.name).await?;
         match read_archive(path.clone()).await? {
             None => Ok(()),
             Some(payload) => {
@@ -659,11 +653,36 @@ fn restore_body(
                 .unwrap_or_else(|| "bridge".into()),
         )
     };
+    // This is the same service-type port policy used by initial builder
+    // creation. Do not serialize host ports into Archive: Docker allocates new
+    // ports for every physical replacement.
+    #[cfg(feature = "deploy-host")]
+    let port_bindings = if shared_types::is_deploy_host()
+        && !crate::deploy_host_ports::suppress_port_publishing()
+    {
+        Some(
+            crate::deploy_host_ports::published_ports_for(&ServiceType::UserappBuilder)
+                .into_iter()
+                .map(|port| {
+                    (
+                        format!("{port}/tcp"),
+                        Some(vec![bollard::models::PortBinding {
+                            host_ip: Some("0.0.0.0".into()),
+                            host_port: None,
+                        }]),
+                    )
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
     let host_config = bollard::models::HostConfig {
         binds: Some(archive.binds.clone()),
         network_mode: Some(network_mode),
-        // Preserve the original lifecycle semantics: the replacement is also
-        // removed by the daemon when it next stops.
+        #[cfg(feature = "deploy-host")]
+        port_bindings,
+        // Stop releases the compute container; workspace data remains on its mounts.
         auto_remove: Some(true),
         security_opt: archive.security_opt.clone(),
         memory: archive.memory,

@@ -883,7 +883,7 @@ async fn verify_url_lightweight_deploy_without_release_id(
     user: &str,
     release_id: &str,
     sha256: &str,
-) {
+) -> bool {
     let artifact_url = format!(
         "{}/api/v1/userapp/static/{app}?release_id={release_id}&user_id={user}",
         rcoder_internal()
@@ -931,7 +931,7 @@ async fn verify_url_lightweight_deploy_without_release_id(
         format!("confirmation took {:.1}s", t0.elapsed().as_secs_f64()),
     );
     if !ok {
-        return;
+        return false;
     }
     let container = format!("rcoder-app-{app}");
     let inspect = std::process::Command::new("docker")
@@ -1007,6 +1007,55 @@ async fn verify_url_lightweight_deploy_without_release_id(
         traffic_ok,
         format!("{:.0}s 内未恢复", t1.elapsed().as_secs_f64()),
     );
+    // The HTTP deployment response and deploy_stage=succeeded only acknowledge
+    // artifact activation. An old proxy listener can still serve /react/ while
+    // this exact operation is orchestrating. Keep the normal Stop/Start case
+    // after its own terminal outcome; interruption has a separate control test.
+    let started = Instant::now();
+    let mut last_status = status;
+    let mut running = false;
+    while started.elapsed() < ready_budget() {
+        let observed = std::process::Command::new("docker")
+            .args([
+                "exec",
+                &container,
+                "wget",
+                "-T",
+                "5",
+                "-qO-",
+                "http://127.0.0.1:3010/v1/deploy/status",
+            ])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| serde_json::from_slice::<Value>(&output.stdout).ok());
+        if let Some(body) = observed {
+            let operation = &body["data"]["operation"];
+            if operation["operation_id"].as_str() == expected_operation
+                && operation["deployment_generation_id"].as_str() == expected_generation
+                && operation["request_release_id"].as_str() == request_release_id.as_deref()
+            {
+                let phase = operation["phase"].as_str();
+                running = phase == Some("running");
+                let failed = phase == Some("failed");
+                last_status = Some(body);
+                if running || failed {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    report.assert_hard(
+        "轻量重部署当前操作编排完成",
+        running,
+        format!(
+            "operation={expected_operation:?}, {:.0}s, status={}",
+            started.elapsed().as_secs_f64(),
+            trunc(&last_status.unwrap_or(Value::Null), 500)
+        ),
+    );
+    traffic_ok && running
 }
 
 /// 部署后 prod 观测族验收（health / logs 三接口 / stats / events）——运行态
@@ -2204,7 +2253,7 @@ async fn userapp_deploy_full_chain() {
         verify_failed_image_update_preserves_runtime(&env, &report, &app, user).await;
         verify_hot_redeploy(&env, &report, &app, user, &release_id, &sha256).await;
         // 轻量部署（无 release_id，独立操作身份确认），同样在独立账号改密后验证。
-        verify_url_lightweight_deploy_without_release_id(
+        let lightweight_ready = verify_url_lightweight_deploy_without_release_id(
             &env,
             &report,
             &app,
@@ -2213,11 +2262,13 @@ async fn userapp_deploy_full_chain() {
             &sha256,
         )
         .await;
-        verify_stop_and_explicit_start(&env, &report, &app, user).await;
-        // Last business mutation: later explicit restart requires caller-owned
-        // application credential configuration, not automatic platform injection.
-        verify_immediate_runtime_password(&env, &report, &app, user).await;
-        verify_password_governance_after_change(&env, &report, &app, user).await;
+        if lightweight_ready {
+            verify_stop_and_explicit_start(&env, &report, &app, user).await;
+            // Last business mutation: later explicit restart requires caller-owned
+            // application credential configuration, not automatic platform injection.
+            verify_immediate_runtime_password(&env, &report, &app, user).await;
+            verify_password_governance_after_change(&env, &report, &app, user).await;
+        }
         cleanup_prod(&env, &report, &app, user).await;
     }
     // No production request was sent when build/artifact preparation failed.

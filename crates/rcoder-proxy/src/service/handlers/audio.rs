@@ -98,7 +98,7 @@ pub async fn handle_audio_request(
     ctx.upstream_host = Some(super::super::upstream::dial_addr(
         &container_ip,
         target_port,
-    ));
+    )?);
 
     info!(
         "[AUDIO] Audio proxy: user_id={}, project_id={}, path={}, target={}:{}",
@@ -164,9 +164,9 @@ pub async fn handle_audio_upstream(
     // 保存音频目标 IP 到上下文（用于响应过滤）
     ctx.vnc_target_ip = Some(container_ip.clone());
 
-    let peer_addr = super::super::upstream::dial_addr(&container_ip, target_port);
+    let peer_addr = super::super::upstream::dial_addr(&container_ip, target_port)?;
     let mut peer = Box::new(HttpPeer::new(
-        super::super::upstream::dial_peer(&container_ip, target_port),
+        super::super::upstream::dial_peer(&container_ip, target_port)?,
         false,          // 不使用 TLS
         "".to_string(), // SNI
     ));

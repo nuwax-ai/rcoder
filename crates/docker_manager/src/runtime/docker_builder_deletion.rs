@@ -3,6 +3,29 @@ use super::docker_runtime::DockerRuntime;
 use container_runtime_api::{ContainerRuntimeError as Error, ContainerRuntimeResult as Result};
 use shared_types::{AppResourceIdentity, AppResourceKind, BuilderDeletionSnapshot, ServiceType};
 
+async fn application_lease_root() -> Result<std::path::PathBuf> {
+    #[cfg(feature = "deploy-host")]
+    if shared_types::is_deploy_host() {
+        if let Ok(root) = std::env::var("RCODER_OPERATION_LOCK_ROOT")
+            && !root.trim().is_empty()
+        {
+            return Ok(std::path::PathBuf::from(root));
+        }
+        return crate::path::resolve_container_path_to_host(std::path::Path::new(
+            shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT,
+        ))
+        .await
+        .map_err(|error| {
+            Error::DockerError(format!(
+                "Resolve deploy-host application lease root: {error}"
+            ))
+        });
+    }
+    Ok(std::path::PathBuf::from(
+        shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT,
+    ))
+}
+
 impl DockerRuntime {
     pub(super) async fn validate_captured_file_lease(
         &self,
@@ -22,7 +45,8 @@ impl DockerRuntime {
                 ));
             }
         };
-        let path = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
+        let path = application_lease_root()
+            .await?
             .join(".app-operation-locks")
             .join(format!("{prefix}-{}.lock", context.app_id));
         let receipt = receipt.clone();
@@ -52,7 +76,8 @@ impl DockerRuntime {
                 ));
             }
         };
-        let path = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
+        let path = application_lease_root()
+            .await?
             .join(".app-operation-locks")
             .join(format!("{prefix}-{}.lock", context.app_id));
         let receipt = receipt.clone();
@@ -148,8 +173,7 @@ impl DockerRuntime {
                 "invalid builder app identifier".into(),
             ));
         }
-        let root = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
-            .join(".app-operation-locks");
+        let root = application_lease_root().await?.join(".app-operation-locks");
         let name = format!("{prefix}-{app_id}.lock");
         let mut pending = tokio::task::spawn_blocking(move || {
             lock_builder_file_with_marker(&root, &name, marker)

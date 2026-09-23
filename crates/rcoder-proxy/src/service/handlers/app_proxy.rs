@@ -88,10 +88,13 @@ pub async fn handle_prod_app_upstream(
     // v4 监听；名字解析失败则落入注册表回退链。
     let resolved_addr = 'addr: {
         // 回退分支用的注册值历史上是 IP 字面量（IPv4），按字面量同步解析即可
-        let try_parse = |host: &str, port: u16| -> Option<std::net::SocketAddr> {
+        let try_parse = |host: &str, port: u16| -> PingoraResult<Option<std::net::SocketAddr>> {
             use std::net::ToSocketAddrs;
-            let (host, port) = super::super::upstream::dial_peer(host, port);
-            (host.as_str(), port).to_socket_addrs().ok()?.next()
+            let (host, port) = super::super::upstream::dial_peer(host, port)?;
+            Ok((host.as_str(), port)
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut addrs| addrs.next()))
         };
         if let Some(host) = container_lookup
             .as_ref()
@@ -103,6 +106,15 @@ pub async fn handle_prod_app_upstream(
                 .find(|e| e.key().0 == app_id)
                 .map(|e| e.key().1)
                 .unwrap_or(shared_types::APP_ENTRY_PORT);
+            #[cfg(feature = "deploy-host")]
+            if shared_types::is_deploy_host() {
+                let addr = super::super::upstream::dial_addr(&host, port)?;
+                let addr = addr.parse::<std::net::SocketAddr>().map_err(|error| {
+                    pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(503))
+                        .more_context(format!("Invalid registered app address: {error}"))
+                })?;
+                break 'addr addr;
+            }
             if let Some(addr) = resolve_preferring_ipv4(&host, Some(port)).await
                 && !is_dns_fake_ip(&addr)
             {
@@ -116,7 +128,7 @@ pub async fn handle_prod_app_upstream(
         if let Some(host) = app_backends.get(&(app_id.to_string(), shared_types::APP_ENTRY_PORT)) {
             // 回退一：lookup 未注入/动态名解析失败——注册表直查（受理副本内存态，
             // 注册值历史上是 IPv4 字面量，直接拼端口解析）
-            if let Some(addr) = try_parse(host.value(), shared_types::APP_ENTRY_PORT) {
+            if let Some(addr) = try_parse(host.value(), shared_types::APP_ENTRY_PORT)? {
                 break 'addr addr;
             }
         }
@@ -128,7 +140,7 @@ pub async fn handle_prod_app_upstream(
                 "prod app fallback to sole registered port: app_id={}, port={}",
                 app_id, port
             );
-            if let Some(addr) = try_parse(e.value(), port) {
+            if let Some(addr) = try_parse(e.value(), port)? {
                 break 'addr addr;
             }
         }

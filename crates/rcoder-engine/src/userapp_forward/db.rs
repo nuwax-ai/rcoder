@@ -126,7 +126,7 @@ pub(super) async fn resolve_exec_target<'a>(
                 })?;
             // dev 通道：dev 容器 file-server execute-command（契约见 ExecChannel）
             let channel = ExecChannel::DevHttp {
-                base: crate::userapp_builder::dev_file_server_addr(state, &info),
+                base: crate::userapp_builder::dev_file_server_addr(state, &info)?,
                 app_id: app_id.to_string(),
             };
             // builder 内 PG 可能刚 initdb（新容器/重建后），等就绪再执行改密命令

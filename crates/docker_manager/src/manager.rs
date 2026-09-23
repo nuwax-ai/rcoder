@@ -329,10 +329,17 @@ impl DockerManager {
                     let mut info = container_info;
                     info.status = status.clone();
                     info.health_status = state.health.and_then(|h| h.status.map(|s| s.to_string()));
-
-                    self.containers.insert(project_id.to_string(), info).await;
-
-                    Ok(Some(status))
+                    let captured_id = info.container_id.clone();
+                    if self
+                        .containers
+                        .update_if_container_id(project_id, &captured_id, info)
+                        .await
+                    {
+                        Ok(Some(status))
+                    } else {
+                        // A replacement took this logical name while inspect was in flight.
+                        Ok(None)
+                    }
                 } else {
                     Ok(Some(ContainerStatus::Unknown("no state".to_string())))
                 }
@@ -340,18 +347,24 @@ impl DockerManager {
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
             }) => {
-                // 容器不存在（HTTP 404），从映射中移除
-                // 双键对齐注册侧（identifier + Docker 容器名）
+                // The 404 belongs to the captured physical ID, not necessarily
+                // to the current occupant of this logical name.
+                let removed = self
+                    .containers
+                    .remove_if_container_id(project_id, &container_info.container_id)
+                    .await;
                 #[cfg(feature = "deploy-host")]
-                if shared_types::is_deploy_host() {
-                    let docker_name = format!(
-                        "{}-{project_id}",
-                        shared_types::ServiceType::Userapp.container_prefix()
+                if shared_types::is_deploy_host()
+                    && let Some(info) = removed.as_ref()
+                {
+                    shared_types::published::unregister_if_physical(
+                        &info.container_name,
+                        &info.container_id,
                     );
-                    shared_types::published::unregister(&docker_name);
-                    shared_types::published::unregister(project_id);
+                    shared_types::published::unregister_if_physical(project_id, &info.container_id);
                 }
-                self.containers.remove(project_id).await;
+                #[cfg(not(feature = "deploy-host"))]
+                drop(removed);
                 Ok(None)
             }
             Err(e) => Err(DockerError::BollardError(e)),

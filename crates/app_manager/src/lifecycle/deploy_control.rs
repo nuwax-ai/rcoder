@@ -313,7 +313,7 @@ impl AppService {
         } else {
             None
         };
-        let restart_image = if restart && previous.is_some() && params.is_none() {
+        let restart_image = if previous.is_some() && params.is_none() {
             crate::runtime::params::platform_restart_image(
                 &std::env::var("RCODER_RUNTIME_IMAGE_DIGEST").ok(),
             )
@@ -477,10 +477,12 @@ impl AppService {
                         .restart_app_target(&target, restart_image.as_deref())
                         .await
                 } else {
-                    self.runtime.start_app_target(&target).await
+                    self.runtime
+                        .start_app_target_with_image(&target, restart_image.as_deref())
+                        .await
                 }
                 .map_err(|error| map_runtime_error("Start captured deployment", error))?;
-                if restart {
+                if restart || restart_image.is_some() {
                     self.refresh_pingora_after_restart(app_id).await;
                 }
             }
@@ -570,12 +572,19 @@ impl AppService {
     /// FQDN (no-op shape). Registration is advisory: a failed status read
     /// warns instead of failing the already-committed restart.
     pub(super) async fn refresh_pingora_after_restart(&self, app_id: &str) {
-        let http_ports = self.registered_http_ports(app_id);
-        if http_ports.is_empty() {
-            return;
-        }
         match self.runtime.get_deployment_status(app_id).await {
             Ok(Some(status)) => {
+                let mut http_ports = self.registered_http_ports(app_id);
+                for port in &status.ports {
+                    if port.expose_type == container_runtime_api::ExposeType::Http
+                        && !http_ports.contains(&port.port)
+                    {
+                        http_ports.push(port.port);
+                    }
+                }
+                if http_ports.is_empty() || status.replicas == 0 {
+                    return;
+                }
                 self.register_pingora_backends(
                     app_id,
                     &http_ports,

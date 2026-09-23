@@ -53,6 +53,7 @@ workspace = true
 
 [dependencies]
 sha2 = { workspace = true }
+hex = { workspace = true }
 # Internal crates
 shared_types = { workspace = true }
 rcoder-storage = { workspace = true }

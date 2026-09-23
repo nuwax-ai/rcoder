@@ -50,9 +50,9 @@ async fn dbx_rewrite_request(
 }
 
 /// 构造 dbx 上游 peer（长会话同款参数：conn 10s / 无读写超时 / idle 3600s）。
-fn dbx_peer(container_addr: &str) -> Box<HttpPeer> {
+fn dbx_peer(container_addr: &str) -> pingora_core::Result<Box<HttpPeer>> {
     let mut peer = HttpPeer::new(
-        super::super::upstream::dial_peer(container_addr, shared_types::DBX_PORT),
+        super::super::upstream::dial_peer(container_addr, shared_types::DBX_PORT)?,
         false,
         "".to_string(),
     );
@@ -61,7 +61,7 @@ fn dbx_peer(container_addr: &str) -> Box<HttpPeer> {
     peer.options.write_timeout = None;
     peer.options.total_connection_timeout = Some(Duration::from_secs(15));
     peer.options.idle_timeout = Some(Duration::from_secs(3600));
-    Box::new(peer)
+    Ok(Box::new(peer))
 }
 
 /// `/api/v1/userapp/proxy/dbx/dev/{user_id}/{app_id}/{*path}` 请求重写（定位在 upstream 阶段完成）。
@@ -99,7 +99,7 @@ pub async fn handle_dev_dbx_upstream(
         container_addr,
         shared_types::DBX_PORT
     );
-    Ok(dbx_peer(&container_addr))
+    dbx_peer(&container_addr)
 }
 
 /// `/api/v1/userapp/proxy/dbx/prod/{user_id}/{app_id}/{*path}` 请求重写。
@@ -133,5 +133,5 @@ pub async fn handle_prod_dbx_upstream(
         container_addr,
         shared_types::DBX_PORT
     );
-    Ok(dbx_peer(&container_addr))
+    dbx_peer(&container_addr)
 }

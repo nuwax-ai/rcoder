@@ -232,7 +232,7 @@ pub async fn computer_agent_status(
         &container_info.container_ip,
         &state.config.app_manager.namespace,
         &state.cluster_domain,
-    );
+    )?;
 
     debug!(
         "📡 [COMPUTER_AGENT_STATUS] gRPC address: {}, project_id={}",

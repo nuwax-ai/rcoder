@@ -43,11 +43,19 @@ pub struct ComputeControlRequest {
     pub request_id: String,
     pub request_fingerprint: String,
     pub action: ComputeControlAction,
+    /// A physical ensure uses the restart coordinator to revive a stopped
+    /// controller without changing its image. Explicit Restart may roll to
+    /// the platform image; the choice is frozen at admission.
+    #[serde(default)]
+    pub restart_image_roll: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ComputeControlRecord {
     pub app_id: String,
     pub lifecycle_id: String,
+    #[serde(skip_serializing)]
+    #[schema(ignore)]
+    pub request_id: String,
     pub scope: UserAppOperationScope,
     pub operation_id: String,
     #[serde(skip_serializing)]

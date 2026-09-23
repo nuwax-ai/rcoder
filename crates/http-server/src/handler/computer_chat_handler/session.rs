@@ -144,7 +144,8 @@ pub(super) async fn probe_agent_status(
             &container_info.container_ip,
             &state.config.app_manager.namespace,
             &state.cluster_domain,
-        );
+        )
+        .map_err(|error| error.to_string())?;
 
         Ok::<_, String>(addr)
     }

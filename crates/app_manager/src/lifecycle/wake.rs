@@ -127,6 +127,7 @@ impl AppService {
         });
         match result {
             Ok(outcome) => {
+                self.refresh_pingora_after_restart(app_id).await;
                 operation.succeed().await?;
                 guard.mark_completed();
                 if !self.activity.try_mark_woken(app_id) {

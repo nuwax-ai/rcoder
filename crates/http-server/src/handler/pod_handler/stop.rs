@@ -19,7 +19,7 @@ use super::*;
     tag = "pod",
     operation_id = "pod_stop",
     summary = "停止并销毁容器（保留数据卷）",
-    description = "根据 user_id / project_id / service_type 定位容器并销毁：K8s 删 STS + Service（PVC 保留，数据不丢，下次 ensure 重建挂回），Docker 删容器。携带 app_id 时进入 userApp 分派：dev=按持久化生命周期与实际计算资源身份停止 UserappBuilder（PVC 与 Service 保留；携带 lifecycle_id/request_id）；prod=scale-to-0 停止生产实例（阻断流量唤醒，ensure 可显式唤醒）。容器不存在时幂等返回成功。注意：对话状态在 agent 内存中，停止即断会话。"
+    description = "根据 user_id / project_id / service_type 定位容器并销毁：K8s 删 STS + Service（PVC 保留，数据不丢，下次 ensure 重建挂回），Docker 删容器。携带 app_id 时进入 userApp 分派：dev=按持久化生命周期与实际计算资源身份停止 UserappBuilder（PVC 与 Service 保留；携带 lifecycle_id/request_id）；prod=scale-to-0 停止生产实例（阻断流量唤醒，ensure 可显式唤醒）。相同停止意图遇到 RecoveryRequired 时沿原 operation_id 异步核验恢复，不另建物理操作；不同控制操作仍快失败。容器不存在时幂等返回成功。注意：对话状态在 agent 内存中，停止即断会话。"
 )]
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn pod_stop(

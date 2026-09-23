@@ -150,7 +150,17 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
     ) -> Result<ComputeControlRecord, UserAppStoreError> {
         let request = request.clone();
         self.run(false, move |tx, backend| {
-            Box::pin(async move { compute::admit(tx, backend, &request).await })
+            Box::pin(async move { compute::admit(tx, backend, &request, false).await })
+        })
+        .await
+    }
+    async fn admit_idle_compute_repair(
+        &self,
+        request: &ComputeControlRequest,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let request = request.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move { compute::admit(tx, backend, &request, true).await })
         })
         .await
     }
@@ -178,6 +188,22 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
             Box::pin(async move {
                 compute::check_access(tx, backend, &app_id, scope, explicit_start).await
             })
+        })
+        .await
+    }
+
+    async fn compute_desired_stopped(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        scope: UserAppOperationScope,
+    ) -> Result<bool, UserAppStoreError> {
+        let app_id = app_id.to_owned();
+        let lifecycle_id = lifecycle_id.to_owned();
+        self.run(true, move |tx, _| {
+            Box::pin(
+                async move { compute::desired_stopped(tx, &app_id, &lifecycle_id, scope).await },
+            )
         })
         .await
     }

@@ -19,12 +19,15 @@ pub(super) async fn probe_agent_runner_readiness(
     locale: &'static str,
 ) {
     // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）
-    let grpc_addr = shared_types::build_grpc_addr(
+    let Ok(grpc_addr) = shared_types::build_grpc_addr(
         &container_info.container_name,
         &container_info.container_ip,
         &state.config.app_manager.namespace,
         &state.cluster_domain,
-    );
+    ) else {
+        debug!(container = %container_info.container_name, "Skip readiness probe: address not ready");
+        return;
+    };
 
     debug!(
         "[CHAT] Probing agent_runner readiness before forward: addr={}",

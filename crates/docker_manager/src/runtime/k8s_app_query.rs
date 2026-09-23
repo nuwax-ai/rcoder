@@ -249,6 +249,12 @@ impl KubernetesRuntime {
 
         DeploymentStatus {
             app_id: app_id.to_string(),
+            lifecycle_id: deploy
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("rcoder.io/lifecycle-id"))
+                .cloned(),
             replicas,
             ready_replicas,
             phase,

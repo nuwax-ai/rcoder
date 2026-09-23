@@ -43,6 +43,11 @@ impl DockerRuntime {
         {
             return Ok(None);
         }
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            let ready = self.confirm_builder_reach(resource, &info).await?;
+            return running_builder_info(&ready, target);
+        }
         running_builder_info(&info, target)
     }
     pub(super) async fn reconcile_builder_stop(
@@ -245,6 +250,7 @@ impl DockerRuntime {
             context: context.clone(),
             workload,
             pod: None,
+            restart_image: None,
         })
     }
 
@@ -362,6 +368,14 @@ impl DockerRuntime {
                 // stop acknowledgement is still the causal evidence recovery
                 // observers match on; persist it before reporting success.
                 super::docker_compute_receipt::save_stop(target).await?;
+                #[cfg(feature = "deploy-host")]
+                if shared_types::is_deploy_host() {
+                    shared_types::published::unregister_if_physical(&resource.name, &resource.uid);
+                    shared_types::published::unregister_if_physical(
+                        &target.context.app_id,
+                        &resource.uid,
+                    );
+                }
                 return Ok(None);
             }
             Err(error) => {
@@ -394,25 +408,87 @@ impl DockerRuntime {
         }
         if !restart {
             super::docker_compute_receipt::save_stop(target).await?;
+            #[cfg(feature = "deploy-host")]
+            if shared_types::is_deploy_host() {
+                shared_types::published::unregister_if_physical(&resource.name, &resource.uid);
+                shared_types::published::unregister_if_physical(
+                    &target.context.app_id,
+                    &resource.uid,
+                );
+            }
             return Ok(None);
         }
         if only_start {
             super::docker_compute_receipt::save_start(target).await?;
         }
-        // deploy-host：builder 重启重建后刷新寻址登记——Direct 登记新 IP；
-        // Published 用重建容器实际映射整表替换（restore_body 无 port_bindings
-        // 的既有缺口：旧死端口被清出注册表）。失败仅 warn，不阻断控制成功路径
+        // A Docker start acknowledgment can precede IP/port publication. Do
+        // not report a successful restart until its new physical reach is
+        // verified and registered.
         #[cfg(feature = "deploy-host")]
-        if shared_types::is_deploy_host()
-            && let Err(error) =
-                crate::deploy_host_ports::register_reach_from_inspect(&resource.name, None, &after)
-        {
-            tracing::warn!(
-                "[deploy-host] builder control reach refresh {} failed: {error}",
-                resource.name
-            );
+        if shared_types::is_deploy_host() {
+            let ready = self.confirm_builder_reach(resource, &after).await?;
+            return running_builder_info(&ready, target);
         }
         running_builder_info(&after, target)
+    }
+
+    #[cfg(feature = "deploy-host")]
+    async fn confirm_builder_reach(
+        &self,
+        resource: &shared_types::AppResourceIdentity,
+        initial: &bollard::models::ContainerInspectResponse,
+    ) -> Result<bollard::models::ContainerInspectResponse> {
+        let client = self.inner.get_docker_client();
+        for attempt in 0..10 {
+            let inspect = if attempt == 0 {
+                initial.clone()
+            } else {
+                client
+                    .inspect_container(&resource.uid, None)
+                    .await
+                    .map_err(|error| {
+                        Error::DockerError(format!("Inspect started builder reach: {error}"))
+                    })?
+            };
+            if inspect.id.as_deref() != Some(resource.uid.as_str())
+                || inspect.state.as_ref().and_then(|state| state.running) != Some(true)
+            {
+                return Err(Error::Conflict(
+                    "Started builder physical identity changed".into(),
+                ));
+            }
+            let ready = if crate::deploy_host_ports::is_direct_reach() {
+                let raw = super::docker_runtime::extract_container_ip(&inspect, None);
+                raw.parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| !ip.is_unspecified())
+            } else {
+                crate::deploy_host_ports::missing_builder_ports(&inspect).is_empty()
+            };
+            if ready {
+                crate::deploy_host_ports::register_reach_from_inspect(
+                    &resource.name,
+                    None,
+                    &inspect,
+                )
+                .map_err(|error| Error::DockerError(format!("Register builder reach: {error}")))?;
+                return Ok(inspect);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        Err(Error::DockerError(format!(
+            "Started builder {} has no usable {} reach (missing published ports: {:?})",
+            resource.uid,
+            if crate::deploy_host_ports::is_direct_reach() {
+                "Direct"
+            } else {
+                "Published"
+            },
+            if crate::deploy_host_ports::is_direct_reach() {
+                Vec::new()
+            } else {
+                crate::deploy_host_ports::missing_builder_ports(initial)
+            }
+        )))
     }
 }
 
@@ -624,6 +700,7 @@ mod tests {
                     resource_version: None,
                 }),
                 pod: None,
+                restart_image: None,
             };
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 let result = runtime

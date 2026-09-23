@@ -183,7 +183,7 @@ pub async fn handle_port_proxy_upstream(
 
     // 创建 HTTP Peer
     let mut peer = HttpPeer::new(
-        super::super::upstream::dial_peer(&resolved_host, target_port),
+        super::super::upstream::dial_peer(&resolved_host, target_port)?,
         false,          // 不使用 TLS
         "".to_string(), // SNI
     );

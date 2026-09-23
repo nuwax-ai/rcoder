@@ -784,6 +784,16 @@ pub trait UserAppLifecycleStore: Send + Sync {
         &self,
         request: &crate::ComputeControlRequest,
     ) -> Result<crate::ComputeControlRecord, UserAppStoreError>;
+    /// Low-priority automatic repair: accept only while both business and
+    /// control slots are idle. It never supersedes or cancels user work.
+    async fn admit_idle_compute_repair(
+        &self,
+        _request: &crate::ComputeControlRequest,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Automatic compute repair is unsupported".into(),
+        ))
+    }
     async fn get_compute_control(
         &self,
         app_id: &str,
@@ -798,6 +808,16 @@ pub trait UserAppLifecycleStore: Send + Sync {
         scope: UserAppOperationScope,
         explicit_start: bool,
     ) -> Result<(), UserAppStoreError>;
+
+    /// A stopped Docker builder has no container to inspect. Read the durable
+    /// compute intent so an explicit ensure can restart it under the existing
+    /// lifecycle instead of entering the ordinary business ensure path.
+    async fn compute_desired_stopped(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        scope: UserAppOperationScope,
+    ) -> Result<bool, UserAppStoreError>;
 
     /// Close an interrupted business operation only from its exact, durable final
     /// effects receipt. Unknown or incomplete effects must remain recoverable.

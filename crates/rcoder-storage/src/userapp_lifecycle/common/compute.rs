@@ -45,6 +45,7 @@ pub(super) fn decode(row: models::ComputeControl) -> Result<ComputeControlRecord
     Ok(ComputeControlRecord {
         app_id: row.app_id,
         lifecycle_id: row.lifecycle_id,
+        request_id: row.request_id,
         scope,
         operation_id: row.operation_id,
         request_fingerprint: row.request_fingerprint,
@@ -91,6 +92,7 @@ pub(super) async fn admit(
     tx: &mut dyn Executor,
     backend: Backend,
     request: &ComputeControlRequest,
+    idle_only: bool,
 ) -> Result<ComputeControlRecord, Error> {
     for (value, name) in [
         (&request.app_id, "app_id"),
@@ -144,6 +146,14 @@ pub(super) async fn admit(
         return decode(replay);
     }
     let active = repo::active(tx, &app).await?;
+    if idle_only
+        && (request.scope != UserAppOperationScope::Dev
+            || request.action != ComputeControlAction::Restart
+            || active.dev.is_some()
+            || active.application.is_some())
+    {
+        return Err(Error::VersionConflict);
+    }
     // An application-wide deletion cannot be undone by physical recovery.
     if let Some(operation) = active.application.as_ref()
         && operation.kind.ends_lifecycle()
@@ -155,6 +165,13 @@ pub(super) async fn admit(
         .exec(tx)
         .await
         .map_err(storage)?;
+    if idle_only
+        && head
+            .as_ref()
+            .is_some_and(|head| head.desired_state == "stopped")
+    {
+        return Err(Error::VersionConflict);
+    }
     let now = chrono::Utc::now().timestamp_micros();
     let mut interrupted = Vec::new();
     let mut supersedes = None;
@@ -168,8 +185,11 @@ pub(super) async fn admit(
                 .ok_or_else(|| invalid("Compute intent target is missing"))?;
             interrupted.extend(old.interrupted_operations.clone());
             if !old.state.is_terminal() {
-                if !(request.action == ComputeControlAction::Stop
+                if !((request.action == ComputeControlAction::Stop
                     && old.action == ComputeControlAction::Restart)
+                    || (!idle_only
+                        && request.action == ComputeControlAction::Restart
+                        && old.request_id.starts_with("auto-repair-")))
                 {
                     return Err(control_conflict(old));
                 }
@@ -198,9 +218,10 @@ pub(super) async fn admit(
         toasty::sql::statement(repo::sql(backend,"UPDATE userapp_compute_controls SET state='superseded',revision=revision+1,updated_at_us=$2,terminal_at_us=$2 WHERE operation_id=$1 AND state IN ('pending','running','recovery_required')"))
             .bind(id).bind(now).exec(tx).await.map_err(storage)?;
     }
-    toasty::sql::statement(repo::sql(backend,"INSERT INTO userapp_compute_controls (operation_id,app_id,lifecycle_id,scope,generation,revision,action,state,request_id,request_fingerprint,stage,evidence_json,created_at_us,updated_at_us) VALUES ($1,$2,$3,$4,$5,1,$6,'pending',$7,$8,'accepted',$9,$10,$10)"))
+    toasty::sql::statement(repo::sql(backend,"INSERT INTO userapp_compute_controls (operation_id,app_id,lifecycle_id,scope,generation,revision,action,state,request_id,request_fingerprint,stage,checkpoint_json,evidence_json,created_at_us,updated_at_us) VALUES ($1,$2,$3,$4,$5,1,$6,'pending',$7,$8,'accepted',$9,$10,$11,$11)"))
         .bind(&request.operation_id).bind(&request.app_id).bind(&request.lifecycle_id).bind(scope).bind(generation)
         .bind(action(request.action)).bind(&request.request_id).bind(&request.request_fingerprint)
+        .bind(serde_json::json!({"restart_image_roll":request.restart_image_roll}).to_string())
         .bind(serde_json::to_string(&interrupted).map_err(storage)?).bind(now).exec(tx).await.map_err(storage)?;
     let desired = if request.action == ComputeControlAction::Stop {
         "stopped"
@@ -516,6 +537,29 @@ pub(super) async fn check_business_execution(
         return Err(Error::VersionConflict);
     }
     check_business_authority(tx, &operation).await
+}
+
+/// A Docker stop may remove the container; the intent remains authoritative
+/// for choosing the high-priority physical start path on explicit ensure.
+pub(super) async fn desired_stopped(
+    tx: &mut dyn Executor,
+    app_id: &str,
+    lifecycle_id: &str,
+    scope: UserAppOperationScope,
+) -> Result<bool, Error> {
+    if scope == UserAppOperationScope::Application {
+        return Err(invalid("Compute intent requires dev or prod scope"));
+    }
+    let head = models::ComputeIntent::filter_by_app_id_and_scope(app_id, codec::scope_name(scope))
+        .first()
+        .exec(tx)
+        .await
+        .map_err(storage)?;
+    match head {
+        Some(head) if head.lifecycle_id != lifecycle_id => Err(Error::LifecycleConflict),
+        Some(head) => Ok(head.desired_state == "stopped"),
+        None => Ok(false),
+    }
 }
 
 /// The explicit-start flag is supplied by chat/workspace control entry points,

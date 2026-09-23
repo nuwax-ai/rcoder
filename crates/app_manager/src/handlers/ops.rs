@@ -20,7 +20,7 @@ use crate::models::{AppRuntimeInfo, RecyclePolicyRequest, StartAppRequest, Start
     params(("app_id" = String, Path, description = "应用 ID")),
     request_body(
         content = StartAppRequest,
-        description = "按 app_id 定位，不使用 user_id；其余可选——空对象 = 传统启动（app 不存在即创建空容器：基础设施形态，PG/ttyd/dbx 可用）。带 url 触发部署：deploy_mode 缺省 pod（app_stage 注入 → Recreate 换 Pod），hot = 容器内原地换应用（不换 Pod、PG/终端不断连；前置不满足自动回退 pod，等编排+bridge 就绪才返回）；release_id 缺省自动生成并在响应返回；sha256 可选校验；app_stage/idle_timeout_seconds 覆盖；pg 凭据与捕获的配置版本一致，凭据应用失败返回操作错误。同步等待边界 = 部署段完成（下载/sha256/解压成功、编排已启动）+ 包内 database SQL 执行——服务启动结果异步可见（GET /apps/{app_id} 或访问探活确认）；成功返回 ≠ 立即接流量（readiness 摘流窗口，配置 bridge_service 的应用摘流到后端就绪）。建议客户端读超时 ≥ 120s；超时 ≠ 失败（服务端继续收敛，先查状态再决定是否重试）"
+        description = "按 app_id 定位，不使用 user_id；其余可选——空对象 = 显式启动（已有容器同时更新到平台默认运行时镜像；app 不存在即创建空容器，PG/ttyd/dbx 可用）。带 url 触发部署：deploy_mode 缺省 pod（app_stage 注入 → Recreate 换 Pod），hot = 容器内原地换应用（不换 Pod、PG/终端不断连；前置不满足自动回退 pod，等编排+bridge 就绪才返回）；release_id 缺省自动生成并在响应返回；sha256 可选校验；app_stage/idle_timeout_seconds 覆盖；pg 凭据与捕获的配置版本一致，凭据应用失败返回操作错误。同步等待边界 = 部署段完成（下载/sha256/解压成功、编排已启动）+ 包内 database SQL 执行——服务启动结果异步可见（GET /apps/{app_id} 或访问探活确认）；成功返回 ≠ 立即接流量（readiness 摘流窗口，配置 bridge_service 的应用摘流到后端就绪）。建议客户端读超时 ≥ 120s；超时 ≠ 失败（服务端继续收敛，先查状态再决定是否重试）"
     ),
     responses(
         (status = 200, description = "启动/部署成功（部署 = 制品已部署 + SQL 已执行，服务启动中）", body = HttpResult<StartAppResult>)

@@ -47,17 +47,6 @@ impl KubernetesRuntime {
                 "Service creation receipt exceeds limit".into(),
             ));
         }
-        let mut desired = super::k8s_service::agent_service_object(
-            &self.namespace,
-            &name,
-            &context.app_id,
-            &shared_types::ServiceType::UserappBuilder,
-        );
-        desired
-            .metadata
-            .annotations
-            .get_or_insert_default()
-            .insert(SERVICE_COMPLETION.into(), payload.clone());
         let api: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
         match api
             .get_opt(&name)
@@ -78,11 +67,8 @@ impl KubernetesRuntime {
                     .as_deref()
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| Error::Conflict("Creation Service version missing".into()))?;
-                let ports = desired.spec.and_then(|spec| spec.ports).ok_or_else(|| {
-                    Error::ConfigurationError("Creation Service ports missing".into())
-                })?;
                 let body = serde_json::json!({"metadata": {"uid": uid, "resourceVersion": version,
-                    "annotations": {(SERVICE_COMPLETION): payload}}, "spec": {"ports": ports}});
+                    "annotations": {(SERVICE_COMPLETION): payload}}});
                 api.patch(
                     &name,
                     &kube::api::PatchParams::default(),
@@ -94,11 +80,9 @@ impl KubernetesRuntime {
                 })?;
             }
             None => {
-                api.create(&PostParams::default(), &desired)
-                    .await
-                    .map_err(|error| {
-                        Error::K8sError(format!("Create builder Service completion: {error}"))
-                    })?;
+                return Err(Error::Conflict(
+                    "Builder Service disappeared before creation completion".into(),
+                ));
             }
         }
         Ok(())

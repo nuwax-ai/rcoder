@@ -274,7 +274,7 @@ async fn forward_request_to_container_service(
         &container_info.container_ip,
         ctx.namespace,
         ctx.cluster_domain,
-    );
+    )?;
 
     debug!(
         "📡 [FORWARD] Sending gRPC request to: {}, prompt_length={}, attachments_count={}",

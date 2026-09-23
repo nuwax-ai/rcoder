@@ -237,12 +237,18 @@ pub async fn forward_chat(
                             .await
                         {
                             Ok(Some(info)) if !info.container_ip.is_empty() => {
-                                let new_addr = shared_types::build_grpc_addr(
+                                let new_addr = match shared_types::build_grpc_addr(
                                     &info.container_name,
                                     &info.container_ip,
                                     rr.namespace,
                                     rr.cluster_domain,
-                                );
+                                ) {
+                                    Ok(addr) => addr,
+                                    Err(error) => {
+                                        last_error = Some(error.into());
+                                        break;
+                                    }
+                                };
                                 if new_addr != grpc_addr {
                                     info!(
                                         "🔄 [{}] Container IP changed on retry: {} -> {}",

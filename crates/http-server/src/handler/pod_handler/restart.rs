@@ -18,7 +18,7 @@ use super::*;
     tag = "pod",
     operation_id = "pod_restart",
     summary = "重启计算资源并保留数据",
-    description = "UserApp dev/prod requests use app_id and app_stage, with optional lifecycle_id and request_id. Returns HTTP 202 with operation_id and status_url. Stop has priority over Restart; new Start/Restart during Stop is rejected without queuing. Ordinary business slots do not block admission. The coordinator drains old writes, stops the captured physical instance, and starts it with the original PVC. Unknown writes remain visible as recovery_required. Ordinary agent restart behavior is unchanged."
+    description = "UserApp dev/prod requests use app_id and app_stage, with optional lifecycle_id and request_id. Normally returns HTTP 202 with operation_id and status_url. In Kubernetes mode the restarted dev StatefulSet and prod Deployment use the current configured platform image while retaining the workspace PVC. Docker dev builders removed by AutoRemove after a completed Stop are recreated on the same mounts and return HTTP 200. A retry of the same durable intent in RecoveryRequired resumes verification under the original operation_id; an explicitly different request_id remains a conflict. Stop has priority over Restart; new Start/Restart during Stop is rejected without queuing. Ordinary business slots do not block admission to the durable compute coordinator. Unknown writes remain visible as recovery_required. Ordinary agent restart behavior is unchanged."
 )]
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn pod_restart(
@@ -46,6 +46,47 @@ pub async fn pod_restart(
             ));
         }
     };
+    if scope == shared_types::UserAppOperationScope::Dev
+        && matches!(
+            crate::userapp_builder::inspect_builder_compute(&state, &app_id)
+                .await
+                .map_err(|error| crate::userapp_builder::control_error(&error))?,
+            crate::userapp_builder::BuilderComputeState::StoppedRemoved
+        )
+    {
+        // Docker builders are removed by AutoRemove after Stop. There is
+        // no physical UID left to restart; explicit control recreates the
+        // container on the same workspace after the completed Stop fence.
+        if let Some(expected) = request.lifecycle_id.as_deref() {
+            let current = state
+                .userapp_store
+                .get_application(&app_id)
+                .await
+                .map_err(|error| {
+                    let error: anyhow::Error = error.into();
+                    crate::userapp_builder::control_error(&error)
+                })?;
+            if current.as_ref().map(|app| app.lifecycle_id.as_str()) != Some(expected) {
+                return Err(AppError::with_message(
+                    shared_types::error_codes::ERR_CONFLICT,
+                    "Application lifecycle changed before compute restart",
+                ));
+            }
+        }
+        let info = crate::userapp_builder::ensure_userapp_builder(&state, &app_id)
+            .await
+            .map_err(|error| crate::userapp_builder::control_error(&error))?;
+        return Ok(HttpResult::success(RestartPodResponse {
+            was_existing: false,
+            restarted: true,
+            container_info: PodContainerInfo {
+                container_id: info.container_id,
+                status: info.status,
+            },
+            message: "UserApp dev 计算容器已使用原工作区重建".into(),
+        })
+        .into_response());
+    }
     let operation = crate::userapp_builder::compute_control::submit(
         &state,
         app_id,

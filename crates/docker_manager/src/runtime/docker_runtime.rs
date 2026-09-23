@@ -344,6 +344,60 @@ impl AgentContainerRuntime for DockerRuntime {
         self.capture_builder_volume_witness(target).await
     }
 
+    async fn missing_builder_published_ports(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<Vec<u16>>> {
+        #[cfg(feature = "deploy-host")]
+        {
+            if !shared_types::is_deploy_host() || crate::deploy_host_ports::is_direct_reach() {
+                return Ok(None);
+            }
+            target.validate().map_err(ContainerRuntimeError::Conflict)?;
+            let Some(resource) = target.workload.as_ref() else {
+                return Ok(None);
+            };
+            let inspect = self
+                .inner
+                .get_docker_client()
+                .inspect_container(&resource.uid, None)
+                .await
+                .map_err(|error| {
+                    ContainerRuntimeError::DockerError(format!(
+                        "Inspect published builder: {error}"
+                    ))
+                })?;
+            if inspect.id.as_deref() != Some(resource.uid.as_str())
+                || super::docker_builder_control::control_identity_with_binding(
+                    &inspect,
+                    &resource.name,
+                    &target.context,
+                    target.resource_binding.as_ref(),
+                    false,
+                )? != *resource
+            {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Published builder identity changed".into(),
+                ));
+            }
+            if inspect.state.as_ref().and_then(|state| state.running) != Some(true) {
+                return Ok(None);
+            }
+            // A builder without its original workspace bind is not a safe
+            // automatic repair candidate. The durable restart checks the exact
+            // witness again before and after replacement.
+            super::docker_builder_restart::bind_witness(&inspect)?;
+            return Ok(Some(crate::deploy_host_ports::missing_builder_ports(
+                &inspect,
+            )));
+        }
+        #[cfg(not(feature = "deploy-host"))]
+        {
+            let _ = target;
+            Ok(None)
+        }
+    }
+
     async fn create_container(
         &self,
         params: ContainerCreateParams,
@@ -829,8 +883,12 @@ pub(super) fn parse_ports_label(raw: &str) -> Vec<AppPortSpec> {
             let port: u16 = it.next()?.trim().parse().ok()?;
             let et = match it.next()?.trim() {
                 "tcp" => ExposeType::Tcp,
-                _ => ExposeType::Http,
+                "http" => ExposeType::Http,
+                _ => return None,
             };
+            if it.next().is_some() {
+                return None;
+            }
             Some(AppPortSpec {
                 name: String::new(),
                 port,

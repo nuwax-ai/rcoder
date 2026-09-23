@@ -80,7 +80,7 @@ pub(crate) async fn create_workspace(
         })?;
 
     // 3. 容器内建 workspace 目录（幂等）
-    let addr = dev_file_server_addr(&state, &info);
+    let addr = dev_file_server_addr(&state, &info)?;
     super::ensure_workspace_via_dev(&addr, &body.app_id)
         .await
         .map_err(|e| AppError::with_message(shared_types::error_codes::ERR_CONTAINER_ERROR, e))?;

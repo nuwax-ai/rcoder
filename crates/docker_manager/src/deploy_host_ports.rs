@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::DockerResult;
 use shared_types::ServiceType;
@@ -104,8 +104,7 @@ pub fn suppress_port_publishing() -> bool {
 /// 从 inspect `NetworkSettings.Ports` 解析容器端口→宿主端口映射。
 ///
 /// 键形如 `"8086/tcp"`，值为绑定列表（Docker 自动分配时 host_port 由 daemon
-/// 填充实际宿主端口）。读不到映射的端口跳过——注册表缺项在拨号时回退
-/// loopback:容器端口并 warn，可归因。
+/// 填充实际宿主端口）。读不到映射的端口跳过，拨号端明确报地址未就绪。
 fn parse_published_map(
     network_ports: &Option<HashMap<String, Option<Vec<bollard::models::PortBinding>>>>,
 ) -> HashMap<u16, u16> {
@@ -114,11 +113,10 @@ fn parse_published_map(
     };
     let mut map = HashMap::new();
     for (container_port_spec, bindings) in ports {
-        let Some(container_port) = container_port_spec
-            .split('/')
-            .next()
-            .and_then(|raw| raw.parse::<u16>().ok())
-        else {
+        let Some((raw_port, "tcp")) = container_port_spec.split_once('/') else {
+            continue;
+        };
+        let Ok(container_port) = raw_port.parse::<u16>() else {
             continue;
         };
         let Some(host_port) = bindings
@@ -126,7 +124,7 @@ fn parse_published_map(
             .flatten()
             .filter_map(|binding| binding.host_port.as_deref())
             .filter_map(|raw| raw.parse::<u16>().ok())
-            .next()
+            .find(|port| *port != 0)
         else {
             continue;
         };
@@ -135,12 +133,34 @@ fn parse_published_map(
     map
 }
 
+/// A running Published builder is usable only when every port from the same
+/// policy as initial creation has a concrete host binding.
+pub fn missing_builder_ports(inspect: &bollard::models::ContainerInspectResponse) -> Vec<u16> {
+    missing_published_ports(inspect, &published_ports_for(&ServiceType::UserappBuilder))
+}
+
+pub fn missing_published_ports(
+    inspect: &bollard::models::ContainerInspectResponse,
+    required: &[u16],
+) -> Vec<u16> {
+    let ports = inspect
+        .network_settings
+        .as_ref()
+        .and_then(|ns| ns.ports.clone());
+    let published = parse_published_map(&ports);
+    required
+        .iter()
+        .copied()
+        .filter(|port| !published.contains_key(port))
+        .collect()
+}
+
 /// 统一登记入口：按当前 Reach 模式把容器 inspect 登记到注册表。
 ///
 /// **Published**：解析 `NetworkSettings.Ports` 映射整表登记；**Direct**：
 /// 取容器真实 IPv4（preferred 网卡优先，None=任意网卡）登记，IP 不可得
-/// 时**不登记 + error**（拨号回退 loopback:容器端口 + warn 可归因——登记
-/// 死 IP 比缺项更糟）。容器键与 Docker 真实名（inspect `.Name` 去斜杠）
+/// 时**不登记 + error 日志**（拨号端报地址未就绪，登记死 IP 比缺项更糟）。
+/// 容器键与 Docker 真实名（inspect `.Name` 去斜杠）
 /// 双键整条目替换（同名容器重建时旧映射不残留；Direct/Published 互替同理）。
 pub fn register_reach_from_inspect(
     container_name: &str,
@@ -156,24 +176,75 @@ pub fn register_reach_from_inspect(
         .as_deref()
         .map(|name| name.trim_start_matches('/').to_owned())
         .filter(|name| *name != container_name);
+    let identifier = inspect
+        .config
+        .as_ref()
+        .and_then(|config| config.labels.as_ref())
+        .and_then(|labels| labels.get("identifier"))
+        .filter(|value| {
+            value.as_str() != container_name && docker_name.as_deref() != Some(value.as_str())
+        })
+        .cloned();
+    let physical_uid = inspect.id.as_deref().ok_or_else(|| {
+        crate::DockerError::ConnectionError("Container inspect has no physical ID".into())
+    })?;
+    let created_at = inspect
+        .created
+        .as_deref()
+        .ok_or_else(|| {
+            crate::DockerError::ConnectionError("Container inspect has no creation time".into())
+        })?
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .map_err(|error| {
+            crate::DockerError::ConnectionError(format!(
+                "Invalid Docker container creation time: {error}"
+            ))
+        })?;
+    let register = |name: &str, reach| {
+        if !shared_types::published::register_physical_at(name, physical_uid, created_at, reach) {
+            warn!(
+                name,
+                physical_uid, "Ignored stale Docker address observation"
+            );
+        }
+    };
 
     #[cfg(feature = "deploy-host")]
     if shared_types::deploy_host_reach::is_direct() {
         let raw = crate::runtime::docker_runtime::extract_container_ip(inspect, preferred_network);
         return match raw.parse::<IpAddr>() {
-            Ok(ip) => {
-                shared_types::published::register_direct(container_name, ip);
+            Ok(ip) if !ip.is_unspecified() => {
+                register(
+                    container_name,
+                    shared_types::published::Reach::Direct { host: ip },
+                );
                 info!("[deploy-host] direct reach registered: container={container_name} ip={ip}");
                 if let Some(docker_name) = docker_name.as_deref() {
-                    shared_types::published::register_direct(docker_name, ip);
+                    register(
+                        docker_name,
+                        shared_types::published::Reach::Direct { host: ip },
+                    );
                     info!("[deploy-host] direct reach registered: container={docker_name} ip={ip}");
+                }
+                if let Some(identifier) = identifier.as_deref() {
+                    register(
+                        identifier,
+                        shared_types::published::Reach::Direct { host: ip },
+                    );
                 }
                 Ok(())
             }
-            Err(_) => {
+            Ok(_) | Err(_) => {
+                shared_types::published::unregister_if_physical(container_name, physical_uid);
+                if let Some(docker_name) = docker_name.as_deref() {
+                    shared_types::published::unregister_if_physical(docker_name, physical_uid);
+                }
+                if let Some(identifier) = identifier.as_deref() {
+                    shared_types::published::unregister_if_physical(identifier, physical_uid);
+                }
                 error!(
                     "[deploy-host] direct reach: container {container_name} ip unavailable \
-                     (raw={raw:?}); leaving registry unregistered, dials will fall back with warn"
+                     (raw={raw:?}); clearing stale address"
                 );
                 Ok(())
             }
@@ -192,13 +263,25 @@ pub fn register_reach_from_inspect(
         .map(|ports| ports.keys().cloned().collect::<Vec<_>>().join(", "))
         .unwrap_or_default();
     if let Some(docker_name) = docker_name.as_deref() {
-        shared_types::published::register(docker_name, map.clone());
+        register(
+            docker_name,
+            shared_types::published::Reach::Published { ports: map.clone() },
+        );
         info!(
             "[deploy-host] published ports registered: container={}, entries={} ({})",
             docker_name, registered, summary
         );
     }
-    shared_types::published::register(container_name, map);
+    if let Some(identifier) = identifier.as_deref() {
+        register(
+            identifier,
+            shared_types::published::Reach::Published { ports: map.clone() },
+        );
+    }
+    register(
+        container_name,
+        shared_types::published::Reach::Published { ports: map },
+    );
     info!(
         "[deploy-host] published ports registered: container={}, entries={} ({})",
         container_name, registered, summary

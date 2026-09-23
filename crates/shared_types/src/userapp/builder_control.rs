@@ -55,6 +55,10 @@ pub struct BuilderControlTarget {
     pub context: crate::UserAppExecutionContext,
     pub workload: Option<crate::AppResourceIdentity>,
     pub pod: Option<BuilderPodIdentity>,
+    /// Image selected for this compute start. Persisted with the operation so
+    /// recovery never picks a different platform release after a rollout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_image: Option<String>,
 }
 
 // The compute ledger adds protocol and volume witnesses alongside the target.
@@ -69,6 +73,8 @@ impl<'de> Deserialize<'de> for BuilderControlTarget {
             context: crate::UserAppExecutionContext,
             workload: Option<crate::AppResourceIdentity>,
             pod: Option<BuilderPodIdentity>,
+            #[serde(default)]
+            restart_image: Option<String>,
             #[serde(default)]
             #[allow(dead_code)]
             builder_compute_single_write: bool,
@@ -85,6 +91,7 @@ impl<'de> Deserialize<'de> for BuilderControlTarget {
             context: wire.context,
             workload: wire.workload,
             pod: wire.pod,
+            restart_image: wire.restart_image,
         })
     }
 }
@@ -92,6 +99,13 @@ impl<'de> Deserialize<'de> for BuilderControlTarget {
 impl BuilderControlTarget {
     pub fn validate(&self) -> Result<(), String> {
         self.context.validate_identity(&self.context.app_id)?;
+        if self
+            .restart_image
+            .as_deref()
+            .is_some_and(|image| image.trim().is_empty())
+        {
+            return Err("Builder restart image is empty".into());
+        }
         if let Some(workload) = &self.workload {
             if workload.name.is_empty() || workload.uid.is_empty() {
                 return Err("Builder compute identity is missing".into());
@@ -152,6 +166,7 @@ mod tests {
             context,
             workload: None,
             pod: None,
+            restart_image: None,
         };
         target.validate().expect("authoritative compute absence");
         for kind in [

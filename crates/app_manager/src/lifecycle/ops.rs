@@ -135,24 +135,24 @@ impl AppService {
                     .await?;
                 operation.authorize_mutation().await?;
                 guard.mark_mutating()?;
+                let restart_image = crate::runtime::params::platform_restart_image(
+                    &std::env::var("RCODER_RUNTIME_IMAGE_DIGEST").ok(),
+                );
                 let result = if restart {
-                    let restart_image = crate::runtime::params::platform_restart_image(
-                        &std::env::var("RCODER_RUNTIME_IMAGE_DIGEST").ok(),
-                    );
                     self.runtime
                         .restart_app_target(&target, restart_image.as_deref())
                         .await
                 } else {
-                    self.runtime.start_app_target(&target).await
+                    self.runtime
+                        .start_app_target_with_image(&target, restart_image.as_deref())
+                        .await
                 };
                 result.map_err(|error| map_runtime_error("Activate captured application", error))
             }
             .await;
             match mutation {
                 Ok(()) => {
-                    if restart {
-                        self.refresh_pingora_after_restart(app_id).await;
-                    }
+                    self.refresh_pingora_after_restart(app_id).await;
                     operation.confirm_effects().await?;
                     operation.succeed().await?;
                     guard.mark_completed();

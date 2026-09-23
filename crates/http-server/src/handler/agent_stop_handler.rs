@@ -68,7 +68,7 @@ async fn destroy_container_for_project(
                 &container_info.container_ip,
                 &state.config.app_manager.namespace,
                 &state.cluster_domain,
-            );
+            )?;
             state.grpc_pool.remove(&old_grpc_addr).await;
         }
 

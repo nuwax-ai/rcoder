@@ -7,20 +7,29 @@
 //! 统一经 [`dial_peer`]/[`dial_addr`]，新增拨号点不得直拼。
 
 /// 元组形式（`HttpPeer::new((host, port), ..)`）。
-pub fn dial_peer(host: &str, port: u16) -> (String, u16) {
+pub fn dial_peer(host: &str, port: u16) -> pingora_core::Result<(String, u16)> {
     #[cfg(feature = "deploy-host")]
     if shared_types::is_deploy_host() {
-        let addr = shared_types::published::resolve_published_addr(host, port);
-        return (addr.ip().to_string(), addr.port());
+        let addr =
+            shared_types::published::resolve_published_addr(host, port).map_err(|error| {
+                pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(503))
+                    .more_context(error.to_string())
+            })?;
+        return Ok((addr.ip().to_string(), addr.port()));
     }
-    (host.to_string(), port)
+    Ok((host.to_string(), port))
 }
 
 /// 字符串形式（`"host:port"`，如 ctx.upstream_host / HttpPeer::new(addr_str)）。
-pub fn dial_addr(host: &str, port: u16) -> String {
+pub fn dial_addr(host: &str, port: u16) -> pingora_core::Result<String> {
     #[cfg(feature = "deploy-host")]
     if shared_types::is_deploy_host() {
-        return shared_types::published::resolve_published_addr(host, port).to_string();
+        return shared_types::published::resolve_published_addr(host, port)
+            .map(|addr| addr.to_string())
+            .map_err(|error| {
+                pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(503))
+                    .more_context(error.to_string())
+            });
     }
-    format!("{host}:{port}")
+    Ok(format!("{host}:{port}"))
 }

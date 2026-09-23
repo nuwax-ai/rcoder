@@ -160,7 +160,7 @@ impl ContainerStatusChecker {
             shared_types::published::resolve_published_addr(
                 &container.container_name,
                 shared_types::GRPC_DEFAULT_PORT,
-            )
+            )?
             .to_string()
         } else {
             format!(

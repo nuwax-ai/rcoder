@@ -1065,8 +1065,15 @@ impl AppService {
                 Command::Start { traffic } => {
                     if !*traffic || previous.phase != "Running" {
                         guard.mark_mutating()?;
+                        let image = if *traffic {
+                            None
+                        } else {
+                            crate::runtime::params::platform_restart_image(
+                                &std::env::var("RCODER_RUNTIME_IMAGE_DIGEST").ok(),
+                            )
+                        };
                         self.runtime
-                            .start_app_target(&target)
+                            .start_app_target_with_image(&target, image.as_deref())
                             .await
                             .map_err(|error| {
                                 map_runtime_error("Start captured recovery target", error)

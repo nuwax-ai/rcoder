@@ -262,6 +262,7 @@ async fn compute_terminal_scan_preserves_uncertain_then_releases_confirmed_recei
             request_id: "stoprequest".into(),
             request_fingerprint: "a".repeat(64),
             action: ComputeControlAction::Stop,
+            restart_image_roll: false,
         })
         .await
         .unwrap();

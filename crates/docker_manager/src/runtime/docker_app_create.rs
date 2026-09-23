@@ -11,6 +11,8 @@ use shared_types::{ContainerBasicInfo, ServiceType};
 use std::time::Duration;
 
 use super::docker_app_mounts::build_prod_flat_mounts;
+#[cfg(feature = "deploy-host")]
+use super::docker_runtime::parse_ports_label;
 use super::docker_runtime::{
     APP_COMMAND_LABEL, APP_PORTS_LABEL, DockerRuntime, app_deployment_name, encode_ports_label,
     extract_container_ip,
@@ -443,14 +445,21 @@ impl DockerRuntime {
                     }
                 }
             }
+            #[cfg(feature = "deploy-host")]
+            if shared_types::is_deploy_host() {
+                shared_types::published::unregister_if_physical(
+                    &app_deployment_name(app_id),
+                    &name,
+                );
+                shared_types::published::unregister_if_physical(app_id, &name);
+            }
         } else {
             client
                 .start_container(&name, None::<StartContainerOptions>)
                 .await
                 .map_err(|e| ContainerRuntimeError::ContainerStartError(e.to_string()))?;
             // deploy-host：stop 后再 start，容器 IP 重分配——刷新寻址登记
-            self.refresh_deploy_host_registration(&app_deployment_name(app_id))
-                .await;
+            self.refresh_deploy_host_registration(app_id, None).await?;
         }
         Ok(())
     }
@@ -640,8 +649,8 @@ impl DockerRuntime {
             }
         }
         // deploy-host：start 后刷新寻址登记（IP 随 start 就绪/漂移）
-        self.refresh_deploy_host_registration(&target.resource.name)
-            .await;
+        self.refresh_deploy_host_registration(&target.context.app_id, Some(&target.resource.uid))
+            .await?;
         Ok(())
     }
 
@@ -689,7 +698,7 @@ impl DockerRuntime {
                 "Invalid physical application stop target".into(),
             ));
         }
-        match self
+        let stopped = match self
             .inner
             .get_docker_client()
             .stop_container(
@@ -719,7 +728,20 @@ impl DockerRuntime {
                 }
                 Err(ContainerRuntimeError::ContainerStopError(message))
             }
+        };
+        stopped?;
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            shared_types::published::unregister_if_physical(
+                &target.resource.name,
+                &target.resource.uid,
+            );
+            shared_types::published::unregister_if_physical(
+                &target.context.app_id,
+                &target.resource.uid,
+            );
         }
+        Ok(())
     }
 
     async fn capture_app_container_id(
@@ -777,48 +799,102 @@ impl DockerRuntime {
                 "Stop captured application before restart: {error}"
             )));
         }
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            shared_types::published::unregister_if_physical(&app_deployment_name(app_id), &name);
+            shared_types::published::unregister_if_physical(app_id, &name);
+        }
         client
             .start_container(&name, None::<StartContainerOptions>)
             .await
             .map_err(|e| ContainerRuntimeError::ContainerStartError(e.to_string()))?;
         // deploy-host：stop/start 后容器 IP 重分配，刷新寻址登记（键与创建链
         // container_name 同源——部署名本身唯一）
-        self.refresh_deploy_host_registration(&app_deployment_name(app_id))
-            .await;
+        self.refresh_deploy_host_registration(app_id, None).await?;
         Ok(())
     }
 
-    /// deploy-host：重建/重启/扩缩后刷新容器寻址登记（Published 端口映射与
-    /// Direct 容器 IP 均随重建漂移）。登记失败仅 warn 不 fail——容器已在跑，
-    /// 强失败恶化状态；拨号回退 loopback+warn 可归因，进程重启 rehydrate 恢复。
-    async fn refresh_deploy_host_registration(&self, key: &str) {
+    /// Confirm the started physical app and its current host reach before
+    /// reporting an activation as complete. A missing IP is polled boundedly;
+    /// it never authorizes container deletion.
+    async fn refresh_deploy_host_registration(
+        &self,
+        app_id: &str,
+        expected_uid: Option<&str>,
+    ) -> ContainerRuntimeResult<()> {
         #[cfg(not(feature = "deploy-host"))]
         {
-            let _ = (self, key);
+            let _ = (self, app_id, expected_uid);
         }
         #[cfg(feature = "deploy-host")]
         if shared_types::is_deploy_host() {
-            let inspect = match self
-                .inner
-                .get_docker_client()
-                .inspect_container(key, None)
-                .await
-            {
-                Ok(inspect) => inspect,
-                Err(error) => {
-                    tracing::warn!("[deploy-host] reach refresh inspect {key} failed: {error}");
-                    return;
-                }
-            };
+            let name = app_deployment_name(app_id);
             let preferred = self.inner.detect_main_network_name().await.ok();
-            if let Err(error) = crate::deploy_host_ports::register_reach_from_inspect(
-                key,
-                preferred.as_deref(),
-                &inspect,
-            ) {
-                tracing::warn!("[deploy-host] reach refresh register {key} failed: {error}");
+            for attempt in 0..10 {
+                let inspect = self
+                    .inner
+                    .get_docker_client()
+                    .inspect_container(&name, None)
+                    .await
+                    .map_err(|error| {
+                        ContainerRuntimeError::DockerError(format!(
+                            "Inspect started application reach {name}: {error}"
+                        ))
+                    })?;
+                let uid = validate_app_container_target(app_id, &inspect)?;
+                if expected_uid.is_some_and(|expected| expected != uid) {
+                    return Err(ContainerRuntimeError::Conflict(
+                        "Application physical ID changed during reach refresh".into(),
+                    ));
+                }
+                if inspect.state.as_ref().and_then(|state| state.running) != Some(true) {
+                    return Err(ContainerRuntimeError::Conflict(
+                        "Application stopped during reach refresh".into(),
+                    ));
+                }
+                let direct = crate::deploy_host_ports::is_direct_reach();
+                let ip_ready = !direct
+                    || extract_container_ip(&inspect, preferred.as_deref())
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| !ip.is_unspecified());
+                let required: Vec<u16> = inspect
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.labels.as_ref())
+                    .and_then(|labels| labels.get(APP_PORTS_LABEL))
+                    .map(|raw| {
+                        parse_ports_label(raw)
+                            .into_iter()
+                            .filter(|port| port.expose_type == ExposeType::Http)
+                            .map(|port| port.port)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let ports_ready = direct
+                    || crate::deploy_host_ports::missing_published_ports(&inspect, &required)
+                        .is_empty();
+                if ip_ready && ports_ready {
+                    crate::deploy_host_ports::register_reach_from_inspect(
+                        &name,
+                        preferred.as_deref(),
+                        &inspect,
+                    )
+                    .map_err(|error| {
+                        ContainerRuntimeError::DockerError(format!(
+                            "Register application reach: {error}"
+                        ))
+                    })?;
+                    return Ok(());
+                }
+                if attempt < 9 {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
             }
+            return Err(ContainerRuntimeError::DockerError(format!(
+                "Started application {app_id} has no usable host address or required HTTP port binding"
+            )));
         }
+        Ok(())
     }
 }
 

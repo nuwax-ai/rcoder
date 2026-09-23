@@ -38,7 +38,7 @@ impl shared_types::UserappDevLocator for UserappDevLocator {
         if created {
             tracing::info!("[USERAPP_DEV_LOCATOR] builder ensured on demand: app_id={app_id}");
         }
-        Ok(dev_file_server_addr(&state, &info))
+        dev_file_server_addr(&state, &info).map_err(|error| error.to_string())
     }
 
     async fn dev_container_alive(&self, app_id: &str) -> Result<bool, String> {

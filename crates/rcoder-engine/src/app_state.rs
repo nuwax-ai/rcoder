@@ -216,6 +216,8 @@ impl AppState {
             .userapp_recovery_handle
             .lock()
             .map_err(|_| anyhow::anyhow!("recovery handle lock poisoned"))? = Some(recovery_handle);
+        #[cfg(feature = "deploy-host")]
+        crate::userapp_builder::auto_repair::start_scan(Arc::downgrade(&state));
         // 契约三周期补偿观察（Weak 持有，关机广播后自行退出，不占 R02 门）
         crate::storage::start_registry_reconcile(Arc::downgrade(&state), shutdown_tx.subscribe());
         Ok(state)
@@ -398,12 +400,18 @@ impl AppState {
             return;
         }
         if shared_types::is_kubernetes_runtime() || !container_ip.is_empty() {
-            let addr = shared_types::build_grpc_addr(
+            let Ok(addr) = shared_types::build_grpc_addr(
                 container_name,
                 container_ip,
                 &self.config.app_manager.namespace,
                 &self.cluster_domain,
-            );
+            ) else {
+                tracing::warn!(
+                    container_name,
+                    "Skip connection teardown: address not registered"
+                );
+                return;
+            };
             self.shutdown_sse_streams_by_addr(&addr);
             self.grpc_pool.remove(&addr).await;
         }

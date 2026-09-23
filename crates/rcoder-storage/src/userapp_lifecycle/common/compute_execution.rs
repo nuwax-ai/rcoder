@@ -470,7 +470,7 @@ pub(super) async fn resume_drain(
         || current.state != ComputeControlState::RecoveryRequired
         || current.stage != "draining_previous"
         || current.lease.is_some()
-        || !current.checkpoint.is_null()
+        || !unstarted_checkpoint(&current.checkpoint)
     {
         return Err(invalid(
             "Recovery requires inspection of the captured runtime write; only unstarted compute can resume draining",
@@ -486,6 +486,22 @@ pub(super) async fn resume_drain(
     compute::get(tx, &snapshot.app_id, &snapshot.operation_id)
         .await?
         .ok_or(Error::NotFound)
+}
+
+/// Admission now persists the restart image policy before an executor runs.
+/// That one field is not a runtime write receipt; any other checkpoint data
+/// still requires physical inspection before resuming the original operation.
+fn unstarted_checkpoint(checkpoint: &serde_json::Value) -> bool {
+    match checkpoint {
+        serde_json::Value::Null => true,
+        serde_json::Value::Object(fields) => {
+            fields.len() == 1
+                && fields
+                    .get("restart_image_roll")
+                    .is_some_and(serde_json::Value::is_boolean)
+        }
+        _ => false,
+    }
 }
 
 /// Stopped/Verifying are written only after the physical operation returned.

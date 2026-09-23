@@ -5,7 +5,7 @@
 
 #![cfg(feature = "kubernetes")]
 
-use container_runtime_api::{ContainerRuntimeResult, RuntimeContainerInfo};
+use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult, RuntimeContainerInfo};
 use k8s_openapi::api::core::v1::ResourceRequirements;
 use k8s_openapi::api::core::v1::{PersistentVolume, PersistentVolumeClaim, Pod};
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind};
@@ -308,6 +308,9 @@ impl KubernetesRuntime {
                             &access_address,
                             shared_types::HTTP_DEFAULT_PORT
                         )
+                        .map_err(|error| {
+                            ContainerRuntimeError::ConnectionError(error.to_string())
+                        })?
                     )
                 } else {
                     format!(
@@ -338,18 +341,14 @@ pub(super) fn inject_object_identity(
     meta: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
 ) -> ContainerRuntimeResult<()> {
     let (Some(uid), Some(version)) = (meta.uid.as_deref(), meta.resource_version.as_deref()) else {
-        return Err(
-            container_runtime_api::ContainerRuntimeError::ConfigurationError(
-                "Captured resource identity is incomplete (uid/resourceVersion)".into(),
-            ),
-        );
+        return Err(ContainerRuntimeError::ConfigurationError(
+            "Captured resource identity is incomplete (uid/resourceVersion)".into(),
+        ));
     };
     if uid.is_empty() || version.is_empty() {
-        return Err(
-            container_runtime_api::ContainerRuntimeError::ConfigurationError(
-                "Captured resource identity is empty (uid/resourceVersion)".into(),
-            ),
-        );
+        return Err(ContainerRuntimeError::ConfigurationError(
+            "Captured resource identity is empty (uid/resourceVersion)".into(),
+        ));
     }
     let metadata = body
         .as_object_mut()
@@ -360,7 +359,7 @@ pub(super) fn inject_object_identity(
                 .as_object_mut()
         })
         .ok_or_else(|| {
-            container_runtime_api::ContainerRuntimeError::ConfigurationError(
+            ContainerRuntimeError::ConfigurationError(
                 "Conditioned patch body must be an object".into(),
             )
         })?;
@@ -376,18 +375,14 @@ pub(super) fn conditioned_delete_params(
     propagation: Option<kube::api::PropagationPolicy>,
 ) -> ContainerRuntimeResult<kube::api::DeleteParams> {
     let (Some(uid), Some(version)) = (meta.uid.clone(), meta.resource_version.clone()) else {
-        return Err(
-            container_runtime_api::ContainerRuntimeError::ConfigurationError(
-                "Captured resource identity is incomplete (uid/resourceVersion)".into(),
-            ),
-        );
+        return Err(ContainerRuntimeError::ConfigurationError(
+            "Captured resource identity is incomplete (uid/resourceVersion)".into(),
+        ));
     };
     if uid.is_empty() || version.is_empty() {
-        return Err(
-            container_runtime_api::ContainerRuntimeError::ConfigurationError(
-                "Captured resource identity is empty (uid/resourceVersion)".into(),
-            ),
-        );
+        return Err(ContainerRuntimeError::ConfigurationError(
+            "Captured resource identity is empty (uid/resourceVersion)".into(),
+        ));
     }
     Ok(kube::api::DeleteParams {
         propagation_policy: propagation,

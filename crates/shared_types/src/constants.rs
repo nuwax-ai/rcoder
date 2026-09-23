@@ -226,6 +226,20 @@ pub fn build_backend_addr(
     }
 }
 
+/// Missing deploy-host reach registration or port binding.
+#[derive(Debug, thiserror::Error)]
+#[error("container address not ready: {container}:{port}")]
+pub struct ReachNotReady {
+    pub container: String,
+    pub port: u16,
+}
+
+impl From<ReachNotReady> for crate::AppError {
+    fn from(error: ReachNotReady) -> Self {
+        Self::with_message(crate::error_codes::ERR_BACKEND_ERROR, error.to_string())
+    }
+}
+
 /// 构建 gRPC 地址
 ///
 /// 根据运行环境自动选择 gRPC 地址：
@@ -245,14 +259,14 @@ pub fn build_grpc_addr(
     container_ip: &str,
     namespace: &str,
     cluster_domain: &str,
-) -> String {
+) -> Result<String, ReachNotReady> {
     let backend_addr = build_backend_addr(container_name, container_ip, namespace, cluster_domain);
     #[cfg(feature = "deploy-host")]
     if is_deploy_host() {
         return crate::published::resolve_published_addr(&backend_addr, GRPC_DEFAULT_PORT)
-            .to_string();
+            .map(|addr| addr.to_string());
     }
-    format!("{}:{}", backend_addr, GRPC_DEFAULT_PORT)
+    Ok(format!("{}:{}", backend_addr, GRPC_DEFAULT_PORT))
 }
 
 /// 构建 HTTP 地址
@@ -274,14 +288,14 @@ pub fn build_http_addr(
     container_ip: &str,
     namespace: &str,
     cluster_domain: &str,
-) -> String {
+) -> Result<String, ReachNotReady> {
     let backend_addr = build_backend_addr(container_name, container_ip, namespace, cluster_domain);
     #[cfg(feature = "deploy-host")]
     if is_deploy_host() {
         return crate::published::resolve_published_addr(&backend_addr, HTTP_DEFAULT_PORT)
-            .to_string();
+            .map(|addr| addr.to_string());
     }
-    format!("{}:{}", backend_addr, HTTP_DEFAULT_PORT)
+    Ok(format!("{}:{}", backend_addr, HTTP_DEFAULT_PORT))
 }
 
 /// 构建指定容器端口的后端地址：deploy-host 经 published-port 注册表解析
@@ -294,13 +308,14 @@ pub fn build_container_port_addr(
     namespace: &str,
     cluster_domain: &str,
     port: u16,
-) -> String {
+) -> Result<String, ReachNotReady> {
     let backend_addr = build_backend_addr(container_name, container_ip, namespace, cluster_domain);
     #[cfg(feature = "deploy-host")]
     if is_deploy_host() {
-        return crate::published::resolve_published_addr(&backend_addr, port).to_string();
+        return crate::published::resolve_published_addr(&backend_addr, port)
+            .map(|addr| addr.to_string());
     }
-    format!("{}:{}", backend_addr, port)
+    Ok(format!("{}:{}", backend_addr, port))
 }
 
 /// 服务 bind 地址单一事实源：env `RCODER_BIND_HOST` 永远优先；deploy-host

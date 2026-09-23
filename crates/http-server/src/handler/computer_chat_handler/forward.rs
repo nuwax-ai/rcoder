@@ -51,12 +51,20 @@ pub(super) async fn forward_computer_request_to_container(
     // gRPC 连接失败会自动返回错误，由上层处理
 
     // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）
-    let grpc_addr = shared_types::build_grpc_addr(
+    let grpc_addr = match shared_types::build_grpc_addr(
         &params.container_info.container_name,
         &params.container_info.container_ip,
         params.namespace,
         params.cluster_domain,
-    );
+    ) {
+        Ok(addr) => addr,
+        Err(error) => {
+            return HttpResult::error(
+                shared_types::error_codes::ERR_CONTAINER_ERROR,
+                &error.to_string(),
+            );
+        }
+    };
 
     debug!(
         "📡 [COMPUTER_FORWARD] gRPC address: {}, prompt_len={}, attachments={}",

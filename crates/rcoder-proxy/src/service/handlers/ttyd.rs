@@ -313,7 +313,7 @@ pub async fn handle_ttyd_upstream(
     // 创建 HTTP Peer 到容器 agent_runner 的 WS 终端中间层端口（ttyd 本体仍 7681，由 agent_runner 内部连接）
     // Pingora 会自动处理 WebSocket upgrade
     let mut peer = HttpPeer::new(
-        super::super::upstream::dial_peer(&container_ip, WS_TERMINAL_PORT),
+        super::super::upstream::dial_peer(&container_ip, WS_TERMINAL_PORT)?,
         false,          // 不使用 TLS
         "".to_string(), // SNI
     );
@@ -394,7 +394,7 @@ pub async fn handle_web_ttyd_upstream(
 
     // 创建 HTTP Peer 到容器 agent_runner 的 WS 终端中间层端口（ttyd 本体仍 7681，由 agent_runner 内部连接）
     let mut peer = HttpPeer::new(
-        super::super::upstream::dial_peer(&container_ip, WS_TERMINAL_PORT),
+        super::super::upstream::dial_peer(&container_ip, WS_TERMINAL_PORT)?,
         false,          // 不使用 TLS
         "".to_string(), // SNI
     );

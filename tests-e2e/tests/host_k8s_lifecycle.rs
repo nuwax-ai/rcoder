@@ -177,10 +177,11 @@ async fn host_k8s_agent_lifecycle_no_llm() {
     // 有界轮询直至 endpoints 就绪 + 探针通过
     let mut nodeport_reachable = false;
     let mut probe_desc = String::from("not probed");
+    let node_ip = std::env::var("RCODER_K8S_NODE_IP").unwrap_or_else(|_| "127.0.0.1".to_string());
     for _ in 0..30 {
         let probe = env
             .http
-            .get(format!("http://127.0.0.1:{node_port}/health"))
+            .get(format!("http://{node_ip}:{node_port}/health"))
             .timeout(Duration::from_secs(2))
             .send()
             .await;

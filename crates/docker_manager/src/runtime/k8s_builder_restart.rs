@@ -100,13 +100,16 @@ impl KubernetesRuntime {
             ));
         }
         let volumes = self.capture_builder_volume_witness(target).await?;
-        let after = self
+        let mut after = self
             .capture_builder_compute_with_binding(
                 &target.context,
                 target.resource_binding.as_ref(),
                 false,
             )
             .await?;
+        // The requested rollout image belongs to the operation checkpoint, not
+        // to the live controller being captured for its private restart archive.
+        after.restart_image = target.restart_image.clone();
         if &after != target {
             return Err(Error::Conflict(
                 "Builder changed during template capture".into(),

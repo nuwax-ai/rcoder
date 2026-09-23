@@ -124,11 +124,19 @@ impl AppService {
             info!("[APP] pingora disabled (no proxy_config), skip backends rebuild");
             return Ok(());
         }
-        let statuses = self
-            .runtime
-            .list_deployments()
-            .await
-            .map_err(|e| map_runtime_error("[APP] rebuild list_deployments failed", e))?;
+        let statuses = match self.runtime.list_deployments().await {
+            Ok(statuses) => statuses,
+            Err(error) if self.config.access_mode == AppAccessMode::Docker => {
+                warn!(%error, "Docker app route recovery could not list containers; controls remain available");
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(map_runtime_error(
+                    "[APP] rebuild list_deployments failed",
+                    error,
+                ));
+            }
+        };
         let mut count = 0;
         for status in &statuses {
             let http_ports: Vec<u16> = status
@@ -138,11 +146,52 @@ impl AppService {
                 .map(|p| p.port)
                 .collect();
             if http_ports.is_empty() {
+                if self.config.access_mode == AppAccessMode::Docker && status.replicas > 0 {
+                    warn!(app_id = %status.app_id,
+                        "Running Docker app has no valid HTTP port metadata for route recovery");
+                }
                 continue;
             }
-            // register 内部按 access_mode 选 host（K8s=svc FQDN）；container_ip 传空（K8s 不用）
+            if self.config.access_mode == AppAccessMode::Docker {
+                let identity = match self.metadata.store.get_application(&status.app_id).await {
+                    Ok(Some(identity)) => identity,
+                    Ok(None) => {
+                        warn!(app_id = %status.app_id, "Docker app route recovery has no lifecycle identity");
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(app_id = %status.app_id, %error, "Docker app route recovery identity read failed");
+                        continue;
+                    }
+                };
+                if identity.state != shared_types::UserAppLifecycleState::Active
+                    || status.lifecycle_id.as_deref() != Some(identity.lifecycle_id.as_str())
+                {
+                    warn!(app_id = %status.app_id, "Docker app route recovery lifecycle mismatch");
+                    continue;
+                }
+                // A stopped app retains its typed HTTP metadata for explicit
+                // Start/traffic wake but must not create a live proxy backend.
+                if status.replicas == 0 {
+                    self.pingora_ports.insert(status.app_id.clone(), http_ports);
+                    continue;
+                }
+                #[cfg(feature = "deploy-host")]
+                let needs_ip =
+                    !shared_types::is_deploy_host() || shared_types::deploy_host_reach::is_direct();
+                #[cfg(not(feature = "deploy-host"))]
+                let needs_ip = true;
+                if needs_ip && status.pod_ip.is_none() {
+                    warn!(app_id = %status.app_id, "Running Docker app has no current IP for route recovery");
+                    continue;
+                }
+            }
             let registered = self
-                .register_pingora_backends(&status.app_id, &http_ports, "")
+                .register_pingora_backends(
+                    &status.app_id,
+                    &http_ports,
+                    status.pod_ip.as_deref().unwrap_or_default(),
+                )
                 .await;
             if !registered.is_empty() {
                 count += 1;

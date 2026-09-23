@@ -63,7 +63,7 @@ pub(super) async fn call_grpc_get_status_with_retry(
         params.container_ip,
         params.namespace,
         params.cluster_domain,
-    );
+    )?;
 
     crate::grpc::retry::call_grpc_with_retry(
         params.pool,

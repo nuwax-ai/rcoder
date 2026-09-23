@@ -155,20 +155,21 @@ impl KubernetesRuntime {
         &self,
         target: &shared_types::UserAppMutationTarget,
     ) -> ContainerRuntimeResult<()> {
-        self.start_captured_with_policy(target, true).await
+        self.start_captured_with_policy(target, true, None).await
     }
 
     pub(super) async fn start_captured_management_target(
         &self,
         target: &shared_types::UserAppMutationTarget,
     ) -> ContainerRuntimeResult<()> {
-        self.start_captured_with_policy(target, false).await
+        self.start_captured_with_policy(target, false, None).await
     }
 
-    async fn start_captured_with_policy(
+    pub(super) async fn start_captured_with_policy(
         &self,
         target: &shared_types::UserAppMutationTarget,
         enable_traffic_wake: bool,
+        image: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
         target
             .context
@@ -193,14 +194,16 @@ impl KubernetesRuntime {
             ContainerRuntimeError::ConfigurationError(format!("Encode start receipt: {error}"))
         })?;
         let patch = if enable_traffic_wake {
-            serde_json::json!({
-                "metadata":{"annotations":{(WAKE_ON_TRAFFIC_ANNOTATION):"true", "rcoder.io/compute-start-receipt":receipt}},
-                "spec":{"replicas":1}
-            })
+            app_compute_start_patch(&receipt, image)
         } else {
             serde_json::json!({"metadata":{"annotations":{"rcoder.io/compute-start-receipt":receipt}},"spec":{"replicas":1}})
         };
-        self.patch_captured_app(&target.resource, patch).await
+        if image.is_some() {
+            self.patch_captured_app_strategic(&target.resource, patch)
+                .await
+        } else {
+            self.patch_captured_app(&target.resource, patch).await
+        }
     }
 
     pub(super) async fn stop_captured_target(
@@ -534,23 +537,134 @@ impl KubernetesRuntime {
             .and_then(|value| {
                 serde_json::from_str::<shared_types::UserAppExecutionContext>(value).ok()
             });
-        Ok(
-            deployment.metadata.uid.as_deref() == Some(target.resource.uid.as_str())
-                && receipt.as_ref() == Some(&target.context)
-                && deployment
-                    .spec
-                    .as_ref()
-                    .is_some_and(|spec| spec.replicas == Some(1))
-                && deployment.status.as_ref().is_some_and(|status| {
-                    status.ready_replicas.unwrap_or(0) > 0
-                        && status.updated_replicas.unwrap_or(0) > 0
-                        && deployment.metadata.generation.is_some_and(|generation| {
-                            status
-                                .observed_generation
-                                .is_some_and(|observed| observed >= generation)
+        if deployment.metadata.uid.as_deref() != Some(target.resource.uid.as_str())
+            || receipt.as_ref() != Some(&target.context)
+            || !deployment
+                .spec
+                .as_ref()
+                .is_some_and(|spec| spec.replicas == Some(1))
+            || !deployment.status.as_ref().is_some_and(|status| {
+                status.updated_replicas.unwrap_or(0) > 0
+                    && deployment.metadata.generation.is_some_and(|generation| {
+                        status
+                            .observed_generation
+                            .is_some_and(|observed| observed >= generation)
+                    })
+            })
+        {
+            return Ok(false);
+        }
+        // Physical restart ends when this Deployment's current Pod is running.
+        // ready_replicas may depend on the user's HTTP readiness probe; a
+        // failing application must not hold the compute operation forever.
+        self.current_app_compute_pod_running(&deployment).await
+    }
+
+    async fn current_app_compute_pod_running(
+        &self,
+        deployment: &k8s_openapi::api::apps::v1::Deployment,
+    ) -> ContainerRuntimeResult<bool> {
+        use k8s_openapi::api::{apps::v1::ReplicaSet, core::v1::Pod};
+        use kube::{Api, api::ListParams};
+
+        let Some(deployment_uid) = deployment.metadata.uid.as_deref() else {
+            return Ok(false);
+        };
+        let Some(revision) = deployment
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get("deployment.kubernetes.io/revision"))
+        else {
+            return Ok(false);
+        };
+        let Some(selector) = deployment.spec.as_ref().map(|spec| &spec.selector) else {
+            return Ok(false);
+        };
+        if selector
+            .match_expressions
+            .as_ref()
+            .is_some_and(|expressions| !expressions.is_empty())
+        {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Unsupported application selector during compute observation".into(),
+            ));
+        }
+        let Some(labels) = selector
+            .match_labels
+            .as_ref()
+            .filter(|labels| !labels.is_empty())
+        else {
+            return Ok(false);
+        };
+        let label_selector = labels
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let params = ListParams::default().labels(&label_selector);
+        let replica_sets: Api<ReplicaSet> = Api::namespaced(self.client.clone(), &self.namespace);
+        let current_rs_uids: std::collections::HashSet<String> = replica_sets
+            .list(&params)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!("Observe compute ReplicaSets: {error}"))
+            })?
+            .items
+            .into_iter()
+            .filter(|rs| {
+                rs.metadata.deletion_timestamp.is_none()
+                    && rs.metadata.owner_references.as_ref().is_some_and(|owners| {
+                        owners.iter().any(|owner| owner.uid == deployment_uid)
+                    })
+                    && rs.metadata.annotations.as_ref().is_some_and(|annotations| {
+                        annotations.get("deployment.kubernetes.io/revision") == Some(revision)
+                    })
+                    && rs
+                        .spec
+                        .as_ref()
+                        .is_some_and(|spec| spec.replicas.unwrap_or(0) > 0)
+            })
+            .filter_map(|rs| rs.metadata.uid)
+            .collect();
+        if current_rs_uids.is_empty() {
+            return Ok(false);
+        }
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        Ok(pods
+            .list(&params)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!("Observe compute Pods: {error}"))
+            })?
+            .items
+            .iter()
+            .any(|pod| {
+                pod.metadata.deletion_timestamp.is_none()
+                    && pod
+                        .metadata
+                        .owner_references
+                        .as_ref()
+                        .is_some_and(|owners| {
+                            owners
+                                .iter()
+                                .any(|owner| current_rs_uids.contains(&owner.uid))
                         })
-                }),
-        )
+                    && pod.status.as_ref().is_some_and(|status| {
+                        status
+                            .container_statuses
+                            .as_ref()
+                            .is_some_and(|containers| {
+                                containers.iter().any(|container| {
+                                    container.name == APP_CONTAINER_NAME
+                                        && container
+                                            .state
+                                            .as_ref()
+                                            .is_some_and(|state| state.running.is_some())
+                                })
+                            })
+                    })
+            }))
     }
 
     pub(super) async fn reconcile_captured_compute_stop(

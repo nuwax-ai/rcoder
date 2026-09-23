@@ -345,11 +345,14 @@ fn show_docker_configuration_help(socket_path: &str) {
 
 /// deploy-host K8s 启动回填：list 本 namespace 的 rcoder-runtime agent
 /// Services（selector: managed-by=rcoder-runtime + component=agent），按
-/// `rcoder.io/instance` label 取 identifier，读回 nodePort 整表登记注册表。
+/// `rcoder.io/identifier` label 取 identifier，读回 nodePort 整表登记注册表。
 #[cfg(all(feature = "kubernetes", feature = "deploy-host"))]
 async fn rehydrate_deploy_host_node_ports() -> anyhow::Result<()> {
     use k8s_openapi::api::core::v1::Service;
     use kube::api::{Api, ListParams};
+
+    let host =
+        shared_types::published::k8s_node_port_host().map_err(|error| anyhow::anyhow!(error))?;
 
     let client = kube::Client::try_default()
         .await
@@ -368,12 +371,19 @@ async fn rehydrate_deploy_host_node_ports() -> anyhow::Result<()> {
             .metadata
             .labels
             .as_ref()
-            .and_then(|labels| labels.get("rcoder.io/instance"))
+            .and_then(|labels| labels.get("rcoder.io/identifier"))
             .cloned()
         else {
             continue;
         };
-        let Some(ports) = svc.spec.as_ref().and_then(|spec| spec.ports.as_ref()) else {
+        let Some(spec) = svc
+            .spec
+            .as_ref()
+            .filter(|spec| spec.type_.as_deref() == Some("NodePort"))
+        else {
+            continue;
+        };
+        let Some(ports) = spec.ports.as_ref() else {
             continue;
         };
         let map: std::collections::HashMap<u16, u16> = ports
@@ -383,7 +393,11 @@ async fn rehydrate_deploy_host_node_ports() -> anyhow::Result<()> {
                 Some((p.port as u16, node_port))
             })
             .collect();
-        if map.is_empty() {
+        if map.len() != ports.len() || map.is_empty() {
+            tracing::warn!(
+                identifier,
+                "[deploy-host] incomplete NodePort Service; skipping route rehydrate"
+            );
             continue;
         }
         // 双键对齐运行期注册（k8s_service.rs：identifier + 完整 STS 名）——
@@ -392,9 +406,9 @@ async fn rehydrate_deploy_host_node_ports() -> anyhow::Result<()> {
         if let Some(svc_name) = svc.metadata.name.as_deref()
             && let Some(sts_name) = svc_name.strip_suffix("-svc")
         {
-            shared_types::published::register(sts_name, map.clone());
+            shared_types::published::register_node_ports(sts_name, host, map.clone());
         }
-        shared_types::published::register(&identifier, map);
+        shared_types::published::register_node_ports(&identifier, host, map);
         registered += 1;
     }
     tracing::info!(

@@ -166,11 +166,12 @@ impl KubernetesRuntime {
         }
         check_cancelled()?;
 
-        // Preserve the ordinary agent creation order. Managed builders attach
-        // their receipt atomically to the final Service mutation below.
-        if params.execution_context.is_none() {
-            self.create_agent_service(identifier, &service_type).await?;
-        }
+        // Host-side address materialization needs the Service's assigned
+        // NodePorts. Keep the admitted builder lease while creating it; the
+        // completion receipt remains a separate final, identity-checked
+        // Service mutation below. A crash between these steps leaves a
+        // discoverable Service without a success receipt.
+        self.create_agent_service(identifier, &service_type).await?;
         let info = self
             .get_container_info_inner(identifier, &service_type)
             .await?

@@ -16,7 +16,7 @@ const RECEIPT_ROOT_ENV: &str = "RCODER_OPERATION_RECEIPT_ROOT";
 /// 推导链：env 显式覆盖 > deploy-host 宿主机形态经 host_map 解析的宿主真实
 /// 根 > 容器形态常量。容器常量 `/app/...` 只在容器内可写；宿主机进程
 /// （macOS 只读根 `/`）直接落盘会 EROFS——宿主机形态与单测必须解析可写根。
-async fn receipts_base() -> Result<PathBuf> {
+pub(super) async fn receipts_base() -> Result<PathBuf> {
     if let Ok(explicit) = std::env::var(RECEIPT_ROOT_ENV)
         && !explicit.trim().is_empty()
     {

@@ -9,7 +9,7 @@ use anyhow::Result;
 use container_runtime_api::ContainerRuntime;
 use shared_types::ServiceType;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::cleanup_task::strategies::DestroyReason;
 use crate::grpc::ShutdownSseFn;
@@ -123,19 +123,26 @@ impl ContainerDestroyer {
         let empty_ip_unusable = !self.is_kubernetes && container_ip.is_empty();
         if empty_ip_unusable {
             debug!("[destroyer] Container IP is empty, skipping gRPC cleanup");
-            return Ok(());
-        }
-        let grpc_addr = shared_types::build_grpc_addr(
-            container_name,
-            container_ip,
-            &self.namespace,
-            &self.cluster_domain,
-        );
-        self.grpc_pool.remove(&grpc_addr).await;
-
-        // 关闭指向该地址的 SSE 共享流（与 grpc_pool.remove 同源同处；幂等）。
-        if let Some(ref shutdown_sse) = self.shutdown_sse {
-            shutdown_sse(&grpc_addr);
+        } else {
+            match shared_types::build_grpc_addr(
+                container_name,
+                container_ip,
+                &self.namespace,
+                &self.cluster_domain,
+            ) {
+                Ok(grpc_addr) => {
+                    self.grpc_pool.remove(&grpc_addr).await;
+                    // 关闭指向该地址的 SSE 共享流（与 grpc_pool.remove 同源同处；幂等）。
+                    if let Some(ref shutdown_sse) = self.shutdown_sse {
+                        shutdown_sse(&grpc_addr);
+                    }
+                }
+                Err(error) => {
+                    // The physical stop has already completed. A missing old
+                    // route cannot prevent the independent proxy cleanup.
+                    warn!(container_name, %error, "Skip unavailable gRPC address during cleanup");
+                }
+            }
         }
 
         if let Some(ref pingora_service) = self.pingora_service {

@@ -671,6 +671,14 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         self.start_captured_target(target).await
     }
 
+    async fn start_app_target_with_image(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+        image: Option<&str>,
+    ) -> ContainerRuntimeResult<()> {
+        self.start_captured_with_policy(target, true, image).await
+    }
+
     async fn app_compute_absent(
         &self,
         context: &shared_types::UserAppExecutionContext,

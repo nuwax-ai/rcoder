@@ -257,6 +257,16 @@ pub trait AgentContainerRuntime: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Observe a captured running Docker builder's Published reach. `None`
+    /// means this runtime/mode is not eligible for automatic repair; an empty
+    /// vector means all required ports are bound. This never mutates compute.
+    async fn missing_builder_published_ports(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<Vec<u16>>> {
+        Ok(None)
+    }
+
     async fn fence_builder_compute_write(
         &self,
         _target: &shared_types::BuilderControlTarget,
@@ -289,6 +299,13 @@ pub trait AgentContainerRuntime: Send + Sync {
         Err(ContainerRuntimeError::ConfigurationError(
             "Captured builder startup is unsupported".into(),
         ))
+    }
+
+    /// Return the currently configured builder image for an explicit compute
+    /// start. The coordinator freezes it in its durable checkpoint before any
+    /// runtime write; backends without a managed image may return `None`.
+    fn current_builder_image(&self) -> Option<String> {
+        None
     }
 
     /// Get container information by project_id
@@ -879,6 +896,21 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         Err(ContainerRuntimeError::ConfigurationError(
             "Identity-bound application start is unsupported".into(),
         ))
+    }
+
+    /// Explicit start with an optional platform image. Implementations should
+    /// retain their ordinary start receipt and wake policy while updating the
+    /// image in the same identity-fenced runtime write.
+    async fn start_app_target_with_image(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+        image: Option<&str>,
+    ) -> ContainerRuntimeResult<()> {
+        if image.is_some() {
+            self.restart_app_target(target, image).await
+        } else {
+            self.start_app_target(target).await
+        }
     }
 
     /// Stop only this captured target. K8s commits wake policy and scale in one

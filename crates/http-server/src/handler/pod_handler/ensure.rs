@@ -1,6 +1,7 @@
 use super::ensure_flow;
 use super::helpers::*;
 use super::*;
+use axum::response::IntoResponse;
 
 /// 启动/确保容器存在（幂等）
 ///
@@ -11,7 +12,8 @@ use super::*;
     path = "/computer/pod/ensure",
     request_body(content = EnsurePodRequest, description = "启动容器请求"),
     responses(
-        (status = 200, description = "成功启动/获取容器；UserApp prod 操作占用返回 ERR_CONFLICT 信封，包含 blocker 及已知的 operation_id", body = HttpResult<EnsurePodResponse>),
+        (status = 200, description = "容器已存在或普通容器已同步创建；UserApp 只表示计算资源已请求运行，不代表业务 Ready", body = HttpResult<EnsurePodResponse>),
+        (status = 202, description = "已有 UserApp 计算资源需要物理启动；返回持久操作 ID 和查询地址，不等待业务服务 Ready", body = HttpResult<crate::userapp_builder::compute_control::ComputeOperationView>),
         (status = 400, description = "请求参数无效", body = HttpResult<String>),
         (status = 401, description = "API Key 鉴权失败", body = HttpResult<String>),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
@@ -19,13 +21,13 @@ use super::*;
     tag = "pod",
     operation_id = "pod_ensure",
     summary = "启动/确保容器存在（幂等）",
-    description = "根据 user_id 和 project_id 启动或获取已存在的容器，仅启动容器不启动 Agent 服务"
+    description = "根据 user_id 和 project_id 启动或获取已存在的容器，仅启动容器不启动 Agent 服务。UserApp 已有控制器但计算资源停止时走高优先级物理控制操作，Kubernetes 启动时将 Pod 模板更新为当前平台镜像并保留 PVC；HTTP 202 返回 operation_id，业务 Ready 单独查询。已运行的容器直接返回，不因 ensure 升级镜像。Stop/Restart 正在执行时快失败，不内部排队。"
 )]
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn pod_ensure(
     State(state): State<Arc<AppState>>,
     I18nJsonOrQuery(request): I18nJsonOrQuery<EnsurePodRequest>,
-) -> Result<HttpResult<EnsurePodResponse>, AppError> {
+) -> Result<axum::response::Response, AppError> {
     let locale = shared_types::current_request_locale();
 
     // 0. userApp 分派（app_id 存在即短路 agent 流程）
@@ -43,14 +45,27 @@ pub async fn pod_ensure(
         }
         Err(e) => {
             error!("[POD_ENSURE] invalid app target: {}", e);
-            return Ok(invalid_app_target_response(locale, &e));
+            return Ok(invalid_app_target_response::<EnsurePodResponse>(locale, &e).into_response());
         }
     }
 
+    ensure_ordinary_pod(&state, &request, locale)
+        .await
+        .map(IntoResponse::into_response)
+}
+
+pub(crate) async fn ensure_ordinary_pod(
+    state: &Arc<AppState>,
+    request: &EnsurePodRequest,
+    locale: &'static str,
+) -> Result<HttpResult<EnsurePodResponse>, AppError> {
     // 1. 验证参数
-    if let Some(resp) =
-        validate_pod_ids(&request.user_id, &request.project_id, locale, "POD_ENSURE")
-    {
+    if let Some(resp) = validate_pod_ids::<EnsurePodResponse>(
+        &request.user_id,
+        &request.project_id,
+        locale,
+        "POD_ENSURE",
+    ) {
         return Ok(resp);
     }
 
@@ -59,7 +74,7 @@ pub async fn pod_ensure(
         && let Err(e) = validate_resource_limits(limits)
     {
         error!("[POD_ENSURE] resources update failed: {}", e);
-        return Ok(HttpResult::error_with_message(
+        return Ok(HttpResult::<EnsurePodResponse>::error_with_message(
             shared_types::error_codes::ERR_INVALID_RESOURCE_LIMITS,
             locale,
             &e,
@@ -71,7 +86,7 @@ pub async fn pod_ensure(
         Ok(st) => st,
         Err(e) => {
             error!("[POD_ENSURE] invalid service_type: {}", e);
-            return Ok(HttpResult::error_with_message(
+            return Ok(HttpResult::<EnsurePodResponse>::error_with_message(
                 shared_types::error_codes::ERR_VALIDATION,
                 locale,
                 &e,
@@ -95,8 +110,8 @@ pub async fn pod_ensure(
     // === 并发保护：检查是否有其他请求正在创建同一用户的容器 ===
     // 使用原子标记（DashMap）避免并发请求互相干扰，无死锁风险
     if let Some(response) = ensure_flow::wait_for_concurrent_creation(
-        &state,
-        &request,
+        state,
+        request,
         &service_type,
         &container_identifier,
     )
@@ -108,16 +123,16 @@ pub async fn pod_ensure(
     // 2. 🔍 实时查询 runtime 检查容器是否存在（不依赖缓存），未运行的旧容器
     // 连同 SSE/gRPC 连接一并清理
     let need_create =
-        ensure_flow::resolve_need_create(&state, &container_identifier, &service_type).await?;
+        ensure_flow::resolve_need_create(state, &container_identifier, &service_type).await?;
 
     // 3. 获取或创建容器（带重试机制 + 标记）
     let (container_info, created) = if need_create {
         let info =
-            ensure_flow::create_with_retry(&state, &request, &service_type, &container_identifier)
+            ensure_flow::create_with_retry(state, request, &service_type, &container_identifier)
                 .await?;
         (info, true)
     } else {
-        ensure_flow::get_existing_with_sync(&state, &request, &service_type, &container_identifier)
+        ensure_flow::get_existing_with_sync(state, request, &service_type, &container_identifier)
             .await?
     };
 
@@ -128,8 +143,8 @@ pub async fn pod_ensure(
         "Container already exists, can access virtual desktop via VNC directly".to_string()
     };
     persist_and_respond(
-        &state,
-        &request,
+        state,
+        request,
         &service_type,
         &container_info,
         created,
@@ -147,7 +162,61 @@ async fn ensure_userapp_dev(
     state: &Arc<AppState>,
     app_id: String,
     _user_id: &str,
-) -> Result<HttpResult<EnsurePodResponse>, AppError> {
+) -> Result<axum::response::Response, AppError> {
+    match crate::userapp_builder::inspect_builder_compute(state, &app_id)
+        .await
+        .map_err(|error| crate::userapp_builder::control_error(&error))?
+    {
+        crate::userapp_builder::BuilderComputeState::Running(info) => {
+            return Ok(HttpResult::success(EnsurePodResponse {
+                created: false,
+                container_info: PodContainerInfo {
+                    container_id: info.container_id,
+                    status: info.status,
+                },
+                message: "UserApp dev 计算容器正在运行；业务服务状态请单独查询".into(),
+            })
+            .into_response());
+        }
+        crate::userapp_builder::BuilderComputeState::StoppedRetained => {
+            let operation = crate::userapp_builder::compute_control::submit_physical_start(
+                state,
+                app_id,
+                shared_types::UserAppOperationScope::Dev,
+                shared_types::UserAppControlRequest {
+                    lifecycle_id: None,
+                    request_id: None,
+                },
+            )
+            .await
+            .map_err(|error| crate::userapp_builder::control_error(&error))?;
+            let operation_id = operation.operation_id.clone();
+            return Ok((
+                axum::http::StatusCode::ACCEPTED,
+                HttpResult::success(operation).with_operation_id(operation_id),
+            )
+                .into_response());
+        }
+        crate::userapp_builder::BuilderComputeState::StoppedRemoved => {
+            // Docker builders use AutoRemove. Their physical object is
+            // gone, so there is no captured UID to restart in place. A
+            // completed Stop has already drained the old business executor;
+            // explicit ensure may create a new container on the same mounts.
+            let info = crate::userapp_builder::ensure_userapp_builder(state, &app_id)
+                .await
+                .map_err(|error| crate::userapp_builder::control_error(&error))?;
+            return Ok(HttpResult::success(EnsurePodResponse {
+                created: true,
+                container_info: PodContainerInfo {
+                    container_id: info.container_id,
+                    status: info.status,
+                },
+                message: "UserApp dev 计算容器已使用原工作区重建".into(),
+            })
+            .into_response());
+        }
+        crate::userapp_builder::BuilderComputeState::Missing => {}
+    }
     let (info, created) = crate::userapp_builder::ensure_userapp_builder_probed(state, &app_id)
         .await
         .map_err(|e| {
@@ -165,86 +234,77 @@ async fn ensure_userapp_dev(
             status: info.status.clone(),
         },
         message: "Userapp dev 容器已就绪（虚拟终端/文件服务经反向代理访问）".to_string(),
-    }))
+    })
+    .into_response())
 }
 
-/// ensure 的 userApp prod 分支：三态分派——已存在→唤醒（Ready/AlreadyRunning
-/// 成功，Timeout/Failed 报错）；**不存在→空容器预创建**（复用 start 无 url
-/// 三态链：supervisord 固定服务 PG/dbx/终端即可用、应用未部署，正式发布走
-/// update 分支承接、PG 凭据由发布链 align）；API 查询故障→报错（
-/// `fetch_runtime_status_or_err` 的精确分类保证只有"集群真不存在"才创建，
-/// 瞬时故障不误建容器）。
+/// Existing prod compute is an explicit physical control, independent of
+/// application readiness and the ordinary deployment slot. Missing compute
+/// still follows the initial empty-container creation path.
 async fn ensure_userapp_prod(
     state: &Arc<AppState>,
     locale: &str,
     app_id: String,
     _user_id: &str,
-) -> Result<HttpResult<EnsurePodResponse>, AppError> {
-    match state.app_service.get_app(&app_id).await {
-        Ok(_) => {}
+) -> Result<axum::response::Response, AppError> {
+    let runtime = match state.app_service.get_app(&app_id).await {
+        Ok(runtime) => runtime,
         Err(app_manager::AppOperationError::NotFound(_)) => {
-            return ensure_userapp_prod_created(state, locale, app_id).await;
+            return ensure_userapp_prod_created(state, locale, app_id)
+                .await
+                .map(IntoResponse::into_response);
         }
         Err(e) => {
             // API Server 不可达/RBAC 拒绝等查询故障：语义=查询失败而非应用不存在，
             // 与唤醒路径的 Timeout/Failed 同码（Backend），不触发创建
             error!("[POD_ENSURE] query userapp prod app failed: app_id={app_id}: {e:#}");
-            return Ok(HttpResult::error_with_message(
+            return Ok(HttpResult::<EnsurePodResponse>::error_with_message(
                 shared_types::error_codes::ERR_BACKEND_ERROR,
                 locale,
                 &format!("query userapp prod app failed: {e:#}"),
-            ));
+            )
+            .into_response());
         }
-    }
-    use shared_types::AppWakeControl;
-    // 拍板 2026-09-23：手动 stop 与闲置回收统一——pod/ensure 与 rcoder-proxy
-    // 被动流量共用 ensure_running 语义，有请求即唤醒。
-    let outcome = state.activity.ensure_running(&app_id).await;
-    match outcome {
-        shared_types::WakeOutcome::Ready => Ok(HttpResult::success(EnsurePodResponse {
-            created: true,
-            container_info: PodContainerInfo {
-                container_id: app_id.clone(),
-                status: "Running".to_string(),
-            },
-            message: "Userapp 生产实例已唤醒（wake_on_traffic 已启用）".to_string(),
-        })),
-        shared_types::WakeOutcome::AlreadyRunning => Ok(HttpResult::success(EnsurePodResponse {
+    };
+    if runtime.replicas > 0 && runtime.phase != "Error" {
+        // The physical controller already asks for a Pod. Do not wait on
+        // application readiness or an unrelated deploy, but do not race an
+        // active Stop/Restart or report a stopped intent as running.
+        state
+            .userapp_store
+            .check_compute_access(&app_id, shared_types::UserAppOperationScope::Prod, false)
+            .await
+            .map_err(|error| {
+                let error: anyhow::Error = error.into();
+                crate::userapp_builder::control_error(&error)
+            })?;
+        return Ok(HttpResult::success(EnsurePodResponse {
             created: false,
             container_info: PodContainerInfo {
-                container_id: app_id.clone(),
-                status: "Running".to_string(),
+                container_id: app_id,
+                status: runtime.phase,
             },
-            message: "Userapp 生产实例已在运行".to_string(),
-        })),
-        shared_types::WakeOutcome::Timeout => {
-            error!("[POD_ENSURE] userapp prod wake timeout: app_id={app_id}");
-            Ok(HttpResult::error_with_message(
-                shared_types::error_codes::ERR_BACKEND_ERROR,
-                locale,
-                "userapp prod ensure failed: wake timeout",
-            ))
-        }
-        shared_types::WakeOutcome::Blocked { message, blocker } => {
-            let mut response = HttpResult::error_with_message(
-                shared_types::error_codes::ERR_CONFLICT,
-                locale,
-                &message,
-            );
-            if !blocker.operation_id.is_empty() {
-                response = response.with_operation_id(blocker.operation_id.clone());
-            }
-            Ok(response.with_blocker(blocker))
-        }
-        shared_types::WakeOutcome::Failed(e) => {
-            error!("[POD_ENSURE] userapp prod wake failed: app_id={app_id}: {e}");
-            Ok(HttpResult::error_with_message(
-                shared_types::error_codes::ERR_BACKEND_ERROR,
-                locale,
-                &format!("userapp prod ensure failed: {e}"),
-            ))
-        }
+            message: "UserApp prod 计算资源已请求运行；业务服务状态请单独查询".into(),
+        })
+        .into_response());
     }
+    let operation = crate::userapp_builder::compute_control::submit_physical_start(
+        state,
+        app_id,
+        shared_types::UserAppOperationScope::Prod,
+        shared_types::UserAppControlRequest {
+            lifecycle_id: None,
+            request_id: None,
+        },
+    )
+    .await
+    .map_err(|error| crate::userapp_builder::control_error(&error))?;
+    let operation_id = operation.operation_id.clone();
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        HttpResult::success(operation).with_operation_id(operation_id),
+    )
+        .into_response())
 }
 
 /// prod 空容器预创建子分支：应用共享（无 owner 解析），复用 start 无 url

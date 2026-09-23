@@ -197,6 +197,7 @@ impl DockerManager {
                     &container_info.container_name,
                     shared_types::HTTP_DEFAULT_PORT
                 )
+                .map_err(|error| DockerError::ConnectionError(error.to_string()))?
             )
         } else {
             format!(

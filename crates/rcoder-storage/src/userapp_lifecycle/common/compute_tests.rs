@@ -13,8 +13,87 @@ fn request(
         request_id: id.into(),
         request_fingerprint: "a".repeat(64),
         action,
+        restart_image_roll: false,
     }
 }
+
+#[tokio::test]
+async fn automatic_repair_only_claims_idle_scope_and_explicit_restart_supersedes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ToastyUserAppStore::open_exclusive(&dir.path().join("auto-repair.db"))
+        .await
+        .unwrap();
+    let app = store.ensure_identity("autorepairapp").await.unwrap();
+    let ordinary = store
+        .admit(&UserAppAdmission {
+            app_id: app.app_id.clone(),
+            lifecycle_id: Some(app.lifecycle_id.clone()),
+            operation_id: "buildone".into(),
+            request_id: Some("buildrequest".into()),
+            request_fingerprint: "b".repeat(64),
+            kind: UserAppOperationKind::EnsureBuilder,
+            command: None,
+            metadata: None,
+            runtime_policy_on_success: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(ordinary, UserAppAdmissionOutcome::Accepted(_)));
+    let mut auto = request(&app, "autorepairone", ComputeControlAction::Restart);
+    auto.request_id = "auto-repair-physicalone".into();
+    assert!(matches!(
+        store.admit_idle_compute_repair(&auto).await,
+        Err(UserAppStoreError::VersionConflict)
+    ));
+    assert!(
+        store
+            .get_compute_control(&app.app_id, &auto.operation_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    store.shutdown().await.unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = ToastyUserAppStore::open_exclusive(&dir.path().join("idle-repair.db"))
+        .await
+        .unwrap();
+    let app = store.ensure_identity("idleautorepairapp").await.unwrap();
+    let mut auto = request(&app, "autorepairtwo", ComputeControlAction::Restart);
+    auto.request_id = "auto-repair-physicaltwo".into();
+    let admitted = store.admit_idle_compute_repair(&auto).await.unwrap();
+    let executor = ComputeExecutorIdentity {
+        app_id: app.app_id.clone(),
+        lifecycle_id: app.lifecycle_id.clone(),
+        scope: UserAppOperationScope::Dev,
+        operation_id: admitted.operation_id.clone(),
+        generation: admitted.generation,
+        executor_id: "repairworker".into(),
+    };
+    store
+        .claim_compute_control(&executor, admitted.revision)
+        .await
+        .unwrap();
+    let explicit = store
+        .admit_compute_control(&request(
+            &app,
+            "manualrestart",
+            ComputeControlAction::Restart,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        explicit
+            .interrupted_operations
+            .contains(&admitted.operation_id)
+    );
+    assert!(matches!(
+        store.check_compute_executor(&executor).await,
+        Err(UserAppStoreError::VersionConflict)
+    ));
+    store.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn compute_priority_rejects_new_busy_requests_without_releasing_business_slot() {
     let dir = tempfile::tempdir().unwrap();
@@ -338,6 +417,12 @@ async fn compute_intent_blocks_new_same_scope_work_but_not_other_scope() {
         .admit_compute_control(&request(&app, "stop", ComputeControlAction::Stop))
         .await
         .unwrap();
+    assert!(
+        store
+            .compute_desired_stopped(&app.app_id, &app.lifecycle_id, UserAppOperationScope::Dev)
+            .await
+            .unwrap()
+    );
     let mut normal = UserAppAdmission {
         app_id: app.app_id.clone(),
         lifecycle_id: Some(app.lifecycle_id.clone()),
@@ -777,6 +862,49 @@ async fn compute_uncertain_write_cannot_be_downgraded_to_failure_or_reclaimed() 
             .await
             .is_err()
     );
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn compute_drain_recovery_accepts_only_initial_policy_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ToastyUserAppStore::open_exclusive(&dir.path().join("drain-recovery.db"))
+        .await
+        .unwrap();
+    for (app_id, extra_evidence) in [("cleanrecovery", false), ("uncertainrecovery", true)] {
+        let app = store.ensure_identity(app_id).await.unwrap();
+        let mut input = request(
+            &app,
+            &format!("restart{app_id}"),
+            ComputeControlAction::Restart,
+        );
+        input.restart_image_roll = true;
+        let pending = store.admit_compute_control(&input).await.unwrap();
+        let identity = compute_identity(&pending);
+        let claimed = store
+            .claim_compute_control(&identity, pending.revision)
+            .await
+            .unwrap();
+        let mut failure = compute_progress(&claimed, ComputeControlStage::DrainingPrevious);
+        failure.state = ComputeControlState::RecoveryRequired;
+        failure.checkpoint = if extra_evidence {
+            serde_json::json!({"restart_image_roll": true, "runtime_write": "unknown"})
+        } else {
+            claimed.checkpoint.clone()
+        };
+        failure.error_code = Some("ERR_BACKEND_ERROR".into());
+        failure.error_message = Some("Drain interrupted".into());
+        let uncertain = store.advance_compute_control(&failure).await.unwrap();
+        let resumed = store.resume_compute_drain(&uncertain).await;
+        if extra_evidence {
+            assert!(resumed.is_err(), "runtime evidence needs inspection");
+        } else {
+            let resumed = resumed.unwrap();
+            assert_eq!(resumed.operation_id, pending.operation_id);
+            assert_eq!(resumed.state, ComputeControlState::Pending);
+            assert_eq!(resumed.checkpoint, pending.checkpoint);
+        }
+    }
     store.shutdown().await.unwrap();
 }
 

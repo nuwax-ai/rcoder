@@ -20,6 +20,26 @@ use super::docker_runtime::{
     docker_memory_to_quantity, extract_container_ip, extract_container_ports, parse_ports_label,
 };
 
+/// Docker reports published ports as TCP regardless of their application
+/// protocol. The persisted app port label determines which ports use Pingora.
+fn merge_http_port_labels(ports: &mut Vec<AppPortStatus>, raw: &str) {
+    for port in parse_ports_label(raw) {
+        if port.expose_type != ExposeType::Http {
+            continue;
+        }
+        if let Some(existing) = ports.iter_mut().find(|existing| existing.port == port.port) {
+            existing.expose_type = ExposeType::Http;
+        } else {
+            ports.push(AppPortStatus {
+                name: format!("http-{}", port.port),
+                port: port.port,
+                expose_type: ExposeType::Http,
+                external_port: None,
+            });
+        }
+    }
+}
+
 #[async_trait]
 impl UserAppDeploymentRuntime for DockerRuntime {
     async fn cleanup_builder_restart_archive(
@@ -464,6 +484,11 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                     )));
                 }
             }
+            #[cfg(feature = "deploy-host")]
+            if shared_types::is_deploy_host() {
+                shared_types::published::unregister_if_physical(&identity.name, &identity.uid);
+                shared_types::published::unregister_if_physical(&snapshot.app_id, &identity.uid);
+            }
             self.inner
                 .retire_container_cache(&identity.uid)
                 .await
@@ -727,9 +752,23 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             .unwrap_or(false);
         let ip = extract_container_ip(&inspect, None);
         // 提前借用 inspect 提取 ports（避免下方 inspect.state 消费后借用冲突）
-        let ports = extract_container_ports(&inspect);
+        let mut ports = extract_container_ports(&inspect);
+        if let Some(raw) = inspect
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref())
+            .and_then(|labels| labels.get(APP_PORTS_LABEL))
+        {
+            merge_http_port_labels(&mut ports, raw);
+        }
         Ok(Some(DeploymentStatus {
             app_id: app_id.to_string(),
+            lifecycle_id: inspect
+                .config
+                .as_ref()
+                .and_then(|config| config.labels.as_ref())
+                .and_then(|labels| labels.get("rcoder.io/lifecycle-id"))
+                .cloned(),
             replicas: if running { 1 } else { 0 },
             ready_replicas: if running { 1 } else { 0 },
             phase: if running { "Running" } else { "Stopped" }.to_string(),
@@ -845,7 +884,18 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                 continue;
             };
             let running = s.state == Some(ContainerSummaryStateEnum::RUNNING);
-            let ports: Vec<AppPortStatus> = s
+            if s.names.as_ref().is_none_or(|names| {
+                !names
+                    .iter()
+                    .any(|name| name.trim_start_matches('/') == app_deployment_name(&app_id))
+            }) {
+                tracing::warn!(
+                    app_id,
+                    "Ignore managed Docker app with unexpected container name"
+                );
+                continue;
+            }
+            let mut ports: Vec<AppPortStatus> = s
                 .ports
                 .as_ref()
                 .map(|ps| {
@@ -862,13 +912,41 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                         .collect()
                 })
                 .unwrap_or_default();
+            if let Some(raw) = labels.get(APP_PORTS_LABEL) {
+                merge_http_port_labels(&mut ports, raw);
+            }
+            let pod_ip = if running {
+                match client
+                    .inspect_container(s.id.as_deref().unwrap_or_default(), None)
+                    .await
+                {
+                    Ok(inspect) => {
+                        if inspect.id != s.id {
+                            tracing::warn!(
+                                app_id,
+                                "Docker app physical ID changed during route recovery"
+                            );
+                            continue;
+                        }
+                        let ip = extract_container_ip(&inspect, None);
+                        (!ip.is_empty()).then_some(ip)
+                    }
+                    Err(error) => {
+                        tracing::warn!(app_id, %error, "Cannot inspect Docker app for route recovery");
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             out.push(DeploymentStatus {
                 app_id,
+                lifecycle_id: labels.get("rcoder.io/lifecycle-id").cloned(),
                 replicas: if running { 1 } else { 0 },
                 ready_replicas: if running { 1 } else { 0 },
                 phase: if running { "Running" } else { "Stopped" }.to_string(),
                 message: None,
-                pod_ip: None,
+                pod_ip,
                 node: None,
                 restart_count: 0,
                 started_at: None,
@@ -1218,6 +1296,22 @@ fn validate_configuration_exec_target(
 #[cfg(test)]
 mod configuration_exec_tests {
     use super::*;
+
+    #[test]
+    fn http_port_label_overrides_docker_tcp_port_observation() {
+        let mut ports = vec![AppPortStatus {
+            name: String::new(),
+            port: 9080,
+            expose_type: ExposeType::Tcp,
+            external_port: Some(32080),
+        }];
+        merge_http_port_labels(&mut ports, "9080:http,60000:http,5432:tcp,9999:unknown");
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0].expose_type, ExposeType::Http);
+        assert_eq!(ports[0].external_port, Some(32080));
+        assert_eq!(ports[1].port, 60000);
+        assert_eq!(ports[1].expose_type, ExposeType::Http);
+    }
 
     #[test]
     fn configuration_exec_requires_physical_lifecycle_and_generation_match() {

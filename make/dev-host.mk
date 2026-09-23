@@ -2,7 +2,8 @@
 # deploy-host 宿主机运行形态（Phase 5；cargo feature，见 docs/deploy-host.md）
 # ============================================================================
 # 形态定位：rcoder 直接跑在宿主机（Docker 必需 / K8s 可选），控制平面经
-# published-port 注册表拨 127.0.0.1 触达 agent 容器/Pod。默认目录 ~/.rcoder。
+# published-port 注册表触达 agent 容器/Pod；K8s NodePort 可指定节点 IP。
+# 默认目录 ~/.rcoder。
 
 .PHONY: dev-host dev-host-direct dev-host-k8s
 
@@ -26,11 +27,15 @@ dev-host-direct:
 # K8s 宿主机形态：本地 kubeconfig（OrbStack k8s 等）直连集群
 # - storage class 默认 local-path / RWO（env 可覆盖）
 # - agent Service 自动 NodePort 化 + nodePort 读回注册表
+# - NodePort 未转发到宿主机 loopback 时设置 RCODER_K8S_NODE_IP，例如
+#   RCODER_K8S_NODE_IP=$(kubectl get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}') make dev-host-k8s
 # - 三前置（缺一 fail-fast，详见 docs/deploy-host.md「K8s 形态三前置」）：
 #   ① userApp 控制面 PG（docker run postgres + RCODER_USERAPP_STORAGE_BACKEND=
 #      postgres RCODER_USERAPP_PG_URL=postgres://...@127.0.0.1:55432/userapp）
 #   ② ~/.rcoder/config.yml 的 kubernetes_config.services 配 resource_limits
 #   ③ 共享 computer workspace PVC 预建（kubectl apply local-path/RWO 10Gi）
+# - 若要在 RCoder 进程重启后保留容器登记，设置 RCODER_STORAGE_BACKEND=postgres
+#   和 RCODER_PG_URL；memory 后端按现有语义在启动时清理旧计算资源。
 dev-host-k8s:
 	@echo "🚀 deploy-host 宿主机形态（K8s 运行时）..."
-	CONTAINER_RUNTIME=kubernetes cargo run -p rcoder --bin rcoder --features kubernetes,deploy-host
+	CONTAINER_RUNTIME=kubernetes cargo run -p rcoder --bin rcoder --features kubernetes,deploy-host,rcoder-pg

@@ -107,11 +107,9 @@ pub async fn internal_pod_ensure(
             };
 
             let state_clone = state.clone();
-            let result = super::pod_handler::pod_ensure(
-                State(state),
-                super::utils::I18nJsonOrQuery(ensure_request),
-            )
-            .await?;
+            let locale = shared_types::current_request_locale();
+            let result =
+                super::pod_handler::ensure_ordinary_pod(&state, &ensure_request, locale).await?;
 
             if result.success {
                 if let Ok(Some(info)) = state_clone

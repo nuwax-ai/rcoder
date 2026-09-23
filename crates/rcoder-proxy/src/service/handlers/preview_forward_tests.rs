@@ -153,6 +153,13 @@ async fn run_upstream_phase(
     uri: &str,
     ctx: &mut TrackingCtx,
 ) -> Box<pingora_core::upstreams::peer::HttpPeer> {
+    #[cfg(feature = "deploy-host")]
+    if shared_types::is_deploy_host() {
+        shared_types::published::register_direct(
+            "127.0.0.1",
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        );
+    }
     let matched = router.at(uri).expect("route match");
     handle_port_proxy_upstream(
         ctx,

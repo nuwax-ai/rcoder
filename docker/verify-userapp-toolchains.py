@@ -14,7 +14,7 @@ major=next(line.split('=',1)[1].strip() for line in java.splitlines() if 'java.s
 print(json.dumps({'python_abi':sysconfig.get_config_var('SOABI'),'architecture':platform.machine(),'java_major':int(major)}))'''
     container = subprocess.check_output(['docker', 'create', '--network', 'none', '--entrypoint', 'python3', identity, '-c', probe], text=True).strip()
     try:
-        result = subprocess.check_output(['docker', 'start', '-a', container], text=True, timeout=30)
+        result = subprocess.check_output(['docker', 'start', '-a', container], text=True, timeout=60)
         return {'image': image, 'id': identity, **json.loads(result)}
     finally:
         subprocess.run(['docker', 'rm', '-f', container], check=True, stdout=subprocess.DEVNULL)

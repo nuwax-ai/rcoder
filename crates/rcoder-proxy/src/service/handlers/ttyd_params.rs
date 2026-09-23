@@ -50,6 +50,18 @@ pub fn parse_terminal_query(query: Option<&str>) -> Result<TerminalQueryParams, 
 
 /// form 语义解码：`+` → 空格，`%XX` → 字节；`%2B` 还原字面 `+`。
 fn form_decode(value: &str) -> Result<String, String> {
+    let bytes = value.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'%'
+            && (index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit())
+        {
+            return Err(format!(
+                "query parameter contains invalid percent escape: {value}"
+            ));
+        }
+    }
     let plus_to_space = value.replace('+', " ");
     percent_decode_str(&plus_to_space)
         .decode_utf8()
@@ -162,6 +174,13 @@ mod tests {
     fn invalid_utf8_rejected() {
         let err = parse_terminal_query(Some("cwd=%FF%FE")).expect_err("invalid utf8");
         assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn malformed_percent_escapes_are_rejected() {
+        for query in ["cwd=%", "cwd=%2", "cwd=%GG", "service_type=computer%Q0"] {
+            assert!(parse_terminal_query(Some(query)).is_err(), "{query}");
+        }
     }
 
     #[test]

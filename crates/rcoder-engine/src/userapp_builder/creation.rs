@@ -916,7 +916,7 @@ async fn observe_created_ready(
     }
     let info = super::refreshed_registration(&evidence.container, &runtime)
         .unwrap_or_else(|| evidence.container.clone());
-    if !super::probe_file_server(&super::dev_file_server_addr(state, &info)).await {
+    if !super::probe_file_server(&super::dev_file_server_addr(state, &info)?).await {
         return Ok(None);
     }
     let after = super::adoption::capture_bound_target(state, context).await?;
@@ -1415,6 +1415,7 @@ mod tests {
             target: shared_types::BuilderControlTarget {
                 resource_binding: None,
                 pod: None,
+                restart_image: None,
                 workload: Some(shared_types::AppResourceIdentity {
                     kind: shared_types::AppResourceKind::Container,
                     name: "builder".into(),
@@ -1710,6 +1711,7 @@ pub(crate) mod fence_settler_tests {
     fn status_of(phase: &str, replicas: i32) -> DeploymentStatus {
         DeploymentStatus {
             app_id: "fenced".into(),
+            lifecycle_id: None,
             replicas,
             ready_replicas: replicas,
             phase: phase.into(),
@@ -1777,6 +1779,7 @@ pub(crate) mod fence_settler_tests {
                 context: _context.clone(),
                 workload: None,
                 pod: None,
+                restart_image: None,
             })
         }
         async fn capture_builder_control(
@@ -1794,6 +1797,7 @@ pub(crate) mod fence_settler_tests {
                     resource_version: Some("3".into()),
                 }),
                 pod: None,
+                restart_image: None,
             })
         }
     }

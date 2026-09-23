@@ -237,7 +237,14 @@ pub(super) async fn apply_auto_mounts(
                 ] {
                     let hm = workspace_host_path.join(&sub);
                     // 宿主目录预创建（rcoder 容器内经 bind 同步宿主; bind 源必须存在）
-                    let hdc = std::path::PathBuf::from(workspace_resolution).join(&sub);
+                    #[cfg(feature = "deploy-host")]
+                    let hdc = if shared_types::is_deploy_host() {
+                        hm.clone()
+                    } else {
+                        std::path::PathBuf::from(&workspace_resolution).join(&sub)
+                    };
+                    #[cfg(not(feature = "deploy-host"))]
+                    let hdc = std::path::PathBuf::from(&workspace_resolution).join(&sub);
                     if let Err(e) = tokio::fs::create_dir_all(&hdc).await {
                         warn!(
                             "[DOCKER_MGR] Failed to create dev data directory {}: {}",

@@ -355,6 +355,16 @@ pub(super) fn workspace_endpoint_from_bound_pod(
     context: &shared_types::UserAppExecutionContext,
     binding: Option<&shared_types::UserAppResourceBinding>,
 ) -> Result<shared_types::UserAppBuilderWorkspaceEndpoint> {
+    workspace_endpoint_from_bound_pod_with_readiness(pod, workload, context, binding, true)
+}
+
+pub(super) fn workspace_endpoint_from_bound_pod_with_readiness(
+    pod: &k8s_openapi::api::core::v1::Pod,
+    workload: &AppResourceIdentity,
+    context: &shared_types::UserAppExecutionContext,
+    binding: Option<&shared_types::UserAppResourceBinding>,
+    require_ready: bool,
+) -> Result<shared_types::UserAppBuilderWorkspaceEndpoint> {
     if pod.metadata.deletion_timestamp.is_some()
         || !pod
             .metadata
@@ -408,13 +418,30 @@ pub(super) fn workspace_endpoint_from_bound_pod(
         .as_ref()
         .ok_or_else(|| Error::Conflict("Builder pod status is missing".into()))?;
     if status.phase.as_deref() != Some("Running")
-        || !status.conditions.as_ref().is_some_and(|conditions| {
-            conditions
-                .iter()
-                .any(|condition| condition.type_ == "Ready" && condition.status == "True")
-        })
+        || (!require_ready
+            && !status
+                .container_statuses
+                .as_ref()
+                .is_some_and(|containers| {
+                    containers.iter().any(|container| {
+                        container.name == "agent"
+                            && container
+                                .state
+                                .as_ref()
+                                .and_then(|state| state.running.as_ref())
+                                .is_some()
+                    })
+                }))
+        || (require_ready
+            && !status.conditions.as_ref().is_some_and(|conditions| {
+                conditions
+                    .iter()
+                    .any(|condition| condition.type_ == "Ready" && condition.status == "True")
+            }))
     {
-        return Err(Error::Conflict("Captured builder pod is not ready".into()));
+        return Err(Error::Conflict(
+            "Captured builder container is not running or ready".into(),
+        ));
     }
     let container_id = pod
         .metadata

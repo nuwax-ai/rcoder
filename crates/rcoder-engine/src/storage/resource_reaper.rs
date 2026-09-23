@@ -187,18 +187,23 @@ impl ResourceReaper {
                 "[REAPER] Container IP is empty, skipping gRPC/SSE cleanup (no grpc_addr available, SSE streams for {} may linger)",
                 req.container_name
             );
-            return;
+        } else {
+            match shared_types::build_grpc_addr(
+                &req.container_name,
+                &req.container_ip,
+                &req.namespace,
+                &req.cluster_domain,
+            ) {
+                Ok(grpc_addr) => {
+                    self.grpc_pool.remove(&grpc_addr).await;
+                    // SSE streams share the same address and must close with the pool entry.
+                    (self.shutdown_sse)(&grpc_addr);
+                }
+                Err(error) => {
+                    tracing::warn!(container = %req.container_name, %error, "Skip gRPC cleanup: address not ready");
+                }
+            }
         }
-        let grpc_addr = shared_types::build_grpc_addr(
-            &req.container_name,
-            &req.container_ip,
-            &req.namespace,
-            &req.cluster_domain,
-        );
-        self.grpc_pool.remove(&grpc_addr).await;
-
-        // 2.1 关闭指向该地址的 SSE 共享流（与 grpc_pool.remove 同源同处；幂等）。
-        (self.shutdown_sse)(&grpc_addr);
 
         // 3. 清理 DockerManager 缓存（Docker 模式）
         if let Some(ref dm) = self.docker_manager {
