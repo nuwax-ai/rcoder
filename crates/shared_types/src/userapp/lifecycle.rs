@@ -1422,3 +1422,66 @@ mod operation_scope_tests {
         assert!(text.contains("step=claimed"), "{text}");
     }
 }
+
+/// Kani 有界证明：身份 Fail-closed 契约见
+/// `specs/002-kani-high-value-proofs/contracts/identity-fail-closed.md`。
+#[cfg(kani)]
+mod kani_proofs {
+    use super::UserAppExecutionContext;
+
+    /// 定长短 id：kani::any 仅在有限候选中选，避免构造期展开。
+    fn id_pick(sel: u8, mut name: String) -> String {
+        name.push((b'a' + (sel % 26)) as char);
+        name
+    }
+
+    fn id4(sel: u8) -> String {
+        id_pick(sel, String::from("app-"))
+    }
+
+    fn context(app: &str, life: &str, op: &str, exec: &str, fp: &str) -> UserAppExecutionContext {
+        UserAppExecutionContext {
+            app_id: app.to_string(),
+            lifecycle_id: life.to_string(),
+            operation_id: op.to_string(),
+            executor_id: exec.to_string(),
+            request_fingerprint: fp.to_string(),
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn identity_binding() {
+        let a = id4(kani::any());
+        let b = id4(kani::any());
+        let c = id4(kani::any());
+        let d = id4(kani::any());
+        let other = id4(kani::any());
+        // 合法 64 hex fingerprint（固定生成，聚焦绑定性质）
+        let fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let ctx = context(&a, &b, &c, &d, fp);
+        if ctx.validate_identity(&other).is_ok() {
+            assert_eq!(ctx.app_id, other, "Ok implies bound app_id");
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn identity_mismatch_rejected() {
+        let fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let ctx = context("appa", "appb", "appc", "appd", fp);
+        assert!(
+            ctx.validate_identity("other").is_err(),
+            "mismatch must fail"
+        );
+        assert!(ctx.validate_identity("appa").is_ok(), "match may pass");
+    }
+
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn identity_fingerprint_shape() {
+        // 短 fingerprint 不可能是 64 hex → 必拒
+        let ctx = context("appa", "appb", "appc", "appd", "abcd");
+        assert!(ctx.validate_identity("appa").is_err());
+    }
+}

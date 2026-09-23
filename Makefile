@@ -31,6 +31,7 @@ include make/k8s.mk
 include make/k8s-offline.mk
 include make/test.mk
 include make/quality.mk
+include make/verify-kani.mk
 include make/agent-runner.mk
 include make/observability.mk
 include make/remote-k8s.mk

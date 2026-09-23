@@ -478,3 +478,110 @@ mod compute_start_target_tests {
         );
     }
 }
+
+/// Kani 有界证明：删除身份 Fail-closed（P5 不完整资源必拒）。
+/// 契约: `specs/002-kani-high-value-proofs/contracts/identity-fail-closed.md`。
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    use crate::{UserAppExecutionContext, UserAppOperationKind};
+
+    fn short_id(raw: [u8; 4]) -> String {
+        let mut s = String::new();
+        for b in raw {
+            let c = match b % 38 {
+                0..=25 => b'a' + (b % 26),
+                26..=35 => b'0' + (b % 10),
+                36 => b'_',
+                _ => b'-',
+            };
+            s.push(c as char);
+        }
+        s
+    }
+
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn incomplete_resources_reject() {
+        let app = short_id(kani::any());
+        let life = short_id(kani::any());
+        let op = short_id(kani::any());
+        let exec = short_id(kani::any());
+        let name = short_id(kani::any());
+        let uid = short_id(kani::any());
+        let fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let context = UserAppExecutionContext {
+            app_id: app.clone(),
+            lifecycle_id: life,
+            operation_id: op.clone(),
+            executor_id: exec,
+            request_fingerprint: fp.to_string(),
+        };
+        // 至少一个身份字段为空 → validate 必败（P5）
+        let empty_name = kani::any();
+        let empty_uid = kani::any();
+        let resource = AppResourceIdentity {
+            kind: AppResourceKind::Container,
+            name: if empty_name { String::new() } else { name },
+            uid: if empty_uid { String::new() } else { uid },
+            resource_version: None,
+        };
+        kani::assume(empty_name || empty_uid);
+        let checkpoint = UserAppDeletionCheckpoint {
+            stage: UserAppDeletionStage::Captured,
+            schema_version: 1,
+            context,
+            kind: UserAppOperationKind::DeleteCompute,
+            production: AppDeletionSnapshot {
+                app_id: app,
+                operation_id: op,
+                resources: vec![resource],
+            },
+            development: None,
+        };
+        assert!(
+            checkpoint.validate().is_err(),
+            "incomplete deletion resource identity must fail closed"
+        );
+    }
+
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn k8s_resource_requires_resource_version() {
+        let app = short_id(kani::any());
+        let op = short_id(kani::any());
+        let name = short_id(kani::any());
+        let uid = short_id(kani::any());
+        let fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let context = UserAppExecutionContext {
+            app_id: app.clone(),
+            lifecycle_id: short_id(kani::any()),
+            operation_id: op.clone(),
+            executor_id: short_id(kani::any()),
+            request_fingerprint: fp.to_string(),
+        };
+        // 非 Container 的 K8s 资源缺 resource_version → 必拒
+        let resource = AppResourceIdentity {
+            kind: AppResourceKind::StatefulSet,
+            name,
+            uid,
+            resource_version: None,
+        };
+        let checkpoint = UserAppDeletionCheckpoint {
+            stage: UserAppDeletionStage::Captured,
+            schema_version: 1,
+            context,
+            kind: UserAppOperationKind::DeleteCompute,
+            production: AppDeletionSnapshot {
+                app_id: app,
+                operation_id: op,
+                resources: vec![resource],
+            },
+            development: None,
+        };
+        assert!(
+            checkpoint.validate().is_err(),
+            "K8s deletion resource without resource_version must fail"
+        );
+    }
+}

@@ -22,6 +22,9 @@ default-members = [
 
 
 [workspace.lints]
+# Kani proof harness 放在 #[cfg(kani)] 内；日常 rustc 会提示未知 cfg，这里显式放行。
+# 不引入 kani 为 Cargo 依赖（见 specs/002-kani-high-value-proofs）。
+rust.unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 rustdoc.unescaped_backticks = "warn"
 rustdoc.redundant_explicit_links = "warn"
 rust.unused_lifetimes = "warn"
