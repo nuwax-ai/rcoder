@@ -12,7 +12,10 @@ pub mod ime;
 pub mod port_proxy;
 pub mod preview_forward;
 pub mod ttyd;
+pub mod ttyd_params;
 pub mod vnc;
 
 #[cfg(test)]
 mod preview_forward_tests;
+#[cfg(test)]
+mod ttyd_tests;

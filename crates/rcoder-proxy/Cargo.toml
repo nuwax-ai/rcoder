@@ -36,6 +36,8 @@ async-trait = { workspace = true }
 
 # URL parsing for masking
 url = { workspace = true }
+# 终端 query 参数 percent-decode（form 语义）
+percent-encoding = { workspace = true }
 
 # Shared types for API config
 shared_types = { workspace = true }

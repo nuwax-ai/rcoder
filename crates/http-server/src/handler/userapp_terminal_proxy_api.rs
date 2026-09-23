@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 
@@ -29,7 +29,8 @@ use chrono::Utc;
 /// 公共：构造 307 重定向到 Pingora 的文档化响应（或 503 说明）。
 ///
 /// Pingora 侧路由前缀 = `/api/v1/userapp/proxy/{tool}/{stage}`（stage 段
-/// dev/prod 区分定位方式）。
+/// dev/prod 区分定位方式）。原始 query 串原样追加到 Location（终端路由的
+/// `?service_type=`/`?cwd=` 契约依赖它透传到 Pingora）。
 async fn redirect_doc_response(
     state: &AppState,
     stage: &str,
@@ -37,6 +38,7 @@ async fn redirect_doc_response(
     user_id: String,
     app_id: String,
     path: String,
+    raw_query: Option<String>,
 ) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
     let Some(proxy_config) = state.config.proxy_config.as_ref() else {
         return Err((
@@ -55,9 +57,15 @@ async fn redirect_doc_response(
     } else {
         format!("/{}", path)
     };
-    let location = format!(
+    let mut location = format!(
         "http://127.0.0.1:{listen_port}/api/v1/userapp/proxy/{tool}/{stage}/{user_id}/{app_id}{target_path}"
     );
+    if let Some(query) = raw_query
+        && !query.is_empty()
+    {
+        location.push('?');
+        location.push_str(&query);
+    }
     axum::http::Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
         .header(axum::http::header::LOCATION, location)
@@ -92,15 +100,20 @@ async fn redirect_doc_response(
 - **终端工作目录 = 开发卷 `{USERAPP_WORKSPACE_ROOT}/{app_id}`**（Pingora 注入
   `X-Ttyd-Service-Type: user-app-builder`，agent_runner 据此定位 cwd——与 chat
   开发对话、file-server 的 workspace 同根）。
+- 可选 query `cwd`：显式指定终端初始目录（多平台绝对路径，Windows 反斜杠形态
+  自动归一；点段/相对路径/控制字符 400 拒绝）——浏览器原生 WS 无法设自定义
+  header，这是初始目录的唯一客户端载体。本路由不支持 `service_type` 参数
+  （定位键恒为 app_id，出现即 400）。
 - 前置：`POST /api/v1/userapp/workspace` 已创建该 app 的开发容器；未注册 → 404。
 - host = Pingora 入口（rcoder 容器 8088 / K8s NodePort 30435），须直连 Pingora 不走 rcoder 主端口。
 
-> 例：`GET /api/v1/userapp/proxy/ttyd/dev/u1/app-order-svc/`（终端页面）；WebSocket `/api/v1/userapp/proxy/ttyd/dev/u1/app-order-svc/ws`。
+> 例：`GET /api/v1/userapp/proxy/ttyd/dev/u1/app-order-svc/`（终端页面）；WebSocket `/api/v1/userapp/proxy/ttyd/dev/u1/app-order-svc/ws`；指定初始目录 `ws?cwd=/home/user/app-order-svc/sub dir`（空格经 `%20`/`+` 传输）。
 "#,
     params(
         ("user_id" = String, Path, description = "宿主机数据卷分区归属目录名（dev=懒创建显式 owner 档；prod=挂载路径组成段）"),
         ("app_id" = String, Path, description = "应用 ID（定位其 per-app 开发容器；workspace 须已创建）"),
-        ("path" = String, Path, description = "ttyd 内路径（`/` 终端页面；`ws` WebSocket）")
+        ("path" = String, Path, description = "ttyd 内路径（`/` 终端页面；`ws` WebSocket）"),
+        ("cwd" = Option<String>, Query, description = "终端初始目录（多平台绝对路径；缺省 = 开发卷/{app_id}）")
     ),
     responses(
         (status = 307, description = "重定向到 Pingora 代理服务", body = String),
@@ -111,8 +124,9 @@ async fn redirect_doc_response(
 pub async fn proxy_to_userapp_ttyd(
     State(state): State<Arc<AppState>>,
     Path((user_id, app_id, path)): Path<(String, String, String)>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
-    redirect_doc_response(&state, "dev", "ttyd", user_id, app_id, path).await
+    redirect_doc_response(&state, "dev", "ttyd", user_id, app_id, path, raw_query).await
 }
 
 /// Pingora 代理 - userApp 开发域远程桌面（noVNC）
@@ -145,8 +159,9 @@ pub async fn proxy_to_userapp_ttyd(
 pub async fn proxy_to_userapp_vnc(
     State(state): State<Arc<AppState>>,
     Path((user_id, app_id, path)): Path<(String, String, String)>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
-    redirect_doc_response(&state, "dev", "vnc", user_id, app_id, path).await
+    redirect_doc_response(&state, "dev", "vnc", user_id, app_id, path, raw_query).await
 }
 
 /// Pingora 代理 - userApp 开发域语音（audio）
@@ -181,8 +196,9 @@ pub async fn proxy_to_userapp_vnc(
 pub async fn proxy_to_userapp_audio(
     State(state): State<Arc<AppState>>,
     Path((user_id, app_id, path)): Path<(String, String, String)>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
-    redirect_doc_response(&state, "dev", "audio", user_id, app_id, path).await
+    redirect_doc_response(&state, "dev", "audio", user_id, app_id, path, raw_query).await
 }
 
 /// Pingora 代理 - userApp 开发域输入法（IME）
@@ -215,8 +231,9 @@ pub async fn proxy_to_userapp_audio(
 pub async fn proxy_to_userapp_ime(
     State(state): State<Arc<AppState>>,
     Path((user_id, app_id, path)): Path<(String, String, String)>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
-    redirect_doc_response(&state, "dev", "ime", user_id, app_id, path).await
+    redirect_doc_response(&state, "dev", "ime", user_id, app_id, path, raw_query).await
 }
 
 /// Pingora 代理 - DBX 数据库 Web GUI（开发阶段，UserappBuilder 开发容器）
@@ -251,8 +268,9 @@ Web GUI（60+ 数据库，supervisor 恒起 4224）——开发阶段查库/改�
 pub async fn proxy_to_dev_dbx(
     State(state): State<Arc<AppState>>,
     Path((user_id, app_id, path)): Path<(String, String, String)>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
-    redirect_doc_response(&state, "dev", "dbx", user_id, app_id, path).await
+    redirect_doc_response(&state, "dev", "dbx", user_id, app_id, path, raw_query).await
 }
 
 // ── 生产域工具族（运行容器，部署后的生产环境）：/api/v1/userapp/proxy/{ttyd,dbx}/prod/{user_id}/{app_id}/{*path} ──
@@ -290,8 +308,9 @@ pub async fn proxy_to_dev_dbx(
 pub async fn proxy_to_userapp_runtime_ttyd(
     State(state): State<Arc<AppState>>,
     Path((user_id, app_id, path)): Path<(String, String, String)>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
-    redirect_doc_response(&state, "prod", "ttyd", user_id, app_id, path).await
+    redirect_doc_response(&state, "prod", "ttyd", user_id, app_id, path, raw_query).await
 }
 
 /// Pingora 代理 - DBX 数据库 Web GUI（生产阶段，Userapp 运行容器）
@@ -325,8 +344,9 @@ pub async fn proxy_to_userapp_runtime_ttyd(
 pub async fn proxy_to_prod_dbx(
     State(state): State<Arc<AppState>>,
     Path((user_id, app_id, path)): Path<(String, String, String)>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
-    redirect_doc_response(&state, "prod", "dbx", user_id, app_id, path).await
+    redirect_doc_response(&state, "prod", "dbx", user_id, app_id, path, raw_query).await
 }
 
 /// userApp 代理入口一览（文档辅助接口：Java 拼接 URL 的速查表）。
@@ -372,8 +392,18 @@ macro_rules! stage_tool_redirect {
         pub async fn $fn_name(
             State(state): State<Arc<AppState>>,
             Path((user_id, app_id)): Path<(String, String)>,
+            RawQuery(raw_query): RawQuery,
         ) -> Result<axum::response::Response, (StatusCode, Json<ProxyErrorResponse>)> {
-            redirect_doc_response(&state, $stage, $tool, user_id, app_id, String::new()).await
+            redirect_doc_response(
+                &state,
+                $stage,
+                $tool,
+                user_id,
+                app_id,
+                String::new(),
+                raw_query,
+            )
+            .await
         }
     };
 }

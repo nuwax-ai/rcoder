@@ -168,6 +168,23 @@ pub async fn handle_dev_ttyd_request(
     let target_path = target_path_of(&params);
     debug!("[DEV_TTYD] app_id={}, target_path={}", app_id, target_path);
 
+    // 终端 query 参数（浏览器 WS 无 header 能力，query 是唯一载体）。
+    // dev 链定位键恒为 app_id、服务类型恒为 UserappBuilder——service_type
+    // 不允许客户端改写，出现即 400；cwd 走多平台绝对路径归一后注入。
+    let query_params = super::ttyd_params::parse_terminal_query(original_uri.query())
+        .map_err(|message| dev_ttyd_bad_request(&message))?;
+    if let Some(service_type) = query_params.service_type.as_deref() {
+        return Err(dev_ttyd_bad_request(&format!(
+            "service_type query parameter is not supported on this route: {service_type}"
+        )));
+    }
+    let explicit_cwd = super::ttyd_params::resolve_terminal_cwd(query_params.cwd.as_deref())
+        .map_err(|message| dev_ttyd_bad_request(&message))?;
+    upstream_request.remove_header("X-Ttyd-Cwd");
+    if let Some(cwd) = explicit_cwd.as_deref() {
+        upstream_request.insert_header("X-Ttyd-Cwd", cwd)?;
+    }
+
     let host = ctx.vnc_target_ip.as_deref().unwrap_or("127.0.0.1");
     upstream_request.insert_header("Host", host)?;
     let new_uri = utils::rewrite_uri(original_uri, target_path)?;
@@ -181,6 +198,13 @@ pub async fn handle_dev_ttyd_request(
         shared_types::ServiceType::UserappBuilder.to_string(),
     )?;
     Ok(())
+}
+
+/// dev 终端 query 参数非法 → 400（带原因，fail fast）。
+fn dev_ttyd_bad_request(message: &str) -> pingora_core::BError {
+    warn!("[DEV_TTYD] rejected query params: {}", message);
+    pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+        .more_context(message.to_string())
 }
 
 /// ttyd 上游：ws_terminal 中间层（17681，agent_runner 协商 tty 子协议后连 ttyd 本体）。

@@ -2881,7 +2881,97 @@ async fn userapp_dev_terminal_cwd_via_ttyd_ws() {
         format!("期望含 {expected}, OUTPUT 首帧样本: {sample}"),
     );
 
+    // 追加腿：终端 query 契约 ?cwd=（浏览器 WS 无 header 能力的初始目录载体）。
+    // 先 mkdir 含空格子目录（$((6*7)) 只在真实输出出现 42，命令回显是字面量），
+    // 再以 ?cwd= 显式指定重连，pwd 回显验证 encode/decode 全链（含空格路径）。
+    let sub_dir = format!("/home/user/{app}/sub dir");
+    ws.send(Message::Binary(
+        format!("0mkdir -p '{sub_dir}' && echo SUB_$((6*7))\n")
+            .into_bytes()
+            .into(),
+    ))
+    .await
+    .ok();
+    let mut mkdir_done = false;
+    let mkdir_deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < mkdir_deadline {
+        let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await
+        else {
+            continue;
+        };
+        let Message::Binary(data) = msg else {
+            continue;
+        };
+        if data.first() != Some(&b'0') {
+            continue;
+        }
+        if strip_ansi(&String::from_utf8_lossy(&data[1..])).contains("SUB_42") {
+            mkdir_done = true;
+            break;
+        }
+    }
+    report.assert_hard(
+        "dev 终端 mkdir 预置子目录（SUB_42 回显）",
+        mkdir_done,
+        format!("期望子目录 {sub_dir}"),
+    );
     ws.close(None).await.ok();
+
+    // ?cwd= 显式初始目录重连（空格经 %20 传输，form 语义）
+    let ws_url_cwd = format!("{ws_url}?cwd=%2Fhome%2Fuser%2F{app}%2Fsub%20dir");
+    let mut ws2 = None;
+    let cwd_deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < cwd_deadline {
+        let Ok(mut req) = ws_url_cwd.clone().into_client_request() else {
+            break;
+        };
+        req.headers_mut()
+            .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("tty"));
+        match connect_async(req).await {
+            Ok((stream, _)) => {
+                ws2 = Some(stream);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
+        }
+    }
+    let cwd_hit = if let Some(mut ws2) = ws2 {
+        ws2.send(Message::Text(r#"{"columns":80,"rows":24}"#.into()))
+            .await
+            .ok();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        ws2.send(Message::Binary(b"0pwd\n".to_vec().into()))
+            .await
+            .ok();
+        let mut hit = false;
+        let read_deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < read_deadline {
+            let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_secs(5), ws2.next()).await
+            else {
+                continue;
+            };
+            let Message::Binary(data) = msg else {
+                continue;
+            };
+            if data.first() != Some(&b'0') {
+                continue;
+            }
+            if strip_ansi(&String::from_utf8_lossy(&data[1..])).contains(&sub_dir) {
+                hit = true;
+                break;
+            }
+        }
+        ws2.close(None).await.ok();
+        hit
+    } else {
+        false
+    };
+    report.assert_hard(
+        "dev 终端 ?cwd= 显式初始目录（含空格，pwd 回显）",
+        cwd_hit,
+        format!("期望含 {sub_dir}, url={ws_url_cwd}"),
+    );
+
     assert_hard_all(report).await;
     cleanup_builder(user, &app);
 }

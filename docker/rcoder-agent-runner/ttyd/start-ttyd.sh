@@ -75,6 +75,18 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# URL 解码 --cwd 值：agent_runner 的 ws_terminal 对 cwd 做 percent-encode 后
+# 注入 URL（ttyd 原样透传不解码——1.7.7 protocol.c 直 strdup），解码在此承担。
+# 两端成对契约：编码端见 agent_runner ws_terminal::proxy::build_ttyd_url。
+# 无 % 的路径（纯标识符）解码为 no-op，兼容旧二进制。
+ttyd_urldecode() {
+    local s="${1//+/ }"
+    printf '%b' "${s//%/\\x}"
+}
+if [ -n "$TARGET_DIR" ]; then
+    TARGET_DIR="$(ttyd_urldecode "$TARGET_DIR")"
+fi
+
 # 设定初始工作目录：--cwd 指定则 cd 到该目录，否则 cd $HOME（非访问控制，bash 后可 cd 任意）
 if [ -n "$TARGET_DIR" ] && [ -d "$TARGET_DIR" ]; then
     cd "$TARGET_DIR" 2>/dev/null || cd "${HOME}" 2>/dev/null || true

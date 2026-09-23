@@ -473,8 +473,10 @@
   ],
   "userapp_dev_terminal_cwd_via_ttyd_ws": [
     "create-workspace（ensure 开发容器+建目录+owner 注册）",
+    "终端 ws 握手（pingora → ws_terminal 子协议 tty）",
     "终端 cwd 落 workspace 压平挂载点（pwd 回显含 /home/user/{app}）",
-    "终端 ws 握手（pingora → ws_terminal 子协议 tty）"
+    "dev 终端 mkdir 预置子目录（SUB_42 回显）",
+    "dev 终端 ?cwd= 显式初始目录（含空格，pwd 回显）"
   ],
   "userapp_dev_two_turn_isolation_anthropic": [
     "create-workspace（ensure 开发容器+建目录+owner 注册）",
@@ -606,5 +608,13 @@
     "same container retained",
     "workspace retained",
     "temporary builder cleanup confirmed"
+  ],
+  "computer_ttyd_cwd_query": [
+    "computer 容器 ensure（pod/ensure 无 LLM 供给）",
+    "终端 ws 握手（默认链路，子协议 tty）",
+    "mkdir 预置目录执行完成（TTYD_MKDIR_42 回显）",
+    "?service_type=computer-normal-project → cwd=/home/user/normalProject/{project}（pwd 回显）",
+    "?cwd= 显式初始目录含空格（%20 传输，pwd 回显）",
+    "?service_type= 非法值 → 握手 400 拒绝"
   ]
 }

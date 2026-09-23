@@ -82,7 +82,9 @@ pub struct TtydProxyPathParams {
     params(
         ("user_id" = String, Path, description = "用户 ID"),
         ("project_id" = String, Path, description = "项目 ID"),
-        ("path" = Option<String>, Path, description = "剩余路径（ws 表示 WebSocket 端点）")
+        ("path" = Option<String>, Path, description = "剩余路径（ws 表示 WebSocket 端点）"),
+        ("service_type" = Option<String>, Query, description = "业务场景（仅 Computer 族，如 computer-normal-project → cwd 落 /home/user/normalProject/{project_id}；非法值/非 Computer 族 400）"),
+        ("cwd" = Option<String>, Query, description = "终端初始目录（多平台绝对路径，优先于按业务推导；点段/相对路径/控制字符 400 拒绝）")
     ),
     responses(
         (
@@ -150,6 +152,18 @@ WebSocket /computer/ttyd/{user_id}/{project_id}/ws
 const ws = new WebSocket('ws://host/computer/ttyd/user_123/proj_456/ws', ['tty']);
 ```
 
+## 终端初始目录（query 参数）
+
+浏览器原生 WebSocket API 无法设置自定义请求头，业务场景与初始目录经 URL query
+传递（空格等特殊字符按 form 语义编码：`%20` 或 `+`）：
+
+- `?service_type=computer-normal-project`：常规项目（NormalProject）业务，
+  cwd 落 `/home/user/normalProject/{project_id}`；缺省 `computer-agent-runner`
+  （cwd = `/home/user/{project_id}`）。也可经请求头 `X-Ttyd-Service-Type` 传递
+  （服务端客户端），两者冲突（不一致）时 400。
+- `?cwd=/home/user/任意 目录`：显式指定初始目录（多平台绝对路径，Windows
+  反斜杠形态自动归一），优先于按业务推导；点段/相对路径/控制字符 400 拒绝。
+
 ## 使用示例
 
 ```javascript
@@ -165,6 +179,12 @@ ws.onmessage = (event) => {
     terminal.write(event.data); // 接收终端输出
 };
 ws.send('ls -la\n'); // 发送命令
+
+// 常规项目（normalProject）+ 显式初始目录
+const ws2 = new WebSocket(
+    'ws://localhost:8088/computer/ttyd/user_123/proj_456/ws?service_type=computer-normal-project&cwd=/home/user/my%20dir',
+    ['tty']
+);
 ```
 "#
 )]

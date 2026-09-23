@@ -77,6 +77,32 @@ pub async fn handle_ttyd_request(
         user_id, project_id, target_path
     );
 
+    // 终端 query 参数（service_type / cwd）——浏览器原生 WS 无法设自定义
+    // header，query 是唯一载体；契约规则见 ttyd_params 模块文档。
+    // 非法显式输入直接 400（fail fast），不静默落默认目录。
+    let query_params = super::ttyd_params::parse_terminal_query(original_uri.query())
+        .map_err(|message| bad_request(&message))?;
+
+    // service_type 合并：query（从严）+ 客户端 header（既有宽容语义）
+    let header_service_type = upstream_request
+        .headers
+        .get("X-Ttyd-Service-Type")
+        .and_then(|value| value.to_str().ok());
+    let ttyd_service_type = super::ttyd_params::resolve_computer_service_type(
+        query_params.service_type.as_deref(),
+        header_service_type,
+    )
+    .map_err(|message| bad_request(&message))?;
+
+    // 显式 cwd：校验归一后注入；无条件先剥客户端伪造值（preview token 同款
+    // 纪律——x-ttyd-cwd 只允许由本代理写入）
+    let explicit_cwd = super::ttyd_params::resolve_terminal_cwd(query_params.cwd.as_deref())
+        .map_err(|message| bad_request(&message))?;
+    upstream_request.remove_header("X-Ttyd-Cwd");
+    if let Some(cwd) = explicit_cwd.as_deref() {
+        upstream_request.insert_header("X-Ttyd-Cwd", cwd)?;
+    }
+
     // 设置 Host 头
     let host = ctx.vnc_target_ip.as_deref().unwrap_or("127.0.0.1");
     upstream_request.insert_header("Host", host)?;
@@ -96,20 +122,21 @@ pub async fn handle_ttyd_request(
     upstream_request.insert_header("X-Ttyd-User-Id", user_id)?;
     upstream_request.insert_header("X-Ttyd-Project-Id", project_id)?;
     // 告知 agent_runner 业务场景（ServiceType 的 Display = kebab-case），用于显式选 cwd 前缀。
-    // 常规项目：客户端已带 X-Ttyd-Service-Type 且解析为 Computer 族时透传本义值
-    // （agent_runner 据此选 /home/user/normalProject 前缀）；未带/解析失败/非
+    // 常规项目：客户端已带 X-Ttyd-Service-Type 且解析为 Computer 族时透传本义值，
+    // 或经 ?service_type= query 指定（合并规则见 resolve_computer_service_type）；
+    // agent_runner 据此选 /home/user/normalProject 前缀。未带/解析失败/非
     // Computer 族一律回落默认 computer-agent-runner——服务端校验防任意类型注入
-    let ttyd_service_type = upstream_request
-        .headers
-        .get("X-Ttyd-Service-Type")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|text| text.parse::<shared_types::ServiceType>().ok())
-        .filter(|st| st.is_computer_family())
-        .unwrap_or(shared_types::ServiceType::ComputerAgentRunner);
     let ttyd_service_type = ttyd_service_type.to_string();
     upstream_request.insert_header("X-Ttyd-Service-Type", &ttyd_service_type)?;
 
     Ok(())
+}
+
+/// 终端 query 参数非法 → 400（带原因，fail fast）。
+fn bad_request(message: &str) -> pingora_core::BError {
+    warn!("[TTYD] rejected query params: {}", message);
+    pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+        .more_context(message.to_string())
 }
 
 /// 处理 Web ttyd 终端代理请求（代理到动态创建的 RCoder 容器的 ttyd）
@@ -164,6 +191,11 @@ pub async fn handle_web_ttyd_request(
         "web ttyd request: user_id={}, project_id={}, target_path={}",
         user_id, project_id, target_path
     );
+
+    // web 链不支持 ?cwd=，但客户端伪造的 x-ttyd-cwd 若透传会被共享容器的
+    // ws_terminal 当显式 cwd 消费——无条件剥离（x-ttyd-cwd 只允许由本代理
+    // 写入的纪律，对到达 ws_terminal 的所有路由生效）
+    upstream_request.remove_header("X-Ttyd-Cwd");
 
     // 设置 Host 头（代理到本地）
     upstream_request.insert_header("Host", "127.0.0.1")?;

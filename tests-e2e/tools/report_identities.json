@@ -490,5 +490,11 @@
       "scenario": "userapp_devbuild_no_lockfile_heal",
       "backend": "compose"
     }
+  ],
+  "computer_ttyd_cwd_query": [
+    {
+      "scenario": "computer_ttyd_cwd_query",
+      "backend": "compose"
+    }
   ]
 }

@@ -1,6 +1,7 @@
 {
   "compose_lifecycle": [
-    "docker_deletion_identity_contract"
+    "docker_deletion_identity_contract",
+    "computer_ttyd_cwd_query"
   ],
   "compose_session": [
     "absolute_agent_work_dir_anthropic",

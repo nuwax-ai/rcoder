@@ -53,8 +53,11 @@ const KEEPALIVE_PAYLOAD: &[u8] = &[0x90];
 
 /// 处理一条「浏览器 → ttyd」的代理连接
 ///
-/// 1. 由 serviceType + project_id 解析项目工作目录（白名单校验）
-/// 2. `connect_async` 连本地 ttyd（含重试），URL 注入 `arg=--cwd&arg={cwd}`（wrapper 据此 cd）
+/// 1. cwd 解析（优先级从高到低）：显式 `X-Ttyd-Cwd`（终端 query 契约 `?cwd=`，
+///    多平台归一 + 容器内存在性校验）→ serviceType + project_id 推导（白名单校验）
+/// 2. `connect_async` 连本地 ttyd（含重试），URL 注入 `arg=--cwd&arg={cwd}`
+///    （**percent-encode**——ttyd 1.7.7 对 URL arg 原样透传不解码，解码由容器内
+///    start-ttyd.sh wrapper 的 urldecode 承担，两端成对契约，见 build_ttyd_url）
 /// 3. 双向透传 Message（原样，不解析帧语义）
 pub async fn handle_terminal(
     browser_ws: WebSocketStream<TcpStream>,
@@ -62,8 +65,28 @@ pub async fn handle_terminal(
     project_id: &str,
     tenant_id: &str,
     space_id: &str,
+    explicit_cwd: &str,
 ) {
-    let cwd = cwd::resolve_project_cwd(service_type, project_id, tenant_id, space_id);
+    let cwd = match cwd::resolve_explicit_cwd(explicit_cwd) {
+        Some(dir) => {
+            info!(
+                "[WS_TERMINAL] explicit cwd override: {} (service_type={}, project_id={})",
+                dir.display(),
+                service_type,
+                project_id
+            );
+            Some(dir)
+        }
+        None => {
+            if !explicit_cwd.is_empty() {
+                warn!(
+                    "[WS_TERMINAL] explicit cwd invalid or dir missing, falling back to service_type derivation: {} (service_type={}, project_id={})",
+                    explicit_cwd, service_type, project_id
+                );
+            }
+            cwd::resolve_project_cwd(service_type, project_id, tenant_id, space_id)
+        }
+    };
 
     // cwd 解析失败的降级策略（按 service_type 区分）：
     // - WebAgentRunner：项目目录必须在 /app/project_workspace 下，进 /home/user 毫无意义。
@@ -227,11 +250,30 @@ async fn is_tcp_port_open(port: u16) -> bool {
     .is_ok_and(|r| r.is_ok())
 }
 
-/// 构造连 ttyd 的 URL，注入 `--cwd`（与 Pingora 旧逻辑等价，但由本模块每次连接执行）
+/// cwd 的 URL arg 编码集：仅保留 unreserved（`A-Za-z0-9-._~`）与 `/`（可读性），
+/// 其余（空格、query 语法字符 `&?#%+=`、控制字符、非 ASCII 等）全部 percent-encode。
+///
+/// **成对契约**：ttyd 1.7.7 对 URL arg 原样透传、不做 percent-decode
+/// （protocol.c `LWS_CALLBACK_ESTABLISHED` 直 `strdup`），解码由容器内
+/// `start-ttyd.sh` wrapper 的 `urldecode` 承担——两端必须同升同降。
+/// 纯标识符路径（`/home/user/{pid}` 等）编码为 no-op，既有行为不变。
+const CWD_ARG_SAFE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'/')
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// 构造连 ttyd 的 URL，注入 `--cwd`（由本模块每次连接执行；编码契约见
+/// [`CWD_ARG_SAFE`] 文档）
 fn build_ttyd_url(cwd: Option<&Path>) -> String {
     let base = format!("ws://127.0.0.1:{}{}", TTYD_PORT, TTYD_WS_PATH);
     match cwd {
-        Some(p) => format!("{}?arg=--cwd&arg={}", base, p.display()),
+        Some(p) => format!(
+            "{}?arg=--cwd&arg={}",
+            base,
+            percent_encoding::utf8_percent_encode(&p.display().to_string(), CWD_ARG_SAFE)
+        ),
         None => base,
     }
 }
@@ -368,6 +410,27 @@ mod tests {
             url,
             "ws://127.0.0.1:7681/ws?arg=--cwd&arg=/home/user/proj-1"
         );
+    }
+
+    /// 含空格/中文/特殊字符的 cwd 必须 percent-encode（ttyd 原样透传，解码在
+    /// wrapper——见 CWD_ARG_SAFE 契约）。纯标识符路径编码为 no-op（上一测试）。
+    #[test]
+    fn build_url_encodes_unsafe_cwd_chars() {
+        let url = build_ttyd_url(Some(Path::new("/home/user/My Project")));
+        assert_eq!(
+            url,
+            "ws://127.0.0.1:7681/ws?arg=--cwd&arg=/home/user/My%20Project"
+        );
+
+        let url = build_ttyd_url(Some(Path::new("/home/user/项目")));
+        assert_eq!(
+            url,
+            "ws://127.0.0.1:7681/ws?arg=--cwd&arg=/home/user/%E9%A1%B9%E7%9B%AE"
+        );
+
+        // query 语法字符必须编码，防破坏 arg 参数结构
+        let url = build_ttyd_url(Some(Path::new("/a&b")));
+        assert_eq!(url, "ws://127.0.0.1:7681/ws?arg=--cwd&arg=/a%26b");
     }
 
     /// Relay preserves real WebSocket frames and emits keepalive only after its deadline.
