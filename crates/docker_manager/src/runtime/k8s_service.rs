@@ -572,6 +572,10 @@ impl K8sServiceOps for KubernetesRuntime {
                         &services, &svc_name, identifier, patched,
                     )
                     .await?;
+                    // K8s-only mode still performs the patch and propagates API errors;
+                    // it simply has no deploy-host registry consumer for the response object.
+                    #[cfg(not(feature = "deploy-host"))]
+                    drop(patched);
                     return Ok(());
                 }
                 debug!("[K8S] Service {} already exists", svc_name);
