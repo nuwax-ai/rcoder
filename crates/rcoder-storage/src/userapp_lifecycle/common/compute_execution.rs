@@ -111,76 +111,29 @@ pub(super) async fn advance(
     if record.revision != progress.expected_revision {
         return Err(Error::VersionConflict);
     }
-    let state = match progress.state {
-        ComputeControlState::Running => "running",
-        ComputeControlState::RecoveryRequired => "recovery_required",
-        ComputeControlState::Succeeded => "succeeded",
-        ComputeControlState::Failed => "failed",
-        _ => return Err(invalid("Invalid compute execution transition")),
-    };
+    let state = progress
+        .state
+        .as_progress_storage_value()
+        .ok_or_else(|| invalid(ComputeProgressPolicyError::InvalidState.message()))?;
     let stage = progress.stage.as_str();
-    let legal_stage = record.stage == stage
-        || matches!(
-            (record.stage.as_str(), progress.stage),
-            ("draining_previous", ComputeControlStage::Stopping)
-                | ("stopping", ComputeControlStage::Stopped)
-                | ("stopped", ComputeControlStage::Starting)
-                | ("starting", ComputeControlStage::Verifying)
-                | ("verifying", ComputeControlStage::Completed)
-        )
-        || (record.action == ComputeControlAction::Stop
-            && record.stage == "stopped"
-            && progress.stage == ComputeControlStage::Completed);
-    if !legal_stage
-        || (record.action == ComputeControlAction::Stop
-            && matches!(
-                progress.stage,
-                ComputeControlStage::Starting | ComputeControlStage::Verifying
-            ))
-    {
-        return Err(invalid("Invalid compute stage transition"));
-    }
-    if progress.state == ComputeControlState::Succeeded
-        && progress.stage != ComputeControlStage::Completed
-    {
-        return Err(invalid("Compute success requires completed evidence"));
-    }
-    if progress.stage == ComputeControlStage::Completed
-        && progress.state != ComputeControlState::Succeeded
-    {
-        return Err(invalid("Completed compute stage requires success"));
-    }
-    if matches!(
+    validate_compute_progress_transition(
+        record.action,
+        ComputeControlStage::from_storage_value(&record.stage),
         progress.state,
-        ComputeControlState::Failed | ComputeControlState::RecoveryRequired
-    ) && (progress.error_code.as_deref().is_none_or(str::is_empty)
-        || progress.error_message.as_deref().is_none_or(str::is_empty))
-    {
-        return Err(invalid("Compute failure requires structured diagnostics"));
-    }
-    if matches!(
-        progress.state,
-        ComputeControlState::Running | ComputeControlState::Succeeded
-    ) && (progress.error_code.is_some() || progress.error_message.is_some())
-    {
-        return Err(invalid(
-            "Compute success or progress cannot retain failure diagnostics",
-        ));
-    }
-    // Once physical work started, a failure is uncertain until independently
-    // reconciled. Do not let an executor turn a timeout into lease release.
-    if progress.state == ComputeControlState::Failed
-        && (record.stage != "draining_previous" || record.lease.is_some())
-    {
-        return Err(invalid("Compute mutation failure requires recovery"));
-    }
+        progress.stage,
+        ComputeDiagnosticValue::from_option(progress.error_code.as_deref()),
+        ComputeDiagnosticValue::from_option(progress.error_message.as_deref()),
+        record.lease.is_some(),
+    )
+    .map_err(|error| invalid(error.message()))?;
     if progress.stage != ComputeControlStage::DrainingPrevious {
         drained(tx, &record).await?;
-        if record.lease.is_none() || !progress.checkpoint.is_object() {
-            return Err(invalid(
-                "Compute mutation requires a lease and structured checkpoint",
-            ));
-        }
+        validate_compute_mutation_evidence(
+            progress.stage,
+            record.lease.is_some(),
+            progress.checkpoint.is_object(),
+        )
+        .map_err(|error| invalid(error.message()))?;
     }
     let now = chrono::Utc::now().timestamp_micros();
     let terminal = if progress.state.is_terminal() {

@@ -53,6 +53,12 @@ PROOFS = (
         30,
         120,
     ),
+    (
+        "shared_types",
+        "userapp::compute_control::kani_progress_policy_proofs::compute_progress_policy_matches_complete_finite_contract",
+        30,
+        120,
+    ),
 )
 
 

@@ -26,12 +26,14 @@ pub struct ComputeAbsenceCheckpoint {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[serde(rename_all = "snake_case")]
 pub enum ComputeControlAction {
     Stop,
     Restart,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[serde(rename_all = "snake_case")]
 pub enum ComputeControlState {
     Pending,
@@ -44,6 +46,17 @@ pub enum ComputeControlState {
 impl ComputeControlState {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed | Self::Superseded)
+    }
+
+    /// Storage representation for states accepted from an executor progress update.
+    pub const fn as_progress_storage_value(self) -> Option<&'static str> {
+        match self {
+            Self::Running => Some("running"),
+            Self::RecoveryRequired => Some("recovery_required"),
+            Self::Succeeded => Some("succeeded"),
+            Self::Failed => Some("failed"),
+            Self::Pending | Self::Superseded => None,
+        }
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -116,6 +129,7 @@ pub struct ComputeControlProgress {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[serde(rename_all = "snake_case")]
 pub enum ComputeControlStage {
     DrainingPrevious,
@@ -135,6 +149,315 @@ impl ComputeControlStage {
             Self::Verifying => "verifying",
             Self::Completed => "completed",
         }
+    }
+
+    /// Parse the stage persisted in the control ledger. Unknown values fail closed.
+    pub fn from_storage_value(value: &str) -> Option<Self> {
+        match value {
+            "draining_previous" => Some(Self::DrainingPrevious),
+            "stopping" => Some(Self::Stopping),
+            "stopped" => Some(Self::Stopped),
+            "starting" => Some(Self::Starting),
+            "verifying" => Some(Self::Verifying),
+            "completed" => Some(Self::Completed),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod compute_stage_storage_tests {
+    use super::ComputeControlStage as Stage;
+
+    #[test]
+    fn stage_storage_vocabulary_round_trips_and_unknown_values_fail_closed() {
+        for stage in [
+            Stage::DrainingPrevious,
+            Stage::Stopping,
+            Stage::Stopped,
+            Stage::Starting,
+            Stage::Verifying,
+            Stage::Completed,
+        ] {
+            assert_eq!(Stage::from_storage_value(stage.as_str()), Some(stage));
+        }
+        assert_eq!(Stage::from_storage_value("future_stage"), None);
+    }
+}
+
+/// Whether a diagnostic field is omitted, present but empty, or non-empty.
+/// Keeping these cases distinct preserves the executor progress contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+pub enum ComputeDiagnosticValue {
+    Absent,
+    Empty,
+    NonEmpty,
+}
+
+impl ComputeDiagnosticValue {
+    pub fn from_option(value: Option<&str>) -> Self {
+        match value {
+            None => Self::Absent,
+            Some("") => Self::Empty,
+            Some(_) => Self::NonEmpty,
+        }
+    }
+}
+
+/// Pure validation failures for one compute-control progress transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeProgressPolicyError {
+    InvalidState,
+    InvalidStageTransition,
+    SuccessRequiresCompletedEvidence,
+    CompletedRequiresSuccess,
+    FailureRequiresDiagnostics,
+    ProgressCannotRetainDiagnostics,
+    MutationFailureRequiresRecovery,
+    MutationRequiresLeaseAndCheckpoint,
+}
+
+impl ComputeProgressPolicyError {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::InvalidState => "Invalid compute execution transition",
+            Self::InvalidStageTransition => "Invalid compute stage transition",
+            Self::SuccessRequiresCompletedEvidence => "Compute success requires completed evidence",
+            Self::CompletedRequiresSuccess => "Completed compute stage requires success",
+            Self::FailureRequiresDiagnostics => "Compute failure requires structured diagnostics",
+            Self::ProgressCannotRetainDiagnostics => {
+                "Compute success or progress cannot retain failure diagnostics"
+            }
+            Self::MutationFailureRequiresRecovery => "Compute mutation failure requires recovery",
+            Self::MutationRequiresLeaseAndCheckpoint => {
+                "Compute mutation requires a lease and structured checkpoint"
+            }
+        }
+    }
+}
+
+/// Validate the finite state/stage/diagnostic policy for an executor update.
+///
+/// Revision/executor identity, interrupted-operation drain proofs, and runtime
+/// receipts remain authoritative checks in the storage transaction. The caller
+/// performs its asynchronous drain-evidence read after this pure policy passes.
+pub fn validate_compute_progress_transition(
+    action: ComputeControlAction,
+    current_stage: Option<ComputeControlStage>,
+    state: ComputeControlState,
+    next_stage: ComputeControlStage,
+    error_code: ComputeDiagnosticValue,
+    error_message: ComputeDiagnosticValue,
+    lease_present: bool,
+) -> Result<(), ComputeProgressPolicyError> {
+    if state.as_progress_storage_value().is_none() {
+        return Err(ComputeProgressPolicyError::InvalidState);
+    }
+
+    let legal_stage = current_stage == Some(next_stage)
+        || matches!(
+            (current_stage, next_stage),
+            (
+                Some(ComputeControlStage::DrainingPrevious),
+                ComputeControlStage::Stopping
+            ) | (
+                Some(ComputeControlStage::Stopping),
+                ComputeControlStage::Stopped
+            ) | (
+                Some(ComputeControlStage::Stopped),
+                ComputeControlStage::Starting
+            ) | (
+                Some(ComputeControlStage::Starting),
+                ComputeControlStage::Verifying
+            ) | (
+                Some(ComputeControlStage::Verifying),
+                ComputeControlStage::Completed
+            )
+        )
+        || (action == ComputeControlAction::Stop
+            && current_stage == Some(ComputeControlStage::Stopped)
+            && next_stage == ComputeControlStage::Completed);
+    if !legal_stage
+        || (action == ComputeControlAction::Stop
+            && matches!(
+                next_stage,
+                ComputeControlStage::Starting | ComputeControlStage::Verifying
+            ))
+    {
+        return Err(ComputeProgressPolicyError::InvalidStageTransition);
+    }
+
+    if state == ComputeControlState::Succeeded && next_stage != ComputeControlStage::Completed {
+        return Err(ComputeProgressPolicyError::SuccessRequiresCompletedEvidence);
+    }
+    if next_stage == ComputeControlStage::Completed && state != ComputeControlState::Succeeded {
+        return Err(ComputeProgressPolicyError::CompletedRequiresSuccess);
+    }
+    if matches!(
+        state,
+        ComputeControlState::Failed | ComputeControlState::RecoveryRequired
+    ) && (error_code != ComputeDiagnosticValue::NonEmpty
+        || error_message != ComputeDiagnosticValue::NonEmpty)
+    {
+        return Err(ComputeProgressPolicyError::FailureRequiresDiagnostics);
+    }
+    if matches!(
+        state,
+        ComputeControlState::Running | ComputeControlState::Succeeded
+    ) && (error_code != ComputeDiagnosticValue::Absent
+        || error_message != ComputeDiagnosticValue::Absent)
+    {
+        return Err(ComputeProgressPolicyError::ProgressCannotRetainDiagnostics);
+    }
+    // Once physical work started, a failure is uncertain until independently
+    // reconciled. Do not let an executor turn a timeout into lease release.
+    if state == ComputeControlState::Failed
+        && (current_stage != Some(ComputeControlStage::DrainingPrevious) || lease_present)
+    {
+        return Err(ComputeProgressPolicyError::MutationFailureRequiresRecovery);
+    }
+    Ok(())
+}
+
+/// Validate the non-I/O evidence required after the caller proves old work drained.
+pub const fn validate_compute_mutation_evidence(
+    stage: ComputeControlStage,
+    lease_present: bool,
+    checkpoint_is_object: bool,
+) -> Result<(), ComputeProgressPolicyError> {
+    if !matches!(stage, ComputeControlStage::DrainingPrevious)
+        && (!lease_present || !checkpoint_is_object)
+    {
+        return Err(ComputeProgressPolicyError::MutationRequiresLeaseAndCheckpoint);
+    }
+    Ok(())
+}
+
+#[cfg(kani)]
+mod kani_progress_policy_proofs {
+    use super::*;
+
+    fn expected_error(
+        action: ComputeControlAction,
+        current_stage: Option<ComputeControlStage>,
+        state: ComputeControlState,
+        next_stage: ComputeControlStage,
+        error_code: ComputeDiagnosticValue,
+        error_message: ComputeDiagnosticValue,
+        lease_present: bool,
+    ) -> Option<ComputeProgressPolicyError> {
+        if !matches!(
+            state,
+            ComputeControlState::Running
+                | ComputeControlState::RecoveryRequired
+                | ComputeControlState::Succeeded
+                | ComputeControlState::Failed
+        ) {
+            return Some(ComputeProgressPolicyError::InvalidState);
+        }
+        let stage_allowed = current_stage == Some(next_stage)
+            || matches!(
+                (current_stage, next_stage),
+                (
+                    Some(ComputeControlStage::DrainingPrevious),
+                    ComputeControlStage::Stopping
+                ) | (
+                    Some(ComputeControlStage::Stopping),
+                    ComputeControlStage::Stopped
+                ) | (
+                    Some(ComputeControlStage::Stopped),
+                    ComputeControlStage::Starting
+                ) | (
+                    Some(ComputeControlStage::Starting),
+                    ComputeControlStage::Verifying
+                ) | (
+                    Some(ComputeControlStage::Verifying),
+                    ComputeControlStage::Completed
+                )
+            )
+            || (action == ComputeControlAction::Stop
+                && current_stage == Some(ComputeControlStage::Stopped)
+                && next_stage == ComputeControlStage::Completed);
+        if !stage_allowed
+            || (action == ComputeControlAction::Stop
+                && matches!(
+                    next_stage,
+                    ComputeControlStage::Starting | ComputeControlStage::Verifying
+                ))
+        {
+            return Some(ComputeProgressPolicyError::InvalidStageTransition);
+        }
+        if state == ComputeControlState::Succeeded && next_stage != ComputeControlStage::Completed {
+            return Some(ComputeProgressPolicyError::SuccessRequiresCompletedEvidence);
+        }
+        if next_stage == ComputeControlStage::Completed && state != ComputeControlState::Succeeded {
+            return Some(ComputeProgressPolicyError::CompletedRequiresSuccess);
+        }
+        if matches!(
+            state,
+            ComputeControlState::Failed | ComputeControlState::RecoveryRequired
+        ) && (error_code != ComputeDiagnosticValue::NonEmpty
+            || error_message != ComputeDiagnosticValue::NonEmpty)
+        {
+            return Some(ComputeProgressPolicyError::FailureRequiresDiagnostics);
+        }
+        if matches!(
+            state,
+            ComputeControlState::Running | ComputeControlState::Succeeded
+        ) && (error_code != ComputeDiagnosticValue::Absent
+            || error_message != ComputeDiagnosticValue::Absent)
+        {
+            return Some(ComputeProgressPolicyError::ProgressCannotRetainDiagnostics);
+        }
+        if state == ComputeControlState::Failed
+            && (current_stage != Some(ComputeControlStage::DrainingPrevious) || lease_present)
+        {
+            return Some(ComputeProgressPolicyError::MutationFailureRequiresRecovery);
+        }
+        None
+    }
+
+    /// Exhaustively checks the production policy over every state/action/stage
+    /// combination, including persisted-stage corruption and diagnostic presence.
+    #[kani::proof]
+    fn compute_progress_policy_matches_complete_finite_contract() {
+        let action: ComputeControlAction = kani::any();
+        let current_stage: Option<ComputeControlStage> = kani::any();
+        let state: ComputeControlState = kani::any();
+        let next_stage: ComputeControlStage = kani::any();
+        let error_code: ComputeDiagnosticValue = kani::any();
+        let error_message: ComputeDiagnosticValue = kani::any();
+        let lease_present: bool = kani::any();
+
+        let actual = validate_compute_progress_transition(
+            action,
+            current_stage,
+            state,
+            next_stage,
+            error_code,
+            error_message,
+            lease_present,
+        );
+        assert_eq!(
+            actual.err(),
+            expected_error(
+                action,
+                current_stage,
+                state,
+                next_stage,
+                error_code,
+                error_message,
+                lease_present,
+            )
+        );
+
+        let checkpoint_is_object: bool = kani::any();
+        let evidence_actual =
+            validate_compute_mutation_evidence(next_stage, lease_present, checkpoint_is_object);
+        let evidence_required = next_stage == ComputeControlStage::DrainingPrevious
+            || (lease_present && checkpoint_is_object);
+        assert_eq!(evidence_actual.is_ok(), evidence_required);
     }
 }
 
