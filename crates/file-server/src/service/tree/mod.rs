@@ -263,7 +263,7 @@ pub(crate) fn resolve_subdir(root: &Path, relative_path: Option<&str>) -> AppRes
 
 /// 读取目录条目并按 nuwax 规则过滤 + 排序 (隐藏文件除 .gitignore / traverse_exclude_dirs /
 /// content_traverse_exclude_files; 目录在前 + 名字大小写不敏感)。供递归/单层遍历复用。
-/// 跳过既非目录也非文件的条目 (如符号链接断链), 对齐 TS `isDirectory()/isFile()` 行为。
+/// 保留 symlink 作为叶条目供 metadata 列表报告 `isLink`；读取文件内容的遍历会单独跳过它们。
 async fn read_filtered_entries(
     dir: &Path,
     config: &Config,
@@ -281,7 +281,7 @@ async fn read_filtered_entries(
         let is_link = ft.is_symlink();
         if ft.is_dir() && !config.traverse_exclude_dirs.iter().any(|d| d == &name) {
             items.push((name, path, true, is_link));
-        } else if ft.is_file()
+        } else if (ft.is_file() || is_link)
             && !config
                 .content_traverse_exclude_files
                 .iter()
@@ -339,6 +339,9 @@ async fn list_directory_level(
             continue;
         }
         let relative = make_relative_path(root, &path);
+        if !is_safe_list_link(root, &relative, is_link).await {
+            continue;
+        }
         if is_dir {
             out.push(FileEntry {
                 name: relative,
@@ -380,6 +383,9 @@ async fn traverse_meta(
         }
         natural_count += 1;
         let relative = make_relative_path(root, &path);
+        if !is_safe_list_link(root, &relative, is_link).await {
+            continue;
+        }
         if is_dir {
             let child_count =
                 Box::pin(traverse_meta(root, &path, config, proxy_path, options, out)).await?;
@@ -419,10 +425,13 @@ async fn traverse(
     proxy_path: Option<&str>,
     out: &mut Vec<FileEntry>,
 ) -> AppResult<()> {
-    // 复用 read_filtered_entries (过滤 + 排序), 丢弃 is_link (traverse 不需要)。
+    // 复用 read_filtered_entries (过滤 + 排序)，但不跟随 symlink 读取项目文件内容。
     let items = read_filtered_entries(dir, config).await?;
 
-    for (_name, path, is_dir, _is_link) in items {
+    for (_name, path, is_dir, is_link) in items {
+        if is_link {
+            continue;
+        }
         let relative = make_relative_path(root, &path);
         if is_dir {
             let mut sub = Vec::new();
@@ -446,6 +455,14 @@ async fn traverse(
         }
     }
     Ok(())
+}
+
+/// 列表可展示根目录内的链接，但不暴露指向所选根之外的链接目标。
+async fn is_safe_list_link(root: &Path, relative: &str, is_link: bool) -> bool {
+    !is_link
+        || path_safety::ensure_resolved_within(root, relative)
+            .await
+            .is_ok()
 }
 
 async fn build_file_entry(
@@ -690,6 +707,59 @@ mod tests {
         let entry = files.iter().find(|f| f.name == "a b.txt").unwrap();
         // 空格应被 encode → %20
         assert_eq!(entry.file_proxy_url.as_deref(), Some("/proxy/a%20b.txt"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metadata_lists_only_symlinks_resolving_within_root() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        fs::create_dir(&root).await.unwrap();
+        fs::write(root.join("target.txt"), "inside").await.unwrap();
+        fs::write(parent.path().join("outside.txt"), "outside")
+            .await
+            .unwrap();
+        symlink(root.join("target.txt"), root.join("inside-link.txt")).unwrap();
+        symlink(
+            parent.path().join("outside.txt"),
+            root.join("outside-link.txt"),
+        )
+        .unwrap();
+
+        let config = default_test_config();
+        let entries = list_files_meta(&root, &config, Some("/proxy"), None, true)
+            .await
+            .unwrap();
+        let inside_link = entries
+            .iter()
+            .find(|entry| entry.name == "inside-link.txt")
+            .expect("in-root symlink should be listed");
+        assert!(!inside_link.is_dir);
+        assert_eq!(inside_link.is_link, Some(true));
+        assert_eq!(
+            inside_link.file_proxy_url.as_deref(),
+            Some("/proxy/inside-link.txt")
+        );
+        assert!(
+            !entries.iter().any(|entry| entry.name == "outside-link.txt"),
+            "links resolving outside the selected root must stay out of the listing"
+        );
+
+        let content_entries = list_files(&root, &config, Some("/proxy")).await.unwrap();
+        assert!(
+            !content_entries
+                .iter()
+                .any(|entry| entry.name == "inside-link.txt"),
+            "project content traversal must not follow symlinks"
+        );
+        assert!(
+            !content_entries
+                .iter()
+                .any(|entry| entry.name == "outside-link.txt"),
+            "project content traversal must not follow external symlinks"
+        );
     }
 
     // ── resolve_subdir 单元测试 (components 语义, 不依赖文件系统) ──────────────
