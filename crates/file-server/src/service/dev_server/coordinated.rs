@@ -6,6 +6,7 @@
 //! - stop 只按**记录 pid** 组杀，绝不 ps 扫描、绝不误杀他实例；
 //! - 身份不匹配（迟到旧操作打到新登记）返回 IdentityMismatch 而非执行。
 
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -76,18 +77,52 @@ impl DevServerManager {
         preview_key: &str,
         instance_id: &str,
     ) -> AppResult<ExecutorStopOutcome> {
-        let proc = lock(&self.processes)?.remove(preview_key);
+        self.stop_coordinated_with(preview_key, instance_id, |pid| {
+            self.terminate_pid_group(pid)
+        })
+        .await
+    }
+
+    async fn stop_coordinated_with<F, Fut>(
+        &self,
+        preview_key: &str,
+        instance_id: &str,
+        terminate: F,
+    ) -> AppResult<ExecutorStopOutcome>
+    where
+        F: FnOnce(u32) -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        let stop_lock = {
+            let mut locks = lock(&self.coordinated_stop_locks)?;
+            locks.retain(|_, entry| Arc::strong_count(entry) > 1);
+            Arc::clone(
+                locks
+                    .entry(preview_key.to_string())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let _stop_guard = stop_lock.lock().await;
+
+        // Keep the registration until termination finishes. If this future is
+        // cancelled after SIGTERM, a later stop still finds the original PID
+        // and can finish the same instance instead of returning NotRegistered.
+        let proc = lock(&self.processes)?.get(preview_key).cloned();
         let Some(p) = proc else {
             return Ok(ExecutorStopOutcome::NotRegistered);
         };
         if p.instance_id.as_deref() != Some(instance_id) {
-            // 迟到旧操作打到新登记：把新登记放回，绝不误杀。
-            lock(&self.processes)?.insert(preview_key.to_string(), p);
             return Ok(ExecutorStopOutcome::IdentityMismatch);
         }
-        let killed = self.terminate_pid_group(p.pid).await;
+        let killed = terminate(p.pid).await;
         if !killed {
-            // 进程组已不在（先期退出）也按 Stopped 收口——登记已摘除，端口由存储释放。
+            if process::is_process_running(p.pid) {
+                return Err(AppError::business(format!(
+                    "coordinated stop could not terminate recorded pid {}",
+                    p.pid
+                )));
+            }
+            // 进程组已不在（先期退出）也按 Stopped 收口。
             tracing::warn!(
                 preview_key,
                 pid = p.pid,
@@ -95,6 +130,20 @@ impl DevServerManager {
             );
         }
         super::log::cleanup_temp_logs(&p.log_dir).await;
+        let removed = {
+            let mut processes = lock(&self.processes)?;
+            if processes.get(preview_key).is_some_and(|current| {
+                current.instance_id.as_deref() == Some(instance_id) && current.pid == p.pid
+            }) {
+                processes.remove(preview_key);
+                true
+            } else {
+                false
+            }
+        };
+        if !removed {
+            return Ok(ExecutorStopOutcome::IdentityMismatch);
+        }
         Ok(ExecutorStopOutcome::Stopped)
     }
 
@@ -243,6 +292,7 @@ impl PreviewExecutor for DevServerExecutor {
 #[cfg(test)]
 mod r11_tests {
     use super::*;
+    use crate::models::DevProcess;
 
     /// R11：PortInUse 分类经类型化变体——修改提示文案（含删除
     /// "--strictPort 不自动换端口" 标记句）不破坏分类。
@@ -262,5 +312,69 @@ mod r11_tests {
             PreviewExecutorError::Failed(_) => {}
             other => panic!("system error with marker text must stay Failed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn overlapping_stops_wait_for_process_exit_before_reporting_not_registered() {
+        let logs = tempfile::tempdir().expect("test logs");
+        let manager = Arc::new(DevServerManager::new(Arc::new(crate::Config::default())));
+        let key = "coordinated-stop-race";
+        let instance_id = "instance-one";
+        lock(&manager.processes).expect("process registry").insert(
+            key.to_string(),
+            DevProcess {
+                pid: 42,
+                port: 4001,
+                project_id: key.to_string(),
+                instance_id: Some(instance_id.to_string()),
+                base_path: None,
+                started_at: 0,
+                log_dir: logs.path().to_path_buf(),
+                temp_log_name: String::new(),
+                external_owner: None,
+            },
+        );
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first_manager = Arc::clone(&manager);
+        let first = tokio::spawn(async move {
+            first_manager
+                .stop_coordinated_with(key, instance_id, |_pid| async move {
+                    entered_tx.send(()).expect("signal first stop entered");
+                    release_rx.await.expect("release first stop");
+                    true
+                })
+                .await
+        });
+        entered_rx.await.expect("first stop entered termination");
+        let second_manager = Arc::clone(&manager);
+        let mut second = tokio::spawn(async move {
+            second_manager
+                .stop_coordinated_with(key, instance_id, |_pid| async move {
+                    panic!("second stop must not terminate the same process")
+                })
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut second)
+                .await
+                .is_err(),
+            "second stop must wait for the first stop to finish"
+        );
+        assert!(
+            lock(&manager.processes)
+                .expect("process registry")
+                .contains_key(key),
+            "registration stays visible while process termination is pending"
+        );
+        release_tx.send(()).expect("release first stop");
+        assert!(matches!(
+            first.await.expect("first task").expect("first stop"),
+            ExecutorStopOutcome::Stopped
+        ));
+        assert!(matches!(
+            second.await.expect("second task").expect("second stop"),
+            ExecutorStopOutcome::NotRegistered
+        ));
     }
 }

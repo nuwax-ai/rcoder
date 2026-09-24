@@ -256,7 +256,9 @@ impl PreviewCoordinator {
         if let Ok(Some(row)) = self.store.get(&key).await {
             match row.state {
                 PreviewInstanceState::Ready if self.heartbeat_fresh(&row) => {
-                    return Ok(Self::start_envelope(&row, "Development server started"));
+                    if !self.settle_if_host_absent(&row).await? {
+                        return Ok(Self::start_envelope(&row, "Development server started"));
+                    }
                 }
                 PreviewInstanceState::Ready
                 | PreviewInstanceState::Starting
@@ -761,6 +763,12 @@ impl PreviewCoordination for PreviewCoordinator {
                             .await?;
                         Ok(Self::rebuilt_envelope(env))
                     }
+                    Ok(_) | Err(_) if self.settle_if_host_absent(&row).await? => {
+                        let env = self
+                            .admit_and_start(&req.identity, req.base_path.clone())
+                            .await?;
+                        Ok(Self::rebuilt_envelope(env))
+                    }
                     Ok(_) => Ok(Self::degraded(
                         &req.identity.project_id,
                         degraded_reason::INSTANCE_UNKNOWN,
@@ -1167,6 +1175,94 @@ mod tests {
         assert_eq!(current.state, PreviewInstanceState::Ready);
         assert_eq!(current.host_id, coordinator.host().host_id);
         assert_ne!(current.instance_id, ready.instance_id);
+    }
+
+    #[tokio::test]
+    async fn start_does_not_reuse_fresh_ready_record_from_deleted_host() {
+        let store = Arc::new(InProcessPreviewStore::new());
+        let coordinator = coordinator(Arc::clone(&store), Arc::new(TestExecutor::new(false)));
+        let identity = identity("orphaned-ready-preview");
+        let old = seed_ready(
+            store.as_ref(),
+            &identity,
+            PreviewHostIdentity {
+                host_id: "deleted-pod-uid:old-boot".to_string(),
+                pod_name: Some("deleted-rcoder-pod".to_string()),
+                pod_ip: Some("10.0.0.8".to_string()),
+            },
+            "old-start-operation",
+            "old-instance",
+        )
+        .await;
+        assert!(coordinator.heartbeat_fresh(&old));
+
+        let started = coordinator
+            .start_dev(PreviewStartRequest {
+                identity,
+                base_path: None,
+            })
+            .await
+            .expect("deleted host must be replaced despite a fresh heartbeat");
+
+        assert!(started.success);
+        let current = store
+            .get(&old.preview_key)
+            .await
+            .expect("read current preview")
+            .expect("replacement preview exists");
+        assert_eq!(current.state, PreviewInstanceState::Ready);
+        assert_eq!(current.host_id, coordinator.host().host_id);
+        assert_ne!(current.instance_id, old.instance_id);
+    }
+
+    #[tokio::test]
+    async fn keep_alive_rebuilds_stale_ready_record_from_deleted_host() {
+        let store = Arc::new(InProcessPreviewStore::new());
+        let config = CoordinatorConfig {
+            heartbeat_ttl_secs: 0,
+            start_budget_secs: 1,
+            ..CoordinatorConfig::default()
+        };
+        let coordinator = PreviewCoordinator::new(
+            Arc::clone(&store) as Arc<dyn PreviewLifecycleStore>,
+            Arc::new(TestExecutor::new(false)),
+            Arc::new(SingleInstanceEvidence),
+            "test-preview-token".to_string(),
+            config,
+        );
+        let identity = identity("stale-orphaned-ready-preview");
+        let old = seed_ready(
+            store.as_ref(),
+            &identity,
+            PreviewHostIdentity {
+                host_id: "deleted-pod-uid:old-boot".to_string(),
+                pod_name: Some("deleted-rcoder-pod".to_string()),
+                pod_ip: None,
+            },
+            "old-start-operation",
+            "old-instance",
+        )
+        .await;
+
+        let kept_alive = coordinator
+            .keep_alive_dev(&PreviewKeepAliveRequest {
+                identity,
+                port: old.port.expect("old port"),
+                pid: old.pid,
+                base_path: None,
+            })
+            .await
+            .expect("deleted host must be replaced after verify is unavailable");
+
+        assert!(kept_alive.success);
+        let current = store
+            .get(&old.preview_key)
+            .await
+            .expect("read current preview")
+            .expect("replacement preview exists");
+        assert_eq!(current.state, PreviewInstanceState::Ready);
+        assert_eq!(current.host_id, coordinator.host().host_id);
+        assert_ne!(current.instance_id, old.instance_id);
     }
 
     #[tokio::test]

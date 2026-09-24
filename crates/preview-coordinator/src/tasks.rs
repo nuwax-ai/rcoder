@@ -77,6 +77,12 @@ impl PreviewCoordinator {
             }
         };
         for row in rows {
+            // The stop owner is responsible for this transition. Inspecting a
+            // process while it is being terminated can observe a transient
+            // missing registration and incorrectly turn Stopping into Unknown.
+            if row.state == PreviewInstanceState::Stopping {
+                continue;
+            }
             let report = match self
                 .executor
                 .verify_local(&row.preview_key, &row.instance_id)

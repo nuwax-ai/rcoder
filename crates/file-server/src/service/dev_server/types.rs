@@ -100,6 +100,10 @@ pub(crate) enum OwnerExpectation {
 pub struct DevServerManager {
     pub(super) processes: Mutex<HashMap<String, DevProcess>>,
     pub(super) starting: Mutex<HashSet<String>>,
+    /// Serializes coordinated stops for one preview key through process exit.
+    /// A second stop must not see NotRegistered while the first is still killing
+    /// the process. Idle entries are pruned when the next stop is admitted.
+    pub(super) coordinated_stop_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// UserApp manifest 编排进程（app-cli）的监督句柄（P1-03：唯一
     /// wait/reap + stdout 管道 + stderr ring；vite 路径不登记）。key 与
     /// processes 同（project_id）；stop_dev 同步摘除。
@@ -132,6 +136,7 @@ impl DevServerManager {
         let manager = Self {
             processes: Mutex::new(HashMap::new()),
             starting: Mutex::new(HashSet::new()),
+            coordinated_stop_locks: Mutex::new(HashMap::new()),
             supervised: Mutex::new(HashMap::new()),
             cleanup_state: Arc::new(Mutex::new(HashMap::new())),
             owner_expectations: Mutex::new(HashMap::new()),
