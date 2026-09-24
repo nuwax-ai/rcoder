@@ -618,7 +618,8 @@
         "git-status-clean",
         "git-status-after-worktree-change",
         "git-status-after-unstage",
-        "git-status-after-checkout"
+        "git-status-after-checkout",
+        "git-status-after-merge-conflict"
       ]
     },
     {

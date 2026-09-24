@@ -57,7 +57,7 @@ Rust 与 TypeScript 镜像按顺序构建，避免两个依赖安装/编译任�
 ## 套件与覆盖边界
 
 - `core`：健康/API 版本、React/Vue 模板初始化与读取、项目文件更新、静态普通/Range 读取、Computer 文件列表/resolve/search/metadata 边界和基础文件系统操作。无 npm 外网依赖。
-- `git`：通过 HTTP 对照 init、status、add、commit、file-content、branch create/delete、tag、log、worktree/staged diff、unstage、checkout、discard、revert，以及 mixed/hard/soft reset。每个会改变历史或工作树的流程使用独立 pageApp fixture，避免一个实现的失败污染其他场景；最终比较 refs 对应 tree、HEAD tree、index entries、工作区状态和文件树。Rust 服务使用 gix，TS 服务使用镜像内系统 Git；驱动只用系统 Git 读取最终仓库状态及准备对称 fixture，不参与被测 API 操作。
+- `git`：通过 HTTP 对照 init、status、add、commit、file-content、branch create/delete、tag、log、worktree/staged diff、unstage、checkout、discard、revert，以及 mixed/hard/soft reset。另用系统 Git 为两侧独立 fixture 准备相同的真实 merge-conflict index，再通过 HTTP 对照 `status.conflicted`；当前 API 没有 merge 操作端点，因此不把 fixture 准备命令当成被测 API。每个会改变历史或工作树的流程使用独立 pageApp fixture，避免一个实现的失败污染其他场景；最终比较 refs 对应 tree、HEAD tree、index entries、工作区状态和文件树。Rust 服务使用 gix，TS 服务使用镜像内系统 Git；驱动只用系统 Git读取最终仓库状态及准备对称 fixture，不参与被测 API 操作。
 - `build`：分别用两份模板走项目初始化、依赖安装、production build、产物静态读取、start-dev、真实页面 HTTP、开发日志分页、日志缓存查询/清理、端口池状态、keep-alive、restart-dev 和 stop-dev，并对照构建错误解析。依赖 registry 网络；报告记下环境版本与错误。
 - `all`：顺序执行以上套件。路由清单按当前 TypeScript 基线快照维护；没有 A/B 场景的共同路由明确标为 pending。
 

@@ -184,6 +184,9 @@ enum GitPreparation {
     DiscardDirty,
     ResetHardDirty,
     CreateDeleteBranch,
+    MergeConflictFeatureChange,
+    MergeConflictMainChange,
+    CreateMergeConflict,
 }
 
 const GIT_PROJECT_MAIN: &str = "file-server-ab-git";
@@ -194,6 +197,7 @@ const GIT_PROJECT_RESET_HARD: &str = "file-server-ab-git-reset-hard";
 const GIT_PROJECT_RESET_SOFT: &str = "file-server-ab-git-reset-soft";
 const GIT_PROJECT_CHECKOUT: &str = "file-server-ab-git-checkout";
 const GIT_PROJECT_DISCARD: &str = "file-server-ab-git-discard";
+const GIT_PROJECT_MERGE_CONFLICT: &str = "file-server-ab-git-merge-conflict";
 const GIT_PROJECT_IDS: &[&str] = &[
     GIT_PROJECT_MAIN,
     GIT_PROJECT_BRANCH_DELETE,
@@ -203,6 +207,7 @@ const GIT_PROJECT_IDS: &[&str] = &[
     GIT_PROJECT_RESET_SOFT,
     GIT_PROJECT_CHECKOUT,
     GIT_PROJECT_DISCARD,
+    GIT_PROJECT_MERGE_CONFLICT,
 ];
 
 #[derive(Debug, Serialize)]
@@ -652,6 +657,19 @@ async fn run_suite(options: RunOptions) -> Result<()> {
                                 &format!("/assertions/{side}/log"),
                                 error,
                             )),
+                        }
+                    }
+                }
+                "git-status-after-merge-conflict" => {
+                    for (side, exchange) in [("rust", &rust), ("typescript", &ts)] {
+                        if let Err(error) =
+                            validate_git_conflicted_status(&exchange.body, "README.md")
+                        {
+                            case.differences.push(assertion_difference(
+                                case_name,
+                                &format!("/assertions/{side}/conflicted"),
+                                error,
+                            ));
                         }
                     }
                 }
@@ -1480,6 +1498,105 @@ fn git_scenarios() -> Result<Vec<GitScenario>> {
         Some(GitPreparation::DiscardDirty),
     ));
 
+    let merge_conflict = GIT_PROJECT_MERGE_CONFLICT;
+    append_git_seed(
+        &mut scenarios,
+        merge_conflict,
+        "git-merge-conflict-seed",
+        false,
+    )?;
+    scenarios.push(git_scenario(
+        "git-merge-conflict-create-feature",
+        merge_conflict,
+        git_json(
+            merge_conflict,
+            Method::POST,
+            "/api/git/branch-create",
+            json!({"branchName":"ab-conflict-feature"}),
+        )?,
+        None,
+    ));
+    scenarios.push(git_scenario(
+        "git-merge-conflict-switch-feature",
+        merge_conflict,
+        git_json(
+            merge_conflict,
+            Method::POST,
+            "/api/git/branch-switch",
+            json!({"branchName":"ab-conflict-feature"}),
+        )?,
+        None,
+    ));
+    scenarios.push(git_scenario(
+        "git-merge-conflict-stage-feature",
+        merge_conflict,
+        git_json(
+            merge_conflict,
+            Method::POST,
+            "/api/git/add",
+            json!({"files":["README.md"]}),
+        )?,
+        Some(GitPreparation::MergeConflictFeatureChange),
+    ));
+    scenarios.push(git_scenario(
+        "git-merge-conflict-commit-feature",
+        merge_conflict,
+        git_json(
+            merge_conflict,
+            Method::POST,
+            "/api/git/commit",
+            json!({
+                "message":"A/B conflict feature commit",
+                "authorName":"File Server A-B",
+                "authorEmail":"ab@example.invalid"
+            }),
+        )?,
+        None,
+    ));
+    scenarios.push(git_scenario(
+        "git-merge-conflict-switch-main",
+        merge_conflict,
+        git_json(
+            merge_conflict,
+            Method::POST,
+            "/api/git/branch-switch",
+            json!({"branchName":"main"}),
+        )?,
+        None,
+    ));
+    scenarios.push(git_scenario(
+        "git-merge-conflict-stage-main",
+        merge_conflict,
+        git_json(
+            merge_conflict,
+            Method::POST,
+            "/api/git/add",
+            json!({"files":["README.md"]}),
+        )?,
+        Some(GitPreparation::MergeConflictMainChange),
+    ));
+    scenarios.push(git_scenario(
+        "git-merge-conflict-commit-main",
+        merge_conflict,
+        git_json(
+            merge_conflict,
+            Method::POST,
+            "/api/git/commit",
+            json!({
+                "message":"A/B conflict main commit",
+                "authorName":"File Server A-B",
+                "authorEmail":"ab@example.invalid"
+            }),
+        )?,
+        None,
+    ));
+    scenarios.push(git_scenario(
+        "git-status-after-merge-conflict",
+        merge_conflict,
+        git_get(merge_conflict, "status"),
+        Some(GitPreparation::CreateMergeConflict),
+    ));
+
     Ok(scenarios)
 }
 
@@ -1567,7 +1684,61 @@ fn prepare_git_scenario(
             GitPreparation::CreateDeleteBranch => {
                 run_git_fixture_command(&project, &["branch", "ab-review"])?;
             }
+            GitPreparation::MergeConflictFeatureChange => {
+                fs::write(project.join("README.md"), "feature branch version\n")?;
+            }
+            GitPreparation::MergeConflictMainChange => {
+                fs::write(project.join("README.md"), "main branch version\n")?;
+            }
+            GitPreparation::CreateMergeConflict => {
+                run_git_merge_conflict_fixture(&project, "ab-conflict-feature", "README.md")?;
+            }
         }
+    }
+    Ok(())
+}
+
+fn run_git_merge_conflict_fixture(project: &Path, branch: &str, path: &str) -> Result<()> {
+    let merge = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(project)
+        .args([
+            "-c",
+            "user.name=File Server A-B",
+            "-c",
+            "user.email=ab@example.invalid",
+            "merge",
+            "--no-commit",
+            "--no-ff",
+            branch,
+        ])
+        .output()
+        .with_context(|| format!("start Git merge fixture in {}", project.display()))?;
+    if merge.status.code() != Some(1) {
+        bail!(
+            "expected a merge conflict for {path} in {} but git merge exited {}: {}",
+            project.display(),
+            merge.status,
+            String::from_utf8_lossy(&merge.stderr).trim()
+        );
+    }
+
+    let unmerged = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(project)
+        .args(["ls-files", "-u", "--", path])
+        .output()
+        .with_context(|| format!("inspect unmerged Git index in {}", project.display()))?;
+    if !unmerged.status.success()
+        || !String::from_utf8_lossy(&unmerged.stdout)
+            .lines()
+            .any(|line| line.ends_with(path))
+    {
+        bail!(
+            "Git merge returned conflict status but did not leave {path} unmerged in {}: {}",
+            project.display(),
+            String::from_utf8_lossy(&unmerged.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -2191,6 +2362,27 @@ fn validate_git_commit_response(body: &[u8]) -> Result<String, String> {
         ));
     }
     Ok(hash.to_string())
+}
+
+fn validate_git_conflicted_status(body: &[u8], expected_path: &str) -> Result<(), String> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("Git status response is not JSON: {error}"))?;
+    if value.get("success").and_then(Value::as_bool) != Some(true) {
+        return Err("Git status response must contain success=true".into());
+    }
+    let conflicted = value
+        .get("conflicted")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Git status response must contain a conflicted array".to_string())?;
+    if !conflicted
+        .iter()
+        .any(|path| path.as_str() == Some(expected_path))
+    {
+        return Err(format!(
+            "Git status conflicted list must contain {expected_path:?}, got {conflicted:?}"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_git_log_response(body: &[u8]) -> Result<String, String> {
