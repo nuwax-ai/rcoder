@@ -270,11 +270,11 @@ pub fn validate_compute_progress_transition(
             ) | (
                 Some(ComputeControlStage::Starting),
                 ComputeControlStage::Verifying
-            ) | (
-                Some(ComputeControlStage::Verifying),
-                ComputeControlStage::Completed
             )
         )
+        || (action == ComputeControlAction::Restart
+            && current_stage == Some(ComputeControlStage::Verifying)
+            && next_stage == ComputeControlStage::Completed)
         || (action == ComputeControlAction::Stop
             && current_stage == Some(ComputeControlStage::Stopped)
             && next_stage == ComputeControlStage::Completed);
@@ -371,11 +371,11 @@ mod kani_progress_policy_proofs {
                 ) | (
                     Some(ComputeControlStage::Starting),
                     ComputeControlStage::Verifying
-                ) | (
-                    Some(ComputeControlStage::Verifying),
-                    ComputeControlStage::Completed
                 )
             )
+            || (action == ComputeControlAction::Restart
+                && current_stage == Some(ComputeControlStage::Verifying)
+                && next_stage == ComputeControlStage::Completed)
             || (action == ComputeControlAction::Stop
                 && current_stage == Some(ComputeControlStage::Stopped)
                 && next_stage == ComputeControlStage::Completed);
@@ -439,6 +439,20 @@ mod kani_progress_policy_proofs {
             error_message,
             lease_present,
         );
+        // A Stop intent has no start/verification phase. Check both the
+        // persisted and requested stages directly so this safety rule cannot
+        // silently drift with the reference contract below.
+        if action == ComputeControlAction::Stop
+            && (matches!(
+                current_stage,
+                Some(ComputeControlStage::Starting | ComputeControlStage::Verifying)
+            ) || matches!(
+                next_stage,
+                ComputeControlStage::Starting | ComputeControlStage::Verifying
+            ))
+        {
+            assert!(actual.is_err());
+        }
         assert_eq!(
             actual.err(),
             expected_error(
@@ -458,6 +472,50 @@ mod kani_progress_policy_proofs {
         let evidence_required = next_stage == ComputeControlStage::DrainingPrevious
             || (lease_present && checkpoint_is_object);
         assert_eq!(evidence_actual.is_ok(), evidence_required);
+    }
+}
+
+#[cfg(test)]
+mod compute_progress_policy_tests {
+    use super::*;
+
+    #[test]
+    fn stop_completion_requires_stopped_while_restart_completes_after_verifying() {
+        let stop_from_verifying = validate_compute_progress_transition(
+            ComputeControlAction::Stop,
+            Some(ComputeControlStage::Verifying),
+            ComputeControlState::Succeeded,
+            ComputeControlStage::Completed,
+            ComputeDiagnosticValue::Absent,
+            ComputeDiagnosticValue::Absent,
+            true,
+        );
+        assert_eq!(
+            stop_from_verifying,
+            Err(ComputeProgressPolicyError::InvalidStageTransition)
+        );
+
+        let restart_from_verifying = validate_compute_progress_transition(
+            ComputeControlAction::Restart,
+            Some(ComputeControlStage::Verifying),
+            ComputeControlState::Succeeded,
+            ComputeControlStage::Completed,
+            ComputeDiagnosticValue::Absent,
+            ComputeDiagnosticValue::Absent,
+            true,
+        );
+        assert!(restart_from_verifying.is_ok());
+
+        let stop_from_stopped = validate_compute_progress_transition(
+            ComputeControlAction::Stop,
+            Some(ComputeControlStage::Stopped),
+            ComputeControlState::Succeeded,
+            ComputeControlStage::Completed,
+            ComputeDiagnosticValue::Absent,
+            ComputeDiagnosticValue::Absent,
+            true,
+        );
+        assert!(stop_from_stopped.is_ok());
     }
 }
 
