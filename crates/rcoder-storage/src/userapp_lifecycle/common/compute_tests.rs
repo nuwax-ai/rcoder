@@ -990,3 +990,39 @@ async fn compute_original_executor_drain_ack_releases_only_old_receipt() {
     );
     store.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn public_repair_prefix_is_rejected_before_control_intent_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ToastyUserAppStore::open_exclusive(&dir.path().join("publicrequest.db"))
+        .await
+        .unwrap();
+    let app = store.ensure_identity("publicrequestapp").await.unwrap();
+    for action in [ComputeControlAction::Stop, ComputeControlAction::Restart] {
+        let mut input = request(&app, "manualrequest", action);
+        input.request_id = "auto-repair-manual1".into();
+        assert!(matches!(
+            store.admit_compute_control(&input).await,
+            Err(UserAppStoreError::InvalidOperation(_))
+        ));
+        assert!(
+            store
+                .get_compute_control(&app.app_id, &input.operation_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !store
+                .compute_desired_stopped(&app.app_id, &app.lifecycle_id, UserAppOperationScope::Dev)
+                .await
+                .unwrap()
+        );
+    }
+    let normal = request(&app, "normalstop", ComputeControlAction::Stop);
+    assert_eq!(
+        store.admit_compute_control(&normal).await.unwrap().state,
+        ComputeControlState::Pending
+    );
+    store.shutdown().await.unwrap();
+}

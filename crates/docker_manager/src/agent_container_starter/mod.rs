@@ -417,30 +417,56 @@ impl<'a> AgentContainerStarter<'a> {
         // 同款；Direct 模式多网卡容器需要它保证取主网卡 IP）
         #[cfg(feature = "deploy-host")]
         if shared_types::is_deploy_host() {
-            let inspect = self
-                .manager
-                .docker
-                .inspect_container(
-                    &created.container_id,
-                    None::<bollard::query_parameters::InspectContainerOptions>,
-                )
-                .await
-                .map_err(|e| {
-                    DockerError::ContainerCreationError(format!(
-                        "deploy-host reach registration inspect failed: {e}"
-                    ))
-                })?;
             let preferred_network = self.manager.get_main_network_name().await;
-            crate::deploy_host_ports::register_reach_from_inspect(
-                &container_id,
-                Some(preferred_network.as_str()),
-                &inspect,
-            )
-            .map_err(|e| {
-                DockerError::ContainerCreationError(format!(
-                    "deploy-host reach registration failed: {e}"
-                ))
-            })?;
+            let required_ports = crate::deploy_host_ports::published_ports_for(&service_type);
+            for attempt in 0..10 {
+                let observation =
+                    shared_types::published::begin_physical_observation(&created.container_id);
+                let inspect = self
+                    .manager
+                    .docker
+                    .inspect_container(
+                        &created.container_id,
+                        None::<bollard::query_parameters::InspectContainerOptions>,
+                    )
+                    .await
+                    .map_err(|e| {
+                        DockerError::ContainerCreationError(format!(
+                            "deploy-host reach registration inspect failed: {e}"
+                        ))
+                    })?;
+                let ready = if crate::deploy_host_ports::is_direct_reach() {
+                    crate::runtime::docker_runtime::extract_container_ip(
+                        &inspect,
+                        Some(&preferred_network),
+                    )
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| !ip.is_unspecified())
+                } else {
+                    crate::deploy_host_ports::missing_published_ports(&inspect, &required_ports)
+                        .is_empty()
+                };
+                if ready {
+                    crate::deploy_host_ports::register_reach_from_inspect(
+                        &container_id,
+                        Some(&preferred_network),
+                        &inspect,
+                        &observation,
+                    )
+                    .map_err(|e| {
+                        DockerError::ContainerCreationError(format!(
+                            "deploy-host reach registration failed: {e}"
+                        ))
+                    })?;
+                    break;
+                }
+                if attempt == 9 {
+                    return Err(DockerError::ContainerCreationError(
+                        "Started container address or published ports are not ready".into(),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
         }
 
         // 5. 等待就绪并返回信息

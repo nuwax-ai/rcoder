@@ -104,6 +104,10 @@ async fn submit_with_image_policy(
     restart_image_roll: bool,
 ) -> Result<ComputeOperationView> {
     validate_identifier(&app_id, "app_id").map_err(anyhow::Error::msg)?;
+    if let Some(request_id) = request.request_id.as_deref() {
+        validate_user_compute_request_id(request_id)
+            .map_err(UserAppStoreError::InvalidOperation)?;
+    }
     let app = super::adoption::discover_missing_identity(state, &app_id)
         .await?
         .ok_or(UserAppStoreError::NotFound)?;
@@ -499,7 +503,10 @@ pub(crate) async fn execute_pending(state: &AppState, pending: ComputeControlRec
         Err(UserAppStoreError::VersionConflict) => return Ok(()), // another replica won
         Err(error) => return Err(error.into()),
     };
-    if record.request_id.starts_with("auto-repair-") {
+    if record
+        .request_id
+        .starts_with(AUTOMATIC_REPAIR_REQUEST_PREFIX)
+    {
         let preflight =
             async {
                 let context = record.execution_context().map_err(anyhow::Error::msg)?;

@@ -18,7 +18,9 @@
 //! 并发约束（AGENTS.md §3）：DashMap entry API，不持 guard 跨 await。
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Weak};
+
+use parking_lot::Mutex;
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -55,6 +57,71 @@ struct ReachEntry {
 }
 
 static REGISTRY: LazyLock<DashMap<String, ReachEntry>> = LazyLock::new(DashMap::new);
+
+// A brief local publication gate, never held across I/O. It orders completed
+// observations against stop invalidation; it is not a runtime operation lock.
+static OBSERVATIONS: LazyLock<Mutex<HashMap<String, Weak<()>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Capture BEFORE inspecting the physical container. Stop invalidates all
+/// outstanding observations, including ones not yet present in REGISTRY.
+#[derive(Clone)]
+pub struct PhysicalObservation {
+    physical_uid: String,
+    generation: Arc<()>,
+}
+
+pub fn begin_physical_observation(physical_uid: &str) -> PhysicalObservation {
+    let mut observations = OBSERVATIONS.lock();
+    let generation = observations
+        .get(physical_uid)
+        .and_then(Weak::upgrade)
+        .unwrap_or_else(|| {
+            let generation = Arc::new(());
+            observations.insert(physical_uid.to_owned(), Arc::downgrade(&generation));
+            generation
+        });
+    PhysicalObservation {
+        physical_uid: physical_uid.to_owned(),
+        generation,
+    }
+}
+
+impl PhysicalObservation {
+    pub fn physical_uid(&self) -> &str {
+        &self.physical_uid
+    }
+
+    /// Publish all aliases under one invalidation boundary. A new observation
+    /// after stop/start is allowed, even when Docker reuses the same physical ID.
+    pub fn register(&self, names: &[&str], created_at: DateTime<Utc>, reach: Reach) -> bool {
+        let observations = OBSERVATIONS.lock();
+        if !observations
+            .get(&self.physical_uid)
+            .is_some_and(|current| current.ptr_eq(&Arc::downgrade(&self.generation)))
+        {
+            return false;
+        }
+        let mut accepted = true;
+        for name in names {
+            accepted &= register_physical_at(name, &self.physical_uid, created_at, reach.clone());
+        }
+        accepted
+    }
+}
+
+impl Drop for PhysicalObservation {
+    fn drop(&mut self) {
+        let mut observations = OBSERVATIONS.lock();
+        if Arc::strong_count(&self.generation) == 1
+            && observations
+                .get(&self.physical_uid)
+                .is_some_and(|current| current.ptr_eq(&Arc::downgrade(&self.generation)))
+        {
+            observations.remove(&self.physical_uid);
+        }
+    }
+}
 
 /// 登记单个端口的发布映射（entry 合并，容器多端口可分次登记）。
 ///
@@ -130,7 +197,8 @@ pub fn k8s_node_port_host() -> Result<IpAddr, String> {
     }
 }
 
-pub fn register_physical(container: &str, physical_uid: &str, reach: Reach) {
+#[cfg(test)]
+fn register_physical(container: &str, physical_uid: &str, reach: Reach) {
     REGISTRY.insert(
         container.to_owned(),
         ReachEntry {
@@ -144,7 +212,7 @@ pub fn register_physical(container: &str, physical_uid: &str, reach: Reach) {
 /// Docker inspect results may complete out of order. A delayed observation of
 /// the older physical container cannot replace the current container's route.
 /// Returns false when the observation lost to a newer Docker creation time.
-pub fn register_physical_at(
+fn register_physical_at(
     container: &str,
     physical_uid: &str,
     created_at: DateTime<Utc>,
@@ -188,13 +256,21 @@ pub fn register_direct(container: &str, host: IpAddr) {
 
 /// 注销容器（容器删除/Service 删除路径）。
 pub fn unregister(container: &str) -> Option<Reach> {
-    REGISTRY.remove(container).map(|(_, entry)| entry.reach)
+    let mut observations = OBSERVATIONS.lock();
+    REGISTRY.remove(container).map(|(_, entry)| {
+        if let Some(uid) = &entry.physical_uid {
+            observations.remove(uid);
+        }
+        entry.reach
+    })
 }
 
 /// A retiring container may clear only addresses it registered itself. A new
 /// physical instance under the same logical name is never invalidated by a
 /// delayed old-container callback.
 pub fn unregister_if_physical(container: &str, physical_uid: &str) -> bool {
+    let mut observations = OBSERVATIONS.lock();
+    observations.remove(physical_uid);
     match REGISTRY.entry(container.to_owned()) {
         Entry::Occupied(occupied)
             if occupied.get().physical_uid.as_deref() == Some(physical_uid) =>
@@ -460,6 +536,26 @@ mod tests {
             "10.1.0.3"
         );
         assert!(unregister_if_physical(&container, "new"));
+        assert!(resolve_published_addr(&container, 8086).is_err());
+    }
+    #[test]
+    fn stop_invalidates_pending_inspect_but_allows_fresh_same_uid_start() {
+        let container = unique_container("pending-inspect");
+        let uid = unique_container("physical");
+        let old = begin_physical_observation(&uid);
+        let reach = Reach::Direct {
+            host: "10.1.0.2".parse().unwrap(),
+        };
+        // No route yet: stop must also invalidate first-time rehydration.
+        assert!(!unregister_if_physical(&container, &uid));
+        assert!(!old.register(&[&container], Utc::now(), reach.clone()));
+        assert!(resolve_published_addr(&container, 8086).is_err());
+        let current = begin_physical_observation(&uid);
+        assert!(current.register(&[&container], Utc::now(), reach.clone()));
+        drop(old); // Must not remove the new generation's publication authority.
+        assert!(current.register(&[&container], Utc::now(), reach.clone()));
+        assert!(unregister_if_physical(&container, &uid));
+        assert!(!current.register(&[&container], Utc::now(), reach));
         assert!(resolve_published_addr(&container, 8086).is_err());
     }
 }

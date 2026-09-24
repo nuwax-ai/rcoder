@@ -102,6 +102,16 @@ pub(super) async fn admit(
     ] {
         validate_identifier(value, name).map_err(Error::InvalidOperation)?;
     }
+    if !idle_only {
+        validate_user_compute_request_id(&request.request_id).map_err(Error::InvalidOperation)?;
+    } else if !request
+        .request_id
+        .starts_with(AUTOMATIC_REPAIR_REQUEST_PREFIX)
+    {
+        return Err(invalid(
+            "Automatic repair requires an internal request identity",
+        ));
+    }
     if request.scope == UserAppOperationScope::Application {
         return Err(invalid("Compute control requires dev or prod scope"));
     }
@@ -189,7 +199,7 @@ pub(super) async fn admit(
                     && old.action == ComputeControlAction::Restart)
                     || (!idle_only
                         && request.action == ComputeControlAction::Restart
-                        && old.request_id.starts_with("auto-repair-")))
+                        && old.request_id.starts_with(AUTOMATIC_REPAIR_REQUEST_PREFIX)))
                 {
                     return Err(control_conflict(old));
                 }

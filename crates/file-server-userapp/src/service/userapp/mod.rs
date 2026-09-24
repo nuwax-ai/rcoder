@@ -674,7 +674,9 @@ async fn hash_file(path: &Path) -> AppResult<(String, u64)> {
         .len();
 
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
+    // Keep the buffer off the async future: nested task/context wrappers copy
+    // that future on debug builds and can exhaust the Tokio worker stack.
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = file
             .read(&mut buf)
@@ -1030,5 +1032,75 @@ mod no_lockfile_heal_tests {
             error.to_string().contains("self-heal attempted"),
             "final error must carry the heal context"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod stack_tests {
+    use super::*;
+
+    /// Run in a subprocess: a stack overflow aborts, so it must not kill the
+    /// rest of the test suite. Exercise the real task/worker/build future chain.
+    #[test]
+    fn build_task_completes_on_default_worker_stack() {
+        const CHILD: &str = "RCODER_BUILD_STACK_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "service::userapp::stack_tests::build_task_completes_on_default_worker_stack",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("RCODER_PINGAP_VERSION", "0.14.3")
+                .env("RCODER_PINGAP_COMMIT", "stack-test")
+                .env("RCODER_RUNTIME_IMAGE_DIGEST", "local-dev")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child {}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(2 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::spawn(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let ws = tmp.path().join("stackapp");
+                std::fs::create_dir_all(ws.join("web")).unwrap();
+                std::fs::write(ws.join("workspace.manifest.toml"), "schema_version = 1\n[workspace]\nname = 'stackbuild'\n").unwrap();
+                std::fs::write(ws.join("web/project.manifest.toml"), "schema_version = 1\n[project]\nservice_id = 'web'\nname = 'web'\ntype = 'static'\n[build]\ncommand = ['sh', '-c', 'mkdir -p dist && cp index.html dist/index.html']\nartifact = 'dist'\n[proxy]\npath = '/'\nstrip_prefix = false\n").unwrap();
+                std::fs::write(ws.join("web/index.html"), "<html><body>stack regression</body></html>").unwrap();
+                let config = Arc::new(file_server::Config {
+                    userapp_workspace_dir: tmp.path().to_path_buf(),
+                    userapp_single_app_id: None,
+                    log_base_dir: tmp.path().join("logs"),
+                    ..Default::default()
+                });
+                let store = BuildTaskStore::new();
+                let (id, path) = start_build_task(&store, &config, Arc::new(BuildManager::new(1)), ws.clone(), "stackapp".into(), 20).await.unwrap();
+                let task = store.get(&id).await.unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                    loop {
+                        if task.is_terminal().await { break; }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }).await.unwrap();
+                let snapshot = task.snapshot().await;
+                assert_eq!(snapshot.status, crate::models::BuildTaskStatus::Completed, "{snapshot:?}");
+                let bytes = std::fs::read(ws.join(path)).unwrap();
+                assert!(!bytes.is_empty());
+                store.workers.drain(tokio::time::Instant::now() + std::time::Duration::from_secs(5)).await.unwrap();
+            }).await.unwrap();
+        });
     }
 }

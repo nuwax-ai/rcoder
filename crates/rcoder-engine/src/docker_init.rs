@@ -457,6 +457,7 @@ async fn rehydrate_deploy_host_docker_ports() {
             skipped_unmanaged += 1;
             continue;
         }
+        let observation = shared_types::published::begin_physical_observation(inspect_id);
         let Ok(inspect) = docker
             .inspect_container(inspect_id, None::<InspectContainerOptions>)
             .await
@@ -490,6 +491,7 @@ async fn rehydrate_deploy_host_docker_ports() {
                 &key,
                 Some(preferred.as_str()),
                 &inspect,
+                &observation,
             ) {
                 Ok(()) => registered += 1,
                 Err(_) => failed += 1,

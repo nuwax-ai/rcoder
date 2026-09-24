@@ -16,9 +16,10 @@
 //! 扩缩刷新链共用。端口清单与 K8s `agent_service_ports`（k8s_service.rs）
 //! 对称：同一组容器内端口在两种形态下都需被外部（rcoder 进程）触达。
 use std::collections::HashMap;
+#[cfg(feature = "deploy-host")]
 use std::net::IpAddr;
 
-use tracing::{error, info, warn};
+use tracing::info;
 
 use crate::DockerResult;
 use shared_types::ServiceType;
@@ -159,14 +160,17 @@ pub fn missing_published_ports(
 ///
 /// **Published**：解析 `NetworkSettings.Ports` 映射整表登记；**Direct**：
 /// 取容器真实 IPv4（preferred 网卡优先，None=任意网卡）登记，IP 不可得
-/// 时**不登记 + error 日志**（拨号端报地址未就绪，登记死 IP 比缺项更糟）。
+/// 时返回地址未就绪，调用方按启动预算重读，不登记无效地址。
 /// 容器键与 Docker 真实名（inspect `.Name` 去斜杠）
 /// 双键整条目替换（同名容器重建时旧映射不残留；Direct/Published 互替同理）。
 pub fn register_reach_from_inspect(
     container_name: &str,
     preferred_network: Option<&str>,
     inspect: &bollard::models::ContainerInspectResponse,
+    observation: &shared_types::published::PhysicalObservation,
 ) -> DockerResult<()> {
+    #[cfg(not(feature = "deploy-host"))]
+    let _ = preferred_network;
     // 双键注册：identifier（starter 的 container_id 键）+ Docker 真实容器名
     // （inspect .Name 去前导 '/'——get_agent_info 查询键）。两键指向同一端口表，
     // 查询侧无论用哪个身份都命中（2026-09-22 宿主机实测：单键不匹配导致健康
@@ -200,12 +204,28 @@ pub fn register_reach_from_inspect(
                 "Invalid Docker container creation time: {error}"
             ))
         })?;
-    let register = |name: &str, reach| {
-        if !shared_types::published::register_physical_at(name, physical_uid, created_at, reach) {
-            warn!(
-                name,
-                physical_uid, "Ignored stale Docker address observation"
-            );
+    if observation.physical_uid() != physical_uid
+        || inspect.state.as_ref().and_then(|state| state.running) != Some(true)
+    {
+        return Err(crate::DockerError::ConnectionError(
+            "Container address observation is not for the running physical instance".into(),
+        ));
+    }
+    let names: Vec<&str> = [
+        Some(container_name),
+        docker_name.as_deref(),
+        identifier.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let register = |reach| {
+        if observation.register(&names, created_at, reach) {
+            Ok(())
+        } else {
+            Err(crate::DockerError::ConnectionError(
+                "Container address observation was superseded by stop or replacement".into(),
+            ))
         }
     };
 
@@ -214,40 +234,11 @@ pub fn register_reach_from_inspect(
         let raw = crate::runtime::docker_runtime::extract_container_ip(inspect, preferred_network);
         return match raw.parse::<IpAddr>() {
             Ok(ip) if !ip.is_unspecified() => {
-                register(
-                    container_name,
-                    shared_types::published::Reach::Direct { host: ip },
-                );
-                info!("[deploy-host] direct reach registered: container={container_name} ip={ip}");
-                if let Some(docker_name) = docker_name.as_deref() {
-                    register(
-                        docker_name,
-                        shared_types::published::Reach::Direct { host: ip },
-                    );
-                    info!("[deploy-host] direct reach registered: container={docker_name} ip={ip}");
-                }
-                if let Some(identifier) = identifier.as_deref() {
-                    register(
-                        identifier,
-                        shared_types::published::Reach::Direct { host: ip },
-                    );
-                }
-                Ok(())
+                register(shared_types::published::Reach::Direct { host: ip })
             }
-            Ok(_) | Err(_) => {
-                shared_types::published::unregister_if_physical(container_name, physical_uid);
-                if let Some(docker_name) = docker_name.as_deref() {
-                    shared_types::published::unregister_if_physical(docker_name, physical_uid);
-                }
-                if let Some(identifier) = identifier.as_deref() {
-                    shared_types::published::unregister_if_physical(identifier, physical_uid);
-                }
-                error!(
-                    "[deploy-host] direct reach: container {container_name} ip unavailable \
-                     (raw={raw:?}); clearing stale address"
-                );
-                Ok(())
-            }
+            _ => Err(crate::DockerError::ConnectionError(format!(
+                "Container {container_name} address is not ready"
+            ))),
         };
     }
 
@@ -262,26 +253,7 @@ pub fn register_reach_from_inspect(
         .as_ref()
         .map(|ports| ports.keys().cloned().collect::<Vec<_>>().join(", "))
         .unwrap_or_default();
-    if let Some(docker_name) = docker_name.as_deref() {
-        register(
-            docker_name,
-            shared_types::published::Reach::Published { ports: map.clone() },
-        );
-        info!(
-            "[deploy-host] published ports registered: container={}, entries={} ({})",
-            docker_name, registered, summary
-        );
-    }
-    if let Some(identifier) = identifier.as_deref() {
-        register(
-            identifier,
-            shared_types::published::Reach::Published { ports: map.clone() },
-        );
-    }
-    register(
-        container_name,
-        shared_types::published::Reach::Published { ports: map },
-    );
+    register(shared_types::published::Reach::Published { ports: map })?;
     info!(
         "[deploy-host] published ports registered: container={}, entries={} ({})",
         container_name, registered, summary

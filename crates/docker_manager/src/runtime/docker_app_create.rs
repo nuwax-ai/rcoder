@@ -296,16 +296,22 @@ impl DockerRuntime {
         let ip = {
             let mut ip = String::new();
             for attempt in 0..6u32 {
+                #[cfg(feature = "deploy-host")]
+                let observation = shared_types::published::begin_physical_observation(&created.id);
                 match client.inspect_container(&created.id, None).await {
                     Ok(inspect) => {
+                        ip = extract_container_ip(&inspect, preferred);
                         #[cfg(feature = "deploy-host")]
-                        if shared_types::is_deploy_host() {
+                        if shared_types::is_deploy_host()
+                            && (!crate::deploy_host_ports::is_direct_reach() || !ip.is_empty())
+                        {
                             // 同一次 inspect：Published 读回发布端口；Direct 提取
                             // 容器 IPv4（零额外 inspect）
                             crate::deploy_host_ports::register_reach_from_inspect(
                                 &container_name,
                                 preferred,
                                 &inspect,
+                                &observation,
                             )
                             .map_err(|e| {
                                 ContainerRuntimeError::DockerError(format!(
@@ -313,7 +319,6 @@ impl DockerRuntime {
                                 ))
                             })?;
                         }
-                        ip = extract_container_ip(&inspect, preferred);
                         if !ip.is_empty() {
                             break;
                         }
@@ -459,7 +464,7 @@ impl DockerRuntime {
                 .await
                 .map_err(|e| ContainerRuntimeError::ContainerStartError(e.to_string()))?;
             // deploy-host：stop 后再 start，容器 IP 重分配——刷新寻址登记
-            self.refresh_deploy_host_registration(app_id, None).await?;
+            self.refresh_deploy_host_registration(app_id, &name).await?;
         }
         Ok(())
     }
@@ -649,7 +654,7 @@ impl DockerRuntime {
             }
         }
         // deploy-host：start 后刷新寻址登记（IP 随 start 就绪/漂移）
-        self.refresh_deploy_host_registration(&target.context.app_id, Some(&target.resource.uid))
+        self.refresh_deploy_host_registration(&target.context.app_id, &target.resource.uid)
             .await?;
         Ok(())
     }
@@ -810,7 +815,7 @@ impl DockerRuntime {
             .map_err(|e| ContainerRuntimeError::ContainerStartError(e.to_string()))?;
         // deploy-host：stop/start 后容器 IP 重分配，刷新寻址登记（键与创建链
         // container_name 同源——部署名本身唯一）
-        self.refresh_deploy_host_registration(app_id, None).await?;
+        self.refresh_deploy_host_registration(app_id, &name).await?;
         Ok(())
     }
 
@@ -820,7 +825,7 @@ impl DockerRuntime {
     async fn refresh_deploy_host_registration(
         &self,
         app_id: &str,
-        expected_uid: Option<&str>,
+        expected_uid: &str,
     ) -> ContainerRuntimeResult<()> {
         #[cfg(not(feature = "deploy-host"))]
         {
@@ -831,10 +836,11 @@ impl DockerRuntime {
             let name = app_deployment_name(app_id);
             let preferred = self.inner.detect_main_network_name().await.ok();
             for attempt in 0..10 {
+                let observation = shared_types::published::begin_physical_observation(expected_uid);
                 let inspect = self
                     .inner
                     .get_docker_client()
-                    .inspect_container(&name, None)
+                    .inspect_container(expected_uid, None)
                     .await
                     .map_err(|error| {
                         ContainerRuntimeError::DockerError(format!(
@@ -842,7 +848,7 @@ impl DockerRuntime {
                         ))
                     })?;
                 let uid = validate_app_container_target(app_id, &inspect)?;
-                if expected_uid.is_some_and(|expected| expected != uid) {
+                if expected_uid != uid {
                     return Err(ContainerRuntimeError::Conflict(
                         "Application physical ID changed during reach refresh".into(),
                     ));
@@ -878,6 +884,7 @@ impl DockerRuntime {
                         &name,
                         preferred.as_deref(),
                         &inspect,
+                        &observation,
                     )
                     .map_err(|error| {
                         ContainerRuntimeError::DockerError(format!(

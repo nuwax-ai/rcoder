@@ -33,7 +33,7 @@ pub(super) async fn repair_if_needed(
     #[cfg(not(feature = "deploy-host"))]
     {
         let _ = (state, app_id, expected_uid);
-        return Ok(None);
+        Ok(None)
     }
     #[cfg(feature = "deploy-host")]
     {
@@ -68,7 +68,11 @@ pub(super) async fn repair_if_needed(
             return Ok(None);
         }
         let uid_digest = hex::encode(Sha256::digest(resource.uid.as_bytes()));
-        let request_id = format!("auto-repair-{}", &uid_digest[..52]);
+        let request_id = format!(
+            "{}{}",
+            shared_types::AUTOMATIC_REPAIR_REQUEST_PREFIX,
+            &uid_digest[..52]
+        );
         let flight = state.userapp_op_flight.guard()?;
         let record = match state
             .userapp_store

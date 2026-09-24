@@ -16,6 +16,8 @@ impl DockerRuntime {
         let Some(resource) = &target.workload else {
             return Ok(None);
         };
+        #[cfg(feature = "deploy-host")]
+        let observation = shared_types::published::begin_physical_observation(&resource.uid);
         let info = self
             .inner
             .get_docker_client()
@@ -45,7 +47,9 @@ impl DockerRuntime {
         }
         #[cfg(feature = "deploy-host")]
         if shared_types::is_deploy_host() {
-            let ready = self.confirm_builder_reach(resource, &info).await?;
+            let ready = self
+                .confirm_builder_reach(resource, &info, observation)
+                .await?;
             return running_builder_info(&ready, target);
         }
         running_builder_info(&info, target)
@@ -359,6 +363,8 @@ impl DockerRuntime {
                 }
             }
         }
+        #[cfg(feature = "deploy-host")]
+        let observation = shared_types::published::begin_physical_observation(&resource.uid);
         let after = match client.inspect_container(&resource.uid, None).await {
             Ok(info) => info,
             Err(bollard::errors::Error::DockerResponseServerError {
@@ -426,7 +432,9 @@ impl DockerRuntime {
         // verified and registered.
         #[cfg(feature = "deploy-host")]
         if shared_types::is_deploy_host() {
-            let ready = self.confirm_builder_reach(resource, &after).await?;
+            let ready = self
+                .confirm_builder_reach(resource, &after, observation)
+                .await?;
             return running_builder_info(&ready, target);
         }
         running_builder_info(&after, target)
@@ -437,9 +445,15 @@ impl DockerRuntime {
         &self,
         resource: &shared_types::AppResourceIdentity,
         initial: &bollard::models::ContainerInspectResponse,
+        initial_observation: shared_types::published::PhysicalObservation,
     ) -> Result<bollard::models::ContainerInspectResponse> {
         let client = self.inner.get_docker_client();
         for attempt in 0..10 {
+            let observation = if attempt == 0 {
+                initial_observation.clone()
+            } else {
+                shared_types::published::begin_physical_observation(&resource.uid)
+            };
             let inspect = if attempt == 0 {
                 initial.clone()
             } else {
@@ -469,6 +483,7 @@ impl DockerRuntime {
                     &resource.name,
                     None,
                     &inspect,
+                    &observation,
                 )
                 .map_err(|error| Error::DockerError(format!("Register builder reach: {error}")))?;
                 return Ok(inspect);

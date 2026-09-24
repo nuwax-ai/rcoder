@@ -4,6 +4,18 @@ use super::lifecycle::UserAppOperationScope;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+/// Request IDs in this namespace are issued only by idle repair admission.
+pub const AUTOMATIC_REPAIR_REQUEST_PREFIX: &str = "auto-repair-";
+
+/// Validate public compute controls before discovery or durable admission.
+pub fn validate_user_compute_request_id(request_id: &str) -> Result<(), String> {
+    crate::validate_identifier(request_id, "request_id")?;
+    if request_id.starts_with(AUTOMATIC_REPAIR_REQUEST_PREFIX) {
+        return Err("request_id prefix 'auto-repair-' is reserved for internal repair".into());
+    }
+    Ok(())
+}
+
 /// Recorded only after previous executions have drained and compute absence
 /// was observed under the physical lease. Recovery must recheck live absence.
 #[derive(Debug, Clone, Serialize, Deserialize)]

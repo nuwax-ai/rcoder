@@ -620,6 +620,8 @@ impl UserAppRuntimePolicy {
 pub struct UserAppControlRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_id: Option<String>,
+    /// Idempotency key. For physical Stop/Restart, the `auto-repair-` prefix is
+    /// reserved for platform-issued repairs; public requests reject it before admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 }
