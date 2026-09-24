@@ -220,6 +220,15 @@ pub struct UserappFileListQuery {
     #[garde(skip)]
     /// 是否递归展开子目录；缺省 true，显式 "false" 仅当前层
     pub recursive: Option<String>,
+    #[serde(default, rename = "type")]
+    #[garde(skip)]
+    /// 输出类型：all（缺省）/file/dir；directory 是 dir 别名。
+    /// 递归模式只筛选原扁平结果中的空目录。
+    pub file_type: Option<String>,
+    #[serde(default)]
+    #[garde(skip)]
+    /// 最多输出的条目数，非负整数；0 返回空列表，缺省不限
+    pub limit: Option<String>,
 }
 
 #[derive(Deserialize, Validate, utoipa::IntoParams)]

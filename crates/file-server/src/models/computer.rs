@@ -49,8 +49,8 @@ pub struct UserCidQuery {
     pub app_id: Option<String>,
 }
 
-/// `get-file-list` 查询参数: 在 `UserCidQuery` 基础上新增 `relativePath` / `recursive`
-/// (对齐 TS commit ba08d0c)。缺省 `recursive=true` (原全量递归), 向后兼容。
+/// `get-file-list` 查询参数。缺省递归列出原有扁平结果；`type`/`limit`
+/// 对齐 TS 1.5.3，过滤输出并在达到上限时停止遍历。
 #[derive(Deserialize, Validate, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase")]
@@ -99,6 +99,15 @@ pub struct FileListQuery {
     #[serde(default)]
     #[garde(skip)]
     pub recursive: Option<String>,
+    /// 输出类型：all（缺省）/file/dir；directory 是 dir 别名。
+    /// 递归模式仅返回原扁平结果中的目录（空目录）。
+    #[serde(default, rename = "type")]
+    #[garde(skip)]
+    pub file_type: Option<String>,
+    /// 最多输出的条目数，非负整数；0 返回空列表，缺省不限。
+    #[serde(default)]
+    #[garde(skip)]
+    pub limit: Option<String>,
 }
 
 /// `resolve-file` 查询参数 (对齐 TS resolveExistingFile)。
@@ -589,7 +598,7 @@ pub struct FsMkdirRequest {
     /// 父目录绝对路径（宿主语义；父目录须已存在，非递归创建）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub parent_path: String,
-    /// 新目录名（仅名字，禁止路径分隔符/`.`/`..`；中文名等任意合法文件名）
+    /// 新目录名（原样保留首尾空格；纯空白、路径分隔符/`.`/`..` 不合法）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub dir_name: String,
 }
@@ -601,7 +610,7 @@ pub struct FsRenameRequest {
     /// 现目录绝对路径（宿主语义）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub path: String,
-    /// 新名字（仅名字，禁止路径分隔符；不支持跨目录移动）
+    /// 新名字（原样保留首尾空格；禁止路径分隔符；不支持跨目录移动）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub new_name: String,
 }

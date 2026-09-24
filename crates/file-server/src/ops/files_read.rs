@@ -15,13 +15,74 @@ use crate::error::AppError;
 use crate::extract::AppJson as Json;
 use crate::service::{code as code_service, tree};
 
+#[derive(Clone, Copy)]
 pub struct FileListParams<'a> {
     pub proxy_path: Option<&'a str>,
     pub relative_path: Option<&'a str>,
     /// 原始 recursive 串: 缺省/非 "false" 均按递归 (对齐 TS)。
     pub recursive: Option<&'a str>,
+    /// `type`: all/file/dir (directory 为 dir 别名)，缺省 all。
+    pub file_type: Option<&'a str>,
+    /// `limit`: 非负整数，缺省不限；上限由 usize 表示范围决定。
+    pub limit: Option<&'a str>,
     /// 原始 customTargetDir 串: 仅用于 fileProxyUrl 后缀 (定位语义由壳层消化)。
     pub custom_target_dir: Option<&'a str>,
+}
+
+pub struct FileListOutcome {
+    pub files: Vec<tree::FileEntry>,
+    pub recursive: bool,
+    pub file_type: tree::MetaListType,
+    pub limit: Option<usize>,
+}
+
+fn parse_file_list_type(raw: Option<&str>) -> Result<tree::MetaListType, AppError> {
+    match raw.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+        "" | "all" => Ok(tree::MetaListType::All),
+        "file" => Ok(tree::MetaListType::File),
+        "dir" | "directory" => Ok(tree::MetaListType::Dir),
+        _ => Err(AppError::validation_with(
+            "type must be file, dir, or all",
+            json!({ "field": "type" }),
+        )),
+    }
+}
+
+fn parse_file_list_limit(raw: Option<&str>) -> Result<Option<usize>, AppError> {
+    match raw {
+        None | Some("") => Ok(None),
+        // TS Number("  ") 为 0；空串本身仍表示未指定。
+        Some(value) if value.trim().is_empty() => Ok(Some(0)),
+        Some(value) => value.trim().parse::<usize>().map(Some).map_err(|_| {
+            AppError::validation_with(
+                "limit must be a non-negative integer",
+                json!({ "field": "limit" }),
+            )
+        }),
+    }
+}
+
+#[cfg(test)]
+mod file_list_options_tests {
+    use super::{parse_file_list_limit, parse_file_list_type};
+    use crate::service::tree::MetaListType;
+
+    #[test]
+    fn options_reject_invalid_values_and_accept_boundary_values() {
+        assert_eq!(
+            parse_file_list_type(Some(" DIRECTORY ")).unwrap(),
+            MetaListType::Dir
+        );
+        assert!(parse_file_list_type(Some("other")).is_err());
+        assert_eq!(parse_file_list_limit(None).unwrap(), None);
+        assert_eq!(parse_file_list_limit(Some("0")).unwrap(), Some(0));
+        assert_eq!(
+            parse_file_list_limit(Some(&usize::MAX.to_string())).unwrap(),
+            Some(usize::MAX)
+        );
+        assert!(parse_file_list_limit(Some("-1")).is_err());
+        assert!(parse_file_list_limit(Some("1.5")).is_err());
+    }
 }
 
 /// get-file-list 的 workspace 无关核心 (computer / userapp 域共用;
@@ -30,22 +91,43 @@ pub struct FileListParams<'a> {
 pub async fn get_file_list_core(
     state: &AppState,
     path: &Path,
-    proxy_path: Option<&str>,
-    relative_path: Option<&str>,
-    recursive: Option<&str>,
-) -> Result<(Vec<tree::FileEntry>, bool), AppError> {
+    p: FileListParams<'_>,
+) -> Result<FileListOutcome, AppError> {
+    // 参数校验先于目录不存在的空列表早返回；无效过滤条件必须明确报错。
+    let file_type = parse_file_list_type(p.file_type)?;
+    let limit = parse_file_list_limit(p.limit)?;
     // 默认 true=原全量递归; 仅显式 "false" 时单层 (对齐 TS recursive === false || recursive === "false")。
     // 注: query 参数经 serde 解析均为字符串, 故只需匹配 "false"。
     // 提前计算: 所有返回点 (含目录不存在的早返回) 都需带上 recursive (对齐 TS 1.3.7)。
-    let is_recursive = !matches!(recursive, Some("false"));
+    let recursive = !matches!(p.recursive, Some("false"));
     // 对齐 nuwax: 目标根目录不存在 → 返回空数组 (非报错), 带 recursive
     if !crate::service::fs_util::path_exists(path).await? {
-        return Ok((Vec::new(), is_recursive));
+        return Ok(FileListOutcome {
+            files: Vec::new(),
+            recursive,
+            file_type,
+            limit,
+        });
     }
     // list_files_meta 内部解析 relativePath (越界 / 非目录抛 ValidationError → 400)。
-    let files =
-        tree::list_files_meta(path, &state.config, proxy_path, relative_path, is_recursive).await?;
-    Ok((files, is_recursive))
+    let files = tree::list_files_meta_filtered(
+        path,
+        &state.config,
+        p.proxy_path,
+        p.relative_path,
+        tree::MetaListOptions {
+            recursive,
+            file_type,
+            limit,
+        },
+    )
+    .await?;
+    Ok(FileListOutcome {
+        files,
+        recursive,
+        file_type,
+        limit,
+    })
 }
 
 /// get-file-list 的 workspace 无关实现 (computer 域 TS 响应拼装)。
@@ -54,8 +136,7 @@ pub async fn get_file_list_impl(
     path: &Path,
     p: FileListParams<'_>,
 ) -> Result<Json<Value>, AppError> {
-    let (mut files, is_recursive) =
-        get_file_list_core(state, path, p.proxy_path, p.relative_path, p.recursive).await?;
+    let mut result = get_file_list_core(state, path, p).await?;
     let ct = trimmed_non_empty(p.custom_target_dir);
     // fileProxyUrl 追加 ?customTargetDir (对齐 nuwax; 值需 encodeURIComponent)。
     // 单层/递归模式统一在此补齐后缀。
@@ -64,15 +145,19 @@ pub async fn get_file_list_impl(
             "?customTargetDir={}",
             code_service::encode_uri_component(ct)
         );
-        for f in files.iter_mut() {
+        for f in result.files.iter_mut() {
             if let Some(u) = f.file_proxy_url.as_mut() {
                 u.push_str(&suffix);
             }
         }
     }
-    Ok(Json(
-        json!({ "success": true, "files": files, "recursive": is_recursive }),
-    ))
+    Ok(Json(json!({
+        "success": true,
+        "files": result.files,
+        "recursive": result.recursive,
+        "type": result.file_type.as_str(),
+        "limit": result.limit,
+    })))
 }
 
 /// resolve-file 命中结果（file_proxy_url 为预览 URL，未含 customTargetDir 后缀）。

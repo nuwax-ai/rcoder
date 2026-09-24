@@ -23,8 +23,8 @@ use file_server::ops::files::{
     BatchUploadItem, generate_file_core, import_project_core, upload_file_core, upload_files_core,
 };
 use file_server::ops::files_read::{
-    effective_file_meta_max_batch, get_file_list_core, get_file_meta_core, resolve_file_core,
-    search_files_core,
+    FileListParams, effective_file_meta_max_batch, get_file_list_core, get_file_meta_core,
+    resolve_file_core, search_files_core,
 };
 use file_server::ops::multipart::{file_field, text_field, validate_zip_ext};
 use file_server::service::code as code_service;
@@ -37,8 +37,8 @@ use file_server::workspace::resolve_userapp_dev;
 ///
 /// 列开发卷 workspace 内指定目录的文件清单（名称/大小/mtime 等元信息，不读
 /// 内容）。`relative_path` 相对 workspace 根（缺省列根一层）；`recursive`
-/// 缺省 true 递归展开整棵子树，显式 "false" 仅当前层。响应
-/// `{ success, files[], recursive }`；传 `proxy_path` 时条目附 `proxy_url`
+/// 缺省 true 递归展开整棵子树，显式 "false" 仅当前层。`type`/`limit`
+/// 过滤输出并提前停止，响应回显生效值；传 `proxy_path` 时条目附 `proxy_url`
 /// 预览地址（`custom_target_dir` 非空时自动追加同名 query 参数）。
 #[utoipa::path(
     get,
@@ -53,19 +53,28 @@ pub(crate) async fn get_file_list(
 ) -> Result<Json<Value>, AppError> {
     q.validate().map_err(file_server::error::from_garde)?;
     let path = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.fs.config)?;
-    let (entries, is_recursive) = get_file_list_core(
+    let result = get_file_list_core(
         &state.fs,
         &path,
-        q.proxy_path.as_deref(),
-        q.relative_path.as_deref(),
-        q.recursive.as_deref(),
+        FileListParams {
+            proxy_path: q.proxy_path.as_deref(),
+            relative_path: q.relative_path.as_deref(),
+            recursive: q.recursive.as_deref(),
+            file_type: q.file_type.as_deref(),
+            limit: q.limit.as_deref(),
+            custom_target_dir: q.custom_target_dir.as_deref(),
+        },
     )
     .await?;
-    let mut files: Vec<UserappFileEntry> = entries.into_iter().map(Into::into).collect();
+    let mut files: Vec<UserappFileEntry> = result.files.into_iter().map(Into::into).collect();
     append_proxy_url_suffix(&mut files, q.custom_target_dir.as_deref());
-    Ok(Json(
-        json!({ "success": true, "files": files, "recursive": is_recursive }),
-    ))
+    Ok(Json(json!({
+        "success": true,
+        "files": files,
+        "recursive": result.recursive,
+        "type": result.file_type.as_str(),
+        "limit": result.limit,
+    })))
 }
 
 // ── resolve-file ────────────────────────────────────────────────────────────────
@@ -638,6 +647,8 @@ mod tests {
             custom_target_dir: None,
             relative_path: None,
             recursive: Some("false".into()),
+            file_type: Some("dir".into()),
+            limit: Some("1".into()),
         });
         let res = get_file_list(State(state.clone()), q)
             .await
@@ -649,6 +660,8 @@ mod tests {
             .map(|f| f["name"].as_str().unwrap())
             .collect();
         assert!(names.contains(&"demo-app"), "names={names:?}");
+        assert_eq!(res.0["type"], "dir");
+        assert_eq!(res.0["limit"], 1);
 
         // 3. detect_project ({app_id}/{app_stage} 新形态) 应在开发卷里找到项目
         let reply = super::super::userapp::detect_project(

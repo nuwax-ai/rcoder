@@ -1,4 +1,4 @@
-//! 文件系统目录浏览与目录弹窗写操作（目录选择弹窗用，对齐 TS 1.5.1 `fsBrowserUtils.js`）。
+//! 文件系统目录浏览与目录弹窗写操作（目录选择弹窗用，对齐 TS 1.5.3 `fsBrowserUtils.js`）。
 //!
 //! **信任模型**：按绝对路径操作，**不锚定工作空间、不带会话上下文**——
 //! 与 `resolveServiceContext` 体系无关（TS 侧同款设计：/fs 端点不解析
@@ -16,7 +16,7 @@ use crate::models::response::{FsEntry, FsRootEntry};
 /// `isDir`/`isSymlink` 为端点语义常量，由 handler 按端点填入）。
 #[derive(Debug)]
 pub(crate) struct FsMutatedDir {
-    /// trim 后的目录名
+    /// 原样保留的目录名
     pub name: String,
     /// 归一化后的完整路径
     pub path: String,
@@ -162,7 +162,8 @@ fn validate_absolute_path(dir_path: &str, field: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// 校验目录/文件名（mkdir 的 dirName、rename 的 newName 共用），返回 trim 后的名字。
+/// 校验目录/文件名（mkdir 的 dirName、rename 的 newName 共用），原样返回名字。
+/// 仅用 trim 判断纯空白名，不改变有意义的首尾空格。
 ///
 /// `/` 与 `\` 均拒绝：`\` 在 win32 是分隔符，且 `to_display_path` 会把 `\`
 /// 归一为 `/`，POSIX 下合法的反斜杠名会导致回显路径与实际路径错乱。
@@ -172,33 +173,32 @@ fn validate_absolute_path(dir_path: &str, field: &str) -> AppResult<()> {
 /// UTF-16 码元——分别判定，不误伤宿主上合法的名字，超限名提前拿到干净的
 /// "exceeds 255 characters" 而非 OS 报错兜底。
 fn validate_entry_name(name: &str, field: &str) -> AppResult<String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() || trimmed.contains('\0') {
+    if name.trim().is_empty() || name.contains('\0') {
         return Err(validation_field(format!("{field} is required"), field));
     }
-    if trimmed.contains('/') || trimmed.contains('\\') {
+    if name.contains('/') || name.contains('\\') {
         return Err(validation_field(
             format!("{field} must not contain path separators"),
             field,
         ));
     }
-    if trimmed == "." || trimmed == ".." {
+    if name == "." || name == ".." {
         return Err(validation_field(
             format!("{field} must not be a relative segment"),
             field,
         ));
     }
     #[cfg(windows)]
-    let too_long = trimmed.encode_utf16().count() > 255;
+    let too_long = name.encode_utf16().count() > 255;
     #[cfg(not(windows))]
-    let too_long = trimmed.len() > 255;
+    let too_long = name.len() > 255;
     if too_long {
         return Err(validation_field(
             format!("{field} exceeds 255 characters"),
             field,
         ));
     }
-    Ok(trimmed.to_string())
+    Ok(name.to_string())
 }
 
 /// ValidationError 且带 `field` 定位（对齐 TS `ValidationError(msg, {field})`
@@ -459,6 +459,7 @@ mod tests {
         assert!(list_fs_children("/a\0b").await.is_err());
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn children_serves_dir_with_trailing_space_verbatim() {
         // 尾空格目录名合法：路径原样使用（不做 trim），浏览带尾空格的目录本身
@@ -478,10 +479,10 @@ mod tests {
 
     #[test]
     fn entry_name_validation_rejects_bad_input() {
-        // 合法名：保留原文并 trim 首尾空白；中文名等任意合法文件名
+        // 合法名：首尾空白是名字的一部分；中文名等任意合法文件名
         assert_eq!(
             validate_entry_name("  新建目录 ", "dirName").expect("valid"),
-            "新建目录"
+            "  新建目录 "
         );
         for bad in ["", "   ", "a/b", "a\\b", ".", "..", "a\0b"] {
             let err = validate_entry_name(bad, "dirName").expect_err(bad);
@@ -508,8 +509,8 @@ mod tests {
         // 期望值经 to_display_path 归一（Windows 反斜杠 → `/`），与返回值同口径
         let display_parent = to_display_path(&parent);
 
-        // 成功：中文名 + 入参 trim；返回 display 路径与父路径
-        let dir = create_fs_directory(&parent, "  新建目录 ")
+        // 成功：中文名；返回 display 路径与父路径
+        let dir = create_fs_directory(&parent, "新建目录")
             .await
             .expect("mkdir");
         assert_eq!(dir.name, "新建目录");
@@ -564,7 +565,7 @@ mod tests {
             .unwrap();
 
         // 成功：同目录改名，返回新路径与父路径（父路径为 display 归一口径）
-        let dir = rename_fs_directory(&parent.join("old").to_string_lossy(), "  新名字 ")
+        let dir = rename_fs_directory(&parent.join("old").to_string_lossy(), "新名字")
             .await
             .expect("rename");
         assert_eq!(dir.name, "新名字");
@@ -617,5 +618,24 @@ mod tests {
             // 源目录未被移动
             assert!(tokio::fs::try_exists(parent.join("新名字")).await.unwrap());
         }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn mkdir_and_rename_preserve_name_whitespace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().to_string_lossy();
+        let created = create_fs_directory(&parent, "  新建目录 ")
+            .await
+            .expect("create spaced name");
+        assert_eq!(created.name, "  新建目录 ");
+        assert!(tmp.path().join("  新建目录 ").is_dir());
+
+        let renamed = rename_fs_directory(&created.path, " 新名字 ")
+            .await
+            .expect("rename spaced name");
+        assert_eq!(renamed.name, " 新名字 ");
+        assert!(tmp.path().join(" 新名字 ").is_dir());
+        assert!(!tmp.path().join("  新建目录 ").exists());
     }
 }

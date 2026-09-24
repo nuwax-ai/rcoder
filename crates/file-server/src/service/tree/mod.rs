@@ -99,6 +99,44 @@ pub async fn list_files(
     Ok(files)
 }
 
+/// 文件列表输出类型；递归模式中的目录仅指自然空目录。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MetaListType {
+    #[default]
+    All,
+    File,
+    Dir,
+}
+
+impl MetaListType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::File => "file",
+            Self::Dir => "dir",
+        }
+    }
+}
+
+impl std::fmt::Display for MetaListType {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MetaListOptions {
+    pub recursive: bool,
+    pub file_type: MetaListType,
+    pub limit: Option<usize>,
+}
+
+impl MetaListOptions {
+    fn reached_limit(self, count: usize) -> bool {
+        self.limit.is_some_and(|limit| count >= limit)
+    }
+}
+
 /// 轻量元信息遍历 (对齐 nuwax computer `traverseDirectory`): **不读文件内容**,
 /// 仅返回 `{name, isDir, fileProxyUrl, isLink}` (binary/sizeExceeded/contents 均省略)。
 /// 供 computer get-file-list 使用 (避免为列目录读取全部文件内容)。
@@ -114,6 +152,29 @@ pub async fn list_files_meta(
     relative_path: Option<&str>,
     recursive: bool,
 ) -> AppResult<Vec<FileEntry>> {
+    list_files_meta_filtered(
+        root,
+        config,
+        proxy_path,
+        relative_path,
+        MetaListOptions {
+            recursive,
+            file_type: MetaListType::All,
+            limit: None,
+        },
+    )
+    .await
+}
+
+/// `get-file-list` 的筛选遍历。`limit` 只计入实际输出，达到上限后停止下钻；
+/// 递归目录仍仅在自然内容为空时输出，不因 `type=file/dir` 过滤改变空目录判定。
+pub async fn list_files_meta_filtered(
+    root: &Path,
+    config: &Config,
+    proxy_path: Option<&str>,
+    relative_path: Option<&str>,
+    options: MetaListOptions,
+) -> AppResult<Vec<FileEntry>> {
     let list_dir = resolve_subdir(root, relative_path)?;
     if !crate::service::fs_util::path_exists(&list_dir).await? {
         // 目录不存在 → 空数组 (handler 层也会先判存在, 这里是防御)
@@ -125,16 +186,20 @@ pub async fn list_files_meta(
     }
     let mut files = Vec::new();
     let start = Instant::now();
-    if recursive {
-        traverse_meta(root, &list_dir, config, proxy_path, &mut files).await?;
-    } else {
-        list_directory_level(root, &list_dir, config, proxy_path, &mut files).await?;
+    if !options.reached_limit(0) {
+        if options.recursive {
+            traverse_meta(root, &list_dir, config, proxy_path, options, &mut files).await?;
+        } else {
+            list_directory_level(root, &list_dir, config, proxy_path, options, &mut files).await?;
+        }
     }
     tracing::info!(
         op = "list_files_meta",
         elapsed_ms = start.elapsed().as_millis(),
         file_count = files.len(),
-        recursive,
+        recursive = options.recursive,
+        file_type = %options.file_type,
+        limit = ?options.limit,
         "file listing completed"
     );
     Ok(files)
@@ -260,10 +325,19 @@ async fn list_directory_level(
     dir: &Path,
     config: &Config,
     proxy_path: Option<&str>,
+    options: MetaListOptions,
     out: &mut Vec<FileEntry>,
 ) -> AppResult<()> {
     let items = read_filtered_entries(dir, config).await?;
     for (_name, path, is_dir, is_link) in items {
+        if options.reached_limit(out.len()) {
+            break;
+        }
+        if (is_dir && options.file_type == MetaListType::File)
+            || (!is_dir && options.file_type == MetaListType::Dir)
+        {
+            continue;
+        }
         let relative = make_relative_path(root, &path);
         if is_dir {
             out.push(FileEntry {
@@ -295,15 +369,24 @@ async fn traverse_meta(
     dir: &Path,
     config: &Config,
     proxy_path: Option<&str>,
+    options: MetaListOptions,
     out: &mut Vec<FileEntry>,
-) -> AppResult<()> {
+) -> AppResult<usize> {
     let items = read_filtered_entries(dir, config).await?;
+    let mut natural_count = 0;
     for (_name, path, is_dir, is_link) in items {
+        if options.reached_limit(out.len()) {
+            break;
+        }
+        natural_count += 1;
         let relative = make_relative_path(root, &path);
         if is_dir {
-            let mut sub = Vec::new();
-            Box::pin(traverse_meta(root, &path, config, proxy_path, &mut sub)).await?;
-            if sub.is_empty() {
+            let child_count =
+                Box::pin(traverse_meta(root, &path, config, proxy_path, options, out)).await?;
+            if child_count == 0
+                && options.file_type != MetaListType::File
+                && !options.reached_limit(out.len())
+            {
                 out.push(FileEntry {
                     name: relative,
                     is_dir: true,
@@ -313,10 +396,8 @@ async fn traverse_meta(
                     file_proxy_url: None,
                     is_link: Some(is_link),
                 });
-            } else {
-                out.extend(sub);
             }
-        } else {
+        } else if options.file_type != MetaListType::Dir {
             out.push(FileEntry {
                 name: relative.to_string(),
                 is_dir: false,
@@ -328,7 +409,7 @@ async fn traverse_meta(
             });
         }
     }
-    Ok(())
+    Ok(natural_count)
 }
 
 async fn traverse(
@@ -506,6 +587,56 @@ mod tests {
         // 不应包含孙子层
         assert!(!names.contains(&"sub/c.txt"));
         assert!(!names.contains(&"sub/nested/e.txt"));
+    }
+
+    #[tokio::test]
+    async fn list_files_meta_type_filter_keeps_natural_empty_dir_and_limits_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_test_tree(tmp.path()).await;
+        fs::create_dir(tmp.path().join("empty")).await.unwrap();
+        let cfg = default_test_config();
+
+        let dir_options = MetaListOptions {
+            recursive: true,
+            file_type: MetaListType::Dir,
+            limit: None,
+        };
+        let dirs = list_files_meta_filtered(tmp.path(), &cfg, None, None, dir_options)
+            .await
+            .unwrap();
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0].name, "empty");
+        assert!(dirs[0].is_dir);
+
+        let files = list_files_meta_filtered(
+            tmp.path(),
+            &cfg,
+            None,
+            None,
+            MetaListOptions {
+                file_type: MetaListType::File,
+                limit: Some(1),
+                ..dir_options
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(!files[0].is_dir);
+
+        let none = list_files_meta_filtered(
+            tmp.path(),
+            &cfg,
+            None,
+            None,
+            MetaListOptions {
+                limit: Some(0),
+                ..dir_options
+            },
+        )
+        .await
+        .unwrap();
+        assert!(none.is_empty());
     }
 
     #[tokio::test]

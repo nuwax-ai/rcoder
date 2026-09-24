@@ -1,5 +1,5 @@
 //! /fs/roots、/fs/children、/fs/mkdir、/fs/rename handlers：文件系统目录
-//! 浏览与目录弹窗写操作（对齐 TS 1.5.1——不锚定工作空间、不带会话上下文，
+//! 浏览与目录弹窗写操作（对齐 TS 1.5.3——不锚定工作空间、不带会话上下文，
 //! 不解析 service）。
 
 use garde::Validate;
@@ -110,8 +110,7 @@ mod tests {
     use tower::ServiceExt;
 
     /// wire 形状端到端：mkdir/rename 走真实 axum router，锁定 camelCase
-    /// 字段（`parentPath` 而非 `parent_path`）、success 信封与名字 trim 语义
-    /// （名字 trim、路径原样——schema 守卫只查文档，不查实际序列化）。
+    /// 字段（`parentPath` 而非 `parent_path`）、success 信封与路径返回值。
     #[tokio::test]
     async fn mkdir_and_rename_wire_shape_is_camel_case() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -122,7 +121,7 @@ mod tests {
             .route("/fs/mkdir", axum::routing::post(fs_mkdir))
             .route("/fs/rename", axum::routing::post(fs_rename));
 
-        let body = serde_json::json!({ "parentPath": parent, "dirName": " 新建目录 " });
+        let body = serde_json::json!({ "parentPath": parent, "dirName": "新建目录" });
         let response = app
             .clone()
             .oneshot(

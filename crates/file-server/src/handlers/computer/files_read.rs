@@ -24,9 +24,8 @@ use super::resolve_computer_target;
 
 /// 获取文件列表
 ///
-/// 对齐 nuwax getFileList, 含 commit ba08d0c 增强:
-/// 轻量元信息遍历 (不读内容) + customTargetDir 覆盖 + relativePath 子目录 + recursive 单层开关;
-/// 目录不存在返回空数组。
+/// 对齐 nuwax getFileList：轻量元信息遍历、子目录、递归开关及
+/// `type`/`limit` 扫描时过滤；目录不存在返回空数组并回显生效参数。
 #[utoipa::path(
     get,
     path = "/get-file-list",
@@ -59,6 +58,8 @@ pub(crate) async fn get_file_list(
             proxy_path: q.proxy_path.as_deref(),
             relative_path: q.relative_path.as_deref(),
             recursive: q.recursive.as_deref(),
+            file_type: q.file_type.as_deref(),
+            limit: q.limit.as_deref(),
             custom_target_dir: q.custom_target_dir.as_deref(),
         },
     )
@@ -260,11 +261,15 @@ mod tests {
             app_id: None,
             relative_path: None,
             recursive: None, // 缺省 = 递归
+            file_type: None,
+            limit: None,
         });
         let res = get_file_list(State(state), q).await.expect("list ok");
         let val = res.0;
         assert_eq!(val["success"], json!(true));
         assert_eq!(val["recursive"], json!(true)); // 缺省 recursive=true
+        assert_eq!(val["type"], json!("all"));
+        assert_eq!(val["limit"], json!(null));
         let names: Vec<&str> = val["files"]
             .as_array()
             .unwrap()
@@ -293,6 +298,8 @@ mod tests {
             app_id: None,
             relative_path: None,
             recursive: Some("false".into()),
+            file_type: None,
+            limit: None,
         });
         let res = get_file_list(State(state), q).await.expect("list ok");
         let val = res.0;
@@ -325,6 +332,8 @@ mod tests {
             app_id: None,
             relative_path: None,
             recursive: None,
+            file_type: None,
+            limit: None,
         });
         let res = get_file_list(State(state), q).await.expect("list ok");
         let val = res.0;
@@ -352,6 +361,8 @@ mod tests {
             app_id: None,
             relative_path: None,
             recursive: Some("false".into()),
+            file_type: None,
+            limit: None,
         });
         let res = get_file_list(State(state), q).await.expect("list ok");
         let val = res.0;
@@ -385,10 +396,15 @@ mod tests {
             app_id: None,
             relative_path: None,
             recursive: Some("false".into()),
+            file_type: Some("FiLe".into()),
+            limit: Some("1".into()),
         });
         let res = get_file_list(State(state), q).await.expect("list ok");
         let val = res.0;
         let entry = &val["files"][0];
+        assert_eq!(val["type"], json!("file"));
+        assert_eq!(val["limit"], json!(1));
+        assert_eq!(val["files"].as_array().map(Vec::len), Some(1));
         // 空格 encode → %20
         assert_eq!(entry["name"], "a b.txt");
         assert_eq!(entry["fileProxyUrl"], "/proxy/a%20b.txt");
@@ -613,6 +629,8 @@ mod tests {
             app_id: None,
             relative_path: None,
             recursive: None,
+            file_type: None,
+            limit: None,
         });
         let res = get_file_list(State(state), q).await.expect("list ok");
         let names: Vec<&str> = res.0["files"]
@@ -641,6 +659,8 @@ mod tests {
             app_id: None,
             relative_path: None,
             recursive: None,
+            file_type: None,
+            limit: None,
         });
         let err = match get_file_list(State(state), q).await {
             Err(e) => e,

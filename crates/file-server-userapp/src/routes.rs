@@ -308,6 +308,16 @@ mod tests {
                     && matches!(p.parameter_in, utoipa::openapi::path::ParameterIn::Query))),
             "static 接口参数缺 release_id Query 声明（按版本取包是对外契约）"
         );
+        let list_params = document
+            .paths
+            .paths
+            .get("/api/v1/userapp/get-file-list")
+            .and_then(|item| item.get.as_ref())
+            .and_then(|operation| operation.parameters.as_ref())
+            .expect("userapp get-file-list query parameters");
+        assert!(list_params.iter().any(|param| param.name == "type"));
+        assert!(list_params.iter().any(|param| param.name == "limit"));
+        assert!(!list_params.iter().any(|param| param.name == "file_type"));
     }
 
     /// 全域兜底: `in=path` 只允许出现在路径模板同名占位符上。

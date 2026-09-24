@@ -213,6 +213,16 @@ mod tests {
         );
         assert!(document.paths.paths.contains_key("/api/computer/fs/mkdir"));
         assert!(document.paths.paths.contains_key("/api/computer/fs/rename"));
+        let list_params = document
+            .paths
+            .paths
+            .get("/api/computer/get-file-list")
+            .and_then(|item| item.get.as_ref())
+            .and_then(|operation| operation.parameters.as_ref())
+            .expect("get-file-list query parameters");
+        assert!(list_params.iter().any(|param| param.name == "type"));
+        assert!(list_params.iter().any(|param| param.name == "limit"));
+        assert!(!list_params.iter().any(|param| param.name == "file_type"));
         assert!(
             document
                 .paths
