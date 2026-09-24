@@ -166,7 +166,7 @@ impl PreviewCoordinator {
     /// Unknown 行恢复证据：宿主 Pod 不存在（K8s 查证/单机恒成立）。
     async fn recovery_evidence(&self, row: &PreviewInstanceRecord) -> Option<String> {
         let pod_uid = pod_uid_of(&row.host_id);
-        if self.evidence.host_pod_exists(pod_uid).await {
+        if self.host_pod_exists(pod_uid).await {
             tracing::warn!(
                 preview_key = %row.preview_key,
                 host_id = %row.host_id,
@@ -177,6 +177,61 @@ impl PreviewCoordinator {
         Some(format!(
             "host pod {pod_uid} no longer exists (verified at startup/recovery)"
         ))
+    }
+
+    pub(crate) async fn host_pod_exists(&self, pod_uid: &str) -> bool {
+        self.evidence.host_pod_exists(pod_uid).await
+    }
+
+    /// With positive evidence that the recorded host no longer exists, fence
+    /// the exact instance through Unknown and settle it as Stopped. Both writes
+    /// remain generation-bound in the store, so a replacement instance wins a
+    /// concurrent race instead of being overwritten by this recovery.
+    pub(crate) async fn settle_orphaned_instance(
+        &self,
+        row: &PreviewInstanceRecord,
+        evidence: &str,
+    ) -> Result<PreviewInstanceRecord, PreviewCoordinationError> {
+        if evidence.is_empty() {
+            return Err(invalid("orphaned preview recovery evidence is empty"));
+        }
+        let unknown = if row.state == PreviewInstanceState::Unknown {
+            row.clone()
+        } else {
+            self.store
+                .mark_unknown(&row.preview_key, &row.instance_id, evidence)
+                .await
+                .map_err(store_error)?
+        };
+        let stopped = self
+            .store
+            .resolve_unknown_stopped(&unknown.preview_key, &unknown.instance_id, evidence)
+            .await
+            .map_err(store_error)?;
+        if let Some(port) = stopped.port {
+            self.route_cache.invalidate(port);
+        }
+        tracing::info!(
+            preview_key = %stopped.preview_key,
+            instance_id = %stopped.instance_id,
+            host_id = %stopped.host_id,
+            "orphaned preview instance reconciled as stopped"
+        );
+        Ok(stopped)
+    }
+
+    async fn settle_if_host_absent(
+        &self,
+        row: &PreviewInstanceRecord,
+    ) -> Result<bool, PreviewCoordinationError> {
+        if row.host_id == self.host.host_id {
+            return Ok(false);
+        }
+        let Some(evidence) = self.recovery_evidence(row).await else {
+            return Ok(false);
+        };
+        self.settle_orphaned_instance(row, &evidence).await?;
+        Ok(true)
     }
 
     fn start_envelope(row: &PreviewInstanceRecord, message: &str) -> PreviewStartEnvelope {
@@ -203,6 +258,10 @@ impl PreviewCoordinator {
                 PreviewInstanceState::Ready if self.heartbeat_fresh(&row) => {
                     return Ok(Self::start_envelope(&row, "Development server started"));
                 }
+                PreviewInstanceState::Ready
+                | PreviewInstanceState::Starting
+                | PreviewInstanceState::Stopping
+                    if self.settle_if_host_absent(&row).await? => {}
                 PreviewInstanceState::Unknown => match self.recovery_evidence(&row).await {
                     Some(evidence) => {
                         recovery = Some(shared_types::PreviewRecoveryEvidence {
@@ -370,32 +429,79 @@ impl PreviewCoordinator {
         &self,
         row: &PreviewInstanceRecord,
     ) -> Result<(), PreviewCoordinationError> {
-        let operation_id = new_id();
-        let stopping = self
-            .store
-            .accept_stop(&row.preview_key, &operation_id)
-            .await
-            .map_err(store_error)?;
-        if stopping.state == PreviewInstanceState::Stopped {
-            return Ok(()); // 幂等：并发停止已完成
+        if self.settle_if_host_absent(row).await? {
+            return Ok(());
         }
-        let outcome = self.dispatch_stop(&stopping, &operation_id).await?;
+        // Resume an already accepted stop with its durable operation identity.
+        // Re-dispatch is safe: executor stop is instance-bound and idempotent.
+        let current = self
+            .store
+            .get(&row.preview_key)
+            .await
+            .map_err(store_error)?
+            .ok_or_else(|| invalid("preview stop target disappeared"))?;
+        if current.instance_id != row.instance_id {
+            return Err(conflict(
+                "stop target superseded by a newer preview instance",
+            ));
+        }
+        let stopping = if current.state == PreviewInstanceState::Stopping {
+            current
+        } else {
+            self.store
+                .accept_stop(&current.preview_key, &new_id())
+                .await
+                .map_err(store_error)?
+        };
+        if !stopping.state.is_active() {
+            return Ok(()); // 幂等：并发停止已完成或实例已终结
+        }
+        let outcome = match self.dispatch_stop(&stopping, &stopping.operation_id).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let detail = format!("stop dispatch outcome unknown: {error}");
+                if let Err(store_failure) = self
+                    .store
+                    .mark_unknown(&stopping.preview_key, &stopping.instance_id, &detail)
+                    .await
+                {
+                    return Err(unavailable(format!(
+                        "{error}; failed to persist uncertain stop outcome: {store_failure}"
+                    )));
+                }
+                if let Some(port) = stopping.port {
+                    self.route_cache.invalidate(port);
+                }
+                return Err(error);
+            }
+        };
         match outcome {
             ExecutorStopOutcome::Stopped | ExecutorStopOutcome::NotRegistered => {
-                note_store_result(
-                    self.store
-                        .mark_stopped(&row.preview_key, &operation_id, stopping.revision)
-                        .await,
-                );
+                self.store
+                    .mark_stopped(
+                        &stopping.preview_key,
+                        &stopping.operation_id,
+                        stopping.revision,
+                    )
+                    .await
+                    .map_err(store_error)?;
                 if let Some(port) = stopping.port {
                     self.route_cache.invalidate(port);
                 }
                 Ok(())
             }
             // 迟到旧操作打到新登记：不杀新实例；行由新实例持有，本操作作废。
-            ExecutorStopOutcome::IdentityMismatch => Err(conflict(
-                "stop target superseded by a newer instance on the host",
-            )),
+            ExecutorStopOutcome::IdentityMismatch => {
+                let detail = "stop target superseded by a newer instance on the host";
+                self.store
+                    .mark_unknown(&stopping.preview_key, &stopping.instance_id, detail)
+                    .await
+                    .map_err(store_error)?;
+                if let Some(port) = stopping.port {
+                    self.route_cache.invalidate(port);
+                }
+                Err(conflict(detail))
+            }
         }
     }
 
@@ -670,11 +776,20 @@ impl PreviewCoordination for PreviewCoordinator {
             PreviewInstanceState::Starting => Err(conflict(
                 "project dev server is already starting, please wait",
             )),
-            PreviewInstanceState::Stopping => Ok(Self::degraded(
-                &req.identity.project_id,
-                degraded_reason::INSTANCE_UNKNOWN,
-                "preview instance is stopping; retry on next keep-alive",
-            )),
+            PreviewInstanceState::Stopping => {
+                if self.settle_if_host_absent(&row).await? {
+                    let env = self
+                        .admit_and_start(&req.identity, req.base_path.clone())
+                        .await?;
+                    Ok(Self::rebuilt_envelope(env))
+                } else {
+                    Ok(Self::degraded(
+                        &req.identity.project_id,
+                        degraded_reason::INSTANCE_UNKNOWN,
+                        "preview instance is stopping; retry on next keep-alive",
+                    ))
+                }
+            }
             PreviewInstanceState::Unknown => match self.recovery_evidence(&row).await {
                 Some(evidence) => {
                     note_store_result(
@@ -875,5 +990,217 @@ impl PreviewCoordination for PreviewCoordinator {
 fn note_store_result(result: Result<impl Send, PreviewStoreError>) {
     if let Err(error) = result {
         tracing::debug!("preview store write skipped (converged by CAS): {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use shared_types::{PreviewExecutor, PreviewExecutorError, PreviewLifecycleStore};
+
+    use super::*;
+    use crate::{InProcessPreviewStore, SingleInstanceEvidence};
+
+    struct TestExecutor {
+        fail_stop: bool,
+    }
+
+    impl TestExecutor {
+        fn new(fail_stop: bool) -> Self {
+            Self { fail_stop }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PreviewExecutor for TestExecutor {
+        async fn start_local(
+            &self,
+            ticket: &ExecutorStartTicket,
+        ) -> Result<(i64, u16), PreviewExecutorError> {
+            Ok((42, ticket.port))
+        }
+
+        async fn stop_local(
+            &self,
+            _preview_key: &str,
+            _instance_id: &str,
+        ) -> Result<ExecutorStopOutcome, PreviewExecutorError> {
+            if self.fail_stop {
+                Err(PreviewExecutorError::Failed(
+                    "injected stop failure".to_string(),
+                ))
+            } else {
+                Ok(ExecutorStopOutcome::NotRegistered)
+            }
+        }
+
+        async fn verify_local(
+            &self,
+            _preview_key: &str,
+            _instance_id: &str,
+        ) -> Result<ExecutorVerifyReport, PreviewExecutorError> {
+            Ok(ExecutorVerifyReport {
+                identity_match: true,
+                alive: true,
+                pid: Some(1),
+                port: Some(PREVIEW_PORT_MIN),
+            })
+        }
+
+        async fn registration_matches(
+            &self,
+            _preview_key: &str,
+            _instance_id: &str,
+        ) -> Result<bool, PreviewExecutorError> {
+            Ok(true)
+        }
+
+        async fn read_log_local(
+            &self,
+            _log_key: &str,
+            _log_type: &str,
+            _start_index: usize,
+        ) -> Result<ExecutorLogChunk, PreviewExecutorError> {
+            Ok(ExecutorLogChunk {
+                logs: Vec::new(),
+                total_lines: 0,
+                log_file_name: String::new(),
+            })
+        }
+    }
+
+    fn identity(project_id: &str) -> PreviewProjectIdentity {
+        PreviewProjectIdentity {
+            project_id: project_id.to_string(),
+            tenant_id: None,
+            space_id: None,
+            isolation_type: None,
+            resolved_path: format!("/tmp/{project_id}"),
+        }
+    }
+
+    fn coordinator(
+        store: Arc<InProcessPreviewStore>,
+        executor: Arc<TestExecutor>,
+    ) -> PreviewCoordinator {
+        let config = CoordinatorConfig {
+            start_budget_secs: 1,
+            ..CoordinatorConfig::default()
+        };
+        PreviewCoordinator::new(
+            store,
+            executor,
+            Arc::new(SingleInstanceEvidence),
+            "test-preview-token".to_string(),
+            config,
+        )
+    }
+
+    async fn seed_ready(
+        store: &InProcessPreviewStore,
+        identity: &PreviewProjectIdentity,
+        host: PreviewHostIdentity,
+        operation_id: &str,
+        instance_id: &str,
+    ) -> PreviewInstanceRecord {
+        let key = compute_key(identity);
+        let accepted = store
+            .accept_start(AcceptStartInput {
+                preview_key: key.clone(),
+                project_id: identity.project_id.clone(),
+                project_path: identity.resolved_path.clone(),
+                host,
+                operation_id: operation_id.to_string(),
+                instance_id: instance_id.to_string(),
+                requested_port: None,
+                recover_unknown_evidence: None,
+            })
+            .await
+            .expect("seed start admission");
+        let AcceptStartOutcome::Admitted(starting) = accepted else {
+            panic!("seed start must be admitted");
+        };
+        let port = starting.port.expect("seed start allocates port");
+        store
+            .publish_running(&key, operation_id, starting.revision, 42, port, None)
+            .await
+            .expect("seed ready instance")
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_stopping_instance_owned_by_deleted_host() {
+        let store = Arc::new(InProcessPreviewStore::new());
+        let executor = Arc::new(TestExecutor::new(false));
+        let coordinator = coordinator(Arc::clone(&store), Arc::clone(&executor));
+        let identity = identity("orphaned-preview");
+        let ready = seed_ready(
+            store.as_ref(),
+            &identity,
+            PreviewHostIdentity {
+                host_id: "deleted-pod-uid:old-boot".to_string(),
+                pod_name: Some("deleted-rcoder-pod".to_string()),
+                pod_ip: Some("10.0.0.8".to_string()),
+            },
+            "old-start-operation",
+            "old-instance",
+        )
+        .await;
+        let stopping = store
+            .accept_stop(&ready.preview_key, "abandoned-stop-operation")
+            .await
+            .expect("seed abandoned stop");
+        assert_eq!(stopping.state, PreviewInstanceState::Stopping);
+
+        let restarted = coordinator
+            .restart_dev(PreviewRestartRequest {
+                identity,
+                base_path: None,
+            })
+            .await
+            .expect("restart must recover deleted host and start a replacement");
+
+        assert!(restarted.success);
+        let current = store
+            .get(&ready.preview_key)
+            .await
+            .expect("read current preview")
+            .expect("replacement preview exists");
+        assert_eq!(current.state, PreviewInstanceState::Ready);
+        assert_eq!(current.host_id, coordinator.host().host_id);
+        assert_ne!(current.instance_id, ready.instance_id);
+    }
+
+    #[tokio::test]
+    async fn stop_dispatch_failure_does_not_leave_instance_stopping() {
+        let store = Arc::new(InProcessPreviewStore::new());
+        let executor = Arc::new(TestExecutor::new(true));
+        let coordinator = coordinator(Arc::clone(&store), executor);
+        let identity = identity("failed-stop-preview");
+        let ready = seed_ready(
+            store.as_ref(),
+            &identity,
+            coordinator.host().clone(),
+            "start-operation",
+            "local-instance",
+        )
+        .await;
+
+        let error = coordinator
+            .coordinated_stop(&ready)
+            .await
+            .expect_err("injected stop failure must propagate");
+        assert!(error.to_string().contains("injected stop failure"));
+
+        let current = store
+            .get(&ready.preview_key)
+            .await
+            .expect("read failed stop state")
+            .expect("preview remains recorded");
+        assert_eq!(current.state, PreviewInstanceState::Unknown);
+        assert!(
+            current
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("injected stop failure"))
+        );
     }
 }

@@ -25,6 +25,45 @@ impl PreviewCoordinator {
             Ok(_) => {}
             Err(error) => tracing::warn!("preview startup reconcile failed: {error}"),
         }
+
+        // A StatefulSet replacement has a new Pod UID, so the same-Pod reboot
+        // reconciliation above cannot see rows owned by a deleted predecessor.
+        // Query host existence once per distinct UID, then settle each exact
+        // instance with generation-bound store writes.
+        let rows = match self.store.list_active().await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!("preview orphan scan failed: {error}");
+                return;
+            }
+        };
+        let mut by_pod = std::collections::BTreeMap::<String, Vec<_>>::new();
+        for row in rows {
+            if row.host_id == self.host().host_id {
+                continue;
+            }
+            by_pod
+                .entry(crate::evidence::pod_uid_of(&row.host_id).to_string())
+                .or_default()
+                .push(row);
+        }
+        for (orphan_uid, rows) in by_pod {
+            if self.host_pod_exists(&orphan_uid).await {
+                continue;
+            }
+            let evidence = format!(
+                "host pod {orphan_uid} no longer exists (verified during startup reconciliation)"
+            );
+            for row in rows {
+                if let Err(error) = self.settle_orphaned_instance(&row, &evidence).await {
+                    tracing::warn!(
+                        preview_key = %row.preview_key,
+                        host_id = %row.host_id,
+                        "preview orphan reconciliation lost a race or failed: {error}"
+                    );
+                }
+            }
+        }
     }
 
     /// 一轮心跳扫描：本机实例探活上报；Starting 自愈（迟到的启动完成补发布）；
