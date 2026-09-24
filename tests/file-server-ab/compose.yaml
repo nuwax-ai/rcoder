@@ -30,6 +30,8 @@ services:
       GIT_DEFAULT_AUTHOR_NAME: File Server A-B
       GIT_DEFAULT_AUTHOR_EMAIL: ab@example.invalid
       DEPLOYMENT_MODE: docker-compose
+      DEV_PORT_RANGE_START: "4000"
+      DEV_PORT_RANGE_END: "4000"
       RUST_LOG: info
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:60000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
@@ -74,3 +76,13 @@ services:
       interval: 2s
       timeout: 2s
       retries: 45
+
+  driver:
+    image: rcoder-file-server-ab-rust:${AB_IMAGE_TAG:-local}
+    entrypoint: ["file-server-ab"]
+    user: "${AB_UID}:${AB_GID}"
+    volumes:
+      - "${AB_RUNTIME_DIR}:/ab-runtime"
+      - "${AB_REPORT_ROOT}:/ab-reports"
+      - "${RCODER_ROOT}/tests/file-server-ab:/ab-input:ro"
+      - "${RCODER_ROOT}/tmp/template:/ab-fixtures:ro"

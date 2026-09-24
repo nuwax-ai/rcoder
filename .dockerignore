@@ -1,11 +1,18 @@
 # 构建产物（最重要：排除 target 避免传输19GB）
 target/
 **/target/
+# Make BuildKit ignore the directories and contents explicitly; in particular,
+# crates/app-cli/target is independent of the root Cargo target directory.
+target/**
+**/target
+**/target/**
 target-check/
 target-appcli/
 
 # Git 相关
 .git
+/.git/**
+/.git/
 .gitignore
 .gitattributes
 

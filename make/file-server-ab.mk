@@ -3,6 +3,7 @@ AB_TS_SOURCE ?= /Users/soddy/Documents/git-workspace/nuwax-file-server
 AB_TS_REF ?= HEAD
 AB_REPORT_ROOT ?= $(CURDIR)/tests-e2e/reports/file-server-ab
 AB_PNPM_VERSION ?= 10.34.5
+AB_SUITE ?= core
 AB_RUST_PORT ?=
 AB_TS_PORT ?=
 AB_KEEP ?= 0
@@ -13,6 +14,7 @@ file-server-ab:
 	@AB_TS_SOURCE="$(AB_TS_SOURCE)" AB_TS_REF="$(AB_TS_REF)" \
 	 AB_REPORT_ROOT="$(AB_REPORT_ROOT)" AB_RUST_PORT="$(AB_RUST_PORT)" \
 	 AB_TS_PORT="$(AB_TS_PORT)" AB_PNPM_VERSION="$(AB_PNPM_VERSION)" \
+	 AB_SUITE="$(AB_SUITE)" \
 	 AB_KEEP="$(AB_KEEP)" \
 	 tests/file-server-ab/run.sh
 
@@ -23,6 +25,7 @@ file-server-ab-doctor:
 	 --ts-url "$(TS_URL)"
 
 file-server-ab-help:
-	@echo "make file-server-ab [AB_TS_SOURCE=/path/to/nuwax-file-server] [AB_TS_REF=HEAD] [AB_PNPM_VERSION=10.34.5]"
-	@echo "  Builds and starts isolated Rust/TS Docker services, runs the core suite, and writes evidence under tests-e2e/reports/file-server-ab/."
+	@echo "make file-server-ab [AB_SUITE=core|git|build|all] [AB_TS_SOURCE=/path/to/nuwax-file-server] [AB_TS_REF=HEAD] [AB_PNPM_VERSION=10.34.5]"
+	@echo "  core: offline API/file behavior; git: gix-vs-system-Git API; build: template install/build/dev lifecycle; all: all three."
+	@echo "  Builds isolated Rust/TS Docker services and writes evidence under tests-e2e/reports/file-server-ab/."
 	@echo "  AB_KEEP=1 retains containers and workspaces after the run; AB_RUST_PORT/AB_TS_PORT override local ports."

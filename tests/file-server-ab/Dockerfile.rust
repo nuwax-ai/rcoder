@@ -12,8 +12,9 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git/db \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p file-server-proxy --bin file-server-proxy \
-    && install -D /src/target/release/file-server-proxy /out/file-server-proxy
+    cargo build --release -p file-server-proxy --bin file-server-proxy -p file-server-ab --bin file-server-ab \
+    && install -D /src/target/release/file-server-proxy /out/file-server-proxy \
+    && install -D /src/target/release/file-server-ab /out/file-server-ab
 
 FROM ${NODE_RUNTIME_IMAGE} AS runtime
 ARG PNPM_VERSION=10.34.5
@@ -24,6 +25,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /out/file-server-proxy /usr/local/bin/file-server-proxy
+COPY --from=builder /out/file-server-ab /usr/local/bin/file-server-ab
 
 ENV FILE_SERVER_PROXY_HOST=0.0.0.0 \
     NODE_ENV=ab \

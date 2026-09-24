@@ -20,6 +20,7 @@ rust_builder_image="${AB_RUST_BUILDER_IMAGE:-rust:1.98-bookworm}"
 rust_port="${AB_RUST_PORT:-}"
 ts_port="${AB_TS_PORT:-}"
 pnpm_version="${AB_PNPM_VERSION:-10.34.5}"
+suite="${AB_SUITE:-core}"
 report_dir="${report_root}/${run_id}"
 keep="${AB_KEEP:-0}"
 phase="initialize"
@@ -36,6 +37,8 @@ export AB_IMAGE_TAG="${image_tag}"
 export AB_RUST_BUILDER_IMAGE="${rust_builder_image}"
 export AB_REPORT_ROOT="${report_root}"
 export AB_RUN_ID="${run_id}"
+export AB_UID="$(id -u)"
+export AB_GID="$(id -g)"
 
 cleanup() {
   status=$?
@@ -47,7 +50,7 @@ cleanup() {
       resolve-node-image|resolve-rust-builder-image|build-rust-image|build-ts-image|start-containers)
         failure_kind="environment"
         ;;
-      run-core-suite)
+      run-selected-suites)
         failure_kind="comparison-runner"
         ;;
     esac
@@ -128,11 +131,13 @@ if [[ "${rust_source_before}" != "${rust_source_after}" ]]; then
 fi
 
 phase="start-containers"
-docker compose -p "${project}" -f "${compose_file}" up -d --wait
+docker compose -p "${project}" -f "${compose_file}" up -d --wait rust typescript
 rust_mapping="$(docker compose -p "${project}" -f "${compose_file}" port rust 60000)"
 ts_mapping="$(docker compose -p "${project}" -f "${compose_file}" port typescript 60000)"
-rust_host_port="${rust_mapping##*:}"
-ts_host_port="${ts_mapping##*:}"
+export AB_RUST_HOST_URL="http://${rust_mapping}"
+export AB_TS_HOST_URL="http://${ts_mapping}"
+echo "Rust API (host): ${AB_RUST_HOST_URL}"
+echo "TypeScript API (host): ${AB_TS_HOST_URL}"
 
 ts_revision="$(cat "${ts_context}/.ab-source-revision")"
 export AB_RUST_SOURCE="${rust_source_before}"
@@ -141,20 +146,42 @@ rust_image_id="$(docker image inspect --format '{{.Id}}' "rcoder-file-server-ab-
 ts_image_id="$(docker image inspect --format '{{.Id}}' "rcoder-file-server-ab-ts:${image_tag}")"
 export AB_RUST_IMAGE="${rust_image_id} (builder=${rust_builder_digest:-${rust_builder_image}}, runtime=${node_digest})"
 export AB_TS_IMAGE="${ts_image_id} (runtime=${node_digest})"
-export AB_NODE_VERSION="$(docker compose -p "${project}" -f "${compose_file}" exec -T rust node --version)"
-export AB_NODE_ARCH="$(docker compose -p "${project}" -f "${compose_file}" exec -T rust node -p 'process.arch')"
-export AB_PNPM_VERSION="$(docker compose -p "${project}" -f "${compose_file}" exec -T rust pnpm --version)"
-export AB_GIT_VERSION="$(docker compose -p "${project}" -f "${compose_file}" exec -T rust git --version)"
+export AB_RUST_NODE_VERSION="$(docker compose -p "${project}" -f "${compose_file}" exec -T rust node --version)"
+export AB_TS_NODE_VERSION="$(docker compose -p "${project}" -f "${compose_file}" exec -T typescript node --version)"
+export AB_RUST_NODE_ARCH="$(docker compose -p "${project}" -f "${compose_file}" exec -T rust node -p 'process.arch')"
+export AB_TS_NODE_ARCH="$(docker compose -p "${project}" -f "${compose_file}" exec -T typescript node -p 'process.arch')"
+export AB_RUST_PNPM_VERSION="$(docker compose -p "${project}" -f "${compose_file}" exec -T rust pnpm --version)"
+export AB_TS_PNPM_VERSION="$(docker compose -p "${project}" -f "${compose_file}" exec -T typescript pnpm --version)"
+export AB_RUST_GIT_VERSION="$(docker compose -p "${project}" -f "${compose_file}" exec -T rust git --version)"
+export AB_TS_GIT_VERSION="$(docker compose -p "${project}" -f "${compose_file}" exec -T typescript git --version)"
 
-phase="run-core-suite"
-cargo run -p file-server-ab -- run --run-id "${run_id}" \
-	 --rules "${repo_root}/tests/file-server-ab/diff-rules.json" \
-	 --rust-url "http://127.0.0.1:${rust_host_port}" \
-	 --ts-url "http://127.0.0.1:${ts_host_port}" \
-  --rust-root "${runtime_dir}/rust" \
-  --ts-root "${runtime_dir}/typescript" \
-  --fixtures "${repo_root}/tmp/template" \
-  --report-root "${report_root}"
+phase="run-selected-suites"
+docker compose -p "${project}" -f "${compose_file}" run --rm --no-deps -T \
+	 -e "AB_RUST_SOURCE=${rust_source_before}" \
+	 -e "AB_TS_SOURCE=${ts_revision}" \
+	 -e "AB_RUST_HOST_URL=${AB_RUST_HOST_URL}" \
+	 -e "AB_TS_HOST_URL=${AB_TS_HOST_URL}" \
+	 -e "AB_RUST_IMAGE=${rust_image_id} (builder=${rust_builder_digest:-${rust_builder_image}}, runtime=${node_digest})" \
+	 -e "AB_TS_IMAGE=${ts_image_id} (runtime=${node_digest})" \
+	 -e "AB_RUST_NODE_VERSION=${AB_RUST_NODE_VERSION}" \
+	 -e "AB_TS_NODE_VERSION=${AB_TS_NODE_VERSION}" \
+	 -e "AB_RUST_NODE_ARCH=${AB_RUST_NODE_ARCH}" \
+	 -e "AB_TS_NODE_ARCH=${AB_TS_NODE_ARCH}" \
+	 -e "AB_RUST_PNPM_VERSION=${AB_RUST_PNPM_VERSION}" \
+	 -e "AB_TS_PNPM_VERSION=${AB_TS_PNPM_VERSION}" \
+	 -e "AB_RUST_GIT_VERSION=${AB_RUST_GIT_VERSION}" \
+	 -e "AB_TS_GIT_VERSION=${AB_TS_GIT_VERSION}" \
+	 driver run --suite "${suite}" --run-id "${run_id}" \
+	 --rules "/ab-input/diff-rules.json" \
+	 --route-coverage "/ab-input/route-coverage.json" \
+	 --rust-url "http://rust:60000" \
+	 --ts-url "http://typescript:60000" \
+	 --rust-dev-url "http://rust" \
+	 --ts-dev-url "http://typescript" \
+	 --rust-root "/ab-runtime/rust" \
+	 --ts-root "/ab-runtime/typescript" \
+	 --fixtures "/ab-fixtures" \
+	 --report-root "/ab-reports"
 
 phase="complete"
 echo "A/B report: ${report_dir}"

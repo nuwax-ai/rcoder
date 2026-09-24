@@ -8,10 +8,21 @@
 make file-server-ab
 ```
 
+默认执行离线 `core` 套件。需要比较 Git 或模板依赖安装/构建/开发服务时显式选套件：
+
+```bash
+make file-server-ab AB_SUITE=git
+make file-server-ab AB_SUITE=build
+make file-server-ab AB_SUITE=all
+```
+
+`build` / `all` 会从两份 ZIP 模板创建项目，访问 npm registry 安装依赖并构建，再验证 dev server 的启动、HTTP 可达、keep-alive、重启和停止。首次运行较慢；失败会保留证据并区分比较差异与环境错误。
+
 可选参数：
 
 ```bash
 make file-server-ab \
+  AB_SUITE=core \
   AB_TS_SOURCE=/path/to/nuwax-file-server \
   AB_TS_REF=main \
   AB_PNPM_VERSION=10.34.5 \
@@ -32,6 +43,7 @@ Rust 与 TypeScript 镜像按顺序构建，避免两个依赖安装/编译任�
 - `bodies/`：请求与响应原文；单个文件最多保存 2 MiB，截断状态、完整字节数和完整 SHA-256 仍记录在 JSONL。
 - `state/`：请求执行前与结束后的两侧工作区树、文件内容摘要、权限与软链接。
 - `diff.json`、`summary.md`：机器可读差异及人工可读总览；错误响应只归一化精确路径 `/error/requestId` 和 `/error/timestamp`，两侧原值仍保存在正文证据中。
+- `route-coverage.json`：TS/Rust 路由交集、已覆盖/待覆盖状态，以及本次选择的套件是否实际执行了对应场景。
 - `logs/compose.log`：Compose 服务日志。
 
 镜像解析、构建或容器启动失败时不会生成比较通过结果；启动器会写 `runner-failure.json`，包含失败阶段和类别，并在 `summary.md` 中明确说明没有产生对照结果。HTTP 传输错误保存在 `diff.json`，会使命令失败。
@@ -42,6 +54,13 @@ Rust 与 TypeScript 镜像按顺序构建，避免两个依赖安装/编译任�
 
 默认所有差异都视为未分类并使命令失败。经人工确认的预期差异可写入 `diff-rules.json`，规则必须精确匹配 `case`、JSON Pointer `path`、`kind`、Rust 值和 TypeScript 值，并附原因、审核者和未过期日期；不接受通配路径，也不允许把传输错误归为预期差异。值缺失用 `{"$missing":true}` 表示。命中规则只改变分类，不会删除原始响应或 diff。
 
-## 当前覆盖边界
+## 套件与覆盖边界
 
-目前只执行离线 `core` 子集：健康探针、React/Vue 模板项目初始化与读取、项目文件更新和静态读取、Computer 文件列表边界、文件系统浏览/创建/重命名。Git 操作与依赖安装、构建及 dev server 生命周期还未纳入本轮。
+- `core`：健康/API 版本、React/Vue 模板初始化与读取、项目文件更新、静态普通/Range 读取、Computer 文件列表/resolve/search/metadata 边界和基础文件系统操作。无 npm 外网依赖。
+- `git`：独立 pageApp 工作区内通过 HTTP 执行 init、status、add、commit、file-content、branch/tag、log，并比较 API 与最终工作树。Rust 使用 gix，TS 使用镜像内系统 Git。
+- `build`：分别用两份模板走依赖安装、production build、产物静态读取、start-dev、真实页面 HTTP、keep-alive、restart-dev 和 stop-dev。依赖 registry 网络；报告记下环境版本与错误。
+- `all`：顺序执行以上套件。路由清单按当前 TypeScript 基线快照维护；没有 A/B 场景的共同路由明确标为 pending。
+
+路由清单的 `typescript_revision` 必须与本次准备的 TypeScript Git 提交一致；基线变化时 Make 运行会在发请求前失败，要求先复核并更新路由清单。
+
+这不是“所有路由都已覆盖”的声明。真实结果以报告中的 `route-coverage.json` 与 `requests.jsonl` 为准；Rust-only `/api/v1/userapp` 由既有 UserApp 测试单独覆盖。
