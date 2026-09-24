@@ -214,9 +214,11 @@
       "path": "/api/computer/files-update",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-files-update-mixed-operations"
+      ]
     },
     {
       "method": "GET",
@@ -385,27 +387,35 @@
       "path": "/api/computer/static/:userId/:cId/*",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-read-files-update-content",
+        "computer-read-uploaded-single-binary",
+        "computer-read-uploaded-batch-binary"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/computer/upload-file",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-upload-file-binary"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/computer/upload-files",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-upload-files-mixed-content"
+      ]
     },
     {
       "method": "POST",

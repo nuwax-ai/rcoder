@@ -17,6 +17,7 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(90);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CASE_USER: &str = "file-server-ab-user";
 const CASE_CID: &str = "file-server-ab-session";
+const AB_MULTIPART_BOUNDARY: &str = "----file-server-ab-boundary-6d86f5";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -563,15 +564,35 @@ async fn run_suite(options: RunOptions) -> Result<()> {
                 &spec,
             )
             .await?;
-            if case_name == "computer-file-meta" {
-                for (side, exchange) in [("rust", &rust), ("typescript", &ts)] {
-                    if let Err(error) = validate_meta_response(&exchange.body) {
-                        case.differences.push(assertion_difference(
-                            case_name,
-                            &format!("/assertions/{side}/metadata"),
-                            error,
-                        ));
+            for (side, exchange) in [("rust", &rust), ("typescript", &ts)] {
+                let validation = match case_name {
+                    "computer-file-meta" => validate_meta_response(&exchange.body),
+                    "computer-files-update-mixed-operations" => {
+                        validate_files_update_response(&exchange.body, CASE_USER, CASE_CID, 5)
                     }
+                    "computer-upload-file-binary" => {
+                        validate_upload_file_response(&exchange.body, 7)
+                    }
+                    "computer-upload-files-mixed-content" => {
+                        validate_upload_files_response(&exchange.body)
+                    }
+                    "computer-read-files-update-content" => {
+                        validate_body_equals(&exchange.body, "A/B+%中\n".as_bytes())
+                    }
+                    "computer-read-uploaded-single-binary" => {
+                        validate_body_equals(&exchange.body, &[0, 1, 2, 13, 10, 127, 255])
+                    }
+                    "computer-read-uploaded-batch-binary" => {
+                        validate_body_equals(&exchange.body, &[0, 255, 10, 13, 42])
+                    }
+                    _ => Ok(()),
+                };
+                if let Err(error) = validation {
+                    case.differences.push(assertion_difference(
+                        case_name,
+                        &format!("/assertions/{side}/contract"),
+                        error,
+                    ));
                 }
             }
             println!(
@@ -898,6 +919,31 @@ fn core_scenarios() -> Result<Vec<(&'static str, RequestSpec)>> {
             "filePaths": [".hidden.txt", "  中文文件 .txt  ", "binary.bin"]
         }),
     )?;
+    let single_upload_bytes: &[u8] = &[0, 1, 2, 13, 10, 127, 255];
+    let single_upload_body = multipart_form_body(
+        AB_MULTIPART_BOUNDARY,
+        &[
+            ("userId", user),
+            ("cId", cid),
+            ("filePath", "ab-transfer/single/nested/payload.bin"),
+        ],
+        &[("file", "payload.bin", single_upload_bytes)],
+    );
+    let batch_first_bytes: &[u8] = b"batch upload one\n";
+    let batch_second_bytes: &[u8] = &[0, 255, 10, 13, 42];
+    let batch_upload_body = multipart_form_body(
+        AB_MULTIPART_BOUNDARY,
+        &[
+            ("userId", user),
+            ("cId", cid),
+            ("filePaths", "ab-transfer/batch/one.txt"),
+            ("filePaths", "ab-transfer/batch/nested/two.bin"),
+        ],
+        &[
+            ("files", "one.txt", batch_first_bytes),
+            ("files", "two.bin", batch_second_bytes),
+        ],
+    );
     let mut static_read =
         get("/api/page/static/file-server-ab-react/src/file-server-ab.txt".to_string());
     static_read.normalized_headers = vec!["etag".into(), "last-modified".into()];
@@ -1028,6 +1074,72 @@ fn core_scenarios() -> Result<Vec<(&'static str, RequestSpec)>> {
         ("computer-file-meta", file_meta),
         ("computer-file-meta-boundary", boundary_meta),
         (
+            "computer-files-update-mixed-operations",
+            json_request(
+                Method::POST,
+                "/api/computer/files-update".to_string(),
+                json!({
+                    "userId": user,
+                    "cId": cid,
+                    "files": [
+                        {"operation":"create", "name":"ab-write", "isDir":true},
+                        {"operation":"create", "name":"ab-write/created.txt", "contents":"A%2FB%2B%25%E4%B8%AD%0A"},
+                        {"operation":"modify", "name":"README.md", "contents":"Updated%20README%0A"},
+                        {"operation":"rename", "name":"ab-write/renamed.txt", "renameFrom":"ab-write/created.txt"},
+                        {"operation":"delete", "name":"sub/nested/hello.txt"}
+                    ]
+                }),
+            )?,
+        ),
+        (
+            "computer-read-files-update-content",
+            get(format!(
+                "/api/computer/static/{user}/{cid}/ab-write/renamed.txt"
+            )),
+        ),
+        (
+            "computer-upload-file-binary",
+            RequestSpec {
+                method: Method::POST,
+                path: "/api/computer/upload-file".to_string(),
+                body: single_upload_body,
+                content_type: Some("multipart/form-data; boundary=----file-server-ab-boundary-6d86f5"),
+                headers: BTreeMap::new(),
+                health_probe: false,
+                expected_status: ExpectedStatus::Success2xx,
+                normalized_paths: Vec::new(),
+                normalized_headers: Vec::new(),
+                timeout: Duration::from_secs(30),
+            },
+        ),
+        (
+            "computer-read-uploaded-single-binary",
+            get(format!(
+                "/api/computer/static/{user}/{cid}/ab-transfer/single/nested/payload.bin"
+            )),
+        ),
+        (
+            "computer-upload-files-mixed-content",
+            RequestSpec {
+                method: Method::POST,
+                path: "/api/computer/upload-files".to_string(),
+                body: batch_upload_body,
+                content_type: Some("multipart/form-data; boundary=----file-server-ab-boundary-6d86f5"),
+                headers: BTreeMap::new(),
+                health_probe: false,
+                expected_status: ExpectedStatus::Success2xx,
+                normalized_paths: Vec::new(),
+                normalized_headers: Vec::new(),
+                timeout: Duration::from_secs(30),
+            },
+        ),
+        (
+            "computer-read-uploaded-batch-binary",
+            get(format!(
+                "/api/computer/static/{user}/{cid}/ab-transfer/batch/nested/two.bin"
+            )),
+        ),
+        (
             "computer-file-list-invalid-type",
             get_client_error(format!(
                 "/api/computer/get-file-list?userId={user}&cId={cid}&type=invalid"
@@ -1064,6 +1176,117 @@ fn core_scenarios() -> Result<Vec<(&'static str, RequestSpec)>> {
             )?,
         ),
     ])
+}
+
+fn multipart_form_body(
+    boundary: &str,
+    text_fields: &[(&str, &str)],
+    file_fields: &[(&str, &str, &[u8])],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (name, value) in text_fields {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    for (field_name, file_name, bytes) in file_fields {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"{field_name}\"; filename=\"{file_name}\"\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+fn validate_files_update_response(
+    body: &[u8],
+    expected_user: &str,
+    expected_cid: &str,
+    expected_count: u64,
+) -> Result<(), String> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("files-update response is not JSON: {error}"))?;
+    if value.get("success").and_then(Value::as_bool) != Some(true)
+        || value.get("userId").and_then(Value::as_str) != Some(expected_user)
+        || value.get("cId").and_then(Value::as_str) != Some(expected_cid)
+        || value.get("filesCount").and_then(Value::as_u64) != Some(expected_count)
+    {
+        return Err(format!(
+            "files-update response must confirm success, workspace identity, and {expected_count} operations; got {value}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_upload_file_response(body: &[u8], expected_size: u64) -> Result<(), String> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("upload-file response is not JSON: {error}"))?;
+    if value.get("success").and_then(Value::as_bool) != Some(true)
+        || value.get("fileSize").and_then(Value::as_u64) != Some(expected_size)
+    {
+        return Err(format!(
+            "upload-file response must confirm success and {expected_size} bytes; got {value}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_upload_files_response(body: &[u8]) -> Result<(), String> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("upload-files response is not JSON: {error}"))?;
+    let results = value
+        .get("results")
+        .and_then(Value::as_array)
+        .filter(|results| results.len() == 2)
+        .ok_or_else(|| "upload-files response must contain two results".to_string())?;
+    let expected = [
+        ("ab-transfer/batch/one.txt", "one.txt", 17),
+        ("ab-transfer/batch/nested/two.bin", "two.bin", 5),
+    ];
+    if value.get("success").and_then(Value::as_bool) != Some(true)
+        || value.get("totalCount").and_then(Value::as_u64) != Some(2)
+        || value.get("successCount").and_then(Value::as_u64) != Some(2)
+        || value.get("failCount").and_then(Value::as_u64) != Some(0)
+    {
+        return Err(format!(
+            "upload-files response must report two successful files and zero failures; got {value}"
+        ));
+    }
+    for (result, (path, name, size)) in results.iter().zip(expected) {
+        if result.get("success").and_then(Value::as_bool) != Some(true)
+            || result.get("filePath").and_then(Value::as_str) != Some(path)
+            || result.get("originalname").and_then(Value::as_str) != Some(name)
+            || result.get("fileSize").and_then(Value::as_u64) != Some(size)
+        {
+            return Err(format!(
+                "upload-files result for {path} must preserve path, filename, and {size}-byte size; got {result}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_body_equals(body: &[u8], expected: &[u8]) -> Result<(), String> {
+    if body == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "file body differs: expected {} bytes sha256={}, got {} bytes sha256={}",
+            expected.len(),
+            sha256(expected),
+            body.len(),
+            sha256(body)
+        ))
+    }
 }
 
 fn git_scenario(

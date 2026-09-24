@@ -30,6 +30,8 @@ make file-server-ab \
   AB_KEEP=1
 ```
 
+国内网络可将 `DOCKER_MIRROR=registry-prefix` 放入被 Git 忽略的 `.env.local`，或仅在调用时传给 Make。A/B 启动器优先使用本机缓存的官方 Node/Rust 基础镜像；缓存缺失时才从镜像站拉取，并自动补齐末尾 `/`。不设置镜像站时使用官方镜像。该地址不会写入源码或 Git 跟踪文件；本地报告记录实际镜像身份，可能包含镜像源地址。
+
 默认宿主机端口由 Docker 动态分配并只绑定到 `127.0.0.1`。指定 `AB_RUST_PORT` / `AB_TS_PORT` 后使用固定端口。每轮都有唯一 Compose project、容器镜像 tag、宿主机工作区和报告目录。正常结束会删除本轮容器、镜像与临时工作区；对照差异或服务请求失败时会保留工作区以便复查。`AB_KEEP=1` 保留容器与工作区。
 
 Rust 与 TypeScript 镜像按顺序构建，避免两个依赖安装/编译任务同时争用本机内存和磁盘。
@@ -56,7 +58,7 @@ Rust 与 TypeScript 镜像按顺序构建，避免两个依赖安装/编译任�
 
 ## 套件与覆盖边界
 
-- `core`：健康/API 版本、React/Vue 模板初始化与读取、项目文件更新、静态普通/Range 读取、Computer 文件列表/resolve/search/metadata 边界和基础文件系统操作。无 npm 外网依赖。
+- `core`：健康/API 版本、React/Vue 模板初始化与读取、项目文件更新、Computer `files-update` 的 create/modify/rename/delete 和 URL 解码、单文件/批量 multipart（二进制含 NUL/非 UTF-8 字节）上传，再通过静态接口读取并逐字节核验；还覆盖文件列表/resolve/search/metadata 边界、静态普通/Range 读取和基础文件系统操作。无 npm 外网依赖。
 - `git`：通过 HTTP 对照 init、status、add、commit、file-content、branch create/delete、tag、log、worktree/staged diff、unstage、checkout、discard、revert，以及 mixed/hard/soft reset。另用系统 Git 为两侧独立 fixture 准备相同的真实 merge-conflict index，再通过 HTTP 对照 `status.conflicted`；当前 API 没有 merge 操作端点，因此不把 fixture 准备命令当成被测 API。每个会改变历史或工作树的流程使用独立 pageApp fixture，避免一个实现的失败污染其他场景；最终比较 refs 对应 tree、HEAD tree、index entries、工作区状态和文件树。Rust 服务使用 gix，TS 服务使用镜像内系统 Git；驱动只用系统 Git读取最终仓库状态及准备对称 fixture，不参与被测 API 操作。
 - `build`：分别用两份模板走项目初始化、依赖安装、production build、产物静态读取、start-dev、真实页面 HTTP、开发日志分页、日志缓存查询/清理、端口池状态、keep-alive、restart-dev 和 stop-dev，并对照构建错误解析。依赖 registry 网络；报告记下环境版本与错误。
 - `all`：顺序执行以上套件。路由清单按当前 TypeScript 基线快照维护；没有 A/B 场景的共同路由明确标为 pending。

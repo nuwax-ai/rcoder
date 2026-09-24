@@ -15,8 +15,25 @@ ts_context="${work_root}/ts-context"
 compose_file="${script_dir}/compose.yaml"
 project="file-server-ab-${run_id}"
 image_tag="${run_id}"
-node_image="${AB_NODE_IMAGE:-node:22-bookworm-slim}"
-rust_builder_image="${AB_RUST_BUILDER_IMAGE:-rust:1.98-bookworm}"
+docker_mirror="${AB_DOCKER_MIRROR:-}"
+if [[ -n "${docker_mirror}" && "${docker_mirror}" != */ ]]; then
+  docker_mirror="${docker_mirror}/"
+fi
+if [[ -n "${docker_mirror}" ]]; then
+  default_node_image="${docker_mirror}library/node:22-bookworm-slim"
+  default_rust_builder_image="${docker_mirror}rust:1.98-bookworm"
+  if docker image inspect "node:22-bookworm-slim" >/dev/null 2>&1; then
+    default_node_image="node:22-bookworm-slim"
+  fi
+  if docker image inspect "rust:1.98-bookworm" >/dev/null 2>&1; then
+    default_rust_builder_image="rust:1.98-bookworm"
+  fi
+else
+  default_node_image="node:22-bookworm-slim"
+  default_rust_builder_image="rust:1.98-bookworm"
+fi
+node_image="${AB_NODE_IMAGE:-${default_node_image}}"
+rust_builder_image="${AB_RUST_BUILDER_IMAGE:-${default_rust_builder_image}}"
 rust_port="${AB_RUST_PORT:-}"
 ts_port="${AB_TS_PORT:-}"
 pnpm_version="${AB_PNPM_VERSION:-10.34.5}"
