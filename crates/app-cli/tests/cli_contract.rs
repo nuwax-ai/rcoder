@@ -34,6 +34,7 @@ fn explicit_commands_accept_their_options() {
             "--help",
         ],
         vec!["gen-lock", "--workspace", "project with spaces", "--help"],
+        vec!["gen-lock", "--dev", "--help"],
         vec![
             "run-service",
             "release1",
@@ -70,7 +71,7 @@ fn commands_reject_unrelated_options() {
         vec!["build", "--admin-addr", "127.0.0.1:3010", "--help"],
         vec!["build", "--attach", "--help"],
         vec!["run", "--attach", "--help"],
-        vec!["gen-lock", "--dev", "--help"],
+        vec!["gen-lock", "--attach", "--help"],
         vec!["serve", "--dev", "--help"],
     ] {
         assert_eq!(cli(&args).status.code(), Some(2), "{args:?}");

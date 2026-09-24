@@ -153,7 +153,7 @@ impl SupervisordHost {
 
         // 2. pingap 配置编译（生成/校验/原子提交；未就绪前不启动）
         anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
-        let pingap_outcome = compile_pingap(args, release).await?;
+        let pingap_outcome = compile_pingap(args, release, dev_profile).await?;
         let endpoint = admin_probe::ensure_admin_endpoint();
 
         // 2.5 workspace 首页静态服务（幂等；判定与 pingap 编译的兜底路由注入
@@ -309,11 +309,20 @@ impl SupervisordHost {
 }
 
 /// 编译 pingap 配置（复用 builtin 的编译/校验/原子提交）。
-async fn compile_pingap(args: &RuntimeArgs, release: &ReleaseLock) -> Result<CompileOutcome> {
-    let runtime_root = std::env::var_os("APP_CLI_PINGAP_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| "/run/app-cli/pingap".into());
-    compile_and_validate(&args.workspace, &runtime_root, &args.pingap_bin, release).await
+async fn compile_pingap(
+    args: &RuntimeArgs,
+    release: &ReleaseLock,
+    dev_profile: bool,
+) -> Result<CompileOutcome> {
+    let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+    compile_and_validate(
+        &args.workspace,
+        &runtime_root,
+        &args.pingap_bin,
+        release,
+        dev_profile,
+    )
+    .await
 }
 
 /// pingap 的 spec（argv = pingap -c {config} --autoreload；admin 凭证只进

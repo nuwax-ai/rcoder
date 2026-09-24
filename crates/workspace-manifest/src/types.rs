@@ -230,10 +230,26 @@ pub struct ProxySection {
     pub path: String,
     #[serde(default)]
     pub strip_prefix: bool,
+    /// Override only while this service is running via [devrun]. Production
+    /// static hosting keeps strip_prefix. Omitted fields preserve older locks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev_strip_prefix: Option<bool>,
     #[serde(default)]
     pub plugins: Vec<String>,
     #[serde(default)]
     pub upstream_includes: Vec<String>,
+}
+
+impl ProxySection {
+    /// `using_devrun` means both the dev profile and this service's [devrun]
+    /// are active. Services falling back to [run] keep the production policy.
+    pub fn effective_strip_prefix(&self, using_devrun: bool) -> bool {
+        if using_devrun {
+            self.dev_strip_prefix.unwrap_or(self.strip_prefix)
+        } else {
+            self.strip_prefix
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

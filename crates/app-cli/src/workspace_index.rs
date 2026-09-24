@@ -273,6 +273,7 @@ mod tests {
             proxy: Some(ProxySection {
                 path: if catchall { "/".into() } else { "/app".into() },
                 strip_prefix: false,
+                dev_strip_prefix: None,
                 plugins: Vec::new(),
                 upstream_includes: Vec::new(),
             }),

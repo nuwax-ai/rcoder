@@ -290,6 +290,7 @@ async fn run_inner(
             &args.pingap_bin,
             &release,
             &mut children,
+            dev_profile,
         )
         .await?;
         // 启动编排终局（pingap 确认后输出——9080 listen 即全部启动判定完成，
@@ -1207,14 +1208,14 @@ async fn start_pingap(
     pingap_bin: &Path,
     release: &workspace_manifest::ReleaseLock,
     children: &mut ManagedChildren,
+    dev_profile: bool,
 ) -> Result<()> {
     // N02：运行目录默认不假设容器 /run（原生 Windows/macOS 不可写）——
     // env 显式优先（平台注入容器布局），缺省挂 log_dir 子目录（用户可写、
     // 稳定、非系统临时目录；配置每次启动重生成，随日志卷持久无害）。
-    let runtime_root = std::env::var_os("APP_CLI_PINGAP_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| log_root.join("pingap"));
-    let outcome = compile_and_validate(ws_root, &runtime_root, pingap_bin, release).await?;
+    let runtime_root = crate::proxy::compiler::runtime_root(log_root);
+    let outcome =
+        compile_and_validate(ws_root, &runtime_root, pingap_bin, release, dev_profile).await?;
     info!(
         "📝 effective pingap config → {}",
         outcome.config_path.display()

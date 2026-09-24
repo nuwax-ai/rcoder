@@ -40,7 +40,7 @@ fn pingap_identity() -> (String, String) {
 /// `ReleaseMetadata` 的 pingap 版本/commit 来自环境变量（缺省回退上方常量，仅影响日志追溯）；
 /// 镜像 digest 用本地占位值；`minimum_app_cli_version` 取当前 app-cli 版本，
 /// 确保紧接着能用本二进制 `run` 起来。
-pub async fn gen_lock(workspace: &Path) -> Result<()> {
+pub async fn gen_lock(workspace: &Path, dev_profile: bool) -> Result<()> {
     let ws_path = workspace.join("workspace.manifest.toml");
     let ws_content = tokio::fs::read_to_string(&ws_path)
         .await
@@ -107,7 +107,11 @@ pub async fn gen_lock(workspace: &Path) -> Result<()> {
         let proxy = service
             .proxy
             .as_ref()
-            .map(|proxy| format!("{} (strip_prefix={})", proxy.path, proxy.strip_prefix))
+            .map(|proxy| {
+                let strip_prefix =
+                    proxy.effective_strip_prefix(dev_profile && service.devrun.is_some());
+                format!("{} (strip_prefix={strip_prefix})", proxy.path)
+            })
             .unwrap_or_else(|| "— (无 [proxy]，不对外暴露)".into());
         println!(
             "   • {:<24} port={}  proxy={}",
@@ -116,11 +120,12 @@ pub async fn gen_lock(workspace: &Path) -> Result<()> {
     }
 
     // 编译 Pingap 生效配置（纯函数：不调 pingap 二进制、不落盘）。
-    let (pingap_toml, hash) = compile_effective_config(workspace, &lock)
+    let (pingap_toml, hash) = compile_effective_config(workspace, &lock, dev_profile)
         .await
         .context("compile effective Pingap config")?;
 
-    println!("\n🛡  Pingap 生效配置 (expected hash = {hash}):");
+    let profile = if dev_profile { "dev" } else { "prod" };
+    println!("\n🛡  Pingap 生效配置 (profile = {profile}, expected hash = {hash}):");
     println!("──── pingap.toml ────");
     println!("{pingap_toml}──── end ────");
 
@@ -131,7 +136,7 @@ pub async fn gen_lock(workspace: &Path) -> Result<()> {
         .with_context(|| format!("write {}", lock_path.display()))?;
     println!("\n✅ release.lock.toml 已写入: {}", lock_path.display());
     println!(
-        "   现在可以: APP_CLI_WORKSPACE={} APP_CLI_PINGAP_BIN=<pingap> app-cli run",
+        "   现在可以: APP_CLI_RUN_PROFILE={profile} app-cli run --workspace {} --pingap-bin <pingap>",
         workspace.display()
     );
     Ok(())

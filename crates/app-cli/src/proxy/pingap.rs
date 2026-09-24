@@ -119,7 +119,10 @@ pub fn build_pingap_config(
                 // path 是字面前缀，须正则转义：元字符（如 `(`、`|`）裸拼会改变捕获组
                 // 编号或把正则切成 alternation，路由静默错乱（校验层只拒绝 `..`/`?`/`#`，
                 // 放行这些元字符——生成层必须自守）
-                loc.rewrite = Some(format!("^{}(.*) /$1", regex::escape(&e.proxy.path)));
+                // Consume exactly the separator after the prefix. Otherwise a
+                // slashless prefix turns /react/assets/x into //assets/x.
+                let prefix = e.proxy.path.trim_end_matches('/');
+                loc.rewrite = Some(format!("^{}(?:/|$)(.*) /$1", regex::escape(prefix)));
             }
         }
         cfg.locations.insert(format!("{name}Location"), loc);
@@ -139,6 +142,7 @@ mod tests {
             proxy: ProxySection {
                 path: path.into(),
                 strip_prefix: strip,
+                dev_strip_prefix: None,
                 plugins: Vec::new(),
                 upstream_includes: Vec::new(),
             },
@@ -216,7 +220,7 @@ mod tests {
         assert!(toml_text.contains("path = \"/api/\""), "{toml_text}");
         // regex::escape 只转义真元字符，`/` 不在其中——普通路径输出不变
         assert!(
-            toml_text.contains("rewrite = \"^/api/(.*) /$1\""),
+            toml_text.contains("rewrite = \"^/api(?:/|$)(.*) /$1\""),
             "{toml_text}"
         );
         assert!(toml_text.contains("\"pingap:requestId\""), "{toml_text}");
@@ -249,5 +253,38 @@ mod tests {
             None,
             "metacharacters must not add capture groups"
         );
+    }
+
+    #[test]
+    fn strip_rewrite_preserves_resource_paths_with_or_without_trailing_slash() {
+        for prefix in ["/react", "/react/", "/api/v(1)", "/api/v(1)/"] {
+            let config = build_pingap_config(&[entry("web", 4000, prefix, true)], None)
+                .unwrap()
+                .unwrap();
+            let config = PingapConfig::new(config.as_bytes(), true).unwrap();
+            let rewrite = config.locations["webLocation"].rewrite.as_ref().unwrap();
+            let (pattern, replacement) = rewrite.split_once(' ').unwrap();
+            let regex = regex::Regex::new(pattern).unwrap();
+            let base = prefix.trim_end_matches('/');
+            for (suffix, expected) in [
+                ("", "/"),
+                ("/", "/"),
+                ("/@vite/client", "/@vite/client"),
+                ("/assets/index.js", "/assets/index.js"),
+                ("/health", "/health"),
+            ] {
+                let path = format!("{base}{suffix}");
+                assert_eq!(
+                    regex.replace(&path, replacement),
+                    expected,
+                    "{prefix}: {path}"
+                );
+            }
+            let unrelated = format!("{base}ive/main.js");
+            assert!(
+                !regex.is_match(&unrelated),
+                "must respect a path segment boundary"
+            );
+        }
     }
 }

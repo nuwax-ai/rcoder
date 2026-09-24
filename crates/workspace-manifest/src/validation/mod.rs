@@ -262,6 +262,7 @@ mod tests {
         java_a.proxy = Some(crate::ProxySection {
             path: "/api/java/".into(),
             strip_prefix: true,
+            dev_strip_prefix: None,
             plugins: Vec::new(),
             upstream_includes: Vec::new(),
         });
@@ -269,6 +270,7 @@ mod tests {
         java_b.proxy = Some(crate::ProxySection {
             path: "/api/java/".into(),
             strip_prefix: true,
+            dev_strip_prefix: None,
             plugins: Vec::new(),
             upstream_includes: Vec::new(),
         });
@@ -350,6 +352,7 @@ mod tests {
         root_a.proxy = Some(crate::ProxySection {
             path: "/".into(),
             strip_prefix: false,
+            dev_strip_prefix: None,
             plugins: Vec::new(),
             upstream_includes: Vec::new(),
         });
@@ -357,6 +360,7 @@ mod tests {
         root_b.proxy = Some(crate::ProxySection {
             path: "/".into(),
             strip_prefix: false,
+            dev_strip_prefix: None,
             plugins: Vec::new(),
             upstream_includes: Vec::new(),
         });

@@ -9,7 +9,7 @@ use app_cli::CliArgs;
 async fn main() -> anyhow::Result<()> {
     let args = match CliArgs::parse().command {
         app_cli::config::Command::GenLock(args) => {
-            return app_cli::devtool::gen_lock(&args.workspace).await;
+            return app_cli::devtool::gen_lock(&args.workspace.workspace, args.dev).await;
         }
         app_cli::config::Command::Build(args) => {
             app_cli::build::run(

@@ -86,7 +86,6 @@ struct ApiDoc;
 #[derive(Clone)]
 pub(super) struct AppState {
     server: Arc<ServerState>,
-    workspace: PathBuf,
     pingap_bin: PathBuf,
     log_dir: PathBuf,
 }
@@ -118,9 +117,11 @@ pub async fn bind(
     pingap_bin: PathBuf,
     server: Arc<ServerState>,
 ) -> Result<(tokio::net::TcpListener, Router)> {
+    // Legacy run captures its startup profile here; serve replaces it when
+    // an operation selects the actual execution workspace/profile.
+    server.set_proxy_context(workspace, crate::supervisor::dev_run_profile());
     let state = AppState {
         server,
-        workspace,
         pingap_bin,
         log_dir,
     };
@@ -583,7 +584,6 @@ mod tests {
     fn test_state() -> AppState {
         AppState {
             server: Arc::new(ServerState::new(RuntimeStatusService::default())),
-            workspace: PathBuf::from("/nonexistent"),
             pingap_bin: PathBuf::from("/bin/true"),
             log_dir: tempfile::tempdir().unwrap().keep(),
         }

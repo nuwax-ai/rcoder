@@ -91,6 +91,8 @@ pub struct ServerState {
     /// R08：当前运行操作的 dev profile（None = 操作未指定，legacy 直跑/
     /// env 兜底）。编排生效命令选择的显式依据。
     pending_dev_profile: std::sync::Mutex<Option<bool>>,
+    /// Profile and workspace actually selected for the current orchestration.
+    proxy_context: RwLock<Option<crate::proxy::compiler::RuntimeProxyContext>>,
     /// R08：每操作 PG 凭据槽（settle 写入，supervisor spawn 取走）。
     pending_run_config: std::sync::Mutex<Option<shared_types::StartPgCredential>>,
     /// 运行控制信号通道（源码编排/停止业务——api → 主循环；与部署通道并行）。
@@ -303,6 +305,7 @@ impl ServerState {
             runtime_recovery_hold: std::sync::atomic::AtomicU8::new(0),
             credential_recovery_operation: std::sync::Mutex::new(None),
             pending_dev_profile: std::sync::Mutex::new(None),
+            proxy_context: RwLock::new(None),
             pending_run_config: std::sync::Mutex::new(None),
             control_tx,
             control_rx: tokio::sync::Mutex::new(control_rx),
@@ -355,6 +358,24 @@ impl ServerState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
+    }
+
+    pub(crate) fn set_proxy_context(&self, workspace: std::path::PathBuf, dev_profile: bool) {
+        *self
+            .proxy_context
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(crate::proxy::compiler::RuntimeProxyContext {
+                workspace,
+                dev_profile,
+            });
+    }
+
+    pub(crate) fn proxy_context(&self) -> Option<crate::proxy::compiler::RuntimeProxyContext> {
+        self.proxy_context
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn set_pending_run_config(&self, pg: Option<shared_types::StartPgCredential>) {
@@ -3583,6 +3604,7 @@ async fn server_loop(
         let run_dev_profile = state
             .take_pending_dev_profile()
             .unwrap_or_else(crate::supervisor::dev_run_profile);
+        state.set_proxy_context(args.workspace.clone(), run_dev_profile);
         // R08：本次操作的 PG 凭据（owner 复用时平台传入的新凭据——注入服务
         // env 覆盖旧值）。take 一次性消费；未携带 → None（维持进程 env）
         let run_pg = state.take_pending_run_config();

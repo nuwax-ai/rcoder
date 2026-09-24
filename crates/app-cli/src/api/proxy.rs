@@ -326,11 +326,15 @@ async fn compile(state: &AppState) -> anyhow::Result<CompileOutcome> {
     let release = state.server.release().ok_or_else(|| {
         anyhow::anyhow!("no release deployed (idle); proxy endpoints unavailable")
     })?;
+    let context = state.server.proxy_context().ok_or_else(|| {
+        anyhow::anyhow!("no active orchestration profile; proxy reload unavailable")
+    })?;
     compile_and_validate(
-        &state.workspace,
-        &runtime_root(),
+        &context.workspace,
+        &crate::proxy::compiler::runtime_root(&state.log_dir),
         &state.pingap_bin,
         &release,
+        context.dev_profile,
     )
     .await
 }
@@ -365,15 +369,9 @@ async fn rollback_to_previous(target: &Path) -> anyhow::Result<()> {
 }
 
 fn effective_path(state: &AppState) -> PathBuf {
-    runtime_root()
+    crate::proxy::compiler::runtime_root(&state.log_dir)
         .join(state.server.boot_id())
         .join("pingap.toml")
-}
-
-fn runtime_root() -> PathBuf {
-    std::env::var_os("APP_CLI_PINGAP_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| "/run/app-cli/pingap".into())
 }
 
 fn proxy_error(error: anyhow::Error) -> Response {

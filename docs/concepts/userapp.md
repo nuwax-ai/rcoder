@@ -62,5 +62,6 @@ dev 与 prod 各有独立的存储：删除 prod 运行容器默认保留数据�
 
 ## 相关文档
 
+- [子路径预览与静态资源](userapp-subpath-routing.md)：Vite dev/prod 路径配对、存量项目升级与真实进程回归
 - [架构总览](../architecture/overview.md)：UserApp 域的 crate 划分（app_manager / app-cli / workspace-manifest / file-server-userapp 等）
 - [gRPC 内部通信](../architecture/grpc.md)：rcoder 与构建/运行容器之间的通信基座

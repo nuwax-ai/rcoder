@@ -36,9 +36,22 @@ fn parses_service_port_identity_and_routes() {
     assert_eq!(service.health.readiness_path, "/ready");
     assert_eq!(service.proxy.as_ref().expect("proxy").path, "/api/go/");
     assert!(service.proxy.as_ref().unwrap().strip_prefix);
+    assert_eq!(service.proxy.as_ref().unwrap().dev_strip_prefix, None);
+    assert!(!toml::to_string(&lock).unwrap().contains("dev_strip_prefix"));
     assert_eq!(service.logs.len(), 1);
     assert_eq!(service.logs[0].id, "application");
     assert_eq!(service.run.command, vec!["./server".to_owned()]);
+}
+
+#[test]
+fn dev_proxy_override_survives_release_lock_roundtrip() {
+    let mut lock = load_fixture();
+    let proxy = lock.services[0].proxy.as_mut().unwrap();
+    proxy.dev_strip_prefix = Some(false);
+    let loaded = load_release_lock(&toml::to_string(&lock).unwrap()).unwrap();
+    let proxy = loaded.services[0].proxy.as_ref().unwrap();
+    assert!(!proxy.effective_strip_prefix(true));
+    assert!(proxy.effective_strip_prefix(false));
 }
 
 #[test]

@@ -19,7 +19,7 @@ pub enum Command {
     /// 构建 workspace 服务，不启动服务。
     Build(BuildArgs),
     /// 校验 manifest 并生成 release.lock.toml，不启动服务。
-    GenLock(WorkspaceArgs),
+    GenLock(GenLockArgs),
     /// 执行 supervisord 管理的服务 spec。
     RunService(RunServiceArgs),
     /// 部署 journal 运维（双权威域裁决等）。
@@ -51,6 +51,15 @@ pub struct WorkspaceArgs {
     /// 包含 workspace.manifest.toml 或 release.lock.toml 的工作区。
     #[arg(long, default_value = "/app/code", env = "APP_CLI_WORKSPACE")]
     pub workspace: PathBuf,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct GenLockArgs {
+    #[command(flatten)]
+    pub workspace: WorkspaceArgs,
+    /// 预览 devrun 对应的代理规则；锁文件同时保留 dev/prod 配置。
+    #[arg(long)]
+    pub dev: bool,
 }
 
 #[derive(Args, Debug, Clone)]

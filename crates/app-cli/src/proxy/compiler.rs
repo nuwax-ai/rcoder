@@ -17,17 +17,33 @@ pub struct CompileOutcome {
     pub expected_hash: String,
 }
 
+/// Capture the execution profile when orchestration starts. Proxy reload must
+/// use this profile, not a later request or the owner's startup environment.
+#[derive(Clone)]
+pub(crate) struct RuntimeProxyContext {
+    pub workspace: PathBuf,
+    pub dev_profile: bool,
+}
+
+pub(crate) fn runtime_root(log_root: &Path) -> PathBuf {
+    std::env::var_os("APP_CLI_PINGAP_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| log_root.join("pingap"))
+}
+
 pub async fn compile_and_validate(
     workspace: &Path,
     runtime_root: &Path,
     pingap_bin: &Path,
     release: &ReleaseLock,
+    dev_profile: bool,
 ) -> Result<CompileOutcome> {
     let runtime_layout_roots: Vec<PathBuf> = std::fs::canonicalize(runtime_root)
         .map(|root| vec![root])
         .unwrap_or_default();
     let (content, expected_hash) =
-        compile_effective_config_with_roots(workspace, release, &runtime_layout_roots).await?;
+        compile_effective_config_with_roots(workspace, release, &runtime_layout_roots, dev_profile)
+            .await?;
 
     let target_dir = runtime_root.join(&release.release_id);
     tokio::fs::create_dir_all(&target_dir)
@@ -81,8 +97,9 @@ pub async fn compile_and_validate(
 pub async fn compile_effective_config(
     workspace: &Path,
     release: &ReleaseLock,
+    dev_profile: bool,
 ) -> Result<(String, String)> {
-    compile_effective_config_with_roots(workspace, release, &[]).await
+    compile_effective_config_with_roots(workspace, release, &[], dev_profile).await
 }
 
 /// [`compile_effective_config`] 的可参数化核心（N02）：`extra_layout_roots`
@@ -92,6 +109,7 @@ pub async fn compile_effective_config_with_roots(
     workspace: &Path,
     release: &ReleaseLock,
     extra_layout_roots: &[PathBuf],
+    dev_profile: bool,
 ) -> Result<(String, String)> {
     let mut layout_roots: Vec<PathBuf> = Vec::new();
     if let Ok(canonical) = std::fs::canonicalize(workspace) {
@@ -99,8 +117,8 @@ pub async fn compile_effective_config_with_roots(
     }
     layout_roots.extend(extra_layout_roots.iter().cloned());
     let mut config = match release.pingap.mode {
-        PingapMode::Managed => managed_config(workspace, release)?,
-        PingapMode::Extend => compile_extend(workspace, release).await?,
+        PingapMode::Managed => managed_config(workspace, release, dev_profile)?,
+        PingapMode::Extend => compile_extend(workspace, release, dev_profile).await?,
         PingapMode::Custom => load_user_config(workspace, release).await?,
     };
     resolve_service_addresses(&mut config, release)?;
@@ -118,7 +136,11 @@ pub async fn compile_effective_config_with_roots(
     Ok((content, expected_hash))
 }
 
-fn managed_config(workspace: &Path, release: &ReleaseLock) -> Result<PingapConfig> {
+fn managed_config(
+    workspace: &Path,
+    release: &ReleaseLock,
+    dev_profile: bool,
+) -> Result<PingapConfig> {
     let entries: Vec<_> = release
         .services
         .iter()
@@ -126,11 +148,16 @@ fn managed_config(workspace: &Path, release: &ReleaseLock) -> Result<PingapConfi
         // （对齐 resolve_service_addresses 的 enabled 过滤先例）。
         .filter(|service| service.enabled)
         .filter_map(|service| {
-            service.proxy.as_ref().map(|proxy| ProxyEntry {
-                name: service.service_id.clone(),
-                port: service.port,
-                proxy: proxy.clone(),
-                health: service.health.readiness_path.clone(),
+            service.proxy.as_ref().map(|proxy| {
+                let mut proxy = proxy.clone();
+                proxy.strip_prefix =
+                    proxy.effective_strip_prefix(dev_profile && service.devrun.is_some());
+                ProxyEntry {
+                    name: service.service_id.clone(),
+                    port: service.port,
+                    proxy,
+                    health: service.health.readiness_path.clone(),
+                }
             })
         })
         .collect();
@@ -146,8 +173,12 @@ fn managed_config(workspace: &Path, release: &ReleaseLock) -> Result<PingapConfi
     PingapConfig::new(content.as_bytes(), true).context("parse managed Pingap config")
 }
 
-async fn compile_extend(workspace: &Path, release: &ReleaseLock) -> Result<PingapConfig> {
-    let mut managed = managed_config(workspace, release)?;
+async fn compile_extend(
+    workspace: &Path,
+    release: &ReleaseLock,
+    dev_profile: bool,
+) -> Result<PingapConfig> {
+    let mut managed = managed_config(workspace, release, dev_profile)?;
     let extension = load_user_config(workspace, release).await?;
     if !extension.servers.is_empty()
         || !extension.locations.is_empty()
@@ -516,8 +547,12 @@ format = "text"
 
     #[test]
     fn disabled_services_are_excluded_from_managed_config() {
-        let config = managed_config(&no_index_workspace(), &release_lock_with_disabled_proxy())
-            .expect("managed config compiles");
+        let config = managed_config(
+            &no_index_workspace(),
+            &release_lock_with_disabled_proxy(),
+            false,
+        )
+        .expect("managed config compiles");
         assert!(config.upstreams.contains_key("api"));
         assert!(
             !config.upstreams.contains_key("worker"),
@@ -533,7 +568,58 @@ format = "text"
             .services
             .retain(|service| service.service_id == "worker");
         // 唯一的 proxied 服务被禁用 → 无拓扑可编译，报错而非生成空配置。
-        assert!(managed_config(&no_index_workspace(), &release).is_err());
+        assert!(managed_config(&no_index_workspace(), &release, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn dev_proxy_override_applies_only_to_services_running_devrun() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut release = release_lock_with_disabled_proxy();
+        release.services.retain(|service| service.enabled);
+        let service = &mut release.services[0];
+        service.devrun = Some(workspace_manifest::DevrunSection {
+            command: vec!["vite".into()],
+        });
+        let proxy = service.proxy.as_mut().unwrap();
+        proxy.path = "/react".into();
+        proxy.strip_prefix = true;
+        proxy.dev_strip_prefix = Some(false);
+
+        // Exercise the shared compiler used by startup, reload and gen-lock.
+        for mode in [
+            workspace_manifest::PingapMode::Managed,
+            workspace_manifest::PingapMode::Extend,
+        ] {
+            release.pingap.mode = mode;
+            if release.pingap.mode == workspace_manifest::PingapMode::Extend {
+                std::fs::write(workspace.path().join("extension.toml"), "").unwrap();
+                release.pingap.config = Some("extension.toml".into());
+            }
+            for (dev, has_devrun, override_value, should_strip) in [
+                (true, true, Some(false), false),
+                (false, true, Some(false), true),
+                (true, false, Some(false), true),
+                (true, true, None, true),
+                (true, true, Some(true), true),
+            ] {
+                release.services[0].devrun =
+                    has_devrun.then(|| workspace_manifest::DevrunSection {
+                        command: vec!["vite".into()],
+                    });
+                release.services[0].proxy.as_mut().unwrap().dev_strip_prefix = override_value;
+                let (content, _) = super::compile_effective_config(workspace.path(), &release, dev)
+                    .await
+                    .unwrap();
+                let config = pingap_config::PingapConfig::new(content.as_bytes(), true).unwrap();
+                let location = &config.locations["apiLocation"];
+                assert_eq!(location.path.as_deref(), Some("/react"));
+                assert_eq!(
+                    location.rewrite.is_some(),
+                    should_strip,
+                    "dev={dev}, devrun={has_devrun}, override={override_value:?}"
+                );
+            }
+        }
     }
 
     #[test]
