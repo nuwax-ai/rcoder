@@ -13,6 +13,32 @@ use rcoder_e2e::common::report::JsonlReporter;
 use rcoder_e2e::common::{Env, TestUserGuard};
 use serde_json::json;
 
+/// Short UserApp dev compute regression: the same HTTP contract as Compose and
+/// host K8s, with Published host-port and workspace-mount evidence.
+#[tokio::test]
+async fn host_userapp_dev_compute_no_llm() {
+    use rcoder_e2e::common::{resources, userapp_compute, userapp_compute_docker::DockerDevProbe};
+    let scenario = "host_userapp_dev_compute_no_llm";
+    let Some((env, report)) = host_or_skip(scenario).await else {
+        return;
+    };
+    let case_id = std::env::var("E2E_CASE_ID").expect("strict case identity");
+    let app = format!("e2e{}", &case_id[..12]);
+    let mut probe = DockerDevProbe::new(true);
+    let _lifecycle =
+        userapp_compute::run_dev_compute_cycle(&env, &report, &app, &mut probe, true).await;
+    let cleanup = resources::cleanup_container(&format!("rcoder-app-builder-{app}"));
+    report.assert_hard(
+        "userapp owned resources purged",
+        cleanup.is_ok(),
+        format!("{cleanup:?}"),
+    );
+    assert!(
+        report.finish(),
+        "host Docker UserApp compute contract failed"
+    );
+}
+
 async fn post_json(
     env: &Env,
     path: &str,

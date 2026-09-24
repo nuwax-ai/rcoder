@@ -70,10 +70,14 @@ test-e2e-k8s:
 test-e2e-k8s-userapp:
 	python3 tests-e2e/tools/k8s_userapp.py --ssh "$(TEST_K8S_SSH)" --url "$(RCODER_URL)" --proxy-url "$(E2E_PINGORA_URL)"
 
-# deploy-host 宿主机形态严格 E2E（前置：make dev-host 已运行）
+# deploy-host 宿主机 Published 形态严格 E2E（前置：make dev-host-published 已运行）
 .PHONY: test-e2e-host
 test-e2e-host:
 	python3 tests-e2e/tools/run.py --group host
+
+.PHONY: test-e2e-host-userapp
+test-e2e-host-userapp:
+	E2E_FILTER=host_userapp_dev_compute_no_llm python3 tests-e2e/tools/run.py --group host
 
 # deploy-host Direct 直拨形态严格 E2E（前置：make dev-host-direct 已运行——
 # RCODER_DEPLOY_HOST_REACH=direct 的宿主机 rcoder；反向断言 fail-loud 模式门）
@@ -85,6 +89,10 @@ test-e2e-host-direct:
 .PHONY: test-e2e-host-k8s
 test-e2e-host-k8s:
 	python3 tests-e2e/tools/run.py --group host_k8s
+
+.PHONY: test-e2e-host-k8s-userapp
+test-e2e-host-k8s-userapp:
+	E2E_FILTER=host_k8s_userapp_dev_compute_no_llm python3 tests-e2e/tools/run.py --group host_k8s
 
 # e2e 可用性辅助：场景清单（含最近一次 verdict/耗时）/ 三份登记一致性秒级校验
 .PHONY: test-e2e-list test-e2e-check

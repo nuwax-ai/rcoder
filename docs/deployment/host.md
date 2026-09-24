@@ -44,6 +44,7 @@ CONTAINER_RUNTIME=kubernetes cargo run -p rcoder --bin rcoder --features kuberne
 | `RCODER_DEPLOY_HOST_NETWORK` | `rcoder-agent-network` | agent 容器网络（不存在自动创建） |
 | `RCODER_DEPLOY_HOST_REACH` | `auto` | 容器寻址模式：`direct`（容器 IP 直拨零发布）/ `published`（发布到宿主机）/ `auto`（按 socket 检测）；优先于 config `deploy_host.reach` |
 | `RCODER_BIND_HOST` | `127.0.0.1`（容器形态 `0.0.0.0`） | 主 HTTP 端口 bind 地址 |
+| `RCODER_PORT` | config 的 `port` | 与本地 Compose 同时运行时为宿主机实例指定独立 HTTP 端口 |
 | `DOCKER_SOCKET_PATH` | `/var/run/docker.sock` | OrbStack 备选 `$HOME/.orbstack/run/docker.sock` |
 | `RCODER_K8S_NAMESPACE` | `default` | K8s 形态 namespace |
 | `RCODER_K8S_STORAGE_CLASS` | `local-path`（容器形态 `rcoder-nfs`） | PVC storage class |
@@ -70,6 +71,22 @@ CONTAINER_RUNTIME=kubernetes cargo run -p rcoder --bin rcoder --features kuberne
 - docker.sock 等价 root：与容器内 rcoder 挂载 docker.sock 同等权限面，非新增风险，但宿主机形态感知更直接——默认只监听 `127.0.0.1` + api_key_auth 首启启用，不要在不受信网络上开放 `RCODER_BIND_HOST`。
 - 单租户单实例定位：多实例共写 `~/.rcoder` 属误用；desktop 与同机 rcoder server 占同一组端口，二选一。
 
+## 快速集成回归
+
+`tests-e2e` 复用一条不依赖 LLM 的 UserApp dev 业务流程：创建工作区、Stop、等待操作终态、Restart、核验原工作区数据和生命周期。运行环境分别核验 Docker 挂载与端口、K8s Pod 与 PVC 身份。Compose 的完整业务回归和远端 K8s 的 Helm/RBAC/多节点验收仍使用原入口。
+
+| RCoder 运行形态 | 先启动 | 聚焦 UserApp 计算场景 |
+| --- | --- | --- |
+| Docker Compose | `make dev-up` | `E2E_SUITE=compose_userapp E2E_FILTER=userapp_dev_compute_shared_contract make test-e2e-compose` |
+| macOS/Linux 宿主机 + Docker Published | `RCODER_PORT=<独立端口> make dev-host-published` | `RCODER_URL=http://127.0.0.1:<独立端口> make test-e2e-host-userapp` |
+| 宿主机 + 本地 K8s | `make dev-host-k8s`（按下述隔离环境配置） | `make test-e2e-host-k8s-userapp` |
+
+宿主机实例与 Compose 并行时，还须为 Pingora 和 file-server-proxy 分配独立监听端口；用独立 `RCODER_CONFIG_FILE` 与工作区映射，不共写当前 Compose 数据。宿主机 Docker 的 `host` 组要求 Published；OrbStack 的 `auto` 默认 Direct，应使用 `make dev-host-published`。原 `make test-e2e-host-direct` 检查 Direct 的普通 agent 寻址。
+
+本地 K8s 严格启动器要求显式导出 `KUBECONFIG`、本机 `RCODER_URL`、`TEST_K8S_NS` 与相同的 `RCODER_K8S_NAMESPACE`。namespace 必须是独立的 `rcoder-*`，测试期间所有 `kubectl` 均显式指定该 namespace。先按已有宿主机 K8s 前置准备 PG、resource limits 与工作区 PVC。UserApp 场景用专属 app ID；正常结束通过 RCoder 删除其测试数据，失败且结果未知时保留现场并报告残留，不直接删除 PVC。
+
+OrbStack 首次供卷和拉起 UserApp Pod 可能超过默认 90 秒。运行本地 K8s UserApp 场景前，可在启动宿主机 RCoder 时设 `RCODER_USERAPP_ENSURE_TIMEOUT_SECONDS=240`；测试 HTTP 预算为 300 秒。一次超时不代表后台创建已结束，应先查询该测试应用的生命周期与实际资源，再通过 RCoder 的删除入口收尾。
+
 ## K8s 形态三前置（`make dev-host-k8s`）
 
 K8s 形态（本地 kubeconfig 直连 OrbStack k3s 等）比 Docker 形态多三个前置，缺一会在启动或首个 agent 创建时 fail-fast：
@@ -87,5 +104,5 @@ agent 镜像：OrbStack 的 Docker 与 K8s **共享镜像仓库**——本地 `d
 - agent 容器 egress 在独立 bridge（`rcoder-agent-network`），无法解析 compose 环境服务名（如内网 LLM 网关）——LLM `base_url` 请配 IP/localhost。
 - K8s NodePort 段 30000-32767（共 2768 个），每 agent 6-9 个端口——本地开发可接受，长期多 agent 需固定段分配（roadmap）。
 - Direct 模式依赖容器网段从宿主机可路由——Docker Desktop（macOS）虚拟网络不可达，`auto` 检测会选 published；手动强制 direct 而 socket 特征未知时运行期连接失败可归因（注册表未登记→拨号回退 warn 日志）。
-- Published 模式下 builder 重启重建的替换容器无 port_bindings（既有缺口，发布丢失）——Direct 模式经重启刷新点登记新 IP，无此问题。
+- Published 模式下，builder 重启重建会重新发布所需端口并核对绑定；可用 `make test-e2e-host-userapp` 检查这一行为。Direct 模式在替换容器启动并取得新 IP 后更新登记。
 - app-cli 保持独立命令（npm `@nuwax-ai/app-cli` 自装）；宿主机形态 UserApp 编排仍在容器内，宿主机进程不需要 app-cli。

@@ -251,9 +251,33 @@ REQUIRED['host_agent_direct_lifecycle_no_llm'] = {
 
 
 REQUIRED['host_k8s_agent_lifecycle_no_llm'] = {
+    'host K8s explicit namespace',
     'host_k8s_pod_ensure_created',
     'host_k8s_service_nodeport_assigned',
     'host_k8s_nodeport_reachable',
     'host_k8s_ensure_idempotent_reuse',
     'host_k8s_owned_cleanup_reclaims',
+}
+
+USERAPP_COMPUTE = {
+    'userapp workspace created',
+    'userapp lifecycle identified',
+    'userapp physical workspace marked',
+    'userapp dev stop completed',
+    'userapp compute stopped with storage retained',
+    'userapp dev restart completed',
+    'userapp workspace and address survived restart',
+    'userapp lifecycle unchanged',
+    'userapp owned resources purged',
+}
+REQUIRED['userapp_dev_compute_shared_contract'] = USERAPP_COMPUTE | {
+    'userapp builder ownership recorded',
+}
+REQUIRED['host_userapp_dev_compute_no_llm'] = USERAPP_COMPUTE | {
+    'userapp builder ownership recorded',
+}
+REQUIRED['host_k8s_userapp_dev_compute_no_llm'] = USERAPP_COMPUTE | {
+    'host K8s explicit namespace',
+    'host K8s RCoder reachable',
+    'userapp K8s test resources absent after purge',
 }

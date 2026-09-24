@@ -82,6 +82,20 @@ After implementation freezes, run `python3 tests-e2e/tools/turso_compose_contrac
 
 冻结RCoder源码快照运行三份Compose配置验收时，可用 `E2E_BUILD_AGENT_DOCKER_ROOT` 指定另行冻结的镜像仓库配置目录，默认仍为RCoder相邻的build-agent-docker。该目录必须含两份原始Compose配置；应将其内容纳入本轮输入清单与指纹，不指向运行中会被修改的工作树。
 
+### 宿主机与 Compose 共用 UserApp 计算流程
+
+`userapp_dev_compute_shared_contract`（Compose）、`host_userapp_dev_compute_no_llm`（宿主机 Docker Published）与 `host_k8s_userapp_dev_compute_no_llm`（宿主机本地 K8s）共用 `tests-e2e/src/common/userapp_compute.rs` 的 HTTP 顺序与操作终态断言。物理探针分别验证 Docker 工作区挂载与所有 Published 端口、K8s Pod 换代与 PVC UID 保留。三个场景都不调用 LLM，也不构建七语言制品。
+
+```bash
+E2E_SUITE=compose_userapp E2E_FILTER=userapp_dev_compute_shared_contract make test-e2e-compose
+RCODER_URL=http://127.0.0.1:<宿主机独立端口> make test-e2e-host-userapp
+KUBECONFIG=<隔离 kubeconfig> TEST_K8S_NS=<rcoder-* namespace> RCODER_K8S_NAMESPACE=<同 namespace> RCODER_URL=http://127.0.0.1:<宿主机独立端口> make test-e2e-host-k8s-userapp
+```
+
+本地 K8s 启动器不运行 Docker 盘点和清理；它只在显式隔离 namespace 中清理归属本次测试的普通 agent 资源。UserApp 删除由 RCoder 完成；若操作结果未知，启动器报告残留供恢复，不绕过生命周期删除 PVC。远端 K8s 的 `make test-e2e-k8s-userapp` 继续覆盖 Helm 与真实集群拓扑，尚未与这条 Rust 宿主机场景合并。
+
+OrbStack 首次创建 UserApp PVC/Pod 可能超过默认 90 秒，运行前可给宿主机 RCoder 设置 `RCODER_USERAPP_ENSURE_TIMEOUT_SECONDS=240`（测试 HTTP 预算 300 秒）；详见 [宿主机部署说明](../../docs/deployment/host.md)。
+
 ### 手动 app-cli 与平台交替控制
 
 ```bash

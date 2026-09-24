@@ -10,6 +10,32 @@ use rcoder_e2e::common::Env;
 use rcoder_e2e::common::report::JsonlReporter;
 use serde_json::{Value, json};
 
+/// Same Stop → Restart business contract as the deploy-host Docker/K8s suites.
+/// Compose keeps its own container/network assertions in the existing suites.
+#[tokio::test]
+async fn userapp_dev_compute_shared_contract() {
+    use rcoder_e2e::common::{resources, userapp_compute, userapp_compute_docker::DockerDevProbe};
+    let scenario = "userapp_dev_compute_shared_contract";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    let case_id = std::env::var("E2E_CASE_ID").expect("strict case identity");
+    let app = format!("e2e{}", &case_id[..12]);
+    let mut probe = DockerDevProbe::new(false);
+    let _lifecycle =
+        userapp_compute::run_dev_compute_cycle(&env, &report, &app, &mut probe, true).await;
+    let cleanup = resources::cleanup_container(&format!("rcoder-app-builder-{app}"));
+    report.assert_hard(
+        "userapp owned resources purged",
+        cleanup.is_ok(),
+        format!("{cleanup:?}"),
+    );
+    assert!(
+        report.finish(),
+        "shared Compose UserApp compute contract failed"
+    );
+}
+
 /// HttpResult 包装的成功判定（success 字段 serde skip，判定用 code == "0000"）。
 fn http_ok(body: &Value) -> bool {
     body["code"].as_str() == Some("0000")

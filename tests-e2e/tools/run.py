@@ -408,6 +408,9 @@ def main():
             parser.error('--remote-k8s requires --group k8s')
         from remote_k8s_cleanup import validate
         validate(os.environ)
+    if args.group == 'host_k8s':
+        from local_k8s_cleanup import validate
+        validate(os.environ)
     suites = args.suite.split(',') if args.suite else GROUPS[args.group]
     known = set(sum(GROUPS.values(), []))
     if not suites or any(s not in known for s in suites):
@@ -424,7 +427,7 @@ def main():
     head = ORIGIN_HEAD or output('git', 'rev-parse', 'HEAD')
     manifest = {'run_id': run_id, 'head': head,
                 'worktree_sha256': source_fingerprint(),
-                'containers_before': [] if args.remote_k8s else container_identities(),
+                'containers_before': [] if args.remote_k8s or args.group == 'host_k8s' else container_identities(),
                 'remote_k8s': args.remote_k8s,
                 'suites': suites, 'filter': args.filter, 'planned': [], 'results': []}
     def persist():
@@ -443,7 +446,7 @@ def main():
     atexit.register(persist)
     persist()
     inventory = manifest['containers_before']
-    if not isinstance(inventory, list) and args.group != 'k8s':
+    if not isinstance(inventory, list) and args.group not in ('k8s', 'host_k8s'):
         manifest['infrastructure_error'] = 'Docker inventory unavailable before acceptance'
         return 2
     existing_ids = [json.loads(row.split()[0]) for row in inventory] if isinstance(inventory, list) else []
@@ -526,6 +529,9 @@ def main():
         if args.remote_k8s:
             from remote_k8s_cleanup import cleanup as remote_cleanup
             cleanup_action = lambda: remote_cleanup(case_id, run_id, case_dir, case_env)
+        elif args.group == 'host_k8s':
+            from local_k8s_cleanup import cleanup as local_cleanup
+            cleanup_action = lambda: local_cleanup(case_id, run_id, case_dir, case_env)
         else:
             cleanup_action = lambda: cleanup_case(case_id, run_id, case_dir, existing_ids)
         with (case_dir / 'process.log').open('w') as log:
@@ -541,7 +547,7 @@ def main():
                     errors.append(f'cleanup failed: {cleanup.name}')
             except (OSError, ValueError):
                 errors.append(f'unreadable cleanup evidence: {cleanup.name}')
-        manifest['containers_after'] = [] if args.remote_k8s else container_identities()
+        manifest['containers_after'] = [] if args.remote_k8s or args.group == 'host_k8s' else container_identities()
         if exit_code:
             errors.append(f'libtest exit {exit_code}')
         verdict = 'fail' if errors else 'pass'

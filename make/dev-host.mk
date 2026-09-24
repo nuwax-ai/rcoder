@@ -1,11 +1,11 @@
 # ============================================================================
-# deploy-host 宿主机运行形态（Phase 5；cargo feature，见 docs/deploy-host.md）
+# deploy-host 宿主机运行形态（Phase 5；cargo feature，见 docs/deployment/host.md）
 # ============================================================================
 # 形态定位：rcoder 直接跑在宿主机（Docker 必需 / K8s 可选），控制平面经
 # published-port 注册表触达 agent 容器/Pod；K8s NodePort 可指定节点 IP。
 # 默认目录 ~/.rcoder。
 
-.PHONY: dev-host dev-host-direct dev-host-k8s
+.PHONY: dev-host dev-host-published dev-host-direct dev-host-k8s
 
 # Docker 宿主机形态：本地 Docker（OrbStack/Docker Desktop）
 # - 默认落 ~/.rcoder/{config.yml,data,workspace,logs,agent-cache}（首启自动生成）
@@ -18,8 +18,14 @@ dev-host:
 	@echo "🚀 deploy-host 宿主机形态（Docker 运行时）..."
 	cargo run -p rcoder --bin rcoder --features deploy-host
 
+# Published 专项：Docker Desktop 或需要验证宿主端口重建时使用。
+# OrbStack 的 auto 默认是 Direct，测试 host 组前须显式使用此入口。
+dev-host-published:
+	@echo "🚀 deploy-host 宿主机形态（Docker Published）..."
+	RCODER_DEPLOY_HOST_REACH=published cargo run -p rcoder --bin rcoder --features deploy-host
+
 # Direct 直拨形态：容器零端口发布，注册表登记容器 IPv4 直拨
-# （e2e host_direct 套件的前置；详见 docs/deploy-host.md「端口行为」）
+# （e2e host_direct 套件的前置；详见 docs/deployment/host.md「端口行为」）
 dev-host-direct:
 	@echo "🚀 deploy-host 宿主机形态（Docker 运行时，Reach=direct 零端口发布）..."
 	RCODER_DEPLOY_HOST_REACH=direct cargo run -p rcoder --bin rcoder --features deploy-host
@@ -29,7 +35,7 @@ dev-host-direct:
 # - agent Service 自动 NodePort 化 + nodePort 读回注册表
 # - NodePort 未转发到宿主机 loopback 时设置 RCODER_K8S_NODE_IP，例如
 #   RCODER_K8S_NODE_IP=$(kubectl get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}') make dev-host-k8s
-# - 三前置（缺一 fail-fast，详见 docs/deploy-host.md「K8s 形态三前置」）：
+# - 三前置（缺一 fail-fast，详见 docs/deployment/host.md「K8s 形态三前置」）：
 #   ① userApp 控制面 PG（docker run postgres + RCODER_USERAPP_STORAGE_BACKEND=
 #      postgres RCODER_USERAPP_PG_URL=postgres://...@127.0.0.1:55432/userapp）
 #   ② ~/.rcoder/config.yml 的 kubernetes_config.services 配 resource_limits

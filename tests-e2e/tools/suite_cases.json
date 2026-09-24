@@ -30,7 +30,8 @@
     "two_turn_isolation_openai"
   ],
   "compose_userapp": [
-    "userapp_compose_regression"
+    "userapp_compose_regression",
+    "userapp_dev_compute_shared_contract"
   ],
   "compose_userapp_build_rules": [
     "userapp_build_no_lockfile_pnpm_install",
@@ -114,12 +115,14 @@
     "cpp_hmr_websocket"
   ],
   "host_docker_lifecycle": [
-    "host_agent_lifecycle_no_llm"
+    "host_agent_lifecycle_no_llm",
+    "host_userapp_dev_compute_no_llm"
   ],
   "host_docker_direct_lifecycle": [
     "host_agent_direct_lifecycle_no_llm"
   ],
   "host_k8s_lifecycle": [
-    "host_k8s_agent_lifecycle_no_llm"
+    "host_k8s_agent_lifecycle_no_llm",
+    "host_k8s_userapp_dev_compute_no_llm"
   ]
 }

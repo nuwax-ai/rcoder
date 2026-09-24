@@ -467,6 +467,12 @@
       "backend": "host"
     }
   ],
+  "host_userapp_dev_compute_no_llm": [
+    {
+      "scenario": "host_userapp_dev_compute_no_llm",
+      "backend": "host"
+    }
+  ],
   "host_agent_direct_lifecycle_no_llm": [
     {
       "scenario": "host_agent_direct_lifecycle_no_llm",
@@ -477,6 +483,18 @@
     {
       "scenario": "host_k8s_agent_lifecycle_no_llm",
       "backend": "host"
+    }
+  ],
+  "host_k8s_userapp_dev_compute_no_llm": [
+    {
+      "scenario": "host_k8s_userapp_dev_compute_no_llm",
+      "backend": "host"
+    }
+  ],
+  "userapp_dev_compute_shared_contract": [
+    {
+      "scenario": "userapp_dev_compute_shared_contract",
+      "backend": "compose"
     }
   ],
   "userapp_build_no_lockfile_pnpm_install": [
