@@ -25,11 +25,20 @@ pub(crate) async fn branch_create(
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let name = body.branch_name.clone();
     let sp = body.start_point.clone();
+    let author_name = state.config.git_default_author_name.clone();
+    let author_email = state.config.git_default_author_email.clone();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         let repo = git::ensure_repo(&path)?;
         git::ensure_gitignore(&path)?;
         // switch=true: 创建后立即 checkout (对齐 nuwax git.branch checkout:true)
-        git::create_branch(&repo, &name, sp.as_deref(), true)
+        git::create_branch(
+            &repo,
+            &name,
+            sp.as_deref(),
+            true,
+            &author_name,
+            &author_email,
+        )
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;

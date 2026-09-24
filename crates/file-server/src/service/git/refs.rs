@@ -10,7 +10,8 @@ use gix::actor::Signature;
 use gix::bstr::BString;
 use gix::date::{Time, parse::TimeBuf};
 use gix::object::Kind as ObjectKind;
-use gix::refs::transaction::PreviousValue;
+use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+use gix::refs::{FullName, Target};
 
 /// 创建分支 (对齐 nuwax createBranch; start_point 默认 HEAD)。
 /// `switch=true` 时创建后立即 checkout (对齐 nuwax `git.branch({ checkout: true })`):
@@ -20,6 +21,8 @@ pub fn create_branch(
     name: &str,
     start_point: Option<&str>,
     switch: bool,
+    author_name: &str,
+    author_email: &str,
 ) -> AppResult<()> {
     if switch {
         super::ops::clean_tree_check(repo)?;
@@ -30,7 +33,28 @@ pub fn create_branch(
         None => head_id_required(repo, "create branch without start_point")?,
     };
     let full = format!("refs/heads/{name}");
-    repo.reference(full, target, PreviousValue::MustNotExist, "create branch")
+    let reference_name = FullName::try_from(full.as_str())
+        .map_err(|e| map_git_err(e, "git branch reference name"))?;
+    let edit = RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: "create branch".into(),
+            },
+            expected: PreviousValue::MustNotExist,
+            new: Target::Object(target),
+        },
+        name: reference_name,
+        deref: false,
+    };
+    let committer = Signature {
+        name: BString::from(author_name),
+        email: BString::from(author_email),
+        time: Time::now_local_or_utc(),
+    };
+    let mut time_buf = TimeBuf::default();
+    repo.edit_references_as(std::iter::once(edit), Some(committer.to_ref(&mut time_buf)))
         .map_err(|e| map_git_err(e, "git reference (branch may already exist)"))?;
     if switch {
         super::ops::switch_branch(repo, name)?;
@@ -127,7 +151,8 @@ mod tests {
         crate::service::git::ensure_repo(dir.path()).expect("init unborn repo");
         let repo = open(dir.path()).expect("open repo");
 
-        let err = create_branch(&repo, "feature", None, false).expect_err("unborn 建分支必须报错");
+        let err = create_branch(&repo, "feature", None, false, "Test", "test@example.com")
+            .expect_err("unborn 建分支必须报错");
         let msg = system_message(&err);
         assert!(
             !msg.contains("does not have any commits"),
@@ -156,8 +181,15 @@ mod tests {
         stage_path(&repo, "a.txt").expect("stage v2");
         commit_indexed(&repo, "c2", "Test", "test@example.com").expect("commit c2");
 
-        create_branch(&repo, "feature", Some("HEAD~1"), false)
-            .expect("HEAD~1 start_point 必须可解析");
+        create_branch(
+            &repo,
+            "feature",
+            Some("HEAD~1"),
+            true,
+            "Test",
+            "test@example.com",
+        )
+        .expect("HEAD~1 start_point 必须可解析");
         let id = repo
             .find_reference("refs/heads/feature")
             .expect("branch exists")
@@ -165,12 +197,32 @@ mod tests {
             .detach()
             .to_string();
         assert_eq!(id, c1, "feature 应指向 HEAD~1 即 c1");
+        let reflog = std::fs::read_to_string(dir.path().join(".git/logs/refs/heads/feature"))
+            .expect("branch creation should write a reflog");
+        assert!(
+            reflog.contains("Test <test@example.com>"),
+            "branch reflog should use the configured committer: {reflog}"
+        );
 
-        let err = create_branch(&repo, "broken", Some("no-such-ref"), false)
-            .expect_err("缺 start_point 必须报错");
+        let err = create_branch(
+            &repo,
+            "broken",
+            Some("no-such-ref"),
+            false,
+            "Test",
+            "test@example.com",
+        )
+        .expect_err("缺 start_point 必须报错");
         assert!(matches!(err, AppError::System(..)), "{err:?}");
-        let err =
-            create_branch(&repo, "broken2", Some("HEAD~x"), false).expect_err("坏表达式必须报错");
+        let err = create_branch(
+            &repo,
+            "broken2",
+            Some("HEAD~x"),
+            false,
+            "Test",
+            "test@example.com",
+        )
+        .expect_err("坏表达式必须报错");
         assert!(matches!(err, AppError::Validation(..)), "{err:?}");
     }
 

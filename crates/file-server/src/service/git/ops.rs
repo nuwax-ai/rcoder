@@ -8,6 +8,9 @@
 use std::path::Path;
 
 use gix::Repository;
+use gix::actor::Signature;
+use gix::bstr::BString;
+use gix::date::{Time, parse::TimeBuf};
 use gix::hash::{ObjectId, oid};
 use gix::index::{entry::Stage, write::Options as IndexWriteOptions};
 use gix::path::from_bstr;
@@ -87,7 +90,13 @@ pub struct ResetOutcome {
 /// - 移动当前分支 ref → target
 /// - mixed/hard: 重建 index 为 target tree
 /// - hard: 额外重写 worktree (写 target 文件 + 删除 target 之外文件) + 补 .gitignore
-pub fn reset(repo: &Repository, target: &str, mode: ResetMode) -> AppResult<ResetOutcome> {
+pub fn reset(
+    repo: &Repository,
+    target: &str,
+    mode: ResetMode,
+    author_name: &str,
+    author_email: &str,
+) -> AppResult<ResetOutcome> {
     let target_id = resolve_rev_required(repo, target, "git reset target")?;
     // index_from_tree 需 tree id (非 commit id)
     let target_tree_id = repo
@@ -103,7 +112,7 @@ pub fn reset(repo: &Repository, target: &str, mode: ResetMode) -> AppResult<Rese
         .map_err(|e| map_git_err(e, "git head_tree_id_or_empty"))?
         .detach();
 
-    move_branch_ref(repo, target_id, "reset")?;
+    move_branch_ref(repo, target_id, "reset", author_name, author_email)?;
 
     match mode {
         ResetMode::Soft => {}
@@ -299,16 +308,42 @@ pub fn switch_branch(repo: &Repository, name: &str) -> AppResult<()> {
 
 /// 移动当前分支 ref → target_id (对齐 nuwax writeRef force=true)。
 /// HEAD 须是 symbolic (在某分支上); detached → BusinessError。
-fn move_branch_ref(repo: &Repository, target_id: ObjectId, log_msg: &str) -> AppResult<()> {
+fn move_branch_ref(
+    repo: &Repository,
+    target_id: ObjectId,
+    log_msg: &str,
+    author_name: &str,
+    author_email: &str,
+) -> AppResult<()> {
     let branch_full = repo
         .head_name()
         .ok()
         .flatten()
         .ok_or_else(|| AppError::business("cannot reset/checkout in detached HEAD state"))?;
-    let mut r = repo
+    let reference = repo
         .find_reference(branch_full.as_bstr())
         .map_err(|e| map_git_err(e, "git find_reference (current branch)"))?;
-    r.set_target_id(target_id, log_msg)
+    let previous_id = reference.id().detach();
+    let edit = RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: log_msg.into(),
+            },
+            expected: PreviousValue::MustExistAndMatch(Target::Object(previous_id)),
+            new: Target::Object(target_id),
+        },
+        name: branch_full,
+        deref: false,
+    };
+    let committer = Signature {
+        name: BString::from(author_name),
+        email: BString::from(author_email),
+        time: Time::now_local_or_utc(),
+    };
+    let mut time_buf = TimeBuf::default();
+    repo.edit_references_as(std::iter::once(edit), Some(committer.to_ref(&mut time_buf)))
         .map_err(|e| map_git_err(e, "git set_target_id"))?;
     Ok(())
 }
@@ -433,20 +468,41 @@ mod tests {
     #[test]
     fn reset_target_missing_is_explicit_and_bad_expression_is_validation() {
         let (_dir, repo, _c1, _c2) = fixture();
-        let err =
-            reset(&repo, "no-such-ref", ResetMode::Mixed).expect_err("缺 target 必须显式报错");
+        let err = reset(
+            &repo,
+            "no-such-ref",
+            ResetMode::Mixed,
+            "Test",
+            "test@example.com",
+        )
+        .expect_err("缺 target 必须显式报错");
         assert!(matches!(err, AppError::System(..)), "{err:?}");
-        let err = reset(&repo, "HEAD~x", ResetMode::Mixed).expect_err("坏表达式必须显式报错");
+        let err = reset(
+            &repo,
+            "HEAD~x",
+            ResetMode::Mixed,
+            "Test",
+            "test@example.com",
+        )
+        .expect_err("坏表达式必须显式报错");
         assert!(matches!(err, AppError::Validation(..)), "{err:?}");
     }
 
     #[test]
     fn reset_and_checkout_accept_revision_expression_targets() {
         let (dir, repo, c1, _c2) = fixture();
-        let out = reset(&repo, "HEAD~1", ResetMode::Soft).expect("HEAD~1 target 必须可解析");
+        let out = reset(&repo, "HEAD~1", ResetMode::Soft, "Test", "test@example.com")
+            .expect("HEAD~1 target 必须可解析");
         assert_eq!(out.previous_head.as_deref(), Some(_c2.as_str()));
         let head = repo.head_id().expect("head").detach().to_string();
         assert_eq!(head, c1, "soft reset 后 HEAD 应停在父提交");
+        let reflog = std::fs::read_to_string(dir.path().join(".git/logs/refs/heads/main"))
+            .expect("soft reset should write a branch reflog");
+        let reset_entry = reflog.lines().last().expect("reset reflog entry");
+        assert!(
+            reset_entry.contains("Test <test@example.com>") && reset_entry.ends_with("\treset"),
+            "reset reflog should use the configured committer and operation: {reset_entry}"
+        );
 
         checkout_tree(&repo, &c1[..7]).expect("短 hash checkout 必须可解析");
         assert_eq!(

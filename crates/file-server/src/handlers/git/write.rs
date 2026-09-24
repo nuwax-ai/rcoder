@@ -237,13 +237,15 @@ pub(crate) async fn reset(
     let target = body.target.clone();
     let mode = git::ResetMode::parse(&body.mode)?;
     let mode_label = mode.to_string();
+    let author_name = state.config.git_default_author_name.clone();
+    let author_email = state.config.git_default_author_email.clone();
     let outcome = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
         if !path.exists() {
             return Err(AppError::resource("workspace does not exist"));
         }
         let repo = git::ensure_repo(&path)?;
         git::ensure_gitignore(&path)?;
-        git::reset(&repo, &target, mode)
+        git::reset(&repo, &target, mode, &author_name, &author_email)
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
