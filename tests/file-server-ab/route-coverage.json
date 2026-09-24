@@ -269,6 +269,7 @@
       "suite": "core",
       "cases": [
         "computer-file-list-all",
+        "computer-file-list-boundary-fixtures",
         "computer-file-list-files-limited",
         "computer-file-list-empty-directories",
         "computer-file-list-subdirectory",
@@ -284,7 +285,8 @@
       "status": "covered",
       "suite": "core",
       "cases": [
-        "computer-file-meta"
+        "computer-file-meta",
+        "computer-file-meta-boundary"
       ]
     },
     {
@@ -349,7 +351,11 @@
       "status": "covered",
       "suite": "core",
       "cases": [
-        "computer-resolve-file-existing"
+        "computer-resolve-file-existing",
+        "computer-resolve-file-hidden",
+        "computer-resolve-file-symlink-inside",
+        "computer-resolve-file-symlink-outside-root",
+        "computer-resolve-file-path-traversal"
       ]
     },
     {
@@ -407,7 +413,20 @@
       "status": "covered",
       "suite": "git",
       "cases": [
-        "git-add-initial-files"
+        "git-add-initial-files",
+        "git-add-second-change",
+        "git-restage-second-change",
+        "git-branch-delete-seed-add-initial",
+        "git-revert-seed-add-initial",
+        "git-revert-seed-add-second",
+        "git-reset-mixed-seed-add-initial",
+        "git-reset-mixed-seed-add-second",
+        "git-reset-hard-seed-add-initial",
+        "git-reset-hard-seed-add-second",
+        "git-reset-soft-seed-add-initial",
+        "git-reset-soft-seed-add-second",
+        "git-checkout-seed-add-initial",
+        "git-discard-seed-add-initial"
       ]
     },
     {
@@ -451,7 +470,8 @@
       "status": "covered",
       "suite": "git",
       "cases": [
-        "git-list-branches"
+        "git-list-branches-after-create",
+        "git-list-branches-after-delete"
       ]
     },
     {
@@ -459,9 +479,11 @@
       "path": "/api/git/checkout",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-checkout-head"
+      ]
     },
     {
       "method": "POST",
@@ -471,7 +493,19 @@
       "status": "covered",
       "suite": "git",
       "cases": [
-        "git-commit-initial"
+        "git-commit-initial",
+        "git-commit-second",
+        "git-branch-delete-seed-commit-initial",
+        "git-revert-seed-commit-initial",
+        "git-revert-seed-commit-second",
+        "git-reset-mixed-seed-commit-initial",
+        "git-reset-mixed-seed-commit-second",
+        "git-reset-hard-seed-commit-initial",
+        "git-reset-hard-seed-commit-second",
+        "git-reset-soft-seed-commit-initial",
+        "git-reset-soft-seed-commit-second",
+        "git-checkout-seed-commit-initial",
+        "git-discard-seed-commit-initial"
       ]
     },
     {
@@ -479,18 +513,23 @@
       "path": "/api/git/diff",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-worktree-diff",
+        "git-staged-diff"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/git/discard",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-discard-all"
+      ]
     },
     {
       "method": "POST",
@@ -511,7 +550,14 @@
       "status": "covered",
       "suite": "git",
       "cases": [
-        "git-init"
+        "git-init",
+        "git-branch-delete-seed-init",
+        "git-revert-seed-init",
+        "git-reset-mixed-seed-init",
+        "git-reset-hard-seed-init",
+        "git-reset-soft-seed-init",
+        "git-checkout-seed-init",
+        "git-discard-seed-init"
       ]
     },
     {
@@ -530,18 +576,24 @@
       "path": "/api/git/reset",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-reset-mixed-to-first",
+        "git-reset-hard-to-first",
+        "git-reset-soft-to-first"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/git/revert",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-revert-to-initial"
+      ]
     },
     {
       "method": "GET",
@@ -552,7 +604,10 @@
       "suite": "git",
       "cases": [
         "git-status-before-first-commit",
-        "git-status-clean"
+        "git-status-clean",
+        "git-status-after-worktree-change",
+        "git-status-after-unstage",
+        "git-status-after-checkout"
       ]
     },
     {
@@ -593,9 +648,11 @@
       "path": "/api/git/unstage",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-unstage-new-file"
+      ]
     },
     {
       "method": "GET",

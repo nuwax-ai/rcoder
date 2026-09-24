@@ -41,7 +41,7 @@ Rust 与 TypeScript 镜像按顺序构建，避免两个依赖安装/编译任�
 - `manifest.json`：Rust/TS 源码身份、镜像 ID、Node/pnpm/Git 版本、运行架构、模板 ZIP 哈希、配置 profile 和规则文件哈希。
 - `requests.jsonl`：每个场景、每一侧的请求摘要、状态、选定响应头、耗时、完整响应哈希、原文引用或传输错误。
 - `bodies/`：请求与响应原文；单个文件最多保存 2 MiB，截断状态、完整字节数和完整 SHA-256 仍记录在 JSONL。
-- `state/`：请求执行前与结束后的两侧工作区树、文件内容摘要、权限与软链接。
+- `state/`：请求执行前与结束后的两侧工作区树、文件内容摘要、权限与软链接；`git`/`all` 另保存每个 fixture repo 的 HEAD、refs 对应 tree、index entries 和 porcelain 状态。
 - `diff.json`、`summary.md`：机器可读差异及人工可读总览；错误响应只归一化精确路径 `/error/requestId` 和 `/error/timestamp`，两侧原值仍保存在正文证据中。
 - `route-coverage.json`：TS/Rust 路由交集、已覆盖/待覆盖状态，以及本次选择的套件是否实际执行了对应场景。
 - `logs/compose.log`：Compose 服务日志。
@@ -57,7 +57,7 @@ Rust 与 TypeScript 镜像按顺序构建，避免两个依赖安装/编译任�
 ## 套件与覆盖边界
 
 - `core`：健康/API 版本、React/Vue 模板初始化与读取、项目文件更新、静态普通/Range 读取、Computer 文件列表/resolve/search/metadata 边界和基础文件系统操作。无 npm 外网依赖。
-- `git`：独立 pageApp 工作区内通过 HTTP 执行 init、status、add、commit、file-content、branch/tag、log，并比较 API 与最终工作树。Rust 使用 gix，TS 使用镜像内系统 Git。
+- `git`：通过 HTTP 对照 init、status、add、commit、file-content、branch create/delete、tag、log、worktree/staged diff、unstage、checkout、discard、revert，以及 mixed/hard/soft reset。每个会改变历史或工作树的流程使用独立 pageApp fixture，避免一个实现的失败污染其他场景；最终比较 refs 对应 tree、HEAD tree、index entries、工作区状态和文件树。Rust 服务使用 gix，TS 服务使用镜像内系统 Git；驱动只用系统 Git 读取最终仓库状态及准备对称 fixture，不参与被测 API 操作。
 - `build`：分别用两份模板走依赖安装、production build、产物静态读取、start-dev、真实页面 HTTP、keep-alive、restart-dev 和 stop-dev。依赖 registry 网络；报告记下环境版本与错误。
 - `all`：顺序执行以上套件。路由清单按当前 TypeScript 基线快照维护；没有 A/B 场景的共同路由明确标为 pending。
 

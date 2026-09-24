@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -157,10 +158,59 @@ struct SnapshotEntry {
 }
 
 #[derive(Debug, Serialize)]
+struct GitStateSnapshot {
+    repository_exists: bool,
+    head_reference: Option<String>,
+    head_tree: Option<String>,
+    refs: BTreeMap<String, String>,
+    index_entries: Vec<String>,
+    status_entries: Vec<String>,
+    capture_errors: Vec<String>,
+}
+
+#[derive(Debug)]
+struct GitScenario {
+    name: String,
+    project_id: String,
+    spec: RequestSpec,
+    preparation: Option<GitPreparation>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GitPreparation {
+    MainWorktreeChange,
+    SecondCommitChange,
+    CheckoutDirty,
+    DiscardDirty,
+    ResetHardDirty,
+    CreateDeleteBranch,
+}
+
+const GIT_PROJECT_MAIN: &str = "file-server-ab-git";
+const GIT_PROJECT_BRANCH_DELETE: &str = "file-server-ab-git-branch-delete";
+const GIT_PROJECT_REVERT: &str = "file-server-ab-git-revert";
+const GIT_PROJECT_RESET_MIXED: &str = "file-server-ab-git-reset-mixed";
+const GIT_PROJECT_RESET_HARD: &str = "file-server-ab-git-reset-hard";
+const GIT_PROJECT_RESET_SOFT: &str = "file-server-ab-git-reset-soft";
+const GIT_PROJECT_CHECKOUT: &str = "file-server-ab-git-checkout";
+const GIT_PROJECT_DISCARD: &str = "file-server-ab-git-discard";
+const GIT_PROJECT_IDS: &[&str] = &[
+    GIT_PROJECT_MAIN,
+    GIT_PROJECT_BRANCH_DELETE,
+    GIT_PROJECT_REVERT,
+    GIT_PROJECT_RESET_MIXED,
+    GIT_PROJECT_RESET_HARD,
+    GIT_PROJECT_RESET_SOFT,
+    GIT_PROJECT_CHECKOUT,
+    GIT_PROJECT_DISCARD,
+];
+
+#[derive(Debug, Serialize)]
 struct RunDiff {
     cases: Vec<CaseResult>,
     initial_state_differences: Vec<Difference>,
     state_differences: Vec<Difference>,
+    git_state_differences: Vec<Difference>,
     summary: Summary,
 }
 
@@ -314,8 +364,8 @@ async fn run_suite(options: RunOptions) -> Result<()> {
     prepare_computer_fixture(&rust_root)?;
     prepare_computer_fixture(&ts_root)?;
     if matches!(suite, Suite::Git | Suite::All) {
-        prepare_git_fixture(&rust_root)?;
-        prepare_git_fixture(&ts_root)?;
+        prepare_git_fixtures(&rust_root)?;
+        prepare_git_fixtures(&ts_root)?;
     }
 
     let fixture_hashes = hash_fixtures(&fixtures)?;
@@ -442,6 +492,7 @@ async fn run_suite(options: RunOptions) -> Result<()> {
             cases: Vec::new(),
             initial_state_differences: Vec::new(),
             state_differences: Vec::new(),
+            git_state_differences: Vec::new(),
             summary: Summary {
                 comparisons: 0,
                 equal: 0,
@@ -483,6 +534,7 @@ async fn run_suite(options: RunOptions) -> Result<()> {
             },
             initial_state_differences,
             state_differences: Vec::new(),
+            git_state_differences: Vec::new(),
         };
         write_json(&report_dir.join("diff.json"), &diff)?;
         write_summary(&report_dir.join("summary.md"), &run_id, &diff)?;
@@ -532,7 +584,11 @@ async fn run_suite(options: RunOptions) -> Result<()> {
     if matches!(suite, Suite::Git | Suite::All) {
         let mut rust_commit_hash = None;
         let mut ts_commit_hash = None;
-        for (case_name, spec) in git_scenarios()? {
+        for scenario in git_scenarios()? {
+            let case_name = scenario.name.as_str();
+            if let Some(preparation) = scenario.preparation {
+                prepare_git_scenario(preparation, &scenario.project_id, &rust_root, &ts_root)?;
+            }
             let (mut case, rust, ts) = run_pair_specs(
                 &client,
                 &report_dir,
@@ -540,12 +596,27 @@ async fn run_suite(options: RunOptions) -> Result<()> {
                 case_name,
                 &rust_url,
                 &ts_url,
-                &spec,
-                &spec,
+                &scenario.spec,
+                &scenario.spec,
             )
             .await?;
             match case_name {
                 "git-commit-initial" => {
+                    for (side, exchange, hash_slot) in [
+                        ("rust", &rust, &mut rust_commit_hash),
+                        ("typescript", &ts, &mut ts_commit_hash),
+                    ] {
+                        match validate_git_commit_response(&exchange.body) {
+                            Ok(hash) => *hash_slot = Some(hash),
+                            Err(error) => case.differences.push(assertion_difference(
+                                case_name,
+                                &format!("/assertions/{side}/commit"),
+                                error,
+                            )),
+                        }
+                    }
+                }
+                "git-commit-second" => {
                     for (side, exchange, hash_slot) in [
                         ("rust", &rust, &mut rust_commit_hash),
                         ("typescript", &ts, &mut ts_commit_hash),
@@ -623,15 +694,60 @@ async fn run_suite(options: RunOptions) -> Result<()> {
     write_json(&report_dir.join("state/rust.json"), &rust_state)?;
     write_json(&report_dir.join("state/typescript.json"), &ts_state)?;
     let mut state_differences = compare_snapshots(&rust_state, &ts_state)?;
+    let git_suite_ran = matches!(suite, Suite::Git | Suite::All);
+    let mut git_state_differences = Vec::new();
+    if git_suite_ran {
+        let mut rust_git_states = BTreeMap::new();
+        let mut ts_git_states = BTreeMap::new();
+        for project_id in GIT_PROJECT_IDS {
+            let rust_git_state =
+                snapshot_git_state(&rust_root.join("project-workspace").join(project_id))?;
+            let ts_git_state =
+                snapshot_git_state(&ts_root.join("project-workspace").join(project_id))?;
+            for (side, state) in [("rust", &rust_git_state), ("typescript", &ts_git_state)] {
+                if !state.repository_exists || !state.capture_errors.is_empty() {
+                    git_state_differences.push(assertion_difference(
+                        "git-state",
+                        &format!("/repositories/{project_id}/assertions/{side}/capture"),
+                        format!(
+                            "could not capture a complete Git state: repository_exists={}, errors={:?}",
+                            state.repository_exists, state.capture_errors
+                        ),
+                    ));
+                }
+            }
+            rust_git_states.insert(project_id.to_string(), rust_git_state);
+            ts_git_states.insert(project_id.to_string(), ts_git_state);
+        }
+        write_json(&report_dir.join("state/git-rust.json"), &rust_git_states)?;
+        write_json(
+            &report_dir.join("state/git-typescript.json"),
+            &ts_git_states,
+        )?;
+        let rust_json =
+            serde_json::to_value(&rust_git_states).context("serialize Rust Git state")?;
+        let ts_json =
+            serde_json::to_value(&ts_git_states).context("serialize TypeScript Git state")?;
+        json_differences(
+            "git-state",
+            "",
+            &rust_json,
+            &ts_json,
+            &[],
+            &mut git_state_differences,
+        );
+    }
     for case in &mut cases {
         apply_rules(&mut case.differences, &rules);
         case.equal = case.differences.is_empty();
     }
     apply_rules(&mut state_differences, &rules);
+    apply_rules(&mut git_state_differences, &rules);
 
     let equal = cases.iter().filter(|case| case.equal).count()
         + usize::from(initial_state_differences.is_empty())
-        + usize::from(state_differences.is_empty());
+        + usize::from(state_differences.is_empty())
+        + usize::from(git_suite_ran && git_state_differences.is_empty());
     let expected_differences = cases
         .iter()
         .flat_map(|case| &case.differences)
@@ -642,6 +758,10 @@ async fn run_suite(options: RunOptions) -> Result<()> {
             .filter(|difference| difference.accepted)
             .count()
         + initial_state_differences
+            .iter()
+            .filter(|difference| difference.accepted)
+            .count()
+        + git_state_differences
             .iter()
             .filter(|difference| difference.accepted)
             .count();
@@ -657,6 +777,10 @@ async fn run_suite(options: RunOptions) -> Result<()> {
         + initial_state_differences
             .iter()
             .filter(|difference| !difference.accepted)
+            .count()
+        + git_state_differences
+            .iter()
+            .filter(|difference| !difference.accepted)
             .count();
     let environment_errors = cases
         .iter()
@@ -665,7 +789,7 @@ async fn run_suite(options: RunOptions) -> Result<()> {
         .count();
     let diff = RunDiff {
         summary: Summary {
-            comparisons: cases.len() + 2,
+            comparisons: cases.len() + 2 + usize::from(git_suite_ran),
             equal,
             expected_differences,
             unclassified_differences,
@@ -676,6 +800,7 @@ async fn run_suite(options: RunOptions) -> Result<()> {
         cases,
         initial_state_differences,
         state_differences,
+        git_state_differences,
     };
     write_json(&report_dir.join("diff.json"), &diff)?;
     write_summary(&report_dir.join("summary.md"), &run_id, &diff)?;
@@ -746,6 +871,15 @@ fn core_scenarios() -> Result<Vec<(&'static str, RequestSpec)>> {
     // Separate fixture trees are created milliseconds apart. Compare every stable metadata
     // field and validate that both timestamps are present; preserve their raw values in bodies.
     file_meta.normalized_paths = vec!["/metas/0/mtimeMs".into(), "/metas/1/mtimeMs".into()];
+    let boundary_meta = json_request(
+        Method::POST,
+        "/api/computer/get-file-meta".to_string(),
+        json!({
+            "userId": user,
+            "cId": cid,
+            "filePaths": [".hidden.txt", "  中文文件 .txt  ", "binary.bin"]
+        }),
+    )?;
     let mut static_read =
         get("/api/page/static/file-server-ab-react/src/file-server-ab.txt".to_string());
     static_read.normalized_headers = vec!["etag".into(), "last-modified".into()];
@@ -818,6 +952,10 @@ fn core_scenarios() -> Result<Vec<(&'static str, RequestSpec)>> {
             get(format!("/api/computer/get-file-list?userId={user}&cId={cid}&proxyPath=%2Fproxy")),
         ),
         (
+            "computer-file-list-boundary-fixtures",
+            get(format!("/api/computer/get-file-list?userId={user}&cId={cid}&type=file&proxyPath=%2Fproxy")),
+        ),
+        (
             "computer-file-list-files-limited",
             get(format!("/api/computer/get-file-list?userId={user}&cId={cid}&type=file&limit=2")),
         ),
@@ -836,12 +974,41 @@ fn core_scenarios() -> Result<Vec<(&'static str, RequestSpec)>> {
             )),
         ),
         (
+            "computer-resolve-file-hidden",
+            get(format!(
+                "/api/computer/resolve-file?userId={user}&cId={cid}&filePath={}&proxyPath=%2Fproxy",
+                encode_query(".hidden.txt")
+            )),
+        ),
+        (
+            "computer-resolve-file-symlink-inside",
+            get(format!(
+                "/api/computer/resolve-file?userId={user}&cId={cid}&filePath={}&proxyPath=%2Fproxy",
+                encode_query("inside-link.txt")
+            )),
+        ),
+        (
+            "computer-resolve-file-symlink-outside-root",
+            get(format!(
+                "/api/computer/resolve-file?userId={user}&cId={cid}&filePath={}&proxyPath=%2Fproxy",
+                encode_query("outside-link.txt")
+            )),
+        ),
+        (
+            "computer-resolve-file-path-traversal",
+            get(format!(
+                "/api/computer/resolve-file?userId={user}&cId={cid}&filePath={}&proxyPath=%2Fproxy",
+                encode_query("../../file-server-ab-outside-secret.txt")
+            )),
+        ),
+        (
             "computer-search-files",
             get(format!(
                 "/api/computer/search-files?userId={user}&cId={cid}&kw=hello&limit=10&maxVisit=100&timeoutMs=1000"
             )),
         ),
         ("computer-file-meta", file_meta),
+        ("computer-file-meta-boundary", boundary_meta),
         (
             "computer-file-list-invalid-type",
             get_client_error(format!(
@@ -881,107 +1048,439 @@ fn core_scenarios() -> Result<Vec<(&'static str, RequestSpec)>> {
     ])
 }
 
-fn git_scenarios() -> Result<Vec<(&'static str, RequestSpec)>> {
-    let base = json!({
-        "workspaceType":"pageApp",
-        "projectId":"file-server-ab-git"
-    });
-    let mut git_log =
-        get_spec("/api/git/log?workspaceType=pageApp&projectId=file-server-ab-git&maxCount=10");
-    git_log.normalized_paths = vec!["/commits/0/hash".into(), "/commits/0/date".into()];
-    Ok(vec![
-        (
-            "git-init",
-            json_spec(Method::POST, "/api/git/init", base.clone())?,
-        ),
-        (
-            "git-status-before-first-commit",
-            get_spec("/api/git/status?workspaceType=pageApp&projectId=file-server-ab-git"),
-        ),
-        (
-            "git-add-initial-files",
-            json_spec(
+fn git_scenario(
+    name: impl Into<String>,
+    project_id: &str,
+    spec: RequestSpec,
+    preparation: Option<GitPreparation>,
+) -> GitScenario {
+    GitScenario {
+        name: name.into(),
+        project_id: project_id.to_string(),
+        spec,
+        preparation,
+    }
+}
+
+fn git_get(project_id: &str, route: &str) -> RequestSpec {
+    get_spec(format!(
+        "/api/git/{route}?workspaceType=pageApp&projectId={project_id}"
+    ))
+}
+
+fn git_json(project_id: &str, method: Method, path: &str, mut body: Value) -> Result<RequestSpec> {
+    let object = body
+        .as_object_mut()
+        .context("Git A/B request body must be an object")?;
+    object.insert("workspaceType".to_string(), json!("pageApp"));
+    object.insert("projectId".to_string(), json!(project_id));
+    json_spec(method, path, body)
+}
+
+fn append_git_seed(
+    scenarios: &mut Vec<GitScenario>,
+    project_id: &str,
+    prefix: &str,
+    second_commit: bool,
+) -> Result<()> {
+    scenarios.push(git_scenario(
+        format!("{prefix}-init"),
+        project_id,
+        git_json(project_id, Method::POST, "/api/git/init", json!({}))?,
+        None,
+    ));
+    scenarios.push(git_scenario(
+        format!("{prefix}-add-initial"),
+        project_id,
+        git_json(
+            project_id,
+            Method::POST,
+            "/api/git/add",
+            json!({"files":["README.md","src/index.html"]}),
+        )?,
+        None,
+    ));
+    scenarios.push(git_scenario(
+        format!("{prefix}-commit-initial"),
+        project_id,
+        git_json(
+            project_id,
+            Method::POST,
+            "/api/git/commit",
+            json!({
+                "message":"A/B initial commit",
+                "authorName":"File Server A-B",
+                "authorEmail":"ab@example.invalid"
+            }),
+        )?,
+        None,
+    ));
+    if second_commit {
+        scenarios.push(git_scenario(
+            format!("{prefix}-add-second"),
+            project_id,
+            git_json(
+                project_id,
                 Method::POST,
                 "/api/git/add",
-                json!({"workspaceType":"pageApp","projectId":"file-server-ab-git","files":["README.md","src/index.html"]}),
+                json!({"files":["README.md","src/new.txt"]}),
             )?,
-        ),
-        (
-            "git-commit-initial",
-            json_spec(
+            Some(GitPreparation::SecondCommitChange),
+        ));
+        scenarios.push(git_scenario(
+            format!("{prefix}-commit-second"),
+            project_id,
+            git_json(
+                project_id,
                 Method::POST,
                 "/api/git/commit",
                 json!({
-                    "workspaceType":"pageApp",
-                    "projectId":"file-server-ab-git",
+                    "message":"A/B second commit",
+                    "authorName":"File Server A-B",
+                    "authorEmail":"ab@example.invalid"
+                }),
+            )?,
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn git_scenarios() -> Result<Vec<GitScenario>> {
+    let main = GIT_PROJECT_MAIN;
+    let mut scenarios = vec![
+        git_scenario(
+            "git-init",
+            main,
+            git_json(main, Method::POST, "/api/git/init", json!({}))?,
+            None,
+        ),
+        git_scenario(
+            "git-status-before-first-commit",
+            main,
+            git_get(main, "status"),
+            None,
+        ),
+        git_scenario(
+            "git-add-initial-files",
+            main,
+            git_json(
+                main,
+                Method::POST,
+                "/api/git/add",
+                json!({"files":["README.md","src/index.html"]}),
+            )?,
+            None,
+        ),
+        git_scenario(
+            "git-commit-initial",
+            main,
+            git_json(
+                main,
+                Method::POST,
+                "/api/git/commit",
+                json!({
                     "message":"A/B initial commit",
                     "authorName":"File Server A-B",
                     "authorEmail":"ab@example.invalid"
                 }),
             )?,
+            None,
         ),
-        (
-            "git-status-clean",
-            get_spec("/api/git/status?workspaceType=pageApp&projectId=file-server-ab-git"),
-        ),
-        (
+        git_scenario("git-status-clean", main, git_get(main, "status"), None),
+        git_scenario(
             "git-read-head-file",
-            json_spec(
+            main,
+            git_json(
+                main,
                 Method::POST,
                 "/api/git/file-content",
-                json!({"workspaceType":"pageApp","projectId":"file-server-ab-git","filePath":"src/index.html","ref":"HEAD"}),
+                json!({"filePath":"src/index.html","ref":"HEAD"}),
             )?,
+            None,
         ),
-        (
-            "git-create-branch",
-            json_spec(
-                Method::POST,
-                "/api/git/branch-create",
-                json!({"workspaceType":"pageApp","projectId":"file-server-ab-git","branchName":"ab-review"}),
-            )?,
-        ),
-        (
-            "git-list-branches",
-            get_spec("/api/git/branches?workspaceType=pageApp&projectId=file-server-ab-git"),
-        ),
-        (
-            "git-switch-main",
-            json_spec(
-                Method::POST,
-                "/api/git/branch-switch",
-                json!({"workspaceType":"pageApp","projectId":"file-server-ab-git","branchName":"main"}),
-            )?,
-        ),
-        (
-            "git-create-tag",
-            json_spec(
-                Method::POST,
-                "/api/git/tag-create",
-                json!({"workspaceType":"pageApp","projectId":"file-server-ab-git","tagName":"ab-v1","message":"A/B baseline tag"}),
-            )?,
-        ),
-        (
-            "git-list-tags",
-            get_spec("/api/git/tags?workspaceType=pageApp&projectId=file-server-ab-git"),
-        ),
-        (
-            "git-delete-tag",
-            json_spec(
-                Method::POST,
-                "/api/git/tag-delete",
-                json!({"workspaceType":"pageApp","projectId":"file-server-ab-git","tagName":"ab-v1"}),
-            )?,
-        ),
-        (
-            "git-delete-branch",
-            json_spec(
-                Method::POST,
-                "/api/git/branch-delete",
-                json!({"workspaceType":"pageApp","projectId":"file-server-ab-git","branchName":"ab-review"}),
-            )?,
-        ),
-        ("git-log", git_log),
-    ])
+    ];
+
+    let branch_list = git_get(main, "branches");
+    scenarios.push(git_scenario(
+        "git-create-branch",
+        main,
+        git_json(
+            main,
+            Method::POST,
+            "/api/git/branch-create",
+            json!({"branchName":"ab-review"}),
+        )?,
+        None,
+    ));
+    scenarios.push(git_scenario(
+        "git-list-branches-after-create",
+        main,
+        branch_list,
+        None,
+    ));
+    scenarios.push(git_scenario(
+        "git-switch-main",
+        main,
+        git_json(
+            main,
+            Method::POST,
+            "/api/git/branch-switch",
+            json!({"branchName":"main"}),
+        )?,
+        None,
+    ));
+    scenarios.push(git_scenario(
+        "git-create-tag",
+        main,
+        git_json(
+            main,
+            Method::POST,
+            "/api/git/tag-create",
+            json!({"tagName":"ab-v1","message":"A/B baseline tag"}),
+        )?,
+        None,
+    ));
+    scenarios.push(git_scenario(
+        "git-list-tags",
+        main,
+        git_get(main, "tags"),
+        None,
+    ));
+    scenarios.push(git_scenario(
+        "git-delete-tag",
+        main,
+        git_json(
+            main,
+            Method::POST,
+            "/api/git/tag-delete",
+            json!({"tagName":"ab-v1"}),
+        )?,
+        None,
+    ));
+
+    scenarios.push(git_scenario(
+        "git-status-after-worktree-change",
+        main,
+        git_get(main, "status"),
+        Some(GitPreparation::MainWorktreeChange),
+    ));
+    scenarios.push(git_scenario(
+        "git-worktree-diff",
+        main,
+        git_json(
+            main,
+            Method::POST,
+            "/api/git/diff",
+            json!({"source":"worktree"}),
+        )?,
+        None,
+    ));
+    scenarios.push(git_scenario(
+        "git-add-second-change",
+        main,
+        git_json(
+            main,
+            Method::POST,
+            "/api/git/add",
+            json!({"files":["README.md","src/new.txt"]}),
+        )?,
+        None,
+    ));
+    scenarios.push(git_scenario(
+        "git-staged-diff",
+        main,
+        git_json(
+            main,
+            Method::POST,
+            "/api/git/diff",
+            json!({"source":"staged"}),
+        )?,
+        None,
+    ));
+    scenarios.push(git_scenario(
+        "git-unstage-new-file",
+        main,
+        git_json(
+            main,
+            Method::POST,
+            "/api/git/unstage",
+            json!({"files":["src/new.txt"]}),
+        )?,
+        None,
+    ));
+    scenarios.push(git_scenario(
+        "git-status-after-unstage",
+        main,
+        git_get(main, "status"),
+        None,
+    ));
+    scenarios.push(git_scenario(
+        "git-restage-second-change",
+        main,
+        git_json(
+            main,
+            Method::POST,
+            "/api/git/add",
+            json!({"files":["README.md","src/new.txt"]}),
+        )?,
+        None,
+    ));
+    scenarios.push(git_scenario(
+        "git-commit-second",
+        main,
+        git_json(
+            main,
+            Method::POST,
+            "/api/git/commit",
+            json!({
+                "message":"A/B second commit",
+                "authorName":"File Server A-B",
+                "authorEmail":"ab@example.invalid"
+            }),
+        )?,
+        None,
+    ));
+    let mut git_log = get_spec(format!(
+        "/api/git/log?workspaceType=pageApp&projectId={main}&maxCount=10"
+    ));
+    git_log.normalized_paths = vec![
+        "/commits/0/hash".into(),
+        "/commits/0/date".into(),
+        "/commits/1/hash".into(),
+        "/commits/1/date".into(),
+    ];
+    scenarios.push(git_scenario("git-log", main, git_log, None));
+
+    let branch_delete = GIT_PROJECT_BRANCH_DELETE;
+    append_git_seed(
+        &mut scenarios,
+        branch_delete,
+        "git-branch-delete-seed",
+        false,
+    )?;
+    scenarios.push(git_scenario(
+        "git-delete-branch",
+        branch_delete,
+        git_json(
+            branch_delete,
+            Method::POST,
+            "/api/git/branch-delete",
+            json!({"branchName":"ab-review"}),
+        )?,
+        Some(GitPreparation::CreateDeleteBranch),
+    ));
+    scenarios.push(git_scenario(
+        "git-list-branches-after-delete",
+        branch_delete,
+        git_get(branch_delete, "branches"),
+        None,
+    ));
+
+    let revert = GIT_PROJECT_REVERT;
+    append_git_seed(&mut scenarios, revert, "git-revert-seed", true)?;
+    let mut revert_spec = git_json(
+        revert,
+        Method::POST,
+        "/api/git/revert",
+        json!({
+            "target":"HEAD~1",
+            "message":"A/B revert to initial tree",
+            "authorName":"File Server A-B",
+            "authorEmail":"ab@example.invalid"
+        }),
+    )?;
+    revert_spec.normalized_paths = vec!["/commit".into(), "/target".into(), "/previousHead".into()];
+    scenarios.push(git_scenario(
+        "git-revert-to-initial",
+        revert,
+        revert_spec,
+        None,
+    ));
+
+    let reset_mixed = GIT_PROJECT_RESET_MIXED;
+    append_git_seed(&mut scenarios, reset_mixed, "git-reset-mixed-seed", true)?;
+    let mut reset_mixed_spec = git_json(
+        reset_mixed,
+        Method::POST,
+        "/api/git/reset",
+        json!({"target":"HEAD~1","mode":"mixed"}),
+    )?;
+    reset_mixed_spec.normalized_paths = vec!["/previousHead".into()];
+    scenarios.push(git_scenario(
+        "git-reset-mixed-to-first",
+        reset_mixed,
+        reset_mixed_spec,
+        None,
+    ));
+
+    let reset_hard = GIT_PROJECT_RESET_HARD;
+    append_git_seed(&mut scenarios, reset_hard, "git-reset-hard-seed", true)?;
+    let mut reset_hard_spec = git_json(
+        reset_hard,
+        Method::POST,
+        "/api/git/reset",
+        json!({"target":"HEAD~1","mode":"hard"}),
+    )?;
+    reset_hard_spec.normalized_paths = vec!["/previousHead".into()];
+    scenarios.push(git_scenario(
+        "git-reset-hard-to-first",
+        reset_hard,
+        reset_hard_spec,
+        Some(GitPreparation::ResetHardDirty),
+    ));
+
+    let reset_soft = GIT_PROJECT_RESET_SOFT;
+    append_git_seed(&mut scenarios, reset_soft, "git-reset-soft-seed", true)?;
+    let mut reset_soft_spec = git_json(
+        reset_soft,
+        Method::POST,
+        "/api/git/reset",
+        json!({"target":"HEAD~1","mode":"soft"}),
+    )?;
+    reset_soft_spec.normalized_paths = vec!["/previousHead".into()];
+    scenarios.push(git_scenario(
+        "git-reset-soft-to-first",
+        reset_soft,
+        reset_soft_spec,
+        None,
+    ));
+
+    let checkout = GIT_PROJECT_CHECKOUT;
+    append_git_seed(&mut scenarios, checkout, "git-checkout-seed", false)?;
+    scenarios.push(git_scenario(
+        "git-checkout-head",
+        checkout,
+        git_json(
+            checkout,
+            Method::POST,
+            "/api/git/checkout",
+            json!({"target":"HEAD"}),
+        )?,
+        Some(GitPreparation::CheckoutDirty),
+    ));
+    scenarios.push(git_scenario(
+        "git-status-after-checkout",
+        checkout,
+        git_get(checkout, "status"),
+        None,
+    ));
+
+    let discard = GIT_PROJECT_DISCARD;
+    append_git_seed(&mut scenarios, discard, "git-discard-seed", false)?;
+    scenarios.push(git_scenario(
+        "git-discard-all",
+        discard,
+        git_json(
+            discard,
+            Method::POST,
+            "/api/git/discard",
+            json!({"files":[]}),
+        )?,
+        Some(GitPreparation::DiscardDirty),
+    ));
+
+    Ok(scenarios)
 }
 
 fn json_spec(method: Method, path: &str, body: Value) -> Result<RequestSpec> {
@@ -1018,11 +1517,83 @@ fn get_spec(path: impl Into<String>) -> RequestSpec {
     }
 }
 
-fn prepare_git_fixture(root: &Path) -> Result<()> {
-    let project = root.join("project-workspace/file-server-ab-git");
-    fs::create_dir_all(project.join("src"))?;
-    fs::write(project.join("README.md"), "Git A/B fixture\n")?;
-    fs::write(project.join("src/index.html"), "<main>Git fixture</main>\n")?;
+fn prepare_git_fixtures(root: &Path) -> Result<()> {
+    for project_id in GIT_PROJECT_IDS {
+        let project = root.join("project-workspace").join(project_id);
+        fs::create_dir_all(project.join("src"))
+            .with_context(|| format!("create Git fixture directory {}", project.display()))?;
+        fs::write(project.join("README.md"), "Git A/B fixture\n")
+            .with_context(|| format!("write Git fixture README in {}", project.display()))?;
+        fs::write(project.join("src/index.html"), "<main>Git fixture</main>\n")
+            .with_context(|| format!("write Git fixture entry in {}", project.display()))?;
+    }
+    Ok(())
+}
+
+fn prepare_git_scenario(
+    preparation: GitPreparation,
+    project_id: &str,
+    rust_root: &Path,
+    ts_root: &Path,
+) -> Result<()> {
+    for root in [rust_root, ts_root] {
+        let project = root.join("project-workspace").join(project_id);
+        match preparation {
+            GitPreparation::MainWorktreeChange | GitPreparation::SecondCommitChange => {
+                fs::write(project.join("README.md"), "Git A/B fixture changed\n")?;
+                fs::write(project.join("src/new.txt"), "new staged fixture\n")?;
+            }
+            GitPreparation::CheckoutDirty => {
+                fs::write(project.join("README.md"), "dirty before checkout\n")?;
+                fs::write(
+                    project.join("checkout-extra.txt"),
+                    "checkout keeps unrelated file\n",
+                )?;
+            }
+            GitPreparation::DiscardDirty => {
+                fs::write(project.join("README.md"), "dirty before discard\n")?;
+                fs::write(
+                    project.join("discard-extra.txt"),
+                    "discard removes untracked file\n",
+                )?;
+            }
+            GitPreparation::ResetHardDirty => {
+                fs::write(project.join("README.md"), "dirty before hard reset\n")?;
+                fs::write(
+                    project.join("reset-extra.txt"),
+                    "hard reset removes untracked file\n",
+                )?;
+            }
+            GitPreparation::CreateDeleteBranch => {
+                run_git_fixture_command(&project, &["branch", "ab-review"])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_git_fixture_command(project: &Path, args: &[&str]) -> Result<()> {
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(project)
+        .args(args)
+        .output()
+        .with_context(|| {
+            format!(
+                "start git {} for fixture {}",
+                args.join(" "),
+                project.display()
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed for fixture {} with {}: {}",
+            args.join(" "),
+            project.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
     Ok(())
 }
 
@@ -1405,14 +1976,14 @@ fn validate_git_log_response(body: &[u8]) -> Result<String, String> {
     if value.get("success").and_then(Value::as_bool) != Some(true) {
         return Err("git log response must contain success=true".into());
     }
-    if value.get("total").and_then(Value::as_u64) != Some(1) {
-        return Err("git log should return exactly the single fixture commit".into());
+    if value.get("total").and_then(Value::as_u64) != Some(2) {
+        return Err("git log should return the two fixture commits".into());
     }
     let commits = value
         .get("commits")
         .and_then(Value::as_array)
-        .filter(|commits| commits.len() == 1)
-        .ok_or_else(|| "git log should contain one commit entry".to_string())?;
+        .filter(|commits| commits.len() == 2)
+        .ok_or_else(|| "git log should contain two commit entries".to_string())?;
     let commit = &commits[0];
     let hash = commit
         .get("hash")
@@ -1427,14 +1998,37 @@ fn validate_git_log_response(body: &[u8]) -> Result<String, String> {
         .ok_or_else(|| "git log entry must contain date".to_string())?;
     chrono::DateTime::parse_from_rfc3339(date)
         .map_err(|error| format!("git log date must be RFC 3339: {error}"))?;
-    if commit.get("author_name").and_then(Value::as_str) != Some("File Server A-B")
-        || commit.get("author_email").and_then(Value::as_str) != Some("ab@example.invalid")
-        || commit
-            .get("message")
-            .and_then(Value::as_str)
-            .is_none_or(str::is_empty)
+    for (index, expected_message) in ["A/B second commit", "A/B initial commit"]
+        .into_iter()
+        .enumerate()
     {
-        return Err("git log entry is missing the fixture author or message".into());
+        let entry = &commits[index];
+        let entry_hash = entry
+            .get("hash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("git log entry {index} must contain hash"))?;
+        if entry_hash.len() != 40 || !entry_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!(
+                "git log entry {index} must contain a full 40-digit SHA-1 hash"
+            ));
+        }
+        let date = entry
+            .get("date")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("git log entry {index} must contain date"))?;
+        chrono::DateTime::parse_from_rfc3339(date)
+            .map_err(|error| format!("git log entry {index} date must be RFC 3339: {error}"))?;
+        if entry.get("author_name").and_then(Value::as_str) != Some("File Server A-B")
+            || entry.get("author_email").and_then(Value::as_str) != Some("ab@example.invalid")
+            || entry
+                .get("message")
+                .and_then(Value::as_str)
+                .is_none_or(|message| message.trim_end_matches('\n') != expected_message)
+        {
+            return Err(format!(
+                "git log entry {index} must contain the fixture author and message {expected_message:?}"
+            ));
+        }
     }
     Ok(hash.to_string())
 }
@@ -2010,6 +2604,133 @@ fn snapshot_roots(root: &Path) -> Result<Vec<SnapshotEntry>> {
     Ok(entries)
 }
 
+fn snapshot_git_state(repo_root: &Path) -> Result<GitStateSnapshot> {
+    let repository_exists = repo_root.join(".git").exists();
+    let mut snapshot = GitStateSnapshot {
+        repository_exists,
+        head_reference: None,
+        head_tree: None,
+        refs: BTreeMap::new(),
+        index_entries: Vec::new(),
+        status_entries: Vec::new(),
+        capture_errors: Vec::new(),
+    };
+    if !repository_exists {
+        snapshot
+            .capture_errors
+            .push("Git worktree has no .git entry".to_string());
+        return Ok(snapshot);
+    }
+
+    if let Some(bytes) = capture_git_command(
+        repo_root,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        &mut snapshot.capture_errors,
+    ) {
+        snapshot.head_reference = String::from_utf8_lossy(&bytes).trim().to_string().into();
+    }
+    if let Some(bytes) = capture_git_command(
+        repo_root,
+        &["rev-parse", "--verify", "HEAD^{tree}"],
+        &mut snapshot.capture_errors,
+    ) {
+        snapshot.head_tree = String::from_utf8_lossy(&bytes).trim().to_string().into();
+    }
+    if let Some(bytes) = capture_git_command(
+        repo_root,
+        &["for-each-ref", "--format=%(refname)"],
+        &mut snapshot.capture_errors,
+    ) {
+        for reference in String::from_utf8_lossy(&bytes).lines() {
+            if reference.is_empty() {
+                continue;
+            }
+            let revision = format!("{reference}^{{tree}}");
+            let args = ["rev-parse", "--verify", revision.as_str()];
+            if let Some(tree) = capture_git_command(repo_root, &args, &mut snapshot.capture_errors)
+            {
+                snapshot.refs.insert(
+                    reference.to_string(),
+                    String::from_utf8_lossy(&tree).trim().to_string(),
+                );
+            }
+        }
+    }
+    if let Some(bytes) = capture_git_command(
+        repo_root,
+        &["ls-files", "--stage", "-z"],
+        &mut snapshot.capture_errors,
+    ) {
+        snapshot.index_entries = git_index_records(&bytes);
+    }
+    if let Some(bytes) = capture_git_command(
+        repo_root,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        &mut snapshot.capture_errors,
+    ) {
+        snapshot.status_entries = nul_records(&bytes);
+        snapshot.status_entries.sort();
+    }
+    Ok(snapshot)
+}
+
+fn capture_git_command(
+    repo_root: &Path,
+    args: &[&str],
+    errors: &mut Vec<String>,
+) -> Option<Vec<u8>> {
+    let output = match ProcessCommand::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            errors.push(format!("git {} could not start: {error}", args.join(" ")));
+            return None;
+        }
+    };
+    if output.status.success() {
+        Some(output.stdout)
+    } else {
+        errors.push(format!(
+            "git {} exited with {}: {}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+        None
+    }
+}
+
+fn nul_records(bytes: &[u8]) -> Vec<String> {
+    bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .map(|record| String::from_utf8_lossy(record).into_owned())
+        .collect()
+}
+
+fn git_index_records(bytes: &[u8]) -> Vec<String> {
+    let mut entries = bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .map(
+            |record| match record.iter().position(|byte| *byte == b'\t') {
+                Some(separator) => format!(
+                    "{}\t{}",
+                    String::from_utf8_lossy(&record[separator + 1..]),
+                    String::from_utf8_lossy(&record[..separator])
+                ),
+                None => String::from_utf8_lossy(record).into_owned(),
+            },
+        )
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
+}
+
 fn snapshot_dir(root: &Path, dir: &Path, entries: &mut Vec<SnapshotEntry>) -> Result<()> {
     let mut children = fs::read_dir(dir)
         .with_context(|| format!("read workspace directory {}", dir.display()))?
@@ -2063,6 +2784,7 @@ fn snapshot_dir(root: &Path, dir: &Path, entries: &mut Vec<SnapshotEntry>) -> Re
 }
 
 fn prepare_computer_fixture(root: &Path) -> Result<()> {
+    let workspace = root.join("computer-workspace");
     let dir = root
         .join("computer-workspace")
         .join(CASE_USER)
@@ -2075,6 +2797,23 @@ fn prepare_computer_fixture(root: &Path) -> Result<()> {
         dir.join("  spaced name.txt  "),
         "spaces are part of the file name\n",
     )?;
+    fs::write(dir.join(".hidden.txt"), "hidden fixture\n")?;
+    fs::write(dir.join("  中文文件 .txt  "), "unicode and edge spaces\n")?;
+    fs::write(dir.join("binary.bin"), [0, 1, 2, 13, 10, 127, 255])?;
+    fs::write(
+        workspace.join("file-server-ab-outside-secret.txt"),
+        "must remain outside the selected session root\n",
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        symlink("sub/nested/hello.txt", dir.join("inside-link.txt"))?;
+        symlink(
+            "../../file-server-ab-outside-secret.txt",
+            dir.join("outside-link.txt"),
+        )?;
+    }
     Ok(())
 }
 
@@ -2199,6 +2938,14 @@ fn write_summary(path: &Path, run_id: &str, diff: &RunDiff) -> Result<()> {
         writeln!(summary, "No file-tree differences.")?;
     } else {
         for difference in &diff.state_differences {
+            writeln!(summary, "- `{}` `{}`", difference.path, difference.kind)?;
+        }
+    }
+    writeln!(summary, "\n## Git ref, index and status differences\n")?;
+    if diff.git_state_differences.is_empty() {
+        writeln!(summary, "No captured Git-state differences.")?;
+    } else {
+        for difference in &diff.git_state_differences {
             writeln!(summary, "- `{}` `{}`", difference.path, difference.kind)?;
         }
     }
@@ -2517,5 +3264,20 @@ mod tests {
         assert_eq!(differences.len(), 1);
         assert_eq!(differences[0].path, "/files/$order");
         assert_eq!(differences[0].kind, "array_order");
+    }
+
+    #[test]
+    fn git_index_entries_are_ordered_by_path_not_object_id() {
+        let entries = git_index_records(
+            b"100644 ffffffffffffffffffffffffffffffffffffffff 0\tz.txt\0\
+              100644 0000000000000000000000000000000000000000 0\ta.txt\0",
+        );
+        assert_eq!(
+            entries,
+            [
+                "a.txt\t100644 0000000000000000000000000000000000000000 0",
+                "z.txt\t100644 ffffffffffffffffffffffffffffffffffffffff 0"
+            ]
+        );
     }
 }
