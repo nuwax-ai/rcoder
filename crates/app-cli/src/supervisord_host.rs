@@ -168,12 +168,11 @@ impl SupervisordHost {
             );
         }
 
-        // 2.6 static 服务托管（无进程——内置静态承载于 lock 端口；幂等，热部署
-        // 重 orchestrate 不二次 bind。run-service spec/conf 不为 static 生成
-        //（下方循环跳过 command 为空的服务）。
-        crate::static_hosting::reconcile(&specs, &args.workspace, false).await?;
+        // 2.6 static 服务托管；dev + devrun 时让出端口，由 supervisord 启动
+        // 开发服务。模式切换先排空旧静态 listener，再启动进程。
+        crate::static_hosting::reconcile(&specs, &args.workspace, dev_profile).await?;
         for spec in &specs {
-            if crate::static_hosting::hosts_statically(spec, false) {
+            if crate::static_hosting::hosts_statically(spec, dev_profile) {
                 info!(
                     "📄 static host '{}' serving on :{}",
                     spec.service_id, spec.port
@@ -184,8 +183,8 @@ impl SupervisordHost {
         // 3. 写 per-service specs（run-service 启动契约；pingap 同机制承载凭证）
         let mut started: Vec<String> = Vec::new();
         for spec in &specs {
-            if crate::static_hosting::hosts_statically(spec, false) {
-                continue; // static：无进程，不经 run-service
+            if !runs_as_process(spec, dev_profile) {
+                continue;
             }
             let svc_spec = ServiceSpecFile {
                 release_id: release.release_id.clone(),
@@ -219,13 +218,15 @@ impl SupervisordHost {
             .await
             .with_context(|| format!("create {}", services_log_dir.display()))?;
         anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
-        let conf = render_programs_conf(release, &specs, &args.log_dir, &args.workspace);
+        let conf =
+            render_programs_conf(release, &specs, &args.log_dir, &args.workspace, dev_profile);
         write_conf(&self.conf_path, &conf).await?;
         mutation_result(self.client.reload_config().await).context("supervisord reloadConfig")?;
 
         // 5. 旧代差量摘除（不在新集合的组）
         let new_names: Vec<String> = specs
             .iter()
+            .filter(|spec| runs_as_process(spec, dev_profile))
             .map(|s| format!("{SVC_PROGRAM_PREFIX}{}", s.service_id))
             .chain([PINGAP_PROGRAM.to_string()])
             .collect();
@@ -240,18 +241,19 @@ impl SupervisordHost {
 
         // 6. 依赖序启动（lock services 顺序即拓扑序；startProcessWait 等 startsecs）
         for spec in &specs {
-            // B08：判空用**生效命令**（devrun 可能非空而 run 为空——与 builtin
-            // 的 effective_run_argv 同源判定）
-            if crate::supervisor::effective_run_argv(spec, dev_profile).is_empty() {
+            if !runs_as_process(spec, dev_profile) {
                 // static 服务无进程（步骤 2.6 已内置托管）——不是配置问题，
                 // 与进程态服务的"未配命令"区分文案
-                if crate::static_hosting::hosts_statically(spec, false) {
+                if crate::static_hosting::hosts_statically(spec, dev_profile) {
                     info!(
                         "📄 {} static host（无进程，步骤 2.6 已托管）",
                         spec.service_id
                     );
                 } else {
-                    warn!("⚠️  {} 无 [run].command，跳过", spec.service_id);
+                    warn!(
+                        "⚠️  {} has no command for the selected run profile; skipping",
+                        spec.service_id
+                    );
                 }
                 continue;
             }
@@ -380,6 +382,7 @@ pub(crate) fn render_programs_conf(
     specs: &[ServiceSpec],
     log_dir: &Path,
     workspace: &Path,
+    dev_profile: bool,
 ) -> String {
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
@@ -387,8 +390,7 @@ pub(crate) fn render_programs_conf(
     let rid = &release.release_id;
     let mut out = String::new();
     for spec in specs {
-        // static 服务无进程（内置托管承载）——不生成 run-service program
-        if crate::static_hosting::hosts_statically(spec, false) {
+        if !runs_as_process(spec, dev_profile) {
             continue;
         }
         let id = safe_program_token(&spec.service_id);
@@ -436,6 +438,13 @@ pub(crate) fn render_programs_conf(
         pingap_log.display(),
     ));
     out
+}
+
+/// Keep spec files, rendered programs, stale-group cleanup and process startup
+/// on the same selection. A static frontend with devrun is a process only in dev.
+fn runs_as_process(spec: &ServiceSpec, dev_profile: bool) -> bool {
+    !crate::static_hosting::hosts_statically(spec, dev_profile)
+        && !supervisor::effective_run_argv(spec, dev_profile).is_empty()
 }
 
 /// program 名/参数 token 白名单（防 conf 注入——service_id 本已过 manifest
@@ -582,6 +591,7 @@ NODE_ENV = "production"
             &specs,
             Path::new("/app/logs"),
             Path::new("/app/code"),
+            false,
         );
         assert!(conf.contains("[program:app-svc-web]"));
         assert!(conf.contains("run-service rel-t web"));
@@ -593,6 +603,43 @@ NODE_ENV = "production"
         assert!(conf.contains("stdout_logfile=/app/logs/services/pingap.log"));
         // autostart=false：启动顺序由 server 显式控制（依赖序）
         assert_eq!(conf.matches("autostart=false").count(), 2);
+
+        // Frontend templates are static in prod, but must get a real Vite
+        // program in dev even though [run].command is empty.
+        let mut frontend = specs[0].clone();
+        frontend.r#type = workspace_manifest::ProjectType::Static;
+        frontend.run.command.clear();
+        frontend.devrun = Some(workspace_manifest::DevrunSection {
+            command: vec!["pnpm".into(), "dev".into()],
+        });
+        let dev_conf = render_programs_conf(
+            &release,
+            std::slice::from_ref(&frontend),
+            Path::new("/app/logs"),
+            Path::new("/app/code"),
+            true,
+        );
+        assert!(dev_conf.contains("[program:app-svc-web]"));
+        assert!(dev_conf.contains("run-service rel-t web"));
+
+        // The same service becomes an in-process static host in production,
+        // even when a stale [run] command is present in the manifest.
+        frontend.run.command = vec!["must-not-run".into()];
+        let prod_conf = render_programs_conf(
+            &release,
+            std::slice::from_ref(&frontend),
+            Path::new("/app/logs"),
+            Path::new("/app/code"),
+            false,
+        );
+        assert!(!prod_conf.contains("[program:app-svc-web]"));
+        assert!(prod_conf.contains("[program:app-pingap]"));
+
+        // No devrun means static hosting in both profiles; do not invent a
+        // process from the stale command either.
+        frontend.devrun = None;
+        assert!(!runs_as_process(&frontend, true));
+        assert!(!runs_as_process(&frontend, false));
     }
 
     #[test]

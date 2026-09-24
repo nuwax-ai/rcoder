@@ -1,6 +1,6 @@
 # UserApp 子路径预览与静态资源
 
-适用于 app-cli 0.3.7 及配套的 `workspace-manifest` 解析器。
+适用于 app-cli 0.3.8 及配套的 `workspace-manifest` 解析器。0.3.8 同步修复容器 supervisord 引擎：开发模式的 static + devrun 服务由开发进程承载，生产模式由内置静态服务承载。
 
 ## dev 与 prod 的路径配对
 
@@ -40,7 +40,7 @@ Pingap 配置目录由 `APP_CLI_PINGAP_RUNTIME_DIR` 指定；未指定时统一�
 
 ## 存量项目升级
 
-1. 在使用新模板构建、启动应用前，升级包含新 manifest 解析器的 RCoder/file-server 和 app-cli 0.3.7（包括 agent-runner、app-runtime 对应镜像）。模板 npm 包可以先发布，但旧运行时的严格解析器会拒绝新字段，包发布不等于部署环境已兼容。
+1. 在使用新模板构建、启动应用前，升级包含新 manifest 解析器的 RCoder/file-server 和 app-cli 0.3.8（包括 agent-runner、app-runtime 对应镜像）。模板 npm 包可以先发布，但旧运行时的严格解析器会拒绝新字段，包发布不等于部署环境已兼容。
 2. React/Vue 模板通过 `scripts/manifest-routing.mjs` 和 `smol-toml` 读取本模块 TOML 的 `[proxy].path`，在 dev/build 加载配置时生成 base。存量项目同步 helper、开发依赖、tsconfig 及 Vite 接线，保留业务插件；不再写死 base 或通过环境变量存储第二份路径。
 3. 在该项目 manifest 中增加 `dev_strip_prefix = false`，保留 prod 的 `strip_prefix = true`。
 4. 开发健康插件同时响应内部探测 `/health` 和带 base 的 `/react/health`；Vite 接到 `/react` 的 GET/HEAD 时跳转到 `/react/`，保留查询参数。生成新的锁文件后重启开发服务。不要直接编辑运行目录下的生成态 Pingap 配置。

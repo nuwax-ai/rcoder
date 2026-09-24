@@ -52,6 +52,6 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// Cargo 版本与本常量，并重建 app-runtime 镜像——已发布的旧二进制内嵌
 /// 编译时点的 schema（deny_unknown_fields），序列化新增字段会让其部署死循环
 /// （前车之鉴：startup_timeout_seconds，序列化侧须 skip 默认值兜底）。
-pub const MINIMUM_APP_CLI_VERSION: &str = "0.3.7";
+pub const MINIMUM_APP_CLI_VERSION: &str = "0.3.8";
 pub const INTERNAL_PORT_MIN: u16 = 4000;
 pub const INTERNAL_PORT_MAX: u16 = 7999;
