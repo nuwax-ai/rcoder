@@ -40,6 +40,34 @@ pub fn garde_err_to_app_error(report: Report) -> AppError {
 /// 22 同样覆盖。
 pub const USERAPP_APP_ID_MAX_LEN: usize = 22;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdentifierValidationError {
+    Empty,
+    TooLong,
+    InvalidByte,
+}
+
+fn validate_identifier_length(length: usize) -> Result<(), IdentifierValidationError> {
+    if length == 0 {
+        return Err(IdentifierValidationError::Empty);
+    }
+    if length > 64 {
+        return Err(IdentifierValidationError::TooLong);
+    }
+    Ok(())
+}
+
+/// Pure byte kernel shared by the public string validator and Kani.
+fn validate_identifier_bytes(bytes: &[u8]) -> Result<(), IdentifierValidationError> {
+    validate_identifier_length(bytes.len())?;
+    for &byte in bytes {
+        if !(byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-') {
+            return Err(IdentifierValidationError::InvalidByte);
+        }
+    }
+    Ok(())
+}
+
 /// 校验路径标识符（project_id, agent_work_dir 等）
 ///
 /// # 规则
@@ -51,22 +79,17 @@ pub const USERAPP_APP_ID_MAX_LEN: usize = 22;
 /// # 错误
 /// 返回描述校验失败原因的字符串
 pub fn validate_identifier(value: &str, field_name: &str) -> Result<(), String> {
-    if value.is_empty() {
-        return Err(format!("{} 不能为空", field_name));
-    }
-    if value.len() > 64 {
-        return Err(format!("{} 长度超过 64 字符: {}", field_name, value.len()));
-    }
-    if !value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return Err(format!(
+    match validate_identifier_bytes(value.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(IdentifierValidationError::Empty) => Err(format!("{} 不能为空", field_name)),
+        Err(IdentifierValidationError::TooLong) => {
+            Err(format!("{} 长度超过 64 字符: {}", field_name, value.len()))
+        }
+        Err(IdentifierValidationError::InvalidByte) => Err(format!(
             "{} 包含非法字符: '{}'，仅允许字母、数字、下划线和连字符",
             field_name, value
-        ));
+        )),
     }
-    Ok(())
 }
 
 /// 标识符白名单正则（garde 内置 pattern 规则用；DTO 字段
@@ -327,42 +350,20 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_identifier_accepts_valid() {
-        assert!(validate_identifier("user123", "user_id").is_ok());
-        assert!(validate_identifier("my-project_01", "project_id").is_ok());
-        assert!(validate_identifier("a", "id").is_ok());
+    fn validate_identifier_public_api_preserves_diagnostics() {
         assert!(validate_identifier("A-B_C", "id").is_ok());
-        assert!(validate_identifier("12345", "id").is_ok());
-    }
-
-    #[test]
-    fn test_validate_identifier_rejects_traversal() {
-        assert!(validate_identifier("../etc", "user_id").is_err());
-        assert!(validate_identifier("..\\etc", "user_id").is_err());
-        assert!(validate_identifier("foo/bar", "user_id").is_err());
-        assert!(validate_identifier("..", "user_id").is_err());
-        assert!(validate_identifier(".", "user_id").is_err());
-    }
-
-    #[test]
-    fn test_validate_identifier_rejects_special_chars() {
-        assert!(validate_identifier("user id", "user_id").is_err());
-        assert!(validate_identifier("user;rm", "user_id").is_err());
-        assert!(validate_identifier("user$id", "user_id").is_err());
-        assert!(validate_identifier("user@id", "user_id").is_err());
-    }
-
-    #[test]
-    fn test_validate_identifier_rejects_empty() {
-        assert!(validate_identifier("", "user_id").is_err());
-    }
-
-    #[test]
-    fn test_validate_identifier_rejects_too_long() {
-        let long_id = "a".repeat(65);
-        assert!(validate_identifier(&long_id, "user_id").is_err());
-        let ok_id = "a".repeat(64);
-        assert!(validate_identifier(&ok_id, "user_id").is_ok());
+        assert_eq!(validate_identifier("", "id").unwrap_err(), "id 不能为空");
+        assert_eq!(
+            validate_identifier(&"a".repeat(65), "id").unwrap_err(),
+            "id 长度超过 64 字符: 65"
+        );
+        assert_eq!(
+            validate_identifier("a/b", "id").unwrap_err(),
+            "id 包含非法字符: 'a/b'，仅允许字母、数字、下划线和连字符"
+        );
+        assert!(validate_identifier("../etc", "id").is_err());
+        assert!(validate_identifier("..\\etc", "id").is_err());
+        assert!(validate_identifier("é", "id").is_err());
     }
 
     // ── normalize_absolute_dir / is_absolute_path_like（与 file-server 既有
@@ -633,5 +634,43 @@ mod tests {
                 "{st:?}: {err}"
             );
         }
+    }
+}
+
+/// Symbolic proof of the exact identifier byte grammar used by the public API.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    fn contract_identifier_byte(byte: u8) -> bool {
+        matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-')
+    }
+
+    /// All 64-byte-or-shorter inputs are checked without assumptions on content.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn identifier_symbolic_grammar() {
+        let bytes: [u8; 64] = kani::any();
+        let symbolic_length: u8 = kani::any();
+        kani::assume(symbolic_length <= 64);
+        let length = symbolic_length as usize;
+
+        let actual = validate_identifier_bytes(&bytes[..length]).is_ok();
+        let mut expected = (1..=64).contains(&length);
+        let mut index = 0usize;
+        while expected && index < length {
+            expected = contract_identifier_byte(bytes[index]);
+            index += 1;
+        }
+        assert_eq!(actual, expected);
+    }
+
+    /// Cover every machine-sized length, independently of the grammar buffer.
+    #[kani::proof]
+    fn identifier_symbolic_length() {
+        let length: usize = kani::any();
+        let actual = validate_identifier_length(length).is_ok();
+        let expected = (1..=64).contains(&length);
+        assert_eq!(actual, expected);
     }
 }

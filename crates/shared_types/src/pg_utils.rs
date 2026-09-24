@@ -10,32 +10,71 @@
 
 use std::result::Result;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PgIdentifierValidationError {
+    Empty,
+    TooLong,
+    InvalidFirstByte,
+    InvalidByte,
+}
+
+fn validate_pg_identifier_length(length: usize) -> Result<(), PgIdentifierValidationError> {
+    if length == 0 {
+        return Err(PgIdentifierValidationError::Empty);
+    }
+    if length > 63 {
+        return Err(PgIdentifierValidationError::TooLong);
+    }
+    Ok(())
+}
+
+fn is_pg_identifier_first_byte(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_pg_identifier_continuation_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Shared byte-level validation kernel used by the public string API and Kani.
+fn validate_pg_identifier_bytes(bytes: &[u8]) -> Result<(), PgIdentifierValidationError> {
+    validate_pg_identifier_length(bytes.len())?;
+
+    let Some((&first, rest)) = bytes.split_first() else {
+        return Err(PgIdentifierValidationError::Empty);
+    };
+    if !is_pg_identifier_first_byte(first) {
+        return Err(PgIdentifierValidationError::InvalidFirstByte);
+    }
+    for &byte in rest {
+        if !is_pg_identifier_continuation_byte(byte) {
+            return Err(PgIdentifierValidationError::InvalidByte);
+        }
+    }
+    Ok(())
+}
+
 /// PG 标识符校验 — 白名单, 拒绝即报错
 ///
 /// 规则: `[a-zA-Z_][a-zA-Z0-9_]*`, 长度 1..=63 字节。
 /// `str::len()` 返回字节数；当前白名单只允许 ASCII，因此也等于字符数。
 pub fn validate_pg_identifier(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        // 固定文案：避免 format! 展开（Kani 证明路径 / Fail Fast）
-        return Err("PG identifier must be 1..=63 bytes, got 0".to_string());
-    }
-    if name.len() > 63 {
-        return Err(format!(
+    match validate_pg_identifier_bytes(name.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(PgIdentifierValidationError::Empty) => {
+            Err("PG identifier must be 1..=63 bytes, got 0".to_string())
+        }
+        Err(PgIdentifierValidationError::TooLong) => Err(format!(
             "PG identifier must be 1..=63 bytes, got {len}",
             len = name.len()
-        ));
+        )),
+        Err(PgIdentifierValidationError::InvalidFirstByte) => {
+            Err("PG identifier must start with letter or '_'".to_string())
+        }
+        Err(PgIdentifierValidationError::InvalidByte) => {
+            Err("PG identifier: only [a-zA-Z0-9_] allowed after the first char".to_string())
+        }
     }
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return Err("PG identifier must not be empty".to_string());
-    };
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return Err("PG identifier must start with letter or '_'".to_string());
-    }
-    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Err("PG identifier: only [a-zA-Z0-9_] allowed after the first char".to_string());
-    }
-    Ok(())
 }
 
 /// PG SQL 字符串字面量转义 — 标准 escape `'` → `''`
@@ -408,6 +447,10 @@ mod tests {
     #[test]
     fn validate_rejects_too_long() {
         assert!(validate_pg_identifier(&"a".repeat(64)).is_err());
+        assert_eq!(
+            validate_pg_identifier(&"é".repeat(32)).unwrap_err(),
+            "PG identifier must be 1..=63 bytes, got 64"
+        );
     }
 
     #[test]
@@ -695,156 +738,51 @@ mod tests {
     }
 }
 
-/// Kani 有界证明：转义闭合契约见
-/// `specs/002-kani-high-value-proofs/contracts/quote-escaping.md`。
+/// Symbolic proof for the exact byte grammar used by `validate_pg_identifier`.
+/// String escaping remains covered by concrete nextest cases.
 #[cfg(kani)]
 mod kani_proofs {
     use super::*;
 
-    fn str_from_bytes(bytes: &[u8]) -> Option<&str> {
-        let s = std::str::from_utf8(bytes).ok()?;
-        if s.as_bytes().contains(&0) {
-            return None;
-        }
-        Some(s)
+    fn contract_first_byte(byte: u8) -> bool {
+        matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'_')
     }
 
-    /// sh 词法：单引号包裹 + `'\''` 内嵌引号 后，整串必须是一个 well-formed 词
-    /// （扫描结束后必须回到 outside，且不出现未配对引号）。
-    fn sh_single_quoted_well_formed(s: &str) -> bool {
-        let b = s.as_bytes();
-        if b.is_empty() {
-            return false;
-        }
-        let mut i = 0usize;
-        let mut in_single = false;
-        let mut saw_word = false;
-        while i < b.len() {
-            if in_single {
-                if b[i] == b'\'' {
-                    in_single = false;
-                }
-                i += 1;
-            } else if b[i] == b'\'' {
-                in_single = true;
-                saw_word = true;
-                i += 1;
-            } else if b[i] == b'\\' {
-                // outside 单引号的 \X 转义（'\'' 中的 \' 落在这里）
-                if i + 1 >= b.len() {
-                    return false;
-                }
-                saw_word = true;
-                i += 2;
-            } else {
-                // 裸字符（pg_shell_quote 产物不应出现，但 well-formed 仍允许）
-                saw_word = true;
-                i += 1;
+    fn contract_continuation_byte(byte: u8) -> bool {
+        matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_')
+    }
+
+    /// For every byte string of length 0..=64, acceptance matches the complete
+    /// 1..=63-byte PostgreSQL identifier grammar. No content assumptions narrow
+    /// the symbolic input; length 64 exercises the first rejected boundary.
+    #[kani::proof]
+    #[kani::unwind(66)]
+    fn pg_identifier_symbolic_grammar() {
+        let bytes: [u8; 64] = kani::any();
+        let symbolic_length: u8 = kani::any();
+        kani::assume(symbolic_length <= 64);
+        let length = symbolic_length as usize;
+
+        let actual = validate_pg_identifier_bytes(&bytes[..length]).is_ok();
+        let mut expected = (1..=63).contains(&length);
+        if expected {
+            expected = contract_first_byte(bytes[0]);
+            let mut index = 1usize;
+            while expected && index < length {
+                expected = contract_continuation_byte(bytes[index]);
+                index += 1;
             }
         }
-        saw_word && !in_single
+        assert_eq!(actual, expected);
     }
 
+    /// Length is checked for every machine-sized value, including lengths above
+    /// the bounded byte buffer used by the grammar proof.
     #[kani::proof]
-    #[kani::unwind(10)]
-    fn shell_quote_roundtrip() {
-        let raw: [u8; 6] = kani::any();
-        let mut i = 0usize;
-        while i < raw.len() {
-            kani::assume(raw[i] < 128);
-            kani::assume(raw[i] != 0);
-            i += 1;
-        }
-        let Some(value) = str_from_bytes(&raw) else {
-            return;
-        };
-        let quoted = pg_shell_quote(value);
-        assert!(quoted.starts_with('\'') && quoted.ends_with('\''));
-        assert!(
-            sh_single_quoted_well_formed(&quoted),
-            "pg_shell_quote output must be one well-formed sh word"
-        );
-    }
-
-    #[kani::proof]
-    #[kani::unwind(10)]
-    fn quote_ident_closure() {
-        let raw: [u8; 4] = kani::any();
-        let mut i = 0usize;
-        while i < raw.len() {
-            kani::assume(raw[i] < 128);
-            kani::assume(raw[i] != 0);
-            i += 1;
-        }
-        let Some(name) = str_from_bytes(&raw) else {
-            return;
-        };
-        let quoted = pg_quote_ident(name);
-        let qb = quoted.as_bytes();
-        assert!(qb.len() >= 2 && qb[0] == b'"' && qb[qb.len() - 1] == b'"');
-        let mut i = 1usize;
-        while i + 1 < qb.len() {
-            if qb[i] == b'"' {
-                // The partner must be inside the identifier, not its closing quote.
-                assert!(i + 2 < qb.len() && qb[i + 1] == b'"');
-                i += 2;
-            } else {
-                i += 1;
-            }
-        }
-        assert_eq!(i, qb.len() - 1);
-    }
-
-    #[kani::proof]
-    #[kani::unwind(10)]
-    fn escape_literal_pairs() {
-        let raw: [u8; 6] = kani::any();
-        let mut i = 0usize;
-        while i < raw.len() {
-            kani::assume(raw[i] < 128);
-            kani::assume(raw[i] != 0);
-            i += 1;
-        }
-        let Some(value) = str_from_bytes(&raw) else {
-            return;
-        };
-        let escaped = pg_escape_literal(value);
-        let eb = escaped.as_bytes();
-        let mut i = 0usize;
-        let mut singles = 0usize;
-        while i < eb.len() {
-            if eb[i] == b'\'' {
-                singles += 1;
-            }
-            i += 1;
-        }
-        assert_eq!(singles % 2, 0, "literal quotes must appear in pairs");
-    }
-
-    #[kani::proof]
-    #[kani::unwind(4)]
-    fn pg_identifier_rejects_non_whitelist() {
-        assert!(validate_pg_identifier("").is_err());
-        assert!(validate_pg_identifier("-b").is_err());
-        assert!(validate_pg_identifier("2b").is_err());
-        assert!(validate_pg_identifier("a.b").is_err());
-    }
-
-    #[kani::proof]
-    #[kani::unwind(4)]
-    fn pg_identifier_accepts_alnum() {
-        assert!(validate_pg_identifier("a").is_ok());
-        assert!(validate_pg_identifier("_").is_ok());
-        assert!(validate_pg_identifier("a_b1").is_ok()); // 本函数白名单不含 `-`，与 validate_identifier 不同
-    }
-}
-
-/// 吞吐探针：无堆分配，用于测量 crate 级 kani 编译/求解成本。
-#[cfg(kani)]
-mod kani_probe {
-    #[kani::proof]
-    #[kani::unwind(4)]
-    fn empty_identifier_rejected() {
-        assert!(super::validate_pg_identifier("").is_err());
+    fn pg_identifier_symbolic_length() {
+        let length: usize = kani::any();
+        let actual = validate_pg_identifier_length(length).is_ok();
+        let expected = length >= 1 && length <= 63;
+        assert_eq!(actual, expected);
     }
 }

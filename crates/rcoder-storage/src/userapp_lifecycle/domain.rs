@@ -156,24 +156,13 @@ pub(super) fn admission(
     // Conflict matrix: dev blocks on dev+application, prod on prod+application,
     // application requires every slot idle. Application-scope blockers surface
     // first so diagnostics name the operation that fences both environments.
-    let blocks_request = |blocker: UserAppOperationScope| match scope {
-        UserAppOperationScope::Application => true,
-        UserAppOperationScope::Dev => matches!(
-            blocker,
-            UserAppOperationScope::Dev | UserAppOperationScope::Application
-        ),
-        UserAppOperationScope::Prod => matches!(
-            blocker,
-            UserAppOperationScope::Prod | UserAppOperationScope::Application
-        ),
-    };
     let blocker = [
         UserAppOperationScope::Application,
         UserAppOperationScope::Dev,
         UserAppOperationScope::Prod,
     ]
     .into_iter()
-    .filter(|blocker| blocks_request(*blocker))
+    .filter(|blocker| shared_types::userapp_scope_blocks_request(scope, *blocker))
     .find_map(|blocker| active.slot(blocker).map(|operation| (blocker, operation)));
     if let Some((blocker_scope, operation)) = blocker {
         let mut detail = operation.blocker();
@@ -234,16 +223,16 @@ pub(super) fn advance(
     }
     shared_types::validate_identifier(&progress.executor_id, "executor_id")
         .map_err(|_| Error::InvalidOperation("invalid executor identity".into()))?;
-    match operation.state {
-        OpState::Pending | OpState::WaitingRetry if progress.state == OpState::Running => {
-            operation.executor_id = Some(progress.executor_id.clone());
-        }
-        OpState::Running if operation.executor_id.as_deref() == Some(&progress.executor_id) => {}
-        _ => {
-            return Err(Error::InvalidOperation(
-                "operation requires an exclusive execution claim".into(),
-            ));
-        }
+    let claim = shared_types::authorize_userapp_progress_claim(
+        operation.state,
+        progress.state,
+        operation.executor_id.as_deref() == Some(&progress.executor_id),
+    )
+    .ok_or_else(|| {
+        Error::InvalidOperation("operation requires an exclusive execution claim".into())
+    })?;
+    if claim == shared_types::UserAppProgressClaim::AcquireExecutor {
+        operation.executor_id = Some(progress.executor_id.clone());
     }
     if operation.state.is_terminal()
         || progress.state == OpState::Pending

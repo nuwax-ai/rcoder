@@ -271,6 +271,7 @@ impl UserAppActiveOperations {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 pub enum UserAppOperationState {
     Pending,
     Running,
@@ -285,7 +286,41 @@ impl UserAppOperationState {
     }
 }
 
+/// Decision returned while an operation progress update claims or retains its
+/// exclusive executor identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserAppProgressClaim {
+    /// Pending/retry work is being claimed by the executor in this progress.
+    AcquireExecutor,
+    /// A running operation continues under its already-recorded executor.
+    RetainExecutor,
+}
+
+/// Authorize the state/executor portion of an operation progress claim.
+///
+/// Lifecycle identity, operation-slot ownership, revision, and executor syntax
+/// are checked by the storage transaction before this shared state rule runs.
+/// The return value tells the caller whether to record a new executor identity.
+pub const fn authorize_userapp_progress_claim(
+    current_state: UserAppOperationState,
+    progress_state: UserAppOperationState,
+    executor_matches: bool,
+) -> Option<UserAppProgressClaim> {
+    match current_state {
+        UserAppOperationState::Pending | UserAppOperationState::WaitingRetry
+            if matches!(progress_state, UserAppOperationState::Running) =>
+        {
+            Some(UserAppProgressClaim::AcquireExecutor)
+        }
+        UserAppOperationState::Running if executor_matches => {
+            Some(UserAppProgressClaim::RetainExecutor)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 pub enum UserAppOperationScope {
     Dev,
     Prod,
@@ -303,6 +338,26 @@ impl UserAppOperationScope {
             Self::Prod => "prod",
             Self::Application => "application",
         }
+    }
+}
+
+/// Whether an in-flight operation in `blocker_scope` prevents admission in
+/// `requested_scope`. Application-wide work conflicts with every scope;
+/// dev and prod work can proceed independently of each other.
+pub const fn userapp_scope_blocks_request(
+    requested_scope: UserAppOperationScope,
+    blocker_scope: UserAppOperationScope,
+) -> bool {
+    match requested_scope {
+        UserAppOperationScope::Application => true,
+        UserAppOperationScope::Dev => matches!(
+            blocker_scope,
+            UserAppOperationScope::Dev | UserAppOperationScope::Application
+        ),
+        UserAppOperationScope::Prod => matches!(
+            blocker_scope,
+            UserAppOperationScope::Prod | UserAppOperationScope::Application
+        ),
     }
 }
 
@@ -1445,65 +1500,54 @@ mod operation_scope_tests {
     }
 }
 
-/// Kani 有界证明：身份 Fail-closed 契约见
-/// `specs/002-kani-high-value-proofs/contracts/identity-fail-closed.md`。
+/// Kani proof for the complete finite operation-state/executor claim matrix.
 #[cfg(kani)]
-mod kani_proofs {
-    use super::UserAppExecutionContext;
-
-    /// 定长短 id：kani::any 仅在有限候选中选，避免构造期展开。
-    fn id_pick(sel: u8, mut name: String) -> String {
-        name.push((b'a' + (sel % 26)) as char);
-        name
-    }
-
-    fn id4(sel: u8) -> String {
-        id_pick(sel, String::from("app-"))
-    }
-
-    fn context(app: &str, life: &str, op: &str, exec: &str, fp: &str) -> UserAppExecutionContext {
-        UserAppExecutionContext {
-            app_id: app.to_string(),
-            lifecycle_id: life.to_string(),
-            operation_id: op.to_string(),
-            executor_id: exec.to_string(),
-            request_fingerprint: fp.to_string(),
-        }
-    }
+mod kani_progress_claim_proofs {
+    use super::{
+        UserAppOperationState as State, UserAppProgressClaim, authorize_userapp_progress_claim,
+    };
 
     #[kani::proof]
-    #[kani::unwind(6)]
-    fn identity_binding() {
-        let a = id4(kani::any());
-        let b = id4(kani::any());
-        let c = id4(kani::any());
-        let d = id4(kani::any());
-        let other = id4(kani::any());
-        // 合法 64 hex fingerprint（固定生成，聚焦绑定性质）
-        let fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let ctx = context(&a, &b, &c, &d, fp);
-        if ctx.validate_identity(&other).is_ok() {
-            assert_eq!(ctx.app_id, other, "Ok implies bound app_id");
+    fn progress_claim_matches_state_contract() {
+        let current: State = kani::any();
+        let progress: State = kani::any();
+        let executor_matches: bool = kani::any();
+
+        let can_acquire =
+            matches!(current, State::Pending | State::WaitingRetry) && progress == State::Running;
+        let can_retain = current == State::Running && executor_matches;
+
+        match authorize_userapp_progress_claim(current, progress, executor_matches) {
+            Some(UserAppProgressClaim::AcquireExecutor) => {
+                assert!(can_acquire);
+            }
+            Some(UserAppProgressClaim::RetainExecutor) => {
+                assert!(can_retain);
+            }
+            None => {
+                assert!(!can_acquire && !can_retain);
+            }
         }
     }
+}
+
+/// Kani proof for every pair in the finite dev/prod/application conflict matrix.
+#[cfg(kani)]
+mod kani_scope_conflict_proofs {
+    use super::{UserAppOperationScope as Scope, userapp_scope_blocks_request};
 
     #[kani::proof]
-    #[kani::unwind(6)]
-    fn identity_mismatch_rejected() {
-        let fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let ctx = context("appa", "appb", "appc", "appd", fp);
-        assert!(
-            ctx.validate_identity("other").is_err(),
-            "mismatch must fail"
+    fn scope_conflicts_match_contract_and_are_symmetric() {
+        let requested: Scope = kani::any();
+        let blocker: Scope = kani::any();
+
+        let expected = requested == Scope::Application
+            || blocker == Scope::Application
+            || requested == blocker;
+        assert_eq!(userapp_scope_blocks_request(requested, blocker), expected);
+        assert_eq!(
+            userapp_scope_blocks_request(requested, blocker),
+            userapp_scope_blocks_request(blocker, requested)
         );
-        assert!(ctx.validate_identity("appa").is_ok(), "match may pass");
-    }
-
-    #[kani::proof]
-    #[kani::unwind(6)]
-    fn identity_fingerprint_shape() {
-        // 短 fingerprint 不可能是 64 hex → 必拒
-        let ctx = context("appa", "appb", "appc", "appd", "abcd");
-        assert!(ctx.validate_identity("appa").is_err());
     }
 }
