@@ -35,27 +35,34 @@
       "path": "/api/build/clear-all-log-cache",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "build",
+      "cases": [
+        "build-react-clear-log-cache"
+      ]
     },
     {
       "method": "GET",
       "path": "/api/build/get-dev-log",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "build",
+      "cases": [
+        "build-react-get-dev-log"
+      ]
     },
     {
       "method": "GET",
       "path": "/api/build/get-log-cache-stats",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "build",
+      "cases": [
+        "build-react-log-cache-stats",
+        "build-react-log-cache-stats-after-clear"
+      ]
     },
     {
       "method": "GET",
@@ -86,18 +93,22 @@
       "path": "/api/build/parse-build-error",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "build",
+      "cases": [
+        "build-parse-error"
+      ]
     },
     {
       "method": "GET",
       "path": "/api/build/port-pool-status",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "build",
+      "cases": [
+        "build-react-port-pool-status"
+      ]
     },
     {
       "method": "GET",

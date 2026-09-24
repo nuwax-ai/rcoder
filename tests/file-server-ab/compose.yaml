@@ -30,8 +30,6 @@ services:
       GIT_DEFAULT_AUTHOR_NAME: File Server A-B
       GIT_DEFAULT_AUTHOR_EMAIL: ab@example.invalid
       DEPLOYMENT_MODE: docker-compose
-      DEV_PORT_RANGE_START: "4000"
-      DEV_PORT_RANGE_END: "4000"
       RUST_LOG: info
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:60000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]

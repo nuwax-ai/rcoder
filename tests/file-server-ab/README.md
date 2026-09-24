@@ -16,7 +16,7 @@ make file-server-ab AB_SUITE=build
 make file-server-ab AB_SUITE=all
 ```
 
-`build` / `all` 会从两份 ZIP 模板创建项目，访问 npm registry 安装依赖并构建，再验证 dev server 的启动、HTTP 可达、keep-alive、重启和停止。首次运行较慢；失败会保留证据并区分比较差异与环境错误。
+`build` / `all` 会从两份 ZIP 模板创建项目，访问 npm registry 安装依赖并构建，再验证 dev server 的启动、HTTP 可达、日志分页、日志缓存接口、端口池登记、keep-alive、重启和停止；也会对照构建错误解析。项目创建包含模板解压和初始 Git 提交，驱动为这一步单独留出 120 秒，避免慢磁盘上的 30 秒通用请求预算过早中断后继续请求尚未初始化完成的项目。首次运行较慢；失败会保留证据并区分比较差异与环境错误。
 
 可选参数：
 
@@ -58,7 +58,7 @@ Rust 与 TypeScript 镜像按顺序构建，避免两个依赖安装/编译任�
 
 - `core`：健康/API 版本、React/Vue 模板初始化与读取、项目文件更新、静态普通/Range 读取、Computer 文件列表/resolve/search/metadata 边界和基础文件系统操作。无 npm 外网依赖。
 - `git`：通过 HTTP 对照 init、status、add、commit、file-content、branch create/delete、tag、log、worktree/staged diff、unstage、checkout、discard、revert，以及 mixed/hard/soft reset。每个会改变历史或工作树的流程使用独立 pageApp fixture，避免一个实现的失败污染其他场景；最终比较 refs 对应 tree、HEAD tree、index entries、工作区状态和文件树。Rust 服务使用 gix，TS 服务使用镜像内系统 Git；驱动只用系统 Git 读取最终仓库状态及准备对称 fixture，不参与被测 API 操作。
-- `build`：分别用两份模板走依赖安装、production build、产物静态读取、start-dev、真实页面 HTTP、keep-alive、restart-dev 和 stop-dev。依赖 registry 网络；报告记下环境版本与错误。
+- `build`：分别用两份模板走项目初始化、依赖安装、production build、产物静态读取、start-dev、真实页面 HTTP、开发日志分页、日志缓存查询/清理、端口池状态、keep-alive、restart-dev 和 stop-dev，并对照构建错误解析。依赖 registry 网络；报告记下环境版本与错误。
 - `all`：顺序执行以上套件。路由清单按当前 TypeScript 基线快照维护；没有 A/B 场景的共同路由明确标为 pending。
 
 路由清单的 `typescript_revision` 必须与本次准备的 TypeScript Git 提交一致；基线变化时 Make 运行会在发请求前失败，要求先复核并更新路由清单。

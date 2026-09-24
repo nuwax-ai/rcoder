@@ -1613,16 +1613,60 @@ async fn run_build_suite(
     ts_dev_url: &str,
 ) -> Result<Vec<CaseResult>> {
     let mut results = Vec::new();
+
+    let parse_case = "build-parse-error";
+    let parse_spec = json_spec(
+        Method::POST,
+        "/api/build/parse-build-error",
+        json!({
+            "projectId": "file-server-ab-build-react",
+            "errorMessage": "Error: Cannot find module 'react-dom'"
+        }),
+    )?;
+    let (mut parse_result, rust_parse, ts_parse) = run_pair_specs(
+        client,
+        report_dir,
+        requests,
+        parse_case,
+        rust_api_url,
+        ts_api_url,
+        &parse_spec,
+        &parse_spec,
+    )
+    .await?;
+    for (side, response) in [("rust", &rust_parse), ("typescript", &ts_parse)] {
+        let value = serde_json::from_slice::<Value>(&response.body).ok();
+        if !json_bool(&response.body, "success")
+            || !value
+                .as_ref()
+                .and_then(|body| body.get("message"))
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("react-dom"))
+        {
+            parse_result.differences.push(assertion_difference(
+                parse_case,
+                &format!("/assertions/{side}/parsed-message"),
+                "expected success=true and an explanation containing the missing dependency".into(),
+            ));
+        }
+    }
+    results.push(parse_result);
+
     for (project_id, template_type) in [
         ("file-server-ab-build-react", "react"),
         ("file-server-ab-build-vue", "vue3"),
     ] {
         let create_case = format!("build-{template_type}-create-project");
-        let create_spec = json_spec(
+        let mut create_spec = json_spec(
             Method::POST,
             "/api/project/create-project",
             json!({"projectId":project_id,"templateType":template_type}),
         )?;
+        // Project creation includes extracting the template and creating its initial Git
+        // commit. On a cold Docker bind mount this can take longer than the generic 30s API
+        // timeout; let the comparison observe the actual result instead of cascading into
+        // build requests against a project that is still being initialized.
+        create_spec.timeout = Duration::from_secs(120);
         let (case, _, _) = run_pair_specs(
             client,
             report_dir,
@@ -1691,12 +1735,14 @@ async fn run_build_suite(
         let ts_server = parse_dev_server(&ts_start, "typescript", project_id);
         match (rust_server, ts_server) {
             (Ok(rust_server), Ok(ts_server)) => {
-                if rust_server.port != 4000 || !(4000..=55_000).contains(&ts_server.port) {
+                if !(4000..=55_000).contains(&rust_server.port)
+                    || !(4000..=55_000).contains(&ts_server.port)
+                {
                     case.differences.push(assertion_difference(
                         &start_case,
                         "/assertions/dev-port",
                         format!(
-                            "expected Rust port 4000 and TypeScript port in 4000-55000; Rust={}, TypeScript={}",
+                            "expected both dev-server ports in 4000-55000; Rust={}, TypeScript={}",
                             rust_server.port, ts_server.port
                         ),
                     ));
@@ -1727,6 +1773,181 @@ async fn run_build_suite(
                 )
                 .await?;
                 results.push(case);
+
+                if template_type == "react" {
+                    let log_case = "build-react-get-dev-log";
+                    let log_spec = get_spec(format!(
+                        "/api/build/get-dev-log?projectId={project_id}&startIndex=1&logType=temp"
+                    ));
+                    let (mut log_result, rust_log, ts_log) = run_pair_specs(
+                        client,
+                        report_dir,
+                        requests,
+                        log_case,
+                        rust_api_url,
+                        ts_api_url,
+                        &log_spec,
+                        &log_spec,
+                    )
+                    .await?;
+                    for (side, response) in [("rust", &rust_log), ("typescript", &ts_log)] {
+                        let value = serde_json::from_slice::<Value>(&response.body).ok();
+                        let valid = value.as_ref().is_some_and(|body| {
+                            let logs = body.get("logs").and_then(Value::as_array);
+                            let total_lines = body.get("totalLines").and_then(Value::as_u64);
+                            body.get("success").and_then(Value::as_bool) == Some(true)
+                                && logs.is_some_and(|logs| {
+                                    !logs.is_empty()
+                                        && logs[0].get("line").and_then(Value::as_u64) == Some(1)
+                                        && total_lines
+                                            .is_some_and(|total| total >= logs.len() as u64)
+                                })
+                                && body.get("startIndex").and_then(Value::as_u64) == Some(1)
+                        });
+                        if !valid {
+                            log_result.differences.push(assertion_difference(
+                                log_case,
+                                &format!("/assertions/{side}/log-page"),
+                                "expected a successful non-empty log page starting at line 1 with a consistent totalLines count".into(),
+                            ));
+                        }
+                    }
+                    results.push(log_result);
+
+                    let stats_case = "build-react-log-cache-stats";
+                    let stats_spec = get_spec("/api/build/get-log-cache-stats");
+                    let (mut stats_result, rust_stats, ts_stats) = run_pair_specs(
+                        client,
+                        report_dir,
+                        requests,
+                        stats_case,
+                        rust_api_url,
+                        ts_api_url,
+                        &stats_spec,
+                        &stats_spec,
+                    )
+                    .await?;
+                    for (side, response) in [("rust", &rust_stats), ("typescript", &ts_stats)] {
+                        let value = serde_json::from_slice::<Value>(&response.body).ok();
+                        if !json_bool(&response.body, "success")
+                            || value
+                                .as_ref()
+                                .and_then(|body| body.get("stats"))
+                                .and_then(Value::as_object)
+                                .is_none()
+                        {
+                            stats_result.differences.push(assertion_difference(
+                                stats_case,
+                                &format!("/assertions/{side}/stats"),
+                                "expected success=true and a stats object".into(),
+                            ));
+                        }
+                    }
+                    results.push(stats_result);
+
+                    let clear_case = "build-react-clear-log-cache";
+                    let clear_spec = get_spec("/api/build/clear-all-log-cache");
+                    let (mut clear_result, rust_clear, ts_clear) = run_pair_specs(
+                        client,
+                        report_dir,
+                        requests,
+                        clear_case,
+                        rust_api_url,
+                        ts_api_url,
+                        &clear_spec,
+                        &clear_spec,
+                    )
+                    .await?;
+                    for (side, response) in [("rust", &rust_clear), ("typescript", &ts_clear)] {
+                        if !json_bool(&response.body, "success") {
+                            clear_result.differences.push(assertion_difference(
+                                clear_case,
+                                &format!("/assertions/{side}/success"),
+                                "expected success=true after clearing log cache".into(),
+                            ));
+                        }
+                    }
+                    results.push(clear_result);
+
+                    let cleared_stats_case = "build-react-log-cache-stats-after-clear";
+                    let cleared_stats_spec = get_spec("/api/build/get-log-cache-stats");
+                    let (mut cleared_stats_result, rust_cleared_stats, ts_cleared_stats) =
+                        run_pair_specs(
+                            client,
+                            report_dir,
+                            requests,
+                            cleared_stats_case,
+                            rust_api_url,
+                            ts_api_url,
+                            &cleared_stats_spec,
+                            &cleared_stats_spec,
+                        )
+                        .await?;
+                    for (side, response) in [
+                        ("rust", &rust_cleared_stats),
+                        ("typescript", &ts_cleared_stats),
+                    ] {
+                        let cache_size = serde_json::from_slice::<Value>(&response.body)
+                            .ok()
+                            .and_then(|body| body.get("stats").cloned())
+                            .and_then(|stats| stats.get("cacheSize").cloned())
+                            .and_then(|size| size.as_u64());
+                        if !json_bool(&response.body, "success") || cache_size != Some(0) {
+                            cleared_stats_result.differences.push(assertion_difference(
+                                cleared_stats_case,
+                                &format!("/assertions/{side}/cache-cleared"),
+                                format!(
+                                    "expected success=true and cacheSize=0, got {cache_size:?}"
+                                ),
+                            ));
+                        }
+                    }
+                    results.push(cleared_stats_result);
+
+                    let pool_case = "build-react-port-pool-status";
+                    let mut pool_spec = get_spec("/api/build/port-pool-status");
+                    // Both isolated services allocate different concrete ports. Validate each
+                    // allocation against that side's start-dev response below, then compare
+                    // the remaining port-pool contract normally.
+                    pool_spec.normalized_paths = vec!["/allocations/0/port".into()];
+                    let (mut pool_result, rust_pool, ts_pool) = run_pair_specs(
+                        client,
+                        report_dir,
+                        requests,
+                        pool_case,
+                        rust_api_url,
+                        ts_api_url,
+                        &pool_spec,
+                        &pool_spec,
+                    )
+                    .await?;
+                    for (side, response, expected_port) in [
+                        ("rust", &rust_pool, rust_server.port),
+                        ("typescript", &ts_pool, ts_server.port),
+                    ] {
+                        let value = serde_json::from_slice::<Value>(&response.body).ok();
+                        let contains_running_project = value
+                            .as_ref()
+                            .and_then(|body| body.get("allocations"))
+                            .and_then(Value::as_array)
+                            .is_some_and(|allocations| {
+                                allocations.iter().any(|allocation| {
+                                    allocation.get("projectId").and_then(Value::as_str)
+                                        == Some(project_id)
+                                        && allocation.get("port").and_then(Value::as_u64)
+                                            == Some(u64::from(expected_port))
+                                })
+                            });
+                        if !json_bool(&response.body, "success") || !contains_running_project {
+                            pool_result.differences.push(assertion_difference(
+                                pool_case,
+                                &format!("/assertions/{side}/allocation"),
+                                "expected the running project to be allocated its reported dev port".into(),
+                            ));
+                        }
+                    }
+                    results.push(pool_result);
+                }
 
                 let keep_case = format!("build-{template_type}-keep-alive");
                 let mut rust_keep = get_spec(format!(
@@ -1773,12 +1994,14 @@ async fn run_build_suite(
                 let ts_server = parse_dev_server(&ts_restart, "typescript", project_id);
                 match (rust_server, ts_server) {
                     (Ok(rust_server), Ok(ts_server)) => {
-                        if rust_server.port != 4000 || !(4000..=55_000).contains(&ts_server.port) {
+                        if !(4000..=55_000).contains(&rust_server.port)
+                            || !(4000..=55_000).contains(&ts_server.port)
+                        {
                             case.differences.push(assertion_difference(
                                 &restart_case,
                                 "/assertions/dev-port",
                                 format!(
-                                    "expected Rust port 4000 and TypeScript port in 4000-55000; Rust={}, TypeScript={}",
+                                    "expected both dev-server ports in 4000-55000; Rust={}, TypeScript={}",
                                     rust_server.port, ts_server.port
                                 ),
                             ));
