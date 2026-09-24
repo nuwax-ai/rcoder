@@ -3581,6 +3581,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "file-server-ab"
+version = "0.1.3"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "file-server-proxy"
 version = "0.2.3"
 dependencies = [

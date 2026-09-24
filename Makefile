@@ -36,6 +36,7 @@ include make/agent-runner.mk
 include make/observability.mk
 include make/remote-k8s.mk
 include make/dev-host.mk
+include make/file-server-ab.mk
 
 # 本地编译（仅编译，不构建镜像）
 build:
@@ -69,6 +70,7 @@ uninstall:
 # 默认目标：显示帮助信息
 help:
 	@echo "  make remote-k8s-verify SUITE=smoke - 远端同步、构建、部署及验证（配置见 specs/remote-k8s-dev/README.md）"
+	@echo "  make file-server-ab - 本地独立运行 Rust/TypeScript file-server HTTP 对照（参数见 make file-server-ab-help）"
 	@echo ""
 	@echo "🖥️  deploy-host 宿主机运行形态（详见 docs/deploy-host.md）："
 	@echo "  make dev-host       - 宿主机 Docker 形态（--features deploy-host，默认 ~/.rcoder）"

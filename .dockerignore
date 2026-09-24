@@ -78,5 +78,6 @@ fuzz/
 .workbuddy/
 .zcode/
 .specify/
+specs/
 crates/app-cli/node_modules/
 crates/app-cli/dist/

@@ -1,0 +1,76 @@
+services:
+  rust:
+    image: rcoder-file-server-ab-rust:${AB_IMAGE_TAG:-local}
+    build:
+      context: ${RCODER_ROOT}
+      dockerfile: tests/file-server-ab/Dockerfile.rust
+      args:
+        RUST_BUILDER_IMAGE: ${AB_RUST_BUILDER_IMAGE}
+        NODE_RUNTIME_IMAGE: ${AB_NODE_IMAGE_DIGEST}
+        PNPM_VERSION: ${AB_PNPM_VERSION}
+    ports:
+      - "127.0.0.1:${AB_RUST_PORT:-}:60000"
+    volumes:
+      - "${AB_RUNTIME_DIR}/rust:/data"
+    environment:
+      FILE_SERVER_PROXY_HOST: 0.0.0.0
+      NODE_ENV: ab
+      PROJECT_SOURCE_DIR: /data/project-workspace
+      COMPUTER_WORKSPACE_DIR: /data/computer-workspace
+      USERAPP_WORKSPACE_DIR: /data/userapp-workspace
+      INIT_PROJECT_DIR: /data/init-project
+      UPLOAD_PROJECT_DIR: /data/project-zips
+      DIST_TARGET_DIR: /data/project-nginx
+      LOG_BASE_DIR: /data/logs/project
+      COMPUTER_LOG_DIR: /data/logs/computer
+      FILE_SERVER_LOG_DIR: /data/logs/file-server
+      TEMPLATE_CACHE_DIR: /data/cache/templates
+      NODE_MODULES_LOCAL_DIR: /data/cache/node-modules
+      GIT_ENABLED: "true"
+      GIT_DEFAULT_AUTHOR_NAME: File Server A-B
+      GIT_DEFAULT_AUTHOR_EMAIL: ab@example.invalid
+      DEPLOYMENT_MODE: docker-compose
+      RUST_LOG: info
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:60000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 45
+
+  typescript:
+    image: rcoder-file-server-ab-ts:${AB_IMAGE_TAG:-local}
+    build:
+      context: ${AB_TS_CONTEXT}
+      dockerfile: Dockerfile
+      args:
+        NODE_RUNTIME_IMAGE: ${AB_NODE_IMAGE_DIGEST}
+        PNPM_VERSION: ${AB_PNPM_VERSION}
+    ports:
+      - "127.0.0.1:${AB_TS_PORT:-}:60000"
+    volumes:
+      - "${AB_RUNTIME_DIR}/typescript:/data"
+    environment:
+      NODE_ENV: ab
+      PORT: "60000"
+      PROJECT_SOURCE_DIR: /data/project-workspace
+      COMPUTER_WORKSPACE_DIR: /data/computer-workspace
+      USERAPP_WORKSPACE_DIR: /data/userapp-workspace
+      INIT_PROJECT_DIR: /data/init-project
+      UPLOAD_PROJECT_DIR: /data/project-zips
+      DIST_TARGET_DIR: /data/project-nginx
+      LOG_BASE_DIR: /data/logs/project
+      COMPUTER_LOG_DIR: /data/logs/computer
+      FILE_SERVER_LOG_DIR: /data/logs/file-server
+      TEMPLATE_CACHE_DIR: /data/cache/templates
+      NODE_MODULES_LOCAL_DIR: /data/cache/node-modules
+      GIT_ENABLED: "true"
+      GIT_USE_NATIVE: "true"
+      GIT_DEFAULT_AUTHOR_NAME: File Server A-B
+      GIT_DEFAULT_AUTHOR_EMAIL: ab@example.invalid
+      DEPLOYMENT_MODE: docker-compose
+      PNPM_PRUNE_ENABLED: "false"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:60000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 45

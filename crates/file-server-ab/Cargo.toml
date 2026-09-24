@@ -1,0 +1,26 @@
+[package]
+name = "file-server-ab"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Black-box A/B harness for RCoder Rust and nuwax TypeScript file servers"
+
+[[bin]]
+name = "file-server-ab"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true
