@@ -304,8 +304,24 @@ pub trait AgentContainerRuntime: Send + Sync {
     /// Return the currently configured builder image for an explicit compute
     /// start. The coordinator freezes it in its durable checkpoint before any
     /// runtime write; backends without a managed image may return `None`.
-    fn current_builder_image(&self) -> Option<String> {
-        None
+    async fn current_builder_image(&self) -> ContainerRuntimeResult<Option<String>> {
+        Ok(None)
+    }
+
+    /// Whether a retained stopped builder must be replaced to apply its frozen image.
+    async fn builder_image_replacement_needed(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// Refresh an address observation without starting or replacing compute.
+    async fn refresh_container_reach(
+        &self,
+        _info: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<()> {
+        Ok(())
     }
 
     /// Get container information by project_id
@@ -936,6 +952,16 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
             volumes: Vec::new(),
             restart_image: None,
         })
+    }
+
+    /// Prepare a stopped image replacement. A returned target is still stopped;
+    /// the coordinator persists its UID before authorizing start. Backends which
+    /// can update images in place return None.
+    async fn replace_stopped_app_image(
+        &self,
+        _prior: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppMutationTarget>> {
+        Ok(None)
     }
 
     /// Refresh only a single-write restart target after proving its original

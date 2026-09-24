@@ -478,17 +478,31 @@ impl K8sServiceOps for KubernetesRuntime {
                 // 比对而非点名端口：后续清单再加端口，存量 svc 访问即自愈。
                 // 宿主机模式也将已有 ClusterIP 转为 NodePort，避免同一
                 // namespace 切换部署形态时失去可达地址。
-                // 仅 UserappBuilder 触发：读路径自愈（get_container_info 每次
-                // 经过这里）不对其他 agent 类型写放大。
+                // Port additions are builder-specific; host reachability applies
+                // to every owned agent family, including existing ClusterIP Services.
                 #[cfg(feature = "deploy-host")]
                 let needs_node_port = host_requires_node_port(&existing);
                 #[cfg(not(feature = "deploy-host"))]
                 let needs_node_port = false;
-                if matches!(service_type, ServiceType::UserappBuilder)
-                    && (has_missing_expected_ports(&existing, service_type) || needs_node_port)
-                {
+                let needs_ports = matches!(service_type, ServiceType::UserappBuilder)
+                    && has_missing_expected_ports(&existing, service_type);
+                if needs_ports || needs_node_port {
                     let desired =
                         agent_service_object(&self.namespace, &svc_name, identifier, service_type);
+                    let expected_labels = build_standard_labels(identifier, service_type);
+                    let desired_selector = desired.spec.as_ref().and_then(|s| s.selector.as_ref());
+                    if !existing.metadata.labels.as_ref().is_some_and(|labels| {
+                        expected_labels
+                            .iter()
+                            .all(|(key, value)| labels.get(key) == Some(value))
+                    }) || existing.spec.as_ref().and_then(|s| s.selector.as_ref())
+                        != desired_selector
+                        || existing.metadata.deletion_timestamp.is_some()
+                    {
+                        return Err(ContainerRuntimeError::Conflict(
+                            "Agent Service ownership or selector differs".into(),
+                        ));
+                    }
                     let uid = existing
                         .metadata
                         .uid
@@ -507,11 +521,28 @@ impl K8sServiceOps for KubernetesRuntime {
                                 "Builder Service version missing".into(),
                             )
                         })?;
-                    let ports = desired.spec.and_then(|spec| spec.ports).ok_or_else(|| {
-                        ContainerRuntimeError::ConfigurationError(
-                            "Builder Service desired ports missing".into(),
-                        )
-                    })?;
+                    let desired_ports =
+                        desired.spec.and_then(|spec| spec.ports).ok_or_else(|| {
+                            ContainerRuntimeError::ConfigurationError(
+                                "Builder Service desired ports missing".into(),
+                            )
+                        })?;
+                    // Preserve allocated nodePorts and extra ports; only add missing entries.
+                    let mut ports = existing
+                        .spec
+                        .as_ref()
+                        .and_then(|s| s.ports.clone())
+                        .unwrap_or_default();
+                    if needs_ports {
+                        for port in desired_ports {
+                            if !ports
+                                .iter()
+                                .any(|p| p.port == port.port && p.protocol == port.protocol)
+                            {
+                                ports.push(port);
+                            }
+                        }
+                    }
                     let mut spec = serde_json::json!({"ports": ports});
                     if needs_node_port {
                         spec["type"] = serde_json::Value::String("NodePort".into());

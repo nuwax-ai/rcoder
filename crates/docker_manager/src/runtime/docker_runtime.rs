@@ -155,6 +155,110 @@ impl DockerRuntime {
 
 #[async_trait]
 impl AgentContainerRuntime for DockerRuntime {
+    async fn current_builder_image(&self) -> ContainerRuntimeResult<Option<String>> {
+        self.inner
+            .select_image(&ServiceType::UserappBuilder, None)
+            .await
+            .map(Some)
+            .map_err(|error| {
+                ContainerRuntimeError::ConfigurationError(format!(
+                    "Select current builder image: {error}"
+                ))
+            })
+    }
+
+    async fn builder_image_replacement_needed(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        let (Some(image), Some(resource)) = (&target.restart_image, &target.workload) else {
+            return Ok(false);
+        };
+        let inspect = self
+            .inner
+            .get_docker_client()
+            .inspect_container(&resource.uid, None)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::DockerError(format!("Inspect builder image: {error}"))
+            })?;
+        Ok(inspect
+            .config
+            .as_ref()
+            .and_then(|config| config.image.as_ref())
+            != Some(image))
+    }
+
+    async fn refresh_container_reach(
+        &self,
+        info: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<()> {
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            let observation =
+                shared_types::published::begin_physical_observation(&info.container_id);
+            let preferred = std::env::var("RCODER_AGENT_NETWORK")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "rcoder-agent-network".into());
+            let refresh = async {
+                for attempt in 0..3 {
+                    let inspect = self
+                        .inner
+                        .get_docker_client()
+                        .inspect_container(&info.container_id, None)
+                        .await
+                        .map_err(|error| match error {
+                            bollard::errors::Error::DockerResponseServerError {
+                                status_code: 404,
+                                ..
+                            } => {
+                                ContainerRuntimeError::ContainerNotFound(info.container_id.clone())
+                            }
+                            error => ContainerRuntimeError::DockerError(format!(
+                                "Refresh container address: {error}"
+                            )),
+                        })?;
+                    if inspect.id.as_deref() != Some(info.container_id.as_str())
+                        || inspect
+                            .name
+                            .as_deref()
+                            .map(|name| name.trim_start_matches('/'))
+                            != Some(info.container_name.as_str())
+                    {
+                        return Err(ContainerRuntimeError::Conflict(
+                            "Container address identity changed".into(),
+                        ));
+                    }
+                    match crate::deploy_host_ports::register_reach_from_inspect(
+                        &info.container_name,
+                        Some(&preferred),
+                        &inspect,
+                        &observation,
+                    ) {
+                        Ok(()) => return Ok(()),
+                        Err(error) if attempt == 2 => {
+                            return Err(ContainerRuntimeError::ConnectionError(error.to_string()));
+                        }
+                        Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+                    }
+                }
+                Err(ContainerRuntimeError::ConnectionError(
+                    "Container address is not ready".into(),
+                ))
+            };
+            return tokio::time::timeout(Duration::from_secs(3), refresh)
+                .await
+                .map_err(|_| {
+                    ContainerRuntimeError::ConnectionError(
+                        "Container address refresh timed out".into(),
+                    )
+                })?;
+        }
+        let _ = info;
+        Ok(())
+    }
+
     async fn acquire_builder_operation(
         &self,
         app_id: &str,

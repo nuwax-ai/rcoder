@@ -361,12 +361,12 @@ impl AgentContainerRuntime for KubernetesRuntime {
         self.start_builder_compute(target).await
     }
 
-    fn current_builder_image(&self) -> Option<String> {
-        Some(
+    async fn current_builder_image(&self) -> ContainerRuntimeResult<Option<String>> {
+        Ok(Some(
             self.select_image(&ServiceType::UserappBuilder)
                 .trim()
                 .to_string(),
-        )
+        ))
     }
 
     async fn apply_builder_control(

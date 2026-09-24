@@ -783,20 +783,16 @@ mod kani_proofs {
         let qb = quoted.as_bytes();
         assert!(qb.len() >= 2 && qb[0] == b'"' && qb[qb.len() - 1] == b'"');
         let mut i = 1usize;
-        let mut quotes = 0usize;
-        let mut doubles = 0usize;
         while i + 1 < qb.len() {
             if qb[i] == b'"' {
-                quotes += 1;
-                if qb[i + 1] == b'"' {
-                    doubles += 1;
-                    i += 2;
-                    continue;
-                }
+                // The partner must be inside the identifier, not its closing quote.
+                assert!(i + 2 < qb.len() && qb[i + 1] == b'"');
+                i += 2;
+            } else {
+                i += 1;
             }
-            i += 1;
         }
-        assert_eq!(quotes, doubles * 2, "identifier quotes must be doubled");
+        assert_eq!(i, qb.len() - 1);
     }
 
     #[kani::proof]

@@ -555,21 +555,43 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         self.start_captured_target(target).await
     }
 
+    async fn prepare_app_compute_start(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<shared_types::UserAppComputeStartTarget> {
+        self.prepare_docker_app_start(target).await
+    }
+
+    async fn replace_stopped_app_image(
+        &self,
+        prior: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppMutationTarget>> {
+        self.replace_stopped_app(prior).await
+    }
+
     async fn start_app_compute(
         &self,
         target: &shared_types::UserAppComputeStartTarget,
     ) -> ContainerRuntimeResult<()> {
         if let Some(image) = target.restart_image.as_deref() {
-            // Scoped divergence: the compute-restart verification and recovery
-            // fences bind to the captured physical UID, and a Docker image
-            // roll recreates the container. Image rolls on Docker go through
-            // restart_app_target / update / redeploy, which carry no UID
-            // fence; the compute path restarts the captured container.
-            tracing::warn!(
-                app_id = %target.target.context.app_id,
-                image,
-                "Docker compute restart keeps the captured container; image not rolled"
-            );
+            let inspect = self
+                .inner
+                .get_docker_client()
+                .inspect_container(&target.target.resource.uid, None)
+                .await
+                .map_err(|error| {
+                    ContainerRuntimeError::DockerError(format!("Inspect prepared image: {error}"))
+                })?;
+            if inspect
+                .config
+                .as_ref()
+                .and_then(|config| config.image.as_deref())
+                != Some(image)
+            {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Application image replacement has not been prepared".into(),
+                ));
+            }
         }
         self.start_captured_target(&target.target).await?;
         if !self.captured_start_is_running(&target.target).await? {
@@ -687,7 +709,10 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         if starting {
             super::docker_compute_receipt::matches_app_start(target).await
         } else {
-            super::docker_compute_receipt::matches_app_stop(target).await
+            Ok(
+                super::docker_compute_receipt::matches_app_stop(target).await?
+                    && super::docker_compute_receipt::app_replacement_settled(target).await?,
+            )
         }
     }
 

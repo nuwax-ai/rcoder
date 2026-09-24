@@ -366,13 +366,14 @@ impl DockerRuntime {
             ));
         }
         // Drift check: the captured identity must still hold after the reads.
-        let after = self
+        let mut after = self
             .capture_builder_compute_with_binding(
                 &target.context,
                 target.resource_binding.as_ref(),
                 false,
             )
             .await?;
+        after.restart_image = target.restart_image.clone();
         if after != *target {
             return Err(conflict("Builder changed during template capture"));
         }
@@ -432,15 +433,45 @@ impl DockerRuntime {
             .filter(|resource| resource.kind == AppResourceKind::Container)
             .ok_or_else(|| conflict("Restart source container is missing"))?;
         let client = self.inner.get_docker_client();
-        // The old physical instance must already be gone; its durable stopped
-        // boundary (or absence checkpoint) proves the exit, never this probe.
-        if inspect_absent(
+        // Old versions may retain stopped builders. Replace that exact instance
+        // only after its stop receipt and mount witnesses are confirmed.
+        if let Some(existing) = inspect_absent(
             client.inspect_container(&original.uid, None).await,
             "Confirm original builder exit",
-        )?
-        .is_some()
-        {
-            return Err(conflict("Original builder still exists"));
+        )? {
+            if existing.state.as_ref().and_then(|state| state.running) != Some(false)
+                || !super::docker_compute_receipt::matches_stop(&template.source).await?
+                || bind_witness(&existing)? != template.volumes
+            {
+                return Err(conflict(
+                    "Original builder stop or volume identity is not confirmed",
+                ));
+            }
+            let image = archive
+                .source
+                .restart_image
+                .as_deref()
+                .unwrap_or(&archive.image);
+            self.inner.ensure_image_exists(image).await.map_err(fail)?;
+            client
+                .remove_container(
+                    &original.uid,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: false,
+                        v: false,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map_err(fail)?;
+            if inspect_absent(
+                client.inspect_container(&original.uid, None).await,
+                "Confirm builder removal",
+            )?
+            .is_some()
+            {
+                return Err(conflict("Original builder removal is not confirmed"));
+            }
         }
         #[cfg(feature = "deploy-host")]
         if shared_types::is_deploy_host() {
@@ -482,11 +513,16 @@ impl DockerRuntime {
                     )));
                 }
             }
+            let image = archive
+                .source
+                .restart_image
+                .as_deref()
+                .unwrap_or(&archive.image);
             self.inner
-                .ensure_image_exists(&archive.image)
+                .ensure_image_exists(image)
                 .await
                 .map_err(|error| {
-                    Error::DockerError(format!("Prepare restart image {}: {error}", archive.image))
+                    Error::DockerError(format!("Prepare restart image {image}: {error}"))
                 })?;
             let body = restore_body(template, &archive)?;
             let options = bollard::query_parameters::CreateContainerOptions {
@@ -692,7 +728,13 @@ fn restore_body(
         ..Default::default()
     };
     Ok(bollard::models::ContainerCreateBody {
-        image: Some(archive.image.clone()),
+        image: Some(
+            archive
+                .source
+                .restart_image
+                .clone()
+                .unwrap_or_else(|| archive.image.clone()),
+        ),
         env: Some(archive.env.clone()),
         cmd: archive.cmd.clone(),
         entrypoint: archive.entrypoint.clone(),

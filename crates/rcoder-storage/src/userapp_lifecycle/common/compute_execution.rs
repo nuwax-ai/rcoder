@@ -680,6 +680,34 @@ pub(super) async fn resume_stopped_restart(
     let context = snapshot.execution_context().map_err(|e| invalid(&e))?;
     let old: UserAppMutationTarget =
         serde_json::from_value(snapshot.checkpoint.clone()).map_err(storage)?;
+    let restored = if snapshot.stage == "stopped" && old.resource.uid != target.resource.uid {
+        match old.resource.kind {
+            AppResourceKind::Deployment => snapshot
+                .checkpoint
+                .get("app_restart_template")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<AppRestartTemplate>(value).ok())
+                .is_some_and(|archive| {
+                    archive.source == old
+                        && archive.archive.kind == AppResourceKind::Secret
+                        && !archive.archive.uid.is_empty()
+                }),
+            AppResourceKind::Container => {
+                serde_json::from_value::<UserAppComputeStartTarget>(snapshot.checkpoint.clone())
+                    .ok()
+                    .is_some_and(|captured| {
+                        !captured.volumes.is_empty()
+                            && captured
+                                .restart_image
+                                .as_deref()
+                                .is_some_and(|image| !image.is_empty())
+                    })
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
     if snapshot.action != ComputeControlAction::Restart
         || snapshot.scope != UserAppOperationScope::Prod
         || !matches!(snapshot.stage.as_str(), "stopped" | "starting")
@@ -693,7 +721,8 @@ pub(super) async fn resume_stopped_restart(
         || !(target.resource.kind == AppResourceKind::Deployment
             || (snapshot.stage == "stopped" && target.resource.kind == AppResourceKind::Container))
         || old.resource.kind != target.resource.kind
-        || old.resource.uid != target.resource.uid
+        || target.resource.uid.is_empty()
+        || (old.resource.uid != target.resource.uid && !restored)
         || old.resource.name != target.resource.name
     {
         return Err(invalid("Invalid restart continuation target"));
@@ -765,8 +794,13 @@ pub(super) async fn resume_builder_restart(
         )
         .map_err(storage)?;
         template.source == old
-            && template.archive.kind == AppResourceKind::Secret
-            && original.kind == AppResourceKind::StatefulSet
+            && matches!(
+                (original.kind, template.archive.kind),
+                (AppResourceKind::StatefulSet, AppResourceKind::Secret)
+                    | (AppResourceKind::Container, AppResourceKind::File)
+            )
+            && !template.archive.uid.is_empty()
+            && !template.volumes.is_empty()
             && target.resource_binding.is_none()
     } else {
         false

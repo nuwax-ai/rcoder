@@ -892,7 +892,7 @@ async fn execute_claimed(
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
         {
-            captured.restart_image = state.runtime().current_builder_image();
+            captured.restart_image = state.runtime().current_builder_image().await?;
         }
         builder_compute_checkpoint(
             state,
@@ -976,7 +976,12 @@ async fn execute_claimed(
             let old: BuilderControlTarget = serde_json::from_value(target.clone())?;
             let mut fresh = super::adoption::capture_bound_target(state, &context).await?;
             fresh.restart_image = old.restart_image.clone();
-            if old.workload.as_ref().map(|r| &r.uid) != fresh.workload.as_ref().map(|r| &r.uid) {
+            if old.workload.as_ref().map(|r| &r.uid) != fresh.workload.as_ref().map(|r| &r.uid)
+                || state
+                    .runtime()
+                    .builder_image_replacement_needed(&fresh)
+                    .await?
+            {
                 let template: BuilderRestartTemplate = serde_json::from_value(
                     target
                         .get("builder_restart_template")
@@ -998,33 +1003,12 @@ async fn execute_claimed(
             verify_builder_volume_witness(&target, &prepared)?;
             prepared
         } else {
-            let old: UserAppMutationTarget = serde_json::from_value(target.clone())?;
-            let mut fresh = super::app_adoption::capture_bound_app_target(state, &context).await?;
-            if old.resource.uid != fresh.resource.uid {
-                // Scale-down (or external deletion) replaced the controller.
-                // Restore a zero-replica replacement from the operation-bound
-                // archive; the Starting CAS below must win before it starts.
-                // Docker prod archives nothing (inline env secrets must never
-                // reach disk); its recovery path is explicit redeployment or
-                // the adoption endpoint, not a template replay.
-                let template: AppRestartTemplate = serde_json::from_value(
-                    target
-                        .get("app_restart_template")
-                        .context(
-                            "Original restart template is unavailable; this backend does not \
-                             archive application restarts — redeploy explicitly or adopt the \
-                             replacement controller",
-                        )?
-                        .clone(),
-                )?;
-                ensure!(template.source == old, "Restart archive source differs");
-                state.userapp_store.check_compute_executor(identity).await?;
-                *settled = false;
-                fresh = state.runtime().restore_app_restart(&template).await?;
-                *settled = true;
-            }
-            let mut prepared = state.runtime().prepare_app_compute_start(&fresh).await?;
             let prior: UserAppComputeStartTarget = serde_json::from_value(target.clone())?;
+            state.userapp_store.check_compute_executor(identity).await?;
+            *settled = false;
+            let fresh = stopped_app_restart_target(state, &prior, &target).await?;
+            *settled = true;
+            let mut prepared = state.runtime().prepare_app_compute_start(&fresh).await?;
             prior
                 .verify_same_volumes(&prepared)
                 .map_err(anyhow::Error::msg)?;
@@ -1160,6 +1144,61 @@ fn prod_restart_image() -> Option<String> {
     resolved
 }
 
+/// Recover only from the durable Stopped boundary. Absence is structured;
+/// authorization and connectivity failures must never become permission to create.
+async fn stopped_app_restart_target(
+    state: &AppState,
+    prior: &UserAppComputeStartTarget,
+    checkpoint: &serde_json::Value,
+) -> Result<UserAppMutationTarget> {
+    if let Some(replacement) = state.runtime().replace_stopped_app_image(prior).await? {
+        return Ok(replacement);
+    }
+    let captured =
+        super::app_adoption::capture_bound_app_target(state, &prior.target.context).await;
+    resolve_stopped_app_restart(state.runtime().as_ref(), prior, checkpoint, captured).await
+}
+
+async fn resolve_stopped_app_restart<
+    R: container_runtime_api::UserAppDeploymentRuntime + ?Sized,
+>(
+    runtime: &R,
+    prior: &UserAppComputeStartTarget,
+    checkpoint: &serde_json::Value,
+    captured: Result<UserAppMutationTarget>,
+) -> Result<UserAppMutationTarget> {
+    match captured {
+        Ok(current) if current.resource.uid == prior.target.resource.uid => {
+            ensure!(
+                runtime.reconcile_app_compute_stop(&prior.target).await?,
+                "Original stopped boundary is not confirmed"
+            );
+            return Ok(current);
+        }
+        Ok(_) => {} // restore validates the archive marker of a previous replacement.
+        Err(error)
+            if matches!(
+                error.downcast_ref::<container_runtime_api::ContainerRuntimeError>(),
+                Some(container_runtime_api::ContainerRuntimeError::ContainerNotFound(_))
+            ) => {}
+        Err(error) => return Err(error),
+    }
+    let template: AppRestartTemplate = serde_json::from_value(
+        checkpoint
+            .get("app_restart_template")
+            .context("Original restart archive is unavailable; redeploy or adopt explicitly")?
+            .clone(),
+    )?;
+    ensure!(
+        template.source == prior.target,
+        "Restart archive source differs"
+    );
+    runtime
+        .restore_app_restart(&template)
+        .await
+        .map_err(Into::into)
+}
+
 /// Continue a proven stopped restart under the same durable lease. A CAS
 /// selects one starter; losing observers never submit the runtime request.
 pub(crate) async fn resume_restart_start(
@@ -1199,34 +1238,10 @@ pub(crate) async fn resume_restart_start(
             .context("Original startup is committed but not ready; continue observing the same operation")?
     } else {
         ensure!(
-            state
-                .runtime()
-                .reconcile_app_compute_stop(&prior.target)
-                .await?,
-            "Original stopped boundary is not confirmed"
+            snapshot.stage == "stopped",
+            "Restart has no durable stopped boundary"
         );
-        let mut target = super::app_adoption::capture_bound_app_target(state, &context).await?;
-        if target.resource.uid != prior.target.resource.uid {
-            let template: AppRestartTemplate = serde_json::from_value(
-                snapshot
-                    .checkpoint
-                    .get("app_restart_template")
-                    .context(
-                        "Original restart template is unavailable; this backend does not \
-                         archive application restarts — redeploy explicitly or adopt the \
-                         replacement controller",
-                    )?
-                    .clone(),
-            )?;
-            ensure!(
-                template.source == prior.target,
-                "Restart archive source differs"
-            );
-            // The durable stopped boundary already confirmed old compute exited.
-            // Restore only a zero-replica controller; the CAS below must
-            // succeed before any new business instance can start.
-            target = state.runtime().restore_app_restart(&template).await?;
-        }
+        let target = stopped_app_restart_target(state, &prior, &snapshot.checkpoint).await?;
         let mut prepared = state.runtime().prepare_app_compute_start(&target).await?;
         prior
             .verify_same_volumes(&prepared)
@@ -1574,7 +1589,12 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
     } else {
         let mut fresh = super::adoption::capture_bound_target(state, &context).await?;
         fresh.restart_image = old.restart_image.clone();
-        if fresh.workload.as_ref().map(|r| &r.uid) != old.workload.as_ref().map(|r| &r.uid) {
+        if fresh.workload.as_ref().map(|r| &r.uid) != old.workload.as_ref().map(|r| &r.uid)
+            || state
+                .runtime()
+                .builder_image_replacement_needed(&fresh)
+                .await?
+        {
             let template: BuilderRestartTemplate = serde_json::from_value(
                 snapshot
                     .checkpoint
@@ -1668,4 +1688,110 @@ fn verify_builder_volume_witness(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod restart_resolution_tests {
+    use super::*;
+    use container_runtime_api::{
+        ContainerRuntimeError, ContainerRuntimeResult, UserAppDeploymentRuntime,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Runtime {
+        restores: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl UserAppDeploymentRuntime for Runtime {
+        async fn restore_app_restart(
+            &self,
+            template: &AppRestartTemplate,
+        ) -> ContainerRuntimeResult<UserAppMutationTarget> {
+            self.restores.fetch_add(1, Ordering::SeqCst);
+            let mut target = template.source.clone();
+            target.resource.uid = "replacement".into();
+            Ok(target)
+        }
+        async fn reconcile_app_compute_stop(
+            &self,
+            _: &UserAppMutationTarget,
+        ) -> ContainerRuntimeResult<bool> {
+            Ok(false)
+        }
+    }
+    #[tokio::test]
+    async fn stopped_restart_restores_absence_but_not_unknown_or_unconfirmed_stop() {
+        let runtime = Runtime {
+            restores: AtomicUsize::new(0),
+        };
+        let target = UserAppMutationTarget {
+            context: UserAppExecutionContext {
+                app_id: "review1".into(),
+                lifecycle_id: "life".into(),
+                operation_id: "operation".into(),
+                executor_id: "executor".into(),
+                request_fingerprint: "a".repeat(64),
+            },
+            resource: AppResourceIdentity {
+                kind: AppResourceKind::Deployment,
+                name: "deployment".into(),
+                uid: "original".into(),
+                resource_version: Some("1".into()),
+            },
+        };
+        let prior = UserAppComputeStartTarget {
+            target: target.clone(),
+            compute_start_single_write: true,
+            volumes: vec![],
+            restart_image: None,
+        };
+        let template = AppRestartTemplate {
+            source: target.clone(),
+            archive: AppResourceIdentity {
+                kind: AppResourceKind::Secret,
+                name: "archive".into(),
+                uid: "archiveuid".into(),
+                resource_version: None,
+            },
+            volumes: vec![],
+        };
+        let checkpoint = serde_json::json!({"app_restart_template":template});
+        let restored = resolve_stopped_app_restart(
+            &runtime,
+            &prior,
+            &checkpoint,
+            Err(ContainerRuntimeError::ContainerNotFound("deployment".into()).into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.resource.uid, "replacement");
+        assert!(
+            resolve_stopped_app_restart(
+                &runtime,
+                &prior,
+                &checkpoint,
+                Err(ContainerRuntimeError::K8sError("forbidden".into()).into())
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            resolve_stopped_app_restart(&runtime, &prior, &checkpoint, Ok(target))
+                .await
+                .is_err()
+        );
+        assert_eq!(runtime.restores.load(Ordering::SeqCst), 1);
+        let mut wrong = checkpoint;
+        wrong["app_restart_template"]["source"]["resource"]["uid"] = serde_json::json!("other");
+        assert!(
+            resolve_stopped_app_restart(
+                &runtime,
+                &prior,
+                &wrong,
+                Err(ContainerRuntimeError::ContainerNotFound("deployment".into()).into())
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(runtime.restores.load(Ordering::SeqCst), 1);
+    }
 }

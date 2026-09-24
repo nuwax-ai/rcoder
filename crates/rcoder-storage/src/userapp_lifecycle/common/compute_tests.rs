@@ -1026,3 +1026,180 @@ async fn public_repair_prefix_is_rejected_before_control_intent_changes() {
     );
     store.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn stopped_restart_replacement_uid_requires_witness_and_single_cas_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ToastyUserAppStore::open_exclusive(&dir.path().join("restartrestore.db"))
+        .await
+        .unwrap();
+    for (index, (scope, kind, archive_kind)) in [
+        (
+            UserAppOperationScope::Prod,
+            AppResourceKind::Deployment,
+            AppResourceKind::Secret,
+        ),
+        (
+            UserAppOperationScope::Prod,
+            AppResourceKind::Container,
+            AppResourceKind::File,
+        ),
+        (
+            UserAppOperationScope::Dev,
+            AppResourceKind::StatefulSet,
+            AppResourceKind::Secret,
+        ),
+        (
+            UserAppOperationScope::Dev,
+            AppResourceKind::Container,
+            AppResourceKind::File,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let app = store
+            .ensure_identity(&format!("restorecase{index}"))
+            .await
+            .unwrap();
+        let mut req = request(
+            &app,
+            &format!("restoreop{index}"),
+            ComputeControlAction::Restart,
+        );
+        req.scope = scope;
+        let pending = store.admit_compute_control(&req).await.unwrap();
+        let identity = compute_identity(&pending);
+        store
+            .claim_compute_control(&identity, pending.revision)
+            .await
+            .unwrap();
+        let mut receipt = compute_receipt();
+        if let UserAppOperationLeaseReceipt::Kubernetes { service_type, .. } = &mut receipt {
+            *service_type = if scope == UserAppOperationScope::Prod {
+                ServiceType::Userapp
+            } else {
+                ServiceType::UserappBuilder
+            };
+        }
+        let mut record = store.bind_compute_lease(&identity, &receipt).await.unwrap();
+        let context = record.execution_context().unwrap();
+        let resource = AppResourceIdentity {
+            kind,
+            name: "workload".into(),
+            uid: "oldphysical".into(),
+            resource_version: Some("1".into()),
+        };
+        let volume = AppResourceIdentity {
+            kind: AppResourceKind::HostPath,
+            name: "/workspace".into(),
+            uid: "originalvolume".into(),
+            resource_version: None,
+        };
+        let archive = AppResourceIdentity {
+            kind: archive_kind,
+            name: "archive".into(),
+            uid: "archiveuid".into(),
+            resource_version: None,
+        };
+        let old = UserAppMutationTarget {
+            context: context.clone(),
+            resource: resource.clone(),
+        };
+        let mut new = old.clone();
+        new.resource.uid = "newphysical".into();
+        let builder = BuilderControlTarget {
+            context,
+            resource_binding: None,
+            workload: Some(resource),
+            pod: None,
+            restart_image: Some("imagev2".into()),
+        };
+        let mut new_builder = builder.clone();
+        new_builder.workload.as_mut().unwrap().uid = "newphysical".into();
+        let mut checkpoint = if scope == UserAppOperationScope::Prod {
+            let mut value = serde_json::to_value(UserAppComputeStartTarget {
+                target: old.clone(),
+                compute_start_single_write: kind == AppResourceKind::Deployment,
+                volumes: vec![volume.clone()],
+                restart_image: Some("imagev2".into()),
+            })
+            .unwrap();
+            if kind == AppResourceKind::Deployment {
+                value["app_restart_template"] = serde_json::to_value(AppRestartTemplate {
+                    source: old,
+                    archive: archive.clone(),
+                    volumes: vec![volume.clone()],
+                })
+                .unwrap();
+            }
+            value
+        } else {
+            let mut value = serde_json::to_value(&builder).unwrap();
+            value["builder_restart_template"] = serde_json::to_value(BuilderRestartTemplate {
+                source: builder.clone(),
+                archive,
+                volumes: vec![volume],
+            })
+            .unwrap();
+            value
+        };
+        for stage in [ComputeControlStage::Stopping, ComputeControlStage::Stopped] {
+            let mut progress = compute_progress(&record, stage);
+            progress.checkpoint = checkpoint.clone();
+            record = store.advance_compute_control(&progress).await.unwrap();
+        }
+        let mut missing = record.clone();
+        if scope == UserAppOperationScope::Prod {
+            checkpoint
+                .as_object_mut()
+                .unwrap()
+                .remove("app_restart_template");
+            checkpoint["volumes"] = serde_json::json!([]);
+        } else {
+            checkpoint
+                .as_object_mut()
+                .unwrap()
+                .remove("builder_restart_template");
+        }
+        missing.checkpoint = checkpoint;
+        if scope == UserAppOperationScope::Prod {
+            assert!(
+                store
+                    .resume_compute_restart_start(&missing, &new)
+                    .await
+                    .is_err()
+            );
+            let claimed = store
+                .resume_compute_restart_start(&record, &new)
+                .await
+                .unwrap();
+            assert_eq!(claimed.checkpoint["resource"]["uid"], "newphysical");
+            assert!(
+                store
+                    .resume_compute_restart_start(&record, &new)
+                    .await
+                    .is_err()
+            );
+        } else {
+            assert!(
+                store
+                    .resume_builder_restart_start(&missing, &new_builder)
+                    .await
+                    .is_err()
+            );
+            let claimed = store
+                .resume_builder_restart_start(&record, &new_builder)
+                .await
+                .unwrap();
+            assert_eq!(claimed.checkpoint["workload"]["uid"], "newphysical");
+            assert!(
+                store
+                    .resume_builder_restart_start(&record, &new_builder)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+    store.shutdown().await.unwrap();
+}

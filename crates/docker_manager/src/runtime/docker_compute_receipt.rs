@@ -139,6 +139,56 @@ pub(super) async fn matches_app_stop(target: &UserAppMutationTarget) -> Result<b
     matches(path(&target.context, "prod", "stop").await?, target.clone()).await
 }
 
+/// Single sender for Docker replacement creation, shared across recovery observers.
+/// This intent contains no environment or credentials. An interrupted writer
+/// leaves a marker so observers cannot send another possibly delayed create.
+pub(super) async fn claim_app_replacement(target: &UserAppMutationTarget) -> Result<bool> {
+    let path = path(&target.context, "prod", "replace-intent").await?;
+    let bytes =
+        serde_json::to_vec(target).map_err(|error| Error::ConfigurationError(error.to_string()))?;
+    tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("Receipt parent missing"))?;
+        std::fs::create_dir_all(parent)?;
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(true)
+    })
+    .await
+    .map_err(|error| Error::DockerError(format!("Replacement intent worker: {error}")))?
+    .map_err(|error| Error::DockerError(format!("Persist replacement intent: {error}")))
+}
+
+pub(super) async fn finish_app_replacement(target: &UserAppMutationTarget) -> Result<()> {
+    save(path(&target.context, "prod", "replace-done").await?, target).await
+}
+
+pub(super) async fn app_replacement_settled(target: &UserAppMutationTarget) -> Result<bool> {
+    if read::<UserAppMutationTarget>(path(&target.context, "prod", "replace-intent").await?)
+        .await?
+        .is_none()
+    {
+        return Ok(true);
+    }
+    matches(
+        path(&target.context, "prod", "replace-done").await?,
+        target.clone(),
+    )
+    .await
+}
+
 async fn matches<T>(path: PathBuf, expected: T) -> Result<bool>
 where
     T: serde::de::DeserializeOwned + PartialEq + Send + 'static,
@@ -248,6 +298,8 @@ pub(super) async fn cleanup_compute_receipt_files(context: &UserAppExecutionCont
         path(context, "builder", "start").await?,
         path(context, "prod", "stop").await?,
         path(context, "prod", "start").await?,
+        path(context, "prod", "replace-intent").await?,
+        path(context, "prod", "replace-done").await?,
     ];
     let context = context.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {

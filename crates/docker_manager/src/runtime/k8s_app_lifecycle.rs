@@ -85,7 +85,13 @@ impl KubernetesRuntime {
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         let name = self.app_deployment_name(&context.app_id);
         let deployment = self.deployments_api().get(&name).await.map_err(|error| {
-            ContainerRuntimeError::K8sError(format!("Read application mutation target: {error}"))
+            if matches!(&error, kube::Error::Api(response) if response.code == 404) {
+                ContainerRuntimeError::ContainerNotFound(name.clone())
+            } else {
+                ContainerRuntimeError::K8sError(format!(
+                    "Read application mutation target: {error}"
+                ))
+            }
         })?;
         let expected_labels = self.build_app_labels(&context.app_id, None, None);
         if !deployment.metadata.labels.as_ref().is_some_and(|labels| {

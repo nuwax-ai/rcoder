@@ -905,7 +905,7 @@ impl DockerRuntime {
     }
 }
 
-fn validate_app_container_target(
+pub(super) fn validate_app_container_target(
     app_id: &str,
     container: &bollard::models::ContainerInspectResponse,
 ) -> ContainerRuntimeResult<String> {
@@ -945,7 +945,7 @@ fn validate_app_container_target(
 /// the host config (mounts/network/port bindings) stay byte-identical — this is
 /// the PG-password and workspace retention guarantee — and only the image is
 /// replaced.
-fn recreate_body_from_inspect(
+pub(super) fn recreate_body_from_inspect(
     config: &bollard::models::ContainerConfig,
     host_config: Option<bollard::models::HostConfig>,
     image: &str,
@@ -954,6 +954,12 @@ fn recreate_body_from_inspect(
         image: Some(image.to_string()),
         cmd: config.cmd.clone(),
         env: config.env.clone(),
+        entrypoint: config.entrypoint.clone(),
+        working_dir: config.working_dir.clone(),
+        user: config.user.clone(),
+        exposed_ports: config.exposed_ports.clone(),
+        healthcheck: config.healthcheck.clone(),
+        stop_signal: config.stop_signal.clone(),
         labels: config.labels.clone(),
         host_config,
         ..Default::default()

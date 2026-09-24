@@ -548,7 +548,16 @@ async fn registered_or_discovered_builder(
     instance: &str,
 ) -> Result<Option<ContainerBasicInfo>> {
     if let Some(info) = registered_builder(state, instance) {
-        return Ok(Some(info));
+        if dev_file_server_addr(state, &info).is_ok() {
+            return Ok(Some(info));
+        }
+        match state.runtime().refresh_container_reach(&info).await {
+            Ok(()) => return Ok(Some(info)),
+            Err(container_runtime_api::ContainerRuntimeError::ContainerNotFound(_)) => {}
+            Err(error) => return Err(error.into()),
+        }
+        // An absent cached physical ID needs ordinary discovery, not a repeated
+        // refresh of a container which no longer exists.
     }
     let Some(actual) = state
         .runtime()
@@ -576,6 +585,7 @@ async fn registered_or_discovered_builder(
         workload_uid: None,
     };
     adoption::verify_live_builder(state, instance, instance, &info.container_id).await?;
+    state.runtime().refresh_container_reach(&info).await?;
     register_builder(state, instance, &info)?;
     Ok(Some(info))
 }
