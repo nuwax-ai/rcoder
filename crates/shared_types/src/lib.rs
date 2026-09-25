@@ -19,7 +19,8 @@ pub use project_store::ProjectStore;
 
 // Userapp 域（高内聚收拢于 userapp/ 模块）—— 活动追踪/唤醒 + 业务元数据 + build 进度事件 + 开发资源回收契约
 pub use userapp::activity::{
-    ActivityPersistence, ActivityRow, AppAccessTracker, AppWakeControl, WakeOutcome,
+    ActivityPersistence, ActivityRow, AppAccessTracker, AppWakeControl, RemoteWakeState,
+    WakeOutcome,
 };
 pub use userapp::app_stage::{UserappStage, invalid_app_stage_error};
 pub use userapp::build_event::BuildProgressEvent;

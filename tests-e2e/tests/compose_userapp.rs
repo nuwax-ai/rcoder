@@ -41,6 +41,201 @@ fn http_ok(body: &Value) -> bool {
     body["code"].as_str() == Some("0000")
 }
 
+/// Real Compose proxy regression: ensure may return before DBX listens, and
+/// an already running container can temporarily lose its DBX listener.
+#[tokio::test]
+async fn userapp_prod_connection_recovery() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let Some((env, report)) =
+        Env::compose_or_skip("userapp_prod_connection_recovery", "compose").await
+    else {
+        return;
+    };
+    let case_id = std::env::var("E2E_CASE_ID").expect("strict case identity");
+    let app_id = format!("e2ecr{}", &case_id[..12]);
+    let container = format!("rcoder-app-{app_id}");
+    let proxy = std::env::var("E2E_PINGORA_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:8089".into());
+    let dbx_url = format!("{proxy}/api/v1/userapp/proxy/dbx/prod/e2e-user/{app_id}/");
+
+    // Docker's first start of a newly pulled runtime image can be slow. The
+    // proxy assertion starts immediately after ensure returns.
+    let ensured = env
+        .http
+        .post(format!("{}/computer/pod/ensure", env.rcoder))
+        .timeout(Duration::from_secs(180))
+        .json(&json!({"user_id": "e2e-user", "app_id": app_id, "app_stage": "prod", "service_type": "userapp"}))
+        .send()
+        .await;
+    let (status, body) = match ensured {
+        Ok(response) => {
+            let status = response.status();
+            (
+                status,
+                response.json::<Value>().await.unwrap_or(Value::Null),
+            )
+        }
+        Err(error) => {
+            report.assert_hard(
+                "prod ensure created owned container",
+                false,
+                error.to_string(),
+            );
+            assert!(report.finish(), "prod ensure request failed");
+            return;
+        }
+    };
+    let created = status.is_success() && http_ok(&body) && body["data"]["created"] == true;
+    report.assert_hard(
+        "prod ensure created owned container",
+        created,
+        format!("HTTP {status}, body: {}", trunc(&body, 160)),
+    );
+    if !created {
+        assert!(
+            report.finish(),
+            "ensure unexpectedly passed without an owned container"
+        );
+        return;
+    }
+    let ownership = rcoder_e2e::common::resources::register_created_container(&container);
+    report.assert_hard(
+        "prod container identity captured",
+        ownership.is_ok(),
+        format!("{ownership:?}"),
+    );
+
+    let first = env
+        .http
+        .get(&dbx_url)
+        .timeout(Duration::from_secs(90))
+        .send()
+        .await;
+    report.assert_hard(
+        "immediate DBX GET waits through cold start",
+        first
+            .as_ref()
+            .is_ok_and(|response| response.status() == reqwest::StatusCode::OK),
+        format!(
+            "first DBX response: {:?}",
+            first.as_ref().map(|response| response.status())
+        ),
+    );
+
+    let stop = tokio::process::Command::new("docker")
+        .args(["exec", &container, "supervisorctl", "stop", "dbx"])
+        .output()
+        .await;
+    let stopped = stop.as_ref().is_ok_and(|output| output.status.success());
+    report.assert_hard(
+        "DBX stopped under owned container",
+        stopped,
+        format!(
+            "supervisorctl stop: {:?}",
+            stop.as_ref().map(|output| output.status.code())
+        ),
+    );
+    if stopped {
+        let direct = tokio::process::Command::new("docker")
+            .args([
+                "exec",
+                &container,
+                "curl",
+                "--silent",
+                "--show-error",
+                "--connect-timeout",
+                "1",
+                "--max-time",
+                "2",
+                "http://127.0.0.1:4224/",
+            ])
+            .output()
+            .await;
+        report.assert_hard(
+            "DBX port actually closed before proxy request",
+            direct.as_ref().is_ok_and(|output| !output.status.success()),
+            format!(
+                "direct probe: {:?}",
+                direct.as_ref().map(|output| output.status.code())
+            ),
+        );
+        let restart_container = container.clone();
+        let restart = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::process::Command::new("docker")
+                .args(["exec", &restart_container, "supervisorctl", "start", "dbx"])
+                .output()
+                .await
+        });
+        let started = Instant::now();
+        let recovered = env
+            .http
+            .get(&dbx_url)
+            .timeout(Duration::from_secs(90))
+            .send()
+            .await;
+        let restart_result = restart.await;
+        report.assert_hard(
+            "DBX listener restarted under owned container",
+            matches!(&restart_result, Ok(Ok(output)) if output.status.success()),
+            format!(
+                "restart result: {:?}",
+                restart_result
+                    .as_ref()
+                    .map(|result| result.as_ref().map(|output| output.status.code()))
+            ),
+        );
+        report.assert_hard(
+            "same DBX GET waits for delayed listener",
+            recovered
+                .as_ref()
+                .is_ok_and(|response| response.status() == reqwest::StatusCode::OK)
+                && started.elapsed() >= Duration::from_secs(3),
+            format!(
+                "status={:?}, elapsed={:?}",
+                recovered.as_ref().map(|response| response.status()),
+                started.elapsed()
+            ),
+        );
+    }
+
+    let deleted = env
+        .http
+        .post(format!(
+            "{}/api/v1/userapp/{app_id}/prod/delete",
+            env.rcoder
+        ))
+        .timeout(Duration::from_secs(180))
+        .json(&json!({"user_id": "e2e-user", "purge": true}))
+        .send()
+        .await;
+    let (deleted_status, deleted_body) = match deleted {
+        Ok(response) => {
+            let status = response.status();
+            (
+                status,
+                response.json::<Value>().await.unwrap_or(Value::Null),
+            )
+        }
+        Err(error) => {
+            report.assert_hard("owned prod app purged", false, error.to_string());
+            assert!(report.finish(), "owned prod cleanup failed");
+            return;
+        }
+    };
+    report.assert_hard(
+        "owned prod app purged",
+        deleted_status.is_success() && http_ok(&deleted_body),
+        format!("HTTP {deleted_status}, body: {}", trunc(&deleted_body, 160)),
+    );
+    assert!(
+        report.finish(),
+        "prod connection recovery regression failed"
+    );
+}
+
 fn error_envelope(status: reqwest::StatusCode, body: &Value, code: &str) -> bool {
     status.as_u16() == 200
         && body["code"] == code

@@ -787,6 +787,39 @@ pub struct DeploymentStatus {
     pub deployment_uid: Option<String>,
 }
 
+impl DeploymentStatus {
+    /// A requested workload has not reached its desired ready replica count.
+    /// An explicit runtime error remains a separate, non-wakeable phase.
+    pub fn is_starting(&self) -> bool {
+        self.replicas > 0 && self.ready_replicas < self.replicas && self.phase != "Error"
+    }
+}
+
+#[cfg(test)]
+mod deployment_status_tests {
+    use super::DeploymentStatus;
+
+    #[test]
+    fn starting_requires_desired_replicas_without_runtime_error() {
+        for (phase, replicas, ready, expected) in [
+            ("Stopped", 0, 0, false),
+            ("Starting", 1, 0, true),
+            ("Starting", 2, 1, true),
+            ("Running", 1, 1, false),
+            ("Running", 1, 2, false),
+            ("Error", 1, 0, false),
+        ] {
+            let status = DeploymentStatus {
+                phase: phase.into(),
+                replicas,
+                ready_replicas: ready,
+                ..Default::default()
+            };
+            assert_eq!(status.is_starting(), expected, "{phase}/{replicas}/{ready}");
+        }
+    }
+}
+
 /// 部署故障观察的目标身份（本次操作实际写入的模板归属）。
 ///
 /// `template_token` = 写入 pod template annotations 的 `rcoder.io/deploy-template-token`

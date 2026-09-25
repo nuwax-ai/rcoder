@@ -38,7 +38,7 @@ struct MockRuntime {
     panic_on_nth: AtomicU32,
     // 互斥保护相位切换
     phase: StdMutex<String>,
-    // get_deployment_status 调用计数(remote_stopped TTL 缓存断言用)
+    // get_deployment_status 调用计数(remote_wake_pending TTL 缓存断言用)
     status_calls: AtomicU32,
     // 返回的 wake_on_traffic 注解值(manual_stop 档断言用)
     wake_on_traffic: StdMutex<Option<bool>>,
@@ -174,7 +174,7 @@ impl UserAppDeploymentRuntime for MockRuntime {
         }
         let phase = self.phase.lock().unwrap().clone();
         let mut status = mk_status(app_id, &phase);
-        // 对齐集群语义:replicas==0 即 Stopped(remote_stopped 按 replicas 判定)
+        // 对齐集群语义:replicas==0 即 Stopped(远端状态按 replicas 判定)
         if phase == "Stopped" {
             status.replicas = 0;
         }
@@ -415,12 +415,12 @@ async fn wake_leader_panic_cleans_flight_but_retains_uncertain_operation() {
     assert_eq!(rt.scale_calls.load(Ordering::SeqCst), 1);
 }
 
-// ── remote_stopped 多副本兜底（集群 replicas 为 stopped 事实源）──
+// ── remote_wake_pending 多副本兜底 ──
 
 /// 内存无任何标记（模拟其他副本 stop 后本副本不知情）+ 集群 replicas=0：
 /// ensure_running 经兜底回填后正常唤醒。
 #[tokio::test]
-async fn remote_stopped_backfills_and_wakes_when_cluster_says_stopped() {
+async fn remote_wake_pending_backfills_and_wakes_when_cluster_says_stopped() {
     let rt = Arc::new(MockRuntime::new(true)); // scale 后转 Running
     *rt.phase.lock().unwrap() = "Stopped".to_string();
     let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(100));
@@ -437,13 +437,14 @@ async fn remote_stopped_backfills_and_wakes_when_cluster_says_stopped() {
 
 /// Running app 的兜底查询负缓存：TTL 内重复判定零额外集群查询。
 #[tokio::test]
-async fn remote_stopped_negative_cache_avoids_extra_queries() {
-    let rt = Arc::new(MockRuntime::new(true)); // phase Starting → replicas 1
+async fn remote_wake_pending_negative_cache_avoids_extra_queries() {
+    let rt = Arc::new(MockRuntime::new(true));
+    *rt.phase.lock().unwrap() = "Running".into();
     let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(100));
     reg.set_runtime(rt.clone());
 
-    assert!(!reg.remote_stopped("apprun").await);
-    assert!(!reg.remote_stopped("apprun").await);
+    assert!(!reg.remote_wake_pending("apprun").await);
+    assert!(!reg.remote_wake_pending("apprun").await);
     assert_eq!(
         rt.status_calls.load(Ordering::SeqCst),
         1,
@@ -460,13 +461,110 @@ async fn remote_stopped_negative_cache_avoids_extra_queries() {
 }
 
 #[tokio::test]
+async fn starting_traffic_waits_for_running_and_repairs_cached_state() {
+    let rt = Arc::new(MockRuntime::new(true));
+    let reg = Arc::new(AppActivityRegistry::new(Duration::from_secs(5)));
+    reg.set_runtime(rt.clone());
+    let _fixture = attach_coordinator(&reg, rt.clone(), "startingapp").await;
+
+    assert!(reg.remote_wake_pending("startingapp").await);
+    assert!(!reg.is_stopped("startingapp"), "starting is not stopped");
+    let outcome = reg.ensure_running("startingapp").await;
+    assert!(matches!(outcome, WakeOutcome::Ready), "{outcome:?}");
+    assert_eq!(rt.scale_calls.load(Ordering::SeqCst), 1);
+    let calls_after_wake = rt.status_calls.load(Ordering::SeqCst);
+    assert!(!reg.remote_wake_pending("startingapp").await);
+    assert_eq!(rt.status_calls.load(Ordering::SeqCst), calls_after_wake);
+}
+
+#[tokio::test]
+async fn stale_starting_cache_is_cleared_by_already_running_observation() {
+    let rt = Arc::new(MockRuntime::new(true));
+    let reg = Arc::new(AppActivityRegistry::new(Duration::from_secs(5)));
+    reg.set_runtime(rt.clone());
+    let _fixture = attach_coordinator(&reg, rt.clone(), "becameready").await;
+
+    assert!(reg.remote_wake_pending("becameready").await);
+    *rt.phase.lock().unwrap() = "Running".into();
+    let outcome = reg.ensure_running("becameready").await;
+    assert!(
+        matches!(outcome, WakeOutcome::AlreadyRunning),
+        "{outcome:?}"
+    );
+    assert_eq!(rt.scale_calls.load(Ordering::SeqCst), 0);
+    let calls_after_wake = rt.status_calls.load(Ordering::SeqCst);
+    assert!(!reg.remote_wake_pending("becameready").await);
+    assert_eq!(rt.status_calls.load(Ordering::SeqCst), calls_after_wake);
+}
+
+#[tokio::test]
+async fn error_phase_is_not_wake_pending_or_cached_as_starting() {
+    let rt = Arc::new(MockRuntime::new(false));
+    *rt.phase.lock().unwrap() = "Error".into();
+    let reg = AppActivityRegistry::new(Duration::from_secs(5));
+    reg.set_runtime(rt.clone());
+
+    assert!(!reg.remote_wake_pending("failedapp").await);
+    assert!(!reg.remote_wake_pending("failedapp").await);
+    assert_eq!(rt.status_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        reg.remote_wake_state_fresh("failedapp").await,
+        shared_types::RemoteWakeState::Unavailable
+    );
+    assert_eq!(rt.status_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn fresh_error_observation_discards_stale_starting_cache() {
+    let rt = Arc::new(MockRuntime::new(false));
+    let reg = AppActivityRegistry::new(Duration::from_secs(5));
+    reg.set_runtime(rt.clone());
+    assert!(reg.remote_wake_pending("failedlater").await);
+    *rt.phase.lock().unwrap() = "Error".into();
+    assert_eq!(
+        reg.remote_wake_state_fresh("failedlater").await,
+        shared_types::RemoteWakeState::Unavailable
+    );
+    assert!(!reg.remote_wake_pending("failedlater").await);
+    assert_eq!(rt.status_calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn connection_failure_bypasses_stale_running_cache() {
+    let rt = Arc::new(MockRuntime::new(false));
+    *rt.phase.lock().unwrap() = "Running".into();
+    let reg = AppActivityRegistry::new(Duration::from_secs(5));
+    reg.set_runtime(rt.clone());
+    assert!(!reg.remote_wake_pending("crossreplica").await);
+    *rt.phase.lock().unwrap() = "Stopped".into();
+    assert_eq!(
+        reg.remote_wake_state_fresh("crossreplica").await,
+        shared_types::RemoteWakeState::WakePending
+    );
+    assert_eq!(rt.status_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn mark_running_before_readiness_invalidates_remote_cache() {
+    let rt = Arc::new(MockRuntime::new(false));
+    *rt.phase.lock().unwrap() = "Running".into();
+    let reg = AppActivityRegistry::new(Duration::from_secs(5));
+    reg.set_runtime(rt.clone());
+    assert!(!reg.remote_wake_pending("justcreated").await);
+    *rt.phase.lock().unwrap() = "Starting".into();
+    reg.mark_running("justcreated");
+    assert!(reg.remote_wake_pending("justcreated").await);
+    assert_eq!(rt.status_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn traffic_wakes_a_remote_manual_stop() {
     let runtime = Arc::new(MockRuntime::new(true));
     *runtime.phase.lock().expect("phase") = "Running".into();
     let registry = Arc::new(AppActivityRegistry::new(Duration::from_secs(2)));
     registry.set_runtime(runtime.clone());
     let _fixture = attach_coordinator(&registry, runtime.clone(), "cachedstop").await;
-    assert!(!registry.remote_stopped("cachedstop").await);
+    assert!(!registry.remote_wake_pending("cachedstop").await);
     assert_eq!(runtime.status_calls.load(Ordering::SeqCst), 1);
 
     // Another replica commits a manual stop while this replica retains its
@@ -516,7 +614,7 @@ async fn cached_running_state_requires_a_durable_application_identity() {
     let registry = Arc::new(AppActivityRegistry::new(Duration::from_secs(2)));
     registry.set_runtime(runtime.clone());
     let _fixture = attach_coordinator(&registry, runtime.clone(), "registeredapp").await;
-    assert!(!registry.remote_stopped("unregisteredapp").await);
+    assert!(!registry.remote_wake_pending("unregisteredapp").await);
 
     let outcome = registry.ensure_running("unregisteredapp").await;
     assert!(
@@ -529,18 +627,18 @@ async fn cached_running_state_requires_a_durable_application_identity() {
 
 /// 查询瞬断（Err）不缓存：下次调用重查，恢复后返回真实值。
 #[tokio::test]
-async fn remote_stopped_err_not_cached_retries_next_call() {
+async fn remote_wake_pending_err_not_cached_retries_next_call() {
     let rt = Arc::new(MockRuntime::new(true));
     rt.fail_status.store(true, Ordering::SeqCst);
     let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(100));
     reg.set_runtime(rt.clone());
 
-    assert!(!reg.remote_stopped("appe").await, "瞬断退化为 false");
+    assert!(!reg.remote_wake_pending("appe").await, "瞬断退化为 false");
     assert_eq!(rt.status_calls.load(Ordering::SeqCst), 1);
 
     rt.fail_status.store(false, Ordering::SeqCst);
     assert!(
-        !reg.remote_stopped("appe").await,
+        reg.remote_wake_pending("appe").await,
         "恢复后重查（Err 未缓存）"
     );
     assert_eq!(rt.status_calls.load(Ordering::SeqCst), 2);
@@ -556,7 +654,7 @@ async fn remote_manual_stop_backfills_wakeable_stopped_tier() {
     let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(100));
     reg.set_runtime(rt);
 
-    assert!(reg.remote_stopped("appm").await);
+    assert!(reg.remote_wake_pending("appm").await);
     assert!(
         reg.is_stopped("appm"),
         "manual_stop 统一回填 stopped（可唤醒）档"
@@ -568,14 +666,15 @@ async fn remote_manual_stop_backfills_wakeable_stopped_tier() {
 #[tokio::test]
 async fn mark_writes_refresh_remote_cache_immediately() {
     let rt = Arc::new(MockRuntime::new(true));
+    *rt.phase.lock().unwrap() = "Running".into();
     let reg = AppActivityRegistry::new_with(Duration::from_secs(5), Duration::from_millis(100));
     reg.set_runtime(rt.clone());
-    assert!(!reg.remote_stopped("appc").await); // 查一次（Running）缓存 false
+    assert!(!reg.remote_wake_pending("appc").await); // 查一次（Running）缓存 false
     assert_eq!(rt.status_calls.load(Ordering::SeqCst), 1);
 
     reg.mark_stopped("appc"); // 本副本 stop → 缓存即时刷新
     assert!(
-        reg.remote_stopped("appc").await,
+        reg.remote_wake_pending("appc").await,
         "mark 后缓存立即为 stopped"
     );
     assert_eq!(rt.status_calls.load(Ordering::SeqCst), 1, "零额外集群查询");

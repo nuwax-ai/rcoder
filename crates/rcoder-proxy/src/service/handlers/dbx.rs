@@ -124,8 +124,11 @@ pub async fn handle_prod_dbx_upstream(
     accept_placeholder_user_id(&params)?;
     let container_addr = find_runtime_addr(ip_slot, container_lookup, &app_id).await?;
 
-    metrics.record_request();
-    metrics.inc_active();
+    if !ctx.prod_metrics_counted {
+        metrics.record_request();
+        metrics.inc_active();
+        ctx.prod_metrics_counted = true;
+    }
     ctx.vnc_target_ip = Some(container_addr.clone());
     debug!(
         "[PROD_DBX] app_id={} -> {}:{}",

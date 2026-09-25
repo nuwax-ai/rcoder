@@ -78,7 +78,10 @@ pub async fn handle_prod_app_upstream(
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
     })?;
 
-    metrics.record_request();
+    if !ctx.prod_request_recorded {
+        metrics.record_request();
+        ctx.prod_request_recorded = true;
+    }
 
     // 主路径：确定性命名（K8s svc FQDN / Docker 容器名）——不依赖受理副本
     // 的内存注册表；端口优先取注册表中该 app 的已注册端口（兼容 REST create
@@ -154,10 +157,11 @@ pub async fn handle_prod_app_upstream(
     };
 
     ctx.target_port = Some(resolved_addr.port());
-    metrics.record_request_port(resolved_addr.port());
-    // inc_active 放在解析成功后（对齐 dev_app_proxy：502 不进 response_filter，
-    // 提前 inc 会造成 gauge 单调虚增）
-    metrics.inc_active();
+    if !ctx.prod_metrics_counted {
+        metrics.record_request_port(resolved_addr.port());
+        metrics.inc_active();
+        ctx.prod_metrics_counted = true;
+    }
 
     debug!("prod app route: app_id={}, {}", app_id, resolved_addr);
 

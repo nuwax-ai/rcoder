@@ -162,6 +162,16 @@
     "status 分派 alive+session 回显",
     "stop 分派 success"
   ],
+  "userapp_prod_connection_recovery": [
+    "prod ensure created owned container",
+    "prod container identity captured",
+    "immediate DBX GET waits through cold start",
+    "DBX stopped under owned container",
+    "DBX port actually closed before proxy request",
+    "DBX listener restarted under owned container",
+    "same DBX GET waits for delayed listener",
+    "owned prod app purged"
+  ],
   "userapp_compose_regression": [
     "/userapp/routes 速查表 → 200",
     "POST /api/v1/apps/publish/tasks/query 已删除（404）",

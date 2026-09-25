@@ -206,6 +206,15 @@ pub struct HealthInfo {
 
 /// 请求追踪上下文
 #[derive(Clone)]
+pub struct ProdConnectRecovery {
+    pub app_id: String,
+    pub deadline: tokio::time::Instant,
+    pub retry_requested: bool,
+    pub runtime_checked: bool,
+    pub unavailable_response: bool,
+}
+
+#[derive(Clone)]
 pub struct TrackingCtx {
     pub start: std::time::Instant,
     pub target_port: Option<u16>,
@@ -244,6 +253,12 @@ pub struct TrackingCtx {
     pub preview_forward_port: Option<u16>,
     /// 预览跨 Pod 转发的原始入口端口（`/proxy/{port}`；宿主 410 后失效缓存用）。
     pub preview_origin_port: Option<u16>,
+    /// Request-scoped deadline and retry state for prod UserApp connections.
+    pub prod_connect_recovery: Option<ProdConnectRecovery>,
+    /// Keep prod app request counting stable across retries, including route failures.
+    pub prod_request_recorded: bool,
+    /// Only one handler metric increment and active gauge increment per request.
+    pub prod_metrics_counted: bool,
 }
 
 impl Default for TrackingCtx {
@@ -270,6 +285,9 @@ impl TrackingCtx {
             preview_internal_token: None,
             preview_forward_port: None,
             preview_origin_port: None,
+            prod_connect_recovery: None,
+            prod_request_recorded: false,
+            prod_metrics_counted: false,
         }
     }
 }

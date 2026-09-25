@@ -3,7 +3,7 @@
 //! 支撑「闲置自动回收 + 流量唤醒」特性：
 //! - [`AppAccessTracker`]（短期身份缓存，miss 异步刷新）由 Pingora 代理热路径调用，记录每个 Userapp 的最近 HTTP 访问时间，
 //!   作为闲置回收的活动信号。缓存命中不查库；并发 miss 合流并重新核验 lifecycle。
-//! - [`AppWakeControl`]（异步）由 Pingora 在请求过滤阶段调用：当目标 app 处于 stopped（scale0）时，
+//! - [`AppWakeControl`]（异步）由 Pingora 在请求过滤阶段调用：当目标 app 处于 stopped 或 starting 时，
 //!   hold-and-wait 拉起（scale→1）并轮询 Ready，超时返回 [`WakeOutcome::Timeout`]。
 //!
 //! 两个 trait 仅暴露 Pingora 代理层（跨 crate 消费者）需要的方法（ISP：接口最小化）。
@@ -39,10 +39,18 @@ pub enum WakeOutcome {
     },
 }
 
-/// Userapp 流量唤醒控制（异步）
-///
-/// 由 Pingora `request_filter` 在检测到目标 app stopped 时调用 [`AppWakeControl::ensure_running`]，
-/// hold-and-wait 拉起容器（上限由实现配置，默认 60s）。并发请求由实现内部合流为一次 scale-up。
+/// A fresh runtime observation after a failed upstream connection. Cached
+/// Running observations are intentionally bypassed at this recovery boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteWakeState {
+    WakePending,
+    Running,
+    Unavailable,
+}
+
+/// UserApp 流量唤醒控制。代理在 stopped 或 starting 时调用
+/// [`AppWakeControl::ensure_running`]，hold-and-wait 到 Running；
+/// 并发请求由实现内部合流为一次 scale-up。
 #[async_trait::async_trait]
 pub trait AppWakeControl: Send + Sync {
     /// app 是否处于 stopped（scale replicas==0）。读内存表，O(1)，供 Pingora 快速短路。
@@ -57,11 +65,21 @@ pub trait AppWakeControl: Send + Sync {
     /// bounded wake result.
     async fn ensure_running(&self, app_id: &str) -> WakeOutcome;
 
-    /// 内存无 stopped 记录时的兜底判定（多副本：其他副本 stop 后本副本内存
-    /// 不知情；或本副本重启后未覆盖的场景）。查集群真实 replicas（实现方以
-    /// TTL 缓存节流）。默认 `false` = 无兜底（行为同旧，仅内存表判定）。
-    async fn remote_stopped(&self, _app_id: &str) -> bool {
+    /// Remote stopped or starting status, cached to keep hot requests cheap.
+    /// Probe errors do not authorize a wake and are not cached.
+    async fn remote_wake_pending(&self, _app_id: &str) -> bool {
         false
+    }
+
+    /// Bypass the advisory cache after an actual upstream connection failure.
+    /// Error, missing workload and query failures are Unavailable, never wakeable.
+    async fn remote_wake_state_fresh(&self, _app_id: &str) -> RemoteWakeState {
+        RemoteWakeState::Unavailable
+    }
+
+    /// One budget covers lifecycle wake and connection recovery for a request.
+    fn wake_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(60)
     }
 }
 

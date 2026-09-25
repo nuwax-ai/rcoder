@@ -5,20 +5,51 @@
 
 use crate::service::dispatch::DispatchRequest;
 use async_trait::async_trait;
-use pingora_core::Result as PingoraResult;
 use pingora_core::protocols::Digest;
 use pingora_core::upstreams::peer::{ALPN, HttpPeer};
+use pingora_core::{ErrorType, Result as PingoraResult};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
+use shared_types::RemoteWakeState;
 use std::time::Duration;
 use tracing::{debug, error, warn};
 
 use crate::router::RouteType;
 
-use super::{PortProxy, TrackingCtx, utils};
+use super::{PortProxy, ProdConnectRecovery, TrackingCtx, utils};
 
 /// 唤醒超时/失败时 503 响应的 Retry-After(秒)。客户端据此延后重试(app 仍在后台启动)。
 const WAKE_503_RETRY_AFTER_SECS: &str = "15";
+const CONNECT_RECOVERY_RETRY_DELAY: Duration = Duration::from_millis(250);
+const CONNECT_RECOVERY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Probe only after Pingora's real first connection failed. This uses the same
+/// destination as the request but sends no HTTP bytes; Pingora retries the
+/// original connection after the Service path becomes reachable.
+async fn wait_for_peer_connection(peer: &HttpPeer, deadline: tokio::time::Instant) -> bool {
+    let Some(address) = peer._address.as_inet().copied() else {
+        return false;
+    };
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let attempt_deadline = (now + CONNECT_RECOVERY_ATTEMPT_TIMEOUT).min(deadline);
+        if matches!(
+            tokio::time::timeout_at(attempt_deadline, tokio::net::TcpStream::connect(address))
+                .await,
+            Ok(Ok(_))
+        ) {
+            return true;
+        }
+        tokio::time::sleep(
+            CONNECT_RECOVERY_RETRY_DELAY
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+        )
+        .await;
+    }
+}
 
 #[async_trait]
 impl ProxyHttp for PortProxy {
@@ -30,7 +61,7 @@ impl ProxyHttp for PortProxy {
 
     /// 请求过滤阶段：Userapp 访问追踪 + 流量唤醒。
     ///
-    /// 两类 prod 路由触发唤醒（stopped app → `ensure_running` hold-and-wait ≤60s
+    /// 两类 prod 路由触发唤醒（stopped/starting app → `ensure_running` hold-and-wait ≤60s
     /// 拉起；超时/失败 → 503+Retry-After）：
     /// - `/api/v1/userapp/proxy/app/prod/{user_id}/{app_id}/...` 应用业务流量：
     ///   **touch + wake**（touch 记录最近访问，是闲置回收的信号源）；
@@ -76,24 +107,51 @@ impl ProxyHttp for PortProxy {
             if touch && let Some(ref tracker) = self.access_tracker {
                 let _ = tracker.touch(&app_id).await;
             }
-            // ② 流量唤醒（stopped app 才触发；手动 stop 与闲置回收统一——
+            // ② 流量唤醒（stopped/starting app 触发；手动 stop 与闲置回收统一——
             //    有请求即唤醒，见 AppWakeControl::ensure_running 语义）。
             //    is_stopped 为内存视图：多副本下其他副本 stop 后本副本不知情，
-            //    remote_stopped 兜底查集群真实 replicas（TTL 缓存节流）。
-            if let Some(ref wc) = self.wake_control
-                && (wc.is_stopped(&app_id) || wc.remote_stopped(&app_id).await)
-            {
+            //    remote_wake_pending 兜底查集群真实状态（TTL 缓存节流）。
+            if let Some(ref wc) = self.wake_control {
+                let deadline = tokio::time::Instant::now() + wc.wake_timeout();
+                ctx.prod_connect_recovery = Some(ProdConnectRecovery {
+                    app_id: app_id.clone(),
+                    deadline,
+                    retry_requested: false,
+                    runtime_checked: false,
+                    unavailable_response: false,
+                });
+                let wake_pending = if wc.is_stopped(&app_id) {
+                    true
+                } else {
+                    match tokio::time::timeout_at(deadline, wc.remote_wake_pending(&app_id)).await {
+                        Ok(pending) => pending,
+                        Err(_) => {
+                            let mut resp = ResponseHeader::build(503, None)?;
+                            resp.insert_header("Retry-After", WAKE_503_RETRY_AFTER_SECS)?;
+                            session.write_response_header(Box::new(resp), true).await?;
+                            return Ok(true);
+                        }
+                    }
+                };
+                if !wake_pending {
+                    return Ok(false);
+                }
                 tracing::info!(
-                    "[WAKE] {} traffic wakes stopped app: {}",
+                    "[WAKE] {} traffic waits for app: {}",
                     if touch { "app" } else { "tool" },
                     app_id
                 );
-                match wc.ensure_running(&app_id).await {
-                    shared_types::WakeOutcome::Ready
-                    | shared_types::WakeOutcome::AlreadyRunning => { /* 放行到 upstream */ }
-                    shared_types::WakeOutcome::Timeout
-                    | shared_types::WakeOutcome::Failed(_)
-                    | shared_types::WakeOutcome::Blocked { .. } => {
+                match tokio::time::timeout_at(deadline, wc.ensure_running(&app_id)).await {
+                    Ok(
+                        shared_types::WakeOutcome::Ready
+                        | shared_types::WakeOutcome::AlreadyRunning,
+                    ) => {}
+                    Ok(
+                        shared_types::WakeOutcome::Timeout
+                        | shared_types::WakeOutcome::Failed(_)
+                        | shared_types::WakeOutcome::Blocked { .. },
+                    )
+                    | Err(_) => {
                         // 未获得可用上游（包括操作占用）；返回 503，不宣称仍在启动。
                         let mut resp = ResponseHeader::build(503, None)?;
                         resp.insert_header("Retry-After", WAKE_503_RETRY_AFTER_SECS)?;
@@ -138,24 +196,18 @@ impl ProxyHttp for PortProxy {
                 }
                 Err(shared_types::ApiKeyAuthError::Invalid) => {
                     warn!("[PINGORA_AUTH] Invalid API key for path: {}", path);
-                    return Err(
-                        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(401))
-                            .more_context("Invalid API key".to_string()),
-                    );
+                    return Err(pingora_core::Error::new(ErrorType::HTTPStatus(401))
+                        .more_context("Invalid API key".to_string()));
                 }
                 Err(shared_types::ApiKeyAuthError::Missing) => {
                     warn!("[PINGORA_AUTH] Missing x-api-key header for path: {}", path);
-                    return Err(
-                        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(401))
-                            .more_context("Missing x-api-key header".to_string()),
-                    );
+                    return Err(pingora_core::Error::new(ErrorType::HTTPStatus(401))
+                        .more_context("Missing x-api-key header".to_string()));
                 }
                 Err(shared_types::ApiKeyAuthError::ConfigError) => {
                     error!("[PINGORA_AUTH] Configuration error");
-                    return Err(
-                        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(500))
-                            .more_context("Internal configuration error".to_string()),
-                    );
+                    return Err(pingora_core::Error::new(ErrorType::HTTPStatus(500))
+                        .more_context("Internal configuration error".to_string()));
                 }
             }
         }
@@ -165,7 +217,7 @@ impl ProxyHttp for PortProxy {
         // 使用 matchit 匹配路由
         let matched = self.router.at(&path).map_err(|_| {
             warn!("route not found: {}", path);
-            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
+            pingora_core::Error::new(ErrorType::HTTPStatus(404))
         })?;
 
         let original_uri = upstream_request.uri.clone();
@@ -197,11 +249,111 @@ impl ProxyHttp for PortProxy {
         // 使用 matchit 匹配路由
         let matched = self.router.at(path).map_err(|_| {
             warn!("route not found: {}", path);
-            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404))
+            pingora_core::Error::new(ErrorType::HTTPStatus(404))
         })?;
 
-        self.dispatch_upstream_peer(*matched.value, matched.params, ctx)
-            .await
+        let recovery = ctx.prod_connect_recovery.as_mut().and_then(|state| {
+            if state.retry_requested {
+                state.retry_requested = false;
+                let check_runtime = !state.runtime_checked;
+                state.runtime_checked = true;
+                Some((state.app_id.clone(), state.deadline, check_runtime))
+            } else {
+                None
+            }
+        });
+        if let Some((app_id, deadline, check_runtime)) = &recovery {
+            let Some(wc) = self.wake_control.as_ref() else {
+                return Err(pingora_core::Error::new(ErrorType::HTTPStatus(503)));
+            };
+            if *check_runtime {
+                let state =
+                    tokio::time::timeout_at(*deadline, wc.remote_wake_state_fresh(app_id)).await;
+                match state {
+                    Ok(RemoteWakeState::WakePending) => {
+                        match tokio::time::timeout_at(*deadline, wc.ensure_running(app_id)).await {
+                            Ok(
+                                shared_types::WakeOutcome::Ready
+                                | shared_types::WakeOutcome::AlreadyRunning,
+                            ) => {}
+                            _ => {
+                                if let Some(ctx_state) = ctx.prod_connect_recovery.as_mut() {
+                                    ctx_state.unavailable_response = true;
+                                }
+                                return Err(pingora_core::Error::new(ErrorType::HTTPStatus(503)));
+                            }
+                        }
+                    }
+                    Ok(RemoteWakeState::Running) => {}
+                    Ok(RemoteWakeState::Unavailable) => {
+                        return Err(pingora_core::Error::new(ErrorType::HTTPStatus(502)));
+                    }
+                    Err(_) => {
+                        if let Some(ctx_state) = ctx.prod_connect_recovery.as_mut() {
+                            ctx_state.unavailable_response = true;
+                        }
+                        return Err(pingora_core::Error::new(ErrorType::HTTPStatus(503)));
+                    }
+                }
+            }
+        }
+        let mut peer = self
+            .dispatch_upstream_peer(*matched.value, matched.params, ctx)
+            .await?;
+        if let Some(state) = ctx.prod_connect_recovery.as_mut() {
+            let remaining = state
+                .deadline
+                .saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                state.unavailable_response = true;
+                return Err(pingora_core::Error::new(ErrorType::HTTPStatus(503)));
+            }
+            peer.options.connection_timeout = Some(
+                peer.options
+                    .connection_timeout
+                    .unwrap_or(remaining)
+                    .min(remaining),
+            );
+            peer.options.total_connection_timeout = Some(
+                peer.options
+                    .total_connection_timeout
+                    .unwrap_or(remaining)
+                    .min(remaining),
+            );
+        }
+        if let Some((app_id, deadline, _)) = recovery
+            && !wait_for_peer_connection(&peer, deadline).await
+        {
+            warn!(%app_id, "Prod UserApp Service connection did not recover before wake deadline");
+            if let Some(state) = ctx.prod_connect_recovery.as_mut() {
+                state.unavailable_response = true;
+            }
+            return Err(pingora_core::Error::new(ErrorType::HTTPStatus(503)));
+        }
+        Ok(peer)
+    }
+
+    fn fail_to_connect(
+        &self,
+        _session: &mut Session,
+        _peer: &HttpPeer,
+        ctx: &mut Self::CTX,
+        mut error: Box<pingora_core::Error>,
+    ) -> Box<pingora_core::Error> {
+        if let Some(state) = ctx.prod_connect_recovery.as_mut()
+            && matches!(
+                error.etype(),
+                ErrorType::ConnectRefused | ErrorType::ConnectNoRoute | ErrorType::ConnectTimedout
+            )
+        {
+            if tokio::time::Instant::now() < state.deadline {
+                state.retry_requested = true;
+                error.set_retry(true);
+            } else {
+                state.unavailable_response = true;
+            }
+        }
+        error
     }
 
     /// 连接到上游后的回调
@@ -218,6 +370,7 @@ impl ProxyHttp for PortProxy {
         digest: Option<&Digest>,
         ctx: &mut Self::CTX,
     ) -> PingoraResult<()> {
+        ctx.prod_connect_recovery = None;
         // 记录连接是否被重用
         ctx.connection_reused = reused;
 
@@ -286,6 +439,7 @@ impl ProxyHttp for PortProxy {
 
         // 减少活跃连接数
         self.metrics.dec_active();
+        ctx.prod_metrics_counted = false;
 
         // 记录上游状态码：upstream_response_body_filter 据此收集 4xx/5xx 错误体
         //（此前从未写入，收集分支是死代码）

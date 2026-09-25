@@ -5,7 +5,7 @@
 //! - 本文件（mod.rs）：struct 定义 + mark 系列状态转移 + 访问追踪
 //!   ([`AppAccessTracker`] touch,5s 节流) + 回收过渡协调([`RecycleTransition`]);
 //! - [`wake`]:流量唤醒（[`shared_types::AppWakeControl`] trait impl——hold-and-wait
-//!   拉起 + 并发合流 + 多副本 remote_stopped 兜底）;
+//!   拉起 + 并发合流 + 多副本远端状态兜底）;
 //! - [`persistence_ops`]:影子持久化（PG 影子行 flush/加载/脏行收集）。
 //!
 //! 构造顺序:rcoder 启动早期(init_proxy 之前)独立构造为 `Arc`,注入 Pingora(访问/唤醒);
@@ -312,8 +312,9 @@ impl AppActivityRegistry {
         self.wake_blocked.remove(app_id);
         self.last_accessed.insert(app_id.to_string(), Utc::now());
         self.note_dirty(app_id);
-        self.remote_state
-            .insert(app_id.to_string(), RemoteState::default());
+        // A successful create/start write does not prove K8s readiness yet.
+        // Force the next proxy request to observe the actual replica count.
+        self.remote_state.invalidate(app_id);
     }
 }
 

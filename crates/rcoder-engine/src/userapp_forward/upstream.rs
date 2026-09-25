@@ -1,8 +1,8 @@
 //! userApp 透传层的上游定位与转发内核。
 //!
 //! - 定位契约：dev=注册表 + 探活自愈（30s 正缓存；脏值清 container 字段重建，
-//!   不 remove_project 保 PG 会话映射）；prod=存在性检查 + 唤醒（stopped 自动
-//!   拉起，503+Retry-After）+ 确定性命名/容器 IPv4
+//!   不 remove_project 保 PG 会话映射）；prod=存在性检查 + 唤醒（stopped/starting
+//!   等待，503+Retry-After）+ 确定性命名/容器 IPv4 + 发送请求体前确认端口可连
 //! - 转发内核：method/path/query/headers/body 全量流式（multipart/SSE 天然
 //!   支持），hop-by-hop 头按 RFC 9110 剥离（静态表 ∪ Connection 动态列举）
 //! - 容器定位按 `X-App-Id` header（白名单校验）；容器不在线 502（dev）/
@@ -355,14 +355,104 @@ pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request)
 /// 3. 地址——K8s 确定性命名 FQDN（Service 换 Pod DNS 自愈）；Docker 直查容器 IPv4
 ///    （容器名 DNS 可能返回 AAAA 而容器内 file-server 只 bind IPv4）。
 ///
-/// 唤醒后立刻转发可能与容器内 file-server 启动赛跑（connect refused → 502）——
-/// 客户端重试/下一请求即恢复，不做二次等待。
+/// Starting 由生命周期协调器等待到 Running。该观察不证明实际 Service
+/// 路径已可连接；转发层还需处理连接建立前的短暂不可达窗口。
 pub(crate) async fn forward_to_prod(state: &AppState, app_id: &str, req: Request) -> Response {
+    use shared_types::AppWakeControl;
+
+    let deadline = tokio::time::Instant::now() + state.activity.wake_timeout();
     let addr = match resolve_prod_addr(state, app_id).await {
         Ok(addr) => addr,
         Err(resp) => return super::error_body::reject(req, *resp).await,
     };
+    if let Err(error) = wait_for_prod_service(state, app_id, &addr, deadline).await {
+        return super::error_body::reject(req, error.into_response()).await;
+    }
     forward_to_addr("prod runtime", app_id, &addr, req).await
+}
+
+/// The request body is a single-use stream. Check the real Service path before
+/// moving it into reqwest, so a connection failure never triggers body replay.
+async fn wait_for_prod_service(
+    state: &AppState,
+    app_id: &str,
+    addr: &str,
+    deadline: tokio::time::Instant,
+) -> Result<(), HttpResultError> {
+    use shared_types::AppWakeControl;
+
+    const CONNECT_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    const CONNECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+    let uri = addr.parse::<reqwest::Url>().map_err(|error| {
+        HttpResultError::bad_gateway(format!("Invalid production runtime address: {error}"))
+    })?;
+    let host = uri
+        .host_str()
+        .ok_or_else(|| HttpResultError::bad_gateway("Production runtime address has no host"))?;
+    let port = uri
+        .port_or_known_default()
+        .ok_or_else(|| HttpResultError::bad_gateway("Production runtime address has no port"))?;
+    let mut checked_runtime = false;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(HttpResultError::service_unavailable(
+                format!("app {app_id} service connection timed out; retry later"),
+                WAKE_503_RETRY_AFTER_SECS,
+            ));
+        }
+        let attempt_deadline = (now + CONNECT_ATTEMPT_TIMEOUT).min(deadline);
+        if matches!(
+            tokio::time::timeout_at(
+                attempt_deadline,
+                tokio::net::TcpStream::connect((host, port))
+            )
+            .await,
+            Ok(Ok(_))
+        ) {
+            return Ok(());
+        }
+        if !checked_runtime {
+            checked_runtime = true;
+            match tokio::time::timeout_at(deadline, state.activity.remote_wake_state_fresh(app_id))
+                .await
+            {
+                Ok(shared_types::RemoteWakeState::WakePending) => {
+                    match tokio::time::timeout_at(deadline, state.activity.ensure_running(app_id))
+                        .await
+                    {
+                        Ok(
+                            shared_types::WakeOutcome::Ready
+                            | shared_types::WakeOutcome::AlreadyRunning,
+                        ) => {}
+                        _ => {
+                            return Err(HttpResultError::service_unavailable(
+                                format!("app {app_id} wake failed; retry later"),
+                                WAKE_503_RETRY_AFTER_SECS,
+                            ));
+                        }
+                    }
+                }
+                Ok(shared_types::RemoteWakeState::Running) => {}
+                Ok(shared_types::RemoteWakeState::Unavailable) => {
+                    return Err(HttpResultError::bad_gateway(format!(
+                        "app {app_id} runtime is unavailable"
+                    )));
+                }
+                Err(_) => {
+                    return Err(HttpResultError::service_unavailable(
+                        format!("app {app_id} runtime check timed out; retry later"),
+                        WAKE_503_RETRY_AFTER_SECS,
+                    ));
+                }
+            }
+        }
+        tokio::time::sleep(
+            CONNECT_RETRY_DELAY
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+        )
+        .await;
+    }
 }
 
 /// 定位（含唤醒）生产运行容器 file-server addr（`http://{host}:60000`）。
@@ -373,10 +463,10 @@ async fn resolve_prod_addr(state: &AppState, app_id: &str) -> Result<String, Box
             shared_types::AppError::with_message(e.code(), e.message().to_owned()).into_response(),
         ));
     }
-    // 唤醒（仅 stopped 真时触发——Running 高频文件操作零开销）。is_stopped
-    // 为内存视图，remote_stopped 兜底多副本/重启后状态漂移（TTL 缓存节流）。
+    // 唤醒（stopped 或 starting 时触发——Running 高频文件操作零开销）。
+    // is_stopped 为内存视图，远端状态查询兜底多副本/重启后的漂移。
     use shared_types::AppWakeControl;
-    if state.activity.is_stopped(app_id) || state.activity.remote_stopped(app_id).await {
+    if state.activity.is_stopped(app_id) || state.activity.remote_wake_pending(app_id).await {
         match state.activity.ensure_running(app_id).await {
             shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning => {}
             shared_types::WakeOutcome::Timeout => {

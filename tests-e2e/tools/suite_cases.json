@@ -31,7 +31,8 @@
   ],
   "compose_userapp": [
     "userapp_compose_regression",
-    "userapp_dev_compute_shared_contract"
+    "userapp_dev_compute_shared_contract",
+    "userapp_prod_connection_recovery"
   ],
   "compose_userapp_build_rules": [
     "userapp_build_no_lockfile_pnpm_install",

@@ -167,6 +167,12 @@
       "backend": "openai"
     }
   ],
+  "userapp_prod_connection_recovery": [
+    {
+      "scenario": "userapp_prod_connection_recovery",
+      "backend": "compose"
+    }
+  ],
   "userapp_compose_regression": [
     {
       "scenario": "userapp_compose",

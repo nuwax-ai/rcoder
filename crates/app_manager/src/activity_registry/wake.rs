@@ -1,11 +1,11 @@
 //! 流量唤醒实现（从 activity_registry.rs 拆出；AppWakeControl trait impl +
-//! wake single-flight 合流 + 多副本 remote_stopped 兜底）。
+//! wake single-flight 合流 + 多副本远端状态兜底）。
 //!
 //! - [`AppWakeControl::ensure_running`]：hold-and-wait 拉起（scale→1 + 轮询
 //!   Ready ≤ wake_timeout），并发请求经 watch channel 合流为一次 scale-up
 //!   （Leader/Follower + WakeGuard RAII 广播）；
-//! - [`AppWakeControl::remote_stopped`]：多副本兜底——内存 stopped 表不知情
-//!   其他副本的 stop 时查集群真实 replicas（moka TTL 缓存节流）。
+//! - [`AppWakeControl::remote_wake_pending`]：多副本兜底——内存状态不知情
+//!   其他副本的 stop/start 时查集群真实状态（moka TTL 缓存节流）。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use shared_types::{AppWakeControl, WakeOutcome};
+use shared_types::{AppWakeControl, RemoteWakeState, WakeOutcome};
 
 use super::AppActivityRegistry;
 
@@ -24,22 +24,30 @@ use super::AppActivityRegistry;
 const WAKE_FOLLOWER_GRACE: Duration = Duration::from_secs(10);
 /// leader 异常退出(panic)时广播给 follower 的失败原因
 const WAKE_LEADER_ABORTED: &str = "wake leader aborted";
-/// 集群真实状态兜底缓存 TTL（`remote_stopped` 查询节流，过期自动重查）
+/// 集群真实状态兜底缓存 TTL（`remote_wake_pending` 查询节流，过期自动重查）
 pub(super) const REMOTE_STATE_TTL: Duration = Duration::from_secs(30);
 /// 兜底缓存容量上限（防 app 海量时内存膨胀）
 pub(super) const REMOTE_STATE_MAX_ENTRIES: u64 = 10_000;
 
-/// `get_deployment_status` 的兜底判定快照（多副本 stopped 事实源 = 集群 replicas）。
+/// `get_deployment_status` 的兜底判定快照。
 /// 拍板 2026-09-23：手动 stop 与闲置回收统一——stopped 一律可被流量唤醒，
 /// wake-on-traffic 注解不再参与档位区分。
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct RemoteState {
     pub(super) stopped: bool,
+    pub(super) starting: bool,
 }
 
 impl RemoteState {
     /// 已停、可被流量唤醒（含手动 stop 与闲置回收）
-    pub(super) const STOPPED: Self = Self { stopped: true };
+    pub(super) const STOPPED: Self = Self {
+        stopped: true,
+        starting: false,
+    };
+    pub(super) const STARTING: Self = Self {
+        stopped: false,
+        starting: true,
+    };
 }
 
 /// 进行中的唤醒句柄(leader 持有 `tx`,follower `subscribe` 后等结果)
@@ -81,6 +89,10 @@ impl AppActivityRegistry {
         if let Some(state) = self.remote_state.get(app_id) {
             return Ok(state);
         }
+        self.probe_remote_state_fresh(app_id).await
+    }
+
+    async fn probe_remote_state_fresh(&self, app_id: &str) -> Result<RemoteState, String> {
         let runtime = self
             .runtime
             .get()
@@ -90,8 +102,14 @@ impl AppActivityRegistry {
             .await
             .map_err(|error| format!("Read application runtime state: {error}"))?
             .ok_or_else(|| format!("Application runtime not found: {app_id}"))?;
-        let state = RemoteState {
-            stopped: status.replicas <= 0,
+        let state = if status.phase == "Error" {
+            RemoteState::default()
+        } else if status.replicas <= 0 {
+            RemoteState::STOPPED
+        } else if status.is_starting() {
+            RemoteState::STARTING
+        } else {
+            RemoteState::default()
         };
         self.remote_state.insert(app_id.to_string(), state);
         Ok(state)
@@ -197,14 +215,50 @@ impl AppWakeControl for AppActivityRegistry {
     /// The advisory proxy trait only carries a boolean. Errors are not cached;
     /// the control entry below uses the fallible probe and never reports success
     /// from a failed runtime query.
-    async fn remote_stopped(&self, app_id: &str) -> bool {
+    async fn remote_wake_pending(&self, app_id: &str) -> bool {
         match self.probe_remote_state(app_id).await {
-            Ok(state) => self.backfill_remote_state(app_id, state),
+            Ok(state) => self.backfill_remote_state(app_id, state) || state.starting,
             Err(error) => {
                 warn!(%app_id, %error, "Remote application state probe failed");
                 false
             }
         }
+    }
+
+    async fn remote_wake_state_fresh(&self, app_id: &str) -> RemoteWakeState {
+        // Error and missing workloads must not become starting via a stale
+        // cache. Only a new observation may authorize recovery after a 502.
+        let runtime = match self.runtime.get() {
+            Some(runtime) => runtime,
+            None => return RemoteWakeState::Unavailable,
+        };
+        match runtime.get_deployment_status(app_id).await {
+            Ok(Some(status)) if status.phase == "Error" => {
+                self.remote_state.invalidate(app_id);
+                RemoteWakeState::Unavailable
+            }
+            Ok(Some(status)) if status.replicas <= 0 || status.is_starting() => {
+                self.remote_state.invalidate(app_id);
+                RemoteWakeState::WakePending
+            }
+            Ok(Some(_)) => {
+                self.remote_state.invalidate(app_id);
+                RemoteWakeState::Running
+            }
+            Ok(None) => {
+                self.remote_state.invalidate(app_id);
+                RemoteWakeState::Unavailable
+            }
+            Err(error) => {
+                self.remote_state.invalidate(app_id);
+                warn!(%app_id, %error, "Fresh application state probe failed");
+                RemoteWakeState::Unavailable
+            }
+        }
+    }
+
+    fn wake_timeout(&self) -> Duration {
+        self.wake_timeout
     }
 
     async fn ensure_running(&self, app_id: &str) -> WakeOutcome {
