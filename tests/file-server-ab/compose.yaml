@@ -69,6 +69,7 @@ services:
       GIT_DEFAULT_AUTHOR_EMAIL: ab@example.invalid
       DEPLOYMENT_MODE: docker-compose
       PNPM_PRUNE_ENABLED: "false"
+      UPLOAD_ALLOWED_EXTENSIONS: ".zip"
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:60000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 2s
@@ -83,4 +84,4 @@ services:
       - "${AB_RUNTIME_DIR}:/ab-runtime"
       - "${AB_REPORT_ROOT}:/ab-reports"
       - "${RCODER_ROOT}/tests/file-server-ab:/ab-input:ro"
-      - "${RCODER_ROOT}/tmp/template:/ab-fixtures:ro"
+      - "${AB_RUNTIME_DIR}/fixtures:/ab-fixtures:ro"

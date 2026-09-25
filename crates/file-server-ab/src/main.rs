@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::Duration;
@@ -18,6 +18,14 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CASE_USER: &str = "file-server-ab-user";
 const CASE_CID: &str = "file-server-ab-session";
 const AB_MULTIPART_BOUNDARY: &str = "----file-server-ab-boundary-6d86f5";
+const AB_PACKAGE_CID: &str = "file-server-ab-package-session";
+const AB_IMPORT_CID: &str = "file-server-ab-import-session";
+const AB_SKILLS_V1_CID: &str = "file-server-ab-skills-v1-session";
+const AB_SKILLS_V2_CID: &str = "file-server-ab-skills-v2-session";
+const AB_LOG_CID: &str = "file-server-ab-log-session";
+const ZIP_ENTRY_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
+const ZIP_TOTAL_SIZE_LIMIT: u64 = 128 * 1024 * 1024;
+const ZIP_ENTRY_COUNT_LIMIT: usize = 20_000;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -71,6 +79,7 @@ struct Manifest {
     ts_source: String,
     rust_image: String,
     ts_image: String,
+    docker_builder: String,
     rust_node_version: String,
     ts_node_version: String,
     rust_runtime_architecture: String,
@@ -466,6 +475,7 @@ async fn run_suite(options: RunOptions) -> Result<()> {
         ts_source: env_or("AB_TS_SOURCE", "unknown"),
         rust_image: env_or("AB_RUST_IMAGE", "unknown"),
         ts_image: env_or("AB_TS_IMAGE", "unknown"),
+        docker_builder: env_or("AB_DOCKER_BUILDER", "docker-cli-selected"),
         rust_node_version: env_or("AB_RUST_NODE_VERSION", "unknown"),
         ts_node_version: env_or("AB_TS_NODE_VERSION", "unknown"),
         rust_runtime_architecture: env_or("AB_RUST_NODE_ARCH", "unknown"),
@@ -552,7 +562,7 @@ async fn run_suite(options: RunOptions) -> Result<()> {
 
     let mut cases = Vec::new();
     if matches!(suite, Suite::Core | Suite::All) {
-        for (case_name, spec) in core_scenarios()? {
+        for (case_name, spec) in core_scenarios(&fixtures)? {
             let (mut case, rust, ts) = run_pair_specs(
                 &client,
                 &report_dir,
@@ -585,12 +595,104 @@ async fn run_suite(options: RunOptions) -> Result<()> {
                     "computer-read-uploaded-batch-binary" => {
                         validate_body_equals(&exchange.body, &[0, 255, 10, 13, 42])
                     }
+                    "computer-create-workspace-v1-local-skills"
+                    | "computer-create-workspace-v2-local-config"
+                    | "computer-push-skills-v1-local-zip"
+                    | "computer-push-skills-v2-local-zip"
+                    | "computer-import-project-local-zip"
+                    | "computer-init-project-template-package-fixture"
+                    | "project-push-skills-local-zip"
+                    | "project-upload-single-file-bytes"
+                    | "project-upload-batch-mixed-bytes"
+                    | "project-upload-project-wrapper-zip" => validate_success_json(&exchange.body),
+                    "computer-delete-workspace-owned-fixture" => {
+                        validate_boolean_field(&exchange.body, "deleted", true)
+                    }
+                    "computer-generate-file-utf8" => validate_json_string_field(
+                        &exchange.body,
+                        "fileName",
+                        "ab-generated/nested/message.txt",
+                    ),
+                    "computer-read-generated-file-utf8" => {
+                        validate_body_equals(&exchange.body, "A/B + % 中文\n".as_bytes())
+                    }
+                    "computer-read-imported-project-file"
+                    | "project-read-uploaded-project-file" => {
+                        validate_body_equals(&exchange.body, b"imported from local fixture\n")
+                    }
+                    "computer-import-preservation-contract" => {
+                        validate_execute_command_output(&exchange.body, "import preservation ok\n")
+                    }
+                    "computer-init-template-git-tree" => validate_git_tree_response(&exchange.body),
+                    "computer-install-empty-typescript-project" => validate_json_string_field(
+                        &exchange.body,
+                        "programmingLanguage",
+                        "typescript",
+                    ),
+                    "computer-build-agent-package-synthetic" => {
+                        validate_build_artifact(&exchange.body)
+                    }
+                    "computer-cleanup-build-artifacts" => {
+                        validate_boolean_field(&exchange.body, "cleaned", true)
+                    }
+                    "computer-execute-command-fixed-output" => {
+                        validate_execute_command(&exchange.body)
+                    }
+                    "computer-get-logs-tail-lines" => validate_log_tail(&exchange.body),
+                    "computer-download-all-files-semantic-zip" => {
+                        validate_download_archive(&exchange.body, CASE_USER, CASE_CID)
+                    }
+                    "computer-zip-workspace-semantic" => validate_workspace_archive(&exchange.body),
+                    "project-all-files-update-replace" => validate_json_string_field(
+                        &exchange.body,
+                        "projectId",
+                        "file-server-ab-project-lifecycle",
+                    ),
+                    "project-backup-deprecated-under-git"
+                    | "project-get-version-deprecated-under-git"
+                    | "project-rollback-deprecated-under-git" => {
+                        validate_deprecated_json(&exchange.body)
+                    }
+                    "project-copy-project-tree" => validate_project_copy(&exchange.body),
+                    "project-upload-attachment-deterministic-name" => {
+                        validate_attachment_response(&exchange.body)
+                    }
+                    "project-delete-owned-fixture" => {
+                        validate_project_delete(&exchange.body, "file-server-ab-project-delete")
+                    }
                     _ => Ok(()),
                 };
                 if let Err(error) = validation {
                     case.differences.push(assertion_difference(
                         case_name,
                         &format!("/assertions/{side}/contract"),
+                        error,
+                    ));
+                }
+            }
+            let upload_temp_dirs = match case_name {
+                "computer-import-project-local-zip" => vec![
+                    ("rust", rust_root.join("project-zips").join("temp")),
+                    (
+                        "typescript",
+                        ts_root
+                            .join("computer-workspace")
+                            .join(CASE_USER)
+                            .join(AB_IMPORT_CID)
+                            .join(".tmp"),
+                    ),
+                ],
+                "project-upload-project-wrapper-zip" => vec![
+                    ("rust", rust_root.join("project-zips").join("temp")),
+                    ("typescript", ts_root.join("project-zips").join("temp")),
+                ],
+                _ => Vec::new(),
+            };
+            for (side, path) in upload_temp_dirs {
+                if let Err(error) = validate_directory_empty_or_absent(&path) {
+                    case.differences.push(assertion_difference(
+                        case_name,
+                        &format!("/assertions/{side}/upload-temp-cleanup"),
                         error,
                     ));
                 }
@@ -862,7 +964,7 @@ async fn run_suite(options: RunOptions) -> Result<()> {
     Ok(())
 }
 
-fn core_scenarios() -> Result<Vec<(&'static str, RequestSpec)>> {
+fn core_scenarios(fixtures: &Path) -> Result<Vec<(&'static str, RequestSpec)>> {
     let json_request = |method: Method, path: String, body: Value| -> Result<RequestSpec> {
         Ok(RequestSpec {
             method,
@@ -898,6 +1000,12 @@ fn core_scenarios() -> Result<Vec<(&'static str, RequestSpec)>> {
     let user = CASE_USER;
     let cid = CASE_CID;
     let root = "/data/computer-workspace/file-server-ab-user/file-server-ab-session";
+    let skills_zip =
+        fs::read(fixtures.join("skills-fixture.zip")).context("read local skills A/B fixture")?;
+    let workspace_zip = fs::read(fixtures.join("workspace-project.zip"))
+        .context("read local workspace ZIP A/B fixture")?;
+    let package_zip = fs::read(fixtures.join("package-project.zip"))
+        .context("read local package-project A/B fixture")?;
     let mut file_meta = json_request(
         Method::POST,
         "/api/computer/get-file-meta".to_string(),
@@ -952,7 +1060,7 @@ fn core_scenarios() -> Result<Vec<(&'static str, RequestSpec)>> {
         .headers
         .insert("range".into(), "bytes=0-5".into());
     static_range.expected_status = ExpectedStatus::PartialContent206;
-    Ok(vec![
+    let mut scenarios = vec![
         (
             "health",
             RequestSpec {
@@ -972,11 +1080,7 @@ fn core_scenarios() -> Result<Vec<(&'static str, RequestSpec)>> {
         ("version", get("/api/version".to_string())),
         (
             "create-react-template-project",
-            json_request(
-                Method::POST,
-                "/api/project/create-project".to_string(),
-                json!({"projectId":"file-server-ab-react", "templateType":"react"}),
-            )?,
+            project_create_spec("file-server-ab-react", "react")?,
         ),
         (
             "read-react-template-project",
@@ -1001,11 +1105,7 @@ fn core_scenarios() -> Result<Vec<(&'static str, RequestSpec)>> {
         ("read-project-static-file-range", static_range),
         (
             "create-vue-template-project",
-            json_request(
-                Method::POST,
-                "/api/project/create-project".to_string(),
-                json!({"projectId":"file-server-ab-vue", "templateType":"vue3"}),
-            )?,
+            project_create_spec("file-server-ab-vue", "vue3")?,
         ),
         (
             "read-vue-template-project",
@@ -1175,7 +1275,14 @@ fn core_scenarios() -> Result<Vec<(&'static str, RequestSpec)>> {
                 json!({"path":format!("{root}/  A-B spaced dir  "),"newName":" renamed dir "}),
             )?,
         ),
-    ])
+    ];
+
+    scenarios.extend(core_lifecycle_scenarios(
+        &skills_zip,
+        &workspace_zip,
+        &package_zip,
+    )?);
+    Ok(scenarios)
 }
 
 fn multipart_form_body(
@@ -1205,6 +1312,387 @@ fn multipart_form_body(
     }
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
     body
+}
+
+fn multipart_spec(
+    path: impl Into<String>,
+    text_fields: &[(&str, &str)],
+    file_fields: &[(&str, &str, &[u8])],
+) -> RequestSpec {
+    RequestSpec {
+        method: Method::POST,
+        path: path.into(),
+        body: multipart_form_body(AB_MULTIPART_BOUNDARY, text_fields, file_fields),
+        content_type: Some("multipart/form-data; boundary=----file-server-ab-boundary-6d86f5"),
+        headers: BTreeMap::new(),
+        health_probe: false,
+        expected_status: ExpectedStatus::Success2xx,
+        normalized_paths: Vec::new(),
+        normalized_headers: Vec::new(),
+        timeout: Duration::from_secs(45),
+    }
+}
+
+fn core_lifecycle_scenarios(
+    skills_zip: &[u8],
+    workspace_zip: &[u8],
+    package_zip: &[u8],
+) -> Result<Vec<(&'static str, RequestSpec)>> {
+    let mut scenarios = Vec::new();
+    let user = CASE_USER;
+    let project = "file-server-ab-project-lifecycle";
+    let upload_project = "file-server-ab-project-upload";
+    let delete_project = "file-server-ab-project-delete";
+
+    // Project fixtures are created through the public API, then mutated and consumed in order.
+    for (case, project_id, template_type) in [
+        ("project-fixture-lifecycle-create", project, "react"),
+        ("project-fixture-upload-create", upload_project, "react"),
+        ("project-fixture-delete-create", delete_project, "vue3"),
+    ] {
+        scenarios.push((case, project_create_spec(project_id, template_type)?));
+    }
+
+    let skills_fields = [("userId", user), ("cId", AB_SKILLS_V1_CID)];
+    scenarios.push((
+        "computer-create-workspace-v1-local-skills",
+        multipart_spec(
+            "/api/computer/create-workspace",
+            &skills_fields,
+            &[("file", "skills-fixture.zip", skills_zip)],
+        ),
+    ));
+    scenarios.push((
+        "computer-push-skills-v1-local-zip",
+        multipart_spec(
+            "/api/computer/push-skills-to-workspace",
+            &skills_fields,
+            &[("file", "skills-fixture.zip", skills_zip)],
+        ),
+    ));
+
+    let v2_fields = [
+        ("userId", user),
+        ("cId", AB_SKILLS_V2_CID),
+        ("agentId", "ab-agent"),
+        ("skillUrls", "[]"),
+        ("skillNames", "[\"file-server-ab-skill\"]"),
+        ("mcpServersConfig", "{\"servers\":[]}"),
+        ("hooksConfig", "{\"hooks\":[]}"),
+        ("permissionsConfig", "{\"allow\":[]}"),
+        ("hookScripts", "[]"),
+    ];
+    scenarios.push((
+        "computer-create-workspace-v2-local-config",
+        multipart_spec(
+            "/api/computer/create-workspace-v2",
+            &v2_fields,
+            &[("file", "skills-fixture.zip", skills_zip)],
+        ),
+    ));
+    let v2_push_fields = [
+        ("userId", user),
+        ("cId", AB_SKILLS_V2_CID),
+        ("agentId", "ab-agent"),
+        ("skillUrls", "[]"),
+    ];
+    scenarios.push((
+        "computer-push-skills-v2-local-zip",
+        multipart_spec(
+            "/api/computer/push-skills-to-workspace-v2",
+            &v2_push_fields,
+            &[("file", "skills-fixture.zip", skills_zip)],
+        ),
+    ));
+
+    scenarios.push((
+        "computer-generate-file-utf8",
+        json_spec(
+            Method::POST,
+            "/api/computer/generate-file",
+            json!({
+                "userId": user,
+                "cId": CASE_CID,
+                "fileName": "ab-generated/nested/message.txt",
+                "content": "A/B + % 中文\n"
+            }),
+        )?,
+    ));
+    scenarios.push((
+        "computer-read-generated-file-utf8",
+        get_spec(format!(
+            "/api/computer/static/{user}/{CASE_CID}/ab-generated/nested/message.txt"
+        )),
+    ));
+
+    let import_fields = [("userId", user), ("cId", AB_IMPORT_CID)];
+    scenarios.push((
+        "computer-import-project-local-zip",
+        multipart_spec(
+            "/api/computer/import-project",
+            &import_fields,
+            &[("file", "workspace-project.zip", workspace_zip)],
+        ),
+    ));
+    scenarios.push((
+        "computer-read-imported-project-file",
+        get_spec(format!(
+            "/api/computer/static/{user}/{AB_IMPORT_CID}/src/imported.txt"
+        )),
+    ));
+    scenarios.push((
+        "computer-import-preservation-contract",
+        json_spec(
+            Method::POST,
+            "/api/computer/execute-command",
+            json!({
+                "userId": user,
+                "cId": AB_IMPORT_CID,
+                "command": "test \"$(cat .agents/keep.txt)\" = \"preserved agent data\" && test ! -e .agents/from-archive.txt && printf 'import preservation ok\\n'"
+            }),
+        )?,
+    ));
+
+    let init_fields = [
+        ("userId", user),
+        ("cId", AB_PACKAGE_CID),
+        ("enableGit", "true"),
+    ];
+    scenarios.push((
+        "computer-init-project-template-package-fixture",
+        multipart_spec(
+            "/api/computer/init-project-template",
+            &init_fields,
+            &[("file", "package-project.zip", package_zip)],
+        ),
+    ));
+    scenarios.push((
+        "computer-init-template-git-tree",
+        json_spec(
+            Method::POST,
+            "/api/computer/execute-command",
+            json!({
+                "userId": user,
+                "cId": AB_PACKAGE_CID,
+                "command": "git show -s --format=%T HEAD"
+            }),
+        )?,
+    ));
+    scenarios.push((
+        "computer-install-empty-typescript-project",
+        json_spec(
+            Method::POST,
+            "/api/computer/install-project",
+            json!({
+                "userId": user,
+                "cId": AB_PACKAGE_CID,
+                "programmingLanguage": "typescript"
+            }),
+        )?,
+    ));
+    scenarios.push((
+        "computer-build-agent-package-synthetic",
+        json_spec(
+            Method::POST,
+            "/api/computer/build-agent-package",
+            json!({
+                "userId": user,
+                "cId": AB_PACKAGE_CID,
+                "agentId": "17",
+                "version": "1.2.3"
+            }),
+        )?,
+    ));
+    scenarios.push((
+        "computer-cleanup-build-artifacts",
+        json_spec(
+            Method::POST,
+            "/api/computer/cleanup-build-artifacts",
+            json!({ "userId": user, "cId": AB_PACKAGE_CID }),
+        )?,
+    ));
+
+    scenarios.push((
+        "computer-execute-command-fixed-output",
+        json_spec(
+            Method::POST,
+            "/api/computer/execute-command",
+            json!({
+                "userId": user,
+                "cId": CASE_CID,
+                "command": "printf 'file-server-ab-command-ok\\n'"
+            }),
+        )?,
+    ));
+    scenarios.push((
+        "computer-get-logs-tail-lines",
+        get_spec(format!(
+            "/api/computer/get-logs?userId={user}&cId={AB_LOG_CID}&tailLines=2"
+        )),
+    ));
+    scenarios.push((
+        "computer-download-all-files-semantic-zip",
+        get_spec(format!(
+            "/api/computer/download-all-files?userId={user}&cId={CASE_CID}"
+        )),
+    ));
+    scenarios.push((
+        "computer-zip-workspace-semantic",
+        json_spec(
+            Method::POST,
+            "/api/computer/zip-workspace",
+            json!({ "userId": user, "cId": CASE_CID, "excludeDirs": ["empty"] }),
+        )?,
+    ));
+    scenarios.push((
+        "computer-delete-workspace-owned-fixture",
+        json_spec(
+            Method::POST,
+            "/api/computer/delete-workspace",
+            json!({ "userId": user, "cId": AB_SKILLS_V1_CID }),
+        )?,
+    ));
+
+    scenarios.push((
+        "project-all-files-update-seed-obsolete",
+        json_spec(
+            Method::POST,
+            "/api/project/specified-files-update",
+            json!({
+                "projectId": project,
+                "codeVersion": "1",
+                "files": [{"operation":"create","name":"ab-obsolete.txt","contents":"remove%20me"}]
+            }),
+        )?,
+    ));
+    scenarios.push((
+        "project-all-files-update-replace",
+        json_spec(
+            Method::POST,
+            "/api/project/all-files-update",
+            json!({
+                "projectId": project,
+                "codeVersion": "2",
+                "files": [
+                    { "name": "README.md", "contents": "full%20snapshot%0A", "binary": false },
+                    { "name": "src/index.html", "contents": "<main>A%2FB%20project</main>%0A", "binary": false },
+                    { "name": "empty.txt", "contents": "", "binary": false }
+                ]
+            }),
+        )?,
+    ));
+    let mut removed_file_check = get_spec(format!("/api/page/static/{project}/ab-obsolete.txt"));
+    removed_file_check.expected_status = ExpectedStatus::ClientError4xx;
+    removed_file_check.normalized_paths =
+        vec!["/error/requestId".into(), "/error/timestamp".into()];
+    scenarios.push((
+        "project-all-files-update-removes-omitted-file",
+        removed_file_check,
+    ));
+    scenarios.push((
+        "project-upload-single-file-bytes",
+        multipart_spec(
+            "/api/project/upload-single-file",
+            &[
+                ("projectId", project),
+                ("codeVersion", "3"),
+                ("filePath", "src/single.bin"),
+            ],
+            &[("file", "single.bin", &[0, 1, 2, 13, 10, 127, 255])],
+        ),
+    ));
+    scenarios.push((
+        "project-upload-batch-mixed-bytes",
+        multipart_spec(
+            "/api/project/upload-batch-files",
+            &[
+                ("projectId", project),
+                ("codeVersion", "4"),
+                ("filePaths", "src/batch/one.txt"),
+                ("filePaths", "src/batch/two.bin"),
+            ],
+            &[
+                ("files", "one.txt", b"batch project file\n"),
+                ("files", "two.bin", &[0, 255, 10, 13, 42]),
+            ],
+        ),
+    ));
+    scenarios.push((
+        "project-upload-attachment-deterministic-name",
+        multipart_spec(
+            "/api/project/upload-attachment-file",
+            &[("projectId", project), ("fileName", "ab-attachment.txt")],
+            &[("file", "ab-attachment.txt", b"attachment fixture\n")],
+        ),
+    ));
+    scenarios.push((
+        "project-push-skills-local-zip",
+        multipart_spec(
+            "/api/project/push-skills-to-workspace",
+            &[("projectId", project)],
+            &[("file", "skills-fixture.zip", skills_zip)],
+        ),
+    ));
+    scenarios.push((
+        "project-backup-deprecated-under-git",
+        json_spec(
+            Method::POST,
+            "/api/project/backup-current-version",
+            json!({ "projectId": project, "codeVersion": "4" }),
+        )?,
+    ));
+    scenarios.push((
+        "project-get-version-deprecated-under-git",
+        get_spec(format!(
+            "/api/project/get-project-content-by-version?projectId={project}&codeVersion=4"
+        )),
+    ));
+    scenarios.push((
+        "project-rollback-deprecated-under-git",
+        json_spec(
+            Method::POST,
+            "/api/project/rollback-version",
+            json!({ "projectId": project, "codeVersion": "4", "rollbackTo": "1" }),
+        )?,
+    ));
+    scenarios.push((
+        "project-copy-project-tree",
+        json_spec(
+            Method::POST,
+            "/api/project/copy-project",
+            json!({ "sourceProjectId": project, "targetProjectId": "file-server-ab-project-copy" }),
+        )?,
+    ));
+    scenarios.push((
+        "project-export-latest-semantic-zip",
+        json_spec(
+            Method::POST,
+            "/api/project/export-project",
+            json!({ "projectId": project, "codeVersion": "4", "exportType": "LATEST" }),
+        )?,
+    ));
+    scenarios.push((
+        "project-upload-project-wrapper-zip",
+        multipart_spec(
+            "/api/project/upload-project",
+            &[("projectId", upload_project), ("codeVersion", "5")],
+            &[("file", "workspace-project.zip", workspace_zip)],
+        ),
+    ));
+    scenarios.push((
+        "project-read-uploaded-project-file",
+        get_spec(format!(
+            "/api/page/static/{upload_project}/src/imported.txt"
+        )),
+    ));
+    scenarios.push((
+        "project-delete-owned-fixture",
+        get_spec(format!(
+            "/api/project/delete-project?projectId={delete_project}"
+        )),
+    ));
+
+    Ok(scenarios)
 }
 
 fn validate_files_update_response(
@@ -1287,6 +1775,247 @@ fn validate_body_equals(body: &[u8], expected: &[u8]) -> Result<(), String> {
             sha256(body)
         ))
     }
+}
+
+fn validate_directory_empty_or_absent(path: &Path) -> Result<(), String> {
+    let mut entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("read temporary upload directory: {error}")),
+    };
+    match entries.next() {
+        None => Ok(()),
+        Some(Ok(entry)) => Err(format!(
+            "temporary upload directory still contains {}",
+            entry.file_name().to_string_lossy()
+        )),
+        Some(Err(error)) => Err(format!("read temporary upload directory entry: {error}")),
+    }
+}
+
+fn validate_success_json(body: &[u8]) -> Result<(), String> {
+    let value: Value =
+        serde_json::from_slice(body).map_err(|error| format!("response is not JSON: {error}"))?;
+    if value.get("success").and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(format!("response must contain success=true; got {value}"))
+    }
+}
+
+fn validate_boolean_field(body: &[u8], field: &str, expected: bool) -> Result<(), String> {
+    let value: Value =
+        serde_json::from_slice(body).map_err(|error| format!("response is not JSON: {error}"))?;
+    if value.get(field).and_then(Value::as_bool) == Some(expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "response field {field} must be {expected}; got {value}"
+        ))
+    }
+}
+
+fn validate_json_string_field(body: &[u8], field: &str, expected: &str) -> Result<(), String> {
+    let value: Value =
+        serde_json::from_slice(body).map_err(|error| format!("response is not JSON: {error}"))?;
+    if value.get("success").and_then(Value::as_bool) == Some(true)
+        && value.get(field).and_then(Value::as_str) == Some(expected)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "response must contain success=true and {field}={expected:?}; got {value}"
+        ))
+    }
+}
+
+fn validate_deprecated_json(body: &[u8]) -> Result<(), String> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("deprecated response is not JSON: {error}"))?;
+    if value.get("success").and_then(Value::as_bool) == Some(false)
+        && value.get("deprecated").and_then(Value::as_bool) == Some(true)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "response must explicitly mark the route deprecated; got {value}"
+        ))
+    }
+}
+
+fn validate_execute_command(body: &[u8]) -> Result<(), String> {
+    validate_execute_command_output(body, "file-server-ab-command-ok\n")
+}
+
+fn validate_execute_command_output(body: &[u8], expected_stdout: &str) -> Result<(), String> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("execute-command response is not JSON: {error}"))?;
+    if value.get("success").and_then(Value::as_bool) == Some(true)
+        && value.get("exitCode").and_then(Value::as_i64) == Some(0)
+        && value.get("stdout").and_then(Value::as_str) == Some(expected_stdout)
+        && value.get("stderr").and_then(Value::as_str) == Some("")
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "execute-command output did not match the expected command result; got {value}"
+        ))
+    }
+}
+
+fn validate_git_tree_response(body: &[u8]) -> Result<(), String> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("git tree response is not JSON: {error}"))?;
+    let tree = value
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let is_hex_tree =
+        matches!(tree.len(), 40 | 64) && tree.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if value.get("success").and_then(Value::as_bool) == Some(true)
+        && value.get("exitCode").and_then(Value::as_i64) == Some(0)
+        && value.get("stderr").and_then(Value::as_str) == Some("")
+        && is_hex_tree
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "init-project-template must create a Git commit with a tree hash; got {value}"
+        ))
+    }
+}
+
+fn validate_log_tail(body: &[u8]) -> Result<(), String> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("get-logs response is not JSON: {error}"))?;
+    let logs = value.get("logs").and_then(Value::as_array);
+    let expected = [
+        json!({"line": 3, "content": "third line"}),
+        json!({"line": 4, "content": "fourth line"}),
+    ];
+    if value.get("success").and_then(Value::as_bool) == Some(true)
+        && value.get("totalLines").and_then(Value::as_u64) == Some(4)
+        && value.get("startIndex").and_then(Value::as_u64) == Some(3)
+        && value.get("logFileName").and_then(Value::as_str) == Some("ab.log")
+        && logs.is_some_and(|actual| actual == &expected)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "get-logs did not return the expected two-line tail; got {value}"
+        ))
+    }
+}
+
+fn validate_build_artifact(body: &[u8]) -> Result<(), String> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("build-agent-package response is not JSON: {error}"))?;
+    let artifacts = value.get("artifacts").and_then(Value::as_array);
+    let matches = artifacts.is_some_and(|items| {
+        items.len() == 1
+            && items[0].get("fileName").and_then(Value::as_str)
+                == Some("agent-17-linux-x64-1.2.3.zip")
+            && items[0].get("platform").and_then(Value::as_str) == Some("linux-x64")
+            && items[0]
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| path.ends_with("/agent-17-linux-x64-1.2.3.zip"))
+    });
+    if value.get("success").and_then(Value::as_bool) == Some(true) && matches {
+        Ok(())
+    } else {
+        Err(format!(
+            "build-agent-package artifact discovery differs from fixture; got {value}"
+        ))
+    }
+}
+
+fn validate_project_copy(body: &[u8]) -> Result<(), String> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("copy-project response is not JSON: {error}"))?;
+    if value.get("success").and_then(Value::as_bool) == Some(true)
+        && value.get("sourceProjectId").and_then(Value::as_str)
+            == Some("file-server-ab-project-lifecycle")
+        && value.get("targetProjectId").and_then(Value::as_str)
+            == Some("file-server-ab-project-copy")
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "copy-project response does not identify its source and target; got {value}"
+        ))
+    }
+}
+
+fn validate_attachment_response(body: &[u8]) -> Result<(), String> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("attachment response is not JSON: {error}"))?;
+    if value.get("success").and_then(Value::as_bool) == Some(true)
+        && value.get("fileName").and_then(Value::as_str) == Some("ab-attachment.txt")
+        && value.get("relativePath").and_then(Value::as_str)
+            == Some(".attachments/ab-attachment.txt")
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "attachment response does not match its requested name; got {value}"
+        ))
+    }
+}
+
+fn validate_project_delete(body: &[u8], project_id: &str) -> Result<(), String> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("delete-project response is not JSON: {error}"))?;
+    if value.get("success").and_then(Value::as_bool) == Some(true)
+        && value.get("projectId").and_then(Value::as_str) == Some(project_id)
+        && value
+            .get("failedDirectories")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "delete-project did not confirm a clean deletion; got {value}"
+        ))
+    }
+}
+
+fn validate_download_archive(body: &[u8], user_id: &str, cid: &str) -> Result<(), String> {
+    let entries = zip_semantic_entries(body).map_err(|error| error.to_string())?;
+    let entries = entries
+        .as_object()
+        .ok_or_else(|| "ZIP semantic entries are not an object".to_string())?;
+    let prefix = format!("{user_id}_{cid}/");
+    if !entries.keys().any(|path| path.starts_with(&prefix))
+        || entries.keys().any(|path| path.contains("/."))
+        || !entries.contains_key(&format!("{prefix}README.md"))
+    {
+        return Err(format!(
+            "download-all-files ZIP must have the expected prefix, README and no dot-segment entries; paths={:?}",
+            entries.keys().collect::<Vec<_>>()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workspace_archive(body: &[u8]) -> Result<(), String> {
+    let entries = zip_semantic_entries(body).map_err(|error| error.to_string())?;
+    let entries = entries
+        .as_object()
+        .ok_or_else(|| "ZIP semantic entries are not an object".to_string())?;
+    if !entries.contains_key("README.md")
+        || !entries.contains_key(".gitignore")
+        || entries.keys().any(|path| path.starts_with("empty/"))
+        || !entries.contains_key(".hidden.txt")
+    {
+        return Err(format!(
+            "zip-workspace ZIP must be unprefixed, retain hidden and gitignore files, and exclude the requested directory; paths={:?}",
+            entries.keys().collect::<Vec<_>>()
+        ));
+    }
+    Ok(())
 }
 
 fn git_scenario(
@@ -1840,6 +2569,20 @@ fn json_spec(method: Method, path: &str, body: Value) -> Result<RequestSpec> {
         normalized_headers: Vec::new(),
         timeout: Duration::from_secs(30),
     })
+}
+
+fn project_create_spec(project_id: &str, template_type: &str) -> Result<RequestSpec> {
+    let mut spec = json_spec(
+        Method::POST,
+        "/api/project/create-project",
+        json!({"projectId": project_id, "templateType": template_type}),
+    )?;
+    // Template initialization includes extraction, agent metadata synchronization, and a Git
+    // commit. Cold Docker volumes can exceed the generic API timeout even when initialization
+    // succeeds; allow the comparison to observe the actual result rather than cascade into
+    // later scenarios against a project that is still being initialized.
+    spec.timeout = Duration::from_secs(120);
+    Ok(spec)
 }
 
 fn get_spec(path: impl Into<String>) -> RequestSpec {
@@ -3005,6 +3748,34 @@ fn compare_exchange(
     if rust.status.is_none() || ts.status.is_none() {
         return differences;
     }
+    if is_zip_exchange(rust) || is_zip_exchange(ts) {
+        let rust_entries = zip_semantic_entries(&rust.body);
+        let ts_entries = zip_semantic_entries(&ts.body);
+        for (side, parsed) in [("rust", &rust_entries), ("typescript", &ts_entries)] {
+            if let Err(error) = parsed {
+                differences.push(diff(
+                    case,
+                    &format!("/assertions/{side}/valid-zip"),
+                    "assertion_failed",
+                    Some(json!(format!(
+                        "response declared as ZIP but could not be parsed: {error:#}"
+                    ))),
+                    None,
+                ));
+            }
+        }
+        if let (Ok(rust_entries), Ok(ts_entries)) = (rust_entries, ts_entries) {
+            json_differences(
+                case,
+                "/zip",
+                &rust_entries,
+                &ts_entries,
+                normalized_paths,
+                &mut differences,
+            );
+        }
+        return differences;
+    }
     let rust_json = serde_json::from_slice::<Value>(&rust.body).ok();
     let ts_json = serde_json::from_slice::<Value>(&ts.body).ok();
     if health_probe {
@@ -3042,6 +3813,75 @@ fn compare_exchange(
         ));
     }
     differences
+}
+
+fn is_zip_exchange(exchange: &Exchange) -> bool {
+    exchange
+        .headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("zip"))
+        || exchange.body.starts_with(b"PK\x03\x04")
+        || exchange.body.starts_with(b"PK\x05\x06")
+}
+
+fn zip_semantic_entries(bytes: &[u8]) -> Result<Value> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).context("open ZIP archive")?;
+    if archive.len() > ZIP_ENTRY_COUNT_LIMIT {
+        bail!(
+            "ZIP contains {} entries, above the comparison limit {ZIP_ENTRY_COUNT_LIMIT}",
+            archive.len()
+        );
+    }
+    let mut total_size = 0_u64;
+    let mut entries = BTreeMap::new();
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .with_context(|| format!("read ZIP entry {index}"))?;
+        let name = entry.name().replace('\\', "/");
+        let declared_size = entry.size();
+        if declared_size > ZIP_ENTRY_SIZE_LIMIT {
+            bail!("ZIP entry {name:?} exceeds the per-entry comparison limit");
+        }
+        total_size = total_size
+            .checked_add(declared_size)
+            .context("sum ZIP uncompressed sizes")?;
+        if total_size > ZIP_TOTAL_SIZE_LIMIT {
+            bail!("ZIP exceeds the total uncompressed comparison limit");
+        }
+        let is_dir = entry.is_dir();
+        let mode = entry.unix_mode();
+        let mut content = Vec::with_capacity(declared_size as usize);
+        (&mut entry)
+            .take(ZIP_ENTRY_SIZE_LIMIT + 1)
+            .read_to_end(&mut content)
+            .with_context(|| format!("decompress ZIP entry {name:?}"))?;
+        if content.len() as u64 > ZIP_ENTRY_SIZE_LIMIT {
+            bail!("ZIP entry {name:?} exceeds the per-entry comparison limit");
+        }
+        if content.len() as u64 != declared_size {
+            bail!("ZIP entry {name:?} size did not match its directory record");
+        }
+        let is_symlink = mode.is_some_and(|mode| mode & 0o170000 == 0o120000);
+        let kind = if is_dir {
+            "directory"
+        } else if is_symlink {
+            "symlink"
+        } else {
+            "file"
+        };
+        let semantic = json!({
+            "kind": kind,
+            "sha256": if kind == "directory" { None } else { Some(sha256(&content)) },
+            "size_bytes": if kind == "directory" { None } else { Some(content.len()) },
+            "mode": mode.map(|mode| format!("{:04o}", mode & 0o7777)),
+        });
+        if entries.insert(name.clone(), semantic).is_some() {
+            bail!("ZIP contains duplicate entry path {name:?}");
+        }
+    }
+    serde_json::to_value(entries).context("serialize ZIP semantic entries")
 }
 
 fn json_differences(
@@ -3436,12 +4276,25 @@ fn prepare_computer_fixture(root: &Path) -> Result<()> {
         "spaces are part of the file name\n",
     )?;
     fs::write(dir.join(".hidden.txt"), "hidden fixture\n")?;
+    fs::write(dir.join(".gitignore"), "node_modules\n")?;
     fs::write(dir.join("  中文文件 .txt  "), "unicode and edge spaces\n")?;
     fs::write(dir.join("binary.bin"), [0, 1, 2, 13, 10, 127, 255])?;
+    let log_dir = workspace.join(CASE_USER).join(AB_LOG_CID).join(".logs");
+    fs::create_dir_all(&log_dir)?;
+    fs::write(
+        log_dir.join("ab.log"),
+        "first line\n\nsecond line\nthird line\nfourth line\n",
+    )?;
     fs::write(
         workspace.join("file-server-ab-outside-secret.txt"),
         "must remain outside the selected session root\n",
     )?;
+    let preserved_agents = workspace
+        .join(CASE_USER)
+        .join(AB_IMPORT_CID)
+        .join(".agents");
+    fs::create_dir_all(&preserved_agents)?;
+    fs::write(preserved_agents.join("keep.txt"), "preserved agent data")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
@@ -3482,7 +4335,13 @@ async fn wait_health(client: &Client, base_url: &str, side: &str) -> Result<()> 
 
 fn hash_fixtures(fixtures: &Path) -> Result<BTreeMap<String, String>> {
     let mut hashes = BTreeMap::new();
-    for file in ["react-vite-template.zip", "vue3-vite-template.zip"] {
+    for file in [
+        "react-vite-template.zip",
+        "vue3-vite-template.zip",
+        "skills-fixture.zip",
+        "workspace-project.zip",
+        "package-project.zip",
+    ] {
         let path = fixtures.join(file);
         let bytes = fs::read(&path).with_context(|| format!("read fixture {}", path.display()))?;
         hashes.insert(file.to_string(), sha256(&bytes));
@@ -3902,6 +4761,34 @@ mod tests {
         assert_eq!(differences.len(), 1);
         assert_eq!(differences[0].path, "/files/$order");
         assert_eq!(differences[0].kind, "array_order");
+    }
+
+    #[test]
+    fn zip_responses_compare_by_entry_semantics_not_archive_order() {
+        fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {
+            let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            for (name, body) in files {
+                writer
+                    .start_file(*name, zip::write::SimpleFileOptions::default())
+                    .expect("start ZIP file");
+                writer.write_all(body).expect("write ZIP file");
+            }
+            writer.finish().expect("finish ZIP").into_inner()
+        }
+
+        let ordered = archive(&[("README.md", b"readme"), ("src/main.ts", b"source")]);
+        let reversed = archive(&[("src/main.ts", b"source"), ("README.md", b"readme")]);
+        let changed = archive(&[("README.md", b"readme"), ("src/main.ts", b"different")]);
+
+        assert_eq!(
+            zip_semantic_entries(&ordered).expect("valid ZIP"),
+            zip_semantic_entries(&reversed).expect("valid ZIP")
+        );
+        assert_ne!(
+            zip_semantic_entries(&ordered).expect("valid ZIP"),
+            zip_semantic_entries(&changed).expect("valid ZIP")
+        );
+        assert!(zip_semantic_entries(b"not a ZIP archive").is_err());
     }
 
     #[test]

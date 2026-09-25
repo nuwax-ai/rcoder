@@ -26,15 +26,17 @@ make file-server-ab \
   AB_TS_SOURCE=/path/to/nuwax-file-server \
   AB_TS_REF=main \
   AB_PNPM_VERSION=10.34.5 \
+  AB_BUILDER=mac-arm64 \
   AB_RUST_PORT=61101 AB_TS_PORT=61100 \
   AB_KEEP=1
 ```
 
-国内网络可将 `DOCKER_MIRROR=registry-prefix` 放入被 Git 忽略的 `.env.local`，或仅在调用时传给 Make。A/B 启动器优先使用本机缓存的官方 Node/Rust 基础镜像；缓存缺失时才从镜像站拉取，并自动补齐末尾 `/`。不设置镜像站时使用官方镜像。该地址不会写入源码或 Git 跟踪文件；本地报告记录实际镜像身份，可能包含镜像源地址。
+国内网络可将 `DOCKER_MIRROR=registry-prefix` 放入被 Git 忽略的 `.env.local`，或仅在调用时传给 Make。设置镜像前缀后，Node/Rust 基础镜像均使用该镜像站的 Node/Rust 路径，并自动补齐末尾 `/`；不设置时使用官方镜像。该地址不会写入源码或 Git 跟踪文件；本地报告记录实际镜像身份，可能包含镜像源地址。
 
 默认宿主机端口由 Docker 动态分配并只绑定到 `127.0.0.1`。指定 `AB_RUST_PORT` / `AB_TS_PORT` 后使用固定端口。每轮都有唯一 Compose project、容器镜像 tag、宿主机工作区和报告目录。正常结束会删除本轮容器、镜像与临时工作区；对照差异或服务请求失败时会保留工作区以便复查。`AB_KEEP=1` 保留容器与工作区。
 
 Rust 与 TypeScript 镜像按顺序构建，避免两个依赖安装/编译任务同时争用本机内存和磁盘。
+当另一个任务正在使用当前 Docker builder 时，可通过 `AB_BUILDER` 选择独立 Buildx builder；所选名称会写入本轮 `manifest.json`。
 
 ## 报告
 
@@ -58,11 +60,11 @@ Rust 与 TypeScript 镜像按顺序构建，避免两个依赖安装/编译任�
 
 ## 套件与覆盖边界
 
-- `core`：健康/API 版本、React/Vue 模板初始化与读取、项目文件更新、Computer `files-update` 的 create/modify/rename/delete 和 URL 解码、单文件/批量 multipart（二进制含 NUL/非 UTF-8 字节）上传，再通过静态接口读取并逐字节核验；还覆盖文件列表/resolve/search/metadata 边界、静态普通/Range 读取和基础文件系统操作。无 npm 外网依赖。
+- `core`：健康/API 版本、React/Vue 模板初始化与读取、项目全量文件替换、复制/删除/导出/上传、Computer workspace 创建/删除、skills ZIP、项目 ZIP 导入和模板初始化、合成 package 生成/清理、日志读取、工作区 ZIP 下载/创建，以及 `files-update` 的 create/modify/rename/delete 和 URL 解码。multipart 单/批量二进制上传会静态读回并逐字节核验；所有 ZIP 响应按条目路径、类型、权限和内容摘要比较，不比较压缩顺序/时间戳。另覆盖文件列表/resolve/search/metadata 边界、静态普通/Range 读取和基础文件系统操作。除 `install-project` 的无依赖 pnpm 场景外，不访问 npm 外网。
 - `git`：通过 HTTP 对照 init、status、add、commit、file-content、branch create/delete、tag、log、worktree/staged diff、unstage、checkout、discard、revert，以及 mixed/hard/soft reset。另用系统 Git 为两侧独立 fixture 准备相同的真实 merge-conflict index，再通过 HTTP 对照 `status.conflicted`；当前 API 没有 merge 操作端点，因此不把 fixture 准备命令当成被测 API。每个会改变历史或工作树的流程使用独立 pageApp fixture，避免一个实现的失败污染其他场景；最终比较 refs 对应 tree、HEAD tree、index entries、工作区状态和文件树。Rust 服务使用 gix，TS 服务使用镜像内系统 Git；驱动只用系统 Git读取最终仓库状态及准备对称 fixture，不参与被测 API 操作。
 - `build`：分别用两份模板走项目初始化、依赖安装、production build、产物静态读取、start-dev、真实页面 HTTP、开发日志分页、日志缓存查询/清理、端口池状态、keep-alive、restart-dev 和 stop-dev，并对照构建错误解析。依赖 registry 网络；报告记下环境版本与错误。
 - `all`：顺序执行以上套件。路由清单按当前 TypeScript 基线快照维护；没有 A/B 场景的共同路由明确标为 pending。
 
-路由清单的 `typescript_revision` 必须与本次准备的 TypeScript Git 提交一致；基线变化时 Make 运行会在发请求前失败，要求先复核并更新路由清单。
+路由清单的 `typescript_revision` 必须与本次准备的 TypeScript Git 提交一致；基线变化时 Make 运行会在发请求前失败，要求先复核并更新路由清单。当前清单中的 76 条共同路由均登记了至少一个场景；截至 2026-09-25，`core` 的真实 A/B 报告已执行此前待测的 27 条路由。`covered` 只表示场景实际执行过，不表示两端语义一致；是否一致以差异审阅和精确规则为准。
 
 这不是“所有路由都已覆盖”的声明。真实结果以报告中的 `route-coverage.json` 与 `requests.jsonl` 为准；Rust-only `/api/v1/userapp` 由既有 UserApp 测试单独覆盖。

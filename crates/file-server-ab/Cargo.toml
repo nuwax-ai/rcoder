@@ -21,6 +21,7 @@ sha2 = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+zip = { workspace = true }
 
 [lints]
 workspace = true

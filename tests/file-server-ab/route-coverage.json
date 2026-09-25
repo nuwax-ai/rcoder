@@ -151,63 +151,79 @@
       "path": "/api/computer/build-agent-package",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-build-agent-package-synthetic"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/computer/cleanup-build-artifacts",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-cleanup-build-artifacts"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/computer/create-workspace",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-create-workspace-v1-local-skills"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/computer/create-workspace-v2",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-create-workspace-v2-local-config"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/computer/delete-workspace",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-delete-workspace-owned-fixture"
+      ]
     },
     {
       "method": "GET",
       "path": "/api/computer/download-all-files",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-download-all-files-semantic-zip"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/computer/execute-command",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-execute-command-fixed-output",
+        "computer-init-template-git-tree",
+        "computer-import-preservation-contract"
+      ]
     },
     {
       "method": "POST",
@@ -269,9 +285,11 @@
       "path": "/api/computer/generate-file",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-generate-file-utf8"
+      ]
     },
     {
       "method": "GET",
@@ -307,54 +325,66 @@
       "path": "/api/computer/get-logs",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-get-logs-tail-lines"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/computer/import-project",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-import-project-local-zip"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/computer/init-project-template",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-init-project-template-package-fixture"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/computer/install-project",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-install-empty-typescript-project"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/computer/push-skills-to-workspace",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-push-skills-v1-local-zip"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/computer/push-skills-to-workspace-v2",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-push-skills-v2-local-zip"
+      ]
     },
     {
       "method": "GET",
@@ -392,7 +422,9 @@
       "cases": [
         "computer-read-files-update-content",
         "computer-read-uploaded-single-binary",
-        "computer-read-uploaded-batch-binary"
+        "computer-read-uploaded-batch-binary",
+        "computer-read-generated-file-utf8",
+        "computer-read-imported-project-file"
       ]
     },
     {
@@ -422,9 +454,11 @@
       "path": "/api/computer/zip-workspace",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-zip-workspace-semantic"
+      ]
     },
     {
       "method": "POST",
@@ -687,7 +721,9 @@
         "read-project-static-file",
         "read-project-static-file-range",
         "build-react-static-dist-index",
-        "build-vue3-static-dist-index"
+        "build-vue3-static-dist-index",
+        "project-read-uploaded-project-file",
+        "project-all-files-update-removes-omitted-file"
       ]
     },
     {
@@ -695,27 +731,33 @@
       "path": "/api/project/all-files-update",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-all-files-update-replace"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/project/backup-current-version",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-backup-deprecated-under-git"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/project/copy-project",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-copy-project-tree"
+      ]
     },
     {
       "method": "POST",
@@ -728,7 +770,10 @@
         "create-react-template-project",
         "create-vue-template-project",
         "build-react-create-project",
-        "build-vue3-create-project"
+        "build-vue3-create-project",
+        "project-fixture-lifecycle-create",
+        "project-fixture-upload-create",
+        "project-fixture-delete-create"
       ]
     },
     {
@@ -736,18 +781,22 @@
       "path": "/api/project/delete-project",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-delete-owned-fixture"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/project/export-project",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-export-latest-semantic-zip"
+      ]
     },
     {
       "method": "GET",
@@ -766,27 +815,33 @@
       "path": "/api/project/get-project-content-by-version",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-get-version-deprecated-under-git"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/project/push-skills-to-workspace",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-push-skills-local-zip"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/project/rollback-version",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-rollback-deprecated-under-git"
+      ]
     },
     {
       "method": "POST",
@@ -796,7 +851,8 @@
       "status": "covered",
       "suite": "core",
       "cases": [
-        "update-project-file"
+        "update-project-file",
+        "project-all-files-update-seed-obsolete"
       ]
     },
     {
@@ -804,36 +860,44 @@
       "path": "/api/project/upload-attachment-file",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-upload-attachment-deterministic-name"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/project/upload-batch-files",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-upload-batch-mixed-bytes"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/project/upload-project",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-upload-project-wrapper-zip"
+      ]
     },
     {
       "method": "POST",
       "path": "/api/project/upload-single-file",
       "typescript": "supported",
       "rust": "supported",
-      "status": "pending",
-      "suite": "pending",
-      "cases": []
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-upload-single-file-bytes"
+      ]
     },
     {
       "method": "GET",

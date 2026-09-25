@@ -22,12 +22,6 @@ fi
 if [[ -n "${docker_mirror}" ]]; then
   default_node_image="${docker_mirror}library/node:22-bookworm-slim"
   default_rust_builder_image="${docker_mirror}rust:1.98-bookworm"
-  if docker image inspect "node:22-bookworm-slim" >/dev/null 2>&1; then
-    default_node_image="node:22-bookworm-slim"
-  fi
-  if docker image inspect "rust:1.98-bookworm" >/dev/null 2>&1; then
-    default_rust_builder_image="rust:1.98-bookworm"
-  fi
 else
   default_node_image="node:22-bookworm-slim"
   default_rust_builder_image="rust:1.98-bookworm"
@@ -40,6 +34,7 @@ pnpm_version="${AB_PNPM_VERSION:-10.34.5}"
 suite="${AB_SUITE:-core}"
 report_dir="${report_root}/${run_id}"
 keep="${AB_KEEP:-0}"
+builder="${AB_BUILDER:-}"
 phase="initialize"
 
 export RCODER_ROOT="${repo_root}"
@@ -51,6 +46,7 @@ export AB_RUST_PORT="${rust_port}"
 export AB_TS_PORT="${ts_port}"
 export AB_PNPM_VERSION="${pnpm_version}"
 export AB_IMAGE_TAG="${image_tag}"
+export AB_DOCKER_BUILDER="${builder:-docker-cli-selected}"
 export AB_RUST_BUILDER_IMAGE="${rust_builder_image}"
 export AB_REPORT_ROOT="${report_root}"
 export AB_RUN_ID="${run_id}"
@@ -102,11 +98,14 @@ rust_source_identity() {
 }
 
 phase="prepare-fixtures"
-mkdir -p "${report_dir}/logs" "${runtime_dir}/rust" "${runtime_dir}/typescript"
+mkdir -p "${report_dir}/logs" "${runtime_dir}/rust" "${runtime_dir}/typescript" "${runtime_dir}/fixtures"
+cp "${repo_root}/tmp/template/react-vite-template.zip" "${runtime_dir}/fixtures/react-vite-template.zip"
+cp "${repo_root}/tmp/template/vue3-vite-template.zip" "${runtime_dir}/fixtures/vue3-vite-template.zip"
+python3 "${script_dir}/prepare-fixtures.py" "${runtime_dir}/fixtures"
 for side in rust typescript; do
   mkdir -p "${runtime_dir}/${side}"/{project-workspace,project-zips,project-nginx,computer-workspace,userapp-workspace,logs/project,logs/computer,logs/file-server,cache/templates,cache/node-modules,init-project}
-  cp "${repo_root}/tmp/template/react-vite-template.zip" "${runtime_dir}/${side}/init-project/react-vite-template.zip"
-  cp "${repo_root}/tmp/template/vue3-vite-template.zip" "${runtime_dir}/${side}/init-project/vue3-vite-template.zip"
+  cp "${runtime_dir}/fixtures/react-vite-template.zip" "${runtime_dir}/${side}/init-project/react-vite-template.zip"
+  cp "${runtime_dir}/fixtures/vue3-vite-template.zip" "${runtime_dir}/${side}/init-project/vue3-vite-template.zip"
 done
 
 phase="prepare-ts-source"
@@ -136,9 +135,13 @@ phase="capture-rust-source"
 rust_source_before="$(rust_source_identity)"
 
 phase="build-rust-image"
-docker compose -p "${project}" -f "${compose_file}" build --pull=false rust
+builder_args=()
+if [[ -n "${builder}" ]]; then
+  builder_args=(--builder "${builder}")
+fi
+docker compose -p "${project}" -f "${compose_file}" build "${builder_args[@]}" --pull=false rust
 phase="build-ts-image"
-docker compose -p "${project}" -f "${compose_file}" build --pull=false typescript
+docker compose -p "${project}" -f "${compose_file}" build "${builder_args[@]}" --pull=false typescript
 
 phase="check-rust-source-stability"
 rust_source_after="$(rust_source_identity)"
@@ -174,6 +177,7 @@ export AB_TS_GIT_VERSION="$(docker compose -p "${project}" -f "${compose_file}" 
 
 phase="run-selected-suites"
 docker compose -p "${project}" -f "${compose_file}" run --rm --no-deps -T \
+	 -e "AB_DOCKER_BUILDER=${AB_DOCKER_BUILDER}" \
 	 -e "AB_RUST_SOURCE=${rust_source_before}" \
 	 -e "AB_TS_SOURCE=${ts_revision}" \
 	 -e "AB_RUST_HOST_URL=${AB_RUST_HOST_URL}" \
