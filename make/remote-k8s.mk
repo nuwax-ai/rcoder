@@ -6,7 +6,7 @@ REMOTE_K8S_SUITE ?= $(or $(SUITE),smoke)
 REMOTE_K8S_CASE ?= $(CASE)
 REMOTE_K8S_RUN ?= $(RUN)
 export REMOTE_K8S_SUITE REMOTE_K8S_CASE REMOTE_K8S_RUN
-REMOTE_K8S_ACTIONS := doctor sync-start sync-status sync-stop build deploy test verify logs down status check retest-failed
+REMOTE_K8S_ACTIONS := doctor sync-start sync-status sync-stop build deploy test verify logs down status check retest-failed tenant-isolation
 .PHONY: $(addprefix remote-k8s-,$(REMOTE_K8S_ACTIONS))
 $(addprefix remote-k8s-,$(REMOTE_K8S_ACTIONS)):
 	python3 tools/remote_k8s/main.py $(patsubst remote-k8s-%,%,$@)

@@ -1,4 +1,4 @@
-# ClusterRole：rcoder 主 SA 与 app Pod SA 共用的集群级权限。
+# ClusterRole：仅 rcoder 主 SA 使用的集群编排权限，不能绑定租户 app Pod SA。
 #
 # 单文档（每文件单资源，兼容单文档 YAML 解析器，与同目录 deployment.yaml / pvc.yaml /
 # service.yaml / serviceaccount.yaml 的"一文件一资源"风格一致）。

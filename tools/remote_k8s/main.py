@@ -248,7 +248,7 @@ def build(c, expected_manifest=None):
             metadata = c.remote + '/receipts/' + build_id + '-' + target + '.json'
             args = ['docker', 'buildx', 'build', '--builder', builder, '--platform', 'linux/amd64',
                     '--file', frozen['path'] + '/docker/remote-k8s/Dockerfile', '--target', target,
-                    '--build-arg', 'CARGO_JOBS=' + c.get('JOBS', '4'), '--build-arg', 'RUST_IMAGE=' + c.get('RUST_IMAGE', 'rust:1.95-trixie'),
+                    '--build-arg', 'CARGO_JOBS=' + c.get('JOBS', '4'), '--build-arg', 'RUST_IMAGE=' + rust_build_arg,
                     '--build-arg', 'APT_MIRROR=' + c.get('APT_MIRROR', 'http://deb.debian.org'),
                     '--build-arg', 'CARGO_MIRROR=' + c.get('CARGO_MIRROR', ''),
                     *base_args, '--tag', tag, '--metadata-file', metadata, '--push', '--provenance=false', frozen['path']]
@@ -748,7 +748,9 @@ def retest_failed(c, parent_id):
 def logs(c, destination=None):
     destination = destination or c.state / 'logs' / uuid.uuid4().hex
     destination.mkdir(parents=True, exist_ok=True)
+    # Verify the namespace before reading workload logs or Secret redactions.
     owned(c, 'namespace', c.ns)
+    collection_errors = []
     redactions = [v for k, v in c.values.items() if re.search(r'API_KEY|PASSWORD|TOKEN|SECRET', k) and len(v) > 5]
     try:
         import base64
@@ -759,13 +761,7 @@ def logs(c, destination=None):
         for value in redactions:
             text = text.replace(value, '<redacted>')
         return text
-    # Q06：前置查询逐项独立保护——namespace/pods/events 任一失败不得阻止
-    # 其余诊断项收集（错误记录进 collection-errors）
-    try:
-        owned(c, 'namespace', c.ns)
-    except RuntimeError as error:
-        collection_errors.append({'item': 'namespace ownership', 'error_class': 'collect-failed',
-                                  'detail': str(error)[-300:]})
+    # Namespace ownership is required; subsequent diagnostic reads are independent.
     try:
         pods = c.obj('get', 'pods')['items']
         rows = [{'name': p['metadata']['name'], 'uid': p['metadata']['uid'], 'status': p.get('status')} for p in pods]
@@ -779,7 +775,6 @@ def logs(c, destination=None):
     except Exception as error:  # noqa: BLE001 - 同上
         collection_errors.append({'item': 'events', 'error_class': 'collect-failed',
                                   'detail': str(error)[-300:]})
-    collection_errors = []
     for pod in pods:
         name = pod['metadata']['name']
         for container in pod['spec']['containers']:
@@ -826,7 +821,7 @@ def down(c):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['doctor', 'sync-start', 'sync-status', 'sync-stop', 'build', 'deploy',
-                                           'test', 'verify', 'logs', 'down', 'status', 'check', 'retest-failed'])
+                                           'test', 'verify', 'logs', 'down', 'status', 'check', 'retest-failed', 'tenant-isolation'])
     # 参数经环境变量安全传递（make 侧不插值进 shell；见 make/remote-k8s.mk）。
     parser.add_argument('--suite', choices=['smoke', 'userapp', 'chat', 'gateway', 'all'],
                         default=os.environ.get('REMOTE_K8S_SUITE', 'smoke'))
@@ -870,6 +865,9 @@ def main():
             elif args.action == 'logs': logs(c)
             elif args.action == 'down': down(c)
             elif args.action == 'retest-failed': retest_failed(c, args.run)
+            elif args.action == 'tenant-isolation':
+                import tenant_isolation
+                tenant_isolation.run(c)
             elif args.action == 'verify':
                 # 同轮输入：冻结一次，构建与测试消费同一清单（R1）
                 frozen = snapshot.manifest()

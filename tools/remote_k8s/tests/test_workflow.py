@@ -12,6 +12,7 @@ from common import Config, LABEL
 import main
 import manifests
 import snapshot
+import tenant_isolation
 
 
 class WorkflowTests(unittest.TestCase):
@@ -35,6 +36,8 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(pv['spec']['claimRef']['namespace'], c.ns)
             dep = next(r for r in rows if r['kind'] == 'Deployment')
             self.assertEqual(dep['spec']['replicas'], 2)
+            self.assertEqual(dep['spec']['selector']['matchLabels'], {'app': 'rcoder', LABEL: c.id})
+            self.assertEqual(dep['spec']['template']['metadata']['labels']['app.kubernetes.io/component'], 'rcoder-main')
             self.assertEqual(dep['spec']['template']['spec']['containers'][0]['image'], images['rcoder'])
             config = json.loads(next(r for r in rows if r['kind'] == 'ConfigMap')['data']['config.yml'])
             self.assertEqual(config['docker_config']['multi_image_config']['services'], config['kubernetes_config']['services'])
@@ -50,6 +53,60 @@ class WorkflowTests(unittest.TestCase):
             binding = next(r for r in rows if r['kind'] == 'RoleBinding')
             self.assertEqual(binding['roleRef']['name'], namespaced['metadata']['name'])
             self.assertTrue(all(s['kind'] == 'ServiceAccount' and s['name'] == 'rcoder' for s in binding['subjects']))
+            for binding in (r for r in rows if r['kind'] in ('RoleBinding', 'ClusterRoleBinding')):
+                self.assertEqual(binding['subjects'], [{'kind': 'ServiceAccount', 'name': 'rcoder', 'namespace': c.ns}])
+
+    def test_build_uses_the_toolchain_digest_recorded_in_receipt(self):
+        # A mutable compiler tag can move after resolution. The actual three
+        # image builds must use the same digest as the receipt/cache identity.
+        with tempfile.TemporaryDirectory() as temp:
+            c = self.config(temp)
+            c.state = Path(temp) / 'state'
+            c.values.update({
+                'REMOTE_K8S_RUST_IMAGE': 'example/rust:stable',
+                'REMOTE_K8S_REGISTRY': 'example/test',
+                **{'REMOTE_K8S_' + key: 'example/' + key.lower() + ':base'
+                   for key in ['RCODER_BASE', 'COMPUTER_BASE', 'RUNTIME_BASE']},
+            })
+            resolved = 'sha256:' + 'b' * 64
+
+            def ssh(args, *unused, **kwargs):
+                if args[:3] == ['docker', 'buildx', 'ls']:
+                    return 'rcoder-' + c.id
+                if args[:4] == ['docker', 'buildx', 'imagetools', 'inspect']:
+                    return 'Digest: ' + resolved
+                if args[0] == 'cat':
+                    return json.dumps({'containerimage.digest': 'sha256:' + 'a' * 64})
+                self.fail('unexpected remote command: ' + repr(args))
+
+            frozen = {'path': '/tmp/isolated/project/snapshots/one',
+                      'source_sha256': 'c' * 64, 'manifest': {}}
+            with patch.object(c, 'ssh', side_effect=ssh), \
+                    patch.object(main, 'doctor'), patch.object(main, 'sync_start'), \
+                    patch.object(main, 'alive'), \
+                    patch.object(main.snapshot, 'create', return_value=frozen), \
+                    patch.object(main.remote_process, 'execute') as execute:
+                receipt = main.build(c)
+            self.assertEqual(receipt['rust_image'], 'example/rust:stable@' + resolved)
+            self.assertEqual(execute.call_count, 3)
+            for call in execute.call_args_list:
+                self.assertIn('RUST_IMAGE=' + receipt['rust_image'], call.args[1])
+
+    def test_isolation_does_not_count_broken_source_network_as_a_policy_drop(self):
+        pod = {'metadata': {'name': 'tenant'}, 'spec': {'containers': [{'name': 'agent'}]}}
+        with tempfile.TemporaryDirectory() as temp:
+            c = self.config(temp)
+            for error in ['ENETUNREACH', 'EHOSTUNREACH', 'EMFILE', 'EADDRNOTAVAIL', None]:
+                with self.subTest(error=error), \
+                        patch.object(c, 'kube', return_value=json.dumps(
+                            {'connected': False, 'errno': error, 'timeout': False})), \
+                        self.assertRaisesRegex(RuntimeError, 'inconclusive'):
+                    tenant_isolation.connect(c, pod, '10.0.0.5', 8080)
+            for observation in [{'connected': True},
+                                {'connected': False, 'errno': 'ECONNREFUSED', 'timeout': False},
+                                {'connected': False, 'errno': None, 'timeout': True}]:
+                with patch.object(c, 'kube', return_value=json.dumps(observation)):
+                    self.assertEqual(tenant_isolation.connect(c, pod, '10.0.0.5', 8080), observation)
 
     def test_foreign_resource_rejected_before_mutation(self):
         with tempfile.TemporaryDirectory() as temp:

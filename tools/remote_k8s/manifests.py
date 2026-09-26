@@ -123,7 +123,8 @@ def render(c, images, password, registry_auth=None):
               {'name': 'computer-workspace', 'mountPath': '/app/computer-project-workspace'},
               {'name': 'cephfs-root', 'mountPath': '/app/cephfs-root'}, {'name': 'logs', 'mountPath': '/app/logs'}]
     obj('Deployment', 'rcoder', {'replicas': 2, 'selector': {'matchLabels': {'app': 'rcoder', **labels}},
-        'template': {'metadata': {'labels': {'app': 'rcoder', **labels}}, 'spec': {
+        'template': {'metadata': {'labels': {'app': 'rcoder', **labels,
+            'app.kubernetes.io/component': 'rcoder-main'}}, 'spec': {
             'serviceAccountName': 'rcoder', 'nodeSelector': {'kubernetes.io/arch': 'amd64'},
             'initContainers': [{'name': 'workspace-init', 'image': c.get('POSTGRES_IMAGE', 'postgres:16-alpine'),
                 'command': ['sh', '-ec', 'mkdir -p /workspace/workspace/apps'],
