@@ -27,6 +27,8 @@ struct CachedHint {
 pub struct UserAppProxyFailureAdvisorImpl {
     state: std::sync::Weak<AppState>,
     cache: tokio::sync::Mutex<HashMap<(String, &'static str), CachedHint>>,
+    /// per-key 单飞行闸（错误风暴下不同 app 的观察互不排队）。
+    inflight: dashmap::DashMap<(String, &'static str), Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl UserAppProxyFailureAdvisorImpl {
@@ -34,6 +36,7 @@ impl UserAppProxyFailureAdvisorImpl {
         Self {
             state,
             cache: tokio::sync::Mutex::new(HashMap::new()),
+            inflight: dashmap::DashMap::new(),
         }
     }
 }
@@ -55,8 +58,14 @@ impl UserAppProxyFailureAdvisor for UserAppProxyFailureAdvisorImpl {
                 return (*cached.hint).clone();
             }
         }
-        // 单飞行合并：并发失败只穿透一次观察（锁内做观察——观察自身 ≤2s、
-        // 只读，无业务锁；晚到的并发调用在锁后命中新缓存）。
+        // per-key 单飞行合并：同 app 并发失败只穿透一次观察；不同 app 各自
+        // 持钥互不排队（错误风暴下无跨应用队头阻塞；观察自身 ≤2s、只读）。
+        let gate = self
+            .inflight
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = gate.lock().await;
         let mut cache = self.cache.lock().await;
         if let Some(cached) = cache.get(&key)
             && cached.at.elapsed() < HINT_TTL

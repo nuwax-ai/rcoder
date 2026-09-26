@@ -521,8 +521,18 @@ impl ProxyHttp for PortProxy {
                 .get(shared_types::X_PINGAP_ETYPE_HEADER)
                 .is_some()
         {
-            self.maybe_replace_pingap_error(session, upstream_response, ctx, &route)
-                .await;
+            // 空体标记错误（Content-Length: 0）不替换：pingora 对 eos-at-header
+            // 的响应不再触发 body filter，改写头会造成宣告长度与零正文不符的
+            // 截断响应——原样透传。
+            let zero_body = upstream_response
+                .headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.trim_ascii() == "0");
+            if !zero_body {
+                self.maybe_replace_pingap_error(session, upstream_response, ctx, &route)
+                    .await;
+            }
         }
 
         // 只在 API 代理场景打印详细日志
@@ -630,6 +640,8 @@ impl PortProxy {
         let Some(renderer) = self.error_pages_slot.load_full() else {
             return;
         };
+        // 替换决策读取页面前同样触发按需刷新（错误请求是收敛路径之一）
+        renderer.request_refresh();
         let status = upstream_response.status.as_u16();
         let diagnostic_id = crate::error_page::new_diagnostic_id();
         let (content_type, body): (&'static str, bytes::Bytes) =
@@ -663,6 +675,7 @@ impl PortProxy {
         for header in [
             "content-encoding",
             "content-length",
+            "transfer-encoding",
             "etag",
             "last-modified",
             "cache-control",

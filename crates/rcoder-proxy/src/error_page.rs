@@ -47,6 +47,10 @@ pub struct ErrorPageSnapshot {
 pub trait ErrorPageSource: Send + Sync {
     /// 当前生效的外部页；None = 内置页兜底（未配置/读取失败已降级）。
     fn current(&self) -> Option<Arc<ErrorPageSnapshot>>;
+
+    /// 错误页被消费时的按需刷新触发（fire-and-forget；默认无操作——
+    /// 纯内存源无需刷新）。
+    fn request_refresh(&self) {}
 }
 
 /// 呈现器：模板选择 + 变量渲染。Pingora 与 Axum 管理面共享同一实例。
@@ -57,6 +61,13 @@ pub struct ErrorPageRenderer {
 impl ErrorPageRenderer {
     pub fn new(source: Option<Arc<dyn ErrorPageSource>>) -> Self {
         Self { source }
+    }
+
+    /// 消费方在错误出口调用：触发源的按需刷新（不阻塞渲染）。
+    pub fn request_refresh(&self) {
+        if let Some(source) = self.source.as_ref() {
+            source.request_refresh();
+        }
     }
 
     /// 当前模板（外部页优先；未配置/快照缺失用内置页）。
@@ -284,6 +295,17 @@ pub async fn write_error_response(
     retry_after_secs: Option<u64>,
     context: &str,
 ) -> () {
+    // 响应已开始（上游中途断流等）：绝不再写第二份响应——pingora 默认
+    // respond_error 有同款守卫，这里对齐（正文追加会污染截断的原始流）。
+    if session.as_downstream_mut().response_written().is_some() {
+        tracing::debug!(
+            %status,
+            "downstream response already started; skip friendly error write"
+        );
+        return;
+    }
+    // 错误页被消费 → 触发按需刷新（K8s 投射/手工换页的最终收敛路径之一）
+    renderer.request_refresh();
     let diagnostic_id = new_diagnostic_id();
     let (title, message) = cause.copywriting();
     let representation = negotiate(session);

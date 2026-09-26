@@ -148,15 +148,16 @@ pub(crate) async fn delete_key(config: &ResolvedConfig) -> Result<bool, Configma
     let name = current_name(config);
     let key = page_key(config);
     let api = configmap_api(config).await?;
-    let mut object = match api.get(&name).await {
+    let object = match api.get(&name).await {
         Ok(object) => object,
         Err(kube::Error::Api(error)) if error.code == 404 => return Ok(false),
         Err(error) => return Err(configmap_error(format!("read configmap {name}: {error}"))),
     };
-    let Some(mut data) = object.data.clone() else {
-        return Ok(false);
-    };
-    if data.remove(&key).is_none() {
+    if !object
+        .data
+        .as_ref()
+        .is_some_and(|data| data.contains_key(&key))
+    {
         return Ok(false);
     }
     if object.immutable == Some(true) {
@@ -164,7 +165,6 @@ pub(crate) async fn delete_key(config: &ResolvedConfig) -> Result<bool, Configma
             "configmap {name} is immutable; cannot remove the page key"
         )));
     }
-    object.data = Some(data);
     let version = object.metadata.resource_version.clone().unwrap_or_default();
     let params = PatchParams {
         field_manager: Some("rcoder-error-page".into()),
@@ -172,9 +172,11 @@ pub(crate) async fn delete_key(config: &ResolvedConfig) -> Result<bool, Configma
         dry_run: false,
         ..Default::default()
     };
+    // merge-patch 语义（RFC 7386）：键置 null 才是删除——补丁里省略键不会
+    // 改动 apiserver 上的现有值。只操作页面 key，其他 data 原样保留。
     let patch = json!({
         "metadata": {"resourceVersion": version},
-        "data": object.data,
+        "data": { key.clone(): serde_json::Value::Null },
     });
     if let Err(error) = api.patch(&name, &params, &Patch::Merge(&patch)).await {
         if matches!(&error, kube::Error::Api(api_error) if api_error.code == 409) {

@@ -112,7 +112,9 @@ impl BusinessReadinessObserver {
             _ => {
                 // 指纹变化：清缓存 + 原子计数器前进一步（单调，不回落）。
                 *guard = None;
-                self.revision.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
+                self.revision
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                    + 1
             }
         }
     }
@@ -168,17 +170,25 @@ impl BusinessReadinessObserver {
     }
 
     /// 无网络 I/O 的探测轮：真实探测 + 前后指纹复核。
+    ///
+    /// 两轮共用一个总 deadline（换代重试不额外放大预算，保证上层 rcoder 的
+    /// 通道超时（直连 4s/exec 6s）不会被第二轮击穿成 ADMIN_UNREACHABLE）。
     async fn probe_round(&self) -> UserAppBusinessReadiness {
         let fingerprint_before = ObservationFingerprint::capture(&self.server);
         let revision = self.current_revision(&fingerprint_before);
-        let mut result = Self::probe_once(&self.server).await;
+        let deadline = tokio::time::Instant::now() + OBSERVE_BUDGET;
+        let mut result = Self::probe_once(&self.server, deadline).await;
         let fingerprint_after = ObservationFingerprint::capture(&self.server);
+        let mut final_revision = revision;
         if fingerprint_after != fingerprint_before {
-            // 换代窗口：预算内快速重试一次，仍不稳定则按 INSTANCE_CHANGED 丢弃。
-            let retry = Self::probe_once(&self.server).await;
+            // 换代窗口：剩余预算内快速重试一次，仍不稳定则按 INSTANCE_CHANGED 丢弃。
+            let retry = Self::probe_once(&self.server, deadline).await;
             let fingerprint_retry = ObservationFingerprint::capture(&self.server);
             if fingerprint_retry == fingerprint_after {
                 result = retry;
+                // 探测期间发生了换代：观察序号按换代后指纹重算（单调推进，
+                // 不得把换代前后的两代标成同一序号）。
+                final_revision = self.current_revision(&fingerprint_retry);
             } else {
                 tracing::warn!(
                     "business readiness observation discarded: instance transition during probe"
@@ -203,12 +213,15 @@ impl BusinessReadinessObserver {
                 };
             }
         }
-        result.observation_revision = revision;
+        result.observation_revision = final_revision;
         result
     }
 
     /// 一次完整观察：状态机短路 → 并发服务探测 → Pingap admin 快照 → 集中推导。
-    async fn probe_once(server: &Arc<ServerState>) -> UserAppBusinessReadiness {
+    async fn probe_once(
+        server: &Arc<ServerState>,
+        deadline: tokio::time::Instant,
+    ) -> UserAppBusinessReadiness {
         let checked_at = now_rfc3339();
         let instance_id = runtime_instance_id(server);
         let operation_id = server.current_runtime_operation();
@@ -343,9 +356,8 @@ impl BusinessReadinessObserver {
         }
 
         // ── 真实探测：服务 HTTP（并发 ≤8）+ Pingap admin 快照 + 入口 TCP ──
-        // 总预算 3s：各项探测受剩余预算约束，预算耗尽的未完成项记 unknown
-        //（不折算成失败，也不从汇总集合消失）。
-        let deadline = tokio::time::Instant::now() + OBSERVE_BUDGET;
+        // 总预算由调用方 deadline 给定（探测轮内两轮共用；单项另受 2s 上限），
+        // 预算耗尽的未完成项记 unknown（不折算成失败，也不从汇总集合消失）。
         let admin_snapshot = fetch_admin_snapshot(deadline).await;
         let entry_reachable = tokio::time::timeout(
             item_budget(deadline),

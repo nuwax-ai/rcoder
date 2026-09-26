@@ -242,6 +242,10 @@ pub struct UserAppErrorPageService {
     /// 单刷新执行者（并发请求合并；IO 只在锁内做、锁只属于刷新）。
     refresh_gate: Mutex<()>,
     last_refresh: Mutex<Option<std::time::Instant>>,
+    /// 自引用弱柄（renderer() 装配时回填）：错误页渲染路径经
+    /// [`rcoder_proxy::error_page::ErrorPageSource::request_refresh`]
+    /// fire-and-forget 触发按需刷新（不阻塞错误响应）。
+    self_ref: std::sync::OnceLock<std::sync::Weak<Self>>,
 }
 
 impl UserAppErrorPageService {
@@ -255,11 +259,18 @@ impl UserAppErrorPageService {
             state: std::sync::Mutex::new(LoadState::default()),
             refresh_gate: Mutex::new(()),
             last_refresh: Mutex::new(None),
+            self_ref: std::sync::OnceLock::new(),
         })
     }
 
     /// 呈现器（与 Pingora/Axum 共享本实例——`ErrorPageSource` 实现读取缓存）。
     pub fn renderer(self: &Arc<Self>) -> Arc<ErrorPageRenderer> {
+        if let Err(already) = self.self_ref.set(Arc::downgrade(self)) {
+            debug_assert!(
+                already.upgrade().is_some(),
+                "renderer() called on two different Arcs of the same service"
+            );
+        }
         Arc::new(ErrorPageRenderer::new(Some(self.clone())))
     }
 
@@ -301,8 +312,9 @@ impl UserAppErrorPageService {
             ErrorPageBackend::File => self.save_file(content).await?,
             ErrorPageBackend::KubernetesConfigmap => self.save_configmap(content).await?,
         }
-        // 保存成功后强制刷新（不经节流——上传路径本就是低频管理操作）。
-        self.load_from_read_path().await;
+        // 保存成功后强制刷新（不经节流，且经 refresh_gate 串行——迟到读取
+        // 不得覆盖刚发布的新页）。
+        self.reload_now().await;
         let state = self
             .state
             .lock()
@@ -326,7 +338,7 @@ impl UserAppErrorPageService {
                 self.delete_configmap_key().await?;
             }
         }
-        self.load_from_read_path().await;
+        self.reload_now().await;
         let state = self
             .state
             .lock()
@@ -444,6 +456,24 @@ impl UserAppErrorPageService {
         }
     }
 
+    /// 立即重载（管理写路径专用：跳过节流、经 refresh_gate 串行）。
+    async fn reload_now(&self) {
+        let _guard = self.refresh_gate.lock().await;
+        self.load_from_read_path().await;
+    }
+
+    /// 渲染路径的 fire-and-forget 刷新触发（错误页请求/替换决策调用；无
+    /// runtime 时静默跳过——呈现永远不因刷新失败阻塞或降级）。
+    fn spawn_refresh(self: &Arc<Self>) {
+        if let Ok(handle) = tokio::runtime::Handle::try_current()
+            && let Some(service) = self.self_ref.get().and_then(std::sync::Weak::upgrade)
+        {
+            handle.spawn(async move {
+                service.refresh_if_stale().await;
+            });
+        }
+    }
+
     /// 按需刷新（节流 + 单执行者；本次响应不等待慢 IO——刷新失败保留旧页）。
     async fn refresh_if_stale(&self) {
         {
@@ -541,6 +571,14 @@ impl ResolvedConfig {
 impl rcoder_proxy::error_page::ErrorPageSource for UserAppErrorPageService {
     fn current(&self) -> Option<Arc<ErrorPageSnapshot>> {
         self.cache.load_full()
+    }
+
+    /// 错误页被消费时触发按需刷新（5s 节流 + 单执行者由服务侧保证；
+    /// fire-and-forget——渲染路径零等待）。
+    fn request_refresh(&self) {
+        if let Some(service) = self.self_ref.get().and_then(std::sync::Weak::upgrade) {
+            UserAppErrorPageService::spawn_refresh(&service);
+        }
     }
 }
 
