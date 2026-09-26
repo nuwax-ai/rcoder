@@ -4,12 +4,13 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use garde::Validate;
-use serde_json::json;
 
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
-use crate::models::{GetByVersionParams, GetContentParams};
+use crate::models::{
+    GetByVersionParams, GetContentParams, ProjectContentResult, ProjectVersionContentResult,
+};
 use crate::response;
 use crate::service::{tree, version as version_service};
 use crate::workspace::ProjectContext;
@@ -22,7 +23,7 @@ use crate::workspace::ProjectContext;
     description = r#"
 拉取项目内容树 + 前端框架探测结果：返回 `files` 树、`frontendFramework`/`devFramework`（探测失败时可传 `command` 兜底执行自定义命令）——打开工作台的第一数据源。
 "#,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "项目文件树", body = ProjectContentResult), crate::openapi::ErrorApiResponses),
     tag = "Project"
 )]
 pub(crate) async fn get_project_content(
@@ -58,12 +59,12 @@ pub(crate) async fn get_project_content(
     )
     .await
     {
-        Ok(content) => Json(json!({
-            "success": true,
-            "files": content.files,
-            "frontendFramework": content.frontend_framework,
-            "devFramework": content.dev_framework,
-        }))
+        Ok(content) => Json(ProjectContentResult {
+            success: true,
+            files: content.files,
+            frontend_framework: content.frontend_framework,
+            dev_framework: content.dev_framework,
+        })
         .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -81,7 +82,7 @@ pub(crate) async fn get_project_content(
     description = r#"
 同 [`get-project-content`](#) 但以 `codeVersion` 指定历史版本读取内容树（版本对比/回滚预览场景）。
 "#,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "版本快照文件树", body = ProjectVersionContentResult), crate::openapi::ErrorApiResponses),
     tag = "Project"
 )]
 pub(crate) async fn get_project_content_by_version(
@@ -114,7 +115,11 @@ pub(crate) async fn get_project_content_by_version(
     )
     .await
     {
-        Ok(files) => Json(json!({ "success": true, "files": files })).into_response(),
+        Ok(files) => Json(ProjectVersionContentResult {
+            success: true,
+            files,
+        })
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             response::failure_msg(&e.to_string()),

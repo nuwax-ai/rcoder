@@ -38,7 +38,7 @@ fn create_workspace_response(
 /// 对齐 nuwax createWorkspace; v1:
 /// mkdir 工作区 + `.agents/{skills,agents}` 装配 + 可选 skill zip 合并 + syncAgents。
 /// v2 的 agent hook 配置 (claude/codex/opencode mcp/hooks/permissions) 见 create_workspace_v2。
-#[utoipa::path(post, path = "/create-workspace", request_body(content = CreateWorkspaceForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
+#[utoipa::path(post, path = "/create-workspace", request_body(content = CreateWorkspaceForm, content_type = "multipart/form-data"), responses((status = 200, description = "工作区创建结果", body = CreateWorkspaceResponse), crate::openapi::ErrorApiResponses), tag = "Computer")]
 pub(crate) async fn create_workspace(
     State(state): State<AppState>,
     mut multipart: Multipart,
@@ -113,7 +113,7 @@ pub(crate) async fn create_workspace(
 /// multipart: userId, cId, file, skillUrls, mcpServersConfig, hooksConfig,
 /// permissionsConfig, hookScripts。skillUrls/hookScripts 若为 JSON 字符串则解析。
 /// 有 agentId 时走实体存储 + 软链 (create_workspace_with_agent_store)。
-#[utoipa::path(post, path = "/create-workspace-v2", request_body(content = CreateWorkspaceV2Form, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
+#[utoipa::path(post, path = "/create-workspace-v2", request_body(content = CreateWorkspaceV2Form, content_type = "multipart/form-data"), responses((status = 200, description = "v2 创建结果（含实体存储路径）", body = CreateWorkspaceResponse), crate::openapi::ErrorApiResponses), tag = "Computer")]
 pub(crate) async fn create_workspace_v2(
     State(state): State<AppState>,
     mut multipart: Multipart,

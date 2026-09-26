@@ -30,22 +30,9 @@ pub(crate) const KEEP_HIDDEN_FILE: &str = ".gitignore";
 use crate::error::{AppError, AppResult};
 use crate::path_safety;
 
-#[derive(Serialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct FileEntry {
-    pub name: String,
-    pub is_dir: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub binary: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub size_exceeded: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub contents: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub file_proxy_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_link: Option<bool>,
-}
+// FileEntry 移至 models（wire 契约 + ToSchema）；此处 re-export 保持
+// `tree::FileEntry` 既有引用路径。
+pub use crate::models::FileTreeEntry as FileEntry;
 
 #[derive(Serialize)]
 pub struct ProjectContent {

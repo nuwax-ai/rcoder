@@ -3,14 +3,15 @@
 
 use axum::extract::State;
 use garde::Validate;
-use serde_json::json;
 
 use super::ctx_from;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
 use crate::models::{
-    UploadAttachmentForm, UploadBatchFilesForm, UploadProjectForm, UploadSingleFileForm,
+    ProjectBatchFile, UploadAttachmentForm, UploadAttachmentResult, UploadBatchFilesForm,
+    UploadBatchResult, UploadProjectForm, UploadProjectResult, UploadSingleFileForm,
+    UploadSingleResult,
 };
 use crate::ops::multipart::{file_field, text_field, validate_zip_ext};
 use crate::service::temp_file::TemporaryFile;
@@ -62,11 +63,11 @@ struct UploadProjectFields {
 #[utoipa::path(post, path = "/upload-single-file", request_body(content = UploadSingleFileForm, content_type = "multipart/form-data"), description = r#"
 上传单个文件到项目内指定路径（multipart：file + 目标路径字段）。适合配置/小文件即时修改。
 "#,
-    responses(crate::openapi::JsonApiResponses), tag = "Code")]
+    responses((status = 200, description = "单文件上传结果", body = UploadSingleResult), crate::openapi::ErrorApiResponses), tag = "Code")]
 pub(crate) async fn upload_single_file(
     State(state): State<AppState>,
     mut multipart: Multipart,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<UploadSingleResult>, AppError> {
     let mut project_id = None;
     let mut code_version = None;
     let mut file_path = None;
@@ -131,12 +132,12 @@ pub(crate) async fn upload_single_file(
         &code_version,
     )
     .await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "File uploaded successfully, no need to restart development server",
-        "projectId": result.project_id,
-        "restarted": false,
-    })))
+    Ok(Json(UploadSingleResult {
+        success: true,
+        message: "File uploaded successfully, no need to restart development server".to_string(),
+        project_id: result.project_id,
+        restarted: false,
+    }))
 }
 
 // ── upload-batch-files (multipart) ───────────────────────────────────────────────
@@ -145,11 +146,11 @@ pub(crate) async fn upload_single_file(
 #[utoipa::path(post, path = "/upload-batch-files", request_body(content = UploadBatchFilesForm, content_type = "multipart/form-data"), description = r#"
 批量上传多个文件（multipart 多 file 字段 + 各自相对路径），一次请求落盘多文件。
 "#,
-    responses(crate::openapi::JsonApiResponses), tag = "Code")]
+    responses((status = 200, description = "批量上传逐文件结果", body = UploadBatchResult), crate::openapi::ErrorApiResponses), tag = "Code")]
 pub(crate) async fn upload_batch_files(
     State(state): State<AppState>,
     mut multipart: Multipart,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<UploadBatchResult>, AppError> {
     let mut project_id = None;
     let mut code_version = None;
     let mut file_paths: Vec<String> = Vec::new();
@@ -211,14 +212,21 @@ pub(crate) async fn upload_batch_files(
     )
     .await?;
     let count = written.len();
-    Ok(Json(json!({
-        "success": true,
-        "message": format!("{count} files uploaded successfully"),
-        "projectId": project_id.trim(),
-        "fileCount": count,
-        "files": written,
-        "restarted": false,
-    })))
+    let files: Vec<ProjectBatchFile> = written
+        .into_iter()
+        .map(|f| ProjectBatchFile {
+            file_path: f.file_path,
+            size: f.size,
+        })
+        .collect();
+    Ok(Json(UploadBatchResult {
+        success: true,
+        message: format!("{count} files uploaded successfully"),
+        project_id: project_id.trim().to_string(),
+        file_count: count,
+        files,
+        restarted: false,
+    }))
 }
 
 // ── upload-attachment-file (multipart) ───────────────────────────────────────────
@@ -227,11 +235,11 @@ pub(crate) async fn upload_batch_files(
 #[utoipa::path(post, path = "/upload-attachment-file", request_body(content = UploadAttachmentForm, content_type = "multipart/form-data"), description = r#"
 上传附件类文件（对话附件/资源文件场景）；路径归属与校验规则见 Schema 字段说明。
 "#,
-    responses(crate::openapi::JsonApiResponses), tag = "Project")]
+    responses((status = 200, description = "附件落地路径", body = UploadAttachmentResult), crate::openapi::ErrorApiResponses), tag = "Project")]
 pub(crate) async fn upload_attachment_file(
     State(state): State<AppState>,
     mut multipart: Multipart,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<UploadAttachmentResult>, AppError> {
     let mut project_id = None;
     let mut file_name = None;
     let mut data = None;
@@ -301,11 +309,11 @@ pub(crate) async fn upload_attachment_file(
         data.path(),
     )
     .await?;
-    Ok(Json(json!({
-        "success": true,
-        "fileName": result.file_name,
-        "relativePath": result.relative_path,
-    })))
+    Ok(Json(UploadAttachmentResult {
+        success: true,
+        file_name: result.file_name,
+        relative_path: result.relative_path,
+    }))
 }
 
 // ── upload-project (multipart zip) ──────────────────────────────────────────────
@@ -316,11 +324,11 @@ pub(crate) async fn upload_attachment_file(
 #[utoipa::path(post, path = "/upload-project", request_body(content = UploadProjectForm, content_type = "multipart/form-data"), description = r#"
 上传 zip 整包**覆盖**项目目录（自动解压；含 wrapper 目录剥除参数）。用于整版本替换导入——增量修改请走 single/batch 或 files-update。
 "#,
-    responses(crate::openapi::JsonApiResponses), tag = "Project")]
+    responses((status = 200, description = "整包导入结果", body = UploadProjectResult), crate::openapi::ErrorApiResponses), tag = "Project")]
 pub(crate) async fn upload_project(
     State(state): State<AppState>,
     mut multipart: Multipart,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<UploadProjectResult>, AppError> {
     let mut project_id = None;
     let mut code_version = None;
     let mut data = None;
@@ -390,10 +398,10 @@ pub(crate) async fn upload_project(
         data.path(),
     )
     .await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": format!("Project {} uploaded successfully", result.project_id),
-        "projectId": result.project_id,
-        "codeVersion": result.code_version,
-    })))
+    Ok(Json(UploadProjectResult {
+        success: true,
+        message: format!("Project {} uploaded successfully", result.project_id),
+        project_id: result.project_id,
+        code_version: result.code_version,
+    }))
 }

@@ -59,7 +59,9 @@ pub struct VersionResponse {
 /// 单个 skill URL 推送失败 (best-effort 语义下收集, 透传给调用方)。
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct SkillFailure {
+    /// 推送失败的 skill URL
     pub url: String,
+    /// 失败原因
     pub error: String,
 }
 
@@ -68,9 +70,13 @@ pub struct SkillFailure {
 #[derive(serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateWorkspaceResponse {
+    /// 恒为 true；失败走错误响应
     pub success: bool,
+    /// 结果文案
     pub message: String,
+    /// 工作区根路径 (COMPUTER_WORKSPACE_DIR)
     pub workspace_root: String,
+    /// 已推送的技能目录名列表（空时不输出）
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub updated_skills: Vec<String>,
     /// best-effort 透传: 推送失败的 skill URL 明细 (空则不输出)。
@@ -79,8 +85,10 @@ pub struct CreateWorkspaceResponse {
     /// Agent Store v2 字段；legacy workspace 模式不输出。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_store_path: Option<String>,
+    /// 因重名等原因跳过的技能目录名（无跳过时不输出）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped_skills: Option<Vec<String>>,
+    /// 是否跳过了 store 清单更新（未跳过时不输出）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped_store_update: Option<bool>,
 }
@@ -401,6 +409,33 @@ pub struct FsMutationResponse {
     pub is_dir: bool,
     /// 恒 false
     pub is_symlink: bool,
+}
+
+/// 项目/工作区文件树条目（get-project-content 等直接序列化的 wire 契约）。
+/// 可选键缺省时不序列化（对齐 TS 展开写法）。命名 FileTreeEntry 以区别于
+/// [`crate::models::code`] 的全量更新请求项 FileEntry。
+#[derive(Serialize, Debug, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTreeEntry {
+    /// 文件/目录名（不含路径）
+    pub name: String,
+    /// 是否目录
+    pub is_dir: bool,
+    /// 二进制内容标记（仅文件内容读取场景携带）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary: Option<bool>,
+    /// 超限标记（内容超过上限时携带）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_exceeded: Option<bool>,
+    /// 文本内容（仅内容读取场景携带）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contents: Option<String>,
+    /// 预览代理 URL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_proxy_url: Option<String>,
+    /// 是否符号链接
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_link: Option<bool>,
 }
 
 // ── computer 域响应载荷（wire 契约，对齐 nuwax；字段名/存在性以 A/B 实测为准）──
@@ -1115,4 +1150,263 @@ pub struct GitTagOpResult {
     pub log_id: String,
     /// 标签名
     pub tag_name: String,
+}
+
+// ── project 域响应载荷 ──
+
+/// get-project-content 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectContentResult {
+    /// 恒为 true；失败走错误响应
+    pub success: bool,
+    /// 项目文件树（扁平条目，含 fileProxyUrl）
+    pub files: Vec<FileTreeEntry>,
+    /// 前端框架标识
+    pub frontend_framework: String,
+    /// 开发框架标识
+    pub dev_framework: String,
+}
+
+/// get-project-content-by-version 响应（版本快照文件树）。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectVersionContentResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 版本快照文件树
+    pub files: Vec<FileTreeEntry>,
+}
+
+/// create-project 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateProjectResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 结果文案（含项目 ID）
+    pub message: String,
+    /// 项目根路径
+    pub project_path: String,
+}
+
+/// copy-project 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CopyProjectResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 结果文案（含源/目标 ID）
+    pub message: String,
+    /// 源项目 ID
+    pub source_project_id: String,
+    /// 目标项目 ID
+    pub target_project_id: String,
+    /// 目标项目根路径
+    pub target_project_path: String,
+}
+
+/// delete-project 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteProjectResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 结果文案（含失败目录数提示）
+    pub message: String,
+    /// 项目 ID
+    pub project_id: String,
+    /// 已删除目录列表
+    pub deleted_directories: Vec<String>,
+    /// 删除失败目录列表（空为全成功；条目含失败原因）
+    pub failed_directories: Vec<FailedDirEntry>,
+}
+
+/// 删除失败目录条目（既有 wire 形状：路径 + 失败原因）。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FailedDirEntry {
+    /// 失败的目录路径
+    pub path: String,
+    /// 失败原因
+    pub error: String,
+}
+
+/// specified-files-update 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SpecifiedFilesUpdateResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 固定文案
+    pub message: String,
+    /// 项目 ID
+    pub project_id: String,
+    /// 生效文件数
+    pub files_count: usize,
+}
+
+/// all-files-update 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AllFilesUpdateResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 固定文案
+    pub message: String,
+    /// 项目 ID
+    pub project_id: String,
+    /// 是否重启了 dev server（当前恒 false，对齐 TS wire）
+    pub restarted: bool,
+}
+
+/// upload-single-file 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadSingleResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 固定文案（无需重启）
+    pub message: String,
+    /// 项目 ID
+    pub project_id: String,
+    /// 是否重启了 dev server（恒 false）
+    pub restarted: bool,
+}
+
+/// upload-batch-files 单文件条目（既有 wire 字段名 filePath/size）。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectBatchFile {
+    /// 写入的相对路径
+    pub file_path: String,
+    /// 内容字节数
+    pub size: u64,
+}
+
+/// upload-batch-files 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadBatchResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 结果文案（含数量）
+    pub message: String,
+    /// 项目 ID
+    pub project_id: String,
+    /// 写入文件数
+    pub file_count: usize,
+    /// 逐文件路径与大小
+    pub files: Vec<ProjectBatchFile>,
+    /// 是否重启了 dev server（恒 false）
+    pub restarted: bool,
+}
+
+/// upload-attachment-file 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadAttachmentResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 落地文件名
+    pub file_name: String,
+    /// 附件相对路径
+    pub relative_path: String,
+}
+
+/// upload-project 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadProjectResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 结果文案（含项目 ID）
+    pub message: String,
+    /// 项目 ID
+    pub project_id: String,
+    /// 生效 codeVersion
+    pub code_version: String,
+}
+
+/// project push-skills 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectPushSkillsResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 结果文案（按更新技能数生成）
+    pub message: String,
+    /// 项目根路径
+    pub project_path: String,
+    /// 已推送技能目录名列表
+    pub updated_skills: Vec<String>,
+}
+
+/// backup-current-version（git 未启用分支）响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupVersionResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 项目 ID
+    pub project_id: String,
+    /// 备份 zip 路径
+    pub zip_path: String,
+}
+
+/// rollback-version（git 未启用分支）响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackVersionResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 固定文案
+    pub message: String,
+    /// 回滚产生的新版本号
+    pub new_version: u64,
+    /// 回滚到的目标版本
+    pub rollback_to: u64,
+}
+
+impl DeprecatedResult {
+    /// 构造废弃引导响应（HTTP 200 + `{success:false, deprecated:true, message}`）。
+    pub fn new(message: &str) -> Self {
+        Self {
+            success: false,
+            deprecated: true,
+            message: message.to_string(),
+        }
+    }
+}
+
+/// backup-current-version 响应。git 启用时返回废弃引导，否则返回备份结果。
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum BackupVersionResponse {
+    /// 备份成功
+    Ok(BackupVersionResult),
+    /// 已废弃（引导改用 /api/git/*）
+    Deprecated(DeprecatedResult),
+}
+
+/// rollback-version 响应。git 启用时返回废弃引导，否则返回回滚结果。
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum RollbackVersionResponse {
+    /// 回滚成功
+    Ok(RollbackVersionResult),
+    /// 已废弃（引导改用 /api/git/*）
+    Deprecated(DeprecatedResult),
+}
+
+/// 已废弃接口响应（git 启用后 backup/rollback-version 的引导回复）。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DeprecatedResult {
+    /// 恒为 false
+    pub success: bool,
+    /// 废弃标记
+    pub deprecated: bool,
+    /// 引导文案（指向 /api/git 等替代接口）
+    pub message: String,
 }

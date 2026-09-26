@@ -2,13 +2,12 @@
 
 use axum::extract::State;
 use garde::Validate;
-use serde_json::json;
 
 use super::ctx_from;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
-use crate::models::PushProjectSkillsForm;
+use crate::models::{ProjectPushSkillsResult, PushProjectSkillsForm};
 use crate::ops::multipart::{file_field, text_field};
 use crate::ops::workspace::pushed_skills_message;
 use crate::service::skills as skills_service;
@@ -29,11 +28,11 @@ fn require_project_id(project_id: Option<String>) -> Result<String, AppError> {
 }
 
 /// 技能推送到工作区
-#[utoipa::path(post, path = "/push-skills-to-workspace", request_body(content = PushProjectSkillsForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Project")]
+#[utoipa::path(post, path = "/push-skills-to-workspace", request_body(content = PushProjectSkillsForm, content_type = "multipart/form-data"), responses((status = 200, description = "推送结果（含技能列表）", body = ProjectPushSkillsResult), crate::openapi::ErrorApiResponses), tag = "Project")]
 pub(crate) async fn push_skills_to_workspace(
     State(state): State<AppState>,
     mut multipart: Multipart,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<ProjectPushSkillsResult>, AppError> {
     let mut project_id = None;
     let mut zip_data = None;
     let mut skill_urls: Vec<String> = Vec::new();
@@ -86,10 +85,10 @@ pub(crate) async fn push_skills_to_workspace(
         &state.skill_downloader,
     )
     .await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": pushed_skills_message(&result.updated_skills, false),
-        "projectPath": result.project_path,
-        "updatedSkills": result.updated_skills,
-    })))
+    Ok(Json(ProjectPushSkillsResult {
+        success: true,
+        message: pushed_skills_message(&result.updated_skills, false),
+        project_path: result.project_path,
+        updated_skills: result.updated_skills,
+    }))
 }

@@ -5,13 +5,15 @@
 
 use axum::extract::State;
 use garde::Validate;
-use serde_json::json;
 
 use super::ctx_from;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
-use crate::models::{CopyProjectBody, CreateProjectBody, DeleteParams};
+use crate::models::{
+    CopyProjectBody, CopyProjectResult, CreateProjectBody, CreateProjectResult, DeleteParams,
+    DeleteProjectResult, FailedDirEntry,
+};
 use crate::service::project as project_service;
 use crate::workspace::ProjectContext;
 
@@ -25,13 +27,13 @@ use crate::workspace::ProjectContext;
     description = r#"
 删除整个项目目录（含停止其 dev server 前置动作）。**不可逆**：code/data/logs 一并移除；只删单文件用 files-update/delete 面。
 "#,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "删除结果（含失败目录）", body = DeleteProjectResult), crate::openapi::ErrorApiResponses),
     tag = "Project"
 )]
 pub(crate) async fn delete_project(
     State(state): State<AppState>,
     Query(params): Query<DeleteParams>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<DeleteProjectResult>, AppError> {
     params.validate().map_err(crate::error::from_garde)?;
     let project_id = params.project_id.trim().to_string();
     // 停 dev server (对齐 nuwax: pid 可用时 stopDevServer, 失败不阻塞)
@@ -61,13 +63,20 @@ pub(crate) async fn delete_project(
             result.failed.len()
         )
     };
-    Ok(Json(json!({
-        "success": true,
-        "message": message,
-        "projectId": project_id,
-        "deletedDirectories": result.deleted,
-        "failedDirectories": result.failed,
-    })))
+    Ok(Json(DeleteProjectResult {
+        success: true,
+        message,
+        project_id,
+        deleted_directories: result.deleted,
+        failed_directories: result
+            .failed
+            .into_iter()
+            .map(|f| FailedDirEntry {
+                path: f.path,
+                error: f.error,
+            })
+            .collect(),
+    }))
 }
 
 // ── create-project ───────────────────────────────────────────────────────────────
@@ -76,11 +85,11 @@ pub(crate) async fn delete_project(
 #[utoipa::path(post, path = "/create-project", request_body = CreateProjectBody, description = r#"
 创建项目骨架：在工作区建立 `{projectId}` 目录结构（app 根相对）。**注意是 GET 形态**——沿用 TS 契约，projectId 走 query。成功后即可用文件族接口写入内容或 upload-project 整包导入。
 "#,
-    responses(crate::openapi::JsonApiResponses), tag = "Project")]
+    responses((status = 200, description = "创建结果（含项目路径）", body = CreateProjectResult), crate::openapi::ErrorApiResponses), tag = "Project")]
 pub(crate) async fn create_project(
     State(state): State<AppState>,
     Json(body): Json<CreateProjectBody>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<CreateProjectResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     let project_id = body.project_id.trim().to_string();
     let template_type = body.template_type.as_deref().unwrap_or("react").to_string();
@@ -93,11 +102,11 @@ pub(crate) async fn create_project(
     let result =
         project_service::create_project(&*state.resolver, &state.config, &ctx, &template_type)
             .await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": format!("Project {project_id} created successfully"),
-        "projectPath": result.project_path,
-    })))
+    Ok(Json(CreateProjectResult {
+        success: true,
+        message: format!("Project {project_id} created successfully"),
+        project_path: result.project_path,
+    }))
 }
 
 // ── copy-project ─────────────────────────────────────────────────────────────────
@@ -108,11 +117,11 @@ pub(crate) async fn create_project(
 #[utoipa::path(post, path = "/copy-project", request_body = CopyProjectBody, description = r#"
 复制项目到新 projectId：源/目标各自取租户隔离上下文，字段缺省时逐级回退公共值。用于模板化克隆场景。
 "#,
-    responses(crate::openapi::JsonApiResponses), tag = "Project")]
+    responses((status = 200, description = "复制结果（源/目标身份）", body = CopyProjectResult), crate::openapi::ErrorApiResponses), tag = "Project")]
 pub(crate) async fn copy_project(
     State(state): State<AppState>,
     Json(body): Json<CopyProjectBody>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<CopyProjectResult>, AppError> {
     let common_t = body.tenant_id.clone();
     let common_s = body.space_id.clone();
     let common_i = body.isolation_type.clone();
@@ -137,14 +146,14 @@ pub(crate) async fn copy_project(
     let result =
         project_service::copy_project(&*state.resolver, &state.config, &source_ctx, &target_ctx)
             .await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": format!(
+    Ok(Json(CopyProjectResult {
+        success: true,
+        message: format!(
             "Project {} successfully copied to {}",
             result.source_project_id, result.target_project_id
         ),
-        "sourceProjectId": result.source_project_id,
-        "targetProjectId": result.target_project_id,
-        "targetProjectPath": result.target_project_path,
-    })))
+        source_project_id: result.source_project_id,
+        target_project_id: result.target_project_id,
+        target_project_path: result.target_project_path,
+    }))
 }

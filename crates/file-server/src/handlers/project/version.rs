@@ -4,29 +4,35 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use garde::Validate;
-use serde_json::json;
 
 use super::ctx_from;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
-use crate::models::{BackupVersionBody, ExportBody, RollbackBody};
-use crate::response;
+use crate::models::{
+    BackupVersionBody, BackupVersionResponse, BackupVersionResult, DeprecatedResult, ExportBody,
+    RollbackBody, RollbackVersionResponse, RollbackVersionResult,
+};
 use crate::service::{project as project_service, version as version_service};
+
+/// 废弃引导响应构造（类型化，对齐旧 response::deprecated 的 wire 形状）。
+fn deprecated(message: &str) -> DeprecatedResult {
+    DeprecatedResult::new(message)
+}
 
 /// 备份当前版本
 #[utoipa::path(post, path = "/backup-current-version", request_body = BackupVersionBody, description = r#"
 将当前项目状态备份为一个版本快照（记录 logId/时间戳），供 rollback-version 回退目标。
 "#,
-    responses(crate::openapi::JsonApiResponses), tag = "Project")]
+    responses((status = 200, description = "备份结果或废弃引导", body = BackupVersionResponse), crate::openapi::ErrorApiResponses), tag = "Project")]
 pub(crate) async fn backup_current_version(
     State(state): State<AppState>,
     Json(body): Json<BackupVersionBody>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<BackupVersionResponse>, AppError> {
     if state.config.git_enabled {
-        return Ok(response::deprecated(
+        return Ok(Json(BackupVersionResponse::Deprecated(deprecated(
             "此接口已废弃，请使用 Git 版本管理 API（/api/git/*）",
-        ));
+        ))));
     }
     body.validate().map_err(crate::error::from_garde)?;
     let project_id = body.project_id.trim().to_string();
@@ -43,10 +49,10 @@ pub(crate) async fn backup_current_version(
         &body.code_version,
     )
     .await?;
-    Ok(Json(json!({
-        "success": true,
-        "projectId": result.project_id,
-        "zipPath": result.zip_path,
+    Ok(Json(BackupVersionResponse::Ok(BackupVersionResult {
+        success: true,
+        project_id: result.project_id,
+        zip_path: result.zip_path,
     })))
 }
 
@@ -54,15 +60,15 @@ pub(crate) async fn backup_current_version(
 #[utoipa::path(post, path = "/rollback-version", request_body = RollbackBody, description = r#"
 回滚项目到指定版本快照（覆盖当前内容；当前态建议先 backup 再回滚）。
 "#,
-    responses(crate::openapi::JsonApiResponses), tag = "Project")]
+    responses((status = 200, description = "回滚结果或废弃引导", body = RollbackVersionResponse), crate::openapi::ErrorApiResponses), tag = "Project")]
 pub(crate) async fn rollback_version(
     State(state): State<AppState>,
     Json(body): Json<RollbackBody>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<RollbackVersionResponse>, AppError> {
     if state.config.git_enabled {
-        return Ok(response::deprecated(
+        return Ok(Json(RollbackVersionResponse::Deprecated(deprecated(
             "此接口已废弃，请使用 /api/git/rollback 进行版本回滚",
-        ));
+        ))));
     }
     body.validate().map_err(crate::error::from_garde)?;
     let project_id = body.project_id.trim().to_string();
@@ -80,11 +86,11 @@ pub(crate) async fn rollback_version(
         &body.rollback_to,
     )
     .await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Project rolled back successfully",
-        "newVersion": result.new_version,
-        "rollbackTo": result.rollback_to,
+    Ok(Json(RollbackVersionResponse::Ok(RollbackVersionResult {
+        success: true,
+        message: "Project rolled back successfully".to_string(),
+        new_version: result.new_version,
+        rollback_to: result.rollback_to,
     })))
 }
 
