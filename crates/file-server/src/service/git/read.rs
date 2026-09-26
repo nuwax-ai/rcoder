@@ -249,14 +249,9 @@ pub fn list_tags(repo: &Repository) -> AppResult<Vec<String>> {
     Ok(tags)
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct CommitInfo {
-    pub hash: String,
-    pub date: String,
-    pub message: String,
-    pub author_name: String,
-    pub author_email: String,
-}
+// CommitInfo 移至 models（wire 契约 + ToSchema）；此处 re-export 保持
+// `git::CommitInfo` 既有引用路径。
+pub use crate::models::CommitInfo;
 
 /// 提交历史 (对齐 nuwax logHistory; first-parent)。
 /// `branch` 非空 → 从该 ref 起 walk (对齐 nuwax git.log({ ref: branch })); 默认 HEAD。

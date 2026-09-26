@@ -1,13 +1,15 @@
 //! git 读 handlers: branches / tags / log / file-content / status。
 
 use axum::extract::State;
-use serde_json::{Value, json};
 
 use super::{resolve, resolve_body};
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
-use crate::models::{FileContentBody, GitLogQuery, GitQuery};
+use crate::models::{
+    FileContentBody, GitBranchEntry, GitBranchesResult, GitFileContentResult, GitLogQuery,
+    GitLogResult, GitQuery, GitStatusResult, GitTagsResult,
+};
 use crate::service::git;
 
 /// 列出分支
@@ -18,13 +20,13 @@ use crate::service::git;
     description = r#"
 列 git 仓库全部分支及当前检出分支（`current=true` 标记）。用于分支切换器渲染与提交前校验。
 "#,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "分支表与当前分支", body = GitBranchesResult), crate::openapi::ErrorApiResponses),
     tag = "Git"
 )]
 pub(crate) async fn branches(
     State(state): State<AppState>,
     Query(q): Query<GitQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<GitBranchesResult>, AppError> {
     let (path, log_id) = resolve(&q, &state).await?;
     let (branches, current) = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
         if !path.exists() {
@@ -37,19 +39,25 @@ pub(crate) async fn branches(
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
     // nuwax: branches 为 {name: {name, current}} 对象
-    let branches_obj: serde_json::Map<String, Value> = branches
+    let branches_obj: std::collections::BTreeMap<String, GitBranchEntry> = branches
         .iter()
         .map(|b| {
             let is_cur = Some(b.as_str()) == current.as_deref();
-            (b.clone(), json!({ "name": b, "current": is_cur }))
+            (
+                b.clone(),
+                GitBranchEntry {
+                    name: b.clone(),
+                    current: is_cur,
+                },
+            )
         })
         .collect();
-    Ok(Json(json!({
-        "success": true,
-        "logId": log_id,
-        "branches": branches_obj,
-        "current": current,
-    })))
+    Ok(Json(GitBranchesResult {
+        success: true,
+        log_id,
+        branches: branches_obj,
+        current,
+    }))
 }
 
 /// 列出标签
@@ -60,13 +68,13 @@ pub(crate) async fn branches(
     description = r#"
 列仓库全部标签（轻量引用读取）。常用于版本选择下拉。
 "#,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "标签列表与最新标签", body = GitTagsResult), crate::openapi::ErrorApiResponses),
     tag = "Git"
 )]
 pub(crate) async fn tags(
     State(state): State<AppState>,
     Query(q): Query<GitQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<GitTagsResult>, AppError> {
     let (path, log_id) = resolve(&q, &state).await?;
     let tags = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
         if !path.exists() {
@@ -79,9 +87,12 @@ pub(crate) async fn tags(
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
     let latest = tags.last().cloned();
-    Ok(Json(
-        json!({ "success": true, "logId": log_id, "tags": tags, "latest": latest }),
-    ))
+    Ok(Json(GitTagsResult {
+        success: true,
+        log_id,
+        tags,
+        latest,
+    }))
 }
 
 /// 提交历史
@@ -98,13 +109,13 @@ pub(crate) async fn tags(
     description = r#"
 查提交历史（hash、作者、时间、message 列表，倒序）。配合 diff/file-content 做追溯。
 "#,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "提交历史（新到旧）", body = GitLogResult), crate::openapi::ErrorApiResponses),
     tag = "Git"
 )]
 pub(crate) async fn log_history(
     State(state): State<AppState>,
     Query(q): Query<GitLogQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<GitLogResult>, AppError> {
     let (path, log_id) = resolve(&q.base, &state).await?;
     let max_count = q.max_count.unwrap_or(50).clamp(1, 500);
     let skip = q.skip.unwrap_or(0);
@@ -127,20 +138,23 @@ pub(crate) async fn log_history(
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
     let total = commits.len();
-    Ok(Json(
-        json!({ "success": true, "logId": log_id, "commits": commits, "total": total }),
-    ))
+    Ok(Json(GitLogResult {
+        success: true,
+        log_id,
+        commits,
+        total,
+    }))
 }
 
 /// 读取文件内容
 ///
 /// 对齐 nuwax fileContent; 从 **body** 取 {ref, filePath}。
 /// ref ∈ {worktree, staged, ""} → 直接读 workdir 文件 (不查 git); 否则读 ref 处 blob。
-#[utoipa::path(post, path = "/file-content", request_body = FileContentBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
+#[utoipa::path(post, path = "/file-content", request_body = FileContentBody, responses((status = 200, description = "指定 ref 的文件内容", body = GitFileContentResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn file_content(
     State(state): State<AppState>,
     Json(body): Json<FileContentBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<GitFileContentResult>, AppError> {
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let ref_spec = body.ref_.clone().unwrap_or_else(|| "HEAD".to_string());
     let file_path = body.file_path.clone();
@@ -164,13 +178,13 @@ pub(crate) async fn file_content(
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
-    Ok(Json(json!({
-        "success": true,
-        "logId": log_id,
-        "filePath": file_path,
-        "ref": ref_spec,
-        "content": content,
-    })))
+    Ok(Json(GitFileContentResult {
+        success: true,
+        log_id,
+        file_path,
+        ref_spec,
+        content,
+    }))
 }
 
 /// 查询工作区状态
@@ -183,13 +197,13 @@ pub(crate) async fn file_content(
     description = r#"
 查工作区状态：已修改/已暂存/未跟踪文件清单与当前分支——编辑器脏标记与提交面板的数据源。
 "#,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "工作区状态（5 桶 + 冲突）", body = GitStatusResult), crate::openapi::ErrorApiResponses),
     tag = "Git"
 )]
 pub(crate) async fn status(
     State(state): State<AppState>,
     Query(q): Query<GitQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<GitStatusResult>, AppError> {
     let (path, log_id) = resolve(&q, &state).await?;
     let result = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
         if !path.exists() {
@@ -201,18 +215,19 @@ pub(crate) async fn status(
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
-    Ok(Json(json!({
-        "success": true,
-        "logId": log_id,
-        "current": result.current,
-        "staged": result.staged,
-        "modified": result.modified,
-        "created": result.created,
-        "deleted": result.deleted,
-        "untracked": result.untracked,
-        "conflicted": result.conflicted,
-        "ahead": 0,
-        "behind": 0,
-        "tracking": null,
-    })))
+    Ok(Json(GitStatusResult {
+        success: true,
+        log_id,
+        current: result.current,
+        staged: result.staged,
+        modified: result.modified,
+        created: result.created,
+        deleted: result.deleted,
+        untracked: result.untracked,
+        conflicted: result.conflicted,
+        // 远端追踪未实现，占位 0/0/null（对齐 TS wire）。
+        ahead: 0,
+        behind: 0,
+        tracking: None,
+    }))
 }

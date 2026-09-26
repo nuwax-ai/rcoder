@@ -771,3 +771,348 @@ pub struct PushSkillsResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_store_path: Option<String>,
 }
+
+// ── git 域响应载荷（wire 契约；CommitInfo 蛇形字段名是既有 wire，不改 camelCase）──
+
+/// git log 单条提交（字段名 `author_name`/`author_email` 为既有 wire 蛇形名）。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CommitInfo {
+    /// 提交哈希（完整 SHA-1）
+    pub hash: String,
+    /// 提交时间（RFC 3339 / ISO 字符串）
+    pub date: String,
+    /// 提交消息
+    pub message: String,
+    /// 作者名
+    pub author_name: String,
+    /// 作者邮箱
+    pub author_email: String,
+}
+
+/// git status 响应。ahead/behind/tracking 为占位字段（gix 未实现远端追踪，
+/// 固定 0/0/null，对齐 TS wire）。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitStatusResult {
+    /// 恒为 true；失败走错误响应
+    pub success: bool,
+    /// 本次操作日志 ID
+    pub log_id: String,
+    /// 当前分支名（ unborn 仓库为 null）
+    pub current: Option<String>,
+    /// 已暂存路径
+    pub staged: Vec<String>,
+    /// 工作区已修改路径
+    pub modified: Vec<String>,
+    /// 新增（已暂存）路径
+    pub created: Vec<String>,
+    /// 删除路径
+    pub deleted: Vec<String>,
+    /// 未跟踪路径（叶子路径）
+    pub untracked: Vec<String>,
+    /// 冲突路径（merge 未解决）
+    pub conflicted: Vec<String>,
+    /// 领先远端提交数（占位 0）
+    pub ahead: usize,
+    /// 落后远端提交数（占位 0）
+    pub behind: usize,
+    /// 上游追踪分支（占位 null）
+    pub tracking: Option<String>,
+}
+
+/// branches 响应中的单分支条目。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranchEntry {
+    /// 分支名
+    pub name: String,
+    /// 是否当前检出分支
+    pub current: bool,
+}
+
+/// git branches 响应（branches 为按名索引的对象，对齐 nuwax）。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranchesResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 本次操作日志 ID
+    pub log_id: String,
+    /// 分支表（键为分支名）
+    pub branches: std::collections::BTreeMap<String, GitBranchEntry>,
+    /// 当前分支名
+    pub current: Option<String>,
+}
+
+/// git tags 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitTagsResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 本次操作日志 ID
+    pub log_id: String,
+    /// 标签列表（排序）
+    pub tags: Vec<String>,
+    /// 最新标签（无标签为 null）
+    pub latest: Option<String>,
+}
+
+/// git log 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitLogResult {
+    /// 恒为 true；空仓库/不存在 ref 返回空列表
+    pub success: bool,
+    /// 本次操作日志 ID
+    pub log_id: String,
+    /// 提交列表（新到旧）
+    pub commits: Vec<CommitInfo>,
+    /// 返回条数
+    pub total: usize,
+}
+
+/// git file-content 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitFileContentResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 本次操作日志 ID
+    pub log_id: String,
+    /// 读取的文件相对路径
+    pub file_path: String,
+    /// 读取的 ref（worktree/staged/空 仍回显原值）
+    #[serde(rename = "ref")]
+    pub ref_spec: String,
+    /// 文件内容
+    pub content: String,
+}
+
+/// git init 响应（幂等）。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitInitResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 结果文案（区分已存在/新初始化）
+    pub message: String,
+    /// 本次操作日志 ID
+    pub log_id: String,
+    /// 是否原本已是仓库
+    pub already_exists: bool,
+}
+
+/// git add 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitAddResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 固定文案
+    pub message: String,
+    /// 本次操作日志 ID
+    pub log_id: String,
+}
+
+/// git commit 响应。两态：正常提交携带 commit/summary；无可提交携带
+/// `nothingToCommit: true`。
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum GitCommitResult {
+    /// 提交成功
+    Committed {
+        /// 恒为 true
+        success: bool,
+        /// 固定文案
+        message: String,
+        /// 本次操作日志 ID
+        log_id: String,
+        /// 新提交哈希
+        commit: String,
+        /// 提交摘要
+        summary: GitCommitSummary,
+    },
+    /// 暂存区为空
+    NothingToCommit {
+        /// 恒为 true
+        success: bool,
+        /// 固定文案
+        message: String,
+        /// 本次操作日志 ID
+        log_id: String,
+        /// 无可提交标记
+        nothing_to_commit: bool,
+    },
+}
+
+/// commit 摘要。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCommitSummary {
+    /// 变更文件数
+    pub changes: usize,
+}
+
+/// unstage 的 files 回显：全量为字符串 "all"，否则为文件路径数组。
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum GitUnstageFiles {
+    /// 全量取消暂存时的字面量
+    All(String),
+    /// 指定文件路径
+    Files(Vec<String>),
+}
+
+/// git unstage 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitUnstageResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 结果文案（区分全量/指定）
+    pub message: String,
+    /// 本次操作日志 ID
+    pub log_id: String,
+    /// 回显的文件集合（"all" 或路径数组）
+    pub files: GitUnstageFiles,
+}
+
+/// diff summary 单文件统计。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitDiffFileStat {
+    /// 文件路径
+    pub file: String,
+    /// 变更总数（新增+删除）
+    pub changes: usize,
+    /// 新增行数
+    pub insertions: usize,
+    /// 删除行数
+    pub deletions: usize,
+    /// 是否二进制文件
+    pub binary: bool,
+}
+
+/// diff 汇总。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitDiffSummary {
+    /// 逐文件统计
+    pub files: Vec<GitDiffFileStat>,
+    /// 总新增行数
+    pub insertions: usize,
+    /// 总删除行数
+    pub deletions: usize,
+}
+
+/// git diff 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitDiffResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 本次操作日志 ID
+    pub log_id: String,
+    /// diff 来源（worktree/staged/commit）
+    pub source: String,
+    /// unified diff 文本
+    pub diff: String,
+    /// 变更汇总
+    pub summary: GitDiffSummary,
+}
+
+/// git reset 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitResetResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 结果文案（含 mode 与 target）
+    pub message: String,
+    /// 本次操作日志 ID
+    pub log_id: String,
+    /// 重置目标（ref/哈希）
+    pub target: String,
+    /// 重置模式（soft/mixed/hard）
+    pub mode: String,
+    /// 重置前 HEAD（无 HEAD 为 null）
+    pub previous_head: Option<String>,
+}
+
+/// git checkout 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCheckoutResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 结果文案（含 target）
+    pub message: String,
+    /// 本次操作日志 ID
+    pub log_id: String,
+    /// 检出目标
+    pub target: String,
+}
+
+/// git revert 响应。两态：产生新提交（commit/previousHead）或目标态与当前一致
+/// （`nothingToCommit: true`）。
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum GitRevertResult {
+    /// 产生回退提交
+    Reverted {
+        /// 恒为 true
+        success: bool,
+        /// 固定文案
+        message: String,
+        /// 本次操作日志 ID
+        log_id: String,
+        /// 新提交哈希
+        commit: String,
+        /// 回退目标
+        target: String,
+        /// 回退前 HEAD
+        previous_head: String,
+    },
+    /// 目标态与当前一致，未产生提交
+    NothingToRevert {
+        /// 恒为 true
+        success: bool,
+        /// 固定文案
+        message: String,
+        /// 本次操作日志 ID
+        log_id: String,
+        /// 无可提交标记
+        nothing_to_commit: bool,
+        /// 回退目标
+        target: String,
+    },
+}
+
+/// branch-create/delete/switch 响应（三接口共用形状）。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranchOpResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 固定文案
+    pub message: String,
+    /// 本次操作日志 ID
+    pub log_id: String,
+    /// 分支名
+    pub branch_name: String,
+}
+
+/// tag-create/delete 响应（两接口共用形状）。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitTagOpResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 固定文案
+    pub message: String,
+    /// 本次操作日志 ID
+    pub log_id: String,
+    /// 标签名
+    pub tag_name: String,
+}
