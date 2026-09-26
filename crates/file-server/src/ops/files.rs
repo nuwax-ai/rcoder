@@ -5,10 +5,11 @@
 use std::path::Path;
 
 use crate::extract::AppJson as Json;
-use serde_json::{Value, json};
 
 use crate::error::AppError;
-use crate::models::FileOp;
+use crate::models::{
+    FileOp, GenerateFileResult, UploadFileResult, UploadFilesResult, UploadResultItem,
+};
 use crate::path_safety;
 use crate::service::code as code_service;
 use crate::service::temp_file::TemporaryFile;
@@ -57,13 +58,13 @@ pub async fn upload_file_impl(
     ws: &Path,
     file_path: &str,
     data: TemporaryFile,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<UploadFileResult>, AppError> {
     let r = upload_file_core(ws, file_path, data).await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "File uploaded successfully",
-        "fileSize": r.file_size,
-    })))
+    Ok(Json(UploadFileResult {
+        success: true,
+        message: "File uploaded successfully".to_string(),
+        file_size: r.file_size,
+    }))
 }
 
 /// upload-files 单文件结果（成功/失败两态；失败含 error 文案）。
@@ -139,9 +140,9 @@ pub async fn upload_files_impl(
     ws: &Path,
     file_paths: &[String],
     files_vec: &[(Option<String>, TemporaryFile)],
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<UploadFilesResult>, AppError> {
     let r = upload_files_core(ws, file_paths, files_vec).await?;
-    let results: Vec<Value> = r
+    let results: Vec<UploadResultItem> = r
         .results
         .into_iter()
         .map(|item| match item {
@@ -149,33 +150,33 @@ pub async fn upload_files_impl(
                 file_path,
                 original,
                 file_size,
-            } => json!({
-                "success": true,
-                "filePath": file_path,
-                "originalname": original,
-                "message": "File uploaded successfully",
-                "fileSize": file_size,
-            }),
+            } => UploadResultItem::Ok {
+                success: true,
+                file_path,
+                originalname: original,
+                message: "File uploaded successfully".to_string(),
+                file_size,
+            },
             BatchUploadItem::Err {
                 file_path,
                 original,
                 error,
-            } => json!({
-                "success": false,
-                "filePath": file_path,
-                "originalname": original,
-                "error": error,
-            }),
+            } => UploadResultItem::Err {
+                success: false,
+                file_path,
+                originalname: original,
+                error,
+            },
         })
         .collect();
-    Ok(Json(json!({
-        "success": true,
-        "message": "Batch upload completed",
-        "totalCount": r.total,
-        "successCount": r.success_count,
-        "failCount": r.total - r.success_count,
-        "results": results,
-    })))
+    Ok(Json(UploadFilesResult {
+        success: true,
+        message: "Batch upload completed".to_string(),
+        total_count: r.total,
+        success_count: r.success_count,
+        fail_count: r.total - r.success_count,
+        results,
+    }))
 }
 
 /// 写文件 (父目录自动创建); 用于 upload-files 单文件隔离错误。
@@ -220,14 +221,14 @@ pub async fn generate_file_impl(
     ws: std::path::PathBuf,
     file_name: &str,
     content: String,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<GenerateFileResult>, AppError> {
     let r = generate_file_core(ws, file_name, content).await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "File generated successfully",
-        "fileName": r.file_name,
-        "fileSize": r.file_size,
-    })))
+    Ok(Json(GenerateFileResult {
+        success: true,
+        message: "File generated successfully".to_string(),
+        file_name: r.file_name,
+        file_size: r.file_size as u64,
+    }))
 }
 
 /// import-project 的 workspace 无关核心：解压合并并返回目标目录（类型化返回，展示/回显归各域壳层）。

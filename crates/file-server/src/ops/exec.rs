@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::extract::AppJson as Json;
-use serde_json::{Value, json};
+use crate::models::{ComputerLogsResult, ExecuteCommandResult};
 
 use crate::AppState;
 use crate::error::{AppError, AppResult};
@@ -43,15 +43,15 @@ pub async fn execute_command_impl(
     state: &AppState,
     cwd: PathBuf,
     command: &str,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<ExecuteCommandResult>, AppError> {
     let result = execute_command_core(state, cwd, command).await?;
-    Ok(Json(json!({
+    Ok(Json(ExecuteCommandResult {
         // TS 外层响应始终 success=true，命令结果由 exitCode 表示。
-        "success": true,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-        "exitCode": result.exit_code,
-    })))
+        success: true,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exit_code: i64::from(result.exit_code),
+    }))
 }
 
 /// get-logs 单行（行号从 1 起）。
@@ -128,35 +128,35 @@ pub async fn get_logs_impl(
     state: &AppState,
     log_dir: PathBuf,
     tail_lines: usize,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<ComputerLogsResult>, AppError> {
     match get_logs_core(state, log_dir, tail_lines).await? {
-        LogsOutcome::Empty { reason } => Ok(Json(json!({
-            "success": true,
-            "message": reason,
-            "logs": [],
-            "totalLines": 0,
-            "startIndex": 1,
-            "logFileName": null,
-        }))),
+        LogsOutcome::Empty { reason } => Ok(Json(ComputerLogsResult {
+            success: true,
+            message: reason.to_string(),
+            logs: Vec::new(),
+            total_lines: 0,
+            start_index: 1,
+            log_file_name: None,
+        })),
         LogsOutcome::Tail {
             logs,
             total_lines,
             start_index,
             log_file_name,
-        } => {
-            let logs: Vec<Value> = logs
+        } => Ok(Json(ComputerLogsResult {
+            success: true,
+            message: "Get log successfully".to_string(),
+            logs: logs
                 .into_iter()
-                .map(|l| json!({ "line": l.line, "content": l.content }))
-                .collect();
-            Ok(Json(json!({
-                "success": true,
-                "message": "Get log successfully",
-                "logs": logs,
-                "totalLines": total_lines,
-                "startIndex": start_index,
-                "logFileName": log_file_name,
-            })))
-        }
+                .map(|l| crate::models::LogLine {
+                    line: l.line,
+                    content: l.content,
+                })
+                .collect(),
+            total_lines,
+            start_index,
+            log_file_name: Some(log_file_name),
+        })),
     }
 }
 

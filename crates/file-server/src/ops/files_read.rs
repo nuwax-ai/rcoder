@@ -7,12 +7,16 @@
 use std::path::{Path, PathBuf};
 
 use futures_util::StreamExt;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::AppState;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
+use crate::models::{
+    ComputerFileEntry, FileListResult, FileMetaEntryResult, FileMetaResult, ResolveFileResult,
+    SearchFilesResult,
+};
 use crate::service::{code as code_service, tree};
 
 #[derive(Clone, Copy)]
@@ -158,7 +162,7 @@ pub async fn get_file_list_impl(
     state: &AppState,
     path: &Path,
     p: FileListParams<'_>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<FileListResult>, AppError> {
     let mut result = get_file_list_core(state, path, p).await?;
     let ct = trimmed_non_empty(p.custom_target_dir);
     // fileProxyUrl 追加 ?customTargetDir (对齐 nuwax; 值需 encodeURIComponent)。
@@ -174,14 +178,13 @@ pub async fn get_file_list_impl(
             }
         }
     }
-    let files = computer_file_entries_json(result.files);
-    Ok(Json(json!({
-        "success": true,
-        "files": files,
-        "recursive": result.recursive,
-        "type": result.file_type.as_str(),
-        "limit": result.limit,
-    })))
+    Ok(Json(FileListResult {
+        success: true,
+        files: computer_file_entries(result.files),
+        recursive: result.recursive,
+        file_type: result.file_type.as_str().to_string(),
+        limit: result.limit,
+    }))
 }
 
 /// resolve-file 命中结果（file_proxy_url 为预览 URL，未含 customTargetDir 后缀）。
@@ -213,10 +216,15 @@ pub async fn resolve_file_impl(
     file_path: &str,
     proxy_path: Option<&str>,
     custom_target_dir: Option<&str>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<ResolveFileResult>, AppError> {
     let mut r = match resolve_file_core(path, file_path, proxy_path).await? {
         Some(r) => r,
-        None => return Ok(Json(json!({ "success": true, "exists": false }))),
+        None => {
+            return Ok(Json(ResolveFileResult::Missing {
+                success: true,
+                exists: false,
+            }));
+        }
     };
     // customTargetDir 后缀统一在此追加 (对齐 nuwax)
     if let (Some(ct), Some(url)) = (
@@ -226,12 +234,12 @@ pub async fn resolve_file_impl(
         url.push_str("?customTargetDir=");
         url.push_str(&code_service::encode_uri_component(ct));
     }
-    Ok(Json(json!({
-        "success": true,
-        "exists": true,
-        "name": r.name,
-        "fileProxyUrl": r.file_proxy_url,
-    })))
+    Ok(Json(ResolveFileResult::Found {
+        success: true,
+        exists: true,
+        name: r.name,
+        file_proxy_url: r.file_proxy_url,
+    }))
 }
 
 /// search-files 的 workspace 无关实现。
@@ -295,7 +303,7 @@ pub async fn search_files_impl(
     state: &AppState,
     path: PathBuf,
     p: SearchFilesParams<'_>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<SearchFilesResult>, AppError> {
     let mut r = search_files_core(state, path, p).await?;
     let ct = trimmed_non_empty(p.custom_target_dir);
     // customTargetDir 后缀统一在此追加 (对齐 nuwax)
@@ -310,36 +318,19 @@ pub async fn search_files_impl(
             }
         }
     }
-    let files = computer_file_entries_json(r.files);
-    Ok(Json(json!({
-        "success": true,
-        "files": files,
-        "truncated": r.truncated,
-        "visited": r.visited,
-    })))
+    Ok(Json(SearchFilesResult {
+        success: true,
+        files: computer_file_entries(r.files),
+        truncated: r.truncated,
+        visited: r.visited,
+    }))
 }
 
-/// Shape Computer file-list/search entries like the TypeScript API.
-/// Files always include `fileProxyUrl` (null when proxyPath is absent); directory
-/// entries intentionally contain only `name` and `isDir`.
-fn computer_file_entries_json(files: Vec<tree::FileEntry>) -> Vec<Value> {
-    files
-        .into_iter()
-        .map(|file| {
-            let mut value = json!({
-                "name": file.name,
-                "isDir": file.is_dir,
-            });
-            if !file.is_dir {
-                value["fileProxyUrl"] = file
-                    .file_proxy_url
-                    .map(Value::String)
-                    .unwrap_or(Value::Null);
-                value["isLink"] = json!(file.is_link.unwrap_or(false));
-            }
-            value
-        })
-        .collect()
+/// Shape Computer file-list/search entries like the TypeScript API:
+/// files always carry `fileProxyUrl` (null when proxyPath is absent) and `isLink`;
+/// directory entries intentionally contain only `name` and `isDir`.
+fn computer_file_entries(files: Vec<tree::FileEntry>) -> Vec<ComputerFileEntry> {
+    files.into_iter().map(ComputerFileEntry::from).collect()
 }
 
 /// trim 后非空才返回 (customTargetDir 的 URL 后缀语义)。
@@ -444,29 +435,29 @@ pub async fn get_file_meta_impl(
     state: &AppState,
     path: &Path,
     file_paths: &[String],
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<FileMetaResult>, AppError> {
     let metas = get_file_meta_core(state, path, file_paths).await?;
-    let metas: Vec<Value> = metas
-        .iter()
-        .map(|m| {
-            let mut obj = json!({
-                "path": m.path,
-                "isDir": m.is_dir,
-                "isLink": m.is_link,
-                "size": m.size,
-                "mtimeMs": m.mtime_ms,
-                "extension": m.extension,
-                "mimeType": m.mime_type,
-                "linkTarget": m.link_target,
-                "childCount": m.child_count,
-            });
-            if let Some(error) = &m.error {
-                obj["error"] = json!(error);
-            }
-            obj
-        })
-        .collect();
-    Ok(Json(json!({ "success": true, "metas": metas })))
+    Ok(Json(FileMetaResult {
+        success: true,
+        metas: metas.into_iter().map(FileMetaEntryResult::from).collect(),
+    }))
+}
+
+impl From<FileMetaEntry> for FileMetaEntryResult {
+    fn from(m: FileMetaEntry) -> Self {
+        Self {
+            path: m.path,
+            is_dir: m.is_dir,
+            is_link: m.is_link,
+            size: m.size,
+            mtime_ms: m.mtime_ms,
+            extension: m.extension,
+            mime_type: m.mime_type,
+            link_target: m.link_target,
+            child_count: m.child_count,
+            error: m.error,
+        }
+    }
 }
 
 /// 单条元数据查询: 非法路径/不存在仅该条带 error。lstat 不跟随符号链接

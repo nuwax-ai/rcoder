@@ -2,7 +2,6 @@
 
 use axum::extract::State;
 use garde::Validate;
-use serde_json::Value;
 
 use crate::ops::files::generate_file_impl;
 
@@ -11,7 +10,7 @@ use super::super::resolve_computer_target;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
-use crate::models::GenerateFileBody;
+use crate::models::{GenerateFileBody, GenerateFileResult};
 
 /// 生成文本文件
 ///
@@ -24,13 +23,13 @@ use crate::models::GenerateFileBody;
     post,
     path = "/generate-file",
     request_body = GenerateFileBody,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "生成文件名与字节数", body = GenerateFileResult), crate::openapi::ErrorApiResponses),
     tag = "Computer"
 )]
 pub(crate) async fn generate_file(
     State(state): State<AppState>,
     Json(body): Json<GenerateFileBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<GenerateFileResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     let ws = resolve_computer_target(
         &state,
@@ -99,7 +98,7 @@ mod tests {
         let res = generate_file(State(state), Json(body))
             .await
             .expect("generate-file should succeed");
-        let val = res.0;
+        let val = serde_json::to_value(&res.0).expect("serialize response");
         assert_eq!(val["success"], serde_json::json!(true));
         assert_eq!(val["message"], "File generated successfully");
         assert_eq!(val["fileName"], "src/a.txt");
@@ -209,7 +208,7 @@ mod tests {
         let res = generate_file(State(state), Json(body))
             .await
             .expect("leading-slash fileName should succeed");
-        let val = res.0;
+        let val = serde_json::to_value(&res.0).expect("serialize response");
         assert_eq!(val["fileName"], "/src/a.txt"); // 回显 trim 后(保留斜杠)
         assert_eq!(val["fileSize"], 2);
         // 实际写入剥前导斜杠

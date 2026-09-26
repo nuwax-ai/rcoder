@@ -402,3 +402,372 @@ pub struct FsMutationResponse {
     /// 恒 false
     pub is_symlink: bool,
 }
+
+// ── computer 域响应载荷（wire 契约，对齐 nuwax；字段名/存在性以 A/B 实测为准）──
+
+/// computer 文件列表/搜索条目。TS 契约是多态形状：目录条目只有
+/// `name`/`isDir` 两键，文件条目另有恒存在的 `fileProxyUrl`（无代理时为
+/// null）与 `isLink`。
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum ComputerFileEntry {
+    /// 目录条目（仅两键）
+    #[serde(rename_all = "camelCase")]
+    Directory {
+        /// 文件/目录名（不含路径）
+        name: String,
+        /// 是否目录
+        is_dir: bool,
+    },
+    /// 文件条目
+    #[serde(rename_all = "camelCase")]
+    File {
+        /// 文件/目录名（不含路径）
+        name: String,
+        /// 是否目录（文件条目恒 false）
+        is_dir: bool,
+        /// 预览代理 URL；未提供 proxyPath 时为 null
+        file_proxy_url: Option<String>,
+        /// 是否符号链接（缺省按非链接序列化）
+        is_link: bool,
+    },
+}
+
+impl From<crate::service::tree::FileEntry> for ComputerFileEntry {
+    fn from(file: crate::service::tree::FileEntry) -> Self {
+        if file.is_dir {
+            Self::Directory {
+                name: file.name,
+                is_dir: true,
+            }
+        } else {
+            Self::File {
+                name: file.name,
+                is_dir: false,
+                file_proxy_url: file.file_proxy_url,
+                is_link: file.is_link.unwrap_or(false),
+            }
+        }
+    }
+}
+
+/// get-file-list 响应。`limit` 未指定时序列化为 null（键恒存在）。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FileListResult {
+    /// 恒为 true；失败走错误响应
+    pub success: bool,
+    /// 条目列表（目录不存在时为空数组）
+    pub files: Vec<ComputerFileEntry>,
+    /// 是否递归列出
+    pub recursive: bool,
+    /// 生效的过滤类型（all/file/dir）
+    #[serde(rename = "type")]
+    pub file_type: String,
+    /// 生效的条数上限（未限制时为 null）
+    pub limit: Option<usize>,
+}
+
+/// resolve-file 响应。TS 契约按存在性多态：未命中只有 `success`/`exists`，
+/// 命中才有 `name` 与 `fileProxyUrl`。
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum ResolveFileResult {
+    /// 未命中（不存在 / 根目录缺失）
+    #[serde(rename_all = "camelCase")]
+    Missing {
+        /// 恒为 true
+        success: bool,
+        /// 文件是否存在
+        exists: bool,
+    },
+    /// 命中
+    #[serde(rename_all = "camelCase")]
+    Found {
+        /// 恒为 true
+        success: bool,
+        /// 文件是否存在
+        exists: bool,
+        /// 命中文件名
+        name: String,
+        /// 预览代理 URL（无 proxyPath 时为 null）
+        file_proxy_url: Option<String>,
+    },
+}
+
+/// search-files 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchFilesResult {
+    /// 恒为 true；失败走错误响应
+    pub success: bool,
+    /// 命中条目（有界实时搜索）
+    pub files: Vec<ComputerFileEntry>,
+    /// 是否因 limit/预算截断
+    pub truncated: bool,
+    /// 实际遍历的目录数
+    pub visited: usize,
+}
+
+/// get-file-meta 单条元数据。基础键恒存在（无值为 null）；`error` 仅失败
+/// 条目携带（成功条目无该键，对齐 TS 展开写法）。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FileMetaEntryResult {
+    /// 请求的文件路径（原样回显）
+    pub path: String,
+    /// 是否目录
+    pub is_dir: Option<bool>,
+    /// 是否符号链接
+    pub is_link: Option<bool>,
+    /// 文件字节数（目录为 null）
+    pub size: Option<u64>,
+    /// 修改时间（epoch 毫秒，浮点）
+    pub mtime_ms: Option<f64>,
+    /// 扩展名（不含点；无扩展为 null）
+    pub extension: Option<String>,
+    /// MIME 类型
+    pub mime_type: Option<String>,
+    /// 符号链接目标（非链接为 null）
+    pub link_target: Option<String>,
+    /// 目录直接子项数（文件为 null）
+    pub child_count: Option<u64>,
+    /// 单条失败原因（仅失败条目存在该键）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// get-file-meta 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FileMetaResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 与请求同序的元数据条目
+    pub metas: Vec<FileMetaEntryResult>,
+}
+
+/// computer files-update 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FilesUpdateResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 固定文案
+    pub message: String,
+    /// 回显请求的用户 ID
+    pub user_id: String,
+    /// 回显请求的实例 ID
+    pub c_id: String,
+    /// 本次生效的文件操作数
+    pub files_count: usize,
+}
+
+/// generate-file 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateFileResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 固定文案
+    pub message: String,
+    /// 生成文件的相对路径
+    pub file_name: String,
+    /// 生成内容字节数
+    pub file_size: u64,
+}
+
+/// upload-file 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadFileResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 固定文案
+    pub message: String,
+    /// 上传内容字节数
+    pub file_size: u64,
+}
+
+/// upload-files 单条结果。成功条目携带 `message`，失败条目携带 `error`。
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum UploadResultItem {
+    /// 上传成功
+    #[serde(rename_all = "camelCase")]
+    Ok {
+        /// 该条是否成功
+        success: bool,
+        /// 目标相对路径
+        file_path: String,
+        /// 原始文件名（表单缺失时为 null）
+        originalname: Option<String>,
+        /// 固定文案
+        message: String,
+        /// 内容字节数
+        file_size: u64,
+    },
+    /// 上传失败
+    #[serde(rename_all = "camelCase")]
+    Err {
+        /// 该条是否成功
+        success: bool,
+        /// 目标相对路径
+        file_path: String,
+        /// 原始文件名（表单缺失时为 null）
+        originalname: Option<String>,
+        /// 失败原因
+        error: String,
+    },
+}
+
+/// upload-files 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadFilesResult {
+    /// 批量受理恒为 true（单条失败见 results）
+    pub success: bool,
+    /// 固定文案
+    pub message: String,
+    /// 总条数
+    pub total_count: usize,
+    /// 成功条数
+    pub success_count: usize,
+    /// 失败条数
+    pub fail_count: usize,
+    /// 与上传同序的逐条结果
+    pub results: Vec<UploadResultItem>,
+}
+
+/// execute-command 响应。外层恒 success=true，命令结果由 exitCode 表示。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecuteCommandResult {
+    /// 恒为 true；失败走错误响应
+    pub success: bool,
+    /// 标准输出
+    pub stdout: String,
+    /// 标准错误
+    pub stderr: String,
+    /// 命令退出码
+    pub exit_code: i64,
+}
+
+/// computer get-logs 响应。`logFileName` 无日志文件时为 null（键恒存在）。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputerLogsResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 结果说明（空日志时为原因文案）
+    pub message: String,
+    /// 日志行（行号从 1 起）
+    pub logs: Vec<LogLine>,
+    /// 日志总行数
+    pub total_lines: usize,
+    /// 本页起始行号
+    pub start_index: usize,
+    /// 日志文件名（无日志文件时为 null）
+    pub log_file_name: Option<String>,
+}
+
+/// install-project 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallProjectResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 固定文案
+    pub message: String,
+    /// 安装发生的项目目录（绝对路径）
+    pub project_dir: String,
+    /// 识别的编程语言
+    pub programming_language: String,
+}
+
+/// build-agent-package 单个产物。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentArtifact {
+    /// 产物相对工作区路径
+    pub path: String,
+    /// 产物文件名
+    pub file_name: String,
+    /// 目标平台标识（如 linux-x64）
+    pub platform: String,
+}
+
+/// build-agent-package 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildAgentPackageResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 打包产物列表
+    pub artifacts: Vec<AgentArtifact>,
+}
+
+/// cleanup-build-artifacts 响应（无 message 字段）。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupBuildArtifactsResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 是否实际清理了产物目录
+    pub cleaned: bool,
+}
+
+/// import-project 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportProjectResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 固定文案
+    pub message: String,
+    /// 回显请求的用户 ID
+    pub user_id: String,
+    /// 回显请求的实例 ID
+    pub c_id: String,
+    /// 导入落地的目标目录
+    pub target_dir: String,
+}
+
+/// delete-workspace 响应（不存在视为已删除）。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteWorkspaceResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 是否删除（目录不存在时仍为 true）
+    pub deleted: bool,
+}
+
+/// init-project-template 响应。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InitProjectTemplateResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 固定文案
+    pub message: String,
+    /// 初始化的工作区根路径
+    pub workspace_root: String,
+}
+
+/// push-skills 响应。`agentStorePath` 仅实体存储路径存在时携带。
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PushSkillsResult {
+    /// 恒为 true
+    pub success: bool,
+    /// 结果文案（按更新技能数/是否实体存储生成）
+    pub message: String,
+    /// 工作区根路径
+    pub workspace_root: String,
+    /// 已推送的技能目录名列表
+    pub updated_skills: Vec<String>,
+    /// agent 实体存储路径（未走实体存储时无该键）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_store_path: Option<String>,
+}

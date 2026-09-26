@@ -4,13 +4,15 @@
 //! [`crate::service::package_build`]。
 
 use axum::extract::State;
-use serde_json::{Value, json};
 
 use super::{ServiceScope, resolve_computer_target, ws_path};
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
-use crate::models::{BuildAgentBody, CleanupBuildArtifactsBody, InstallBody};
+use crate::models::{
+    BuildAgentBody, BuildAgentPackageResult, CleanupBuildArtifactsBody,
+    CleanupBuildArtifactsResult, InstallBody, InstallProjectResult,
+};
 use crate::ops::packages::install_project_impl;
 use crate::ops::process_capture::run_capture;
 use crate::service::package_build;
@@ -23,11 +25,11 @@ use crate::service::pnpm_config;
 ///
 /// 对齐 nuwax installProjectDependencies。
 /// typescript → 递归找 package.json 目录 pnpm install; python → 找 requirements/pyproject pip install。
-#[utoipa::path(post, path = "/install-project", request_body = InstallBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
+#[utoipa::path(post, path = "/install-project", request_body = InstallBody, responses((status = 200, description = "依赖安装结果", body = InstallProjectResult), crate::openapi::ErrorApiResponses), tag = "Computer")]
 pub(crate) async fn install_project(
     State(state): State<AppState>,
     Json(body): Json<InstallBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<InstallProjectResult>, AppError> {
     let ws = ws_path(
         &state,
         &body.user_id,
@@ -51,11 +53,11 @@ pub(crate) async fn install_project(
 /// 递归找含 scripts/package-platforms.mjs 的目录 → pnpm install →
 /// `node scripts/package-platforms.mjs agent-{id} {ver} {dir}/dist-packages --print-artifacts`
 /// → 解析 stdout 中产物 (path 转 workspace 相对, platform 从文件名提取)。响应无 stdout。
-#[utoipa::path(post, path = "/build-agent-package", request_body = BuildAgentBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
+#[utoipa::path(post, path = "/build-agent-package", request_body = BuildAgentBody, responses((status = 200, description = "打包产物列表", body = BuildAgentPackageResult), crate::openapi::ErrorApiResponses), tag = "Computer")]
 pub(crate) async fn build_agent_package(
     State(state): State<AppState>,
     Json(body): Json<BuildAgentBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<BuildAgentPackageResult>, AppError> {
     let ws = ws_path(
         &state,
         &body.user_id,
@@ -107,7 +109,10 @@ pub(crate) async fn build_agent_package(
     }
     // 解析产物 (path 转 workspace 相对, platform 从文件名提取; 无 stdout 字段)
     let artifacts = package_build::parse_artifacts(&stdout, &pkg_dir, &ws);
-    Ok(Json(json!({ "success": true, "artifacts": artifacts })))
+    Ok(Json(BuildAgentPackageResult {
+        success: true,
+        artifacts,
+    }))
 }
 
 // ── cleanup-build-artifacts ─────────────────────────────────────────────────────
@@ -117,11 +122,11 @@ pub(crate) async fn build_agent_package(
 /// 对齐 nuwax cleanupBuildArtifacts; 删 dist-packages。
 /// 返回 {success, cleaned} (字段 cleaned, 非 removed; 无 message)。
 /// 递归找 scripts/package-platforms.mjs 所在 projectDir, 删其 dist-packages (对齐 nuwax)。
-#[utoipa::path(post, path = "/cleanup-build-artifacts", request_body = CleanupBuildArtifactsBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
+#[utoipa::path(post, path = "/cleanup-build-artifacts", request_body = CleanupBuildArtifactsBody, responses((status = 200, description = "清理结果", body = CleanupBuildArtifactsResult), crate::openapi::ErrorApiResponses), tag = "Computer")]
 pub(crate) async fn cleanup_build_artifacts(
     State(state): State<AppState>,
     Json(body): Json<CleanupBuildArtifactsBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<CleanupBuildArtifactsResult>, AppError> {
     let ws = resolve_computer_target(
         &state,
         &body.user_id,
@@ -136,12 +141,20 @@ pub(crate) async fn cleanup_build_artifacts(
     )
     .await?;
     if !tokio::fs::try_exists(&ws).await.unwrap_or(false) {
-        return Ok(Json(json!({ "success": true, "cleaned": false })));
+        return Ok(Json(CleanupBuildArtifactsResult {
+            success: true,
+            cleaned: false,
+        }));
     }
     let skip = package_build::package_search_skip_dirs(&state.config.zip_workspace_exclude);
     let project_dir = match package_build::find_package_script(&ws, &skip).await {
         Some(d) => d,
-        None => return Ok(Json(json!({ "success": true, "cleaned": false }))),
+        None => {
+            return Ok(Json(CleanupBuildArtifactsResult {
+                success: true,
+                cleaned: false,
+            }));
+        }
     };
     let dist = project_dir.join("dist-packages");
     let cleaned = if tokio::fs::try_exists(&dist).await.unwrap_or(false) {
@@ -155,5 +168,8 @@ pub(crate) async fn cleanup_build_artifacts(
     } else {
         false
     };
-    Ok(Json(json!({ "success": true, "cleaned": cleaned })))
+    Ok(Json(CleanupBuildArtifactsResult {
+        success: true,
+        cleaned,
+    }))
 }

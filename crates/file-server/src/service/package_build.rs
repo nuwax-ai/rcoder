@@ -4,8 +4,6 @@
 
 use std::path::{Path, PathBuf};
 
-use serde_json::{Value, json};
-
 /// 递归找含 `manifest` 的最近目录, 返回该目录 (BFS)。
 pub async fn find_first(root: &Path, manifest: &str) -> Option<PathBuf> {
     use std::collections::VecDeque;
@@ -84,7 +82,11 @@ pub async fn find_package_script(root: &Path, skip_dirs: &[String]) -> Option<Pa
 /// 从 package-platforms stdout 解析产物列表: {path (workspace 相对), fileName, platform}。
 /// 脚本以 package_dir 为 cwd 输出相对路径；先依照 TS 的 path.resolve(packageDir, line)
 /// 还原产物路径，再相对 workspace 返回，路径分隔符统一为 `/`。
-pub fn parse_artifacts(stdout: &str, package_dir: &Path, workspace: &Path) -> Vec<Value> {
+pub fn parse_artifacts(
+    stdout: &str,
+    package_dir: &Path,
+    workspace: &Path,
+) -> Vec<crate::models::AgentArtifact> {
     let mut out = Vec::new();
     for line in stdout.lines() {
         let t = line.trim();
@@ -107,11 +109,11 @@ pub fn parse_artifacts(stdout: &str, package_dir: &Path, workspace: &Path) -> Ve
             .unwrap_or_else(|_| t.to_string());
         let file_name = t.rsplit('/').next().unwrap_or(t).to_string();
         let platform = extract_platform_from_filename(&file_name).unwrap_or_default();
-        out.push(json!({
-            "path": rel,
-            "fileName": file_name,
-            "platform": platform,
-        }));
+        out.push(crate::models::AgentArtifact {
+            path: rel,
+            file_name,
+            platform,
+        });
     }
     out
 }
@@ -119,7 +121,6 @@ pub fn parse_artifacts(stdout: &str, package_dir: &Path, workspace: &Path) -> Ve
 #[cfg(test)]
 mod artifact_path_tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn parse_artifacts_resolves_relative_paths_from_nested_package_dir() {
@@ -133,13 +134,15 @@ mod artifact_path_tests {
             &workspace,
         );
 
+        // 断言按 wire JSON 比较 (顺带校验类型化产物的序列化形状)。
+        let artifacts = serde_json::to_value(&artifacts).expect("serialize artifacts");
         assert_eq!(
             artifacts,
-            vec![json!({
+            serde_json::json!([{
                 "path": "agent-package/dist-packages/agent-17-linux-x64-1.2.3.zip",
                 "fileName": "agent-17-linux-x64-1.2.3.zip",
                 "platform": "linux-x64"
-            })]
+            }])
         );
     }
 }

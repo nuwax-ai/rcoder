@@ -5,12 +5,14 @@
 
 use axum::extract::State;
 use garde::Validate;
-use serde_json::Value;
 
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
-use crate::models::{FileListQuery, GetFileMetaBody, ResolveFileQuery, SearchFilesQuery};
+use crate::models::{
+    FileListQuery, FileListResult, FileMetaResult, GetFileMetaBody, ResolveFileQuery,
+    ResolveFileResult, SearchFilesQuery, SearchFilesResult,
+};
 
 use crate::ops::files_read::{
     FileListParams, SearchFilesParams, effective_file_meta_max_batch, get_file_list_impl,
@@ -30,13 +32,13 @@ use super::resolve_computer_target;
     get,
     path = "/get-file-list",
     params(FileListQuery),
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "文件列表（含生效参数回显）", body = FileListResult), crate::openapi::ErrorApiResponses),
     tag = "Computer"
 )]
 pub(crate) async fn get_file_list(
     State(state): State<AppState>,
     Query(q): Query<FileListQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<FileListResult>, AppError> {
     q.validate().map_err(crate::error::from_garde)?;
     let path = resolve_computer_target(
         &state,
@@ -76,13 +78,13 @@ pub(crate) async fn get_file_list(
     get,
     path = "/resolve-file",
     params(ResolveFileQuery),
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "文件存在性（命中时含 name/fileProxyUrl）", body = ResolveFileResult), crate::openapi::ErrorApiResponses),
     tag = "Computer"
 )]
 pub(crate) async fn resolve_file(
     State(state): State<AppState>,
     Query(q): Query<ResolveFileQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<ResolveFileResult>, AppError> {
     q.validate().map_err(crate::error::from_garde)?;
     let path = resolve_computer_target(
         &state,
@@ -116,13 +118,13 @@ pub(crate) async fn resolve_file(
     get,
     path = "/search-files",
     params(SearchFilesQuery),
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "有界实时搜索结果", body = SearchFilesResult), crate::openapi::ErrorApiResponses),
     tag = "Computer"
 )]
 pub(crate) async fn search_files(
     State(state): State<AppState>,
     Query(q): Query<SearchFilesQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<SearchFilesResult>, AppError> {
     q.validate().map_err(crate::error::from_garde)?;
     let path = resolve_computer_target(
         &state,
@@ -163,13 +165,13 @@ pub(crate) async fn search_files(
     post,
     path = "/get-file-meta",
     request_body = GetFileMetaBody,
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "批量元数据（单条失败仅该条带 error）", body = FileMetaResult), crate::openapi::ErrorApiResponses),
     tag = "Computer"
 )]
 pub(crate) async fn get_file_meta(
     State(state): State<AppState>,
     Json(body): Json<GetFileMetaBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<FileMetaResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     // 非空与上限联合校验 (对齐 TS ValidationError 位置; 上限缺省 100/硬顶 1000)
     if body.file_paths.is_empty() {
@@ -201,6 +203,12 @@ pub(crate) async fn get_file_meta(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+
+    /// 测试断言仍按 wire JSON 走（同时顺带验证类型化响应的序列化形状）。
+    fn wire(body: &impl serde::Serialize) -> Value {
+        serde_json::to_value(body).expect("serialize typed response")
+    }
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -265,7 +273,7 @@ mod tests {
             limit: None,
         });
         let res = get_file_list(State(state), q).await.expect("list ok");
-        let val = res.0;
+        let val = wire(&res.0);
         assert_eq!(val["success"], json!(true));
         assert_eq!(val["recursive"], json!(true)); // 缺省 recursive=true
         assert_eq!(val["type"], json!("all"));
@@ -309,7 +317,7 @@ mod tests {
             limit: None,
         });
         let res = get_file_list(State(state), q).await.expect("list ok");
-        let val = res.0;
+        let val = wire(&res.0);
         assert_eq!(val["recursive"], json!(false)); // 显式 false
         let names: Vec<&str> = val["files"]
             .as_array()
@@ -343,7 +351,7 @@ mod tests {
             limit: None,
         });
         let res = get_file_list(State(state), q).await.expect("list ok");
-        let val = res.0;
+        let val = wire(&res.0);
         assert_eq!(val["success"], json!(true));
         assert_eq!(val["files"], json!([]));
         // 早返回也带 recursive (对齐 TS 1.3.7)
@@ -372,7 +380,7 @@ mod tests {
             limit: None,
         });
         let res = get_file_list(State(state), q).await.expect("list ok");
-        let val = res.0;
+        let val = wire(&res.0);
         let file_entry = &val["files"][0];
         assert_eq!(file_entry["name"], "f.txt");
         // fileProxyUrl 应含 ?customTargetDir= 后缀
@@ -407,7 +415,7 @@ mod tests {
             limit: Some("1".into()),
         });
         let res = get_file_list(State(state), q).await.expect("list ok");
-        let val = res.0;
+        let val = wire(&res.0);
         let entry = &val["files"][0];
         assert_eq!(val["type"], json!("file"));
         assert_eq!(val["limit"], json!(1));
@@ -435,7 +443,7 @@ mod tests {
             file_path: "sub/c.txt".into(),
         });
         let res = resolve_file(State(state), q).await.expect("resolve ok");
-        let val = res.0;
+        let val = wire(&res.0);
         assert_eq!(val["success"], json!(true));
         assert_eq!(val["exists"], json!(true));
         assert_eq!(val["name"], "sub/c.txt");
@@ -460,7 +468,7 @@ mod tests {
             file_path: "nope.txt".into(),
         });
         let res = resolve_file(State(state), q).await.expect("resolve ok");
-        let val = res.0;
+        let val = wire(&res.0);
         assert_eq!(val["success"], json!(true));
         assert_eq!(val["exists"], json!(false));
         assert!(val.get("name").is_none());
@@ -509,7 +517,7 @@ mod tests {
             file_path: "f.txt".into(),
         });
         let res = resolve_file(State(state), q).await.expect("resolve ok");
-        let val = res.0;
+        let val = wire(&res.0);
         assert_eq!(val["exists"], json!(true));
         // customTargetDir 后缀需 encodeURIComponent
         assert!(
@@ -542,7 +550,7 @@ mod tests {
             timeout_ms: "5000".into(),
         });
         let res = search_files(State(state), q).await.expect("search ok");
-        let val = res.0;
+        let val = wire(&res.0);
         assert_eq!(val["success"], json!(true));
         let names: Vec<&str> = val["files"]
             .as_array()
@@ -647,7 +655,8 @@ mod tests {
             limit: None,
         });
         let res = get_file_list(State(state), q).await.expect("list ok");
-        let names: Vec<&str> = res.0["files"]
+        let val = wire(&res.0);
+        let names: Vec<&str> = val["files"]
             .as_array()
             .unwrap()
             .iter()
@@ -746,7 +755,7 @@ mod tests {
         )
         .await
         .expect("meta ok");
-        let val = res.0;
+        let val = wire(&res.0);
         assert_eq!(val["success"], json!(true));
 
         // 常规文件: size/mtimeMs/extension 小写/mime 查表, 无 error 键
@@ -791,7 +800,7 @@ mod tests {
         let res = get_file_meta(State(state), meta_body(vec!["a.txt", "nope.txt", "sub"]))
             .await
             .expect("meta ok");
-        let val = res.0;
+        let val = wire(&res.0);
         // 响应与请求同序 (按键关联的兜底契约)
         let paths: Vec<&str> = val["metas"]
             .as_array()
@@ -816,7 +825,7 @@ mod tests {
         let res = get_file_meta(State(state), meta_body(vec!["../x", "  ", "/a.txt"]))
             .await
             .expect("meta ok");
-        let val = res.0;
+        let val = wire(&res.0);
         // 穿越 → illegal path
         assert_eq!(meta_of(&val, "../x")["error"], json!("illegal path"));
         // 空白串 trim 后为空 → illegal path (path 回显 trimmed 空串)
@@ -856,7 +865,8 @@ mod tests {
         let res = get_file_meta(State(state), meta_body(vec!["a.txt"]))
             .await
             .expect("meta ok");
-        assert_eq!(res.0["success"], json!(true));
-        assert_eq!(res.0["metas"], json!([]));
+        let val = wire(&res.0);
+        assert_eq!(val["success"], json!(true));
+        assert_eq!(val["metas"], json!([]));
     }
 }

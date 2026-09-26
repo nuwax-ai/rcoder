@@ -1,7 +1,6 @@
 //! push-skills-to-workspace v1/v2 handlers: 技能推送 (可选 agent-store 路径)。
 
 use axum::extract::State;
-use serde_json::Value;
 
 use crate::ops::multipart::{file_field, text_field};
 use crate::ops::workspace::push_skills_impl;
@@ -12,35 +11,35 @@ use super::require_workspace_fields;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
-use crate::models::PushSkillsForm;
+use crate::models::{PushSkillsForm, PushSkillsResult};
 
 /// 技能推送到工作区
 ///
 /// 对齐 nuwax pushSkillsToWorkspace;
 /// 复用 skills_service::push_skills_at, 推到 .claude/skills + syncAgents。
-#[utoipa::path(post, path = "/push-skills-to-workspace", request_body(content = PushSkillsForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
+#[utoipa::path(post, path = "/push-skills-to-workspace", request_body(content = PushSkillsForm, content_type = "multipart/form-data"), responses((status = 200, description = "推送结果（含已更新技能列表）", body = PushSkillsResult), crate::openapi::ErrorApiResponses), tag = "Computer")]
 pub(crate) async fn push_skills_to_workspace(
     State(state): State<AppState>,
     multipart: Multipart,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<PushSkillsResult>, AppError> {
     push_skills_to_workspace_impl(state, multipart).await
 }
 
 /// 推送 skills 到工作区
 ///
 /// v2：多文件上传，软链优先 + copy 回退。
-#[utoipa::path(post, path = "/push-skills-to-workspace-v2", request_body(content = PushSkillsForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
+#[utoipa::path(post, path = "/push-skills-to-workspace-v2", request_body(content = PushSkillsForm, content_type = "multipart/form-data"), responses((status = 200, description = "推送结果（v2 含实体存储路径）", body = PushSkillsResult), crate::openapi::ErrorApiResponses), tag = "Computer")]
 pub(crate) async fn push_skills_to_workspace_v2(
     State(state): State<AppState>,
     multipart: Multipart,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<PushSkillsResult>, AppError> {
     push_skills_to_workspace_impl(state, multipart).await
 }
 
 async fn push_skills_to_workspace_impl(
     state: AppState,
     mut multipart: Multipart,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<PushSkillsResult>, AppError> {
     let mut user_id = None;
     let mut cid = None;
     let mut workspace_path = None; // 用户维度工作目录 (对齐 TS 1.4.5, 可选 multipart 字段)

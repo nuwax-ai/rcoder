@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use crate::extract::AppJson as Json;
-use serde_json::{Value, json};
+use crate::models::InstallProjectResult;
 
 use crate::AppState;
 use crate::error::AppError;
@@ -110,12 +110,12 @@ pub async fn install_project_impl(
     state: &AppState,
     ws: PathBuf,
     programming_language: &str,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<InstallProjectResult>, AppError> {
     let r = install_project_core(state, ws, programming_language).await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Project dependencies installed successfully",
-        "projectDir": r.project_dir.display().to_string(),
-        "programmingLanguage": r.programming_language,
-    })))
+    Ok(Json(InstallProjectResult {
+        success: true,
+        message: "Project dependencies installed successfully".to_string(),
+        project_dir: r.project_dir.display().to_string(),
+        programming_language: r.programming_language,
+    }))
 }

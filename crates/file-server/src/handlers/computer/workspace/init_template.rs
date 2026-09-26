@@ -2,7 +2,6 @@
 
 use axum::extract::State;
 use garde::Validate;
-use serde_json::Value;
 
 use crate::ops::multipart::{file_field, text_field};
 use crate::ops::workspace::init_project_template_impl;
@@ -12,7 +11,7 @@ use super::super::ws_path;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
-use crate::models::InitProjectTemplateForm;
+use crate::models::{InitProjectTemplateForm, InitProjectTemplateResult};
 use crate::service::temp_file::TemporaryFile;
 
 /// init-project-template 必填字段 (含模板 zip 文件)。
@@ -55,11 +54,11 @@ impl InitTemplateFields {
 /// 对齐 nuwax initProjectTemplate。
 /// multipart: userId, cId, file(模板 zip), enableGit。解压到工作区。
 /// git 触发双开关: GIT_ENABLED && enableGit → init + commit (对齐 nuwax)。
-#[utoipa::path(post, path = "/init-project-template", request_body(content = InitProjectTemplateForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
+#[utoipa::path(post, path = "/init-project-template", request_body(content = InitProjectTemplateForm, content_type = "multipart/form-data"), responses((status = 200, description = "初始化结果（含工作区根路径）", body = InitProjectTemplateResult), crate::openapi::ErrorApiResponses), tag = "Computer")]
 pub(crate) async fn init_project_template(
     State(state): State<AppState>,
     mut multipart: Multipart,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<InitProjectTemplateResult>, AppError> {
     let mut user_id = None;
     let mut cid = None;
     let mut workspace_path = None; // 用户维度工作目录 (对齐 TS 1.4.5, 可选 multipart 字段)

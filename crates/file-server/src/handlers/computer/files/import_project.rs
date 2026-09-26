@@ -2,7 +2,6 @@
 
 use axum::extract::State;
 use garde::Validate;
-use serde_json::{Value, json};
 
 use crate::ops::files::import_project_core;
 use crate::ops::multipart::{file_field, text_field, validate_zip_ext};
@@ -12,7 +11,7 @@ use super::super::resolve_computer_target;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
-use crate::models::ImportProjectForm;
+use crate::models::{ImportProjectForm, ImportProjectResult};
 use crate::service::temp_file::TemporaryFile;
 
 /// import-project 必填字段 (userId/cId 必填非空 + zip 文件必填)。
@@ -54,11 +53,11 @@ impl ImportProjectFields {
 ///
 /// 对齐 nuwax computer importProject:
 /// 上传 zip → 解压 + removeTopLevelDir + 白名单保留合并到工作区。
-#[utoipa::path(post, path = "/import-project", request_body(content = ImportProjectForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
+#[utoipa::path(post, path = "/import-project", request_body(content = ImportProjectForm, content_type = "multipart/form-data"), responses((status = 200, description = "导入结果（含落地目录）", body = ImportProjectResult), crate::openapi::ErrorApiResponses), tag = "Computer")]
 pub(crate) async fn import_project(
     State(state): State<AppState>,
     mut multipart: Multipart,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<ImportProjectResult>, AppError> {
     let mut user_id = None;
     let mut cid = None;
     let mut custom_target_dir = None;
@@ -112,11 +111,11 @@ pub(crate) async fn import_project(
     )
     .await?;
     let target = import_project_core(target_dir, v.data).await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Project imported successfully",
-        "userId": v.user_id,
-        "cId": v.cid,
-        "targetDir": target,
-    })))
+    Ok(Json(ImportProjectResult {
+        success: true,
+        message: "Project imported successfully".to_string(),
+        user_id: v.user_id,
+        c_id: v.cid,
+        target_dir: target,
+    }))
 }

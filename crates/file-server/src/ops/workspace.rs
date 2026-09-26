@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use crate::extract::AppJson as Json;
-use serde_json::{Value, json};
+use crate::models::{InitProjectTemplateResult, PushSkillsResult};
 
 use crate::AppState;
 use crate::error::AppError;
@@ -44,13 +44,13 @@ pub async fn init_project_template_impl(
     ws: std::path::PathBuf,
     data: TemporaryFile,
     enable_git: bool,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<InitProjectTemplateResult>, AppError> {
     let ws = init_project_template_core(state, ws, data, enable_git).await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Project template initialized successfully",
-        "workspaceRoot": ws.display().to_string(),
-    })))
+    Ok(Json(InitProjectTemplateResult {
+        success: true,
+        message: "Project template initialized successfully".to_string(),
+        workspace_root: ws.display().to_string(),
+    }))
 }
 
 /// push-skills 结果（updated 为已推送的技能目录名列表）。
@@ -209,17 +209,15 @@ pub async fn push_skills_impl(
     state: &AppState,
     params: PushSkillsParams<'_>,
     response_workspace_root: &Path,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<PushSkillsResult>, AppError> {
     let r = push_skills_core_with_store(state, params).await?;
-    let message = pushed_skills_message(&r.updated, r.agent_store_path.is_some());
-    let mut response = json!({
-        "success": true,
-        "message": message,
-        "workspaceRoot": response_workspace_root.display().to_string(),
-        "updatedSkills": r.updated,
-    });
-    if let Some(agent_store_path) = r.agent_store_path {
-        response["agentStorePath"] = json!(agent_store_path);
-    }
-    Ok(Json(response))
+    let agent_store_path = r.agent_store_path;
+    let message = pushed_skills_message(&r.updated, agent_store_path.is_some());
+    Ok(Json(PushSkillsResult {
+        success: true,
+        message,
+        workspace_root: response_workspace_root.display().to_string(),
+        updated_skills: r.updated,
+        agent_store_path,
+    }))
 }

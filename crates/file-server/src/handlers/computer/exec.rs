@@ -5,13 +5,12 @@
 
 use axum::extract::State;
 use garde::Validate;
-use serde_json::Value;
 
 use super::ServiceScope;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
-use crate::models::{ExecCommandBody, GetLogsQuery};
+use crate::models::{ComputerLogsResult, ExecCommandBody, ExecuteCommandResult, GetLogsQuery};
 
 use crate::ops::exec::{execute_command_impl, get_logs_impl};
 
@@ -24,11 +23,11 @@ use super::{resolve_computer_target, ws_path};
 /// 对齐 nuwax executeCommand; shell 执行 + 超时 + 捕获输出。
 /// command 是 agent 提供的 shell 命令串, 故经 shell -c (与 nuwax child_process.exec 一致)。
 /// shell 优先用 `BASH_PATH` (未配置则 sh); stdout/stderr 截断到 50MB (对齐 nuwax maxBuffer)。
-#[utoipa::path(post, path = "/execute-command", request_body = ExecCommandBody, responses(crate::openapi::JsonApiResponses), tag = "Computer")]
+#[utoipa::path(post, path = "/execute-command", request_body = ExecCommandBody, responses((status = 200, description = "命令结果（退出码表示成败）", body = ExecuteCommandResult), crate::openapi::ErrorApiResponses), tag = "Computer")]
 pub(crate) async fn execute_command(
     State(state): State<AppState>,
     Json(body): Json<ExecCommandBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<ExecuteCommandResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     let cwd = ws_path(
         &state,
@@ -55,13 +54,13 @@ pub(crate) async fn execute_command(
     get,
     path = "/get-logs",
     params(GetLogsQuery),
-    responses(crate::openapi::JsonApiResponses),
+    responses((status = 200, description = "日志末尾分页", body = ComputerLogsResult), crate::openapi::ErrorApiResponses),
     tag = "Computer"
 )]
 pub(crate) async fn get_logs(
     State(state): State<AppState>,
     Query(q): Query<GetLogsQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<ComputerLogsResult>, AppError> {
     q.validate().map_err(crate::error::from_garde)?;
     // 绑定目录优先于 userapp/默认 (收口内); 日志目录跟随工作区: {ws}/.logs (对齐 TS 1.4.5)
     let log_dir = resolve_computer_target(

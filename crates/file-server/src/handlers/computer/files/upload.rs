@@ -2,7 +2,6 @@
 
 use axum::extract::State;
 use garde::Validate;
-use serde_json::Value;
 
 use crate::ops::files::{upload_file_impl, upload_files_impl};
 use crate::ops::multipart::{file_field, text_field};
@@ -12,7 +11,7 @@ use super::super::resolve_computer_target;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
-use crate::models::{UploadFileForm, UploadFilesForm};
+use crate::models::{UploadFileForm, UploadFileResult, UploadFilesForm, UploadFilesResult};
 use crate::service::temp_file::TemporaryFile;
 
 /// upload-file 必填字段 (multipart 提取后构造 + garde 校验; 文件字段用内置 required)。
@@ -94,11 +93,11 @@ impl UploadFilesFields {
 ///
 /// 对齐 nuwax computer uploadFile; multipart。
 /// 返回 {success, message, fileSize} (不返回 filePath/originalname)。
-#[utoipa::path(post, path = "/upload-file", request_body(content = UploadFileForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
+#[utoipa::path(post, path = "/upload-file", request_body(content = UploadFileForm, content_type = "multipart/form-data"), responses((status = 200, description = "上传结果", body = UploadFileResult), crate::openapi::ErrorApiResponses), tag = "Computer")]
 pub(crate) async fn upload_file(
     State(state): State<AppState>,
     mut multipart: Multipart,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<UploadFileResult>, AppError> {
     let mut user_id = None;
     let mut cid = None;
     let mut file_path = None;
@@ -162,11 +161,11 @@ pub(crate) async fn upload_file(
 ///
 /// 对齐 nuwax computer uploadFiles; 多文件 multipart。
 /// 返回 {success, message, totalCount, successCount, failCount, results:[{success,filePath,originalname?,message?,fileSize?,error?}]}。
-#[utoipa::path(post, path = "/upload-files", request_body(content = UploadFilesForm, content_type = "multipart/form-data"), responses(crate::openapi::JsonApiResponses), tag = "Computer")]
+#[utoipa::path(post, path = "/upload-files", request_body(content = UploadFilesForm, content_type = "multipart/form-data"), responses((status = 200, description = "批量上传逐条结果", body = UploadFilesResult), crate::openapi::ErrorApiResponses), tag = "Computer")]
 pub(crate) async fn upload_files(
     State(state): State<AppState>,
     mut multipart: Multipart,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<UploadFilesResult>, AppError> {
     let mut user_id = None;
     let mut cid = None;
     let mut custom_target_dir = None;
