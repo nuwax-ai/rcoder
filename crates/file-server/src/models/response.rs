@@ -956,6 +956,7 @@ pub struct GitAddResult {
 #[serde(untagged)]
 pub enum GitCommitResult {
     /// 提交成功
+    #[serde(rename_all = "camelCase")]
     Committed {
         /// 恒为 true
         success: bool,
@@ -969,6 +970,7 @@ pub enum GitCommitResult {
         summary: GitCommitSummary,
     },
     /// 暂存区为空
+    #[serde(rename_all = "camelCase")]
     NothingToCommit {
         /// 恒为 true
         success: bool,
@@ -1095,6 +1097,7 @@ pub struct GitCheckoutResult {
 #[serde(untagged)]
 pub enum GitRevertResult {
     /// 产生回退提交
+    #[serde(rename_all = "camelCase")]
     Reverted {
         /// 恒为 true
         success: bool,
@@ -1110,6 +1113,7 @@ pub enum GitRevertResult {
         previous_head: String,
     },
     /// 目标态与当前一致，未产生提交
+    #[serde(rename_all = "camelCase")]
     NothingToRevert {
         /// 恒为 true
         success: bool,
