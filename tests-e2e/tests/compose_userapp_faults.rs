@@ -11,15 +11,33 @@ async fn userapp_hot_deployment_supervisord_contract() {
     run_scenario("userapp_hot_deployment_supervisord_contract", "supervisord").await;
 }
 
+#[tokio::test]
+async fn userapp_worker_builtin_contract() {
+    worker_scenario("userapp_worker_builtin_contract", "builtin").await;
+}
+
+#[tokio::test]
+async fn userapp_worker_supervisord_contract() {
+    worker_scenario("userapp_worker_supervisord_contract", "supervisord").await;
+}
+
+async fn worker_scenario(scenario: &str, engine: &str) {
+    let Some((_env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    run_contract(&report, engine, "worker_contract.py", "worker-contract");
+    assert!(report.finish(), "worker contract failed");
+}
+
 async fn run_scenario(scenario: &str, engine: &str) {
     let Some((_env, report)) = Env::compose_or_skip(scenario, "compose").await else {
         return;
     };
-    run_contract(&report, engine);
+    run_contract(&report, engine, "hot_contract.py", "hot-contract");
     assert!(report.finish(), "hot deployment contract failed");
 }
 
-fn run_contract(report: &JsonlReporter, engine: &str) {
+fn run_contract(report: &JsonlReporter, engine: &str, script: &str, artifacts: &str) {
     let Some(directory) = std::env::var_os("E2E_REPORT_DIR") else {
         report.assert_hard(
             "strict runner report directory",
@@ -29,18 +47,21 @@ fn run_contract(report: &JsonlReporter, engine: &str) {
         return;
     };
     let result = std::process::Command::new("python3")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tools/hot_contract.py"
-        ))
+        .arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tools")
+                .join(script),
+        )
         .env("E2E_APP_CLI_ENGINE", engine)
         .status();
     report.assert_hard(
         "Docker contract process completed",
         result.is_ok_and(|s| s.success()),
-        "see hot-contract artifacts".into(),
+        format!("see {artifacts} artifacts"),
     );
-    let path = std::path::PathBuf::from(directory).join("hot-contract/assertions.json");
+    let path = std::path::PathBuf::from(directory)
+        .join(artifacts)
+        .join("assertions.json");
     let assertions = std::fs::read(&path)
         .ok()
         .and_then(|b| serde_json::from_slice::<Vec<serde_json::Value>>(&b).ok());

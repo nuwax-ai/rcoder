@@ -30,6 +30,18 @@ pub fn validate_project_at(manifest: &ProjectManifest, dir: &str) -> Vec<Validat
     };
     let mut issues = Vec::new();
     let project = &manifest.project;
+    issues.extend(
+        super::startup::collect_startup_issues(
+            &project.kind,
+            &project.r#type,
+            &manifest.health,
+            manifest.proxy.is_some(),
+            &manifest.run,
+            manifest.devrun.as_ref(),
+        )
+        .into_iter()
+        .map(&locate),
+    );
     if manifest.schema_version != SCHEMA_VERSION {
         issues.push(locate(
             ValidationIssue::new(format!(
@@ -78,7 +90,7 @@ pub fn validate_project_at(manifest: &ProjectManifest, dir: &str) -> Vec<Validat
     {
         issues.push(
             locate(issue).at_field("run.command").with_hint(
-                "the service must listen on 0.0.0.0:$PORT ($PORT is injected per service)",
+                "provide a foreground service command; HTTP/TCP checks require listening on 0.0.0.0:$PORT",
             ),
         );
     }
@@ -115,7 +127,7 @@ pub fn validate_project_at(manifest: &ProjectManifest, dir: &str) -> Vec<Validat
     {
         issues.push(locate(issue).at_field("devrun.command").with_hint(
             "dev 阶段热加载启动命令（配置即切源码态，缺省回落 [run].command）；\
-             需监听 0.0.0.0:$PORT（与 run.command 同款注入）",
+             HTTP/TCP 检查需监听 0.0.0.0:$PORT；无监听 worker 须显式声明 process 检查",
         ));
     }
     if !manifest.run.migrate.is_empty()
@@ -154,11 +166,10 @@ pub fn validate_project_at(manifest: &ProjectManifest, dir: &str) -> Vec<Validat
     if project.kind == ProjectKind::Worker && manifest.proxy.is_some() {
         issues.push(
             locate(
-                ValidationIssue::new("worker service must not declare [proxy]")
-                    .at_field("proxy"),
+                ValidationIssue::new("worker service must not declare [proxy]").at_field("proxy"),
             )
             .with_hint(
-                "workers don't serve HTTP; remove the [proxy] section, or set kind = \"web\" if it does",
+                "workers have no public proxy route; internal HTTP health endpoints are allowed",
             ),
         );
     }

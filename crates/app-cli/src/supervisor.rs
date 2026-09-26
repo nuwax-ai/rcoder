@@ -142,10 +142,15 @@ async fn run_inner(
     let mut startup_failures: Vec<FailedService> = Vec::new();
     // Done 终局是否已发射（正常路径 :241；失败兜底路径据此保证"至多一次"）。
     let mut done_emitted = false;
+    let mut checked_readiness = None;
     let startup = async {
         crate::static_hosting::reconcile(&specs, &args.workspace, dev_profile).await?;
         // ── 启动循环（容错）：单服务失败记 EVT 后 continue ──
         for spec in &specs {
+            anyhow::ensure!(
+                !cancel.as_ref().is_some_and(|token| token.is_cancelled()),
+                "Orchestration cancelled"
+            );
             // static 服务：内置静态托管承载（无进程，bind 即成恒成功；dev 源码态
             // 且配了 [devrun] 时端口让给 dev server——fallthrough 到正常 spawn）
             if crate::static_hosting::hosts_statically(spec, dev_profile) {
@@ -196,6 +201,7 @@ async fn run_inner(
                     service: spec.service_id.clone(),
                 },
             );
+            let launched_at = tokio::time::Instant::now();
             match start_service(
                 spec,
                 argv,
@@ -206,7 +212,21 @@ async fn run_inner(
             )
             .await
             {
-                Ok(child) => {
+                Ok(mut child) => {
+                    // Observe explicit contracts as soon as this execution starts.
+                    // A later service's slow migration must not consume this one's
+                    // budget before its first observation. Legacy probes remain parallel.
+                    if spec.health.startup_probe.is_some() {
+                        let check = crate::startup_probe::builtin(
+                            spec,
+                            &mut child,
+                            dev_profile,
+                            launched_at,
+                            cancel.as_ref(),
+                        )
+                        .await;
+                        record_startup_check(&spec.service_id, check, &mut startup_failures);
+                    }
                     children.push((spec.service_id.clone(), child));
                     started_user_services += 1;
                 }
@@ -234,55 +254,44 @@ async fn run_inner(
                 crate::workspace_index::INDEX_PORT
             );
         }
-        // ── 并行 readiness 探测：spawn 成功的服务在各自 [health].
-        //    startup_timeout_seconds 窗口内探测（500ms 间隔）：
-        //    - 进程态（[run]）：HTTP readiness_path 轮询（K8s readinessProbe 语义）
-        //    - devrun 启动的热加载服务：**TCP 连通**即可——vite/nodemon 等 dev
-        //      server 的 HTTP 路径语义不可知（多数不实现 readiness_path，按 HTTP
-        //      探会误判超时）；"端口在听"是热加载命令的保守正确判定
-        //    探测超时的服务**保留运行**（部分运行态：可能仅慢启动或探针路径配错，
-        //    杀掉武断；supervise 循环继续管理其退出重启）。结果逐服务 emit（dev
-        //    链路 SSE 可见）。
-        let mut probe_tasks = Vec::new();
-        for (service_id, _) in &children {
-            let Some(spec) = specs.iter().find(|s| &s.service_id == service_id) else {
-                continue;
-            };
-            let spec = spec.clone();
-            probe_tasks.push(tokio::spawn(async move {
-                let outcome = if dev_profile && spec.devrun.is_some() {
-                    wait_for_port_open(&spec, spec.health.startup_timeout_seconds).await
-                } else {
-                    wait_for_service_ready_within(&spec, spec.health.startup_timeout_seconds).await
-                };
-                (spec.service_id.clone(), outcome.err())
-            }));
-        }
-        for task in probe_tasks {
-            let Ok((service_id, failure)) = task.await else {
-                continue;
-            };
-            match failure {
-                None => {
-                    info!("✅ {service_id} ready (readiness probe passed)");
-                    emit_event(&OrchestrationEvent::ServiceStartOk {
-                        service: service_id,
-                    });
+        // Borrow owned children for parallel checks: no detached probe tasks and
+        // no JoinError branch that could silently omit a service failure.
+        let checks = children
+            .iter_mut()
+            .filter(|(id, _)| {
+                specs
+                    .iter()
+                    .any(|spec| &spec.service_id == id && spec.health.startup_probe.is_none())
+            })
+            .map(|(service_id, child)| {
+                let specs = &specs;
+                let cancel = cancel.as_ref();
+                async move {
+                    let result = async {
+                        let spec = specs
+                            .iter()
+                            .find(|s| &s.service_id == service_id)
+                            .context("started service is absent from release lock")?;
+                        crate::startup_probe::builtin(
+                            spec,
+                            child,
+                            dev_profile,
+                            tokio::time::Instant::now(),
+                            cancel,
+                        )
+                        .await
+                    }
+                    .await;
+                    (service_id.clone(), result)
                 }
-                Some(e) => {
-                    let error = format!("readiness probe: {e:#}");
-                    warn!("⏳ {service_id} {error} — 服务保留运行（启动判定失败）");
-                    emit_event(&OrchestrationEvent::ServiceStartFail {
-                        service: service_id.clone(),
-                        error: error.clone(),
-                    });
-                    startup_failures.push(FailedService {
-                        service: service_id,
-                        error,
-                    });
-                }
-            }
+            });
+        for (service_id, result) in futures::future::join_all(checks).await {
+            record_startup_check(&service_id, result, &mut startup_failures);
         }
+        anyhow::ensure!(
+            !cancel.as_ref().is_some_and(|token| token.is_cancelled()),
+            "Orchestration cancelled"
+        );
         // 编译、完整验证并启动 Pingap；代理失败时 workspace 不得进入 ready。
         start_pingap(
             &args.workspace,
@@ -293,6 +302,36 @@ async fn run_inner(
             dev_profile,
         )
         .await?;
+        // Explicit startup contracts cover the complete startup commit, including
+        // bridge observation. Do not emit a successful terminal before this wait.
+        if specs.iter().any(|spec| spec.health.startup_probe.is_some()) {
+            checked_readiness = Some(wait_for_bridge(&release, &specs, cancel.as_ref()).await?);
+        }
+        // A worker may have exited while another service or Pingap was starting.
+        // Recheck the very same owned execution before emitting the operation terminal.
+        for (id, child) in &mut children {
+            if specs
+                .iter()
+                .any(|s| &s.service_id == id && s.health.startup_probe.is_some())
+                && !startup_failures.iter().any(|f| &f.service == id)
+                && let Err(error) = crate::startup_probe::root_alive(child)
+            {
+                let error = format!("startup commit check: {error:#}");
+                emit_event(&OrchestrationEvent::ServiceStartFail {
+                    service: id.clone(),
+                    error: error.clone(),
+                });
+                startup_failures.push(FailedService {
+                    service: id.clone(),
+                    error,
+                });
+            }
+        }
+        anyhow::ensure!(
+            !cancel.as_ref().is_some_and(|token| token.is_cancelled()),
+            "Orchestration cancelled"
+        );
+        anyhow::ensure!(started_user_services > 0, "no service started");
         // 启动编排终局（pingap 确认后输出——9080 listen 即全部启动判定完成，
         // 下游终态判定无竞态）：failed 空 = 全部成功。
         emit_event(&OrchestrationEvent::OrchestrationDone {
@@ -301,8 +340,12 @@ async fn run_inner(
         done_emitted = true;
         if on_running.is_some() && !startup_failures.is_empty() {
             anyhow::bail!(
-                "deployment startup failed for {} service(s)",
-                startup_failures.len()
+                "deployment startup failed: {}",
+                startup_failures
+                    .iter()
+                    .map(|failure| format!("{}: {}", failure.service, failure.error))
+                    .collect::<Vec<_>>()
+                    .join("; ")
             );
         }
         if !startup_failures.is_empty() {
@@ -383,41 +426,19 @@ async fn run_inner(
     //     但不 bail/崩溃(liveness /health 仍 200,容器活着,用户可 exec 进去排查)。
     // 防御过滤:bridge 查找仅在已过滤的 specs(enabled 服务)中进行,disabled 服务
     // 即便被手工写入 bridge_service 也不会被等待(走 warn 默认 ready 分支)。
-    let ready = match &release.bridge_service {
-        None => true,
-        Some(bridge_id) => match specs.iter().find(|s| &s.service_id == bridge_id) {
-            None => {
-                warn!(
-                    "⚠️  [health].bridge_service '{bridge_id}' not in release services; \
-                     defaulting to ready"
-                );
-                true
+    let ready = match checked_readiness {
+        Some(ready) => ready,
+        None => match wait_for_bridge(&release, &specs, cancel.as_ref()).await {
+            Ok(ready) => ready,
+            Err(error) => {
+                shutdown_all(std::mem::take(&mut children), 5)
+                    .await
+                    .context("cleanup after bridge observation interrupted")?;
+                return Err(error);
             }
-            Some(spec) => match wait_for_service_ready(spec).await {
-                Ok(()) => {
-                    info!("✅ bridge service '{bridge_id}' ready");
-                    true
-                }
-                Err(e) => {
-                    warn!(
-                        "⏳ bridge service '{bridge_id}' not ready: {e}; \
-                         staying NotReady (traffic withheld, liveness unaffected)"
-                    );
-                    false
-                }
-            },
         },
     };
     runtime_status.set_ready(ready);
-
-    // 守卫语义: 所有用户服务都因空 [run].command 被跳过时应 fail。不能用
-    // children.is_empty() 判断 —— start_pingap 已无条件 push pingap, 恒非空。
-    // 失败路径同样先清理 (此时 children 里至少有 pingap), 与 startup 失败兜底一致。
-    if started_user_services == 0 {
-        error!("❌ no service started, shutting down already-started children");
-        shutdown_all(std::mem::take(&mut children), 5).await?;
-        anyhow::bail!("no service started");
-    }
 
     // 5. supervise（阻塞直到任一退出或信号或外部取消）
     info!(
@@ -439,6 +460,64 @@ async fn run_inner(
     supervise(children, shutdown_timeout, cancel, known_failed).await?;
     runtime_status.set_ready(false);
     Ok(())
+}
+
+fn record_startup_check(service_id: &str, result: Result<()>, failures: &mut Vec<FailedService>) {
+    match result {
+        Ok(()) => {
+            info!("✅ {service_id} startup check passed");
+            emit_event(&OrchestrationEvent::ServiceStartOk {
+                service: service_id.into(),
+            });
+        }
+        Err(error) => {
+            let error = format!("startup check: {error:#}");
+            warn!("{service_id}: {error}");
+            emit_event(&OrchestrationEvent::ServiceStartFail {
+                service: service_id.into(),
+                error: error.clone(),
+            });
+            failures.push(FailedService {
+                service: service_id.into(),
+                error,
+            });
+        }
+    }
+}
+
+async fn wait_for_bridge(
+    release: &workspace_manifest::ReleaseLock,
+    specs: &[ServiceSpec],
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<bool> {
+    Ok(match &release.bridge_service {
+        None => true,
+        Some(bridge_id) => match specs.iter().find(|s| &s.service_id == bridge_id) {
+            None => {
+                warn!(
+                    "⚠️  [health].bridge_service '{bridge_id}' not in release services; \
+                     defaulting to ready"
+                );
+                true
+            }
+            Some(spec) => match tokio::select! {
+                result = wait_for_service_ready(spec) => result,
+                () = async { match cancel { Some(token) => token.cancelled().await, None => std::future::pending().await } } => anyhow::bail!("Orchestration cancelled"),
+            } {
+                Ok(()) => {
+                    info!("✅ bridge service '{bridge_id}' ready");
+                    true
+                }
+                Err(e) => {
+                    warn!(
+                        "⏳ bridge service '{bridge_id}' not ready: {e}; \
+                         staying NotReady (traffic withheld, liveness unaffected)"
+                    );
+                    false
+                }
+            },
+        },
+    })
 }
 
 pub(crate) fn validate_runtime_compatibility(

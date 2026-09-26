@@ -190,9 +190,24 @@ impl Default for RunSection {
     }
 }
 
+/// Explicit startup evidence. Omission retains each engine's legacy behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StartupProbe {
+    Http,
+    Tcp,
+    Process,
+}
+
+/// Process checks require the owned root to survive this continuous interval.
+pub const PROCESS_STARTUP_OBSERVATION_SECONDS: u64 = 5;
+pub const STARTUP_PROBE_CAPABILITY: &str = "startup-probe-v1";
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HealthSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_probe: Option<StartupProbe>,
     #[serde(default = "default_health_path")]
     pub startup_path: String,
     #[serde(default = "default_health_path")]
@@ -216,6 +231,7 @@ pub struct HealthSection {
 impl Default for HealthSection {
     fn default() -> Self {
         Self {
+            startup_probe: None,
             startup_path: default_health_path(),
             readiness_path: default_health_path(),
             liveness_path: default_health_path(),

@@ -139,6 +139,7 @@ pub async fn compile_effective_config_with_roots(
     extra_layout_roots: &[PathBuf],
     dev_profile: bool,
 ) -> Result<(String, String)> {
+    workspace_manifest::validate_release_startup(release)?;
     let mut layout_roots: Vec<PathBuf> = Vec::new();
     if let Ok(canonical) = std::fs::canonicalize(workspace) {
         layout_roots.push(canonical);
@@ -301,6 +302,10 @@ fn resolve_service_addresses(config: &mut PingapConfig, release: &ReleaseLock) -
                     "upstream {upstream_name} references missing or disabled service {service_id}"
                 )
             })?;
+            anyhow::ensure!(
+                service.health.startup_probe != Some(workspace_manifest::StartupProbe::Process),
+                "upstream {upstream_name} must not reference process worker {service_id}"
+            );
             *address = format!("127.0.0.1:{}", service.port);
         }
     }

@@ -60,6 +60,9 @@ pub async fn run_dev_builds(
         .into_iter()
         .filter(|project| project.manifest.project.enabled)
         .collect();
+    let workspace = read_workspace_manifest(ws).await?;
+    shared_types::validate_workspace_startup(&workspace, &enabled)
+        .map_err(|error| AppError::business(error.to_string()))?;
 
     // 与发布编译同款互斥（同 app_id 的 /build、dev 任务并发防穿插）
     let _ws_guard = build_manager.try_start(app_id)?;
@@ -461,6 +464,11 @@ mod tests {
     /// 返回 (workspace, sentinel 路径)；sentinel 存在 = 安装后的检查确实执行。
     fn pnpm_devbuild_ws(devbuild_extra: &str) -> (PathBuf, PathBuf) {
         let ws = temp_ws();
+        fs::write(
+            ws.join("workspace.manifest.toml"),
+            "schema_version=1\n[workspace]\nname='devbuild-test'\n",
+        )
+        .unwrap();
         let proj = ws.join("frontend");
         local_dep(&proj, "dep-a");
         write_pkg_json(&proj, &[("dep-a", "file:./vendor/dep-a")]);

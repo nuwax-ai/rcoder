@@ -182,6 +182,7 @@ impl SupervisordHost {
 
         // 3. 写 per-service specs（run-service 启动契约；pingap 同机制承载凭证）
         let mut started: Vec<String> = Vec::new();
+        let mut checked_instances = Vec::new();
         for spec in &specs {
             if !runs_as_process(spec, dev_profile) {
                 continue;
@@ -259,10 +260,46 @@ impl SupervisordHost {
             }
             anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
             let name = format!("{SVC_PROGRAM_PREFIX}{}", spec.service_id);
-            mutation_result(self.client.add_process_group(&name).await)?;
-            anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
-            mutation_result(self.client.start_process_wait(&name).await)
-                .with_context(|| format!("start {name}"))?;
+            crate::orchestration_events::emit(
+                &crate::orchestration_events::OrchestrationEvent::ServiceStarting {
+                    service: spec.service_id.clone(),
+                },
+            );
+            let result = if let Some(probe) = spec.health.startup_probe {
+                self.start_checked(spec, &name, probe, cancel)
+                    .await
+                    .map(Some)
+            } else {
+                // Omitted strategy keeps supervisord's historical startsecs/retry behavior.
+                async {
+                    mutation_result(self.client.add_process_group(&name).await)?;
+                    anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
+                    mutation_result(self.client.start_process_wait(&name).await)?;
+                    Ok(None)
+                }
+                .await
+            };
+            match result {
+                Ok(instance) => {
+                    if let Some(instance) = instance {
+                        checked_instances.push((spec.service_id.clone(), name.clone(), instance));
+                    }
+                    crate::orchestration_events::emit(
+                        &crate::orchestration_events::OrchestrationEvent::ServiceStartOk {
+                            service: spec.service_id.clone(),
+                        },
+                    );
+                }
+                Err(error) => {
+                    crate::orchestration_events::emit(
+                        &crate::orchestration_events::OrchestrationEvent::ServiceStartFail {
+                            service: spec.service_id.clone(),
+                            error: format!("{error:#}"),
+                        },
+                    );
+                    return Err(error).with_context(|| format!("start {name}"));
+                }
+            }
             started.push(name);
         }
 
@@ -308,10 +345,108 @@ impl SupervisordHost {
             },
         };
         anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
+        for (service, name, expected) in &checked_instances {
+            let check = async {
+                let current = crate::startup_probe::within_budget(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(3),
+                    Some(cancel),
+                    self.client.running_process(name),
+                )
+                .await?;
+                anyhow::ensure!(
+                    &current == expected,
+                    "program {name} restarted before startup completed"
+                );
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = check {
+                crate::orchestration_events::emit(
+                    &crate::orchestration_events::OrchestrationEvent::ServiceStartFail {
+                        service: service.clone(),
+                        error: format!("startup commit check: {error:#}"),
+                    },
+                );
+                return Err(error).with_context(|| format!("startup commit check for {name}"));
+            }
+        }
         runtime_status.set_ready(ready);
         let _ = started; // 全部成功；失败路径由外层 stop_all 清理
         Ok(())
     }
+
+    async fn start_checked(
+        &self,
+        spec: &ServiceSpec,
+        name: &str,
+        probe: workspace_manifest::StartupProbe,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<crate::xmlrpc::RunningProcess> {
+        let deadline = crate::startup_probe::deadline(spec, tokio::time::Instant::now())?;
+        let added =
+            settle_start_mutation(deadline, cancel, self.client.add_process_group(name)).await?;
+        if !added {
+            return Err(supervisor::ShutdownUnconfirmed(format!(
+                "program {name} was already registered; launch identity is unconfirmed"
+            ))
+            .into());
+        }
+        // A stop between the two acknowledged mutations must not launch a new root.
+        anyhow::ensure!(!cancel.is_cancelled(), "Startup check cancelled");
+        settle_start_mutation(deadline, cancel, self.client.start_process_wait(name)).await?;
+        crate::startup_probe::within_budget(deadline, Some(cancel), async {
+            // startProcess(wait=true) already observed startsecs=5. Do not wait another 5s.
+            let instance = self.client.running_process(name).await?;
+            if probe != workspace_manifest::StartupProbe::Process {
+                let network = crate::startup_probe::network(spec, probe);
+                tokio::pin!(network);
+                loop {
+                    anyhow::ensure!(
+                        self.client.running_process(name).await? == instance,
+                        "program {name} restarted during startup check"
+                    );
+                    tokio::select! {
+                        result = &mut network => { result?; break; }
+                        () = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                    }
+                }
+            }
+            anyhow::ensure!(
+                self.client.running_process(name).await? == instance,
+                "program {name} changed before startup confirmation"
+            );
+            Ok(instance)
+        })
+        .await
+    }
+}
+
+/// Keep an in-flight mutation's response when Stop arrives. A confirmed response
+/// allows the caller's normal stop_all cleanup; dropping the HTTP future would
+/// unnecessarily turn every cancellation during startsecs into recovery-required.
+/// A lost reply still remains uncertain, and cancellation cannot extend the
+/// original startup budget. Six seconds covers startsecs=5 plus response latency.
+async fn settle_start_mutation<T>(
+    deadline: tokio::time::Instant,
+    cancel: &tokio_util::sync::CancellationToken,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    anyhow::ensure!(!cancel.is_cancelled(), "Startup check cancelled");
+    tokio::pin!(future);
+    let result = tokio::select! {
+        biased;
+        result = tokio::time::timeout_at(deadline, &mut future) => result,
+        () = cancel.cancelled() => {
+            let drain_until = deadline.min(tokio::time::Instant::now()
+                + std::time::Duration::from_secs(workspace_manifest::PROCESS_STARTUP_OBSERVATION_SECONDS + 1));
+            tokio::time::timeout_at(drain_until, &mut future).await
+        }
+    };
+    mutation_result(
+        result
+            .context("startup mutation response deadline exceeded")
+            .and_then(|result| result),
+    )
 }
 
 /// 编译 pingap 配置（复用 builtin 的编译/校验/原子提交）。
@@ -400,6 +535,12 @@ pub(crate) fn render_programs_conf(
         let id = safe_program_token(&spec.service_id);
         let name = format!("{SVC_PROGRAM_PREFIX}{id}");
         let service_log = log_dir.join("services").join(format!("{id}.log"));
+        let retries =
+            if spec.health.startup_probe == Some(workspace_manifest::StartupProbe::Process) {
+                0
+            } else {
+                10
+            };
         out.push_str(&format!(
             "[program:{name}]\n\
              command={exe} run-service {rid} {id}\n\
@@ -407,7 +548,7 @@ pub(crate) fn render_programs_conf(
              autostart=false\n\
              autorestart=true\n\
              startsecs=5\n\
-             startretries=10\n\
+             startretries={retries}\n\
              stopsignal=TERM\n\
              stopasgroup=true\n\
              killasgroup=true\n\
@@ -483,6 +624,49 @@ fn mutation_result<T>(result: Result<T>) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_start_keeps_acknowledgement_but_lost_reply_stays_uncertain() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for reply in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("supervisor.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let stop = cancel.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                // Stop is accepted after the mutation reached the server, before
+                // its response. Closing the socket simulates a lost response.
+                stop.cancel();
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                if reply {
+                    let body = "<methodResponse><params><param><value><boolean>1</boolean></value></param></params></methodResponse>";
+                    stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let client = SupervisorClient::new(path);
+            let result = settle_start_mutation(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                &cancel,
+                client.start_process_wait("app-svc-worker"),
+            )
+            .await;
+            if reply {
+                assert!(
+                    result.is_ok(),
+                    "acknowledged start must allow cleanup: {result:?}"
+                );
+            } else {
+                assert!(result.unwrap_err().is::<supervisor::ShutdownUnconfirmed>());
+            }
+            server.await.unwrap();
+        }
+    }
 
     /// B08：supervisord 引擎与 builtin 同一生效命令选择——dev profile 且
     /// 配 [devrun] 时 devrun.command 优先（不再恒用 run.command）。

@@ -492,6 +492,17 @@ impl DevServerManager {
         super::owner_client::verify_project_identity(&identity, project_path, &app_id)
             .map_err(|error| AppError::business(format!("owner identity rejected: {error:#}")))?;
         let expected_ws = identity.workspace_id.clone();
+        super::startup_contract::require_owner_support(
+            project_path,
+            artifact_release_id,
+            &identity.capabilities,
+        )
+        .await
+        .map_err(|error| {
+            AppError::business(format!(
+                "startup contract rejected before owner restart: {error:#}"
+            ))
+        })?;
 
         // 匹配 owner：读凭据（源码/产物两种状态根落点都探测；owner 未
         // 启用写端点 → 无法路由，明确报错）
@@ -1431,12 +1442,35 @@ mod owner_reuse_tests {
     #[tokio::test]
     async fn artifact_owner_route_preserves_run_dir_on_rejection() {
         use crate::Config;
+        use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().join("ws-art");
         std::fs::create_dir_all(&ws).unwrap();
         // 既有 .run（旧版本运行目录）+ 标记文件——必须原样保留
         std::fs::create_dir_all(ws.join(".run")).unwrap();
         std::fs::write(ws.join(".run").join("marker-old"), "v1").unwrap();
+        std::fs::create_dir_all(ws.join("builds")).unwrap();
+        let write_candidate = |explicit: bool| {
+            let mut lock = shared_types::load_release_lock(include_str!(
+                "../../../../workspace-manifest/tests/fixtures/lock_v1.toml"
+            ))
+            .unwrap();
+            if explicit {
+                lock.services[0].health.startup_probe = Some(shared_types::StartupProbe::Http);
+            }
+            let file =
+                std::fs::File::create(ws.join("builds/workspace-package-rel-new.zip")).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file(
+                "release.lock.toml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(toml::to_string(&lock).unwrap().as_bytes())
+                .unwrap();
+            zip.finish().unwrap();
+        };
+        write_candidate(false);
 
         // mock owner：workspace_id=".run"（产物态绑定）、token 文件、
         // 受理后固定返回 ERR_REVISION_MISMATCH 拒绝
@@ -1519,6 +1553,24 @@ mod owner_reuse_tests {
         assert!(
             error.to_string().contains("ERR_REVISION_MISMATCH"),
             "diagnostic: {error}"
+        );
+        // An explicit probe on a candidate artifact is checked before any POST,
+        // against the artifact lock (the serving .run has no such field).
+        write_candidate(true);
+        let error = mgr
+            .route_artifact_restart("userapp:art", &ws, "rel-new", None, None, None)
+            .await
+            .expect_err("old owner cannot execute explicit startup probes");
+        assert!(
+            error
+                .to_string()
+                .contains(shared_types::STARTUP_PROBE_CAPABILITY),
+            "{error}"
+        );
+        assert_eq!(
+            submitted.lock().unwrap().len(),
+            1,
+            "unsupported candidate must not submit another restart"
         );
         // R03 核心：`.run` 原样（提交拒绝不改变 active 内容）
         assert!(

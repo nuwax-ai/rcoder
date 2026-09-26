@@ -35,6 +35,7 @@ pub mod run_service;
 pub mod runtime_kernel;
 pub mod runtime_status;
 pub mod server;
+mod startup_probe;
 pub mod static_hosting;
 pub mod supervisor;
 pub mod supervisord_host;

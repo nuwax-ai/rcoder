@@ -2458,17 +2458,49 @@ async fn assemble_runtime_kernel(
                 dev_profile,
                 pg,
             } => {
-                if dispatch_state
-                    .control_tx
-                    .send(ControlSignal::OrchestrateSource {
-                        operation_id: operation_id.clone(),
-                        dev_profile,
-                        pg,
-                    })
-                    .is_err()
-                {
-                    tracing::error!("runtime dispatch: control channel closed ({operation_id})");
-                }
+                let state = dispatch_state.clone();
+                let source = dispatch_workspace.clone();
+                tokio::spawn(async move {
+                    let checked = crate::manifest::preflight_startup(&source, dev_profile).await;
+                    if let Err(error) = checked {
+                        if let Err(persist) = state
+                            .finish_runtime_operation_by_id(
+                                &operation_id,
+                                shared_types::RuntimeOperationState::Failed,
+                                Some((
+                                    shared_types::ERR_VALIDATION.into(),
+                                    format!("startup preflight: {error:#}"),
+                                )),
+                            )
+                            .await
+                        {
+                            hold_unconfirmed(
+                                &state,
+                                format!("persist startup rejection: {persist:#}"),
+                            )
+                            .await;
+                        }
+                        return;
+                    }
+                    if state.settle_cancelled_before_execution(&operation_id).await {
+                        return;
+                    }
+                    if state
+                        .control_tx
+                        .send(ControlSignal::OrchestrateSource {
+                            operation_id: operation_id.clone(),
+                            dev_profile,
+                            pg,
+                        })
+                        .is_err()
+                    {
+                        hold_unconfirmed(
+                            &state,
+                            format!("runtime control channel closed ({operation_id})"),
+                        )
+                        .await;
+                    }
+                });
             }
             DispatchAction::StopBusiness { operation_id } => {
                 // R01：Stop 在 active 期间受理（意图屏障），但**不抢占执行身份**——

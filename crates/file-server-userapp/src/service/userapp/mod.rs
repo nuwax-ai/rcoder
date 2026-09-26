@@ -240,6 +240,8 @@ pub async fn build_workspace_package(
             manifest.workspace.name
         )));
     }
+    shared_types::validate_workspace_startup(&manifest, &discovered)
+        .map_err(|error| AppError::business(error.to_string()))?;
 
     // 4. 各子项目 build（log_dir = workspace/logs/<dir>；分项目日志方便排查哪个构建失败）
     let enabled: Vec<_> = discovered

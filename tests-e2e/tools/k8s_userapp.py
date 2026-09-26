@@ -44,7 +44,7 @@ REQUIRED = {'cluster_ready', 'concurrent_ensure', 'ensure_retry', 'builder_ident
             'lifecycle_stable_stop_wake', 'request_id_replay_no_redeploy', 'request_id_by_request',
             'stop_idempotent', 'stop_zero_pods', 'wake_new_pod', 'wake', 'wake_content_B', 'cleanup',
             'tombstone_deleted', 'tombstone_old_ensure_rejected', 'recreate_new_lifecycle',
-            'recreate_deleted', 'baseline_preserved'}
+            'recreate_deleted', 'baseline_preserved', 'worker_artifact_contract', 'worker_process_running'}
 
 
 def compact_resource(row):
@@ -267,6 +267,25 @@ path = "/"
 strip_prefix = false
 ''')
             archive.writestr('web/index.html', self.id + '-' + version)
+            archive.writestr('worker/project.manifest.toml', '''schema_version = 1
+[project]
+service_id = "worker"
+name = "Process worker acceptance"
+type = "python"
+kind = "worker"
+[build]
+command = ["python3", "-c", "from zipfile import ZipFile; z=ZipFile('artifact.zip','w'); z.write('main.py'); z.close()"]
+artifact = "artifact.zip"
+[devbuild]
+command = ["python3", "-m", "py_compile", "main.py"]
+[devrun]
+command = ["python3", "main.py"]
+[run]
+command = ["python3", "main.py"]
+[health]
+startup_probe = "process"
+''')
+            archive.writestr('worker/main.py', 'import time\nwhile True:\n    time.sleep(1)\n')
         boundary = uuid.uuid4().hex
         body = b''
         for key, value in {'app_id': self.app, 'user_id': self.user, 'enable_git': 'false'}.items():
@@ -283,6 +302,12 @@ strip_prefix = false
         status, data = self.request(artifact, raw=True)
         self.check('artifact_' + version, status == 200 and hashlib.sha256(data).hexdigest() == sha)
         (self.root / ('artifact-' + version + '.zip')).write_bytes(data)
+        import tomllib
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            locked = tomllib.loads(archive.read('release.lock.toml').decode())
+        workers = [s for s in locked['services'] if s['service_id'] == 'worker']
+        self.check('worker_artifact_contract', len(workers) == 1 and workers[0]['health'].get('startup_probe') == 'process'
+                   and workers[0]['kind'] == 'worker' and 'proxy' not in workers[0], workers)
         if version == 'A':
             cancel = self.api(path.replace('?', '/cancel?'), {}, self.entries[-1])
             self.check('cross_replica_cancel', cancel.get('already_terminal') is True, cancel)
@@ -571,6 +596,28 @@ strip_prefix = false
         result = self.poll(read, lambda r: r[0] == 200 and r[1].decode() == expected, 180)
         return result[0] == 200
 
+    def worker_running(self, pod):
+        # Inspect the process and its actual port from the lock; business HTTP
+        # working alone does not prove that an enabled worker started correctly.
+        code = '''import json,pathlib,socket,tomllib
+roots=[]
+for p in pathlib.Path('/proc').iterdir():
+ if p.name.isdigit():
+  try:
+   argv=(p/'cmdline').read_bytes().split(b'\\0')
+   if len(argv)>1 and argv[0].endswith(b'python3') and argv[1]==b'main.py': roots.append(p)
+  except OSError: pass
+out={'roots':[int(p.name) for p in roots]}
+if len(roots)==1:
+ cwd=(roots[0]/'cwd').resolve()
+ lock=tomllib.loads((cwd.parent/'release.lock.toml').read_text())
+ spec=next(s for s in lock['services'] if s['service_id']=='worker')
+ s=socket.socket();s.settimeout(1);out['no_listener']=s.connect_ex(('127.0.0.1',spec['port']))!=0;s.close()
+print(json.dumps(out))'''
+        evidence = json.loads(self.kube('exec', pod['name'], '--', 'python3', '-c', code))
+        self.check('worker_process_running', len(evidence['roots']) == 1 and evidence.get('no_listener') is True,
+                   {'pod_uid': pod['uid'], **evidence})
+
     def deploy(self, artifact_a, release_a, artifact_b, release_b):
         path = '/api/v1/userapp/' + self.app + '/start'
         cold_request_id = 'cold-' + self.id[:20]
@@ -580,6 +627,7 @@ strip_prefix = false
         self.check('content_A', self.content(self.id + '-A'))
         pod = self.prod_pod()
         self.save('production-A.json', pod)
+        self.worker_running(pod)
         # D′：整请求 request_id 幂等——同参重放返回存储响应、Pod 不换、
         # by-request 查询定位该 Deploy 操作。
         replayed = self.api(path, {'user_id': self.user, 'request_id': cold_request_id, **artifact_a}, timeout=120)
@@ -601,6 +649,7 @@ strip_prefix = false
         self.check('content_B', self.content(self.id + '-B'))
         after = self.prod_pod()
         self.save('production-B.json', after)
+        self.worker_running(after)
         self.check('hot_pod_preserved', (pod['uid'], [(c['imageID'], c['containerID']) for c in pod['images']]) == (after['uid'], [(c['imageID'], c['containerID']) for c in after['images']]))
         name = after['name']
         status = json.loads(self.kube('exec', name, '--', 'curl', '-fsS', 'http://127.0.0.1:3010/v1/deploy/status'))

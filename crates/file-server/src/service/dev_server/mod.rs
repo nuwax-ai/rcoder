@@ -19,6 +19,7 @@ mod owner_client;
 pub mod port_pool;
 pub mod process;
 mod start;
+mod startup_contract;
 mod stop;
 pub mod supervise;
 mod support;

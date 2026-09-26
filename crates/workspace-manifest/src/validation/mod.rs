@@ -4,6 +4,7 @@
 mod issue;
 mod parse;
 mod project;
+mod startup;
 mod topology;
 
 pub use issue::{ValidationIssue, manifest_file_of};
@@ -11,6 +12,9 @@ pub use parse::{
     parse_project, parse_project_toml, parse_workspace, validate_project, validate_workspace,
 };
 pub use project::{collect_workspace_issues, validate_project_at, validate_service_id};
+pub use startup::{
+    require_startup_probe_capability, validate_release_startup, validate_workspace_startup,
+};
 pub use topology::{collect_topology_issues, validate_topology};
 
 #[cfg(test)]

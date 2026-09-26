@@ -1818,7 +1818,7 @@ async fn userapp_dev_dbx_proxy() {
 }
 
 // ============================================================
-// B5 dev server 进程族：backend-go 单服务 → dev/start → 9080 探活 → stop
+// B5 dev server：legacy HTTP web + process worker → dev/start → 终态与进程 → stop
 // ============================================================
 #[tokio::test]
 async fn userapp_dev_server_lifecycle() {
@@ -1859,7 +1859,56 @@ async fn userapp_dev_server_lifecycle() {
     // 脚本 + zip 外部 chmod 不行。方案：manifest run command 用 ["sh","-c","sleep 9999"]
     zw.start_file("backend-go/start.sh", opts).unwrap();
     std::io::Write::write_all(&mut zw, b"#!/bin/sh\nsleep 9999\n").unwrap();
+    zw.start_file("worker/project.manifest.toml", opts).unwrap();
+    std::io::Write::write_all(
+        &mut zw,
+        br#"schema_version = 1
+[project]
+service_id = "worker"
+name = "Process Worker"
+type = "python"
+kind = "worker"
+[build]
+command = ["sh", "-c", "zip -q artifact.zip worker_main.py"]
+artifact = "artifact.zip"
+[run]
+command = ["python3", "worker_main.py"]
+shutdown_timeout_seconds = 2
+[health]
+startup_probe = "process"
+"#,
+    )
+    .unwrap();
+    zw.start_file("worker/worker_main.py", opts).unwrap();
+    std::io::Write::write_all(&mut zw, b"import time\nwhile True: time.sleep(1)\n").unwrap();
     let zip_bytes = zw.finish().unwrap().into_inner();
+
+    // Observe the real worker root in this case's builder. A completed task or
+    // working web service alone cannot establish that the worker is running.
+    let worker_roots = || -> Result<Vec<u32>, String> {
+        let output = std::process::Command::new("docker")
+            .args([
+                "exec",
+                &format!("rcoder-app-builder-{app}"),
+                "python3",
+                "-c",
+                r#"import json,pathlib
+roots=[]
+for p in pathlib.Path('/proc').iterdir():
+ if p.name.isdigit():
+  try:
+   argv=(p/'cmdline').read_bytes().split(b'\0')
+   if len(argv)>1 and argv[1]==b'worker_main.py': roots.append(int(p.name))
+  except (OSError,ProcessLookupError): pass
+print(json.dumps(roots))"#,
+            ])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())
+    };
 
     let part = reqwest::multipart::Part::bytes(zip_bytes).file_name("template.zip");
     let form = reqwest::multipart::Form::new()
@@ -1948,6 +1997,12 @@ async fn userapp_dev_server_lifecycle() {
         term_ok,
         format!("terminal={terminal:?}, err: {err}"),
     );
+    let roots = worker_roots();
+    report.assert_hard(
+        "dev/start process worker 真实运行",
+        roots.as_ref().is_ok_and(|roots| roots.len() == 1),
+        format!("{roots:?}"),
+    );
 
     // dev/list：port=9080 + pid>0
     let resp = env
@@ -2035,6 +2090,12 @@ async fn userapp_dev_server_lifecycle() {
             .as_str()
             .is_some_and(|m| m.contains("Stopped")),
         format!("body 截断: {}", trunc(&body, 120)),
+    );
+    let roots = worker_roots();
+    report.assert_hard(
+        "dev/stop 收束 process worker",
+        roots.as_ref().is_ok_and(|roots| roots.is_empty()),
+        format!("{roots:?}"),
     );
     let resp = env
         .http

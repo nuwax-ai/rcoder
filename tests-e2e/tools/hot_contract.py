@@ -17,7 +17,7 @@ import zipfile
 
 from hot_cleanup import run_owned, cleanup as cleanup_owned
 
-REPORT = Path(os.environ['E2E_REPORT_DIR']) / 'hot-contract'
+REPORT = Path(os.environ['E2E_REPORT_DIR']) / os.environ.get('E2E_CONTRACT_DIR', 'hot-contract')
 REPORT.mkdir(parents=True, exist_ok=True)
 RUN = os.environ['E2E_RUN_ID']
 TOKEN = uuid.uuid4().hex

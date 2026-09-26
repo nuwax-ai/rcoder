@@ -24,6 +24,21 @@ pub fn build_specs(workspace: &Path) -> Result<Vec<ServiceSpec>> {
     Ok(read_release_lock(workspace)?.services)
 }
 
+/// Validate explicit startup strategies before stopping old services or activating code.
+pub(crate) async fn preflight_startup(workspace: &Path, dev_profile: bool) -> Result<()> {
+    let release = read_release_lock(workspace)?;
+    if release
+        .services
+        .iter()
+        .any(|s| s.health.startup_probe.is_some())
+    {
+        crate::supervisor::validate_runtime_compatibility(&release)?;
+        // Includes rcoder:// references in custom/extend config; no files are written.
+        crate::proxy::compiler::compile_effective_config(workspace, &release, dev_profile).await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

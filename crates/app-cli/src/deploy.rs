@@ -212,6 +212,7 @@ pub(crate) async fn prepare_with_local(
         && expected_sha.is_some_and(|sha| sha.eq_ignore_ascii_case(&state.sha256))
         && tokio::fs::try_exists(workspace.join("release.lock.toml")).await?
     {
+        crate::manifest::preflight_startup(workspace, false).await?;
         return Ok(None);
     }
     tokio::fs::create_dir_all(root)
@@ -299,6 +300,9 @@ pub(crate) async fn prepare_with_local(
         })
         .await
         .context("join artifact preparation")??;
+    crate::manifest::preflight_startup(staging.path(), false)
+        .await
+        .context("validate staged startup contract before activation")?;
     Ok(Some(PreparedDeploy {
         staging,
         _lease: lease,
@@ -787,6 +791,41 @@ format = "jsonl"
                 std::fs::read_dir(root.path().join(name))
                     .expect("directory")
                     .count(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_startup_contract_preserves_serving_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("code");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("release.lock.toml"), MINIMAL_LOCK).unwrap();
+        std::fs::write(workspace.join("serving"), "old generation").unwrap();
+        // A process strategy on a web service used to be ignored. Reject the
+        // candidate while it is still staged, before handing it to activation.
+        let invalid = MINIMAL_LOCK.replace(
+            "[services.health]",
+            "[services.health]\nstartup_probe = \"process\"",
+        );
+        let url = serve_once(build_zip(&[("release.lock.toml", &invalid)])).await;
+        assert!(
+            prepare(&workspace, &url, "invalid-probe", None, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("release.lock.toml")).unwrap(),
+            MINIMAL_LOCK
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("serving")).unwrap(),
+            "old generation"
+        );
+        for name in [INCOMING_DIR, STAGING_DIR] {
+            assert_eq!(
+                std::fs::read_dir(root.path().join(name)).unwrap().count(),
                 0
             );
         }

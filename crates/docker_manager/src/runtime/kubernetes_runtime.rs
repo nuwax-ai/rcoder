@@ -1147,6 +1147,13 @@ mod create_lease_tests {
                                     "name":"rcoder-app-builder-errclaim-svc",
                                     "uid":"svc-owned","resourceVersion":"42",
                                     "labels":{
+                                        "app.kubernetes.io/name":"user-app-builder",
+                                        "app.kubernetes.io/instance":"errclaim",
+                                        "app.kubernetes.io/version":"v1",
+                                        "app.kubernetes.io/component":"agent",
+                                        "app.kubernetes.io/managed-by":"rcoder-runtime",
+                                        "app.kubernetes.io/part-of":"rcoder",
+                                        "rcoder.io/app-id":"errclaim",
                                         "rcoder.io/identifier":"errclaim",
                                         "rcoder.io/service-type":"user-app-builder"
                                     }

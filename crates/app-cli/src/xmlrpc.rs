@@ -56,6 +56,13 @@ pub(crate) struct SupervisorClient {
     socket: std::path::PathBuf,
 }
 
+/// Evidence for the instance launched into a newly added program group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunningProcess {
+    pub pid: i64,
+    pub started: i64,
+}
+
 impl SupervisorClient {
     pub(crate) fn new(socket: impl Into<std::path::PathBuf>) -> Self {
         Self {
@@ -127,9 +134,40 @@ impl SupervisorClient {
 
     /// startProcess（wait=true：等待 startsecs 通过才返回——编排的顺序控制点）。
     pub(crate) async fn start_process_wait(&self, name: &str) -> Result<()> {
-        self.call("supervisor.startProcess", &[name.into(), true.into()])
-            .await
-            .map(|_| ())
+        let value = self
+            .call("supervisor.startProcess", &[name.into(), true.into()])
+            .await?;
+        anyhow::ensure!(
+            value.as_bool() == Some(true),
+            "supervisord did not confirm start of {name}"
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn running_process(&self, name: &str) -> Result<RunningProcess> {
+        let value = self
+            .call("supervisor.getProcessInfo", &[name.into()])
+            .await?;
+        anyhow::ensure!(
+            value.get("name").and_then(|v| v.as_str()) == Some(name)
+                && value.get("group").and_then(|v| v.as_str()) == Some(name),
+            "supervisord program identity mismatch for {name}"
+        );
+        anyhow::ensure!(
+            value.get("state").and_then(|v| v.as_i64()) == Some(20),
+            "supervisord program {name} is not RUNNING"
+        );
+        let pid = value
+            .get("pid")
+            .and_then(|v| v.as_i64())
+            .filter(|v| *v > 0)
+            .context("running supervisord program has no PID")?;
+        let started = value
+            .get("start")
+            .and_then(|v| v.as_i64())
+            .filter(|v| *v > 0)
+            .context("running supervisord program has no start identity")?;
+        Ok(RunningProcess { pid, started })
     }
 
     /// getAllProcessInfo：每组一行状态（name/group/statename/description/...）。
@@ -157,7 +195,9 @@ impl SupervisorClient {
                 .map_err(|error| {
                     if matches!(
                         method,
-                        "supervisor.getVersion" | "supervisor.getAllProcessInfo"
+                        "supervisor.getVersion"
+                            | "supervisor.getAllProcessInfo"
+                            | "supervisor.getProcessInfo"
                     ) {
                         error
                     } else {
@@ -179,7 +219,9 @@ impl SupervisorClient {
         outcome.map_err(|error| {
             if matches!(
                 method,
-                "supervisor.getVersion" | "supervisor.getAllProcessInfo"
+                "supervisor.getVersion"
+                    | "supervisor.getAllProcessInfo"
+                    | "supervisor.getProcessInfo"
             ) || (method == "supervisor.startProcess"
                 && error
                     .downcast_ref::<RpcFault>()
@@ -470,7 +512,7 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let fault = r#"<methodResponse><fault><value><struct><member><name>faultCode</name><value><int>50</int></value></member><member><name>faultString</name><value><string>SPAWN_ERROR: app-svc-web</string></value></member></struct></value></fault></methodResponse>"#;
         let server = tokio::spawn(async move {
-            for body in [fault, "malformed XML", fault] {
+            for body in [fault, "malformed XML", fault, "lost read response"] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 loop {
@@ -511,6 +553,12 @@ mod tests {
         assert!(
             stop.downcast_ref::<crate::supervisor::ShutdownUnconfirmed>()
                 .is_some()
+        );
+        let read = client.running_process("app-svc-worker").await.unwrap_err();
+        assert!(
+            read.downcast_ref::<crate::supervisor::ShutdownUnconfirmed>()
+                .is_none(),
+            "an observation failure must not invent an in-flight mutation"
         );
         server.await.unwrap();
     }

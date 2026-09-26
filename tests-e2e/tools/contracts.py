@@ -14,7 +14,18 @@ HOT = {
     'concurrent deployment rejected', 'A serves during prepare',
     'former capacity and entry settings do not reject B', 'B identity', 'B serves content', 'container unchanged', 'owned resource cleanup',
 } | {name + suffix for name in FAULTS for suffix in (' accepted', ' fails correct operation', ' old content healthy', ' no temporary residue')}
+WORKER = {
+    'Docker contract process completed', 'startup probe capability',
+    'failed worker diagnostic', 'failed worker cleaned', 'one live worker root',
+    'worker has no listener', 'web actual HTTP', 'stop cleans worker',
+    'restart replaces worker', 'exit zero is failure', 'stop interrupts startup',
+    'owner and container retained', 'owned resource cleanup',
+} | {op + suffix for op in ('http-no-listener', 'process-artifact', 'stop-worker',
+                            'process-source', 'restart-worker', 'early-exit', 'interrupt-worker')
+     for suffix in (' accepted', ' terminal')}
 REQUIRED = {
+    'userapp_worker_builtin_contract': WORKER,
+    'userapp_worker_supervisord_contract': WORKER,
     'userapp_hot_deployment_builtin_contract': HOT,
     'userapp_hot_deployment_supervisord_contract': HOT,
     'userapp_deploy_full_chain': {

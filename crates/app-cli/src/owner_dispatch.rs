@@ -237,6 +237,9 @@ pub async fn dispatch_to_owner(
         );
     }
     let expected_ws = identity.workspace_id.clone();
+    let release = crate::manifest::read_release_lock(workspace)
+        .context("read source startup contract before owner dispatch")?;
+    workspace_manifest::require_startup_probe_capability(&release, &identity.capabilities)?;
 
     // 凭据：owner 启用写端点时落盘状态根（与平台侧同一读取契约）
     let token = crate::runtime_kernel::RuntimeStore::read_token(state_root);
@@ -470,6 +473,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().join("ws-d");
         std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("release.lock.toml"),
+            include_str!("../../workspace-manifest/tests/fixtures/lock_v1.toml"),
+        )
+        .unwrap();
         let application_id = std::env::var("PROJECT_ID")
             .ok()
             .filter(|value| !value.trim().is_empty())

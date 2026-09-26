@@ -41,8 +41,9 @@ pub use release_lock::{ReleaseMetadata, build_release_lock, load_release_lock};
 pub use types::*;
 pub use validation::{
     ValidationIssue, collect_topology_issues, collect_workspace_issues, manifest_file_of,
-    parse_project, parse_project_toml, parse_workspace, validate_project, validate_project_at,
-    validate_service_id, validate_topology, validate_workspace,
+    parse_project, parse_project_toml, parse_workspace, require_startup_probe_capability,
+    validate_project, validate_project_at, validate_release_startup, validate_service_id,
+    validate_topology, validate_workspace, validate_workspace_startup,
 };
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -52,6 +53,6 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// Cargo 版本与本常量，并重建 app-runtime 镜像——已发布的旧二进制内嵌
 /// 编译时点的 schema（deny_unknown_fields），序列化新增字段会让其部署死循环
 /// （前车之鉴：startup_timeout_seconds，序列化侧须 skip 默认值兜底）。
-pub const MINIMUM_APP_CLI_VERSION: &str = "0.3.8";
+pub const MINIMUM_APP_CLI_VERSION: &str = "0.3.9";
 pub const INTERNAL_PORT_MIN: u16 = 4000;
 pub const INTERNAL_PORT_MAX: u16 = 7999;

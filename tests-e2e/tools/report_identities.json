@@ -520,5 +520,17 @@
       "scenario": "computer_ttyd_cwd_query",
       "backend": "compose"
     }
+  ],
+  "userapp_worker_builtin_contract": [
+    {
+      "scenario": "userapp_worker_builtin_contract",
+      "backend": "compose"
+    }
+  ],
+  "userapp_worker_supervisord_contract": [
+    {
+      "scenario": "userapp_worker_supervisord_contract",
+      "backend": "compose"
+    }
   ]
 }

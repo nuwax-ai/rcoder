@@ -59,6 +59,11 @@ pub fn run(
         }
         bail!("manifest validation failed with {} issue(s)", issues.len());
     }
+    let workspace_manifest = workspace_manifest::parse_workspace(
+        &fs::read_to_string(workspace.join("workspace.manifest.toml"))
+            .context("read workspace manifest before building services")?,
+    )?;
+    workspace_manifest::validate_workspace_startup(&workspace_manifest, &projects)?;
 
     let only_ids: Option<Vec<String>> = only.map(|ids| {
         ids.split(',')

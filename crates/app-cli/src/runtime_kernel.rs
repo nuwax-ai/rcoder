@@ -415,6 +415,7 @@ impl RuntimeStore {
                 // Both routes use owner-controlled preparation and activation.
                 "deploy-artifact-url".into(),
                 "deploy-artifact-id".into(),
+                workspace_manifest::STARTUP_PROBE_CAPABILITY.into(),
             ],
         };
         // identity.json 不回读旧 runtime_instance（旧实例身份不得复用），仅覆盖。

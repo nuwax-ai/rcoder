@@ -23,6 +23,7 @@ pub fn build_release_lock(
     metadata: ReleaseMetadata<'_>,
 ) -> Result<ReleaseLock, ManifestError> {
     validate_workspace(workspace)?;
+    crate::validate_workspace_startup(workspace, projects)?;
     let dependency_order = validate_topology(projects)?;
     let ports = allocate_ports(projects)?;
     let by_id: BTreeMap<_, _> = projects
@@ -71,7 +72,7 @@ pub fn build_release_lock(
             "[health].bridge_service references unknown service_id '{bridge_id}'"
         )));
     }
-    Ok(ReleaseLock {
+    let lock = ReleaseLock {
         schema_version: SCHEMA_VERSION,
         release_id: metadata.release_id.to_owned(),
         workspace_name: workspace.workspace.name.clone(),
@@ -85,7 +86,9 @@ pub fn build_release_lock(
         runtime_image_digest: metadata.runtime_image_digest.to_owned(),
         services,
         bridge_service,
-    })
+    };
+    crate::validate_release_startup(&lock)?;
+    Ok(lock)
 }
 
 fn allocate_ports(projects: &[DiscoveredProject]) -> Result<BTreeMap<String, u16>, ManifestError> {
@@ -174,6 +177,8 @@ fn parse_current(content: &str) -> Result<ReleaseLock, LoadError> {
     if lock.services.is_empty() {
         return Err(LoadError::Invariant("release lock has no services".into()));
     }
+    crate::validate_release_startup(&lock)
+        .map_err(|error| LoadError::Invariant(error.to_string()))?;
     Ok(lock)
 }
 
