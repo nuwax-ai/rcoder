@@ -8,6 +8,12 @@ use workspace_manifest::ProxySection;
 /// pingap 监听端口（不用 3000，前端框架默认端口；9080 无冲突）。
 pub const PINGAP_PORT: u16 = 9080;
 
+/// 错误来源剥离插件名（managed/extend 生成的普通响应插件链末尾移除应用
+/// 响应中的 `X-Pingap-EType` 头；pingap 自产 fail_to_proxy 错误不走插件链、
+/// 头保留——rcoder 据此区分「代理自产错误」与「应用自己返回的错误正文」）。
+/// 实测依据：锁定 Pingap cd74a461（v0.14.3）二进制协议验证（2026-09-26）。
+pub const STRIP_ERROR_ORIGIN_PLUGIN: &str = "rcoderStripErrorOrigin";
+
 /// workspace 首页静态服务的 pingap upstream / location 名（注入兜底路由用）。
 pub const WORKSPACE_INDEX_UPSTREAM: &str = "workspaceIndex";
 pub const WORKSPACE_INDEX_LOCATION: &str = "workspaceIndexLocation";
@@ -78,6 +84,15 @@ pub fn build_pingap_config(
         );
     }
 
+    // 错误来源剥离插件定义（response_headers · 移除应用响应的同名头）。
+    // PluginConf 与本 crate 的 serde_json 可能来自不同版本实例——经 serde
+    // 解析构造（跨版本安全），不直接组装 Map。
+    let strip_plugin: pingap_config::PluginConf = serde_json::from_str(
+        r#"{"category":"response_headers","remove_headers":["X-Pingap-EType"]}"#,
+    )?;
+    cfg.plugins
+        .insert(STRIP_ERROR_ORIGIN_PLUGIN.into(), strip_plugin);
+
     // 每个 proxied 项目：[upstreams.<name>] + [locations.<name>Location]
     for e in entries {
         let name = e.name.clone();
@@ -90,10 +105,12 @@ pub fn build_pingap_config(
             },
         );
 
-        // 平台内置插件 + manifest 显式引用的插件。
+        // 平台内置插件 + manifest 显式引用的插件 + 错误来源剥离（响应链末尾：
+        // 应用同名响应头被移除，代理自产错误头保留——见常量注释）。
         let mut plugins: Vec<String> = vec!["pingap:requestId".into()];
         plugins.extend(e.proxy.plugins.clone());
         plugins.push("pingap:compressionUpstream".into());
+        plugins.push(STRIP_ERROR_ORIGIN_PLUGIN.into());
 
         let is_catchall = e.proxy.path == "/";
         let mut loc = LocationConf {
@@ -227,6 +244,35 @@ mod tests {
         assert!(
             toml_text.contains("\"pingap:compressionUpstream\""),
             "{toml_text}"
+        );
+    }
+
+    /// 错误来源剥离插件：定义存在 + 挂在每个 proxied location 的响应链末尾。
+    #[test]
+    fn strip_error_origin_plugin_is_declared_and_attached() {
+        let entries = vec![entry("frontend", 4000, "/", false)];
+        let toml_text = build_pingap_config(&entries, None)
+            .expect("serialize")
+            .expect("non-empty config");
+        assert!(
+            toml_text.contains("[plugins.rcoderStripErrorOrigin]"),
+            "{toml_text}"
+        );
+        assert!(
+            toml_text.contains(r#"remove_headers = ["X-Pingap-EType"]"#),
+            "{toml_text}"
+        );
+        assert!(
+            toml_text.contains("category = \"response_headers\""),
+            "{toml_text}"
+        );
+        let parsed: toml::Value = toml::from_str(&toml_text).expect("reparse");
+        let plugins = parsed["locations"]["frontendLocation"]["plugins"]
+            .as_array()
+            .expect("plugins list");
+        assert_eq!(
+            plugins.last().and_then(|p| p.as_str()),
+            Some(STRIP_ERROR_ORIGIN_PLUGIN)
         );
     }
 

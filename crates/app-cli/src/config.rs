@@ -22,11 +22,23 @@ pub enum Command {
     GenLock(GenLockArgs),
     /// 执行 supervisord 管理的服务 spec。
     RunService(RunServiceArgs),
+    /// 纯只读业务就绪查询（GET 管理 API；不进入 serve/run、不启动 owner）。
+    Readiness(ReadinessArgs),
     /// 部署 journal 运维（双权威域裁决等）。
     Journal {
         #[command(subcommand)]
         command: JournalCommand,
     },
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ReadinessArgs {
+    /// 管理 API 查询地址（exec 场景容器内固定 loopback）。
+    #[arg(long, default_value = "127.0.0.1:3010", env = "APP_CLI_ADMIN_ADDR")]
+    pub admin_addr: String,
+    /// JSON 输出（查询结果恒以 JSON 写 stdout，flag 保留为显式契约）。
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -167,6 +179,30 @@ mod tests {
                 .command,
             Command::Run(_)
         ));
+    }
+
+    #[test]
+    fn readiness_subcommand_owns_query_options() {
+        let cli = CliArgs::try_parse_from([
+            "app-cli",
+            "readiness",
+            "--json",
+            "--admin-addr",
+            "127.0.0.1:3010",
+        ])
+        .expect("readiness options");
+        let Command::Readiness(args) = cli.command else {
+            panic!("expected readiness")
+        };
+        assert_eq!(args.admin_addr, "127.0.0.1:3010");
+        assert!(args.json);
+        // 默认 loopback 管理 addr（exec 场景约定）
+        let cli = CliArgs::try_parse_from(["app-cli", "readiness"]).expect("defaults");
+        let Command::Readiness(args) = cli.command else {
+            panic!("expected readiness")
+        };
+        assert_eq!(args.admin_addr, "127.0.0.1:3010");
+        assert!(!args.json);
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod hot_deploy;
 mod ops;
 mod policy;
 mod query;
+mod readiness;
 mod recovery;
 mod start;
 mod status;

@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{{RCODER_TITLE}} ({{RCODER_STATUS}})</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    background: #f6f7f9; color: #1f2328;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background: #0d1117; color: #e6edf3; }
+    .card { background: #161b22 !important; border-color: #30363d !important; }
+    .diag { color: #8b949e !important; }
+  }
+  .card {
+    background: #ffffff; border: 1px solid #d0d7de; border-radius: 12px;
+    padding: 32px 28px; max-width: 460px; width: calc(100% - 32px); text-align: center;
+  }
+  .icon { font-size: 40px; line-height: 1; margin-bottom: 16px; }
+  h1 { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
+  p { font-size: 14px; line-height: 1.7; margin-bottom: 20px; }
+  .status {
+    display: inline-block; font-size: 12px; font-weight: 600;
+    background: #fff1f0; color: #cf1322; border: 1px solid #ffa39e;
+    border-radius: 999px; padding: 2px 10px; margin-bottom: 16px;
+  }
+  @media (prefers-color-scheme: dark) {
+    .status { background: #3a1d1d; color: #ff7875; border-color: #5c2b2b; }
+  }
+  button {
+    font: inherit; font-size: 14px; cursor: pointer;
+    background: #1f6feb; color: #fff; border: 1px solid rgba(31, 111, 235, 0.5);
+    border-radius: 8px; padding: 8px 22px;
+  }
+  button:hover { background: #1a5fd0; }
+  button:active { transform: translateY(1px); }
+  .diag { margin-top: 18px; font-size: 12px; color: #57606a; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: rgba(110, 118, 129, 0.12); border-radius: 4px; padding: 1px 6px;
+    user-select: all;
+  }
+</style>
+</head>
+<body>
+<main class="card">
+  <div class="icon">&#9888;&#65039;</div>
+  <span class="status">HTTP {{RCODER_STATUS}}</span>
+  <h1>{{RCODER_TITLE}}</h1>
+  <p>{{RCODER_MESSAGE}}</p>
+  <button type="button" onclick="location.reload()">重新访问</button>
+  <div class="diag">诊断编号 <code>{{RCODER_DIAGNOSTIC_ID}}</code></div>
+</main>
+</body>
+</html>

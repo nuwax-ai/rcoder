@@ -5,6 +5,8 @@ use std::sync::Arc;
 use axum::{
     Json,
     extract::{Path, Query, State},
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
 };
 use garde::Validate as _;
 use serde::Deserialize;
@@ -50,6 +52,58 @@ pub async fn get_app_health(
     );
     let health = state.app_service.get_app_health(app_stage, &app_id).await?;
     Ok(Json(HttpResult::success(health)))
+}
+
+/// 获取应用业务就绪状态（只读观察：服务健康契约 + Pingap 入口/生效配置）
+#[utoipa::path(
+    get,
+    path = "/api/v1/userapp/{app_id}/{app_stage}/readiness",
+    params(
+        ("app_id" = String, Path, description = "应用 ID"),
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）；`prod`=运行容器（Userapp）"),
+    ),
+    description = r#"
+业务就绪查询（只读）：由当前物理实例内 app-cli 的业务观察（服务 HTTP 健康契约
++ Pingap 入口/生效配置）合并平台控制意图后的快照。与容器探针（`/health`、
+`/ready`）分离。
+
+- 查询成功恒 200（`success=true` 只表示观察完成），**`data.ready` 才表示业务可用**；
+  未就绪/启动中/已停止/失败/未知/不支持都是合法观察结果。
+- `status`：`not_deployed` / `starting` / `stopping` / `stopped` / `ready` /
+  `degraded` / `failed` / `unknown` / `unsupported`；`reason_code` 为结构化原因。
+- 只读保证：不启动/唤醒/停止容器，不刷新闲置计时，不阻塞 Stop/Restart。
+- 查询期间停止已受理 → `stopping`；旧运行时无新接口 → `unsupported`
+  （`RUNTIME_UPGRADE_REQUIRED`）。
+- 应用权威记录不存在或已删除、`app_stage` 非法、查询系统故障分别走错误信封
+  （404/400/5xx）。
+"#,
+    responses(
+        (status = 200, description = "观察完成（data.ready 才是业务可用）", body = HttpResult<shared_types::UserAppReadinessResponse>)
+    ),
+    tag = "Userapp · 双态 · 生命周期"
+)]
+#[instrument(skip(state))]
+pub async fn get_app_readiness(
+    State(state): State<Arc<AppManagerState>>,
+    Path((app_id, app_stage)): Path<(String, String)>,
+) -> Response {
+    let app_stage = match super::parse_app_stage_param(&app_stage) {
+        Ok(stage) => stage,
+        Err(error) => return error.into_response(),
+    };
+    match state
+        .app_service
+        .get_app_readiness(app_stage, &app_id)
+        .await
+    {
+        Ok(readiness) => (
+            StatusCode::OK,
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(HttpResult::success(readiness)),
+        )
+            .into_response(),
+        Err(error) => AppError::from(error).into_response(),
+    }
 }
 
 /// stats 查询参数

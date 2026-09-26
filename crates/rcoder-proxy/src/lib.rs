@@ -58,6 +58,7 @@
 
 // 导入模块
 pub mod config;
+pub mod error_page;
 pub mod pingora_server;
 pub mod route_type;
 pub mod router;

@@ -119,7 +119,7 @@ pub mod guard_tables {
     /// 守卫闭包比对——该清单增删须同步。原 `{app_id}/db/*` 两路已下线，数据库
     /// 管理统一走转发层 `/api/v1/userapp/db/{app_stage}/*`；文件/存储八接口已加
     /// `{app_stage}` 段显式分派 dev/prod）。
-    pub const APP_MANAGER_PATHS: [&str; 30] = [
+    pub const APP_MANAGER_PATHS: [&str; 31] = [
         "/api/v1/userapp/{app_id}/lifecycle",
         "/api/v1/userapp/{app_id}/operations/current",
         "/api/v1/userapp/{app_id}/operations/by-request",
@@ -140,6 +140,7 @@ pub mod guard_tables {
         "/api/v1/userapp/{app_id}/{app_stage}/logs/query",
         "/api/v1/userapp/{app_id}/{app_stage}/logs/stream",
         "/api/v1/userapp/{app_id}/{app_stage}/health",
+        "/api/v1/userapp/{app_id}/{app_stage}/readiness",
         "/api/v1/userapp/{app_id}/{app_stage}/stats",
         "/api/v1/userapp/{app_id}/{app_stage}/events",
         "/api/v1/userapp/{app_id}/{app_stage}/upload",

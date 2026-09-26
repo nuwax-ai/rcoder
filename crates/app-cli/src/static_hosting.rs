@@ -272,6 +272,14 @@ pub async fn reconcile(
     HOSTED.reconcile(specs, workspace, dev_profile).await
 }
 
+/// 当前端口上静态托管的 live root（只读观察：未托管该端口/正在 reconcile → None）。
+/// hosts 是 tokio Mutex（reconcile 持锁做 bind/stop）——观察用 try_lock 短读
+/// （仅 clone PathBuf），reconcile 进行中不给观察路径加等待。
+pub async fn hosted_root(port: u16) -> Option<PathBuf> {
+    let hosts = HOSTED.hosts.try_lock().ok()?;
+    hosts.get(&port).map(|host| host.root.borrow().clone())
+}
+
 /// static 服务是否应走内置托管（而非 spawn 进程）：
 /// `type = static` 且（非 dev 源码形态 或 未配 `[devrun]`）。
 /// dev 源码态 + `[devrun]`：端口让给 dev server（vite dev 热加载）。

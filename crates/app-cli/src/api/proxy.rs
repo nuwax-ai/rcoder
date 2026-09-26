@@ -185,6 +185,8 @@ pub(super) async fn reload(State(state): State<AppState>) -> Response {
     {
         Ok(()) => {
             writer.confirm();
+            // 已确认生效：业务就绪观察以此核对 admin 实际 hash。
+            crate::proxy::compiler::record_expected_hash(&outcome.expected_hash);
             envelope::ok(
                 StatusCode::OK,
                 ProxyReloadData {
@@ -220,6 +222,8 @@ pub(super) async fn reload(State(state): State<AppState>) -> Response {
                 {
                     Ok(()) => {
                         writer.confirm();
+                        // 回切后的实际生效配置是旧 hash——观察期望同步回切。
+                        crate::proxy::compiler::record_expected_hash(&previous_hash);
                         info!("✅ rollback confirmed: previous config_hash live again");
                     }
                     Err(verify_error) => {

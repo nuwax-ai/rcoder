@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 mod storage;
 mod userapp_storage;
+pub use crate::userapp_error_page::UserAppErrorPageConfig;
 pub use storage::{StorageBackend, StorageConfig};
 pub use userapp_storage::{UserAppStorageBackend, UserAppStorageConfig};
 
@@ -116,6 +117,10 @@ pub struct AppConfig {
     /// 应用管理配置
     #[serde(default)]
     pub app_manager: app_manager::AppManagerConfig,
+    /// UserApp 错误页存储/加载配置（段缺失 → 不装配外部存储：内置页兜底、
+    /// 管理上传返回存储未配置；不影响代理失败响应本身）
+    #[serde(default)]
+    pub userapp_error_page: Option<UserAppErrorPageConfig>,
     /// 围栏 holder 死亡兜底收束的超龄门槛（秒）；None/缺省 = 默认 900s
     /// （≫ 操作 deadline + 租约 TTL 60s）。RecoveryRequired 围栏超龄且持有者
     /// 已死（无租约绑定 / 物理租约过期）→ 自动收束 Failed，不再永久占受理 slot。
@@ -168,6 +173,7 @@ impl Default for AppConfig {
             kubernetes_config: None,
             cleanup_config: CleanupConfigSettings::default(),
             userapp_recycle: UserAppRecycleConfig::default(),
+            userapp_error_page: None,
             storage: StorageConfig::default(),
             userapp_storage: UserAppStorageConfig::default(),
             api_key_auth: ApiKeyAuthConfig {

@@ -102,6 +102,25 @@ impl ProxyHttp for PortProxy {
         // 前缀快滤，避免每请求都走 matchit 树匹配（其余路由 /proxy/{port}、
         // /web/ttyd、/computer/vnc、/api/* 等直接放行；dev 流量无闲置回收语义，不触发）
         let path = Self::normalize_path(session.req_header().uri.path());
+        // UserApp app 路由上下文（URI 改写前捕获）：错误页/来源识别只覆盖该域；
+        // dev 路由无唤醒语义但同样需要失败呈现。
+        if path.starts_with("/api/v1/userapp/proxy/app/")
+            && let Ok(matched) = self.router.at(path)
+        {
+            let stage = match matched.value {
+                RouteType::ProdAppProxy => Some("prod"),
+                RouteType::DevAppProxy => Some("dev"),
+                _ => None,
+            };
+            if let Some(stage) = stage
+                && let Some(app_id) = matched.params.get("app_id")
+            {
+                ctx.userapp_route = Some(crate::service::types::UserAppRouteCtx {
+                    app_id: app_id.to_string(),
+                    stage,
+                });
+            }
+        }
         if let Some((app_id, touch)) = classify_wake_target(&self.router, path) {
             // ① 访问追踪（仅业务流量）
             if touch && let Some(ref tracker) = self.access_tracker {
@@ -153,9 +172,15 @@ impl ProxyHttp for PortProxy {
                     )
                     | Err(_) => {
                         // 未获得可用上游（包括操作占用）；返回 503，不宣称仍在启动。
-                        let mut resp = ResponseHeader::build(503, None)?;
-                        resp.insert_header("Retry-After", WAKE_503_RETRY_AFTER_SECS)?;
-                        session.write_response_header(Box::new(resp), true).await?;
+                        self.respond_userapp_error(
+                            session,
+                            ctx,
+                            503,
+                            crate::error_page::ErrorPageCause::Generic,
+                            "wake did not produce a ready upstream",
+                            Some(15),
+                        )
+                        .await;
                         return Ok(true); // 已直接响应，跳过 upstream
                     }
                 }
@@ -333,6 +358,47 @@ impl ProxyHttp for PortProxy {
         Ok(peer)
     }
 
+    /// 代理失败终局：UserApp app 路由给友好表示（真实状态码）；其余路由
+    /// 保持 Pingora 默认（空体 respond_error）。响应已开始的流不会进入本
+    /// 钩子——不存在中途注入 HTML 的路径。
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        error: &pingora_core::Error,
+        ctx: &mut Self::CTX,
+    ) -> pingora_proxy::FailToProxy
+    where
+        Self::CTX: Send + Sync,
+    {
+        let code = default_error_status(error);
+        if ctx.userapp_route.is_some() && code > 0 {
+            // 原因用封闭的错误类型词表（etype），不透出内部地址/凭据细节
+            let reason = error.etype().as_str().to_string();
+            self.respond_userapp_error(
+                session,
+                ctx,
+                code,
+                crate::error_page::ErrorPageCause::Generic,
+                &reason,
+                None,
+            )
+            .await;
+            return pingora_proxy::FailToProxy {
+                error_code: code,
+                can_reuse_downstream: false,
+            };
+        }
+        if code > 0
+            && let Err(write_error) = session.respond_error(code).await
+        {
+            tracing::warn!("send default error response failed: {write_error}");
+        }
+        pingora_proxy::FailToProxy {
+            error_code: code,
+            can_reuse_downstream: false,
+        }
+    }
+
     fn fail_to_connect(
         &self,
         _session: &mut Session,
@@ -403,7 +469,7 @@ impl ProxyHttp for PortProxy {
     /// 响应过滤阶段
     async fn response_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> PingoraResult<()>
@@ -442,8 +508,22 @@ impl ProxyHttp for PortProxy {
         ctx.prod_metrics_counted = false;
 
         // 记录上游状态码：upstream_response_body_filter 据此收集 4xx/5xx 错误体
-        //（此前从未写入，收集分支是死代码）
         ctx.upstream_status = Some(status.as_u16());
+
+        // ── Pingap 自产错误识别（T11）─────────────────────────────────────
+        // 应用容器入口（:9080 pingap）返回的 502/503/504 带 `X-Pingap-EType`：
+        // 仅当失败顾问确认当前实例生效配置具备来源剥离规则（应用同名头已被
+        // 移除）时才替换正文；未知来源/custom/旧配置一律透传原响应。
+        if let Some(route) = ctx.userapp_route.clone()
+            && (502..=504).contains(&status.as_u16())
+            && upstream_response
+                .headers
+                .get(shared_types::X_PINGAP_ETYPE_HEADER)
+                .is_some()
+        {
+            self.maybe_replace_pingap_error(session, upstream_response, ctx, &route)
+                .await;
+        }
 
         // 只在 API 代理场景打印详细日志
         if ctx.upstream_host.is_some() {
@@ -456,7 +536,7 @@ impl ProxyHttp for PortProxy {
         Ok(())
     }
 
-    /// 上游响应体过滤
+    /// 上游响应体过滤（经 ProxyServiceWrapper 委托真正生效）
     fn upstream_response_body_filter(
         &self,
         _session: &mut Session,
@@ -464,6 +544,22 @@ impl ProxyHttp for PortProxy {
         _end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> PingoraResult<Option<Duration>> {
+        // 已确认来源的 Pingap 自产错误替换：首块输出新正文一次、丢弃原错误
+        // 体（不拼接）；旧 Content-Encoding 已在 header 阶段移除，此处恒为
+        // 身份编码，按新表示重建传输边界。
+        if ctx.replace_error_body.is_some() {
+            if ctx.error_replacement_emitted {
+                *body = None;
+            } else {
+                *body = ctx.replace_error_body.clone();
+                ctx.error_replacement_emitted = true;
+            }
+            if _end_of_stream {
+                ctx.replace_error_body = None;
+            }
+            return Ok(None);
+        }
+
         // 如果是 4xx/5xx 响应，收集错误响应体（封顶 64KB：网关 HTML 大页/
         // 误配代理到的默认站点会让单请求内存随 body 线性增长）
         if let Some(status) = ctx.upstream_status
@@ -496,6 +592,205 @@ impl PortProxy {
     /// 规范化路径（去除尾部斜杠）
     fn normalize_path(raw: &str) -> &str {
         utils::normalize_path(raw)
+    }
+
+    /// Pingap 自产错误（已带标记头）的正文替换决策：来源确认才替换。
+    ///
+    /// 替换只动表示：状态码保留；`Content-Encoding`/旧 `Content-Length`/
+    /// 实体校验头移除，按新表示重建；正文经 body filter 一次性输出。
+    /// 未知来源/custom/旧配置无证据 → 原样透传（不猜测、不无条件换 502）。
+    async fn maybe_replace_pingap_error(
+        &self,
+        session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut TrackingCtx,
+        route: &crate::service::types::UserAppRouteCtx,
+    ) {
+        let Some(advisor) = self.failure_advisor_slot.load_full() else {
+            return;
+        };
+        // 失败路径剩余预算（无唤醒上下文时用短上限——诊断绝不延长已耗尽的
+        // 代理等待）
+        let budget = ctx
+            .prod_connect_recovery
+            .as_ref()
+            .map(|recovery| {
+                recovery
+                    .deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .min(Duration::from_millis(1500))
+            })
+            .unwrap_or_else(|| Duration::from_millis(1000));
+        let Some(hint) = advisor.advise(&route.app_id, route.stage, budget).await else {
+            return;
+        };
+        if !hint.error_origin_confirmed {
+            return;
+        }
+        let Some(renderer) = self.error_pages_slot.load_full() else {
+            return;
+        };
+        let status = upstream_response.status.as_u16();
+        let diagnostic_id = crate::error_page::new_diagnostic_id();
+        let (content_type, body): (&'static str, bytes::Bytes) =
+            match crate::error_page::negotiate(session) {
+                crate::error_page::ErrorRepresentation::Document => {
+                    let (title, message) = hint.page_cause().copywriting();
+                    let vars = crate::error_page::ErrorPageVars {
+                        title: title.to_string(),
+                        message: message.to_string(),
+                        diagnostic_id: diagnostic_id.clone(),
+                        status: status.to_string(),
+                    };
+                    ("text/html; charset=utf-8", renderer.render(&vars).into())
+                }
+                crate::error_page::ErrorRepresentation::Machine => {
+                    let (_title, message) = hint.page_cause().copywriting();
+                    let payload = serde_json::json!({
+                        "error": {
+                            "code": "USERAPP_PROXY_FAILURE",
+                            "status": status,
+                            "reason": "pingap_self_produced_error",
+                            "message": message,
+                            "diagnostic_id": diagnostic_id,
+                        }
+                    });
+                    ("application/json", payload.to_string().into())
+                }
+            };
+        // 按新表示重建头：移除编码/实体校验/缓存建议，替换 Content-Type/Length。
+        // 个别头写失败仅记日志——不撤销替换（正文已按新表示重建）。
+        for header in [
+            "content-encoding",
+            "content-length",
+            "etag",
+            "last-modified",
+            "cache-control",
+            "retry-after",
+        ] {
+            if let Some(_removed) = upstream_response.remove_header(header) {
+                // 占用返回值；无旧值 = 头本就不存在（幂等）
+            }
+        }
+        if let Err(error) = upstream_response.insert_header("content-type", content_type) {
+            tracing::warn!("rewrite content-type on replaced response failed: {error}");
+        }
+        if let Err(error) =
+            upstream_response.insert_header("content-length", body.len().to_string())
+        {
+            tracing::warn!("rewrite content-length on replaced response failed: {error}");
+        }
+        if let Err(error) = upstream_response.insert_header("cache-control", "no-store") {
+            tracing::warn!("rewrite cache-control on replaced response failed: {error}");
+        }
+        if let Err(error) = upstream_response
+            .insert_header(crate::error_page::DIAGNOSTIC_HEADER, diagnostic_id.as_str())
+        {
+            tracing::warn!("rewrite diagnostic header on replaced response failed: {error}");
+        }
+        // 移除标记头：替换后的表示不再携带来源标记（避免下游重复判定）
+        if let Some(_removed) = upstream_response.remove_header(shared_types::X_PINGAP_ETYPE_HEADER)
+        {
+        }
+        ctx.replace_error_body = Some(body);
+        ctx.error_replacement_emitted = false;
+        tracing::info!(
+            app_id = %route.app_id,
+            stage = route.stage,
+            %status,
+            diagnostic_id = %diagnostic_id,
+            readiness = ?hint.readiness_status,
+            "replaced confirmed pingap self-produced error body"
+        );
+    }
+
+    /// UserApp 失败出口的统一友好表示。
+    ///
+    /// 未装配错误页呈现器时保持旧的极简响应（header-only）——能力接入前
+    /// 行为零回退。真实状态码保留；HEAD 无正文；写失败不二次发送。
+    pub(crate) async fn respond_userapp_error(
+        &self,
+        session: &mut Session,
+        ctx: &mut TrackingCtx,
+        status: u16,
+        cause: crate::error_page::ErrorPageCause,
+        reason: &str,
+        retry_after_secs: Option<u64>,
+    ) {
+        // 文案证据：失败顾问有当前实例观察时用确定文案（starting/stopped/
+        // failed）；Generic 入参或无证据一律通用文案（不凭连接拒绝宣称启动中）。
+        let cause = if matches!(cause, crate::error_page::ErrorPageCause::Generic)
+            && let Some(advisor) = self.failure_advisor_slot.load_full()
+            && let Some(route) = ctx.userapp_route.clone()
+        {
+            let budget = ctx
+                .prod_connect_recovery
+                .as_ref()
+                .map(|recovery| {
+                    recovery
+                        .deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .min(Duration::from_millis(1500))
+                })
+                .unwrap_or_else(|| Duration::from_millis(1000));
+            advisor
+                .advise(&route.app_id, route.stage, budget)
+                .await
+                .map(|hint| hint.page_cause())
+                .unwrap_or(cause)
+        } else {
+            cause
+        };
+        if let Some(renderer) = self.error_pages_slot.load_full() {
+            let context = ctx
+                .userapp_route
+                .as_ref()
+                .map(|route| format!("app={} stage={}", route.app_id, route.stage))
+                .unwrap_or_else(|| "userapp app proxy".to_string());
+            crate::error_page::write_error_response(
+                session,
+                &renderer,
+                status,
+                cause,
+                reason,
+                retry_after_secs,
+                &context,
+            )
+            .await;
+            return;
+        }
+        let response = ResponseHeader::build(status, None).ok();
+        if let Some(mut response) = response {
+            if let Some(seconds) = retry_after_secs
+                && let Err(error) = response.insert_header("Retry-After", seconds.to_string())
+            {
+                tracing::warn!("insert retry-after into legacy error response failed: {error}");
+            }
+            if let Err(error) = session
+                .write_response_header(Box::new(response), true)
+                .await
+            {
+                tracing::warn!("write legacy error response failed: {error}");
+            }
+        }
+    }
+}
+
+/// Pingora 默认 fail_to_proxy 的状态映射（proxy_trait.rs 631-668 同款）——
+/// UserApp 路由经此拿到与默认一致的真实状态码后再做友好表示。
+fn default_error_status(error: &pingora::Error) -> u16 {
+    use pingora::ErrorSource;
+    use pingora::ErrorType::{ConnectionClosed, HTTPStatus, ReadError, WriteError};
+    match error.etype() {
+        HTTPStatus(code) => *code,
+        _ => match error.esource() {
+            ErrorSource::Upstream => 502,
+            ErrorSource::Downstream => match error.etype() {
+                WriteError | ReadError | ConnectionClosed => 0,
+                _ => 400,
+            },
+            ErrorSource::Internal | ErrorSource::Unset => 500,
+        },
     }
 }
 

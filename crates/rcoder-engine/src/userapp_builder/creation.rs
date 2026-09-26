@@ -2049,6 +2049,7 @@ pub(crate) mod fence_settler_tests {
                 adapter,
             ))),
             pingora_service: None,
+            userapp_error_page: None,
             grpc_pool: Arc::new(crate::grpc::GrpcChannelPool::new()),
             session_stream_registry: Arc::new(crate::grpc::SessionStreamRegistry::new()),
             api_key_config: Arc::new(ArcSwap::from_pointee(

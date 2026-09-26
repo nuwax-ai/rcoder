@@ -218,6 +218,7 @@ async fn attach_coordinator(
         dev_cleanup: std::sync::RwLock::new(None),
         dev_locator: std::sync::RwLock::new(None),
         builder_recovery: std::sync::RwLock::new(None),
+        readiness_reader: std::sync::RwLock::new(None),
         deploy_list_cache: tokio::sync::Mutex::new(None),
     });
     service

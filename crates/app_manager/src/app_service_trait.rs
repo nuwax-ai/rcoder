@@ -1,5 +1,7 @@
 //! 应用服务 trait 定义
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use super::models::*;
@@ -267,6 +269,19 @@ pub trait AppServiceTrait: Send + Sync {
         app_stage: shared_types::UserappStage,
         app_id: &str,
     ) -> AppResult<HealthInfo>;
+
+    /// 业务就绪查询（只读观察）：合并权威记录、scope 控制意图与 app-cli 业务
+    /// 快照；查询成功恒 200，`data.ready` 才表示业务可用。
+    async fn get_app_readiness(
+        &self,
+        app_stage: shared_types::UserappStage,
+        app_id: &str,
+    ) -> AppResult<shared_types::UserAppReadinessResponse>;
+
+    /// 只读观察器句柄（宿主注入后的回读；代理失败诊断顾问等消费）。
+    fn readiness_reader(&self) -> Option<Arc<dyn shared_types::UserAppReadinessReader>> {
+        None
+    }
 
     /// 日志/管理面转发基址（app-cli :3010）：prod=运行实例 IP；dev=开发容器 host
     /// 解析重拼。logs 三接口的透明转发源

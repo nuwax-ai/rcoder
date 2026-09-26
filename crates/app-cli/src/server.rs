@@ -329,7 +329,11 @@ impl ServerState {
             deploy_status: RwLock::new(DeployStatus {
                 phase: AppCliDeployPhase::Idle,
                 protocol_version: DEPLOY_PROTOCOL,
-                capabilities: vec!["progress_v1".into(), "deployment_run_pg".into()],
+                capabilities: vec![
+                    "progress_v1".into(),
+                    "deployment_run_pg".into(),
+                    shared_types::BUSINESS_READINESS_CAPABILITY.into(),
+                ],
                 ..Default::default()
             }),
             deploy_tx,
@@ -631,6 +635,16 @@ impl ServerState {
         self.current_runtime_operation
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// 部署请求 token（`request_release_id`）——业务就绪观察用来标注
+    /// 「正在准备的目标版本」。与 release_id（内容身份）两层语义。
+    pub(crate) fn deploy_request_release_id(&self) -> Option<String> {
+        self.deploy_status
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .request_release_id
             .clone()
     }
 
@@ -1097,7 +1111,11 @@ impl ServerState {
             release_id: previous.release_id.clone(),
             request_release_id: Some(req.release_id.clone()),
             error: None,
-            capabilities: vec!["progress_v1".into(), "deployment_run_pg".into()],
+            capabilities: vec![
+                "progress_v1".into(),
+                "deployment_run_pg".into(),
+                shared_types::BUSINESS_READINESS_CAPABILITY.into(),
+            ],
             progress: None,
         };
         *self
@@ -1192,7 +1210,11 @@ impl ServerState {
             release_id: previous.release_id,
             request_release_id: Some(request.release_id.clone()),
             error: None,
-            capabilities: vec!["progress_v1".into(), "deployment_run_pg".into()],
+            capabilities: vec![
+                "progress_v1".into(),
+                "deployment_run_pg".into(),
+                shared_types::BUSINESS_READINESS_CAPABILITY.into(),
+            ],
             progress: None,
         };
         Ok(())

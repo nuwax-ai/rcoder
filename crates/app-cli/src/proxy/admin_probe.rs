@@ -117,6 +117,78 @@ pub fn parse_config_hash(body: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("admin /api/basic response missing config_hash"))
 }
 
+/// 单个 upstream 的健康视图（pingap `upstream_healthy_status` 值形态）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamHealthView {
+    pub healthy: u32,
+    pub total: u32,
+}
+
+/// admin `/api/basic` 的只读快照（业务就绪观察消费的字段子集）。
+#[derive(Debug, Clone)]
+pub struct AdminBasicSnapshot {
+    /// 当前实际生效配置 hash（缺失 = 观察不完整）
+    pub config_hash: Option<String>,
+    /// upstream 名（= service_id）→ 健康视图
+    pub upstreams: std::collections::HashMap<String, UpstreamHealthView>,
+}
+
+/// 解析 `/api/basic` 为 [`AdminBasicSnapshot`]（未知字段忽略，向前兼容）。
+pub fn parse_admin_basic(body: &str) -> Result<AdminBasicSnapshot> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).context("parse admin /api/basic JSON body")?;
+    let config_hash = value
+        .get("config_hash")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let mut upstreams = std::collections::HashMap::new();
+    if let Some(map) = value
+        .get("upstream_healthy_status")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (name, status) in map {
+            let healthy = status
+                .get("healthy")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32;
+            let total = status
+                .get("total")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32;
+            upstreams.insert(name.clone(), UpstreamHealthView { healthy, total });
+        }
+    }
+    Ok(AdminBasicSnapshot {
+        config_hash,
+        upstreams,
+    })
+}
+
+/// 单次读取 admin `/api/basic` 快照（短超时 connect 1s / total 3s；只读端点）。
+pub async fn fetch_admin_basic(endpoint: &AdminEndpoint) -> Result<AdminBasicSnapshot> {
+    let client = build_probe_client()?;
+    let ts = now_unix_seconds()?;
+    let url = format!("http://{}/api/basic", endpoint.addr);
+    let response = client
+        .get(&url)
+        .header(
+            "Authorization",
+            authorization_header(&endpoint.user, &endpoint.password, ts),
+        )
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .with_context(|| format!("read admin response body from {url}"))?;
+    if !status.is_success() {
+        anyhow::bail!("admin probe {url} returned {status}");
+    }
+    parse_admin_basic(&body)
+}
+
 /// hash 比对：pingap 输出大写 hex，本地 `.hash()` 同格式；仍做大小写无关比对防御格式漂移。
 pub fn hashes_match(expected: &str, actual: &str) -> bool {
     !expected.is_empty() && expected.eq_ignore_ascii_case(actual)
@@ -259,5 +331,42 @@ mod tests {
         assert!(hashes_match("AB12CD34", "AB12CD34"));
         assert!(!hashes_match("AB12CD34", "DEADBEEF"));
         assert!(!hashes_match("", ""), "empty expected must never match");
+    }
+
+    #[test]
+    fn parse_admin_basic_extracts_hash_and_upstreams() {
+        let body = r#"{
+            "version":"0.14.3",
+            "config_hash":"AB12CD34",
+            "upstream_healthy_status":{
+                "frontend":{"healthy":1,"total":1,"unhealthy_backends":[]},
+                "backend":{"healthy":0,"total":1,"unhealthy_backends":["127.0.0.1:4101"]}
+            }
+        }"#;
+        let snapshot = super::parse_admin_basic(body).expect("valid body");
+        assert_eq!(snapshot.config_hash.as_deref(), Some("AB12CD34"));
+        assert_eq!(
+            snapshot
+                .upstreams
+                .get("frontend")
+                .map(|u| (u.healthy, u.total)),
+            Some((1, 1))
+        );
+        assert_eq!(
+            snapshot
+                .upstreams
+                .get("backend")
+                .map(|u| (u.healthy, u.total)),
+            Some((0, 1))
+        );
+    }
+
+    #[test]
+    fn parse_admin_basic_tolerates_missing_sections() {
+        let snapshot = super::parse_admin_basic(r#"{"version":"0.14.3"}"#).expect("valid body");
+        assert_eq!(snapshot.config_hash, None);
+        assert!(snapshot.upstreams.is_empty());
+        // 非法 JSON 仍是错误（协议错误不能当观察成功）
+        assert!(super::parse_admin_basic("not json").is_err());
     }
 }

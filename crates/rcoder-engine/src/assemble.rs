@@ -294,6 +294,21 @@ pub async fn assemble(
         )));
     }
 
+    // UserApp 错误页呈现器回填：与 Axum 管理面共享同一页面服务实例（唯一
+    // 缓存发布路径）；未配置存储时仍注入呈现器（内置页兜底）——换页能力
+    // 依赖外部存储，呈现本身不依赖。
+    if let Some(pingora_service) = proxy_result.pingora_service.as_ref() {
+        let renderer = match &state.userapp_error_page {
+            Some(service) => service.renderer(),
+            None => Arc::new(rcoder_proxy::error_page::ErrorPageRenderer::new(None)),
+        };
+        pingora_service.set_error_pages(renderer);
+        // 失败诊断顾问：与就绪 reader 同源（短缓存）；来源确认/文案证据用。
+        pingora_service.set_failure_advisor(Arc::new(
+            userapp_failure_advisor::UserAppProxyFailureAdvisorImpl::new(Arc::downgrade(&state)),
+        ));
+    }
+
     let bg_handles = background_tasks::start_all_background_tasks(
         &bootstrap_result.config,
         state.clone(),

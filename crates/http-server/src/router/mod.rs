@@ -123,6 +123,8 @@ pub fn create_router(
         // file-server 分流代理运行时启停 (无 state, 受全局 API key 中间件保护;
         // `rcoder file-server {start,stop,restart,status}` CLI 的服务端)
         .merge(crate::file_server_admin::admin_routes())
+        // UserApp 错误页管理接口（PUT/GET/DELETE；受全局 API key 中间件保护）
+        .merge(handler::error_page_admin::routes().with_state(state.clone()))
         // OpenAPI 文档 UI 两面（Swagger + Scalar）。在此 merge = 受下方 API key
         // 中间件保护（与拆分前 router.rs 的挂载语义一致）
         .merge(crate::router_docs::create_swagger_ui())
@@ -194,6 +196,7 @@ mod assembly_guard {
             "router_docs::create_scalar_docs()",
             "userapp_forward::routes()",
             "file_server_admin::admin_routes()",
+            "handler::error_page_admin::routes()",
             "app_manager::routes::app_manager_routes()",
             "internal_pod_ensure",
             "api::api_routes",

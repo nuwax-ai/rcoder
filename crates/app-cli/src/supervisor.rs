@@ -1269,6 +1269,8 @@ async fn start_pingap(
         shutdown_all(std::mem::take(children), 5).await?;
         return Err(error).context("confirm initial Pingap config via loopback admin probe");
     } else {
+        // 已确认生效：业务就绪观察以此核对 admin 实际 hash。
+        crate::proxy::compiler::record_expected_hash(&outcome.expected_hash);
         info!("✅ pingap initial config confirmed (config_hash matched)");
     }
     Ok(())

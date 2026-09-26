@@ -83,6 +83,10 @@ pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
             get(handlers::get_app_health),
         )
         .route(
+            "/api/v1/userapp/{app_id}/{app_stage}/readiness",
+            get(handlers::get_app_readiness),
+        )
+        .route(
             "/api/v1/userapp/{app_id}/{app_stage}/stats",
             get(handlers::get_app_stats),
         )

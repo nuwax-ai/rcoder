@@ -183,6 +183,7 @@ async fn test_state(runtime: Arc<ProbeRuntime>) -> (Arc<AppState>, tempfile::Tem
         config: AppConfig::default(),
         projects: Arc::new(ProjectStoreBackend::Memory(Arc::new(adapter))),
         pingora_service: None,
+        userapp_error_page: None,
         grpc_pool: Arc::new(GrpcChannelPool::new()),
         session_stream_registry: Arc::new(SessionStreamRegistry::new()),
         api_key_config: Arc::new(ArcSwap::from_pointee(ApiKeyAuthConfig::default())),

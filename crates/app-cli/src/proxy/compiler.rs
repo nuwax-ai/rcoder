@@ -17,6 +17,34 @@ pub struct CompileOutcome {
     pub expected_hash: String,
 }
 
+/// 进程级「当前期望生效 config_hash」槽：业务就绪观察用它核对 admin 实际
+/// 生效 hash（不匹配 → PROXY_CONFIG_MISMATCH）。一个 app-cli 进程同一时刻
+/// 只服务一个 release，进程级槽与该语义一致（同 admin endpoint 全局槽模式）。
+///
+/// 写入点：编排编译（builtin/supervisord）与 proxy reload 确认/回切确认——
+/// 即「平台已确认过该 hash 生效」的位置；仅编译未确认不写入。
+static EXPECTED_HASH: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 记录已确认生效的期望 config_hash（空串清除）。
+pub fn record_expected_hash(hash: &str) {
+    let mut guard = EXPECTED_HASH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if hash.is_empty() {
+        *guard = None;
+    } else {
+        *guard = Some(hash.to_string());
+    }
+}
+
+/// 当前已确认生效的期望 hash（None = 本进程尚未确认过任何配置）。
+pub fn expected_hash() -> Option<String> {
+    EXPECTED_HASH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 /// Capture the execution profile when orchestration starts. Proxy reload must
 /// use this profile, not a later request or the owner's startup environment.
 #[derive(Clone)]

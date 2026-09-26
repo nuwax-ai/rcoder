@@ -16,6 +16,7 @@ pub mod activity;
 pub mod app_stage;
 pub mod build_event;
 pub mod builder_instance;
+pub mod business_readiness;
 pub mod db_admin;
 pub mod db_align;
 pub mod db_password;

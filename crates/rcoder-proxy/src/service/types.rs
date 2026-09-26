@@ -214,6 +214,15 @@ pub struct ProdConnectRecovery {
     pub unavailable_response: bool,
 }
 
+/// UserApp app 代理路由上下文（URI 改写前捕获；失败出口/响应阶段读取，
+/// 不再从改写后的 `/` 猜测路由）。
+#[derive(Debug, Clone)]
+pub struct UserAppRouteCtx {
+    pub app_id: String,
+    /// `prod` / `dev`
+    pub stage: &'static str,
+}
+
 #[derive(Clone)]
 pub struct TrackingCtx {
     pub start: std::time::Instant,
@@ -253,6 +262,13 @@ pub struct TrackingCtx {
     pub preview_forward_port: Option<u16>,
     /// 预览跨 Pod 转发的原始入口端口（`/proxy/{port}`；宿主 410 后失效缓存用）。
     pub preview_origin_port: Option<u16>,
+    /// UserApp app 代理路由（request_filter 阶段捕获；错误页/来源识别只覆盖该域）
+    pub userapp_route: Option<UserAppRouteCtx>,
+    /// 已确认来源的 Pingap 自产错误正文替换（response_filter 决定；body filter
+    /// 首块输出新正文并丢弃原错误体，不拼接）。None = 不替换。
+    pub replace_error_body: Option<bytes::Bytes>,
+    /// 替换正文是否已输出（body filter 只发一次）
+    pub error_replacement_emitted: bool,
     /// Request-scoped deadline and retry state for prod UserApp connections.
     pub prod_connect_recovery: Option<ProdConnectRecovery>,
     /// Keep prod app request counting stable across retries, including route failures.
@@ -271,6 +287,9 @@ impl TrackingCtx {
     pub fn new() -> Self {
         Self {
             start: std::time::Instant::now(),
+            userapp_route: None,
+            replace_error_body: None,
+            error_replacement_emitted: false,
             target_port: None,
             vnc_target_ip: None,
             upstream_host: None,

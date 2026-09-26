@@ -15,6 +15,7 @@ mod computer_db_handler;
 mod computer_desktop;
 mod devcomputer_handler;
 mod docs;
+pub mod error_page_admin;
 mod health_handler;
 mod internal_handler;
 mod permission_handler;

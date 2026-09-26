@@ -52,6 +52,8 @@ services:
     volumes:
       # Persist the directory, including SQLite WAL/SHM; never share between deployments.
       - ${RCODER_DATA_DIR:-./data/rcoder}:/app/data
+      # UserApp 错误页持久化目录（管理 API 原子替换；换页不重启容器）
+      - ./error-pages:/etc/rcoder/error-pages:rw
       # 挂载 Docker socket
       - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock
       # 🎯 挂载本地测试配置文件（使用与主容器相同的镜像）

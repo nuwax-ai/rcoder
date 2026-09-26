@@ -78,6 +78,13 @@ pub struct PingoraProxyService {
     /// Custom Page 预览路由依赖（ArcSwap 槽——协调器装配晚于 Pingora 启动，
     /// main 侧经 [`Self::set_preview_routing`] 回填）
     pub(crate) preview_slot: Arc<ArcSwapOption<Arc<PreviewRouteDeps>>>,
+    /// UserApp 错误页呈现器槽（ArcSwap——engine 的页面存储/加载器装配后回填，
+    /// PortProxy 共享同槽实时见；None 时失败出口保持原极简响应）
+    pub(crate) error_pages_slot: Arc<ArcSwapOption<Arc<crate::error_page::ErrorPageRenderer>>>,
+    /// UserApp 失败诊断顾问槽（engine 注入：就绪观察短缓存；失败路径文案/
+    /// Pingap 来源确认用。None = 无证据，一律通用文案 + 不替换上游正文）
+    pub(crate) failure_advisor_slot:
+        Arc<ArcSwapOption<Arc<dyn crate::error_page::UserAppProxyFailureAdvisor>>>,
 }
 
 /// 为了兼容现有接口，我们保留原来的 PortProxyService 别名
@@ -117,6 +124,11 @@ pub struct PortProxy {
     pub(crate) app_runtime_ip_slot: Arc<ArcSwapOption<Arc<dyn shared_types::AppRuntimeIpResolver>>>,
     /// 预览路由依赖槽（与 PingoraProxyService 共享同一 Arc）
     pub(crate) preview_slot: Arc<ArcSwapOption<Arc<PreviewRouteDeps>>>,
+    /// UserApp 错误页呈现器槽（与 PingoraProxyService 共享同一 Arc）
+    pub(crate) error_pages_slot: Arc<ArcSwapOption<Arc<crate::error_page::ErrorPageRenderer>>>,
+    /// UserApp 失败诊断顾问槽（与 PingoraProxyService 共享同一 Arc）
+    pub(crate) failure_advisor_slot:
+        Arc<ArcSwapOption<Arc<dyn crate::error_page::UserAppProxyFailureAdvisor>>>,
 }
 
 impl PingoraProxyService {
@@ -143,7 +155,23 @@ impl PingoraProxyService {
             dev_ensure_slot: Arc::new(ArcSwapOption::from(None)),
             app_runtime_ip_slot: Arc::new(ArcSwapOption::from(None)),
             preview_slot: Arc::new(ArcSwapOption::from(None)),
+            error_pages_slot: Arc::new(ArcSwapOption::from(None)),
+            failure_advisor_slot: Arc::new(ArcSwapOption::from(None)),
         }
+    }
+
+    /// 回填 UserApp 失败诊断顾问（engine 装配后调用；PortProxy 共享槽）。
+    pub fn set_failure_advisor(
+        &self,
+        advisor: Arc<dyn crate::error_page::UserAppProxyFailureAdvisor>,
+    ) {
+        self.failure_advisor_slot.store(Some(Arc::new(advisor)));
+    }
+
+    /// 回填 UserApp 错误页呈现器（engine 页面服务装配后调用；PortProxy
+    /// 共享槽实时见）。呈现器内含共享页面快照——与 Axum 管理面同一实例。
+    pub fn set_error_pages(&self, renderer: Arc<crate::error_page::ErrorPageRenderer>) {
+        self.error_pages_slot.store(Some(Arc::new(renderer)));
     }
 
     /// 回填 userApp 运行容器 IPv4 解析器（启动后调用——main 侧 RuntimeManager
@@ -240,6 +268,8 @@ impl PingoraProxyService {
             dev_ensure_slot: Arc::clone(&self.dev_ensure_slot),
             app_runtime_ip_slot: self.app_runtime_ip_slot.clone(),
             preview_slot: Arc::clone(&self.preview_slot),
+            error_pages_slot: Arc::clone(&self.error_pages_slot),
+            failure_advisor_slot: Arc::clone(&self.failure_advisor_slot),
         })
     }
 }
@@ -263,6 +293,8 @@ impl Clone for PingoraProxyService {
             dev_ensure_slot: Arc::clone(&self.dev_ensure_slot),
             app_runtime_ip_slot: self.app_runtime_ip_slot.clone(),
             preview_slot: Arc::clone(&self.preview_slot),
+            error_pages_slot: Arc::clone(&self.error_pages_slot),
+            failure_advisor_slot: Arc::clone(&self.failure_advisor_slot),
         }
     }
 }

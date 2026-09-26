@@ -278,7 +278,11 @@ impl SupervisordHost {
             endpoint,
             &pingap_outcome.expected_hash,
             admin_probe::CONFIRM_BUDGET,
-        ) => result.context("pingap config hash confirm")?,
+        ) => {
+                result.context("pingap config hash confirm")?;
+                // 已确认生效：业务就绪观察以此核对 admin 实际 hash。
+                crate::proxy::compiler::record_expected_hash(&pingap_outcome.expected_hash);
+            }
             () = cancel.cancelled() => bail!("Orchestration cancelled"),
         }
 

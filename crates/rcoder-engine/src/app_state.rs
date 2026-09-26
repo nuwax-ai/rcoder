@@ -58,6 +58,10 @@ pub struct AppState {
     pub projects: Arc<ProjectStoreBackend>,
     /// Pingora 代理服务引用（用于读取真实指标）
     pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
+    /// UserApp 错误页存储/加载服务（配置了 `userapp_error_page` 段才装配；
+    /// 与 Pingora 错误出口、Axus 管理面共享同一实例）。None = 内置页兜底 +
+    /// 管理上传明确返回存储未配置。
+    pub userapp_error_page: Option<Arc<crate::userapp_error_page::UserAppErrorPageService>>,
     /// gRPC 连接池（用于与 agent_runner 通信）
     pub grpc_pool: Arc<crate::grpc::GrpcChannelPool>,
     /// Session 级共享 SSE 流注册表（每 session 一条 agent_runner SubscribeProgress 流，
@@ -130,6 +134,16 @@ impl AppState {
                 anyhow::anyhow!("failed to initialize agent download manager: {}", e)
             })?);
 
+        // UserApp 错误页存储/加载服务（配置段缺失 → None：内置页兜底）。
+        let userapp_error_page = match &config.userapp_error_page {
+            Some(page_config) => Some(Arc::new(
+                crate::userapp_error_page::UserAppErrorPageService::new(page_config).map_err(
+                    |error| anyhow::anyhow!("invalid userapp_error_page config: {error:#}"),
+                )?,
+            )),
+            None => None,
+        };
+
         // 初始化应用管理服务（Docker / K8s 统一构造，运行时由 access_mode 决定行为）。
         // 保留具体类型 Arc：dev_locator 注入需要在其上调用 inherent setter
         // （发生在下方 Self Arc 包装之后——locator 以 Weak 回指 state）。
@@ -184,7 +198,8 @@ impl AppState {
             userapp_recovery_handle: Arc::new(std::sync::Mutex::new(None)),
             config,
             projects,
-            pingora_service: pingora,
+            pingora_service: pingora.clone(),
+            userapp_error_page,
             grpc_pool: Arc::new(crate::grpc::GrpcChannelPool::new()),
             session_stream_registry: Arc::new(crate::grpc::SessionStreamRegistry::new()),
             api_key_config,
@@ -209,6 +224,12 @@ impl AppState {
 
         app_service_arc.set_builder_recovery(Arc::new(
             crate::userapp_builder::retry::PendingBuilderRecovery::new(Arc::downgrade(&state)),
+        ))?;
+
+        // 业务就绪只读观察回调（/{app_id}/{app_stage}/readiness）：按部署形态
+        // 定位当前物理实例并查询 app-cli。Weak 挂接同 dev_locator（防引用环）。
+        app_service_arc.set_readiness_reader(Arc::new(
+            crate::userapp_readiness::UserAppReadinessReaderImpl::new(Arc::downgrade(&state)),
         ))?;
         let recovery_handle =
             crate::userapp_builder::start_recovery(Arc::downgrade(&state), shutdown_tx.subscribe());

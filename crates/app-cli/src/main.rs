@@ -29,6 +29,23 @@ async fn main() -> anyhow::Result<()> {
             let _guard = init_tracing(&args.log_dir);
             return app_cli::run_service::run(&args.release_id, &args.service_id, &args.log_dir);
         }
+        // 纯只读查询：在运行初始化/日志目录/owner 获取之前分派——无人监听时
+        // 不启动 owner（Plan §5.3）；结果 JSON 写 stdout、诊断写 stderr。
+        app_cli::config::Command::Readiness(args) => {
+            return match app_cli::readiness_query::run(&args.admin_addr).await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    eprintln!("readiness query failed: [{}] {}", error.code, error.message);
+                    let structured = serde_json::json!({
+                        "error": true,
+                        "code": error.code,
+                        "message": error.message,
+                    });
+                    println!("{structured}");
+                    std::process::exit(error.exit_code);
+                }
+            };
+        }
         app_cli::config::Command::Journal {
             command: app_cli::config::JournalCommand::Adopt(args),
         } => {

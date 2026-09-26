@@ -36,6 +36,7 @@ use crate::server::{DeployRequest, ServerState};
 
 mod envelope;
 mod proxy;
+mod readiness;
 mod runtime;
 
 use envelope::ApiJson;
@@ -54,6 +55,7 @@ use envelope::ApiJson;
         proxy::status,
         proxy::effective_config,
         proxy::upstreams,
+        readiness::readiness,
         runtime::identity,
         runtime::status,
         runtime::recovery,
@@ -73,12 +75,19 @@ use envelope::ApiJson;
         DeployAcceptedData,
 
         crate::server::DeployStatus,
+
+        shared_types::UserAppBusinessReadiness,
+        shared_types::UserAppProxyReadiness,
+        shared_types::UserAppServiceReadiness,
+        shared_types::UserAppReadinessStatus,
+        shared_types::UserAppReadinessReason,
     )),
     tags(
         (name = "Runtime Logs", description = "Multi-service declared file logs"),
         (name = "Runtime Proxy", description = "Pingap validation and runtime status"),
         (name = "Runtime Deploy", description = "Hot deploy without pod replacement"),
-        (name = "Runtime Control", description = "Single runtime owner operations (start/restart/deploy/stop)")
+        (name = "Runtime Control", description = "Single runtime owner operations (start/restart/deploy/stop)"),
+        (name = "Runtime Readiness", description = "Read-only business readiness observation")
     )
 )]
 struct ApiDoc;
@@ -88,6 +97,8 @@ pub(super) struct AppState {
     server: Arc<ServerState>,
     pingap_bin: PathBuf,
     log_dir: PathBuf,
+    /// 业务就绪观察器（进程级单例语义；bind 时装配）。
+    readiness: Arc<crate::business_readiness::BusinessReadinessObserver>,
 }
 
 impl AppState {
@@ -121,9 +132,12 @@ pub async fn bind(
     // an operation selects the actual execution workspace/profile.
     server.set_proxy_context(workspace, crate::supervisor::dev_run_profile());
     let state = AppState {
-        server,
+        server: server.clone(),
         pingap_bin,
         log_dir,
+        readiness: Arc::new(crate::business_readiness::BusinessReadinessObserver::new(
+            server,
+        )),
     };
     let app = api_router(state);
     let listener = tokio::net::TcpListener::bind(addr)
@@ -167,6 +181,7 @@ fn api_router(state: AppState) -> Router {
         .route("/v1/proxy/status", get(proxy::status))
         .route("/v1/proxy/effective-config", get(proxy::effective_config))
         .route("/v1/proxy/upstreams", get(proxy::upstreams))
+        .route("/v1/app/readiness", get(readiness::readiness))
         .route("/v1/deploy", post(submit_deploy))
         .route("/v1/deploy/status", get(deploy_status))
         .route("/v1/runtime/identity", get(runtime::identity))
@@ -582,8 +597,12 @@ mod tests {
 
     /// idle 态 AppState（无 release）：日志空集、proxy 端点走 idle 降级错误。
     fn test_state() -> AppState {
+        let server = Arc::new(ServerState::new(RuntimeStatusService::default()));
         AppState {
-            server: Arc::new(ServerState::new(RuntimeStatusService::default())),
+            readiness: Arc::new(crate::business_readiness::BusinessReadinessObserver::new(
+                server.clone(),
+            )),
+            server,
             pingap_bin: PathBuf::from("/bin/true"),
             log_dir: tempfile::tempdir().unwrap().keep(),
         }
@@ -649,6 +668,35 @@ mod tests {
         assert_eq!(body["tid"], serde_json::Value::Null);
         assert!(body["data"]["logs"].as_array().unwrap().is_empty());
         assert_eq!(body["data"].as_object().unwrap().len(), 4);
+    }
+
+    /// 业务就绪查询（idle 空 owner）：观察成功 200 + ready=false + not_deployed
+    /// ——查询完成与业务可用分开；不依赖 release/探测。
+    #[tokio::test]
+    async fn readiness_idle_empty_owner_reports_not_deployed() {
+        let state = test_state();
+        // 空 owner 的稳态（初始化完成后）：真实形态在 bind 后 mark_initialized。
+        state.server.mark_initialized();
+        let (status, body) = call(&state, "GET", "/v1/app/readiness", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["code"], "0000");
+        assert_eq!(body["data"]["ready"], false);
+        assert_eq!(body["data"]["status"], "not_deployed");
+        assert_eq!(body["data"]["runtime_instance_id"], serde_json::Value::Null);
+        // OpenAPI 文档同步注册
+        let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        assert!(document["paths"].get("/v1/app/readiness").is_some());
+    }
+
+    /// 初始化恢复期（API 先于恢复 bind，P1-01）：仍能应答 starting——不等待
+    /// kernel 恢复完成，也不宣称任何业务事实。
+    #[tokio::test]
+    async fn readiness_during_initialization_reports_starting() {
+        let state = test_state();
+        let (status, body) = call(&state, "GET", "/v1/app/readiness", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["status"], "starting");
+        assert_eq!(body["data"]["reason_code"], "SERVICE_STARTING");
     }
 
     /// sources/query 端点信封：idle 态编排器内置源（app-cli/orchestrator）可见
