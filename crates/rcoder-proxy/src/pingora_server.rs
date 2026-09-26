@@ -239,6 +239,7 @@ impl ProxyHttp for ProxyServiceWrapper {
                     crate::error_page::ErrorPageCause::Generic,
                     "upstream unavailable during connection recovery",
                     Some(15),
+                    &format!("connect error: {error}"),
                 )
                 .await;
             return FailToProxy {

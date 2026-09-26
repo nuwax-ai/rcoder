@@ -286,6 +286,7 @@ fn accepts_text_html(accept: &str) -> bool {
 /// - HEAD：对应状态和响应头，无正文；
 /// - 写失败只记录——绝不二次发送第二份响应（连接由 Pingora 收尾）；
 /// - 渲染从内存快照读取，不做任何 IO，不延长已耗尽的代理 deadline。
+#[allow(clippy::too_many_arguments)]
 pub async fn write_error_response(
     session: &mut Session,
     renderer: &ErrorPageRenderer,
@@ -294,6 +295,7 @@ pub async fn write_error_response(
     reason: &str,
     retry_after_secs: Option<u64>,
     context: &str,
+    detail: &str,
 ) -> () {
     // 响应已开始（上游中途断流等）：绝不再写第二份响应——正文追加会污染
     // 截断的原始流。守卫语义与 pingora-core write_error_response（server.rs
@@ -374,10 +376,13 @@ pub async fn write_error_response(
     if let Some(seconds) = retry_after_secs {
         insert!("retry-after", seconds.to_string());
     }
+    // detail 只进日志（错误链可能含内部地址/上游细节，不进页面与响应体）：
+    // 用户报障给编号 → grep 一条命中即可读到根因线索，无须二次排查。
     tracing::error!(
         diagnostic_id = %diagnostic_id,
         %status,
         reason,
+        detail,
         context,
         representation = ?representation,
         "userapp proxy failure response"

@@ -4,59 +4,214 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<title>{{RCODER_TITLE}} ({{RCODER_STATUS}})</title>
+<title>{{RCODER_TITLE}} · {{RCODER_STATUS}}</title>
 <style>
-  :root { color-scheme: light dark; }
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f7f8; --panel: #ffffff; --text: #18181b; --muted: #71717a;
+    --line: #e4e4e7; --accent: #2563eb; --accent-hover: #1d4ed8;
+    --ok: #16a34a; --warn: #d97706; --idle: #9ca3af; --bad: #dc2626;
+    --chip: #f4f4f5; --card-shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 28px rgba(0,0,0,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b0b0e; --panel: #121215; --text: #f4f4f5; --muted: #a1a1aa;
+      --line: #27272a; --accent: #3b82f6; --accent-hover: #60a5fa;
+      --ok: #4ade80; --warn: #fbbf24; --idle: #71717a; --bad: #f87171;
+      --chip: #1c1c1f; --card-shadow: 0 1px 2px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.35);
+    }
+  }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; }
   body {
-    font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text);
     display: flex; align-items: center; justify-content: center;
-    background: #f6f7f9; color: #1f2328;
-  }
-  @media (prefers-color-scheme: dark) {
-    body { background: #0d1117; color: #e6edf3; }
-    .card { background: #161b22 !important; border-color: #30363d !important; }
-    .diag { color: #8b949e !important; }
+    -webkit-font-smoothing: antialiased; padding: 24px;
   }
   .card {
-    background: #ffffff; border: 1px solid #d0d7de; border-radius: 12px;
-    padding: 32px 28px; max-width: 460px; width: calc(100% - 32px); text-align: center;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 16px; padding: 34px 32px 26px;
+    max-width: 460px; width: 100%; text-align: center;
+    box-shadow: var(--card-shadow);
+    animation: rise .3s ease-out;
   }
-  .icon { font-size: 40px; line-height: 1; margin-bottom: 16px; }
-  h1 { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
-  p { font-size: 14px; line-height: 1.7; margin-bottom: 20px; }
-  .status {
-    display: inline-block; font-size: 12px; font-weight: 600;
-    background: #fff1f0; color: #cf1322; border: 1px solid #ffa39e;
-    border-radius: 999px; padding: 2px 10px; margin-bottom: 16px;
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } }
+  .badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    color: var(--bad);
+    border: 1px solid currentColor; border-radius: 999px;
+    padding: 4px 14px;
+    font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums;
+    letter-spacing: .02em;
   }
-  @media (prefers-color-scheme: dark) {
-    .status { background: #3a1d1d; color: #ff7875; border-color: #5c2b2b; }
+  .badge .dot {
+    width: 7px; height: 7px; border-radius: 50%; background: currentColor;
+    animation: pulse 2s ease-in-out infinite;
   }
+  @keyframes pulse { 50% { opacity: .35; } }
+  h1 { font-size: 21px; font-weight: 650; margin: 18px 0 6px; letter-spacing: -.01em; }
+  p.sub { font-size: 13.5px; line-height: 1.7; color: var(--muted); margin-bottom: 26px; }
+  /* ── 链路诊断：浏览器 → 网关 → 应用 ─────────────────────── */
+  .chain {
+    display: flex; align-items: flex-start; justify-content: center;
+    margin-bottom: 26px;
+  }
+  .node { display: flex; flex-direction: column; align-items: center; gap: 6px; width: 76px; }
+  .node .ring {
+    width: 36px; height: 36px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 15px; font-weight: 700; line-height: 1;
+  }
+  .node .name { font-size: 12.5px; font-weight: 600; }
+  .node .state { font-size: 11.5px; }
+  .node.ok .ring {
+    color: var(--ok); border: 1.5px solid var(--ok);
+    background: transparent; background: color-mix(in srgb, var(--ok) 10%, transparent);
+  }
+  .node.ok .state { color: var(--ok); }
+  .node.bad .ring {
+    color: var(--bad); border: 1.5px solid var(--bad);
+    background: transparent; background: color-mix(in srgb, var(--bad) 10%, transparent);
+    animation: ring-pulse 2s ease-in-out infinite;
+  }
+  .node.bad .state { color: var(--bad); }
+  @keyframes ring-pulse { 50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--bad) 12%, transparent); } }
+  .node.warn .ring {
+    color: var(--warn); border: 1.5px solid var(--warn);
+    background: transparent; background: color-mix(in srgb, var(--warn) 10%, transparent);
+  }
+  .node.warn .state { color: var(--warn); }
+  .node.warn .ring .spin {
+    width: 14px; height: 14px; border-radius: 50%;
+    border: 2px solid color-mix(in srgb, var(--warn) 30%, transparent);
+    border-top-color: var(--warn);
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .node.idle .ring {
+    color: var(--idle); border: 1.5px solid var(--idle);
+    background: transparent; background: color-mix(in srgb, var(--idle) 10%, transparent);
+  }
+  .node.idle .state { color: var(--muted); }
+  .node.idle .ring .bar {
+    width: 12px; height: 3px; border-radius: 2px; background: var(--idle);
+  }
+  .link { flex: none; width: 36px; height: 2px; background: var(--line); margin-top: 17px; }
+  .link.bad {
+    background: linear-gradient(90deg, var(--line), var(--bad));
+  }
+  .link.warn {
+    background: linear-gradient(90deg, var(--line), var(--warn));
+  }
+  /* ── 操作 ─────────────────────────────────────────────── */
+  .actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
   button {
-    font: inherit; font-size: 14px; cursor: pointer;
-    background: #1f6feb; color: #fff; border: 1px solid rgba(31, 111, 235, 0.5);
-    border-radius: 8px; padding: 8px 22px;
+    font: inherit; font-size: 14px; font-weight: 550; cursor: pointer;
+    border-radius: 10px; padding: 9px 24px;
+    transition: background .15s ease, transform .05s ease;
   }
-  button:hover { background: #1a5fd0; }
-  button:active { transform: translateY(1px); }
-  .diag { margin-top: 18px; font-size: 12px; color: #57606a; }
-  code {
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .primary { background: var(--accent); color: #fff; border: 1px solid var(--accent); }
+  .primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+  .primary:active { transform: translateY(1px); }
+  /* ── 诊断编号 ─────────────────────────────────────────── */
+  footer { margin-top: 24px; font-size: 12px; color: var(--muted); }
+  .hint { display: block; margin-bottom: 6px; font-size: 11.5px; opacity: .85; }
+  .diag {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--chip); border: 1px solid var(--line);
+    border-radius: 8px; padding: 4px 10px;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    background: rgba(110, 118, 129, 0.12); border-radius: 4px; padding: 1px 6px;
-    user-select: all;
+    font-size: 12px; cursor: pointer;
+    transition: border-color .15s ease;
+  }
+  .diag:hover { border-color: var(--muted); }
+  .diag .id { user-select: all; }
+  .diag .copy { color: var(--muted); font-family: inherit; font-size: 12px; }
+  .brand {
+    margin-top: 18px; font-size: 11px; letter-spacing: .16em;
+    color: var(--muted); opacity: .6;
+  }
+  /* 窄 iframe / 小屏：链路收紧 */
+  @media (max-width: 380px) {
+    .card { padding: 26px 18px 22px; }
+    .node { width: 58px; }
+    .link { width: 18px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .card, .badge .dot, .node.bad .ring, .node.warn .ring .spin { animation: none; }
   }
 </style>
 </head>
 <body>
 <main class="card">
-  <div class="icon">&#9888;&#65039;</div>
-  <span class="status">HTTP {{RCODER_STATUS}}</span>
+  <span class="badge"><span class="dot" aria-hidden="true"></span>HTTP {{RCODER_STATUS}}</span>
   <h1>{{RCODER_TITLE}}</h1>
-  <p>{{RCODER_MESSAGE}}</p>
-  <button type="button" onclick="location.reload()">重新访问</button>
-  <div class="diag">诊断编号 <code>{{RCODER_DIAGNOSTIC_ID}}</code></div>
+  <p class="sub">{{RCODER_MESSAGE}}</p>
+  <div class="chain" role="img" aria-label="链路诊断：浏览器与网关正常，应用服务当前不可用">
+    <div class="node ok">
+      <span class="ring" aria-hidden="true">✓</span>
+      <span class="name">浏览器</span><span class="state">已连接</span>
+    </div>
+    <span class="link" aria-hidden="true"></span>
+    <div class="node ok">
+      <span class="ring" aria-hidden="true">✓</span>
+      <span class="name">网关</span><span class="state">正常</span>
+    </div>
+    <span class="link bad" id="link-app" aria-hidden="true"></span>
+    <div class="node bad" id="node-app">
+      <span class="ring" id="node-app-glyph" aria-hidden="true">✕</span>
+      <span class="name">应用服务</span><span class="state" id="node-app-state">不可用</span>
+    </div>
+  </div>
+  <div class="actions">
+    <button class="primary" type="button" onclick="location.reload()">重新访问</button>
+  </div>
+  <footer>
+    <span class="hint">联系维护者时请附上此编号，便于定位本次请求</span>
+    <span class="diag" onclick="copyDiag(this)" role="button" tabindex="0">
+      <span class="id">{{RCODER_DIAGNOSTIC_ID}}</span><span class="copy">复制</span>
+    </span>
+  </footer>
+  <div class="brand">RCODER</div>
 </main>
+<script>
+// 链路第三节点按失败原因呈现（原因由标题文案承载——四种固定文案）：
+// 启动中 → 琥珀色加载环；已停止 → 灰色暂停条；启动失败/不可用 → 红✕脉冲。
+// 无 JS 或未命中时保持默认红✕不可用（通用兜底）。
+(function () {
+  var title = '';
+  try { title = document.querySelector('h1').textContent || ''; } catch (e) {}
+  var node = document.getElementById('node-app');
+  var glyph = document.getElementById('node-app-glyph');
+  var state = document.getElementById('node-app-state');
+  var link = document.getElementById('link-app');
+  if (title.indexOf('正在启动') !== -1) {
+    node.className = 'node warn';
+    glyph.innerHTML = '<span class="spin"></span>';
+    state.textContent = '启动中';
+    link.className = 'link warn';
+  } else if (title.indexOf('已停止') !== -1) {
+    node.className = 'node idle';
+    glyph.innerHTML = '<span class="bar"></span>';
+    state.textContent = '已停止';
+    link.className = 'link';
+  } else if (title.indexOf('启动失败') !== -1) {
+    state.textContent = '启动失败';
+  }
+})();
+function copyDiag(chip) {
+  var text = chip.querySelector('.id').textContent.trim();
+  var label = chip.querySelector('.copy');
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(text).then(function () {
+      label.textContent = '已复制';
+      setTimeout(function () { label.textContent = '复制'; }, 1200);
+    });
+  }
+}
+</script>
 </body>
 </html>

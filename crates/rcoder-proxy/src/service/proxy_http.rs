@@ -18,8 +18,6 @@ use crate::router::RouteType;
 
 use super::{PortProxy, ProdConnectRecovery, TrackingCtx, utils};
 
-/// 唤醒超时/失败时 503 响应的 Retry-After(秒)。客户端据此延后重试(app 仍在后台启动)。
-const WAKE_503_RETRY_AFTER_SECS: &str = "15";
 const CONNECT_RECOVERY_RETRY_DELAY: Duration = Duration::from_millis(250);
 const CONNECT_RECOVERY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -145,9 +143,17 @@ impl ProxyHttp for PortProxy {
                     match tokio::time::timeout_at(deadline, wc.remote_wake_pending(&app_id)).await {
                         Ok(pending) => pending,
                         Err(_) => {
-                            let mut resp = ResponseHeader::build(503, None)?;
-                            resp.insert_header("Retry-After", WAKE_503_RETRY_AFTER_SECS)?;
-                            session.write_response_header(Box::new(resp), true).await?;
+                            // 唤醒状态查询超时：503 + 友好表示（真实状态保留）
+                            self.respond_userapp_error(
+                                session,
+                                ctx,
+                                503,
+                                crate::error_page::ErrorPageCause::Generic,
+                                "wake status check timed out",
+                                Some(15),
+                                "remote_wake_pending exceeded the wake deadline",
+                            )
+                            .await;
                             return Ok(true);
                         }
                     }
@@ -172,6 +178,14 @@ impl ProxyHttp for PortProxy {
                     )
                     | Err(_) => {
                         // 未获得可用上游（包括操作占用）；返回 503，不宣称仍在启动。
+                        let detail = if wake_pending {
+                            "wake ensure_running did not reach Ready before the deadline"
+                                .to_string()
+                        } else {
+                            format!(
+                                "wake ensure_running outcome was not Ready (pending={wake_pending})"
+                            )
+                        };
                         self.respond_userapp_error(
                             session,
                             ctx,
@@ -179,6 +193,7 @@ impl ProxyHttp for PortProxy {
                             crate::error_page::ErrorPageCause::Generic,
                             "wake did not produce a ready upstream",
                             Some(15),
+                            &detail,
                         )
                         .await;
                         return Ok(true); // 已直接响应，跳过 upstream
@@ -381,6 +396,8 @@ impl ProxyHttp for PortProxy {
                 crate::error_page::ErrorPageCause::Generic,
                 &reason,
                 None,
+                // 错误链完整进日志（可能含内部地址——只进日志不进页面）
+                &format!("pingora error: {error}"),
             )
             .await;
             return pingora_proxy::FailToProxy {
@@ -721,6 +738,7 @@ impl PortProxy {
     ///
     /// 未装配错误页呈现器时保持旧的极简响应（header-only）——能力接入前
     /// 行为零回退。真实状态码保留；HEAD 无正文；写失败不二次发送。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn respond_userapp_error(
         &self,
         session: &mut Session,
@@ -729,6 +747,7 @@ impl PortProxy {
         cause: crate::error_page::ErrorPageCause,
         reason: &str,
         retry_after_secs: Option<u64>,
+        detail: &str,
     ) {
         // 文案证据：失败顾问有当前实例观察时用确定文案（starting/stopped/
         // failed）；Generic 入参或无证据一律通用文案（不凭连接拒绝宣称启动中）。
@@ -768,6 +787,7 @@ impl PortProxy {
                 reason,
                 retry_after_secs,
                 &context,
+                detail,
             )
             .await;
             return;
