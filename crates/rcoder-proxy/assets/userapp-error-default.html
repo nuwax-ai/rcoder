@@ -130,10 +130,6 @@
   .diag:hover { border-color: var(--muted); }
   .diag .id { user-select: all; }
   .diag .copy { color: var(--muted); font-family: inherit; font-size: 12px; }
-  .brand {
-    margin-top: 18px; font-size: 11px; letter-spacing: .16em;
-    color: var(--muted); opacity: .6;
-  }
   /* 窄 iframe / 小屏：链路收紧 */
   @media (max-width: 380px) {
     .card { padding: 26px 18px 22px; }
@@ -175,7 +171,6 @@
       <span class="id">{{RCODER_DIAGNOSTIC_ID}}</span><span class="copy">复制</span>
     </span>
   </footer>
-  <div class="brand">RCODER</div>
 </main>
 <script>
 // 链路第三节点按失败原因呈现（原因由标题文案承载——四种固定文案）：
