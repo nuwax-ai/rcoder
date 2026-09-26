@@ -104,10 +104,17 @@ cleanup() {
     docker compose -p "${project}" -f "${compose_file}" logs --no-color > "${report_dir}/logs/compose.log" 2>&1 || true
   fi
   if [[ "${status}" -ne 0 && ! -f "${report_dir}/summary.md" ]]; then
+    # Conservative attribution: only registry/container/network phases are counted as
+    # environment failures. An image build can fail from a source defect in either
+    # implementation, so it keeps its own kind and requires reading logs/build.log;
+    # the comparison phase is never auto-classified as an environment failure.
     failure_kind="setup"
     case "${phase}" in
-      resolve-node-image|resolve-rust-builder-image|build-image-set|prepare-pnpm-volumes|start-containers|validate-pnpm-store|validate-pnpm-concurrency|validate-pnpm-registry|validate-runtime-home|validate-runtime-parity)
+      resolve-node-image|resolve-rust-builder-image|prepare-pnpm-volumes|start-containers|validate-pnpm-store|validate-pnpm-concurrency|validate-pnpm-registry|validate-runtime-home|validate-runtime-parity)
         failure_kind="environment"
+        ;;
+      build-image-set)
+        failure_kind="image-build"
         ;;
       run-selected-suites)
         failure_kind="comparison-runner"

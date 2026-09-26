@@ -1,4 +1,293 @@
 {
   "schema_version": 1,
-  "rules": []
+  "rules": [
+    {
+      "case": "computer-file-list-all",
+      "path": "/files/outside-link.txt",
+      "kind": "ts_only",
+      "expected_rust": {
+        "$missing": true
+      },
+      "expected_typescript": {
+        "name": "outside-link.txt",
+        "isDir": false,
+        "fileProxyUrl": "/proxy/outside-link.txt",
+        "isLink": true
+      },
+      "reason": "approved: Rust keeps the workspace boundary; TypeScript exposing an outside-root symlink is a known TS defect",
+      "reviewed_by": "claude-ab-convergence-2026-09-26",
+      "expires_on": "2026-12-31"
+    },
+    {
+      "case": "computer-file-list-boundary-fixtures",
+      "path": "/files/outside-link.txt",
+      "kind": "ts_only",
+      "expected_rust": {
+        "$missing": true
+      },
+      "expected_typescript": {
+        "name": "outside-link.txt",
+        "isDir": false,
+        "fileProxyUrl": "/proxy/outside-link.txt",
+        "isLink": true
+      },
+      "reason": "approved: Rust keeps the workspace boundary; TypeScript exposing an outside-root symlink is a known TS defect",
+      "reviewed_by": "claude-ab-convergence-2026-09-26",
+      "expires_on": "2026-12-31"
+    },
+    {
+      "case": "computer-resolve-file-symlink-outside-root",
+      "path": "/exists",
+      "kind": "value",
+      "expected_rust": false,
+      "expected_typescript": true,
+      "reason": "approved: Rust reports exists=false for outside-root symlink targets; TS follows it (known TS defect)",
+      "reviewed_by": "claude-ab-convergence-2026-09-26",
+      "expires_on": "2026-12-31"
+    },
+    {
+      "case": "computer-resolve-file-symlink-outside-root",
+      "path": "/fileProxyUrl",
+      "kind": "ts_only",
+      "expected_rust": {
+        "$missing": true
+      },
+      "expected_typescript": "/proxy/outside-link.txt",
+      "reason": "approved: Rust keeps the workspace boundary (known TS defect)",
+      "reviewed_by": "claude-ab-convergence-2026-09-26",
+      "expires_on": "2026-12-31"
+    },
+    {
+      "case": "computer-resolve-file-symlink-outside-root",
+      "path": "/name",
+      "kind": "ts_only",
+      "expected_rust": {
+        "$missing": true
+      },
+      "expected_typescript": "outside-link.txt",
+      "reason": "approved: Rust keeps the workspace boundary (known TS defect)",
+      "reviewed_by": "claude-ab-convergence-2026-09-26",
+      "expires_on": "2026-12-31"
+    },
+    {
+      "case": "computer-generate-file-utf8",
+      "path": "/fileSize",
+      "kind": "value",
+      "expected_rust": 15,
+      "expected_typescript": 11,
+      "reason": "approved: fileSize is defined by byte size; TS counting UTF-16 code units is a known TS defect",
+      "reviewed_by": "claude-ab-convergence-2026-09-26",
+      "expires_on": "2026-12-31"
+    },
+    {
+      "case": "fs-children",
+      "path": "/entries/.tmp",
+      "kind": "ts_only",
+      "expected_rust": {
+        "$missing": true
+      },
+      "expected_typescript": {
+        "name": ".tmp",
+        "path": "/data/computer-workspace/file-server-ab-user/file-server-ab-session/.tmp",
+        "isDir": true,
+        "isSymlink": false
+      },
+      "reason": "approved: TypeScript leaves a .tmp scratch directory inside the session workspace; Rust cleans up",
+      "reviewed_by": "claude-ab-convergence-2026-09-26",
+      "expires_on": "2026-12-31"
+    },
+    {
+      "case": "project-delete-owned-fixture",
+      "path": "/deletedDirectories/1",
+      "kind": "ts_only",
+      "expected_rust": {
+        "$missing": true
+      },
+      "expected_typescript": "/data/logs/project/file-server-ab-project-delete",
+      "reason": "approved: TS also lists the project log directory; Java consumers read only success/message (verified 2026-09-26)",
+      "reviewed_by": "claude-ab-convergence-2026-09-26",
+      "expires_on": "2026-12-31"
+    },
+    {
+      "case": "workspace-state",
+      "path": "/computer-workspace/file-server-ab-user/file-server-ab-import-session/.tmp",
+      "kind": "ts_only",
+      "expected_rust": {
+        "$missing": true
+      },
+      "expected_typescript": {
+        "path": "computer-workspace/file-server-ab-user/file-server-ab-import-session/.tmp",
+        "kind": "directory",
+        "sha256": null,
+        "size_bytes": null,
+        "mode": "0755",
+        "symlink_target": null
+      },
+      "reason": "approved: TypeScript runtime residue (temp dirs / retained upload zips); Rust cleans these paths",
+      "reviewed_by": "claude-ab-convergence-2026-09-26",
+      "expires_on": "2026-12-31"
+    },
+    {
+      "case": "workspace-state",
+      "path": "/computer-workspace/file-server-ab-user/file-server-ab-package-session/.tmp",
+      "kind": "ts_only",
+      "expected_rust": {
+        "$missing": true
+      },
+      "expected_typescript": {
+        "path": "computer-workspace/file-server-ab-user/file-server-ab-package-session/.tmp",
+        "kind": "directory",
+        "sha256": null,
+        "size_bytes": null,
+        "mode": "0755",
+        "symlink_target": null
+      },
+      "reason": "approved: TypeScript runtime residue (temp dirs / retained upload zips); Rust cleans these paths",
+      "reviewed_by": "claude-ab-convergence-2026-09-26",
+      "expires_on": "2026-12-31"
+    },
+    {
+      "case": "workspace-state",
+      "path": "/computer-workspace/file-server-ab-user/file-server-ab-session/.tmp",
+      "kind": "ts_only",
+      "expected_rust": {
+        "$missing": true
+      },
+      "expected_typescript": {
+        "path": "computer-workspace/file-server-ab-user/file-server-ab-session/.tmp",
+        "kind": "directory",
+        "sha256": null,
+        "size_bytes": null,
+        "mode": "0755",
+        "symlink_target": null
+      },
+      "reason": "approved: TypeScript runtime residue (temp dirs / retained upload zips); Rust cleans these paths",
+      "reviewed_by": "claude-ab-convergence-2026-09-26",
+      "expires_on": "2026-12-31"
+    },
+    {
+      "case": "workspace-state",
+      "path": "/project-zips/file-server-ab-project-upload",
+      "kind": "ts_only",
+      "expected_rust": {
+        "$missing": true
+      },
+      "expected_typescript": {
+        "path": "project-zips/file-server-ab-project-upload",
+        "kind": "directory",
+        "sha256": null,
+        "size_bytes": null,
+        "mode": "0755",
+        "symlink_target": null
+      },
+      "reason": "approved: TypeScript runtime residue (temp dirs / retained upload zips); Rust cleans these paths",
+      "reviewed_by": "claude-ab-convergence-2026-09-26",
+      "expires_on": "2026-12-31"
+    },
+    {
+      "case": "workspace-state",
+      "path": "/project-zips/file-server-ab-project-upload/file-server-ab-project-upload-v5.zip",
+      "kind": "ts_only",
+      "expected_rust": {
+        "$missing": true
+      },
+      "expected_typescript": {
+        "path": "project-zips/file-server-ab-project-upload/file-server-ab-project-upload-v5.zip",
+        "kind": "file",
+        "sha256": "semantic-zip:e3dc247cc18f8c51857f96446695103e28852785b65117eaf877176a78843ff3",
+        "size_bytes": null,
+        "mode": "0644",
+        "symlink_target": null
+      },
+      "reason": "approved: TypeScript runtime residue (temp dirs / retained upload zips); Rust cleans these paths",
+      "reviewed_by": "claude-ab-convergence-2026-09-26",
+      "expires_on": "2026-12-31"
+    },
+    {
+      "case": "workspace-state",
+      "path": "/project-zips/file-server-ab-react",
+      "kind": "ts_only",
+      "expected_rust": {
+        "$missing": true
+      },
+      "expected_typescript": {
+        "path": "project-zips/file-server-ab-react",
+        "kind": "directory",
+        "sha256": null,
+        "size_bytes": null,
+        "mode": "0755",
+        "symlink_target": null
+      },
+      "reason": "approved: TypeScript runtime residue (temp dirs / retained upload zips); Rust cleans these paths",
+      "reviewed_by": "claude-ab-convergence-2026-09-26",
+      "expires_on": "2026-12-31"
+    },
+    {
+      "case": "workspace-state",
+      "path": "/project-workspace/file-server-ab-project-copy/.agents/.sync_version",
+      "kind": "rust_only",
+      "expected_rust": {
+        "path": "project-workspace/file-server-ab-project-copy/.agents/.sync_version",
+        "kind": "file",
+        "sha256": "de48f1b33027f574e462e35670b86192991e03d6a293f77534c31350cd66ec87",
+        "size_bytes": 24,
+        "mode": "0644",
+        "symlink_target": null
+      },
+      "expected_typescript": {
+        "$missing": true
+      },
+      "reason": "approved: Rust agent-sync marker retained in copies (additive state, no TS counterpart)",
+      "reviewed_by": "claude-ab-convergence-2026-09-26",
+      "expires_on": "2026-12-31"
+    },
+    {
+      "case": "workspace-state",
+      "path": "/project-workspace/file-server-ab-project-lifecycle/.agents/.sync_version",
+      "kind": "rust_only",
+      "expected_rust": {
+        "path": "project-workspace/file-server-ab-project-lifecycle/.agents/.sync_version",
+        "kind": "file",
+        "sha256": "de48f1b33027f574e462e35670b86192991e03d6a293f77534c31350cd66ec87",
+        "size_bytes": 24,
+        "mode": "0644",
+        "symlink_target": null
+      },
+      "expected_typescript": {
+        "$missing": true
+      },
+      "reason": "approved: Rust agent-sync marker retained in copies (additive state, no TS counterpart)",
+      "reviewed_by": "claude-ab-convergence-2026-09-26",
+      "expires_on": "2026-12-31"
+    },
+    {
+      "case": "workspace-state",
+      "path": "/project-workspace/file-server-ab-project-copy/packages/frontend/package-lock.json",
+      "kind": "rust_only",
+      "expected_rust": {
+        "path": "project-workspace/file-server-ab-project-copy/packages/frontend/package-lock.json",
+        "kind": "file",
+        "sha256": "f25e7d293543b03d1a2cab20f9827739fd644af8400382bc4f6a5124e46aead0",
+        "size_bytes": 22,
+        "mode": "0644",
+        "symlink_target": null
+      },
+      "expected_typescript": {
+        "$missing": true
+      },
+      "reason": "approved: project copy preserves nested lockfiles for reproducible installs (intentional Rust behavior, approved earlier)",
+      "reviewed_by": "claude-ab-convergence-2026-09-26",
+      "expires_on": "2026-12-31"
+    },
+    {
+      "case": "git-status-before-first-commit",
+      "path": "/untracked/2",
+      "kind": "value",
+      "expected_rust": "src/index.html",
+      "expected_typescript": "src/",
+      "reason": "approved: Rust reports leaf paths for untracked files (nuwax-client buildChangeFileTree cannot represent the trailing-slash directory entries TS's default git status emits); directory-level folding would also need a recursive discard contract",
+      "reviewed_by": "claude-ab-convergence-2026-09-26",
+      "expires_on": "2026-12-31"
+    }
+  ]
 }

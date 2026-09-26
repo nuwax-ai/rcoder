@@ -303,10 +303,10 @@ pub fn log_history(
             .message_raw()
             .map_err(|e| map_git_err(e, "git message"))?
             .to_string();
-        // isomorphic-git 的 `readCommit()` 会把提交消息作为完整消息段返回，
-        // 其序列化的 commit message 末尾带换行。API 保留该可见格式。
-        if !message.ends_with('\n') {
-            message.push('\n');
+        // TS nativeLog 用 `--format=%B` 后 `.replace(/\n$/, "")` 去掉一个尾部换行;
+        // gix message_raw 同样携带提交对象的尾部换行，去掉后与 TS API 契约一致。
+        if message.ends_with('\n') {
+            message.pop();
         }
         let author = commit.author().map_err(|e| map_git_err(e, "git author"))?;
         let secs = commit

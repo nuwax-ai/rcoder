@@ -116,6 +116,18 @@ impl MetaListType {
             Self::Dir => "dir",
         }
     }
+
+    /// 解析归一化后的类型串 (小写、已 trim): `""`/`all` → All、`file` → File、
+    /// `dir`/`directory` → Dir；其余 `None`。错误契约 (文案/details.value) 由调用层
+    /// 构造，纯转换在此独立测试。
+    pub fn parse_normalized(normalized: &str) -> Option<Self> {
+        match normalized {
+            "" | "all" => Some(Self::All),
+            "file" => Some(Self::File),
+            "dir" | "directory" => Some(Self::Dir),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for MetaListType {

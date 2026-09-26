@@ -77,7 +77,22 @@ pub async fn serve_from_root(root: &Path, rest: &str, cors: &CorsConfig, req: Re
         Ok(resp) if resp.status() == StatusCode::NOT_FOUND => {
             cors_resource_404(&request_path, origin.as_deref(), cors)
         }
-        Ok(resp) => add_cors_headers(resp.into_response(), origin.as_deref(), cors),
+        Ok(resp) => {
+            let mut resp = resp.into_response();
+            let headers = resp.headers_mut();
+            // 对齐 TS 静态服务 (send 模块) 的浏览器语义: 总是允许重新验证
+            // (`public, max-age=0`, 避免用户内容被启发式缓存出陈旧副本), 并通告
+            // ServeFile 已实现的 Range 能力; tower-http 默认不发送这两个头。
+            headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=0"),
+            );
+            headers.insert(
+                axum::http::header::ACCEPT_RANGES,
+                HeaderValue::from_static("bytes"),
+            );
+            add_cors_headers(resp, origin.as_deref(), cors)
+        }
         Err(_) => cors_404_static(origin.as_deref(), cors),
     }
 }

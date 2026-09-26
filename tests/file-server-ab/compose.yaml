@@ -16,6 +16,13 @@ x-file-server-ab-shared-profile: &file-server-ab-shared-profile
   ZIP_WORKSPACE_EXCLUDE: ".git,.tmp,.claude,.agents,.codex,.opencode,.logs,.npmrc,__pycache__,node_modules,dist,pnpm-lock.yaml,yarn.lock,package-lock.json"
   HOME: /tmp
   NPM_CONFIG_USERCONFIG: /etc/npmrc
+  # Log-cache parity: Rust defaults to enabled (config/mod.rs) while TS treats an
+  # unset value as disabled and drops the undefined stats fields from its JSON.
+  # Pin one configuration on both sides so the A/B compares behavior, not defaults.
+  LOG_CACHE_ENABLED: "true"
+  LOG_CACHE_DURATION: "180000"
+  LOG_CACHE_MAX_ENTRIES: "100"
+  LOG_CACHE_MAX_FILE_SIZE: "2097152"
 
 services:
   rust:

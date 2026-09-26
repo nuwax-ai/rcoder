@@ -37,15 +37,14 @@ pub struct FileListOutcome {
 }
 
 fn parse_file_list_type(raw: Option<&str>) -> Result<tree::MetaListType, AppError> {
-    match raw.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
-        "" | "all" => Ok(tree::MetaListType::All),
-        "file" => Ok(tree::MetaListType::File),
-        "dir" | "directory" => Ok(tree::MetaListType::Dir),
-        _ => Err(AppError::validation_with(
-            "type must be file, dir, or all",
-            json!({ "field": "type" }),
-        )),
-    }
+    let raw = raw.unwrap_or_default();
+    tree::MetaListType::parse_normalized(&raw.trim().to_ascii_lowercase()).ok_or_else(|| {
+        // 对齐 TS 契约: 文案与 details.value (回显原始输入) 一致，便于调用方定位。
+        AppError::validation_with(
+            "type 仅支持 file/dir/all",
+            json!({ "field": "type", "value": raw }),
+        )
+    })
 }
 
 fn parse_file_list_limit(raw: Option<&str>) -> Result<Option<usize>, AppError> {
@@ -55,8 +54,8 @@ fn parse_file_list_limit(raw: Option<&str>) -> Result<Option<usize>, AppError> {
         Some(value) if value.trim().is_empty() => Ok(Some(0)),
         Some(value) => value.trim().parse::<usize>().map(Some).map_err(|_| {
             AppError::validation_with(
-                "limit must be a non-negative integer",
-                json!({ "field": "limit" }),
+                "limit 必须为非负整数",
+                json!({ "field": "limit", "value": value }),
             )
         }),
     }
@@ -65,6 +64,7 @@ fn parse_file_list_limit(raw: Option<&str>) -> Result<Option<usize>, AppError> {
 #[cfg(test)]
 mod file_list_options_tests {
     use super::{parse_file_list_limit, parse_file_list_type};
+    use crate::error::AppError;
     use crate::service::tree::MetaListType;
 
     #[test]
@@ -82,6 +82,29 @@ mod file_list_options_tests {
         );
         assert!(parse_file_list_limit(Some("-1")).is_err());
         assert!(parse_file_list_limit(Some("1.5")).is_err());
+    }
+
+    #[test]
+    fn invalid_options_echo_raw_input_in_details() {
+        // 对齐 TS ValidationError 契约: 中文文案 + details 回显原始输入值。
+        let AppError::Validation(message, details) =
+            parse_file_list_type(Some("Invalid")).unwrap_err()
+        else {
+            panic!("invalid type must produce a validation error");
+        };
+        assert_eq!(message, "type 仅支持 file/dir/all");
+        let details = details.expect("validation details");
+        assert_eq!(details["field"], "type");
+        assert_eq!(details["value"], "Invalid");
+
+        let AppError::Validation(message, details) = parse_file_list_limit(Some("-3")).unwrap_err()
+        else {
+            panic!("invalid limit must produce a validation error");
+        };
+        assert_eq!(message, "limit 必须为非负整数");
+        let details = details.expect("validation details");
+        assert_eq!(details["field"], "limit");
+        assert_eq!(details["value"], "-3");
     }
 }
 

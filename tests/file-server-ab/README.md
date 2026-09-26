@@ -58,14 +58,19 @@ pnpm 包内容 store 与 registry 元数据缓存使用持久 Docker named volum
 报告位于 `tests-e2e/reports/file-server-ab/<run-id>/`，包括：
 
 - `manifest.json`：Rust/TS 源码身份、镜像 ID、Node/pnpm/Git 版本、运行架构、模板 ZIP 哈希、两侧独立 PNPM store/metadata 卷名、配置 profile 和规则文件哈希。
-- `requests.jsonl`：每个场景、每一侧的请求摘要、状态、选定响应头、耗时、完整响应哈希、原文引用或传输错误。
+- `requests.jsonl`：每个请求的 start 行（发送前写入，含 `request_id`）与 result 行（同一 `request_id`，含状态、选定响应头、耗时、完整响应哈希、原文引用或传输错误）；中断时能看到"已开始未返回"的请求。
+- `cases.jsonl`：每个场景完成即增量追加的 CaseResult，汇总阶段失败也不会丢失已完成场景。
 - `bodies/`：请求与响应原文；单个文件最多保存 2 MiB，截断状态、完整字节数和完整 SHA-256 仍记录在 JSONL。
-- `state/`：请求执行前与结束后的两侧工作区树、文件内容摘要、权限与软链接；`git`/`all` 另保存每个 fixture repo 的 HEAD、refs 对应 tree、index entries 和 porcelain 状态。
+- `state/`：请求执行前与结束后的两侧工作区树、文件内容摘要、权限与软链接；`git`/`all` 另保存每个 fixture repo 的 HEAD、refs 对应 tree、index entries 和 porcelain 状态。快照对三类既有动态内容做形状级归一并在文件摘要中以标记显式呈现：`.dynamic_add.lock`（两侧均写入 `<epoch-millis>` 时间戳标记，按"纯数字+可选换行"形状比较，非该形状仍按字节比较）、生成的 `.npmrc`（两侧均在 `# 自动生成于` 注释行嵌入秒级本地时间，仅归一该行，其余内容按字节比较；该归一同样作用于 ZIP 语义条目中的 `.npmrc`）与 `.zip` 落盘产物（按与 ZIP HTTP 响应相同的条目语义摘要比较，解析失败的 zip 仍按原始字节比较）。存在性、类型和权限始终参与比较。
 - `diff.json`、`summary.md`：机器可读差异及人工可读总览；错误响应只归一化精确路径 `/error/requestId` 和 `/error/timestamp`，两侧原值仍保存在正文证据中。
-- `route-coverage.json`：TS/Rust 路由交集、已覆盖/待覆盖状态，以及本次选择的套件是否实际执行了对应场景。
+- `route-coverage.json`：TS/Rust 路由交集、已覆盖/待覆盖状态。`executed_cases` 只包含"场景完成成对请求**且**真实 method+路由模板匹配到该场景 API 请求记录"的场景；仅 dev-server 探针（如 `/`）不计入 API 路由证据。`execution_status` 区分 `not_run`、`blocked`（依赖场景已失败或被阻断）、`failed`（有断言失败或传输错误）、`partial`（本轮计划内场景未全部执行）、`unverified`（场景名已登记但 Rust/TypeScript 任一侧缺少匹配的 API 请求记录，明细按侧命名，属对照器/清单映射缺陷，会使整轮失败）、`completed`（双侧执行完成且有请求证据，不代表两端语义一致）。`coverage_inconsistencies` 列出所有 `unverified` 明细；`unexecuted_planned_routes` 列出本轮计划内未双侧执行的路由——存在时即使全部已执行场景两端一致，运行也判 incomplete 失败。路由覆盖在**每个场景完成后增量落盘**；场景执行、最终文件/Git 快照与汇总整理处于同一错误收束内，任一阶段失败都会写入带 `incomplete_reason` 的部分 `diff.json`/`summary.md` 与 `attempts.json`（区分已开始与已返回的请求计数），不会因结尾退出丢失已完成场景。
 - `logs/compose.log`：Compose 服务日志，包含被测 API 实际触发的 PNPM 安装输出；没有单独的模板依赖预热安装。
 
-镜像解析、构建或容器启动失败时不会生成比较通过结果；启动器会写 `runner-failure.json`，包含失败阶段和类别，并在 `summary.md` 中明确说明没有产生对照结果。HTTP 传输错误保存在 `diff.json`，会使命令失败。
+镜像解析、构建或容器启动失败时不会生成比较通过结果；启动器会写 `runner-failure.json`，包含失败阶段和类别，并在 `summary.md` 中明确说明没有产生对照结果。失败类别保守分列：只有镜像解析、缓存卷准备、容器启动和运行时校验阶段计为 `environment`；镜像构建失败单列为 `image-build`（可能来自任一侧源码缺陷或网络，需读 `logs/build.log` 归因）；对照阶段失败为 `comparison-runner`，不会自动定性为环境故障。健康前置失败时驱动写 `environment-errors.json`，Compose 服务日志仍由启动器保留。HTTP 传输错误保存在 `diff.json`，会使命令失败。
+
+## 场景依赖与失败隔离
+
+场景按真实数据依赖声明先后关系（如 files-update 之后的读取、项目创建之后的构建、Git seed 链、build 套件每模板的生命周期链）。上游场景出现**断言失败或传输错误**时，依赖它的下游场景标记 `blocked_by` 并跳过执行，不再对已损坏状态发送级联请求；仅外观性差异（如 ETag 值不同）不会阻断下游。被阻断场景在 `diff.json` 的 `blocked` 差异与 `summary.md` 的 `blocked` 计数中单独呈现，不计入未分类差异，也不能用差异规则豁免；其根因失败仍使门禁失败。其他独立项目、仓库或模板链继续执行。build 套件中一侧 start/restart 失败时，已成功启动一侧的 dev server 会通过单独的 `*-stop-dev-cleanup` 请求尽力停止，清理请求保留在 `requests.jsonl` 中但不冒充对照场景。
 
 报告继承启动环境的 `umask 077` 权限，不应手工加入凭据。当前 `core` 场景不读取任何真实凭据。
 
@@ -75,9 +80,9 @@ pnpm 包内容 store 与 registry 元数据缓存使用持久 Docker named volum
 
 ## 套件与覆盖边界
 
-- `core`：健康/API 版本、React/Vue 模板初始化与读取、项目全量文件替换、复制/删除/导出/上传、Computer workspace 创建/删除、skills ZIP、项目 ZIP 导入和模板初始化、合成 package 生成/清理、日志读取、工作区 ZIP 下载/创建，以及 `files-update` 的 create/modify/rename/delete 和 URL 解码。multipart 单/批量二进制上传会静态读回并逐字节核验；所有 ZIP 响应按条目路径、类型、权限和内容摘要比较，不比较压缩顺序/时间戳。另覆盖文件列表/resolve/search/metadata 边界、静态普通/Range 读取和基础文件系统操作。除 `install-project` 的无依赖 pnpm 场景外，不访问 npm 外网。
-- `git`：通过 HTTP 对照 init、status、add、commit、file-content、branch create/delete、tag、log、worktree/staged diff、unstage、checkout、discard、revert，以及 mixed/hard/soft reset。另用系统 Git 为两侧独立 fixture 准备相同的真实 merge-conflict index，再通过 HTTP 对照 `status.conflicted`；当前 API 没有 merge 操作端点，因此不把 fixture 准备命令当成被测 API。每个会改变历史或工作树的流程使用独立 pageApp fixture，避免一个实现的失败污染其他场景；最终比较 refs 对应 tree、HEAD tree、index entries、工作区状态和文件树。Rust 服务使用 gix，TS 服务使用镜像内系统 Git；驱动只用系统 Git读取最终仓库状态及准备对称 fixture，不参与被测 API 操作。diff 正文仅把 unified-diff hunk 中可省略的单行数量 `,1` 视为等价，所有其他行、范围和摘要仍逐字比较；原始 HTTP 正文继续保存。
-- `build`：分别用两份模板走项目初始化、依赖安装、production build、产物静态读取、start-dev、真实页面 HTTP、开发日志分页、日志缓存查询/清理、端口池状态、keep-alive、restart-dev 和 stop-dev，并对照构建错误解析。依赖 registry 网络；报告记下环境版本与错误。
+- `core`：健康/API 版本、React/Vue 模板初始化与读取、项目全量文件替换、复制/删除/导出/上传、Computer workspace 创建/删除、skills ZIP、项目 ZIP 导入和模板初始化、合成 package 生成/清理、日志读取、工作区 ZIP 下载/创建，以及 `files-update` 的 create/modify/rename/delete 和 URL 解码。multipart 单/批量二进制上传会静态读回并逐字节核验；所有 ZIP 响应按条目路径、类型、权限和内容摘要比较，不比较压缩顺序/时间戳。另覆盖文件列表/resolve/search/metadata 边界（带首尾空格文件名的 metadata 差异按已批准分歧做场景级比较：断言 Rust 精确寻址返回完整元数据、TS trim 后 ENOENT）、静态普通/Range 读取和基础文件系统操作。除 `install-project` 的无依赖 pnpm 场景外，不访问 npm 外网。
+- `git`：通过 HTTP 对照 init、status、add、commit、file-content、branch create/delete、tag、log、worktree/staged diff、unstage、checkout、discard、revert，以及 mixed/hard/soft reset。另用系统 Git 为两侧独立 fixture 准备相同的真实 merge-conflict index，再通过 HTTP 对照 `status.conflicted`；当前 API 没有 merge 操作端点，因此不把 fixture 准备命令当成被测 API。每个会改变历史或工作树的流程使用独立 pageApp fixture，避免一个实现的失败污染其他场景；最终比较 refs 对应 tree、HEAD tree、index entries、工作区状态和文件树。Rust 服务使用 gix，TS 服务使用镜像内系统 Git；驱动只用系统 Git读取最终仓库状态及准备对称 fixture，不参与被测 API 操作。diff 正文仅做两类已验证的 hunk 格式归一：可省略的单行数量 `,1`，以及 `new file mode` 文件块内 gix `-1,0` 与 git `-0,0` 的顶部空范围起点约定；零行数量 `,0` 始终保留（不与省略的单行数量混同），块外空范围起点不归一，所有其他行、范围和摘要仍逐字比较；原始 HTTP 正文继续保存。
+- `build`：分别用两份模板走项目初始化、依赖安装、production build、产物静态读取、start-dev、真实页面 HTTP、开发日志分页、日志缓存查询/清理、端口池状态、keep-alive、restart-dev 和 stop-dev，并对照构建错误解析。依赖 registry 网络；报告记下环境版本与错误。`get-dev-log` 逐行校验每侧页面契约（行号从请求的 startIndex 连续、content 为字符串、totalLines 覆盖末行、`dev-temp-<epoch-millis>.log` 文件名形状），并用第二页查询（`build-react-get-dev-log-page-2`，startIndex=首页末行+1）验证分页不重不漏——日志可能增长，不要求两次 totalLines 相等。日志正文与 `logFileName` 是两侧各自的安装/vite instrumentation（结构化 pnpm 事件 vs 原始输出、体量不同），按场景级语义比较归一：页面契约（非空分页、行号、totalLines 一致性）由独立断言保证，`success`/`startIndex` 仍逐字比较，动态的日志正文、`logFileName`、行量派生的 `totalLines` 及正文派生的 `content-length`/`etag` 响应头随之归一。TS Compose 未启用 `FAST_RESTART_ENABLED` 时 restart 走全量重装（删除 node_modules 与 lockfile 后重装），Rust restart 为 stop+start 保留 lockfile；两侧 lockfile 终态差异是该已记录行为差异的后果，不以忽略规则抹除。
 - `all`：顺序执行以上套件。路由清单按当前 TypeScript 基线快照维护；没有 A/B 场景的共同路由明确标为 pending。
 
 路由清单的 `typescript_revision` 必须与本次准备的 TypeScript Git 提交一致；基线变化时 Make 运行会在发请求前失败，要求先复核并更新路由清单。当前清单中的 76 条共同路由均登记了至少一个场景；截至 2026-09-25，`core` 的真实 A/B 报告已执行此前待测的 27 条路由。`covered` 只表示场景实际执行过，不表示两端语义一致；是否一致以差异审阅和精确规则为准。
@@ -91,7 +96,24 @@ pnpm 包内容 store 与 registry 元数据缓存使用持久 Docker named volum
 ### 依赖缓存与证据口径
 
 - TS 服务自身的 `node_modules` 留在镜像依赖层，不挂宿主机目录覆盖；模板项目的 `node_modules` 位于每轮独立项目卷，pnpm 内容/元数据缓存位于每侧独立持久卷。Mac 不直接挂本机 `node_modules`，避免跨系统二进制和共享目录小文件开销。
-- `planned_in_this_run` 是计划；`executed_cases` 来自实际完成的成对请求结果。`completed` 仅表示执行完成，不表示两端一致；中途退出的初始覆盖报告保留 `not_run`，不虚报执行。
+- `planned_in_this_run` 是计划；`executed_cases` 来自实际完成的成对请求结果，并与真实 method/路由模板请求记录交叉核验。`completed` 仅表示执行完成且证据一致，不表示两端一致；被阻断场景单列为 `blocked_cases`，中途退出的增量报告保留已执行部分，不虚报执行。
 - `transport_errors` 表示归因未定的传输失败，不自动计为环境故障；健康前置失败另记录前置错误。传输失败仍使门禁失败。
 - `headers_elapsed_ms` 是响应头耗时，`elapsed_ms` 覆盖正文读取。记录用于诊断，不作为两实现性能胜负依据。
 - 动态 JSON 字段允许值不同，但不能隐去字段缺失或类型改变；场景级关联不变量仍需专门断言。
+
+
+## 响应头协议语义与差异分类
+
+响应头不是逐字比较，也不是全局忽略：`compare_exchange` 对四类头做协议级校验（`header_protocol_verdict`，均有单测锁定）：
+
+- **Content-Type**：媒体类型必须相同；charset 显式 `; charset=utf-8` 与隐式（JSON 默认 UTF-8）等价；charset 实质不同或格式非法按侧报断言失败。
+- **ETag**：实体标签不透明，两侧格式合法即等价；静态内容要求两侧一致存在（校验器属于该契约）；非静态路由允许"TS Express 框架默认弱 ETag vs Rust 无"的存在性差异，条件请求契约由 `read-project-static-file-if-none-match` 等专属场景强制。
+- **Content-Length**：每侧必须等于自身实际传输字节（304 等除外），两侧各自正确即按派生等价；与自身正文不符按侧报断言失败。
+- **Last-Modified**：静态内容两侧各为独立创建的 fixture 文件 mtime，格式合法即等价；非静态逐字比较。
+- 其余头（Cache-Control、Accept-Ranges、Location、CORS 头等）始终逐字比较。
+
+`summary.md` 的 **Classified outcome** 段把每个差异归入：Rust 契约失败（`/assertions/rust/*`）、TS 已知缺陷（`/assertions/typescript/*`，如 git-revert 500、stop-dev 500）、已批准差异（命中 `diff-rules.json`）、未解释差异、传输失败与 blocked。分类只改善定位，strict 退出规则不变。
+
+当前 `diff-rules.json` 登记 25 条已批准差异（值逐条精确匹配并带复核者与到期日）：越根 symlink 边界（Rust 保留边界、TS 越根为已知缺陷）×5、UTF-8 字节数 fileSize ×1、TS `.tmp`/上传 zip 残留 ×7、Rust 复制保留嵌套 lockfile ×1、`.agents/.sync_version` 标记 ×2、TS 删除清单含日志目录 ×1（Java 消费者只读 success/message，2026-09-26 核对）、log-cache-stats Rust 附加字段 ×8（agent-platform 无消费者）。**仍然未分类**的已知项：TS git-revert 500 与 stop-dev 500（失败断言如实保留，不豁免冒充通过）、project-copy Git 历史（待产品决策）、dev 日志缓存口径（Rust 将 dev 日志写入日志缓存：stats 的 `cacheSize`/容量字段与 `get-dev-log` 的 `cacheHit`/消息文案不同；Java `CustomPageBuildController` 会透传 `cacheHit` 到前端，属消费者可见差异，待产品裁定）、export zip 的 TS 框架头（POST 下载上的 Accept-Ranges/Last-Modified/Cache-Control）。`get-dev-log-page-2` 的 `startIndex` 归一是因为各侧回显自己请求的行号（两侧行数不同），回显正确性由 `validate_log_page` 断言。
+
+版本端点：各端报告自身实现的契约线版本（Rust 报 `API_CONTRACT_VERSION`，非 crate 构建号——Java `FileServerVersionSupport` 以 `>=1.4.0` 门禁 agent-store 能力）；A/B 断言语义版本形状而非跨端相等。

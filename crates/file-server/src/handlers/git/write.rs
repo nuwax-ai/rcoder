@@ -9,7 +9,7 @@ use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
 use crate::models::{
-    CommitBody, DiffBody, FilesBody, GitWriteBody, ResetBody, RevertBody, TargetBody,
+    CommitBody, DiffBody, DiscardResult, FilesBody, GitWriteBody, ResetBody, RevertBody, TargetBody,
 };
 use crate::service::git;
 
@@ -154,11 +154,11 @@ pub(crate) async fn unstage(
 #[utoipa::path(post, path = "/discard", request_body = FilesBody, description = r#"
 **丢弃**指定文件的工作区改动（不可恢复——未提交内容将丢失），慎用。
 "#,
-    responses(crate::openapi::JsonApiResponses), tag = "Git")]
+    responses((status = 200, description = "丢弃结果分桶", body = DiscardResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn discard(
     State(state): State<AppState>,
     Json(body): Json<FilesBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<DiscardResult>, AppError> {
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let files = body.files.unwrap_or_default();
     let buckets = tokio::task::spawn_blocking(move || -> Result<git::DiscardBuckets, AppError> {
@@ -171,15 +171,21 @@ pub(crate) async fn discard(
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Changes discarded successfully",
-        "logId": log_id,
-        "discardedCount": buckets.len(),
-        "trackedFiles": buckets.tracked_files,
-        "newFiles": buckets.new_files,
-        "untrackedFiles": buckets.untracked_files,
-    })))
+    let git::DiscardBuckets {
+        tracked_files,
+        new_files,
+        untracked_files,
+    } = buckets;
+    let discarded_count = tracked_files.len() + new_files.len() + untracked_files.len();
+    Ok(Json(DiscardResult {
+        success: true,
+        message: "Files discarded successfully",
+        log_id,
+        discarded_count,
+        tracked_files,
+        new_files,
+        untracked_files,
+    }))
 }
 
 /// 查看差异

@@ -5,7 +5,7 @@
 //! 字段为 `pub`（models 是 crate 内公共层）。
 
 use garde::Validate;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// GET 路由公共查询 (workspaceType + project/computer 标识 + 多租户 +
 /// serviceContext body/query 通道)。
@@ -117,6 +117,26 @@ pub struct FileContentBody {
     pub ref_: Option<String>,
     /// 文件相对路径
     pub file_path: String,
+}
+
+/// discard 成功响应 (对齐 TS gitService discard 返回形状)。
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscardResult {
+    /// 恒为 true；失败走 AppError 错误响应。
+    pub success: bool,
+    /// 对齐 TS 契约文案 (gitService.js discard)。
+    pub message: &'static str,
+    /// 本次操作归属的日志标识。
+    pub log_id: String,
+    /// 丢弃的文件总数 (三类分桶之和)。
+    pub discarded_count: usize,
+    /// 已跟踪文件中丢弃改动的路径。
+    pub tracked_files: Vec<String>,
+    /// 丢弃的暂存新增文件路径。
+    pub new_files: Vec<String>,
+    /// 丢弃的未跟踪文件路径。
+    pub untracked_files: Vec<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]

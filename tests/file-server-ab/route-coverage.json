@@ -49,7 +49,8 @@
       "status": "covered",
       "suite": "build",
       "cases": [
-        "build-react-get-dev-log"
+        "build-react-get-dev-log",
+        "build-react-get-dev-log-page-2"
       ]
     },
     {
