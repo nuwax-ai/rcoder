@@ -492,7 +492,7 @@ async fn materialize_agent_store_by_copy(
             .await?;
     }
 
-    // sync_agents fan-out (.agents → 各家 ACP 目录, 内部也是软链优先)
+    // sync_agents fan-out (.agents → 各家 ACP 目录, 实体复制与 TS legacy 行为一致)
     crate::service::skills::sync_agents(workspace).await?;
     Ok(())
 }

@@ -6,11 +6,13 @@
 
 use std::path::Path;
 
-use axum::extract::Request;
+use axum::extract::{OriginalUri, Request};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use tower::util::ServiceExt;
 use tower_http::services::ServeFile;
+
+use crate::error::AppError;
 
 /// CORS 头配置 (两套路由不同)。
 pub struct CorsConfig {
@@ -45,24 +47,36 @@ pub async fn serve_from_root(root: &Path, rest: &str, cors: &CorsConfig, req: Re
     if req.method() == axum::http::Method::OPTIONS {
         return cors_empty(&req, cors);
     }
+    let origin = origin_value(&req);
+    // Axum strips nested router prefixes from `Request::uri()`. Error responses
+    // should retain the public URL (as Express `sendFile` errors do), so prefer
+    // its original URI and keep the nested URI only for direct service tests.
+    let request_path = req
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|uri| uri.0.path())
+        .unwrap_or_else(|| req.uri().path())
+        .to_owned();
     // tokio::fs::metadata 而非阻塞的 Path::is_file()：本函数每次静态请求都会走到，
-    // 阻塞调用会占住 tokio worker。metadata 同样跟随符号链接，出错按"不是文件"处理，
-    // 与 Path::is_file() 遇错返回 false 语义一致。
-    if !tokio::fs::metadata(&full)
-        .await
-        .map(|m| m.is_file())
-        .unwrap_or(false)
-    {
-        return cors_404(&req, cors);
+    // 阻塞调用会占住 tokio worker。NotFound 使用与 TS 一致的结构化资源错误；其他
+    // I/O 错误按种类传播，不能把权限/设备故障伪装成文件缺失。
+    match tokio::fs::metadata(&full).await {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return cors_404(&req, cors),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return cors_resource_404(&request_path, origin.as_deref(), cors);
+        }
+        Err(error) => {
+            let response = AppError::from(error).into_response();
+            return add_cors_headers(response, origin.as_deref(), cors);
+        }
     }
     // ServeFile 处理 Range / ETag / Last-Modified / conditional GET
-    let origin = req
-        .headers()
-        .get("origin")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
     let serve = ServeFile::new(full);
     match serve.oneshot(req).await {
+        Ok(resp) if resp.status() == StatusCode::NOT_FOUND => {
+            cors_resource_404(&request_path, origin.as_deref(), cors)
+        }
         Ok(resp) => add_cors_headers(resp.into_response(), origin.as_deref(), cors),
         Err(_) => cors_404_static(origin.as_deref(), cors),
     }
@@ -109,6 +123,11 @@ pub fn add_cors_headers(mut resp: Response, origin: Option<&str>, cors: &CorsCon
 fn cors_empty(req: &Request, cors: &CorsConfig) -> Response {
     let origin = origin_value(req);
     add_cors_headers(StatusCode::OK.into_response(), origin.as_deref(), cors)
+}
+
+fn cors_resource_404(path: &str, origin: Option<&str>, cors: &CorsConfig) -> Response {
+    let response = AppError::resource(format!("Path not found: {path}")).into_response();
+    add_cors_headers(response, origin, cors)
 }
 
 pub fn cors_404(req: &Request, cors: &CorsConfig) -> Response {
@@ -253,5 +272,37 @@ mod tests {
         assert!(!outcomes[1].0, "external link resolves to exists:false");
         assert_eq!(outcomes[1].1, StatusCode::NOT_FOUND);
         assert_ne!(outcomes[1].2.as_ref(), b"outside");
+    }
+
+    #[tokio::test]
+    async fn missing_static_file_returns_structured_resource_error_with_cors() {
+        let root = tempfile::tempdir().unwrap();
+        let path = "/api/page/static/project/missing.txt";
+        let request = Request::builder()
+            .uri("/static/project/missing.txt")
+            .header("origin", "https://client.example")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (mut parts, body) = request.into_parts();
+        parts.extensions.insert(OriginalUri(path.parse().unwrap()));
+        let request = Request::from_parts(parts, body);
+
+        let response = serve_from_root(root.path(), "missing.txt", &PAGE_CORS, request).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "https://client.example"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["code"], "UNKNOWN_ERROR");
+        assert_eq!(value["error"]["type"], "RESOURCE_ERROR");
+        assert_eq!(value["error"]["message"], format!("Path not found: {path}"));
     }
 }

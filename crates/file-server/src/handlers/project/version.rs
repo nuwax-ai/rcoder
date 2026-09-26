@@ -25,7 +25,7 @@ pub(crate) async fn backup_current_version(
 ) -> Result<Json<serde_json::Value>, AppError> {
     if state.config.git_enabled {
         return Ok(response::deprecated(
-            "此接口已废弃,请使用 Git 版本管理 API（/api/git/*）",
+            "此接口已废弃，请使用 Git 版本管理 API（/api/git/*）",
         ));
     }
     body.validate().map_err(crate::error::from_garde)?;
@@ -61,7 +61,7 @@ pub(crate) async fn rollback_version(
 ) -> Result<Json<serde_json::Value>, AppError> {
     if state.config.git_enabled {
         return Ok(response::deprecated(
-            "此接口已废弃,请使用 /api/git/rollback 进行版本回滚",
+            "此接口已废弃，请使用 /api/git/rollback 进行版本回滚",
         ));
     }
     body.validate().map_err(crate::error::from_garde)?;

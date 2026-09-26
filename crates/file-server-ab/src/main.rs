@@ -86,6 +86,12 @@ struct Manifest {
     ts_runtime_architecture: String,
     rust_pnpm_version: String,
     ts_pnpm_version: String,
+    pnpm_registry: String,
+    pnpm_network_concurrency: String,
+    pnpm_rust_store_volume: String,
+    pnpm_rust_metadata_cache_volume: String,
+    pnpm_typescript_store_volume: String,
+    pnpm_typescript_metadata_cache_volume: String,
     rust_git_version: String,
     ts_git_version: String,
     fixtures: BTreeMap<String, String>,
@@ -130,6 +136,7 @@ struct RequestLine {
     response_body_file: Option<String>,
     request_body_truncated: bool,
     response_body_truncated: bool,
+    headers_elapsed_ms: Option<u128>,
     elapsed_ms: u128,
     transport_error: Option<String>,
 }
@@ -235,10 +242,24 @@ struct Summary {
     equal: usize,
     expected_differences: usize,
     unclassified_differences: usize,
+    transport_errors: usize,
     environment_errors: usize,
     environment_blocked: bool,
     precondition_errors: usize,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+struct DifferenceGroup {
+    scope: String,
+    path: String,
+    kind: String,
+    accepted: bool,
+    occurrences: usize,
+    cases: BTreeSet<String>,
+}
+
+type DifferenceGroupKey = (String, String, String, bool);
+type DifferenceGroupCounts = (usize, BTreeSet<String>);
 
 #[derive(Debug)]
 struct Exchange {
@@ -267,6 +288,7 @@ enum ExpectedStatus {
     Success2xx,
     ClientError4xx,
     PartialContent206,
+    NotModified304,
 }
 
 impl ExpectedStatus {
@@ -275,6 +297,7 @@ impl ExpectedStatus {
             Self::Success2xx => status.is_success(),
             Self::ClientError4xx => status.is_client_error(),
             Self::PartialContent206 => status == StatusCode::PARTIAL_CONTENT,
+            Self::NotModified304 => status == StatusCode::NOT_MODIFIED,
         })
     }
 
@@ -283,6 +306,7 @@ impl ExpectedStatus {
             Self::Success2xx => "2xx",
             Self::ClientError4xx => "4xx",
             Self::PartialContent206 => "206",
+            Self::NotModified304 => "304",
         }
     }
 }
@@ -341,6 +365,52 @@ async fn doctor(rust_url: &str, ts_url: &str) -> Result<()> {
             bail!("{side} health returned HTTP {}", response.status());
         }
         println!("{side}: HTTP {}", response.status());
+    }
+    Ok(())
+}
+
+/// Coverage is derived from completed paired cases, never the selected suite alone.
+fn update_route_execution(coverage: &mut Value, cases: &[CaseResult]) -> Result<()> {
+    let entries = coverage
+        .get_mut("entries")
+        .and_then(Value::as_array_mut)
+        .context("route coverage entries missing")?;
+    for entry in entries {
+        let planned = entry
+            .get("cases")
+            .and_then(Value::as_array)
+            .context("route coverage cases missing")?;
+        let executed: Vec<_> = cases
+            .iter()
+            .filter(|case| {
+                planned
+                    .iter()
+                    .any(|name| name.as_str() == Some(case.case.as_str()))
+            })
+            .collect();
+        let ids: Vec<_> = executed.iter().map(|case| case.case.as_str()).collect();
+        let status = if executed.is_empty() {
+            "not_run"
+        } else if executed.iter().any(|case| {
+            case.differences
+                .iter()
+                .any(|d| d.kind == "transport_error" || d.kind == "assertion_failed")
+        }) {
+            "failed"
+        } else if executed.len() < planned.len() {
+            "partial"
+        } else {
+            "completed"
+        };
+        // Completed is execution evidence, not a claim that responses are equivalent.
+        let ids = json!(ids);
+        let ran = !executed.is_empty();
+        let object = entry
+            .as_object_mut()
+            .context("route coverage entry is not an object")?;
+        object.insert("executed_cases".into(), ids);
+        object.insert("executed_in_this_run".into(), json!(ran));
+        object.insert("execution_status".into(), json!(status));
     }
     Ok(())
 }
@@ -444,7 +514,9 @@ async fn run_suite(options: RunOptions) -> Result<()> {
                 }
         });
         if let Some(object) = entry.as_object_mut() {
-            object.insert("executed_in_this_run".into(), json!(executed));
+            object.insert("planned_in_this_run".into(), json!(executed));
+            object.insert("executed_in_this_run".into(), json!(false));
+            object.insert("execution_status".into(), json!("not_run"));
         }
     }
     write_json(&report_dir.join("route-coverage.json"), &route_coverage)?;
@@ -470,7 +542,8 @@ async fn run_suite(options: RunOptions) -> Result<()> {
         run_id: run_id.clone(),
         suite: suite.as_str().to_string(),
         started_at: timestamp_rfc3339(),
-        configuration_profile: "isolated-compose-containers".to_string(),
+        configuration_profile:
+            "isolated-compose-containers-shared-test-core-v8-independent-pnpm-caches".to_string(),
         rust_source: env_or("AB_RUST_SOURCE", "unknown"),
         ts_source: env_or("AB_TS_SOURCE", "unknown"),
         rust_image: env_or("AB_RUST_IMAGE", "unknown"),
@@ -482,6 +555,15 @@ async fn run_suite(options: RunOptions) -> Result<()> {
         ts_runtime_architecture: env_or("AB_TS_NODE_ARCH", "unknown"),
         rust_pnpm_version: env_or("AB_RUST_PNPM_VERSION", "unknown"),
         ts_pnpm_version: env_or("AB_TS_PNPM_VERSION", "unknown"),
+        pnpm_registry: env_or("AB_PNPM_REGISTRY", "unknown"),
+        pnpm_network_concurrency: env_or("AB_PNPM_NETWORK_CONCURRENCY", "unknown"),
+        pnpm_rust_store_volume: env_or("AB_PNPM_RUST_STORE_VOLUME", "unknown"),
+        pnpm_rust_metadata_cache_volume: env_or("AB_PNPM_RUST_METADATA_CACHE_VOLUME", "unknown"),
+        pnpm_typescript_store_volume: env_or("AB_PNPM_TS_STORE_VOLUME", "unknown"),
+        pnpm_typescript_metadata_cache_volume: env_or(
+            "AB_PNPM_TS_METADATA_CACHE_VOLUME",
+            "unknown",
+        ),
         rust_git_version: env_or("AB_RUST_GIT_VERSION", "unknown"),
         ts_git_version: env_or("AB_TS_GIT_VERSION", "unknown"),
         fixtures: fixture_hashes,
@@ -514,9 +596,10 @@ async fn run_suite(options: RunOptions) -> Result<()> {
                 equal: 0,
                 expected_differences: 0,
                 unclassified_differences: 0,
-                environment_errors: errors.len(),
+                transport_errors: 0,
+                environment_errors: 0,
                 environment_blocked: true,
-                precondition_errors: 0,
+                precondition_errors: errors.len(),
             },
         };
         write_json(&report_dir.join("environment-errors.json"), &errors)?;
@@ -544,6 +627,7 @@ async fn run_suite(options: RunOptions) -> Result<()> {
                 equal: 0,
                 expected_differences: 0,
                 unclassified_differences: initial_state_differences.len(),
+                transport_errors: 0,
                 environment_errors: 0,
                 environment_blocked: false,
                 precondition_errors: initial_state_differences.len(),
@@ -577,6 +661,9 @@ async fn run_suite(options: RunOptions) -> Result<()> {
             for (side, exchange) in [("rust", &rust), ("typescript", &ts)] {
                 let validation = match case_name {
                     "computer-file-meta" => validate_meta_response(&exchange.body),
+                    "computer-file-meta-boundary" => {
+                        validate_boundary_meta_response(&exchange.body)
+                    }
                     "computer-files-update-mixed-operations" => {
                         validate_files_update_response(&exchange.body, CASE_USER, CASE_CID, 5)
                     }
@@ -707,6 +794,83 @@ async fn run_suite(options: RunOptions) -> Result<()> {
                 case.case
             );
             cases.push(case);
+            if case_name == "read-project-static-file" {
+                let case_name = "read-project-static-file-if-none-match";
+                let mut rust_spec = get_spec(
+                    "/api/page/static/file-server-ab-react/src/file-server-ab.txt".to_string(),
+                );
+                let mut ts_spec = get_spec(
+                    "/api/page/static/file-server-ab-react/src/file-server-ab.txt".to_string(),
+                );
+                rust_spec.expected_status = ExpectedStatus::NotModified304;
+                ts_spec.expected_status = ExpectedStatus::NotModified304;
+                // ETags are opaque validators and intentionally differ between Express and
+                // Rust. Each implementation receives its own validator; the contract is that
+                // both return 304 for their unchanged representation.
+                rust_spec.normalized_headers = vec!["etag".into(), "last-modified".into()];
+                ts_spec.normalized_headers = rust_spec.normalized_headers.clone();
+                let rust_etag = rust
+                    .headers
+                    .get(reqwest::header::ETAG)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let ts_etag = ts
+                    .headers
+                    .get(reqwest::header::ETAG)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                if let Some(etag) = &rust_etag {
+                    rust_spec
+                        .headers
+                        .insert("if-none-match".into(), etag.clone());
+                }
+                if let Some(etag) = &ts_etag {
+                    ts_spec.headers.insert("if-none-match".into(), etag.clone());
+                }
+                let (mut conditional_case, rust_conditional, ts_conditional) = run_pair_specs(
+                    &client,
+                    &report_dir,
+                    &mut requests,
+                    case_name,
+                    &rust_url,
+                    &ts_url,
+                    &rust_spec,
+                    &ts_spec,
+                )
+                .await?;
+                for (side, etag, exchange) in [
+                    ("rust", rust_etag, &rust_conditional),
+                    ("typescript", ts_etag, &ts_conditional),
+                ] {
+                    if etag.is_none() {
+                        conditional_case.differences.push(assertion_difference(
+                            case_name,
+                            &format!("/assertions/{side}/etag"),
+                            "initial static response did not contain an ETag validator".into(),
+                        ));
+                    }
+                    if !exchange.body.is_empty() {
+                        conditional_case.differences.push(assertion_difference(
+                            case_name,
+                            &format!("/assertions/{side}/304-body"),
+                            format!(
+                                "expected an empty 304 response body, got {} bytes",
+                                exchange.body.len()
+                            ),
+                        ));
+                    }
+                }
+                println!(
+                    "{} {}",
+                    if conditional_case.differences.is_empty() {
+                        "PASS"
+                    } else {
+                        "DIFF"
+                    },
+                    conditional_case.case
+                );
+                cases.push(conditional_case);
+            }
         }
     }
     if matches!(suite, Suite::Git | Suite::All) {
@@ -835,6 +999,8 @@ async fn run_suite(options: RunOptions) -> Result<()> {
     write_json(&report_dir.join("state/rust.json"), &rust_state)?;
     write_json(&report_dir.join("state/typescript.json"), &ts_state)?;
     let mut state_differences = compare_snapshots(&rust_state, &ts_state)?;
+    update_route_execution(&mut route_coverage, &cases)?;
+    write_json(&report_dir.join("route-coverage.json"), &route_coverage)?;
     let git_suite_ran = matches!(suite, Suite::Git | Suite::All);
     let mut git_state_differences = Vec::new();
     if git_suite_ran {
@@ -923,7 +1089,7 @@ async fn run_suite(options: RunOptions) -> Result<()> {
             .iter()
             .filter(|difference| !difference.accepted)
             .count();
-    let environment_errors = cases
+    let transport_errors = cases
         .iter()
         .flat_map(|case| &case.differences)
         .filter(|difference| difference.kind == "transport_error")
@@ -934,8 +1100,9 @@ async fn run_suite(options: RunOptions) -> Result<()> {
             equal,
             expected_differences,
             unclassified_differences,
-            environment_errors,
-            environment_blocked: environment_errors > 0,
+            transport_errors,
+            environment_errors: 0,
+            environment_blocked: false,
             precondition_errors: 0,
         },
         cases,
@@ -956,9 +1123,9 @@ async fn run_suite(options: RunOptions) -> Result<()> {
     if diff.summary.unclassified_differences > 0 {
         bail!("A/B run contains unclassified differences; inspect diff.json and summary.md");
     }
-    if diff.summary.environment_blocked {
+    if diff.summary.transport_errors > 0 {
         bail!(
-            "A/B run was blocked by HTTP transport errors; inspect requests.jsonl and summary.md"
+            "A/B run has HTTP transport failures (cause unclassified); inspect requests.jsonl and summary.md"
         );
     }
     Ok(())
@@ -1027,6 +1194,10 @@ fn core_scenarios(fixtures: &Path) -> Result<Vec<(&'static str, RequestSpec)>> {
             "filePaths": [".hidden.txt", "  中文文件 .txt  ", "binary.bin"]
         }),
     )?;
+    let mut boundary_meta = boundary_meta;
+    // These files are created independently on each side. Preserve their raw mtimes in
+    // requests.jsonl, but don't mistake millisecond creation-time skew for API drift.
+    boundary_meta.normalized_paths = vec!["/metas/0/mtimeMs".into(), "/metas/2/mtimeMs".into()];
     let single_upload_bytes: &[u8] = &[0, 1, 2, 13, 10, 127, 255];
     let single_upload_body = multipart_form_body(
         AB_MULTIPART_BOUNDARY,
@@ -1576,7 +1747,9 @@ fn core_lifecycle_scenarios(
                 "files": [
                     { "name": "README.md", "contents": "full%20snapshot%0A", "binary": false },
                     { "name": "src/index.html", "contents": "<main>A%2FB%20project</main>%0A", "binary": false },
-                    { "name": "empty.txt", "contents": "", "binary": false }
+                    { "name": "empty.txt", "contents": "", "binary": false },
+                    { "name": "pnpm-lock.yaml", "contents": "lockfile%20at%20project%20root%0A", "binary": false },
+                    { "name": "packages/frontend/package-lock.json", "contents": "%7B%22lockfileVersion%22%3A3%7D%0A", "binary": false }
                 ]
             }),
         )?,
@@ -1663,6 +1836,18 @@ fn core_lifecycle_scenarios(
             json!({ "sourceProjectId": project, "targetProjectId": "file-server-ab-project-copy" }),
         )?,
     ));
+    let mut copied_project_git_log = get_spec(
+        "/api/git/log?workspaceType=pageApp&projectId=file-server-ab-project-copy&maxCount=20",
+    );
+    for index in 0..20 {
+        copied_project_git_log
+            .normalized_paths
+            .push(format!("/commits/{index}/hash"));
+        copied_project_git_log
+            .normalized_paths
+            .push(format!("/commits/{index}/date"));
+    }
+    scenarios.push(("project-copy-git-history", copied_project_git_log));
     scenarios.push((
         "project-export-latest-semantic-zip",
         json_spec(
@@ -3202,6 +3387,81 @@ async fn run_build_suite(
                         }
                         results.push(case);
 
+                        // A cleared management entry does not prove the dev server exited.
+                        // Probe each side's actual Vite port after stop so a success response
+                        // cannot hide a still-serving process and a stale list cannot create a
+                        // false failure.
+                        let stop_probe_case =
+                            format!("build-{template_type}-stop-dev-port-unreachable");
+                        let mut stop_probe_spec = get_spec("/".to_string());
+                        stop_probe_spec
+                            .headers
+                            .insert("host".into(), "localhost".into());
+                        let rust_dev_endpoint = format!(
+                            "{}:{}",
+                            rust_dev_url.trim_end_matches('/'),
+                            rust_server.port
+                        );
+                        let ts_dev_endpoint =
+                            format!("{}:{}", ts_dev_url.trim_end_matches('/'), ts_server.port);
+                        let ts_probe = exchange(
+                            client,
+                            report_dir,
+                            requests,
+                            &stop_probe_case,
+                            "typescript",
+                            &ts_dev_endpoint,
+                            &stop_probe_spec,
+                        )
+                        .await?;
+                        let rust_probe = exchange(
+                            client,
+                            report_dir,
+                            requests,
+                            &stop_probe_case,
+                            "rust",
+                            &rust_dev_endpoint,
+                            &stop_probe_spec,
+                        )
+                        .await?;
+                        let mut stop_probe_differences = Vec::new();
+                        for (side, endpoint, probe) in [
+                            ("rust", &rust_dev_endpoint, &rust_probe),
+                            ("typescript", &ts_dev_endpoint, &ts_probe),
+                        ] {
+                            let accepts_connections = if probe.status.is_some() {
+                                Ok(true)
+                            } else {
+                                dev_port_accepts_connections(endpoint).await
+                            };
+                            match accepts_connections {
+                                Ok(false) => {}
+                                Ok(true) => stop_probe_differences.push(assertion_difference(
+                                    &stop_probe_case,
+                                    &format!("/assertions/{side}/port-stopped"),
+                                    "dev server port still accepts connections after stop"
+                                        .to_string(),
+                                )),
+                                Err(error) => stop_probe_differences.push(assertion_difference(
+                                    &stop_probe_case,
+                                    &format!("/assertions/{side}/port-stop-unconfirmed"),
+                                    format!("could not confirm stopped dev-server port: {error}"),
+                                )),
+                            }
+                        }
+                        results.push(CaseResult {
+                            case: stop_probe_case,
+                            equal: stop_probe_differences.is_empty(),
+                            compared:
+                                "stopped dev-server port must refuse TCP after HTTP is unreachable"
+                                    .into(),
+                            normalized_paths: Vec::new(),
+                            normalized_headers: Vec::new(),
+                            rust_status: rust_probe.status.map(|status| status.as_u16()),
+                            ts_status: ts_probe.status.map(|status| status.as_u16()),
+                            differences: stop_probe_differences,
+                        });
+
                         let list_case = format!("build-{template_type}-list-after-stop");
                         let list_spec = get_spec("/api/build/list-dev".to_string());
                         let (mut case, rust_list, ts_list) = run_pair_specs(
@@ -3446,6 +3706,37 @@ fn validate_meta_response(body: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_boundary_meta_response(body: &[u8]) -> Result<(), String> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("boundary file metadata response is not JSON: {error}"))?;
+    if value.get("success").and_then(Value::as_bool) != Some(true) {
+        return Err("boundary file metadata response must contain success=true".into());
+    }
+    let metas = value
+        .get("metas")
+        .and_then(Value::as_array)
+        .filter(|metas| metas.len() == 3)
+        .ok_or_else(|| {
+            "boundary metadata response must contain three requested entries".to_string()
+        })?;
+    for (index, path) in [(0, ".hidden.txt"), (2, "binary.bin")] {
+        let entry = &metas[index];
+        if entry.get("path").and_then(Value::as_str) != Some(path)
+            || entry.get("isDir").and_then(Value::as_bool) != Some(false)
+            || entry.get("isLink").and_then(Value::as_bool) != Some(false)
+            || !entry
+                .get("mtimeMs")
+                .and_then(Value::as_f64)
+                .is_some_and(|mtime| mtime > 0.0)
+        {
+            return Err(format!(
+                "boundary metadata entry for {path} is incomplete or invalid"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn response_has_project(body: &[u8], project_id: &str) -> bool {
     serde_json::from_slice::<Value>(body)
         .ok()
@@ -3533,6 +3824,41 @@ async fn run_pair_specs(
     Ok((case_result, rust, ts))
 }
 
+/// Confirm that a dev-server port is actually closed after stop. An HTTP transport error alone
+/// could also mean DNS or another network failure, so require the TCP connect to be refused.
+async fn dev_port_accepts_connections(endpoint: &str) -> Result<bool, String> {
+    let url = reqwest::Url::parse(endpoint)
+        .map_err(|error| format!("parse dev-server endpoint: {error}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "dev-server endpoint has no host".to_string())?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "dev-server endpoint has no port".to_string())?;
+    let addresses = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|error| format!("resolve dev-server host: {error}"))?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err("dev-server hostname resolved to no addresses".into());
+    }
+
+    for address in addresses {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::net::TcpStream::connect(address),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(true),
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            Ok(Err(error)) => return Err(format!("connect to {address}: {error}")),
+            Err(_) => return Err(format!("connect to {address} timed out")),
+        }
+    }
+    Ok(false)
+}
+
 async fn exchange(
     client: &Client,
     report_dir: &Path,
@@ -3565,7 +3891,10 @@ async fn exchange(
     };
     let started = std::time::Instant::now();
     let response = request.timeout(spec.timeout).send().await;
-    let elapsed_ms = started.elapsed().as_millis();
+    let headers_elapsed_ms = response
+        .as_ref()
+        .ok()
+        .map(|_| started.elapsed().as_millis());
     let exchange = match response {
         Ok(response) => {
             let status = response.status();
@@ -3590,7 +3919,8 @@ async fn exchange(
                         response_body_file: None,
                         request_body_truncated,
                         response_body_truncated: false,
-                        elapsed_ms,
+                        headers_elapsed_ms,
+                        elapsed_ms: started.elapsed().as_millis(),
                         transport_error: Some(message.clone()),
                     };
                     append_jsonl(requests, &record)?;
@@ -3620,7 +3950,8 @@ async fn exchange(
                 response_body_file: Some(response_body_file),
                 request_body_truncated,
                 response_body_truncated,
-                elapsed_ms,
+                headers_elapsed_ms,
+                elapsed_ms: started.elapsed().as_millis(),
                 transport_error: None,
             };
             append_jsonl(requests, &record)?;
@@ -3649,7 +3980,8 @@ async fn exchange(
                 response_body_file: None,
                 request_body_truncated,
                 response_body_truncated: false,
-                elapsed_ms,
+                headers_elapsed_ms,
+                elapsed_ms: started.elapsed().as_millis(),
                 transport_error: Some(message.clone()),
             };
             append_jsonl(requests, &record)?;
@@ -3881,7 +4213,61 @@ fn zip_semantic_entries(bytes: &[u8]) -> Result<Value> {
             bail!("ZIP contains duplicate entry path {name:?}");
         }
     }
+    // A nonempty directory can be materialized from its child paths during ZIP extraction, so an
+    // explicit conventional 0755 directory record is representation-only. Keep empty directories
+    // and non-default permission records: those can change the extracted workspace.
+    let implied_directories = entries
+        .keys()
+        .flat_map(|path| {
+            let normalized = path.trim_end_matches('/');
+            if normalized.is_empty() {
+                return Vec::new();
+            }
+            let components: Vec<_> = normalized.split('/').collect();
+            let mut parents = vec![String::new()];
+            let mut parent = String::new();
+            for component in components.iter().take(components.len().saturating_sub(1)) {
+                if !parent.is_empty() {
+                    parent.push('/');
+                }
+                parent.push_str(component);
+                parents.push(format!("{parent}/"));
+            }
+            parents
+        })
+        .collect::<BTreeSet<_>>();
+    for path in implied_directories {
+        let is_conventional_nonempty_directory = entries.get(&path).is_some_and(|entry| {
+            entry.get("kind").and_then(Value::as_str) == Some("directory")
+                && entry.get("mode").and_then(Value::as_str) == Some("0755")
+        });
+        if is_conventional_nonempty_directory {
+            entries.remove(&path);
+        }
+    }
     serde_json::to_value(entries).context("serialize ZIP semantic entries")
+}
+
+fn validate_normalized_shape(
+    case: &str,
+    path: &str,
+    rust: Option<&Value>,
+    ts: Option<&Value>,
+    output: &mut Vec<Difference>,
+) {
+    let same_shape = match (rust, ts) {
+        (Some(a), Some(b)) => std::mem::discriminant(a) == std::mem::discriminant(b),
+        _ => false,
+    };
+    if !same_shape {
+        output.push(diff(
+            case,
+            path,
+            "assertion_failed",
+            rust.cloned(),
+            ts.cloned(),
+        ));
+    }
 }
 
 fn json_differences(
@@ -3901,6 +4287,7 @@ fn json_differences(
                     .iter()
                     .any(|normalized| normalized == &child)
                 {
+                    validate_normalized_shape(case, &child, rust.get(key), ts.get(key), output);
                     continue;
                 }
                 match (rust.get(key), ts.get(key)) {
@@ -3980,6 +4367,7 @@ fn json_differences(
                     .iter()
                     .any(|normalized| normalized == &child)
                 {
+                    validate_normalized_shape(case, &child, rust.get(index), ts.get(index), output);
                     continue;
                 }
                 match (rust.get(index), ts.get(index)) {
@@ -3996,6 +4384,17 @@ fn json_differences(
                 }
             }
         }
+        (Value::String(rust), Value::String(ts)) if path == "/diff" => {
+            if normalize_git_diff_hunk_headers(rust) != normalize_git_diff_hunk_headers(ts) {
+                output.push(diff(
+                    case,
+                    path,
+                    "value",
+                    Some(Value::String(rust.clone())),
+                    Some(Value::String(ts.clone())),
+                ));
+            }
+        }
         _ if rust != ts => output.push(diff(
             case,
             path,
@@ -4005,6 +4404,59 @@ fn json_differences(
         )),
         _ => {}
     }
+}
+
+/// Git-compatible diff producers may omit the line count when it is one.
+/// Compare that formatting semantically while leaving all non-hunk text intact.
+fn normalize_git_diff_hunk_headers(diff_text: &str) -> String {
+    diff_text
+        .split_inclusive('\n')
+        .map(|line| {
+            let (body, newline) = line
+                .strip_suffix('\n')
+                .map_or((line, ""), |body| (body, "\n"));
+            normalize_git_diff_hunk_header(body)
+                .map(|normalized| format!("{normalized}{newline}"))
+                .unwrap_or_else(|| line.to_string())
+        })
+        .collect()
+}
+
+fn normalize_git_diff_hunk_header(line: &str) -> Option<String> {
+    let ranges = line.strip_prefix("@@ ")?;
+    let (ranges, context) = ranges.split_once(" @@")?;
+    let (old, new) = ranges.split_once(' ')?;
+    if !old.starts_with('-') || !new.starts_with('+') {
+        return None;
+    }
+
+    fn omit_unit_count(range: &str) -> Option<String> {
+        let (sign, coordinates) = range.split_at(1);
+        if !matches!(sign, "-" | "+") {
+            return None;
+        }
+        let (start, count) = coordinates
+            .split_once(',')
+            .map_or((coordinates, None), |(start, count)| (start, Some(count)));
+        if start.is_empty() || !start.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        match count {
+            Some("1") => Some(format!("{sign}{start}")),
+            Some(count) if !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit()) => {
+                Some(format!("{sign}{start},{count}"))
+            }
+            None => Some(range.to_string()),
+            _ => None,
+        }
+    }
+
+    Some(format!(
+        "@@ {} {} @@{}",
+        omit_unit_count(old)?,
+        omit_unit_count(new)?,
+        context
+    ))
 }
 
 fn named_array_items(items: &[Value]) -> Option<BTreeMap<&str, &Value>> {
@@ -4406,6 +4858,11 @@ fn write_summary(path: &Path, run_id: &str, diff: &RunDiff) -> Result<()> {
         "- Precondition errors: {}\n",
         diff.summary.precondition_errors
     )?;
+    writeln!(
+        summary,
+        "- Transport failures (cause unclassified): {}\n",
+        diff.summary.transport_errors
+    )?;
     writeln!(summary, "## HTTP cases\n")?;
     writeln!(
         summary,
@@ -4421,6 +4878,45 @@ fn write_summary(path: &Path, run_id: &str, diff: &RunDiff) -> Result<()> {
             display_status(case.ts_status),
             case.differences.len()
         )?;
+    }
+    writeln!(summary, "\n## Difference field summary (reporting only)\n")?;
+    writeln!(
+        summary,
+        "Counts repeated fields by scope, JSON/header path, kind, and classification. This section does not normalize or waive any difference; `diff.json` remains the full source of truth.\n"
+    )?;
+    writeln!(
+        summary,
+        "| Scope | Path | Kind | Classification | Occurrences | Cases (up to 5 shown) |\n|---|---|---|---|---:|---|"
+    )?;
+    for group in difference_groups(diff) {
+        let shown_cases = group.cases.iter().take(5).cloned().collect::<Vec<_>>();
+        let omitted = group.cases.len().saturating_sub(shown_cases.len());
+        let cases = if omitted == 0 {
+            shown_cases.join(", ")
+        } else {
+            format!("{}, … (+{omitted} more)", shown_cases.join(", "))
+        };
+        writeln!(
+            summary,
+            "| {} | {} | {} | {} | {} | {} |",
+            markdown_table_cell(&group.scope),
+            markdown_table_cell(&group.path),
+            markdown_table_cell(&group.kind),
+            if group.accepted {
+                "expected"
+            } else {
+                "unclassified"
+            },
+            group.occurrences,
+            markdown_table_cell(&cases)
+        )?;
+    }
+    if diff.cases.iter().all(|case| case.differences.is_empty())
+        && diff.initial_state_differences.is_empty()
+        && diff.state_differences.is_empty()
+        && diff.git_state_differences.is_empty()
+    {
+        writeln!(summary, "| — | — | — | — | 0 | No differences |")?;
     }
     writeln!(summary, "\n## Initial workspace state differences\n")?;
     if diff.initial_state_differences.is_empty() {
@@ -4468,6 +4964,64 @@ fn write_summary(path: &Path, run_id: &str, diff: &RunDiff) -> Result<()> {
         writeln!(summary, "No JSON fields or response headers normalized.")?;
     }
     Ok(())
+}
+
+fn difference_groups(diff: &RunDiff) -> Vec<DifferenceGroup> {
+    let mut grouped: BTreeMap<DifferenceGroupKey, DifferenceGroupCounts> = BTreeMap::new();
+    let mut add = |scope: &str, case: &str, difference: &Difference| {
+        let key = (
+            scope.to_string(),
+            difference.path.clone(),
+            difference.kind.clone(),
+            difference.accepted,
+        );
+        let (occurrences, cases) = grouped.entry(key).or_default();
+        *occurrences += 1;
+        cases.insert(case.to_string());
+    };
+
+    for case in &diff.cases {
+        for difference in &case.differences {
+            add("HTTP", &case.case, difference);
+        }
+    }
+    for difference in &diff.initial_state_differences {
+        add("initial workspace", "initial snapshot", difference);
+    }
+    for difference in &diff.state_differences {
+        add("workspace", "final snapshot", difference);
+    }
+    for difference in &diff.git_state_differences {
+        add("Git state", "Git snapshot", difference);
+    }
+
+    let mut groups = grouped
+        .into_iter()
+        .map(
+            |((scope, path, kind, accepted), (occurrences, cases))| DifferenceGroup {
+                scope,
+                path,
+                kind,
+                accepted,
+                occurrences,
+                cases,
+            },
+        )
+        .collect::<Vec<_>>();
+    groups.sort_by(|left, right| {
+        right
+            .occurrences
+            .cmp(&left.occurrences)
+            .then_with(|| left.scope.cmp(&right.scope))
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.accepted.cmp(&right.accepted))
+    });
+    groups
+}
+
+fn markdown_table_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace(['\n', '\r'], " ")
 }
 
 fn display_status(status: Option<u16>) -> String {
@@ -4674,6 +5228,134 @@ mod tests {
     use super::*;
 
     #[test]
+    fn normalization_does_not_hide_missing_or_wrong_type() {
+        for ts in [json!({}), json!({"port": "1234"})] {
+            let mut differences = vec![];
+            json_differences(
+                "port",
+                "",
+                &json!({"port": 4321}),
+                &ts,
+                &["/port".into()],
+                &mut differences,
+            );
+            assert_eq!(differences.len(), 1);
+            assert_eq!(differences[0].kind, "assertion_failed");
+        }
+    }
+
+    #[test]
+    fn planned_route_is_not_executed_without_a_completed_case() {
+        let mut coverage = json!({"entries": [{"cases": ["create"], "planned_in_this_run": true}]});
+        update_route_execution(&mut coverage, &[]).unwrap();
+        assert_eq!(coverage["entries"][0]["executed_in_this_run"], false);
+        let case = CaseResult {
+            case: "create".into(),
+            equal: false,
+            compared: "http".into(),
+            normalized_paths: vec![],
+            normalized_headers: vec![],
+            rust_status: None,
+            ts_status: Some(200),
+            differences: vec![diff("create", "/transport", "transport_error", None, None)],
+        };
+        update_route_execution(&mut coverage, &[case]).unwrap();
+        assert_eq!(coverage["entries"][0]["execution_status"], "failed");
+    }
+
+    #[test]
+    fn difference_field_summary_groups_repeats_without_accepting_them() {
+        let repeated_a = diff(
+            "header-a",
+            "/http/headers/content-type",
+            "value",
+            Some(json!("application/json")),
+            Some(json!("application/json; charset=utf-8")),
+        );
+        let repeated_b = diff(
+            "header-b",
+            "/http/headers/content-type",
+            "value",
+            Some(json!("text/html")),
+            Some(json!("text/html; charset=utf-8")),
+        );
+        let state_difference = diff(
+            "state",
+            "/http/headers/content-type",
+            "value",
+            Some(json!("application/json")),
+            Some(json!("application/json; charset=utf-8")),
+        );
+        let report = RunDiff {
+            cases: vec![
+                CaseResult {
+                    case: "header-a".into(),
+                    equal: false,
+                    compared: "http".into(),
+                    normalized_paths: Vec::new(),
+                    normalized_headers: Vec::new(),
+                    rust_status: Some(200),
+                    ts_status: Some(200),
+                    differences: vec![repeated_a],
+                },
+                CaseResult {
+                    case: "header-b".into(),
+                    equal: false,
+                    compared: "http".into(),
+                    normalized_paths: Vec::new(),
+                    normalized_headers: Vec::new(),
+                    rust_status: Some(200),
+                    ts_status: Some(200),
+                    differences: vec![repeated_b],
+                },
+            ],
+            initial_state_differences: Vec::new(),
+            state_differences: vec![state_difference],
+            git_state_differences: Vec::new(),
+            summary: Summary {
+                comparisons: 3,
+                equal: 0,
+                expected_differences: 0,
+                unclassified_differences: 3,
+                transport_errors: 0,
+                environment_errors: 0,
+                environment_blocked: false,
+                precondition_errors: 0,
+            },
+        };
+
+        let groups = difference_groups(&report);
+        let http_header = groups
+            .iter()
+            .find(|group| group.scope == "HTTP")
+            .expect("HTTP header group");
+        assert_eq!(http_header.path, "/http/headers/content-type");
+        assert_eq!(http_header.occurrences, 2);
+        assert_eq!(http_header.cases.len(), 2);
+        assert!(!http_header.accepted);
+
+        let workspace_header = groups
+            .iter()
+            .find(|group| group.scope == "workspace")
+            .expect("workspace state group");
+        assert_eq!(workspace_header.occurrences, 1);
+        assert_eq!(workspace_header.cases.len(), 1);
+        assert!(!workspace_header.accepted);
+
+        let summary_path = std::env::temp_dir().join(format!(
+            "file-server-ab-summary-{}.md",
+            uuid::Uuid::new_v4()
+        ));
+        write_summary(&summary_path, "test-run", &report).expect("write summary");
+        let summary = fs::read_to_string(&summary_path).expect("read summary");
+        assert!(summary.contains("## Difference field summary (reporting only)"));
+        assert!(summary.contains(
+            "| HTTP | /http/headers/content-type | value | unclassified | 2 | header-a, header-b |"
+        ));
+        fs::remove_file(summary_path).expect("remove temporary summary");
+    }
+
+    #[test]
     fn expected_difference_rule_requires_exact_values() {
         let rules = RulesFile {
             schema_version: 1,
@@ -4764,6 +5446,42 @@ mod tests {
     }
 
     #[test]
+    fn git_diff_ignores_only_equivalent_single_line_hunk_count_formatting() {
+        let rust = json!({
+            "diff": "@@ -1,1 +1,1 @@\n-before\n+after\n@@ -0,0 +1,1 @@\n+new\n"
+        });
+        let typescript = json!({
+            "diff": "@@ -1 +1 @@\n-before\n+after\n@@ -0,0 +1 @@\n+new\n"
+        });
+        let mut differences = Vec::new();
+        json_differences("git-diff", "", &rust, &typescript, &[], &mut differences);
+        assert!(differences.is_empty());
+
+        let changed_content = json!({
+            "diff": "@@ -1 +1 @@\n-before\n+different\n@@ -0,0 +1 @@\n+new\n"
+        });
+        json_differences(
+            "git-diff",
+            "",
+            &rust,
+            &changed_content,
+            &[],
+            &mut differences,
+        );
+        assert_eq!(differences.len(), 1);
+        assert_eq!(differences[0].path, "/diff");
+
+        assert_ne!(
+            normalize_git_diff_hunk_headers("@@ -1,2 +1,3 @@ context\n"),
+            normalize_git_diff_hunk_headers("@@ -1 +1 @@ context\n")
+        );
+        assert_eq!(
+            normalize_git_diff_hunk_headers("text,1 is not a hunk range\n"),
+            "text,1 is not a hunk range\n"
+        );
+    }
+
+    #[test]
     fn zip_responses_compare_by_entry_semantics_not_archive_order() {
         fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {
             let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -4792,6 +5510,45 @@ mod tests {
     }
 
     #[test]
+    fn zip_semantics_ignore_implied_directories_but_preserve_empty_directories() {
+        fn archive(explicit_parent_dirs: bool, include_empty_dir: bool) -> Vec<u8> {
+            let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            let options = zip::write::SimpleFileOptions::default();
+            if explicit_parent_dirs {
+                writer
+                    .add_directory("src/", options)
+                    .expect("add src directory");
+                writer
+                    .add_directory("src/nested/", options)
+                    .expect("add nested directory");
+            }
+            if include_empty_dir {
+                writer
+                    .add_directory("empty/", options)
+                    .expect("add empty directory");
+            }
+            writer
+                .start_file("src/nested/main.rs", options)
+                .expect("start source file");
+            writer.write_all(b"source").expect("write source file");
+            writer.finish().expect("finish ZIP").into_inner()
+        }
+
+        let explicit = archive(true, true);
+        let implicit = archive(false, true);
+        let empty_missing = archive(false, false);
+
+        assert_eq!(
+            zip_semantic_entries(&explicit).expect("explicit directory ZIP"),
+            zip_semantic_entries(&implicit).expect("implicit directory ZIP")
+        );
+        assert_ne!(
+            zip_semantic_entries(&implicit).expect("implicit directory ZIP"),
+            zip_semantic_entries(&empty_missing).expect("ZIP without empty directory")
+        );
+    }
+
+    #[test]
     fn git_index_entries_are_ordered_by_path_not_object_id() {
         let entries = git_index_records(
             b"100644 ffffffffffffffffffffffffffffffffffffffff 0\tz.txt\0\
@@ -4803,6 +5560,31 @@ mod tests {
                 "a.txt\t100644 0000000000000000000000000000000000000000 0",
                 "z.txt\t100644 ffffffffffffffffffffffffffffffffffffffff 0"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn dev_port_probe_distinguishes_open_from_refused_ports() {
+        let open_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind open probe listener");
+        let open_endpoint = format!(
+            "http://{}",
+            open_listener.local_addr().expect("open listener addr")
+        );
+
+        assert!(
+            dev_port_accepts_connections(&open_endpoint)
+                .await
+                .expect("probe listening port")
+        );
+
+        let closed_endpoint = "http://127.0.0.1:1";
+        assert!(
+            !dev_port_accepts_connections(closed_endpoint)
+                .await
+                .expect("probe closed port"),
+            "closed endpoint {closed_endpoint} must refuse connections"
         );
     }
 }

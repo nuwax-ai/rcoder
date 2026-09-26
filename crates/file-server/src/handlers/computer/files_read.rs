@@ -279,6 +279,13 @@ mod tests {
         // 递归: sub/c.txt 应扁平展开
         assert!(names.contains(&"a.txt"));
         assert!(names.contains(&"sub/c.txt"));
+        let file = val["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "a.txt")
+            .unwrap();
+        assert_eq!(file["fileProxyUrl"], json!(null));
     }
 
     #[tokio::test]
@@ -522,7 +529,7 @@ mod tests {
         let q = Query(SearchFilesQuery {
             user_id: "u".into(),
             c_id: "c".into(),
-            proxy_path: Some("/proxy".into()),
+            proxy_path: None,
             custom_target_dir: None,
             workspace_path: None,
             service_type: None,
@@ -546,6 +553,13 @@ mod tests {
         assert!(names.contains(&"a.txt"));
         assert!(names.contains(&"sub/c.txt"));
         assert_eq!(val["truncated"], json!(false));
+        let file = val["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "a.txt")
+            .unwrap();
+        assert_eq!(file["fileProxyUrl"], json!(null));
     }
 
     #[tokio::test]

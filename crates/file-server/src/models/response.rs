@@ -76,6 +76,13 @@ pub struct CreateWorkspaceResponse {
     /// best-effort 透传: 推送失败的 skill URL 明细 (空则不输出)。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub failed_skills: Vec<SkillFailure>,
+    /// Agent Store v2 字段；legacy workspace 模式不输出。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_store_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_skills: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_store_update: Option<bool>,
 }
 
 // ── dev server（file-server 本体与 file-server-userapp 跨 crate 共享）──────────

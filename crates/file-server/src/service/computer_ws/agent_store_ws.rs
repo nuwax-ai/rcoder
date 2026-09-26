@@ -97,6 +97,7 @@ pub async fn create_workspace_with_agent_store(
     // 1. 确保 agent-store 目录
     let (agent_skills_dir, agent_agents_dir) =
         crate::service::agent_store::ensure_agent_store_dirs(user_root, agent_id).await?;
+    let agent_store_path = crate::service::agent_store::agent_store_path(user_root, agent_id)?;
 
     // 2. 写 hook 配置到会话工作区 (best-effort)
     if let Err(error) = crate::service::agent_hooks::write_agent_hook_configs(
@@ -294,23 +295,15 @@ pub async fn create_workspace_with_agent_store(
         "workspace created with agent store"
     );
 
-    let message = if updated_skills.is_empty()
-        && skill_zip.is_none()
-        && skill_urls.is_empty()
-        && skill_url_map.is_none()
-    {
-        "Workspace linked to agent store".to_string()
-    } else {
-        format!(
-            "Workspace created successfully, {} skill(s) updated",
-            updated_skills.len()
-        )
-    };
-
     Ok(CreateWorkspaceResult {
-        message,
+        message: "Workspace created successfully, linked to agent store".to_string(),
         updated_skills,
         failed_skills,
+        agent_store_path: Some(agent_store_path.to_string_lossy().into_owned()),
+        skipped_skills: Some(skipped_skills),
+        // This implementation completes the update synchronously; it never reports a skipped
+        // update because a store lock was held.
+        skipped_store_update: Some(false),
     })
 }
 

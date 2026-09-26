@@ -1,0 +1,47 @@
+ARG DOCKER_MIRROR=
+ARG RUST_BUILDER_IMAGE=${DOCKER_MIRROR}rust:trixie
+ARG NODE_RUNTIME_IMAGE=${DOCKER_MIRROR}library/node:22-trixie-slim
+FROM ${NODE_RUNTIME_IMAGE} AS node_runtime
+
+FROM ${RUST_BUILDER_IMAGE} AS toolchain
+ARG PNPM_VERSION=10.34.5
+ARG PNPM_REGISTRY=https://registry.npmmirror.com
+ARG PNPM_NETWORK_CONCURRENCY=32
+
+COPY --from=node_runtime /usr/local /usr/local
+
+# Match the rcoder image's domestic Debian mirror; do not upgrade the base OS.
+# pipefail prevents a failed download from being hidden by an empty bash stdin.
+RUN bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --max-time 120 --retry 3 https://linuxmirrors.cn/main.sh | bash -s -- \
+    --source mirrors.aliyun.com \
+    --protocol https \
+    --use-intranet-source false \
+    --install-epel false \
+    --backup false \
+    --upgrade-software false \
+    --clean-cache true \
+    --ignore-backup-tips'
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates git procps protobuf-compiler pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN printf 'registry=%s\nnetwork-concurrency=%s\n' \
+      "${PNPM_REGISTRY}" "${PNPM_NETWORK_CONCURRENCY}" > /etc/npmrc
+
+ENV NPM_CONFIG_USERCONFIG=/etc/npmrc \
+    npm_config_registry=${PNPM_REGISTRY} \
+    npm_config_fetch_retries=5
+
+RUN --mount=type=cache,target=/root/.npm,sharing=locked npm install --global pnpm@${PNPM_VERSION} \
+    --registry="${PNPM_REGISTRY}" \
+    --fetch-retries=5 \
+    --fetch-timeout=30000
+
+# Identity changes must not invalidate package installation layers.
+ARG AB_UID=1000
+ARG AB_GID=1000
+RUN if ! awk -F: -v uid="${AB_UID}" '$3 == uid { found = 1 } END { exit found ? 0 : 1 }' /etc/passwd; then \
+      printf 'ab-runtime:x:%s:%s:A-B runtime:/tmp:/usr/sbin/nologin\n' "${AB_UID}" "${AB_GID}" >> /etc/passwd; \
+    fi

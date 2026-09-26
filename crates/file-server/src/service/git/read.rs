@@ -5,6 +5,7 @@ use crate::error::{AppError, AppResult};
 use super::{map_git_err, shorten_ref};
 
 use gix::diff::index::ChangeRef as IndexChange;
+use gix::index::entry::Stage;
 use gix::progress::Discard;
 use gix::status::index_worktree::Item as WorktreeItem;
 use gix::status::{Item as StatusItem, UntrackedFiles};
@@ -439,6 +440,7 @@ pub struct StatusResult {
     pub created: Vec<String>,
     pub deleted: Vec<String>,
     pub untracked: Vec<String>,
+    pub conflicted: Vec<String>,
 }
 
 /// 工作区状态 (对齐 nuwax status; gix status platform 折叠到 5-bucket)。
@@ -456,7 +458,17 @@ pub fn get_status(repo: &Repository) -> AppResult<StatusResult> {
         created: vec![],
         deleted: vec![],
         untracked: vec![],
+        conflicted: vec![],
     };
+    let index = repo
+        .open_index()
+        .map_err(|e| map_git_err(e, "git status open_index"))?;
+    let index_backing = index.path_backing();
+    for entry in index.entries() {
+        if entry.stage() != Stage::Unconflicted {
+            r.conflicted.push(entry.path_in(index_backing).to_string());
+        }
+    }
     let mut iter = repo
         .status(Discard)
         .map_err(|e| map_git_err(e, "git status"))?
@@ -506,12 +518,21 @@ pub fn get_status(repo: &Repository) -> AppResult<StatusResult> {
             },
         }
     }
+    // An unmerged index path is staged and conflicted, not a normal worktree modification.
+    // gix's status iterator currently reports common UU conflicts as IndexWorktree::Modification;
+    // the index stages are the authoritative conflict source.
+    for path in &r.conflicted {
+        r.staged.push(path.clone());
+    }
+    r.modified
+        .retain(|path| !r.conflicted.iter().any(|conflict| conflict == path));
     for v in [
         &mut r.staged,
         &mut r.modified,
         &mut r.created,
         &mut r.deleted,
         &mut r.untracked,
+        &mut r.conflicted,
     ] {
         v.sort();
         v.dedup();
@@ -646,6 +667,62 @@ mod tests {
             s.untracked.iter().any(|p| p == "fresh.txt"),
             "未跟踪文件必须进 untracked bucket: {:?}",
             s.untracked
+        );
+    }
+
+    #[test]
+    fn get_status_reports_unmerged_index_paths_as_staged_conflicts() {
+        let t = TestRepo::new();
+        commit_file(&t, "README.md", "base", "base");
+        std::fs::write(
+            t.0.join("README.md"),
+            "<<<<<<< ours\nours\n=======\ntheirs\n>>>>>>> theirs\n",
+        )
+        .expect("write conflict markers");
+
+        let repo = t.open();
+        let path: &gix::bstr::BStr = "README.md".into();
+        let base = {
+            let index = repo.open_index().expect("open index");
+            let entry = index
+                .entry_by_path_and_stage(path, Stage::Unconflicted)
+                .expect("find base index entry");
+            (entry.stat, entry.id, entry.mode)
+        };
+        let ours = repo
+            .write_blob(b"ours\n")
+            .expect("write ours blob")
+            .detach();
+        let theirs = repo
+            .write_blob(b"theirs\n")
+            .expect("write theirs blob")
+            .detach();
+        let mut index = repo.open_index().expect("open index for conflict setup");
+        index.remove_entries(|_, candidate, _| candidate == path);
+        for (stage, id) in [
+            (Stage::Base, base.1),
+            (Stage::Ours, ours),
+            (Stage::Theirs, theirs),
+        ] {
+            index.dangerously_push_entry(
+                base.0,
+                id,
+                gix::index::entry::Flags::from(stage),
+                base.2,
+                path,
+            );
+        }
+        index.sort_entries();
+        index
+            .write(super::super::IndexWriteOptions::default())
+            .expect("write unmerged index");
+
+        let status = get_status(&repo).expect("read status with conflict");
+        assert_eq!(status.conflicted, ["README.md"]);
+        assert_eq!(status.staged, ["README.md"]);
+        assert!(
+            status.modified.is_empty(),
+            "conflict must not be reported as modified: {status:?}"
         );
     }
 

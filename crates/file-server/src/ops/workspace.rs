@@ -25,11 +25,15 @@ pub async fn init_project_template_core(
     zip::extract_to(data.path().to_path_buf(), ws.clone()).await?;
     // git 双开关: GIT_ENABLED && enableGit → init + initial commit (对齐 nuwax)
     if state.config.git_enabled && enable_git {
-        let an = state.config.git_default_author_name.clone();
-        let ae = state.config.git_default_author_email.clone();
-        // init_repo 内部已含 initial commit; 失败传播——nuwax initProjectTemplate 的
-        // init+commit 组合同样不 catch, 吞错会留下无提交的 unborn 工作区
-        crate::service::git::init_repo(&ws, &an, &ae)?;
+        // 模板文件必须进入初始提交。nuwax 先 init 再 commitAllChanges；只调用
+        // init_repo 会仅提交 .gitignore，使刚解压的项目文件全部留在未跟踪状态。
+        crate::service::git::write::init_and_commit_offloaded(
+            ws.clone(),
+            "Initial commit".to_string(),
+            state.config.git_default_author_name.clone(),
+            state.config.git_default_author_email.clone(),
+        )
+        .await?;
     }
     Ok(ws)
 }
@@ -52,6 +56,22 @@ pub async fn init_project_template_impl(
 /// push-skills 结果（updated 为已推送的技能目录名列表）。
 pub struct PushedSkills {
     pub updated: Vec<String>,
+    pub agent_store_path: Option<String>,
+}
+
+/// 成功推送技能时返回与 TypeScript API 一致的消息。
+pub fn pushed_skills_message(updated: &[String], in_agent_store: bool) -> String {
+    if updated.is_empty() {
+        "No valid skill directories found in file or skillUrls".to_string()
+    } else if in_agent_store {
+        format!(
+            "Pushed {} skills to agent store: {}",
+            updated.len(),
+            updated.join(", ")
+        )
+    } else {
+        format!("Pushed {} skills: {}", updated.len(), updated.join(", "))
+    }
 }
 
 /// push-skills 参数集 (结构化入参, 避免 too_many_arguments; 同
@@ -123,6 +143,7 @@ pub async fn push_skills_core_with_store(
 
     // 有 agentId 且 workspace 已软链 → 写 agent-store; 否则旧路径 (对齐 TS pushSkillsToWorkspace)
     let agent_id = agent_id.map(|s| s.trim()).filter(|s| !s.is_empty());
+    let mut agent_store_path = None;
     let updated = if allow_agent_store && let Some(agent_id) = agent_id {
         let skills_path = ws.join(".agents").join("skills");
         // 共享工作区（TS 同款）：挂载目录为实体目录（条目级链接），不做目录级
@@ -132,6 +153,11 @@ pub async fn push_skills_core_with_store(
                 Some(root) => root.to_path_buf(),
                 None => ws.parent().unwrap_or(ws).to_path_buf(),
             };
+            agent_store_path = Some(
+                crate::service::agent_store::agent_store_path(&user_root, agent_id)?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
             skills_service::push_skills_to_agent_store(skills_service::PushToStoreParams {
                 user_root: &user_root,
                 // F02：显式传已解析 ws——底层不再按 user_root.join(cid) 反推
@@ -172,31 +198,28 @@ pub async fn push_skills_core_with_store(
         )
         .await?
     };
-    Ok(PushedSkills { updated })
+    Ok(PushedSkills {
+        updated,
+        agent_store_path,
+    })
 }
 
 /// push-skills 的 workspace 无关实现（computer 域 TS 响应拼装）。
 pub async fn push_skills_impl(
     state: &AppState,
     params: PushSkillsParams<'_>,
+    response_workspace_root: &Path,
 ) -> Result<Json<Value>, AppError> {
-    let ws_display = params.ws.display().to_string();
     let r = push_skills_core_with_store(state, params).await?;
-    // message 对齐 nuwax pushSkillsToWorkspace: 有 skills → "Pushed N skills: a, b";
-    // 无 → "No valid skill directories found in file or skillUrls"
-    let message = if r.updated.is_empty() {
-        "No valid skill directories found in file or skillUrls".to_string()
-    } else {
-        format!(
-            "Pushed {} skills: {}",
-            r.updated.len(),
-            r.updated.join(", ")
-        )
-    };
-    Ok(Json(json!({
+    let message = pushed_skills_message(&r.updated, r.agent_store_path.is_some());
+    let mut response = json!({
         "success": true,
         "message": message,
-        "workspaceRoot": ws_display,
+        "workspaceRoot": response_workspace_root.display().to_string(),
         "updatedSkills": r.updated,
-    })))
+    });
+    if let Some(agent_store_path) = r.agent_store_path {
+        response["agentStorePath"] = json!(agent_store_path);
+    }
+    Ok(Json(response))
 }

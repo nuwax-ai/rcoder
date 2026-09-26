@@ -1,15 +1,14 @@
-ARG NODE_RUNTIME_IMAGE=node:22-bookworm-slim
-FROM ${NODE_RUNTIME_IMAGE}
+FROM toolchain
 ARG PNPM_VERSION=10.34.5
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git procps \
-    && npm install --global pnpm@${PNPM_VERSION} \
-    && rm -rf /var/lib/apt/lists/*
+ARG PNPM_REGISTRY=https://registry.npmmirror.com
+ARG PNPM_NETWORK_CONCURRENCY=32
 
 WORKDIR /srv/nuwax-file-server
 COPY package.json pnpm-lock.yaml ./
-RUN pnpm install --prod --frozen-lockfile
+RUN --mount=type=cache,id=file-server-ab-ts-pnpm-${PNPM_VERSION},target=/pnpm-cache,sharing=locked \
+    npm_config_store_dir=/pnpm-cache pnpm install --prod --frozen-lockfile \
+      --prefer-offline --registry="${PNPM_REGISTRY}" \
+      --network-concurrency="${PNPM_NETWORK_CONCURRENCY}"
 COPY . .
 
 ENV NODE_ENV=ab \

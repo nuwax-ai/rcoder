@@ -151,9 +151,10 @@ pub async fn get_file_list_impl(
             }
         }
     }
+    let files = computer_file_entries_json(result.files);
     Ok(Json(json!({
         "success": true,
-        "files": result.files,
+        "files": files,
         "recursive": result.recursive,
         "type": result.file_type.as_str(),
         "limit": result.limit,
@@ -286,12 +287,36 @@ pub async fn search_files_impl(
             }
         }
     }
+    let files = computer_file_entries_json(r.files);
     Ok(Json(json!({
         "success": true,
-        "files": r.files,
+        "files": files,
         "truncated": r.truncated,
         "visited": r.visited,
     })))
+}
+
+/// Shape Computer file-list/search entries like the TypeScript API.
+/// Files always include `fileProxyUrl` (null when proxyPath is absent); directory
+/// entries intentionally contain only `name` and `isDir`.
+fn computer_file_entries_json(files: Vec<tree::FileEntry>) -> Vec<Value> {
+    files
+        .into_iter()
+        .map(|file| {
+            let mut value = json!({
+                "name": file.name,
+                "isDir": file.is_dir,
+            });
+            if !file.is_dir {
+                value["fileProxyUrl"] = file
+                    .file_proxy_url
+                    .map(Value::String)
+                    .unwrap_or(Value::Null);
+                value["isLink"] = json!(file.is_link.unwrap_or(false));
+            }
+            value
+        })
+        .collect()
 }
 
 /// trim 后非空才返回 (customTargetDir 的 URL 后缀语义)。

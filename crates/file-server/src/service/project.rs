@@ -179,13 +179,8 @@ pub async fn copy_project(
         ));
     }
     fs::create_dir_all(&target_path).await?;
-    if let Err(e) = crate::service::fs_util::copy_dir_filtered(
-        &source_path,
-        &target_path,
-        &config.traverse_exclude_dirs,
-        &config.backup_traverse_exclude_files,
-    )
-    .await
+    if let Err(e) =
+        copy_project_tree(&source_path, &target_path, &config.traverse_exclude_dirs).await
     {
         if let Err(cleanup_err) = fs::remove_dir_all(&target_path).await {
             tracing::warn!(error = %cleanup_err, "cleanup target_path on copy failure failed (skipping)");
@@ -215,6 +210,51 @@ pub async fn copy_project(
         target_project_id: target_id.to_string(),
         target_project_path: target_path.to_string_lossy().to_string(),
     })
+}
+
+/// 复制项目源文件。
+///
+/// `traverse_exclude_dirs` 也包含 `.agents` 等用户项目配置目录，因为普通文件遍历不应
+/// 把它们当作业务源码返回；项目复制则必须保留这些根目录。备份专用的文件排除规则
+/// （例如 `pnpm-lock.yaml`）同样不适用于项目复制。
+async fn copy_project_tree(src: &Path, dst: &Path, exclude_dirs: &[String]) -> AppResult<()> {
+    const PRESERVED_ROOT_DIRS: &[&str] = &[
+        ".agents",
+        ".attachments",
+        ".codex",
+        ".grok",
+        ".opencode",
+        ".pi",
+    ];
+
+    fs::create_dir_all(dst).await?;
+    let mut entries = fs::read_dir(src).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        let name_for_match = name.to_string_lossy();
+        let source = entry.path();
+        let target = dst.join(&name);
+        let file_type = entry.file_type().await?;
+
+        if file_type.is_dir() {
+            let excluded = exclude_dirs
+                .iter()
+                .any(|excluded| excluded == &name_for_match);
+            let preserved_user_data = PRESERVED_ROOT_DIRS
+                .iter()
+                .any(|preserved| *preserved == name_for_match);
+            if excluded && !preserved_user_data {
+                continue;
+            }
+            // 递归时仍过滤生成目录（例如技能仓中的 node_modules），但不套用备份文件规则。
+            crate::service::fs_util::copy_dir_filtered(&source, &target, exclude_dirs, &[]).await?;
+        } else if file_type.is_file() {
+            // 根目录文件及递归目录中的文件均保留，包括各级 package lockfile。
+            fs::copy(&source, &target).await?;
+        }
+        // 与 TS Dirent 行为一致，不跟随或复制符号链接。
+    }
+    Ok(())
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────────
@@ -586,6 +626,79 @@ mod tests {
             matches!(err, AppError::Business(msg) if msg.contains("already exists")),
             "目标已存在必须是 Business 变体"
         );
+    }
+
+    #[tokio::test]
+    async fn copy_preserves_agent_data_and_lockfiles_but_skips_generated_dirs() {
+        let f = fixture();
+        let source = f._root.path().join("ws/source");
+        for directory in [
+            ".agents/skills/review",
+            ".agents/skills/review/node_modules/cache",
+            ".attachments",
+            ".codex",
+            ".grok",
+            ".opencode",
+            ".pi",
+            ".git/objects",
+            "node_modules/dependency",
+            "dist/assets",
+            "packages/frontend",
+        ] {
+            fs::create_dir_all(source.join(directory))
+                .await
+                .expect("create source fixture directory");
+        }
+        for (path, contents) in [
+            (".agents/skills/review/SKILL.md", "skill"),
+            (".attachments/design.txt", "attachment"),
+            (".codex/instructions.md", "codex instructions"),
+            (".grok/config.md", "grok config"),
+            (".opencode/agents.md", "opencode agents"),
+            (".pi/settings.json", "pi settings"),
+            ("pnpm-lock.yaml", "root lockfile"),
+            ("packages/frontend/package-lock.json", "nested lockfile"),
+            (
+                ".agents/skills/review/node_modules/cache/index.js",
+                "generated",
+            ),
+            (".git/HEAD", "git metadata"),
+            ("node_modules/dependency/index.js", "dependency"),
+            ("dist/assets/app.js", "built output"),
+        ] {
+            fs::write(source.join(path), contents)
+                .await
+                .expect("write source fixture file");
+        }
+
+        copy_project(&f.resolver, &f.config, &ctx("source"), &ctx("target"))
+            .await
+            .expect("copy project");
+
+        let target = f._root.path().join("ws/target");
+        for path in [
+            ".agents/skills/review/SKILL.md",
+            ".attachments/design.txt",
+            ".codex/instructions.md",
+            ".grok/config.md",
+            ".opencode/agents.md",
+            ".pi/settings.json",
+            "pnpm-lock.yaml",
+            "packages/frontend/package-lock.json",
+        ] {
+            assert!(target.join(path).is_file(), "expected copied file: {path}");
+        }
+        for path in [
+            ".git",
+            "node_modules",
+            "dist",
+            ".agents/skills/review/node_modules",
+        ] {
+            assert!(
+                !target.join(path).exists(),
+                "generated path should be skipped: {path}"
+            );
+        }
     }
 
     /// 上传 zip 夹具：tempdir 内一个源目录 + pack 成 zip

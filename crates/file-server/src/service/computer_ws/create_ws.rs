@@ -17,6 +17,10 @@ pub struct CreateWorkspaceResult {
     /// best-effort: 推送失败的 skill URL 明细 (空 = 全部成功)。透传给调用方,
     /// 避免 skill 缺失被静默吞掉 (SSRF/HTTPS 校验拒绝、下载/解压失败等)。
     pub failed_skills: Vec<SkillFailure>,
+    /// Agent Store 路径及状态仅在 v2 Agent Store 模式下返回。
+    pub agent_store_path: Option<String>,
+    pub skipped_skills: Option<Vec<String>>,
+    pub skipped_store_update: Option<bool>,
 }
 
 /// create-workspace 核心 (对齐 nuwax createWorkspace):
@@ -77,6 +81,9 @@ pub async fn create_workspace(
             message: "Workspace created (no uploaded file, no skills and agents)".to_string(),
             updated_skills,
             failed_skills: Vec::new(),
+            agent_store_path: None,
+            skipped_skills: None,
+            skipped_store_update: None,
         });
     }
 
@@ -216,6 +223,9 @@ pub async fn create_workspace(
         message,
         updated_skills,
         failed_skills,
+        agent_store_path: None,
+        skipped_skills: None,
+        skipped_store_update: None,
     })
 }
 

@@ -10,6 +10,7 @@ use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppMultipart as Multipart};
 use crate::models::PushProjectSkillsForm;
 use crate::ops::multipart::{file_field, text_field};
+use crate::ops::workspace::pushed_skills_message;
 use crate::service::skills as skills_service;
 
 /// project_id 必填 (multipart 提取后构造 + garde 校验)。
@@ -87,7 +88,7 @@ pub(crate) async fn push_skills_to_workspace(
     .await?;
     Ok(Json(json!({
         "success": true,
-        "message": "Skills pushed to workspace",
+        "message": pushed_skills_message(&result.updated_skills, false),
         "projectPath": result.project_path,
         "updatedSkills": result.updated_skills,
     })))

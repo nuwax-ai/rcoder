@@ -175,7 +175,7 @@ pub(crate) async fn file_content(
 
 /// 查询工作区状态
 ///
-/// 对齐 nuwax status 5-bucket + conflicted/ahead/behind/tracking 固定值。
+/// 对齐 nuwax status 5-bucket + index 冲突列表；ahead/behind/tracking 暂为固定值。
 #[utoipa::path(
     get,
     path = "/status",
@@ -210,7 +210,7 @@ pub(crate) async fn status(
         "created": result.created,
         "deleted": result.deleted,
         "untracked": result.untracked,
-        "conflicted": [],
+        "conflicted": result.conflicted,
         "ahead": 0,
         "behind": 0,
         "tracking": null,

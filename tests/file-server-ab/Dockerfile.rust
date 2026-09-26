@@ -1,27 +1,15 @@
-ARG RUST_BUILDER_IMAGE=rust:1.98-bookworm
-ARG NODE_RUNTIME_IMAGE=node:22-bookworm-slim
-FROM ${RUST_BUILDER_IMAGE} AS builder
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends protobuf-compiler pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+FROM toolchain AS builder
 
 WORKDIR /src
-COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=bind,target=/src,rw \
+    --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git/db \
-    --mount=type=cache,target=/src/target \
+    --mount=type=cache,target=/src/target,sharing=locked \
     cargo build --release -p file-server-proxy --bin file-server-proxy -p file-server-ab --bin file-server-ab \
     && install -D /src/target/release/file-server-proxy /out/file-server-proxy \
     && install -D /src/target/release/file-server-ab /out/file-server-ab
 
-FROM ${NODE_RUNTIME_IMAGE} AS runtime
-ARG PNPM_VERSION=10.34.5
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git procps \
-    && npm install --global pnpm@${PNPM_VERSION} \
-    && rm -rf /var/lib/apt/lists/*
+FROM toolchain AS runtime
 
 COPY --from=builder /out/file-server-proxy /usr/local/bin/file-server-proxy
 COPY --from=builder /out/file-server-ab /usr/local/bin/file-server-ab

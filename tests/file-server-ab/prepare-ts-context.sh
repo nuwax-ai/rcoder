@@ -34,6 +34,10 @@ src/env.*
 logs
 dist
 EOF
-
+# run.sh sets a private umask for reports and scratch files. The TS service
+# runs as the invoking host UID, so restore ordinary source readability after
+# extracting the tracked archive; otherwise Node reports src/server.js as
+# missing because its root-owned parent directories are not traversable.
+chmod -R a+rX "${context}"
 printf '%s\n' "${resolved}" > "${context}/.ab-source-revision"
 echo "Prepared tracked TS source ${resolved} at ${context}"

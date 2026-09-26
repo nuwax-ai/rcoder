@@ -27,6 +27,9 @@ fn create_workspace_response(
             .to_string(),
         updated_skills: result.updated_skills,
         failed_skills: result.failed_skills,
+        agent_store_path: result.agent_store_path,
+        skipped_skills: result.skipped_skills,
+        skipped_store_update: result.skipped_store_update,
     })
 }
 

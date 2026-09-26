@@ -1,19 +1,39 @@
+x-file-server-ab-shared-profile: &file-server-ab-shared-profile
+  # Match the common core settings from the TS test profile. Explicit values
+  # prevent Rust defaults and an empty env.ab from becoming accidental inputs.
+  MAX_INLINE_FILE_SIZE_BYTES: "1048576"
+  UPLOAD_MAX_FILE_SIZE_BYTES: "1048576000"
+  UPLOAD_ALLOWED_EXTENSIONS: ".zip"
+  DOWNLOAD_MAX_FILE_SIZE_BYTES: "104857600"
+  REQUEST_BODY_LIMIT: "1024mb"
+  MAX_BUILD_CONCURRENCY: "20"
+  TRAVERSE_EXCLUDE_DIRS: "dist,node_modules,.pnpm-store,__MACOSX,.attachments,.git,.agents,.codex,.opencode,.logs"
+  BACKUP_TRAVERSE_EXCLUDE_FILES: "pnpm-lock.yaml,yarn.lock,package-lock.json"
+  CONTENT_TRAVERSE_EXCLUDE_FILES: "AGENT.md,AGENTS.md,CLAUDE.md,pnpm-lock.yaml,yarn.lock,package-lock.json"
+  INLINE_IMAGE_EXTENSIONS: ".png,.jpg,.jpeg,.gif,.bmp,.svg,.ico,.webp,.avif"
+  GIT_AUTO_GITIGNORE: "true"
+  GIT_GITIGNORE_ENTRIES: "node_modules/|.pnpm-store/|dist/|dist-packages/|build/|.idea/|.vscode/|.DS_Store|.npmrc|.agents/|.claude/|.opencode/|.codex/|.tmp/|.logs/|pnpm-lock.yaml|yarn.lock|package-lock.json"
+  ZIP_WORKSPACE_EXCLUDE: ".git,.tmp,.claude,.agents,.codex,.opencode,.logs,.npmrc,__pycache__,node_modules,dist,pnpm-lock.yaml,yarn.lock,package-lock.json"
+  HOME: /tmp
+  NPM_CONFIG_USERCONFIG: /etc/npmrc
+
 services:
   rust:
-    image: rcoder-file-server-ab-rust:${AB_IMAGE_TAG:-local}
-    build:
-      context: ${RCODER_ROOT}
-      dockerfile: tests/file-server-ab/Dockerfile.rust
-      args:
-        RUST_BUILDER_IMAGE: ${AB_RUST_BUILDER_IMAGE}
-        NODE_RUNTIME_IMAGE: ${AB_NODE_IMAGE_DIGEST}
-        PNPM_VERSION: ${AB_PNPM_VERSION}
+    image: ${AB_RUST_IMAGE_REF:?AB_RUST_IMAGE_REF is required}
     ports:
       - "127.0.0.1:${AB_RUST_PORT:-}:60000"
+    user: "${AB_UID}:${AB_GID}"
     volumes:
       - "${AB_RUNTIME_DIR}/rust:/data"
+      - rust_project_workspace:/data/project-workspace
+      - pnpm_rust_store:/pnpm-cache
+      - pnpm_rust_metadata_cache:/pnpm-metadata
     environment:
+      <<: *file-server-ab-shared-profile
+      npm_config_store_dir: /pnpm-cache
+      XDG_CACHE_HOME: /pnpm-metadata
       FILE_SERVER_PROXY_HOST: 0.0.0.0
+      FILE_SERVER_PROXY_STATE_DIR: /data/file-server-proxy-state
       NODE_ENV: ab
       PROJECT_SOURCE_DIR: /data/project-workspace
       COMPUTER_WORKSPACE_DIR: /data/computer-workspace
@@ -38,18 +58,19 @@ services:
       retries: 45
 
   typescript:
-    image: rcoder-file-server-ab-ts:${AB_IMAGE_TAG:-local}
-    build:
-      context: ${AB_TS_CONTEXT}
-      dockerfile: Dockerfile
-      args:
-        NODE_RUNTIME_IMAGE: ${AB_NODE_IMAGE_DIGEST}
-        PNPM_VERSION: ${AB_PNPM_VERSION}
+    image: "${AB_TS_IMAGE_REF:?AB_TS_IMAGE_REF is required}"
     ports:
       - "127.0.0.1:${AB_TS_PORT:-}:60000"
+    user: "${AB_UID}:${AB_GID}"
     volumes:
       - "${AB_RUNTIME_DIR}/typescript:/data"
+      - typescript_project_workspace:/data/project-workspace
+      - pnpm_typescript_store:/pnpm-cache
+      - pnpm_typescript_metadata_cache:/pnpm-metadata
     environment:
+      <<: *file-server-ab-shared-profile
+      npm_config_store_dir: /pnpm-cache
+      XDG_CACHE_HOME: /pnpm-metadata
       NODE_ENV: ab
       PORT: "60000"
       PROJECT_SOURCE_DIR: /data/project-workspace
@@ -69,7 +90,8 @@ services:
       GIT_DEFAULT_AUTHOR_EMAIL: ab@example.invalid
       DEPLOYMENT_MODE: docker-compose
       PNPM_PRUNE_ENABLED: "false"
-      UPLOAD_ALLOWED_EXTENSIONS: ".zip"
+      UPLOAD_SINGLE_FILE_SIZE_BYTES: "1048576000"
+      TOP_LEVEL_NOISE_PATTERNS: "__MACOSX,Thumbs.db,node_modules,.pnpm-store,.attachments"
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:60000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 2s
@@ -77,11 +99,36 @@ services:
       retries: 45
 
   driver:
-    image: rcoder-file-server-ab-rust:${AB_IMAGE_TAG:-local}
+    image: ${AB_RUST_IMAGE_REF:?AB_RUST_IMAGE_REF is required}
     entrypoint: ["file-server-ab"]
     user: "${AB_UID}:${AB_GID}"
+    environment:
+      AB_PNPM_REGISTRY: ${AB_PNPM_REGISTRY}
+      AB_PNPM_NETWORK_CONCURRENCY: ${AB_PNPM_NETWORK_CONCURRENCY}
+      AB_PNPM_RUST_STORE_VOLUME: ${AB_PNPM_RUST_STORE_VOLUME}
+      AB_PNPM_RUST_METADATA_CACHE_VOLUME: ${AB_PNPM_RUST_METADATA_CACHE_VOLUME}
+      AB_PNPM_TS_STORE_VOLUME: ${AB_PNPM_TS_STORE_VOLUME}
+      AB_PNPM_TS_METADATA_CACHE_VOLUME: ${AB_PNPM_TS_METADATA_CACHE_VOLUME}
     volumes:
       - "${AB_RUNTIME_DIR}:/ab-runtime"
+      - rust_project_workspace:/ab-runtime/rust/project-workspace
+      - typescript_project_workspace:/ab-runtime/typescript/project-workspace
       - "${AB_REPORT_ROOT}:/ab-reports"
       - "${RCODER_ROOT}/tests/file-server-ab:/ab-input:ro"
       - "${AB_RUNTIME_DIR}/fixtures:/ab-fixtures:ro"
+
+volumes:
+  pnpm_rust_store:
+    external: true
+    name: ${AB_PNPM_RUST_STORE_VOLUME:?AB_PNPM_RUST_STORE_VOLUME is required}
+  pnpm_rust_metadata_cache:
+    external: true
+    name: ${AB_PNPM_RUST_METADATA_CACHE_VOLUME:?AB_PNPM_RUST_METADATA_CACHE_VOLUME is required}
+  pnpm_typescript_store:
+    external: true
+    name: ${AB_PNPM_TS_STORE_VOLUME:?AB_PNPM_TS_STORE_VOLUME is required}
+  pnpm_typescript_metadata_cache:
+    external: true
+    name: ${AB_PNPM_TS_METADATA_CACHE_VOLUME:?AB_PNPM_TS_METADATA_CACHE_VOLUME is required}
+  rust_project_workspace:
+  typescript_project_workspace:

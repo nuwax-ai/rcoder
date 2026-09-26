@@ -108,6 +108,13 @@ async fn push_skills_to_workspace_impl(
         super::super::agent_store_user_root(&state, &user_id, &ws, workspace_path.as_deref())?;
     // F03：合并项目 ID（header > query > body）先落地——借用须活过参数构造
     let merged_project_id = crate::extract::merged_request_app_id(app_id.as_deref());
+    let workspace_kind =
+        crate::extract::merged_workspace_kind(workspace_type.as_deref(), service_type.as_deref())?;
+    // TS returns the configured workspace root, not the per-session leaf path.
+    let response_workspace_root = match workspace_kind {
+        Some(shared_types::ComputerServiceKind::Userapp) => &state.config.userapp_workspace_dir,
+        _ => &state.config.computer_workspace_dir,
+    };
     push_skills_impl(
         &state,
         crate::ops::workspace::PushSkillsParams {
@@ -122,16 +129,14 @@ async fn push_skills_to_workspace_impl(
             // manifest 视图同步；userapp 消费链不可达，不激活（有意偏离）
             // F03：判定/app_id 与 ws_path 同源（merged：header 优先 > body）；
             // 垃圾 workspaceType 已在 ws_path 定位收口 400，此处 `?` 防御一致
-            shared_project_id: match crate::extract::merged_workspace_kind(
-                workspace_type.as_deref(),
-                service_type.as_deref(),
-            )? {
+            shared_project_id: match workspace_kind {
                 Some(shared_types::ComputerServiceKind::NormalProject) => {
                     merged_project_id.as_deref()
                 }
                 _ => None,
             },
         },
+        response_workspace_root,
     )
     .await
 }

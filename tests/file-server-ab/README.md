@@ -16,7 +16,7 @@ make file-server-ab AB_SUITE=build
 make file-server-ab AB_SUITE=all
 ```
 
-`build` / `all` 会从两份 ZIP 模板创建项目，访问 npm registry 安装依赖并构建，再验证 dev server 的启动、HTTP 可达、日志分页、日志缓存接口、端口池登记、keep-alive、重启和停止；也会对照构建错误解析。项目创建包含模板解压和初始 Git 提交，驱动为这一步单独留出 120 秒，避免慢磁盘上的 30 秒通用请求预算过早中断后继续请求尚未初始化完成的项目。首次运行较慢；失败会保留证据并区分比较差异与环境错误。
+`build` / `all` 会从两份 ZIP 模板创建项目，访问 npm registry 安装依赖并构建，再验证 dev server 的启动、HTTP 可达、日志分页、日志缓存接口、端口池登记、keep-alive、重启和停止；也会对照构建错误解析。项目创建包含模板解压和初始 Git 提交，驱动为这一步单独留出 120 秒，避免慢磁盘上的 30 秒通用请求预算过早中断后继续请求尚未初始化完成的项目。模板依赖安装仍在每个被测项目内真实执行，不把项目 `node_modules` 预装进镜像。
 
 可选参数：
 
@@ -26,29 +26,44 @@ make file-server-ab \
   AB_TS_SOURCE=/path/to/nuwax-file-server \
   AB_TS_REF=main \
   AB_PNPM_VERSION=10.34.5 \
+  AB_PNPM_CACHE_VOLUME_PREFIX=rcoder-file-server-ab-pnpm \
+  AB_PNPM_NETWORK_CONCURRENCY=32 \
   AB_BUILDER=mac-arm64 \
   AB_RUST_PORT=61101 AB_TS_PORT=61100 \
   AB_KEEP=1
 ```
 
-国内网络可将 `DOCKER_MIRROR=registry-prefix` 放入被 Git 忽略的 `.env.local`，或仅在调用时传给 Make。设置镜像前缀后，Node/Rust 基础镜像均使用该镜像站的 Node/Rust 路径，并自动补齐末尾 `/`；不设置时使用官方镜像。该地址不会写入源码或 Git 跟踪文件；本地报告记录实际镜像身份，可能包含镜像源地址。
+国内网络可将 `DOCKER_MIRROR` 放入被 Git 忽略的 `.env.local`，或仅在调用时传给 Make。设置镜像前缀后，Rust 构建及运行阶段使用 `${DOCKER_MIRROR}rust:trixie`，并从对应的 `node:22-trixie-slim` 复制 Node；TS 服务运行层也使用 Node Trixie，以保证 Git、Node 和 glibc 环境一致。apt 安装前使用 LinuxMirrors 将 Debian 源配置为阿里云（不升级基础系统）；下载失败通过 `curl -f` 和 `pipefail` 明确报错。镜像构建中的 npm 与 pnpm 均显式使用 npmmirror，并配置有限重试；TS 服务镜像的冻结锁文件安装使用 32 路网络并发，包内容由 BuildKit store 缓存。
 
-默认宿主机端口由 Docker 动态分配并只绑定到 `127.0.0.1`。指定 `AB_RUST_PORT` / `AB_TS_PORT` 后使用固定端口。每轮都有唯一 Compose project、容器镜像 tag、宿主机工作区和报告目录。正常结束会删除本轮容器、镜像与临时工作区；对照差异或服务请求失败时会保留工作区以便复查。`AB_KEEP=1` 保留容器与工作区。
+pnpm 包内容 store 与 registry 元数据缓存使用持久 Docker named volume，不走 OrbStack 的 macOS host-bind 文件共享层。Rust 与 TypeScript 分别使用独立缓存，按 pnpm 版本、目标平台和宿主 UID/GID 隔离；这样每一侧第一次安装都由自己的 API 从 npmmirror 获取依赖，不会因另一侧先运行而白用对方刚下载的包。卷名以 `AB_PNPM_CACHE_VOLUME_PREFIX` 为前缀；Compose 每轮结束只删除项目卷，不删这些外部缓存卷。两侧都把自己的包 store 挂载到 `/pnpm-cache`，把元数据缓存挂载到 `/pnpm-metadata`；启动器检查实际 store 路径、registry 和网络并发配置。
 
-Rust 与 TypeScript 镜像按顺序构建，避免两个依赖安装/编译任务同时争用本机内存和磁盘。
-当另一个任务正在使用当前 Docker builder 时，可通过 `AB_BUILDER` 选择独立 Buildx builder；所选名称会写入本轮 `manifest.json`。
+工具链基础镜像只装 Rust、Node 与 pnpm，不包含模板项目的 `node_modules`。模板依赖安装由被测 Rust/TypeScript API 触发；两边使用 npmmirror、相同 PNPM 版本和网络并发。fixture 不指定导入策略；两侧当前生产 API 都会生成 `package-import-method=copy`，对照保留该实际行为。source-lock 模式下两边各自从原始无锁 fixture 解析并安装，安装结果和下载耗时保留在 API 日志中。
+
+正常重复运行使用固定的 `AB_PNPM_CACHE_VOLUME_PREFIX`，会复用每侧的 PNPM 内容与元数据缓存；只有显式换新前缀时才会做冷缓存比较，不要为普通回归每次换前缀。冷缓存安装耗时包含 registry 下载与解析。TS Compose 配置未启用 `FAST_RESTART_ENABLED` 时，`restart-dev` 会走 Full restart，删除项目 `node_modules` 和 lockfile 后再安装；这是被测 TypeScript 服务的重启行为，不是工具链基础镜像在安装模板依赖。
+
+每侧的 `project-workspace` 与 pnpm 缓存都使用独立 Docker 管理卷；日志、报告和上传文件保存在宿主机 `target/`。这样 Vite 项目解压、`node_modules` 和 pnpm store 的大量小文件读写不会经过 OrbStack 的宿主机目录共享层；模板依赖仍在被测项目中真实安装，绝不预装进共享基础镜像。
+
+默认宿主机端口由 Docker 动态分配并只绑定到 `127.0.0.1`。指定 `AB_RUST_PORT` / `AB_TS_PORT` 后使用固定端口。每轮都有唯一 Compose project、宿主机数据目录和报告目录；镜像标签按内容复用。运行结束会删除本轮容器及其项目工作区卷；对照差异或服务请求失败时仍保留宿主机日志和报告。需要检查容器内项目文件时，用 `AB_KEEP=1` 保留容器与项目工作区卷。
+
+使用 `make file-server-ab-build` 只构建镜像，`make file-server-ab` 构建缺失镜像后执行对照。Bake 将两侧共同的工具链作为 `target:toolchain` 依赖，只导出 Rust 和 TS 两个最终镜像，基础阶段只留在 BuildKit 缓存，不单独打包和导入。Rust 源码通过构建期 bind mount 提供，专用 dockerignore 排除非构建文件，target 缓存使用 `sharing=locked` 防止并发写入。TS 先复制依赖清单安装，再复制源码，源码变化不触发重新安装依赖。
+
+共享工具链基础镜像以 `${DOCKER_MIRROR}rust:trixie` 为 Rust 基础，从镜像仓库的 Node Trixie 复制 Node 22，并经 npmmirror 安装 pnpm；工具链配方按 Dockerfile、版本、平台和 UID/GID 生成稳定指纹，重复运行复用层缓存。基础镜像不带模板项目 `node_modules`。TS 服务镜像按 `pnpm-lock.yaml` 安装自身运行所需的生产依赖，BuildKit pnpm store 用于缓存服务自身的包；React/Vue 模板的 `node_modules` 仍在 A/B 请求中由各 API 真实安装，不会预装进镜像。依赖安装耗时由服务日志记录；首次冷安装与后续命中每侧缓存的安装都属于 A/B 被测行为，不另行预热。构建图单独放在 `docker-bake.hcl`；运行用的 `compose.yaml` 只有 image，没有 build。缓存初始化和驱动使用 `run --pull never`，不会再次构建。最终镜像按源码、工具链和构建配方生成内容标签，重复执行直接复用，并按不可变 image ID 启动。清理仅删除本轮容器与临时工作卷，保留镜像缓存及独立 pnpm 缓存；需要回收镜像时由用户按标签手动清理。
+
+启动器在服务就绪后核对两侧 Node、pnpm、Git 版本，以及 pnpm 实际解析出的 registry、独立持久 store 路径和网络并发配置。TS 服务依赖层只由 `package.json` 与 `pnpm-lock.yaml` 决定，源文件变化不会触发重装；BuildKit store 在该依赖层失效时复用已下载内容。模板依赖安装保留为被测路径，运行时持久 store 位于 Docker named volume，不进入 Git 或工具链基础镜像。
+
+`core` 使用 Compose 中的 `x-file-server-ab-shared-profile`：两侧的大小上限、遍历/归档排除、图片扩展名和 Git 忽略规则由同一个 YAML 锚点注入，基于 TS `env.test` 的共同设置。启动器在构建前要求两侧都含有全部共享配置键，并比较同名环境变量的值；缺键或值不同都会 fail fast。TS-only 的 `TOP_LEVEL_NOISE_PATTERNS` 单独按 TS 测试配置注入；它对应的 Rust 行为差异需由场景验证，不能靠空 `env.ab` 隐去。`REQUEST_BODY_LIMIT` 统一设为 `1024mb`，因为 Rust 实现的硬上限为 1 GiB；core 请求远小于此限制。`manifest.json` 的 `configuration_profile` 标识本配置版本。
 
 ## 报告
 
 报告位于 `tests-e2e/reports/file-server-ab/<run-id>/`，包括：
 
-- `manifest.json`：Rust/TS 源码身份、镜像 ID、Node/pnpm/Git 版本、运行架构、模板 ZIP 哈希、配置 profile 和规则文件哈希。
+- `manifest.json`：Rust/TS 源码身份、镜像 ID、Node/pnpm/Git 版本、运行架构、模板 ZIP 哈希、两侧独立 PNPM store/metadata 卷名、配置 profile 和规则文件哈希。
 - `requests.jsonl`：每个场景、每一侧的请求摘要、状态、选定响应头、耗时、完整响应哈希、原文引用或传输错误。
 - `bodies/`：请求与响应原文；单个文件最多保存 2 MiB，截断状态、完整字节数和完整 SHA-256 仍记录在 JSONL。
 - `state/`：请求执行前与结束后的两侧工作区树、文件内容摘要、权限与软链接；`git`/`all` 另保存每个 fixture repo 的 HEAD、refs 对应 tree、index entries 和 porcelain 状态。
 - `diff.json`、`summary.md`：机器可读差异及人工可读总览；错误响应只归一化精确路径 `/error/requestId` 和 `/error/timestamp`，两侧原值仍保存在正文证据中。
 - `route-coverage.json`：TS/Rust 路由交集、已覆盖/待覆盖状态，以及本次选择的套件是否实际执行了对应场景。
-- `logs/compose.log`：Compose 服务日志。
+- `logs/compose.log`：Compose 服务日志，包含被测 API 实际触发的 PNPM 安装输出；没有单独的模板依赖预热安装。
 
 镜像解析、构建或容器启动失败时不会生成比较通过结果；启动器会写 `runner-failure.json`，包含失败阶段和类别，并在 `summary.md` 中明确说明没有产生对照结果。HTTP 传输错误保存在 `diff.json`，会使命令失败。
 
@@ -61,10 +76,22 @@ Rust 与 TypeScript 镜像按顺序构建，避免两个依赖安装/编译任�
 ## 套件与覆盖边界
 
 - `core`：健康/API 版本、React/Vue 模板初始化与读取、项目全量文件替换、复制/删除/导出/上传、Computer workspace 创建/删除、skills ZIP、项目 ZIP 导入和模板初始化、合成 package 生成/清理、日志读取、工作区 ZIP 下载/创建，以及 `files-update` 的 create/modify/rename/delete 和 URL 解码。multipart 单/批量二进制上传会静态读回并逐字节核验；所有 ZIP 响应按条目路径、类型、权限和内容摘要比较，不比较压缩顺序/时间戳。另覆盖文件列表/resolve/search/metadata 边界、静态普通/Range 读取和基础文件系统操作。除 `install-project` 的无依赖 pnpm 场景外，不访问 npm 外网。
-- `git`：通过 HTTP 对照 init、status、add、commit、file-content、branch create/delete、tag、log、worktree/staged diff、unstage、checkout、discard、revert，以及 mixed/hard/soft reset。另用系统 Git 为两侧独立 fixture 准备相同的真实 merge-conflict index，再通过 HTTP 对照 `status.conflicted`；当前 API 没有 merge 操作端点，因此不把 fixture 准备命令当成被测 API。每个会改变历史或工作树的流程使用独立 pageApp fixture，避免一个实现的失败污染其他场景；最终比较 refs 对应 tree、HEAD tree、index entries、工作区状态和文件树。Rust 服务使用 gix，TS 服务使用镜像内系统 Git；驱动只用系统 Git读取最终仓库状态及准备对称 fixture，不参与被测 API 操作。
+- `git`：通过 HTTP 对照 init、status、add、commit、file-content、branch create/delete、tag、log、worktree/staged diff、unstage、checkout、discard、revert，以及 mixed/hard/soft reset。另用系统 Git 为两侧独立 fixture 准备相同的真实 merge-conflict index，再通过 HTTP 对照 `status.conflicted`；当前 API 没有 merge 操作端点，因此不把 fixture 准备命令当成被测 API。每个会改变历史或工作树的流程使用独立 pageApp fixture，避免一个实现的失败污染其他场景；最终比较 refs 对应 tree、HEAD tree、index entries、工作区状态和文件树。Rust 服务使用 gix，TS 服务使用镜像内系统 Git；驱动只用系统 Git读取最终仓库状态及准备对称 fixture，不参与被测 API 操作。diff 正文仅把 unified-diff hunk 中可省略的单行数量 `,1` 视为等价，所有其他行、范围和摘要仍逐字比较；原始 HTTP 正文继续保存。
 - `build`：分别用两份模板走项目初始化、依赖安装、production build、产物静态读取、start-dev、真实页面 HTTP、开发日志分页、日志缓存查询/清理、端口池状态、keep-alive、restart-dev 和 stop-dev，并对照构建错误解析。依赖 registry 网络；报告记下环境版本与错误。
 - `all`：顺序执行以上套件。路由清单按当前 TypeScript 基线快照维护；没有 A/B 场景的共同路由明确标为 pending。
 
 路由清单的 `typescript_revision` 必须与本次准备的 TypeScript Git 提交一致；基线变化时 Make 运行会在发请求前失败，要求先复核并更新路由清单。当前清单中的 76 条共同路由均登记了至少一个场景；截至 2026-09-25，`core` 的真实 A/B 报告已执行此前待测的 27 条路由。`covered` 只表示场景实际执行过，不表示两端语义一致；是否一致以差异审阅和精确规则为准。
 
 这不是“所有路由都已覆盖”的声明。真实结果以报告中的 `route-coverage.json` 与 `requests.jsonl` 为准；Rust-only `/api/v1/userapp` 由既有 UserApp 测试单独覆盖。
+
+### 本地构建优化边界
+
+`file-server-ab-build` 不创建测试卷或处理模板 ZIP。共享工具链先装软件再配置运行用户，UID/GID 改变不触发 pnpm 重装。npm、TS pnpm 和 Rust target 使用持久构建缓存；写缓存采用互斥挂载。本地对照镜像不生成 provenance attestation，仍记录源码、实际 image ID 和 BuildKit metadata；这不是生产发布入口。构建日志保存在每轮报告的 `logs/build.log`，纯复用镜像时不产生构建日志。
+
+### 依赖缓存与证据口径
+
+- TS 服务自身的 `node_modules` 留在镜像依赖层，不挂宿主机目录覆盖；模板项目的 `node_modules` 位于每轮独立项目卷，pnpm 内容/元数据缓存位于每侧独立持久卷。Mac 不直接挂本机 `node_modules`，避免跨系统二进制和共享目录小文件开销。
+- `planned_in_this_run` 是计划；`executed_cases` 来自实际完成的成对请求结果。`completed` 仅表示执行完成，不表示两端一致；中途退出的初始覆盖报告保留 `not_run`，不虚报执行。
+- `transport_errors` 表示归因未定的传输失败，不自动计为环境故障；健康前置失败另记录前置错误。传输失败仍使门禁失败。
+- `headers_elapsed_ms` 是响应头耗时，`elapsed_ms` 覆盖正文读取。记录用于诊断，不作为两实现性能胜负依据。
+- 动态 JSON 字段允许值不同，但不能隐去字段缺失或类型改变；场景级关联不变量仍需专门断言。

@@ -284,7 +284,8 @@ pub fn sync_target_version() -> String {
 /// (对齐 nuwax AgentWorkspaceUtils syncAgents; PRIMARY_AGENT_TYPE="agents")。
 ///
 /// 2 × SYNC_TARGET_DIRS 个目录 (每个 agent × {skills, agents}) 并发同步
-/// (`try_join_all`); 优先软链 (零拷贝), 失败 fallback 实体复制。
+/// (`try_join_all`) 为实体副本，对齐 TS `syncAgents`。agent-store 场景使用
+/// [`crate::service::agent_store::link_workspace_to_agent_store`] 单独建立软链。
 /// 各 agent 的 hook 配置 (`settings.json` / `hooks.json` / `plugins/` 等) 不受影响。
 pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
     let start = std::time::Instant::now();
@@ -302,8 +303,8 @@ pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
         copy_targets.push((primary_agents.clone(), t_root.join("agents"), has_agents));
     }
 
-    // 并发同步: try_join_all 同时 poll 所有 future, 任一失败立即返回。
-    // 内部优先软链, 失败 fallback copy; .await 让出点由 tokio 调度。
+    // 并发复制: try_join_all 同时 poll 所有 future, 任一失败立即返回。
+    // .await 让出点由 tokio 调度。
     try_join_all(
         copy_targets
             .into_iter()
@@ -329,7 +330,7 @@ pub async fn sync_agents(project_path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-/// 同步单个目录 (优先软链 → fallback copy)。源不存在时创建空目录。
+/// 同步单个目录为实体副本。源不存在时创建空目录。
 async fn sync_dir(src: &Path, dst: &Path, has_src: bool) -> AppResult<()> {
     // 删旧 dst (NotFound 安全)
     match fs::remove_dir_all(dst).await {
@@ -341,32 +342,8 @@ async fn sync_dir(src: &Path, dst: &Path, has_src: bool) -> AppResult<()> {
         fs::create_dir_all(dst).await?;
         return Ok(());
     }
-    // 优先软链 (对齐 TS forceDirSymlink: .agents → 各家 ACP 目录)
-    match crate::service::agent_store::force_dir_symlink(dst, src).await {
-        Ok(()) => {
-            tracing::debug!(
-                src = %src.display(),
-                dst = %dst.display(),
-                "sync_dir: symlink created"
-            );
-            return Ok(());
-        }
-        Err(e) => {
-            tracing::warn!(
-                src = %src.display(),
-                dst = %dst.display(),
-                error = %e,
-                "sync_dir: symlink failed, fallback to copy"
-            );
-            // 软链失败后 dst 可能被部分清理, 确保 copy 前重新删除
-            match fs::remove_dir_all(dst).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
-            }
-        }
-    }
-    // fallback copy
+    // TS project/computer legacy fan-out 是实体复制。需要共享 agent-store 的
+    // workspace 由独立 link_workspace_to_agent_store 路径负责建立目录链接。
     crate::service::fs_util::copy_dir_filtered(src, dst, &[], &[]).await?;
     Ok(())
 }
@@ -428,7 +405,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_dir_links_or_copies_when_src_exists() {
+    async fn sync_dir_materializes_source_directory_when_src_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
         let src = ws.join(".agents").join("skills");
@@ -438,18 +415,16 @@ mod tests {
 
         sync_dir(&src, &dst, true).await.unwrap();
 
-        // Unix: 优先软链; Windows/other: fallback copy (实体目录)
-        #[cfg(unix)]
-        {
-            assert!(dst.is_symlink(), "dst should be a symlink on unix");
-        }
-        #[cfg(not(unix))]
-        {
-            assert!(!dst.is_symlink(), "dst should be a real directory");
-        }
-        // 内容可读 (软链和实体目录都透明)
+        assert!(dst.is_dir(), "fan-out target should be a directory");
+        assert!(!dst.is_symlink(), "fan-out target should be materialized");
         let content = fs::read_to_string(dst.join("SKILL.md")).await.unwrap();
         assert_eq!(content, "test");
+        fs::write(src.join("SKILL.md"), "updated").await.unwrap();
+        assert_eq!(
+            fs::read_to_string(dst.join("SKILL.md")).await.unwrap(),
+            "test",
+            "materialized fan-out must not implicitly track source mutations"
+        );
     }
 
     #[tokio::test]
@@ -477,7 +452,7 @@ mod tests {
 
         sync_dir(&src, &dst, true).await.unwrap();
 
-        // 旧文件已删 (软链/copy 后 dst 指向 src, src 中无 old.md)
+        // 旧文件已删, 新目录是源目录的实体副本。
         assert!(!dst.join("old.md").exists(), "old file should be gone");
         // 新文件可读
         assert_eq!(fs::read_to_string(dst.join("new.md")).await.unwrap(), "new");

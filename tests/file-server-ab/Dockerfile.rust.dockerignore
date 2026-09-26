@@ -1,0 +1,19 @@
+# A/B Rust build inputs only. Keep all workspace manifests for Cargo resolution.
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!.cargo/
+!.cargo/**
+!crates/
+!crates/**
+!tests-e2e/
+!tests-e2e/**
+**/target
+**/node_modules
+**/.git
+**/.env*
+**/*.log
+crates/app-cli/target
+crates/app-cli/dist
+tests-e2e/reports

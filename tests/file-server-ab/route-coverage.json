@@ -623,7 +623,8 @@
       "status": "covered",
       "suite": "git",
       "cases": [
-        "git-log"
+        "git-log",
+        "project-copy-git-history"
       ]
     },
     {
@@ -719,6 +720,7 @@
       "suite": "core",
       "cases": [
         "read-project-static-file",
+        "read-project-static-file-if-none-match",
         "read-project-static-file-range",
         "build-react-static-dist-index",
         "build-vue3-static-dist-index",

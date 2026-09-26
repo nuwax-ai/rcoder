@@ -90,7 +90,7 @@ pub(crate) async fn get_project_content_by_version(
 ) -> Response {
     if state.config.git_enabled {
         return response::deprecated(
-            "此接口已废弃,请使用 /api/git/log + /api/git/diff 查看历史版本内容",
+            "此接口已废弃，请使用 /api/git/log + /api/git/diff 查看历史版本内容",
         )
         .into_response();
     }

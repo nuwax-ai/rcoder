@@ -106,7 +106,7 @@ pub(crate) async fn build_agent_package(
         )));
     }
     // 解析产物 (path 转 workspace 相对, platform 从文件名提取; 无 stdout 字段)
-    let artifacts = package_build::parse_artifacts(&stdout, &ws);
+    let artifacts = package_build::parse_artifacts(&stdout, &pkg_dir, &ws);
     Ok(Json(json!({ "success": true, "artifacts": artifacts })))
 }
 

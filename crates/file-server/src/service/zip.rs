@@ -216,7 +216,19 @@ fn pack_blocking(src: &Path, zip_path: &Path, opts: &PackOpts) -> AppResult<()> 
     let file = std::fs::File::create(zip_path)
         .map_err(|e| AppError::file(format!("create zip failed: {e}")))?;
     let mut zip = zip::ZipWriter::new(file);
-    walk_and_add(src, src, &mut zip, opts)?;
+    let has_entries = walk_and_add(src, src, &mut zip, opts)?;
+    if !has_entries && let Some(prefix) = opts.path_prefix.as_deref() {
+        let entry_name = if prefix.ends_with('/') {
+            prefix.to_string()
+        } else {
+            format!("{prefix}/")
+        };
+        zip.add_directory(
+            &entry_name,
+            zip::write::SimpleFileOptions::default().unix_permissions(0o755),
+        )
+        .map_err(|e| AppError::file(format!("zip add_directory failed: {e}")))?;
+    }
     zip.finish()
         .map_err(|e| AppError::file(format!("zip finish failed: {e}")))?;
     Ok(())
@@ -229,7 +241,8 @@ fn walk_and_add(
     dir: &Path,
     zip: &mut zip::ZipWriter<std::fs::File>,
     opts: &PackOpts,
-) -> AppResult<()> {
+) -> AppResult<bool> {
+    let mut added_entry = false;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
@@ -249,7 +262,25 @@ fn walk_and_add(
             if opts.exclude_dirs.iter().any(|d| d == &name) {
                 continue;
             }
-            walk_and_add(root, &path, zip, opts)?;
+            let subtree_added = walk_and_add(root, &path, zip, opts)?;
+            if !subtree_added {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or_else(|_| Path::new(""))
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let entry_name = match &opts.path_prefix {
+                    Some(prefix) => format!("{prefix}{rel}/"),
+                    None => format!("{rel}/"),
+                };
+                zip.add_directory(
+                    &entry_name,
+                    zip::write::SimpleFileOptions::default().unix_permissions(0o755),
+                )
+                .map_err(|e| AppError::file(format!("zip add_directory failed: {e}")))?;
+            }
+            // Child output makes this directory extractable; empty children emit their own entry.
+            added_entry = true;
         } else if meta.is_file() {
             if opts.exclude_files.iter().any(|f| f == &name) {
                 continue;
@@ -274,9 +305,10 @@ fn walk_and_add(
                 .map_err(|e| AppError::file(format!("zip start_file failed: {e}")))?;
             let mut input = std::fs::File::open(&path)?;
             std::io::copy(&mut input, zip)?;
+            added_entry = true;
         }
     }
-    Ok(())
+    Ok(added_entry)
 }
 
 /// 是否硬链接 (nlink>1, unix)。
@@ -476,6 +508,25 @@ mod tests {
             "{names:?}"
         );
         assert!(!names.iter().any(|n| n.contains("dist/")), "{names:?}");
+        drop(fs::remove_dir_all(&src));
+        drop(fs::remove_file(&out));
+    }
+
+    #[test]
+    fn packing_preserves_empty_directories_but_omits_implied_parents() {
+        let src = unique_tmp("zip_empty_dirs_src");
+        let out = unique_tmp("zip_empty_dirs_out");
+        fs::create_dir_all(src.join("empty")).expect("create empty directory");
+        fs::create_dir_all(src.join("nested")).expect("create nonempty parent");
+        fs::write(src.join("nested/file.txt"), "file").expect("write nested file");
+
+        pack_blocking(&src, &out, &PackOpts::default()).expect("pack workspace");
+        let names = entry_names(&out);
+
+        assert!(names.contains(&"empty/".to_string()), "{names:?}");
+        assert!(names.contains(&"nested/file.txt".to_string()), "{names:?}");
+        assert!(!names.contains(&"nested/".to_string()), "{names:?}");
+
         drop(fs::remove_dir_all(&src));
         drop(fs::remove_file(&out));
     }

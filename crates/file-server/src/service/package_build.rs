@@ -82,8 +82,9 @@ pub async fn find_package_script(root: &Path, skip_dirs: &[String]) -> Option<Pa
 }
 
 /// 从 package-platforms stdout 解析产物列表: {path (workspace 相对), fileName, platform}。
-/// path 对齐 nuwax: 相对 workspace 目录, 路径分隔符转 `/`。
-pub fn parse_artifacts(stdout: &str, workspace: &Path) -> Vec<Value> {
+/// 脚本以 package_dir 为 cwd 输出相对路径；先依照 TS 的 path.resolve(packageDir, line)
+/// 还原产物路径，再相对 workspace 返回，路径分隔符统一为 `/`。
+pub fn parse_artifacts(stdout: &str, package_dir: &Path, workspace: &Path) -> Vec<Value> {
     let mut out = Vec::new();
     for line in stdout.lines() {
         let t = line.trim();
@@ -98,7 +99,7 @@ pub fn parse_artifacts(stdout: &str, workspace: &Path) -> Vec<Value> {
         let abs = if Path::new(t).is_absolute() {
             PathBuf::from(t)
         } else {
-            workspace.join(t)
+            package_dir.join(t)
         };
         let rel = abs
             .strip_prefix(workspace)
@@ -113,6 +114,34 @@ pub fn parse_artifacts(stdout: &str, workspace: &Path) -> Vec<Value> {
         }));
     }
     out
+}
+
+#[cfg(test)]
+mod artifact_path_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_artifacts_resolves_relative_paths_from_nested_package_dir() {
+        let temp = tempfile::tempdir().expect("create temp workspace");
+        let workspace = temp.path().join("workspace");
+        let package_dir = workspace.join("agent-package");
+
+        let artifacts = parse_artifacts(
+            "dist-packages/agent-17-linux-x64-1.2.3.zip\n",
+            &package_dir,
+            &workspace,
+        );
+
+        assert_eq!(
+            artifacts,
+            vec![json!({
+                "path": "agent-package/dist-packages/agent-17-linux-x64-1.2.3.zip",
+                "fileName": "agent-17-linux-x64-1.2.3.zip",
+                "platform": "linux-x64"
+            })]
+        );
+    }
 }
 
 /// 从产物文件名提取 platform (对齐 nuwax extractPlatformFromFileName):
