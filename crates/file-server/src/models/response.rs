@@ -1414,3 +1414,409 @@ pub struct DeprecatedResult {
     /// 引导文案（指向 /api/git 等替代接口）
     pub message: String,
 }
+
+#[cfg(test)]
+mod wire_shape_tests {
+    //! 结构体化改造（2026-09-26）的 wire 键集守卫：每个响应类型序列化后的
+    //! 键名必须与 TS 契约逐字一致（camelCase；既有蛇形名如 author_name 原样）。
+    //! 这类错误编译期查不出（A/B 曾抓到 untagged 枚举变体的 log_id 漏 rename），
+    //! 在单测层提前拦截。
+
+    use super::*;
+    use serde_json::Value;
+
+    fn keys(value: &impl Serialize) -> Vec<String> {
+        let object = serde_json::to_value(value)
+            .expect("serialize response")
+            .as_object()
+            .expect("response serializes to a JSON object")
+            .clone();
+        object.keys().cloned().collect()
+    }
+
+    #[test]
+    fn computer_response_keys_match_wire() {
+        assert_eq!(
+            keys(&FileListResult {
+                success: true,
+                files: vec![ComputerFileEntry::Directory {
+                    name: "d".into(),
+                    is_dir: true,
+                }],
+                recursive: true,
+                file_type: "all".into(),
+                limit: None,
+            }),
+            ["success", "files", "recursive", "type", "limit"]
+        );
+        let file_entry = ComputerFileEntry::File {
+            name: "a.txt".into(),
+            is_dir: false,
+            file_proxy_url: None,
+            is_link: false,
+        };
+        assert_eq!(
+            keys(&file_entry),
+            ["name", "isDir", "fileProxyUrl", "isLink"],
+            "目录条目仅两键、文件条目四键，fileProxyUrl 恒存在"
+        );
+        assert_eq!(
+            keys(&ResolveFileResult::Found {
+                success: true,
+                exists: true,
+                name: "a".into(),
+                file_proxy_url: None,
+            }),
+            ["success", "exists", "name", "fileProxyUrl"]
+        );
+        assert_eq!(
+            keys(&ResolveFileResult::Missing {
+                success: true,
+                exists: false,
+            }),
+            ["success", "exists"]
+        );
+        assert_eq!(
+            keys(&FileMetaEntryResult {
+                path: "a".into(),
+                is_dir: None,
+                is_link: None,
+                size: None,
+                mtime_ms: None,
+                extension: None,
+                mime_type: None,
+                link_target: None,
+                child_count: None,
+                error: None,
+            }),
+            [
+                "path",
+                "isDir",
+                "isLink",
+                "size",
+                "mtimeMs",
+                "extension",
+                "mimeType",
+                "linkTarget",
+                "childCount"
+            ],
+            "error 仅失败条目携带"
+        );
+        assert_eq!(
+            keys(&UploadResultItem::Ok {
+                success: true,
+                file_path: "a".into(),
+                originalname: None,
+                message: "m".into(),
+                file_size: 1,
+            }),
+            ["success", "filePath", "originalname", "message", "fileSize"]
+        );
+        assert_eq!(
+            keys(&UploadResultItem::Err {
+                success: false,
+                file_path: "a".into(),
+                originalname: None,
+                error: "e".into(),
+            }),
+            ["success", "filePath", "originalname", "error"]
+        );
+        assert_eq!(
+            keys(&ComputerLogsResult {
+                success: true,
+                message: "m".into(),
+                logs: Vec::new(),
+                total_lines: 0,
+                start_index: 1,
+                log_file_name: None,
+            }),
+            [
+                "success",
+                "message",
+                "logs",
+                "totalLines",
+                "startIndex",
+                "logFileName"
+            ]
+        );
+    }
+
+    #[test]
+    fn git_response_keys_match_wire() {
+        assert_eq!(
+            keys(&GitStatusResult {
+                success: true,
+                log_id: "l".into(),
+                current: None,
+                staged: Vec::new(),
+                modified: Vec::new(),
+                created: Vec::new(),
+                deleted: Vec::new(),
+                untracked: Vec::new(),
+                conflicted: Vec::new(),
+                ahead: 0,
+                behind: 0,
+                tracking: None,
+            }),
+            [
+                "success",
+                "logId",
+                "current",
+                "staged",
+                "modified",
+                "created",
+                "deleted",
+                "untracked",
+                "conflicted",
+                "ahead",
+                "behind",
+                "tracking"
+            ]
+        );
+        assert_eq!(
+            keys(&GitFileContentResult {
+                success: true,
+                log_id: "l".into(),
+                file_path: "a".into(),
+                ref_spec: "HEAD".into(),
+                content: String::new(),
+            }),
+            ["success", "logId", "filePath", "ref", "content"],
+            "ref 是保留字，需显式 rename"
+        );
+        assert_eq!(
+            keys(&GitCommitResult::Committed {
+                success: true,
+                message: "m".into(),
+                log_id: "l".into(),
+                commit: "h".into(),
+                summary: GitCommitSummary { changes: 1 },
+            }),
+            ["success", "message", "logId", "commit", "summary"]
+        );
+        assert_eq!(
+            keys(&GitCommitResult::NothingToCommit {
+                success: true,
+                message: "m".into(),
+                log_id: "l".into(),
+                nothing_to_commit: true,
+            }),
+            ["success", "message", "logId", "nothingToCommit"]
+        );
+        assert_eq!(
+            keys(&GitRevertResult::Reverted {
+                success: true,
+                message: "m".into(),
+                log_id: "l".into(),
+                commit: "h".into(),
+                target: "t".into(),
+                previous_head: "p".into(),
+            }),
+            [
+                "success",
+                "message",
+                "logId",
+                "commit",
+                "target",
+                "previousHead"
+            ]
+        );
+        assert_eq!(
+            keys(&GitRevertResult::NothingToRevert {
+                success: true,
+                message: "m".into(),
+                log_id: "l".into(),
+                nothing_to_commit: true,
+                target: "t".into(),
+            }),
+            ["success", "message", "logId", "nothingToCommit", "target"]
+        );
+        let unstage = GitUnstageResult {
+            success: true,
+            message: "m".into(),
+            log_id: "l".into(),
+            files: GitUnstageFiles::All("all".into()),
+        };
+        let value: Value = serde_json::to_value(&unstage).unwrap();
+        assert_eq!(value["files"], Value::String("all".into()));
+        assert_eq!(
+            keys(&GitDiffResult {
+                success: true,
+                log_id: "l".into(),
+                source: "worktree".into(),
+                diff: String::new(),
+                summary: GitDiffSummary {
+                    files: Vec::new(),
+                    insertions: 0,
+                    deletions: 0,
+                },
+            }),
+            ["success", "logId", "source", "diff", "summary"]
+        );
+        assert_eq!(
+            keys(&GitResetResult {
+                success: true,
+                message: "m".into(),
+                log_id: "l".into(),
+                target: "t".into(),
+                mode: "mixed".into(),
+                previous_head: None,
+            }),
+            [
+                "success",
+                "message",
+                "logId",
+                "target",
+                "mode",
+                "previousHead"
+            ]
+        );
+        assert_eq!(
+            keys(&GitBranchOpResult {
+                success: true,
+                message: "m".into(),
+                log_id: "l".into(),
+                branch_name: "b".into(),
+            }),
+            ["success", "message", "logId", "branchName"]
+        );
+        assert_eq!(
+            keys(&GitTagOpResult {
+                success: true,
+                message: "m".into(),
+                log_id: "l".into(),
+                tag_name: "t".into(),
+            }),
+            ["success", "message", "logId", "tagName"]
+        );
+        // CommitInfo 保留既有蛇形 wire 字段名。
+        assert_eq!(
+            keys(&CommitInfo {
+                hash: "h".into(),
+                date: "d".into(),
+                message: "m".into(),
+                author_name: "n".into(),
+                author_email: "e".into(),
+            }),
+            ["hash", "date", "message", "author_name", "author_email"]
+        );
+    }
+
+    #[test]
+    fn project_response_keys_match_wire() {
+        assert_eq!(
+            keys(&CreateProjectResult {
+                success: true,
+                message: "m".into(),
+                project_path: "p".into(),
+            }),
+            ["success", "message", "projectPath"]
+        );
+        assert_eq!(
+            keys(&CopyProjectResult {
+                success: true,
+                message: "m".into(),
+                source_project_id: "s".into(),
+                target_project_id: "t".into(),
+                target_project_path: "p".into(),
+            }),
+            [
+                "success",
+                "message",
+                "sourceProjectId",
+                "targetProjectId",
+                "targetProjectPath"
+            ]
+        );
+        assert_eq!(
+            keys(&DeleteProjectResult {
+                success: true,
+                message: "m".into(),
+                project_id: "p".into(),
+                deleted_directories: Vec::new(),
+                failed_directories: Vec::new(),
+            }),
+            [
+                "success",
+                "message",
+                "projectId",
+                "deletedDirectories",
+                "failedDirectories"
+            ]
+        );
+        assert_eq!(
+            keys(&UploadBatchResult {
+                success: true,
+                message: "m".into(),
+                project_id: "p".into(),
+                file_count: 0,
+                files: Vec::new(),
+                restarted: false,
+            }),
+            [
+                "success",
+                "message",
+                "projectId",
+                "fileCount",
+                "files",
+                "restarted"
+            ]
+        );
+        let batch_file = ProjectBatchFile {
+            file_path: "a".into(),
+            size: 1,
+        };
+        assert_eq!(keys(&batch_file), ["filePath", "size"]);
+        assert_eq!(
+            keys(&UploadAttachmentResult {
+                success: true,
+                file_name: "f".into(),
+                relative_path: "r".into(),
+            }),
+            ["success", "fileName", "relativePath"]
+        );
+        assert_eq!(
+            keys(&BackupVersionResult {
+                success: true,
+                project_id: "p".into(),
+                zip_path: "z".into(),
+            }),
+            ["success", "projectId", "zipPath"]
+        );
+        assert_eq!(
+            keys(&RollbackVersionResult {
+                success: true,
+                message: "m".into(),
+                new_version: 2,
+                rollback_to: 1,
+            }),
+            ["success", "message", "newVersion", "rollbackTo"]
+        );
+        let deprecated = BackupVersionResponse::Deprecated(DeprecatedResult::new("x"));
+        assert_eq!(
+            keys(&deprecated),
+            ["success", "deprecated", "message"],
+            "untagged 包装不引入外层键"
+        );
+        assert_eq!(
+            keys(&PushSkillsResult {
+                success: true,
+                message: "m".into(),
+                workspace_root: "w".into(),
+                updated_skills: Vec::new(),
+                agent_store_path: None,
+            }),
+            ["success", "message", "workspaceRoot", "updatedSkills"],
+            "agentStorePath 仅实体存储存在时携带"
+        );
+        assert_eq!(
+            keys(&ProjectContentResult {
+                success: true,
+                files: Vec::new(),
+                frontend_framework: "f".into(),
+                dev_framework: "d".into(),
+            }),
+            ["success", "files", "frontendFramework", "devFramework"]
+        );
+    }
+}
