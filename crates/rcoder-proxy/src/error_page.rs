@@ -19,8 +19,11 @@
 
 use std::sync::Arc;
 
+use opentelemetry::propagation::Extractor;
 use pingora::http::ResponseHeader;
 use pingora_proxy::Session;
+use tracing::Instrument as _;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// 诊断编号响应头（与页面变量、错误日志同一编号）。
 pub const DIAGNOSTIC_HEADER: &str = "x-rcoder-diagnostic-id";
@@ -280,6 +283,37 @@ fn accepts_text_html(accept: &str) -> bool {
     })
 }
 
+/// pingora 请求头的 W3C 传播提取器（只取 traceparent/tracestate）。
+struct PingoraHeaderExtractor<'a>(&'a pingora_http::HMap);
+
+impl Extractor for PingoraHeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|value| value.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        vec!["traceparent", "tracestate"]
+    }
+}
+
+/// 失败出口 span：有入站 traceparent（Java/Gateway 传播）则挂为其子 span
+/// ——精确跨服务串联；无则独立根 span（仍导出 Tempo 且日志携带 trace_id）。
+/// 只在失败路径创建，成功请求零开销。
+fn failure_span(session: &Session, status: u16, context: &str) -> tracing::Span {
+    let span = tracing::error_span!(
+        "userapp_proxy_failure",
+        otel.name = "userapp.proxy.failure",
+        otel.kind = "internal",
+        http.status_code = status,
+        rcoder.context = context,
+    );
+    let extracted = opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.extract(&PingoraHeaderExtractor(&session.req_header().headers))
+    });
+    let _ = span.set_parent(extracted);
+    span
+}
+
 /// 写出 UserApp 代理失败响应（在下游最终响应尚未开始时调用一次）。
 ///
 /// - 保留真实状态码；503 携带 `Retry-After` 建议（非恢复保证）；
@@ -315,6 +349,36 @@ pub async fn write_error_response(
         );
         return;
     }
+    let span = failure_span(session, status, context);
+    write_error_response_inner(
+        session,
+        renderer,
+        status,
+        cause,
+        reason,
+        retry_after_secs,
+        context,
+        detail,
+        &span,
+    )
+    .instrument(span.clone())
+    .await;
+}
+
+/// 注意：本函数不自带 instrument——外层 [`failure_span`] 经 `.instrument()`
+/// 提供上下文（span 对象经参数传入用于记录 diagnostic_id 等属性）。
+#[allow(clippy::too_many_arguments)]
+async fn write_error_response_inner(
+    session: &mut Session,
+    renderer: &ErrorPageRenderer,
+    status: u16,
+    cause: ErrorPageCause,
+    reason: &str,
+    retry_after_secs: Option<u64>,
+    context: &str,
+    detail: &str,
+    span: &tracing::Span,
+) {
     // 错误页被消费 → 触发按需刷新（K8s 投射/手工换页的最终收敛路径之一）
     renderer.request_refresh();
     let diagnostic_id = new_diagnostic_id();
@@ -376,10 +440,15 @@ pub async fn write_error_response(
     if let Some(seconds) = retry_after_secs {
         insert!("retry-after", seconds.to_string());
     }
+    // diagnostic_id 落 span 属性（Tempo 里按编号可直接查到该失败节点）
+    span.record("rcoder.diagnostic_id", &diagnostic_id);
+    span.record("rcoder.reason", reason);
     // detail 只进日志（错误链可能含内部地址/上游细节，不进页面与响应体）：
     // 用户报障给编号 → grep 一条命中即可读到根因线索，无须二次排查。
+    // trace_id 与 span 同源：编号 → 本日志行 → Tempo 精确串联。
     tracing::error!(
         diagnostic_id = %diagnostic_id,
+        trace_id = shared_types::current_otel_trace_id(),
         %status,
         reason,
         detail,

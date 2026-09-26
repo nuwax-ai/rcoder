@@ -249,6 +249,7 @@ pub use model::{
     UnifiedSessionMessage,
     VersionResponse,
     VncStatusResponse,
+    current_otel_trace_id,
 };
 
 // 部署配置域（高内聚收拢于 runtime_config/ 模块）—— Docker/K8s 双运行时配置族 + Quantity 解析
@@ -298,9 +299,11 @@ pub use workspace_manifest::{
     BuildSection, DevbuildSection, DevrunSection, DiscoverError, DiscoveredProject, HealthSection,
     LockedPingap, LockedService, LogFormat, LogSource, LogsSection, MINIMUM_APP_CLI_VERSION,
     ManifestError, PingapMode, PingapSection, ProjectKind, ProjectManifest, ProjectMeta,
-    ProjectType, ProxySection, ReleaseLock, ReleaseMetadata, RunSection, WorkspaceManifest,
-    WorkspaceMeta, build_release_lock, discover_projects, parse_project, parse_workspace,
+    ProjectType, ProxySection, ReleaseLock, ReleaseMetadata, RunSection, STARTUP_PROBE_CAPABILITY,
+    StartupProbe, WorkspaceManifest, WorkspaceMeta, build_release_lock, discover_projects,
+    load_release_lock, parse_project, parse_workspace, require_startup_probe_capability,
     validate_project, validate_service_id, validate_topology, validate_workspace,
+    validate_workspace_startup,
 };
 
 pub mod userapp_http;

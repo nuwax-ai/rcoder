@@ -46,6 +46,10 @@ shared_types = { workspace = true }
 arc-swap = { workspace = true }
 
 serde_json = { workspace = true }
+# 失败出口 OTel span（编号→日志 trace_id→Tempo 精确串联；错误路径专用，
+# 成功请求零开销）。版本与 shared_types/rcoder-telemetry 同源（workspace）。
+opentelemetry = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 futures-util = { workspace = true }
 uuid = { workspace = true }
 

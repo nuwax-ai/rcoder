@@ -10,6 +10,12 @@ use crate::i18n::DEFAULT_LOCALE;
 
 /// 从当前 OpenTelemetry context 获取 trace_id
 fn get_trace_id_from_context() -> Option<String> {
+    current_otel_trace_id()
+}
+
+/// 当前活跃 tracing span 的 OTel trace_id（跨模块复用：代理失败出口把
+/// trace_id 写进诊断日志行，实现 编号→日志→Tempo 的精确串联）。
+pub fn current_otel_trace_id() -> Option<String> {
     let span = tracing::Span::current();
     let context = span.context();
     let span_ref = context.span();
