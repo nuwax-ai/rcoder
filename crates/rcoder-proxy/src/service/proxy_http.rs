@@ -772,6 +772,17 @@ impl PortProxy {
             .await;
             return;
         }
+        // 无呈现器回退：同样必须守卫"响应已开始"（与 write_error_response
+        // 同语义）——中途断流时连极简响应也不能追加。
+        let already_final = session
+            .as_downstream_mut()
+            .response_written()
+            .is_some_and(|written| {
+                !written.status.is_informational() || written.status.as_u16() == 101
+            });
+        if already_final {
+            return;
+        }
         let response = ResponseHeader::build(status, None).ok();
         if let Some(mut response) = response {
             if let Some(seconds) = retry_after_secs

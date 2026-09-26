@@ -295,9 +295,18 @@ pub async fn write_error_response(
     retry_after_secs: Option<u64>,
     context: &str,
 ) -> () {
-    // 响应已开始（上游中途断流等）：绝不再写第二份响应——pingora 默认
-    // respond_error 有同款守卫，这里对齐（正文追加会污染截断的原始流）。
-    if session.as_downstream_mut().response_written().is_some() {
+    // 响应已开始（上游中途断流等）：绝不再写第二份响应——正文追加会污染
+    // 截断的原始流。守卫语义与 pingora-core write_error_response（server.rs
+    // 630-637）逐条对齐：已写的是**终态**响应才跳过；1xx 临时响应放行
+    // （101 除外——按 RFC 9110 §15.2.2 视为终态），否则 100-continue 的
+    // POST 中途失败会只剩一个 100 然后挂住。
+    let already_final = session
+        .as_downstream_mut()
+        .response_written()
+        .is_some_and(|written| {
+            !written.status.is_informational() || written.status.as_u16() == 101
+        });
+    if already_final {
         tracing::debug!(
             %status,
             "downstream response already started; skip friendly error write"
