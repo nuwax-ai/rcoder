@@ -1086,7 +1086,7 @@ impl RuntimeKernel {
                 active_operation_id: None,
             });
         }
-        if guard.recovery_protection {
+        if guard.recovery_protection && request.kind != RuntimeOperationKind::Stop {
             return Err(AdmissionRejection {
                 code: ERR_RECOVERY_REQUIRED,
                 message: "a previous operation has an unconfirmed result; recovery is required"
@@ -2689,6 +2689,28 @@ mod tests {
             .await
             .expect_err("recovery gate");
         assert_eq!(rejection.code, ERR_RECOVERY_REQUIRED);
+        kernel
+            .admit(request(RuntimeOperationKind::Stop, "recovery-stop"))
+            .await
+            .expect("stop is permitted while prior outcome remains protected");
+        kernel
+            .finish(
+                "recovery-stop",
+                RuntimeOperationState::Succeeded,
+                None,
+                None,
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            kernel.get("op-1").await.unwrap().unwrap().state,
+            RuntimeOperationState::RecoveryRequired
+        );
+        assert!(
+            kernel.recovery_protection_active(),
+            "Stop must not erase uncertain deployment history"
+        );
     }
 
     #[tokio::test]

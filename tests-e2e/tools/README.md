@@ -1,5 +1,7 @@
 # 严格 userApp 回归入口
 
+owner 丢失的容器内专项回归使用 `owner_recovery.py`，入口与验收边界见 [开发环境 owner 恢复](../../docs/userapp-dev-owner-recovery.md)。它不替代下列完整 Compose/K8s 套件。
+
 `make test-e2e` 运行基础、dev、build-rules、Docker 热部署故障与完整制品部署链。
 `make test-e2e-compose` 保留共享 chat/SSE 场景并补齐 build-rules。
 

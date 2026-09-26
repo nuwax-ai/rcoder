@@ -456,7 +456,13 @@ impl DevServerManager {
             AppError::business(format!("external owner recovery required: {error:#}"))
         })?;
         let owner_addr = self.config.app_cli_admin_probe_addr.clone();
-        let Some(identity) = super::owner_client::probe_owner(&owner_addr).await else {
+        let Some(super::owner_recovery::AvailableOwner {
+            address: owner_addr,
+            identity,
+        }) = self
+            .recover_owner_if_needed(project_id, project_path)
+            .await?
+        else {
             let persisted = self.read_external_state().map_err(|error| {
                 AppError::business(format!("external recovery required: {error:#}"))
             })?;
@@ -551,7 +557,11 @@ impl DevServerManager {
                 expected_runtime_instance_id: expected_instance,
                 expected_revision,
                 workspace_id: expected_ws.clone(),
-                kind: shared_types::RuntimeOperationKind::Restart,
+                kind: if artifact_release_id.is_some() {
+                    shared_types::RuntimeOperationKind::Deploy
+                } else {
+                    shared_types::RuntimeOperationKind::Restart
+                },
                 profile: match artifact_release_id {
                     Some(id) => shared_types::RunProfileInput::Artifact {
                         artifact: shared_types::ArtifactInput::ArtifactId {
@@ -669,7 +679,7 @@ impl DevServerManager {
     }
 
     /// R03：制品态的 owner 路由决策——**激活权归属 owner**。
-    /// - `Ok(Some(started))`：匹配 owner 已受理 Restart(ArtifactId) 并确认
+    /// - `Ok(Some(started))`：匹配 owner 已受理 Deploy(ArtifactId) 并确认
     ///   Succeeded（owner 侧完成校验/解压/激活/编排）；平台**不触碰 .run**。
     /// - `Ok(None)`：无 owner——调用方走本地激活 + spawn（legacy 路径）。
     /// - `Err`：owner 拒绝（身份/revision/凭据）——`.run` 保持原样（提交
@@ -1589,6 +1599,10 @@ mod owner_reuse_tests {
             .unwrap_or_else(|| panic!("{posted:?}"));
         // wire 形态跟随 RunProfileInput 的 serde tag（tag="profile"/
         // content="input" + ArtifactInput 的 tag="source"/content="value"）
+        assert_eq!(
+            last["kind"], "deploy",
+            "the owner only admits Deploy + Artifact"
+        );
         assert_eq!(
             last["profile"]["profile"], "artifact",
             "artifact restart must use Artifact profile: {last}"

@@ -34,7 +34,7 @@ pub(super) struct OwnerIdentity {
     pub address: String,
     pub runtime_instance_id: String,
 }
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub(super) struct State {
     pub owners: HashMap<String, OwnerRecord>,
     pub stops: HashMap<String, super::types::ExternalStopRecord>,
@@ -42,6 +42,53 @@ pub(super) struct State {
     pub intents: HashMap<String, Intent>,
     #[serde(default)]
     completed: HashMap<String, Intent>,
+    /// Retired transport registrations, not invented terminal operation results.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    retired: HashMap<String, serde_json::Value>,
+}
+
+impl State {
+    pub(super) fn owner_address<'a>(&'a self, project: &str, fallback: &'a str) -> &'a str {
+        self.owners
+            .get(project)
+            .map(|record| record.owner.address.as_str())
+            .or_else(|| {
+                self.intents
+                    .iter()
+                    .find(|(slot, _)| slot.starts_with(&format!("{project}|")))
+                    .map(|(_, intent)| intent.address.as_str())
+            })
+            .unwrap_or(fallback)
+    }
+
+    pub(super) fn project_snapshot(&self, project: &str) -> serde_json::Value {
+        let intents: std::collections::BTreeMap<_, _> = self
+            .intents
+            .iter()
+            .filter(|(slot, _)| slot.starts_with(&format!("{project}|")))
+            .collect();
+        serde_json::json!({"owner": self.owners.get(project), "stop": self.stops.get(project), "intents": intents})
+    }
+
+    pub(super) fn needs_owner(&self, project: &str) -> bool {
+        self.owners.contains_key(project)
+            || self.stops.contains_key(project)
+            || self
+                .intents
+                .keys()
+                .chain(self.completed.keys())
+                .any(|slot| slot.starts_with(&format!("{project}|")))
+    }
+
+    pub(super) fn has_replaced_registration(&self, project: &str, instance: &str) -> bool {
+        self.owners
+            .get(project)
+            .is_some_and(|owner| owner.owner.runtime_instance_id != instance)
+            || self.intents.iter().any(|(slot, intent)| {
+                slot.starts_with(&format!("{project}|"))
+                    && intent.request.expected_runtime_instance_id != instance
+            })
+    }
 }
 
 fn key(project: &str, kind: RuntimeOperationKind) -> String {
@@ -113,6 +160,62 @@ impl DevServerManager {
         self.read_external_state().map(|_| ())
     }
 
+    /// Called after an authenticated successor has completed its own ownership
+    /// and process cleanup checks. No port/PID observation can call this alone.
+    pub(super) fn retire_replaced_registration(
+        &self,
+        project: &str,
+        snapshot: &State,
+        successor: &str,
+    ) -> Result<()> {
+        let mut processes = self
+            .processes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("external process registry poisoned"))?;
+        let mut stops = self
+            .external_stops
+            .lock()
+            .map_err(|_| anyhow::anyhow!("external stop registry poisoned"))?;
+        self.external_transaction(|state| {
+            ensure!(state.project_snapshot(project) == snapshot.project_snapshot(project),
+                "owner registration changed during recovery; retry with current state");
+            // Never retire a request already issued to this successor.
+            let slots: Vec<_> = state.intents.iter()
+                .filter(|(slot, intent)| slot.starts_with(&format!("{project}|"))
+                    && intent.request.expected_runtime_instance_id != successor)
+                .map(|(slot, _)| slot.clone()).collect();
+            let audit = state.project_snapshot(project);
+            for slot in slots {
+                if let Some(intent) = state.intents.remove(&slot) {
+                    state.completed.insert(format!("{project}|{}", intent.request.operation_id), intent);
+                }
+            }
+            if state.owners.get(project).is_some_and(|owner| owner.owner.runtime_instance_id != successor) {
+                state.owners.remove(project);
+                state.stops.remove(project);
+            }
+            state.retired.insert(format!("{project}|{}", uuid::Uuid::new_v4().simple()),
+                serde_json::json!({"reason":"owner_replaced", "successor": successor, "registration":audit}));
+            Ok(())
+        })?;
+        if processes
+            .get(project)
+            .and_then(|p| p.external_owner.as_ref())
+            .is_some_and(|owner| owner.runtime_instance_id != successor)
+        {
+            processes.remove(project);
+        }
+        if snapshot
+            .owners
+            .get(project)
+            .is_some_and(|owner| owner.owner.runtime_instance_id != successor)
+        {
+            stops.remove(project);
+        }
+        tracing::info!(%project, %successor, "retired old owner transport registration; operation history retained");
+        Ok(())
+    }
+
     /// Prepare both owner registration and original request before sending any authenticated write.
     pub(super) fn prepare_external_intent(
         &self,
@@ -146,7 +249,7 @@ impl DevServerManager {
                             == serde_json::to_value(&candidate.profile)?,
                     "pending runtime intent has a different profile; recovery required"
                 );
-                if candidate.kind == RuntimeOperationKind::Restart {
+                if matches!(candidate.kind, RuntimeOperationKind::Restart | RuntimeOperationKind::Deploy) {
                     ensure!(intent.request.request_context == candidate.request_context
                         && (candidate.request_context.is_some() || intent.request.operation_id == candidate.operation_id),
                         "another build request has pending operation {}; resume that operation before a new build request", intent.request.operation_id);
@@ -338,6 +441,11 @@ impl DevServerManager {
         if let Some(intent) = state
             .intents
             .get(&key(project, RuntimeOperationKind::Restart))
+            .or_else(|| {
+                state
+                    .intents
+                    .get(&key(project, RuntimeOperationKind::Deploy))
+            })
             .or_else(|| state.intents.get(&key(project, RuntimeOperationKind::Stop)))
         {
             return Err(crate::error::AppError::Conflict(format!(
@@ -362,6 +470,9 @@ impl DevServerManager {
         if state
             .intents
             .contains_key(&key(project, RuntimeOperationKind::Restart))
+            || state
+                .intents
+                .contains_key(&key(project, RuntimeOperationKind::Deploy))
             || state
                 .intents
                 .contains_key(&key(project, RuntimeOperationKind::Stop))
@@ -469,8 +580,12 @@ impl DevServerManager {
             let completed = state
                 .completed
                 .contains_key(&format!("{project}|{operation_id}"));
-            let identity = super::owner_client::probe_owner(&intent.address)
-                .await
+            // Restore only the management channel here. The caller asked to
+            // recover this exact operation, so preserve its pending receipt
+            // until the matching durable result below has been verified.
+            let identity = self
+                .ensure_owner_available(project, workspace, &intent.address, true)
+                .await?
                 .context("runtime owner unavailable; recovery remains protected")?;
             let app = std::env::var("PROJECT_ID")
                 .ok()
@@ -578,6 +693,51 @@ mod tests {
             runtime_instance_id: "instance".into(),
         }
     }
+    #[test]
+    fn successor_retirement_keeps_history_and_cannot_erase_new_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path());
+        let request = request();
+        let old = owner("127.0.0.1:1");
+        manager
+            .prepare_external_intent("project", dir.path(), &old, &request)
+            .unwrap();
+        let snapshot = manager.read_external_state().unwrap();
+        manager
+            .retire_replaced_registration("project", &snapshot, "successor")
+            .unwrap();
+        let retired = manager.read_external_state().unwrap();
+        assert!(retired.owners.is_empty());
+        assert!(retired.intents.is_empty());
+        assert_eq!(
+            retired.completed["project|original-operation"]
+                .request
+                .operation_id,
+            request.operation_id
+        );
+        assert_eq!(retired.retired.len(), 1);
+        assert!(!manager.processes.lock().unwrap().contains_key("project"));
+        let mut next = request.clone();
+        next.expected_runtime_instance_id = "successor".into();
+        next.operation_id = "next".into();
+        let mut successor = old;
+        successor.runtime_instance_id = "successor".into();
+        manager
+            .prepare_external_intent("project", dir.path(), &successor, &next)
+            .unwrap();
+        assert!(
+            manager
+                .retire_replaced_registration("project", &snapshot, "successor")
+                .is_err()
+        );
+        assert_eq!(
+            manager.read_external_state().unwrap().owners["project"]
+                .registration_operation_id
+                .as_deref(),
+            Some("next")
+        );
+    }
+
     #[test]
     fn pending_task_context_cannot_be_replaced_by_new_or_anonymous_request() {
         let dir = tempfile::tempdir().unwrap();

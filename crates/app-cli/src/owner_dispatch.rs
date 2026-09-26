@@ -619,6 +619,7 @@ mod tests {
             admin_addr: addr.clone(),
             pingap_bin: dir.path().join("must-not-execute"),
             attach: false,
+            control_only: false,
         };
         tokio::time::timeout(
             std::time::Duration::from_secs(5),

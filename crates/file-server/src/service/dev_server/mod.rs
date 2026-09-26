@@ -16,6 +16,7 @@ pub mod error_classify;
 mod external_store;
 pub mod log;
 mod owner_client;
+mod owner_recovery;
 pub mod port_pool;
 pub mod process;
 mod start;
@@ -108,11 +109,35 @@ impl DevServerManager {
     ///   [`OwnerExpectation::ObservationFailed`]：提交明确拒绝——不能用
     ///   "没捕获到"绕过停止屏障（R07 反例）。
     pub async fn capture_owner_expectation(&self, project_id: &str, workspace: &Path) {
+        self.capture_owner_expectation_at(
+            project_id,
+            workspace,
+            &self.config.app_cli_admin_probe_addr,
+        )
+        .await;
+    }
+
+    async fn capture_owner_expectation_at(
+        &self,
+        project_id: &str,
+        workspace: &Path,
+        owner_addr: &str,
+    ) {
         use types::OwnerExpectation;
-        let owner_addr = self.config.app_cli_admin_probe_addr.clone();
-        let expectation = match owner_client::probe_owner(&owner_addr).await {
-            None => {
-                if start::legacy_app_cli_responds(&owner_addr).await {
+        let expectation = match owner_client::probe_owner(owner_addr).await {
+            Ok(None) => {
+                let registered_local = lock(&self.processes)
+                    .ok()
+                    .and_then(|map| map.get(project_id).cloned())
+                    .filter(|process| process.external_owner.is_none())
+                    .is_some_and(|process| {
+                        lock(&self.supervised).ok().is_some_and(|children| {
+                            children.get(project_id).is_some_and(|child| {
+                                child.pid() == process.pid && child.exited().is_none()
+                            })
+                        })
+                    });
+                if !registered_local && start::legacy_app_cli_responds(owner_addr).await {
                     OwnerExpectation::ObservationFailed {
                         reason: "admin port is held by a legacy app-cli without the runtime API"
                             .to_string(),
@@ -121,7 +146,10 @@ impl DevServerManager {
                     OwnerExpectation::NoOwner
                 }
             }
-            Some(identity) => {
+            Err(error) => OwnerExpectation::ObservationFailed {
+                reason: format!("{error:#}"),
+            },
+            Ok(Some(identity)) => {
                 let app_id = std::env::var("PROJECT_ID")
                     .ok()
                     .filter(|value| !value.trim().is_empty())
@@ -145,7 +173,7 @@ impl DevServerManager {
                             .to_string(),
                     },
                     Some((_root, token)) => {
-                        match owner_client::OwnerClient::new(&owner_addr, &token) {
+                        match owner_client::OwnerClient::new(owner_addr, &token) {
                             Err(error) => OwnerExpectation::ObservationFailed {
                                 reason: format!("build owner client: {error:#}"),
                             },

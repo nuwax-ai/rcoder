@@ -108,6 +108,8 @@ pub struct DevServerManager {
     /// wait/reap + stdout 管道 + stderr ring；vite 路径不登记）。key 与
     /// processes 同（project_id）；stop_dev 同步摘除。
     pub(super) supervised: Mutex<HashMap<String, Arc<super::supervise::SupervisedChild>>>,
+    /// Management-only children survive business Stop and are reaped independently.
+    pub(super) owner_children: Mutex<HashMap<String, Arc<super::supervise::SupervisedChild>>>,
     /// 进程停止后未确认清理状态表（P1-05）：并发 dev 操作互斥清理——
     /// 旧 supervised 退出后再次受理 dev/start 前必须确认清理完毕。
     pub(super) cleanup_state: Arc<Mutex<HashMap<String, CleanupStatus>>>,
@@ -138,6 +140,7 @@ impl DevServerManager {
             starting: Mutex::new(HashSet::new()),
             coordinated_stop_locks: Mutex::new(HashMap::new()),
             supervised: Mutex::new(HashMap::new()),
+            owner_children: Mutex::new(HashMap::new()),
             cleanup_state: Arc::new(Mutex::new(HashMap::new())),
             owner_expectations: Mutex::new(HashMap::new()),
             external_stops: Mutex::new(HashMap::new()),

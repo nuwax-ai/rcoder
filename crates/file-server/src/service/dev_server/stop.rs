@@ -116,6 +116,9 @@ impl DevServerManager {
         self.check_external_store().map_err(|error| {
             AppError::business(format!("external owner recovery required: {error:#}"))
         })?;
+        let recovered = self
+            .recover_owner_if_needed(project_id, project_path)
+            .await?;
         let snapshot = lock(&self.processes)?.get(project_id).cloned();
         if let Some(mut external) = snapshot
             .as_ref()
@@ -156,7 +159,9 @@ impl DevServerManager {
             }
             return self.stop_external_owner(project_id, &external).await;
         }
-        let owner_addr = self.config.app_cli_admin_probe_addr.clone();
+        let owner_addr = recovered
+            .map(|owner| owner.address)
+            .unwrap_or_else(|| self.config.app_cli_admin_probe_addr.clone());
         if let Some(identity) = super::owner_client::probe_owner_for_stop(&owner_addr)
             .await
             .map_err(|error| AppError::business(format!("observe owner for stop: {error:#}")))?
@@ -248,7 +253,7 @@ impl DevServerManager {
         let pending = lock(&self.external_stops)?.get(project_id).cloned();
         let route = async {
             let identity = super::owner_client::probe_owner(&external.address)
-                .await
+                .await?
                 .ok_or_else(|| anyhow::anyhow!("external owner identity unavailable"))?;
             anyhow::ensure!(
                 super::owner_client::protocol_compatible(&identity)
@@ -975,7 +980,14 @@ mod external_stop_tests {
         let root = tempfile::tempdir().unwrap();
         let app = axum::Router::new().route(
             "/v1/runtime/identity",
-            axum::routing::get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(
+                        serde_json::json!({"success":false,"code":"ERR_PROTOCOL_UNSUPPORTED"}),
+                    ),
+                )
+            }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut config = crate::Config::from_env().unwrap();

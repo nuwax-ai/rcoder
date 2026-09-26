@@ -106,6 +106,9 @@ pub struct ServeArgs {
     /// 附着到身份匹配的所有者，等待接管。
     #[arg(long, env = "APP_CLI_ATTACH")]
     pub attach: bool,
+    /// 仅恢复管理面，等待显式运行操作；不自动启动业务或执行环境变量部署。
+    #[arg(long, conflicts_with = "attach")]
+    pub control_only: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -141,6 +144,7 @@ pub struct RuntimeArgs {
     pub admin_addr: String,
     pub pingap_bin: PathBuf,
     pub attach: bool,
+    pub control_only: bool,
 }
 
 impl From<RunArgs> for RuntimeArgs {
@@ -151,6 +155,7 @@ impl From<RunArgs> for RuntimeArgs {
             admin_addr: args.runtime.admin_addr,
             pingap_bin: args.runtime.pingap_bin,
             attach: false,
+            control_only: false,
         }
     }
 }
@@ -159,6 +164,7 @@ impl From<ServeArgs> for RuntimeArgs {
     fn from(args: ServeArgs) -> Self {
         Self {
             attach: args.attach,
+            control_only: args.control_only,
             ..args.run.into()
         }
     }
@@ -230,6 +236,19 @@ mod tests {
         assert_eq!(runtime.admin_addr, "127.0.0.1:3999");
         assert_eq!(runtime.pingap_bin, PathBuf::from("tools/pingap"));
         assert!(runtime.attach);
+    }
+
+    #[test]
+    fn control_only_is_explicit_serve_bootstrap_not_attach_or_run() {
+        let cli = CliArgs::try_parse_from(["app-cli", "serve", "--control-only"]).unwrap();
+        let Command::Serve(args) = cli.command else {
+            panic!("serve");
+        };
+        assert!(RuntimeArgs::from(args).control_only);
+        assert!(
+            CliArgs::try_parse_from(["app-cli", "serve", "--control-only", "--attach"]).is_err()
+        );
+        assert!(CliArgs::try_parse_from(["app-cli", "run", "--control-only"]).is_err());
     }
 
     #[test]

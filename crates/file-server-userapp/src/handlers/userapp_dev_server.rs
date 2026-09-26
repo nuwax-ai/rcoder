@@ -290,10 +290,6 @@ async fn spawn_dev_task(
     action: DevTaskAction,
     precheck: crate::service::userapp::DevWorkspacePrecheck,
 ) -> Result<String, AppError> {
-    state
-        .fs
-        .dev_server
-        .ensure_new_build_admissible(&dev_key(app_id))?;
     let workspace_activity = state
         .build_tasks
         .workspace_activity(app_id)
@@ -306,6 +302,16 @@ async fn spawn_dev_task(
     };
     let lifecycle = state.build_tasks.dev_lifecycle(app_id).await;
     let generation = *lifecycle.lock().await;
+    state
+        .fs
+        .dev_server
+        .preflight_userapp_build(&dev_key(app_id), &precheck.ws)
+        .await?;
+    if *lifecycle.lock().await != generation {
+        return Err(AppError::business(
+            "dev stop was accepted during owner recovery; retry after stop completes",
+        ));
+    }
     let task = state
         .build_tasks
         .create(app_id.to_string(), kind)
@@ -339,14 +345,9 @@ async fn spawn_dev_task(
                 //   只配 [devrun] 的服务跳过——devrun 自足；其余回落 [build].command
                 //   刷新源码目录产物）——不打 zip（热加载命令跑源码，
                 //   制品无消费者；可部署性检查走 /api/v1/userapp/build）。
-                // P3-03：构建前捕获 owner 期望（instance/revision）——构建期间
+                // 受理预检已捕获 owner 期望（instance/revision）——构建期间
                 // owner 被 stop/restart 时，提交按 ERR_REVISION_MISMATCH 拒绝
                 // （不自动刷新重发，防绕过用户 stop）。无 owner 时无副作用。
-                state
-                    .fs
-                    .dev_server
-                    .capture_owner_expectation(&key, &ws)
-                    .await;
                 let progress = task_clone.clone();
                 let result = if dev_source_mode {
                     crate::service::userapp::dev_mode::run_dev_builds(
@@ -428,7 +429,7 @@ async fn spawn_dev_task(
             }
             // 启动 workspace 根（形态分派）：
             // - 产物态（R03）：staging 只解压校验；**激活权归属 owner**——
-            //   匹配 owner 在 → Restart(ArtifactId)（owner 侧身份/revision
+            //   匹配 owner 在 → Deploy(ArtifactId)（owner 侧身份/revision
             //   核验后自行解压/激活/编排，拒绝不改变 active 目录）；
             //   无 owner → 本地 activate + spawn（legacy 路径不变）。
             // - 源码态：ensure 源码目录 release.lock（mtime 检测自动重锁），

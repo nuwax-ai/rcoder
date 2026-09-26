@@ -30,12 +30,14 @@ fn kernel_of(
     state: &AppState,
 ) -> Result<Arc<RuntimeKernel>, (StatusCode, Json<serde_json::Value>)> {
     state.runtime_kernel().ok_or_else(|| {
+        let recovering = state.server.kernel_unavailable();
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
                 "success": false,
-                "code": "ERR_PROTOCOL_UNSUPPORTED",
-                "message": "runtime control kernel is not active in this mode",
+                "code": if recovering { "ERR_RECOVERY_REQUIRED" } else { "ERR_PROTOCOL_UNSUPPORTED" },
+                "message": if recovering { "runtime owner startup recovery failed; inspect the owner log" }
+                           else { "runtime control kernel is not active in this mode" },
             })),
         )
     })
@@ -127,12 +129,22 @@ pub(super) async fn recovery(
 #[utoipa::path(
     get,
     path = "/v1/runtime/identity",
-    responses((status = 200, description = "Owner identity, instance and capabilities", body = serde_json::Value)),
+    responses(
+        (status = 200, description = "Owner identity after startup reconciliation", body = serde_json::Value),
+        (status = 503, description = "ERR_INITIALIZING while reconciling, ERR_RECOVERY_REQUIRED on failed recovery, ERR_PROTOCOL_UNSUPPORTED in run mode")
+    ),
     tag = "Runtime Control"
 )]
 pub(super) async fn identity(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if state.server.initializing() {
+        return Err(reject(
+            "ERR_INITIALIZING",
+            "runtime owner is initializing",
+            StatusCode::SERVICE_UNAVAILABLE,
+        ));
+    }
     let kernel = kernel_of(&state)?;
     let identity = kernel.identity().clone();
     Ok(Json(

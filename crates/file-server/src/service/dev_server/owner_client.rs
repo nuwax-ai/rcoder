@@ -9,38 +9,22 @@
 //!
 //! 所有请求 no_proxy——本机 owner 探测不得经系统 HTTP 代理转发（XP10）。
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use shared_types::{
     RUNTIME_CONTROL_PROTOCOL_VERSION, RuntimeIdentityView, RuntimeOperationRequest,
     RuntimeOperationView, RuntimeStatusView,
 };
 
-/// 探测既有 owner（无认证；任何 HTTP 层失败视为无 owner，不区分原因——
-/// 调用方在"无 owner"时走本地 spawn 路径，探测失败≠可以抢锁）。
-pub(super) async fn probe_owner(address: &str) -> Option<RuntimeIdentityView> {
-    let url = format!("http://{address}/v1/runtime/identity");
-    let response = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .no_proxy()
-        .build()
-        .ok()?
-        .get(&url)
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let body: serde_json::Value = response.json().await.ok()?;
-    serde_json::from_value(body.get("data")?.clone()).ok()
+/// Transport observations are not proof that the previous process tree stopped.
+#[derive(Debug)]
+pub(super) enum OwnerProbe {
+    Ready(RuntimeIdentityView),
+    Absent,
+    Initializing,
+    Legacy,
 }
 
-/// Stop must distinguish an absent listener from an unhealthy/foreign listener.
-/// A responding app-cli whose runtime-control kernel is inactive (the local
-/// spawn path starts `app-cli run`, which supervises but has no runtime API)
-/// is not a runtime owner for stop purposes: the caller falls back to its own
-/// registered local pid, which only ever stops a process this server spawned.
-pub(super) async fn probe_owner_for_stop(address: &str) -> Result<Option<RuntimeIdentityView>> {
+pub(super) async fn observe_owner(address: &str) -> Result<OwnerProbe> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .no_proxy()
@@ -58,33 +42,53 @@ pub(super) async fn probe_owner_for_stop(address: &str) -> Result<Option<Runtime
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
                 {
-                    return Ok(None);
+                    return Ok(OwnerProbe::Absent);
                 }
                 cause = current.source();
             }
-            return Err(error).context("owner observation failed; stop is not confirmed");
+            return Err(error).context("owner observation failed; process state is unknown");
         }
     };
-    if response.status().as_u16() == 503 {
-        // ERR_PROTOCOL_UNSUPPORTED: an app-cli is listening without the
-        // runtime kernel (run mode). It is not a runtime owner; absence is
-        // the correct classification and the registered-local-pid path —
-        // which never kills an unregistered process — decides what stops.
-        return Ok(None);
+    let status = response.status();
+    // Older app-cli releases have deploy/status but no runtime identity route.
+    // A positive legacy response classifies a live process; it never grants
+    // permission to clean registrations or start another owner.
+    if status == reqwest::StatusCode::NOT_FOUND
+        && super::start::legacy_app_cli_responds(address).await
+    {
+        return Ok(OwnerProbe::Legacy);
     }
-    let body: serde_json::Value = response
-        .error_for_status()
-        .context("owner identity rejected")?
-        .json()
-        .await
-        .context("invalid owner response")?;
+    let body: serde_json::Value = response.json().await.context("invalid owner response")?;
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        match body.get("code").and_then(serde_json::Value::as_str) {
+            Some("ERR_INITIALIZING") => return Ok(OwnerProbe::Initializing),
+            Some("ERR_PROTOCOL_UNSUPPORTED") => return Ok(OwnerProbe::Legacy),
+            _ => {}
+        }
+    }
+    ensure!(
+        status.is_success(),
+        "owner identity rejected with HTTP {status}"
+    );
     let identity = serde_json::from_value(
         body.get("data")
             .cloned()
             .context("owner identity missing")?,
     )
     .context("invalid owner identity")?;
-    Ok(Some(identity))
+    Ok(OwnerProbe::Ready(identity))
+}
+
+pub(super) async fn probe_owner(address: &str) -> Result<Option<RuntimeIdentityView>> {
+    match observe_owner(address).await? {
+        OwnerProbe::Ready(identity) => Ok(Some(identity)),
+        OwnerProbe::Absent | OwnerProbe::Legacy => Ok(None),
+        OwnerProbe::Initializing => bail!("runtime owner is still initializing"),
+    }
+}
+
+pub(super) async fn probe_owner_for_stop(address: &str) -> Result<Option<RuntimeIdentityView>> {
+    probe_owner(address).await
 }
 
 /// Verify physical project identity before loading or transmitting owner credentials.
@@ -201,6 +205,25 @@ impl OwnerClient {
             token: token.to_string(),
             client,
         })
+    }
+
+    /// Only available after the owner acquired its lock and confirmed old process cleanup.
+    pub(super) async fn recovery(&self) -> Result<shared_types::RuntimeRecoveryView> {
+        let body: serde_json::Value = self
+            .client
+            .get(format!("http://{}/v1/runtime/recovery", self.address))
+            .header("X-Deploy-Token", &self.token)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        serde_json::from_value(
+            body.get("data")
+                .cloned()
+                .context("recovery evidence missing")?,
+        )
+        .context("decode owner recovery evidence")
     }
 
     /// 当前 revision（提交操作的期望值来源）。
@@ -604,5 +627,45 @@ mod r09_tests {
         std::fs::create_dir_all(&run_a).unwrap();
         let (_, token_run) = find_owner_token(&run_a, "unknown-app").expect("token via .run");
         assert_eq!(token_run, "token-a");
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn explicit_run_mode_refusal_and_unknown_service_remain_distinct() {
+        for (code, legacy) in [
+            ("ERR_PROTOCOL_UNSUPPORTED", true),
+            ("ERR_BACKEND_ERROR", false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let app = axum::Router::new().route(
+                "/v1/runtime/identity",
+                axum::routing::get(move || async move {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(serde_json::json!({"code":code})),
+                    )
+                }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let result = observe_owner(&address).await;
+            if legacy {
+                assert!(matches!(result.unwrap(), OwnerProbe::Legacy));
+            } else {
+                assert!(result.is_err());
+            }
+            server.abort();
+            drop(server.await);
+            assert!(matches!(
+                observe_owner(&address).await.unwrap(),
+                OwnerProbe::Absent
+            ));
+        }
     }
 }

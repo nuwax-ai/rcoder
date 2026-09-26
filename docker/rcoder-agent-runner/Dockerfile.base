@@ -30,8 +30,7 @@ ENV \
     TZ=Asia/Shanghai \
     # Pip settings: \
     PIP_DEFAULT_TIMEOUT=100 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # 使用 LinuxMirrors 一键配置阿里云镜像源
 # 参考: https://github.com/SuperManito/LinuxMirrors
@@ -191,8 +190,8 @@ COPY requirements.txt /tmp/requirements.txt
 # 升级基础工具并安装依赖
 # --ignore-installed: trixie 的 Debian 自带 python3-wheel/setuptools 无 pip RECORD 文件,
 # 直接 --upgrade 会报 uninstall-no-record-file; 新装到 /usr/local 遮蔽 dist-packages 副本
-RUN pip3 install --break-system-packages --ignore-installed --upgrade pip setuptools wheel && \
-    pip3 install --break-system-packages --ignore-installed -r /tmp/requirements.txt && \
+RUN pip3 install --no-cache-dir --break-system-packages --ignore-installed --upgrade pip setuptools wheel && \
+    pip3 install --no-cache-dir --break-system-packages --ignore-installed -r /tmp/requirements.txt && \
     echo "✅ Python 数据科学库安装完成" && \
     echo "已安装的包:" && \
     pip3 list | grep -E '(numpy|pandas|scipy|matplotlib|openpyxl|python-docx|PyMuPDF|xlrd|xlwt|seaborn|requests|BeautifulSoup|lxml|scikit-learn)'
@@ -848,11 +847,11 @@ ENV PNPM_HOME="/home/user/.local/share/pnpm" \
 # ============================================================================
 # 安装 pcmflux Python 包（需要 root，用于编译 C++ 扩展）
 # 使用 --break-system-packages 绕过 Debian 12 的 PEP 668 限制
-RUN pip3 install --break-system-packages websockets && \
+RUN pip3 install --no-cache-dir --break-system-packages websockets && \
     if [ "${USE_GITHUB_MIRROR}" = "true" ]; then \
-        pip3 install --break-system-packages git+${GITHUB_MIRROR_URL}linuxserver/pcmflux.git; \
+        pip3 install --no-cache-dir --break-system-packages git+${GITHUB_MIRROR_URL}linuxserver/pcmflux.git; \
     else \
-        pip3 install --break-system-packages git+https://github.com/linuxserver/pcmflux.git; \
+        pip3 install --no-cache-dir --break-system-packages git+https://github.com/linuxserver/pcmflux.git; \
     fi && \
     echo "✅ pcmflux audio streaming installed"
 

@@ -84,6 +84,7 @@ DELETE /api/v1/admin/userapp/error-page   # 幂等恢复内置页
 
 ## 相关文档
 
+- [开发环境 owner 恢复](../userapp-dev-owner-recovery.md)：管理进程丢失后的自动恢复、停止语义与 Python 缓存
 - [子路径预览与静态资源](userapp-subpath-routing.md)：Vite dev/prod 路径配对、存量项目升级与真实进程回归
 - [架构总览](../architecture/overview.md)：UserApp 域的 crate 划分（app_manager / app-cli / workspace-manifest / file-server-userapp 等）
 - [gRPC 内部通信](../architecture/grpc.md)：rcoder 与构建/运行容器之间的通信基座

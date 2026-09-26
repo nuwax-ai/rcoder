@@ -1456,7 +1456,7 @@ pub async fn serve(args: &RuntimeArgs) -> Result<()> {
 /// 1. 尝试 TCP connect 管理端口——不可达 = 无实例，直接走正常 serve 流程
 /// 2. GET /v1/runtime/identity 核验 application_id + workspace_id
 /// 3. 身份匹配 → 等待端口释放（轮询 connect）→ 重新执行本二进制（无 --attach）
-/// 4. 身份不匹配 / API 不可达 / 503 → 立即退出（exit 1）
+/// 4. 初始化中的 owner 有界等待；身份不匹配或其他拒绝响应退出（exit 1）
 async fn attach_to_existing_owner(args: &RuntimeArgs) -> Result<()> {
     use std::process::exit;
 
@@ -1503,12 +1503,25 @@ async fn attach_to_existing_owner(args: &RuntimeArgs) -> Result<()> {
                 return verify_identity_and_attach(args, &body, &addr).await;
             }
             Ok(resp) => {
+                let status = resp.status();
+                if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                    let body = resp
+                        .json::<serde_json::Value>()
+                        .await
+                        .context("decode owner initialization response")?;
+                    if body.get("code").and_then(serde_json::Value::as_str)
+                        == Some("ERR_INITIALIZING")
+                    {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                }
                 // 发现记录指向的地址应答异常——可能是旧记录：回退 CLI 地址重试
                 if record_used {
                     tracing::warn!(
                         "attach mode: endpoint record target {addr} returned {}; \
                          falling back to {}",
-                        resp.status(),
+                        status,
                         args.admin_addr
                     );
                     addr = args.admin_addr.clone();
@@ -1518,7 +1531,7 @@ async fn attach_to_existing_owner(args: &RuntimeArgs) -> Result<()> {
                 tracing::error!(
                     "attach mode: existing instance at {addr} returned {} (identity unavailable); \
                      cannot verify ownership, exiting",
-                    resp.status()
+                    status
                 );
                 exit(1);
             }
@@ -1671,6 +1684,10 @@ fn reexec_without_attach() {
 
 /// serve 核心逻辑（无附着检测）：journal → OwnerGuard → API bind → 状态机主循环。
 async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
+    anyhow::ensure!(
+        !args.control_only || !crate::deploy::deploy_requested(),
+        "control-only startup cannot execute an environment deployment"
+    );
     // OwnerGuard：跨进程排他锁（cross-platform.md §3）——在 API bind 前获取，
     // 确保同一项目最多一个 owner。锁文件位于部署替换范围外的稳定状态根。
     let application_id = std::env::var("PROJECT_ID")
@@ -1682,6 +1699,11 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
     let _owner_guard = match crate::platform::owner_guard::OwnerGuard::try_acquire(&state_root)? {
         Some(guard) => guard,
         None => {
+            // A bootstrap race must never turn into a Start request to the winner.
+            anyhow::ensure!(
+                !args.control_only,
+                "runtime owner is already starting or running"
+            );
             anyhow::ensure!(
                 !crate::deploy::deploy_requested(),
                 "workspace already has an owner; submit artifact deployment through its deployment API"
@@ -1708,6 +1730,8 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
     let ready = RuntimeStatusService::default();
     let mut initial_state = ServerState::new(ready.clone());
     initial_state.initialize_owner_token()?;
+    // A failed serve startup is a recovery failure, never legacy run mode.
+    initial_state.mark_kernel_required();
     if std::env::var(shared_types::APP_DEPLOY_GENERATION_ID).is_err()
         && let Some(receipt) = journal.receipt.as_ref()
     {
@@ -2736,6 +2760,26 @@ async fn initialize_startup(
     // missing old credentials must not latch a hold that rejects the next
     // explicit operation carrying fresh credentials.
     let stopped_args = restored_runtime_args_inner(args, state, false)?;
+    if args.control_only {
+        // Recover the control channel without replaying business startup. Keep
+        // journal/migration uncertainty visible; Stop remains available.
+        if let Err(error) =
+            crate::migration_journal::require_confirmed_migrations(&stopped_args.workspace)
+        {
+            state.begin_runtime_recovery_hold();
+            return Err(error).context("database migration requires reconciliation");
+        }
+        state
+            .journal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
+            .as_ref()
+            .context("deployment journal missing")?
+            .resume(&state.generation)
+            .inspect_err(|_| state.begin_runtime_recovery_hold())?;
+        state.set_phase(ServerPhase::Idle);
+        return Ok(None);
+    }
     // Decide automatic recovery before generating Switching. Stopped must not
     // leave a false interrupted-switch journal when no business was started.
     if !crate::deploy::deploy_requested()
@@ -4423,6 +4467,44 @@ format = "jsonl"
         drop(state.begin_auxiliary_write().unwrap());
         assert!(state.runtime_recovery_hold_active());
         assert!(state.begin_auxiliary_write().is_err());
+    }
+
+    #[tokio::test]
+    async fn control_only_bootstrap_never_autostarts_an_existing_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("code");
+        std::fs::create_dir_all(&workspace).unwrap();
+        // Even a broken release must not be executed by management bootstrap.
+        std::fs::write(workspace.join("release.lock.toml"), "invalid release").unwrap();
+        let state = state();
+        *state.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
+        let kernel = kernel_for(dir.path());
+        kernel
+            .store()
+            .store_desired(shared_types::DesiredState::Running, 7)
+            .unwrap();
+        state.set_runtime_kernel(kernel.clone());
+        let args = RuntimeArgs {
+            workspace,
+            control_only: true,
+            ..Default::default()
+        };
+        assert!(initialize_startup(&args, &state).await.unwrap().is_none());
+        assert_eq!(state.phase(), ServerPhase::Idle);
+        assert_eq!(
+            kernel.store().load_desired().unwrap(),
+            (shared_types::DesiredState::Running, 7)
+        );
+        assert!(
+            state
+                .journal
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .receipt
+                .is_none()
+        );
     }
 
     #[tokio::test]
