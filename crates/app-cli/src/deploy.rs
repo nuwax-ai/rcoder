@@ -508,17 +508,26 @@ async fn download_to_file(url: &str, dest: &Path) -> Result<[u8; 32]> {
     // 5xx or connection errors). Those windows are bounded and the GET is
     // idempotent, so retry within an explicit budget instead of failing the
     // whole deployment. 4xx answers are permanent and never retried.
-    let budget = Duration::from_secs(positive_setting("APP_DEPLOY_UNAVAILABLE_RETRY_SECONDS", 180)?);
+    let budget = Duration::from_secs(positive_setting(
+        "APP_DEPLOY_UNAVAILABLE_RETRY_SECONDS",
+        180,
+    )?);
     let deadline = tokio::time::Instant::now() + budget;
     let mut attempt = 0u32;
     loop {
         attempt += 1;
         match download_once(&client, idle, url, dest).await {
             Ok(digest) => return Ok(digest),
-            Err(error) if retryable_download_failure(&error) && tokio::time::Instant::now() < deadline => {
-                tracing::warn!(attempt, %error, remaining = ?deadline - tokio::time::Instant::now(),
+            Err(error)
+                if retryable_download_failure(&error) && tokio::time::Instant::now() < deadline =>
+            {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                tracing::warn!(attempt, %error, remaining = ?remaining,
                     "artifact upstream unavailable; retrying within budget");
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                tokio::time::sleep(Duration::from_secs(3).min(remaining)).await;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(error.context("artifact upstream retry budget exhausted"));
+                }
             }
             Err(error) => {
                 if attempt > 1 {
@@ -535,6 +544,9 @@ async fn download_to_file(url: &str, dest: &Path) -> Result<[u8; 32]> {
 /// windows all cut the proxied stream mid-chunk).
 fn retryable_download_failure(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
+        if cause.is::<tokio::time::error::Elapsed>() {
+            return true;
+        }
         if let Some(http) = cause.downcast_ref::<reqwest::Error>() {
             if let Some(status) = http.status() {
                 return status.is_server_error();
@@ -941,7 +953,9 @@ format = "jsonl"
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
             loop {
-                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
                 let hits_server = hits_server.clone();
                 let body = body.clone();
                 tokio::spawn(async move {
@@ -954,14 +968,18 @@ format = "jsonl"
                     }
                     let count = hits_server.fetch_add(1, Ordering::SeqCst);
                     let response = if count < 2 {
-                        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
                     } else {
                         format!(
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             body.len()
                         )
                     };
-                    socket.write_all(response.as_bytes()).await.expect("write head");
+                    socket
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("write head");
                     if count >= 2 {
                         socket.write_all(&body).await.expect("write body");
                     }
@@ -971,12 +989,20 @@ format = "jsonl"
 
         // 5xx then success: deployment must succeed after retries.
         unsafe { std::env::set_var("APP_DEPLOY_UNAVAILABLE_RETRY_SECONDS", "30") };
-        deploy(&workspace, &format!("http://{addr}/artifact.zip"), "rel-retry", Some(&sha))
-            .await
-            .expect("deploy after upstream recovery");
+        deploy(
+            &workspace,
+            &format!("http://{addr}/artifact.zip"),
+            "rel-retry",
+            Some(&sha),
+        )
+        .await
+        .expect("deploy after upstream recovery");
         unsafe { std::env::remove_var("APP_DEPLOY_UNAVAILABLE_RETRY_SECONDS") };
         assert!(workspace.join("web/server.js").exists());
-        assert!(hits.load(Ordering::SeqCst) >= 3, "expected retries before success");
+        assert!(
+            hits.load(Ordering::SeqCst) >= 3,
+            "expected retries before success"
+        );
     }
 
     /// 极简本地 HTTP 服务：单次请求返回 body（Connection: close）。

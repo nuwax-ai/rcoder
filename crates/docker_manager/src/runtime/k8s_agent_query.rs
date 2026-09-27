@@ -40,6 +40,9 @@ impl KubernetesRuntime {
             guard.get(identifier).cloned()
         };
         if let Some(entry) = entry
+            // Builder management compares physical UIDs. A TTL cannot prove
+            // the cached Pod survived a kubelet/controller replacement.
+            && *service_type != ServiceType::UserappBuilder
             && entry.cached_at.elapsed() < POD_CACHE_TTL
             && entry.info.status == ContainerRuntimeStatus::Running
             // 家族归一：Computer 族共享容器，缓存/请求两侧归一后比较
@@ -155,7 +158,8 @@ impl KubernetesRuntime {
             guard
                 .get(identifier)
                 .filter(|entry| {
-                    entry.cached_at.elapsed() < POD_CACHE_TTL
+                    *service_type != ServiceType::UserappBuilder
+                        && entry.cached_at.elapsed() < POD_CACHE_TTL
                         && entry.service_type.family_representative()
                             == service_type.family_representative()
                 })

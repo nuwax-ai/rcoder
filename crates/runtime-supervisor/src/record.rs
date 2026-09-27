@@ -205,7 +205,7 @@ fn local_process_space_ended(value: &Generation) -> Result<bool> {
     else {
         return Ok(false);
     };
-    if crate::epoch::matches(recorded, &current) {
+    if !crate::epoch::proves_replacement(recorded, &current) {
         return Ok(false);
     }
     Ok(process_space_ended_with(
@@ -289,8 +289,13 @@ mod tests {
     fn process_epoch_change_retires_only_local_generations_and_preserves_outcomes() {
         // One sequential test: the epoch override is process-global.
         // (a) native scope, epoch changed → retired, business record untouched.
-        let (_temp, id) = stuck_scope(None, Some("pid1:uuid-x:100".into()));
-        let _guard = EpochGuard::new(Some("pid1:uuid-x:9000".into()));
+        let (_temp, id) = stuck_scope(
+            None,
+            Some("pid1:11111111-1111-4111-8111-111111111111:100".into()),
+        );
+        let _guard = EpochGuard::new(Some(
+            "pid1:11111111-1111-4111-8111-111111111111:9000".into(),
+        ));
         reconcile(_temp.path()).unwrap();
         let retired = generation(&work_root(_temp.path(), &id).unwrap()).unwrap();
         assert_eq!(retired.phase, GenerationPhase::Quiescent);
@@ -313,20 +318,28 @@ mod tests {
         drop(_guard);
 
         // (b) native scope, same epoch → still unconfirmed (hard kill only).
-        let (_temp, _id) = stuck_scope(None, Some("pid1:uuid-x:100".into()));
-        let _guard = EpochGuard::new(Some("pid1:uuid-x:100".into()));
+        let (_temp, _id) = stuck_scope(
+            None,
+            Some("pid1:11111111-1111-4111-8111-111111111111:100".into()),
+        );
+        let _guard = EpochGuard::new(Some("pid1:11111111-1111-4111-8111-111111111111:100".into()));
         let error = reconcile(_temp.path()).unwrap_err().to_string();
         assert!(error.contains("cleanup is unconfirmed"), "{error}");
         drop(_guard);
 
         // (c) legacy record without epoch → conservative.
         let (_temp, _id) = stuck_scope(None, None);
-        let _guard = EpochGuard::new(Some("pid1:uuid-x:9000".into()));
+        let _guard = EpochGuard::new(Some(
+            "pid1:11111111-1111-4111-8111-111111111111:9000".into(),
+        ));
         assert!(reconcile(_temp.path()).is_err());
         drop(_guard);
 
         // (d) unreadable epoch → conservative.
-        let (_temp, _id) = stuck_scope(None, Some("pid1:uuid-x:100".into()));
+        let (_temp, _id) = stuck_scope(
+            None,
+            Some("pid1:11111111-1111-4111-8111-111111111111:100".into()),
+        );
         let _guard = EpochGuard::new(None);
         assert!(reconcile(_temp.path()).is_err());
         drop(_guard);
@@ -353,7 +366,7 @@ mod tests {
             exit_code: None,
             error: None,
             physical_domain: Some(other.clone()),
-            process_epoch: Some("pid1:uuid-x:100".into()),
+            process_epoch: Some("pid1:11111111-1111-4111-8111-111111111111:100".into()),
         };
         // Same container identity, new incarnation → local proof applies.
         assert!(process_space_ended_with(&same_domain, Some(&current)));

@@ -85,9 +85,9 @@ async fn post_json(env: &Env, path: &str, body: Value) -> (reqwest::StatusCode, 
             .await
         {
             Ok(response) => break response,
-            Err(error)
-                if error.is_connect() || error.is_request() && attempt < 3 =>
-            {
+            // Only a connection-establishment failure is known not to have sent
+            // this mutation. Other request errors can hide a committed write.
+            Err(error) if error.is_connect() && attempt < 3 => {
                 eprintln!("HTTP POST transport failure (attempt {attempt}): {error}; retrying");
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -133,9 +133,7 @@ async fn get_json(env: &Env, path: &str) -> (reqwest::StatusCode, Value) {
             .await
         {
             Ok(response) => break response,
-            Err(error)
-                if (error.is_connect() || error.is_request()) && attempt < 3 =>
-            {
+            Err(error) if (error.is_connect() || error.is_request()) && attempt < 3 => {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
             Err(error) => panic!("http get failed: {error}"),
@@ -2427,9 +2425,8 @@ async fn userapp_scope_isolation_during_deploy() {
     let deploy_base = env.rcoder.clone();
     let deploy_task_path = deploy_path.clone();
     let deploy_task = tokio::spawn(async move {
-        // Transport-level failures (connection refused under local load) are
-        // transient; the start body carries a stable request identity, so an
-        // identical retry cannot duplicate the deployment.
+        // Retry only failed connection establishment. An interrupted response
+        // may belong to an accepted deployment; query that request below.
         let mut attempt = 0;
         loop {
             attempt += 1;
@@ -2445,7 +2442,7 @@ async fn userapp_scope_isolation_during_deploy() {
                     let b = r.json().await.unwrap_or(Value::Null);
                     return (s, b);
                 }
-                Err(e) if (e.is_connect() || e.is_request()) && attempt < 3 => {
+                Err(e) if e.is_connect() && attempt < 3 => {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
                 Err(e) => {
@@ -2740,48 +2737,44 @@ async fn userapp_scope_isolation_during_deploy() {
     );
 
     // ⑤d 部署收敛：并发 dev 操作不破坏 prod 部署。
-    // 响应丢失窗口：首次请求可能已被受理（响应回程被传输故障切断），同
-    // request_id 重试在原操作仍在途时按设计返回 409 Busy——此时按原操作
-    // ID 等待终态，Succeeded 视为部署成功（与 owner 重放语义一致）。
+    // 响应丢失窗口：通过原 request_id 查询持久操作，不能从 current 列表
+    // 等待终态——成功操作已释放槽位，会从 current 消失。
     let (ds, db) = deploy_task.await.expect("deploy task join");
     let mut deploy_ok =
         ds.is_success() && http_ok(&db) && db["data"]["status"].as_str() == Some("running");
+    let mut final_operation = Value::Null;
     if !deploy_ok {
-        let lost = db["blocker"]["operation_id"].as_str().map(str::to_owned);
-        if let Some(op) = lost {
-            let t0 = Instant::now();
-            while t0.elapsed() < Duration::from_secs(180) {
-                let (os, ob) = get_json(
-                    &env,
-                    &format!("/api/v1/userapp/{app}/operations/current?user_id={user}"),
-                )
-                .await;
-                if os.is_success()
-                    && http_ok(&ob)
-                    && let Some(ops) = ob["data"].as_array()
-                    && let Some(view) = ops
-                        .iter()
-                        .find(|o| o["operation_id"].as_str() == Some(op.as_str()))
-                {
-                    if view["state"].as_str() == Some("Succeeded") {
-                        deploy_ok = true;
-                        break;
-                    }
-                    if matches!(
-                        view["state"].as_str(),
-                        Some("Failed") | Some("Cancelled")
-                    ) {
-                        break;
-                    }
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(180) {
+            let (os, ob) = get_json(
+                &env,
+                &format!("/api/v1/userapp/{app}/operations/by-request?request_id=iso-deploy-{app}"),
+            )
+            .await;
+            if os.is_success() && http_ok(&ob) {
+                final_operation = ob["data"].clone();
+                if final_operation["state"].as_str() == Some("Succeeded") {
+                    deploy_ok = true;
+                    break;
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                if matches!(
+                    final_operation["state"].as_str(),
+                    Some("Failed") | Some("Cancelled")
+                ) {
+                    break;
+                }
             }
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
     report.assert_hard(
         "隔离场景部署终态 running（并发不破坏部署）",
         deploy_ok,
-        format!("HTTP {ds}, body 截断: {}", trunc(&db, 200)),
+        format!(
+            "HTTP {ds}, body 截断: {}, durable operation: {}",
+            trunc(&db, 200),
+            trunc(&final_operation, 400)
+        ),
     );
 
     // ⑥ 回收（复用 full_chain 清理链）

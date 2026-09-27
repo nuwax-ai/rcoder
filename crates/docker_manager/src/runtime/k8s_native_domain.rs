@@ -1,6 +1,6 @@
-//! K8s 正向退出证据：builder Pod 更替后，由平台核验「旧 Pod 已从 API 消失
-//! 且无失联节点」再向新容器签发物理退出回执。这只收束进程回执；迁移、部署
-//! 与业务期望状态仍由各自 journal 决定，绝不改写成功。
+//! K8s execution-domain retirement requires evidence that the old containers
+//! terminated. Pod absence and Node Ready are observations, not process-exit
+//! receipts: force deletion can remove the API object while processes survive.
 use anyhow::{Context, Result, ensure};
 use k8s_openapi::api::core::v1::VolumeMount;
 use runtime_supervisor::domain::{DOMAIN_ENV, PhysicalDomain, Retirement};
@@ -73,13 +73,44 @@ fn pod_domain_env(pod: &k8s_openapi::api::core::v1::Pod) -> Result<String> {
         .context("builder pod execution domain missing")
 }
 
-/// Pure retirement decision for one reconciliation round.
-///
-/// `unreachable_nodes: None` means node liveness could not be observed at all
-/// (e.g. RBAC denied); nothing may then be confirmed. A retired instance that
-/// is still present (even terminating) and any not-Ready node both keep the
-/// previous execution in "needs further verification" — its management plane
-/// and physical stop remain available.
+/// Retirement is allowed only for a terminal Pod with termination status for
+/// every declared container (including sidecars and ephemeral containers).
+/// A missing Pod cannot supply that evidence. Ordinary graceful shutdown uses
+/// the CLI guardian receipts; this fallback must never invent those receipts.
+fn pod_execution_ended(pod: &k8s_openapi::api::core::v1::Pod) -> bool {
+    let (Some(spec), Some(status)) = (&pod.spec, &pod.status) else {
+        return false;
+    };
+    if !matches!(status.phase.as_deref(), Some("Succeeded" | "Failed")) {
+        return false;
+    }
+    let terminated =
+        |name: &str, states: Option<&Vec<k8s_openapi::api::core::v1::ContainerStatus>>| {
+            states.into_iter().flatten().any(|state| {
+                state.name == name
+                    && state
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| state.terminated.is_some())
+            })
+        };
+    !spec.containers.is_empty()
+        && spec
+            .containers
+            .iter()
+            .all(|c| terminated(&c.name, status.container_statuses.as_ref()))
+        && spec
+            .init_containers
+            .iter()
+            .flatten()
+            .all(|c| terminated(&c.name, status.init_container_statuses.as_ref()))
+        && spec
+            .ephemeral_containers
+            .iter()
+            .flatten()
+            .all(|c| terminated(&c.name, status.ephemeral_container_statuses.as_ref()))
+}
+
 #[derive(Default, Debug)]
 pub(crate) struct DomainDecision {
     pub confirm: Vec<Retirement>,
@@ -92,8 +123,7 @@ pub(crate) fn decide_confirmed_retirements(
     current_authority: &str,
     current_volume: &str,
     pending: &[Retirement],
-    pods_still_present: &[(String, bool)],
-    unreachable_nodes: Option<&[String]>,
+    observed_pods: &[k8s_openapi::api::core::v1::Pod],
 ) -> Result<DomainDecision> {
     let mut decision = DomainDecision::default();
     for proof in pending {
@@ -109,33 +139,20 @@ pub(crate) fn decide_confirmed_retirements(
                 && proof.domain.volume == current_volume,
             "previous owner physical/volume binding differs"
         );
-        if let Some((uid, terminating)) = pods_still_present
+        let previous = observed_pods
             .iter()
-            .find(|(uid, _)| uid == &proof.domain.instance)
-        {
-            let reason = if *terminating {
-                format!("previous builder Pod is still terminating (uid {uid})")
+            .find(|pod| pod.metadata.uid.as_deref() == Some(proof.domain.instance.as_str()));
+        if previous.is_some_and(pod_execution_ended) {
+            decision.confirm.push(proof.clone());
+        } else {
+            let reason = if previous.is_some() {
+                "previous builder Pod has no complete container termination evidence"
             } else {
-                format!(
-                    "previous builder Pod still exists; retirement is not authorized (uid {uid})"
-                )
+                "previous builder Pod is absent; API deletion alone does not prove process exit"
             };
-            decision.deferred.push((proof.generation.clone(), reason));
-            continue;
-        }
-        match unreachable_nodes {
-            None => decision.deferred.push((
-                proof.generation.clone(),
-                "node liveness is not observable; cannot confirm the old execution ended".into(),
-            )),
-            Some(nodes) if !nodes.is_empty() => decision.deferred.push((
-                proof.generation.clone(),
-                format!(
-                    "old Pod is gone but node(s) unreachable: {}",
-                    nodes.join(", ")
-                ),
-            )),
-            Some(_) => decision.confirm.push(proof.clone()),
+            decision
+                .deferred
+                .push((proof.generation.clone(), reason.into()));
         }
     }
     Ok(decision)
@@ -195,58 +212,19 @@ impl KubernetesRuntime {
         if pending.is_empty() {
             return Ok(());
         }
-        let pods_still_present: Vec<(String, bool)> = self
+        let observed_pods = self
             .pods()
             .list(&kube::api::ListParams::default())
             .await
             .context("list pods for previous owner verification")?
-            .items
-            .into_iter()
-            .filter_map(|live| {
-                let uid = live.metadata.uid?;
-                let terminating = live.metadata.deletion_timestamp.as_ref().is_some();
-                Some((uid, terminating))
-            })
-            .collect();
-        let nodes: Result<Vec<String>> = async {
-            let nodes: kube::Api<k8s_openapi::api::core::v1::Node> =
-                kube::Api::all(self.client.clone());
-            let listed = nodes
-                .list(&kube::api::ListParams::default())
-                .await
-                .context("list nodes for previous owner verification")?;
-            Ok(listed
-                .items
-                .iter()
-                .filter_map(|node| {
-                    let ready = node
-                        .status
-                        .as_ref()?
-                        .conditions
-                        .as_ref()?
-                        .iter()
-                        .find(|condition| condition.type_ == "Ready")?;
-                    (ready.status != "True").then(|| node.metadata.name.clone().unwrap_or_default())
-                })
-                .collect())
-        }
-        .await;
-        let unreachable_nodes: Option<Vec<String>> = match nodes {
-            Ok(value) => Some(value),
-            Err(error) => {
-                tracing::warn!(%app_id, %error,
-                    "node liveness unavailable; previous builder executions stay protected");
-                None
-            }
-        };
+            .items;
         let decision = decide_confirmed_retirements(
             std::path::Path::new(&workspace),
             &current_uid,
             &current.authority,
             &current.volume,
             &pending,
-            &pods_still_present,
-            unreachable_nodes.as_deref(),
+            &observed_pods,
         )?;
         for (generation, reason) in &decision.deferred {
             tracing::warn!(%app_id, %generation, %reason,
@@ -301,8 +279,7 @@ mod tests {
 
     fn decide(
         pending: &[Retirement],
-        pods: &[(String, bool)],
-        nodes: Option<&[String]>,
+        pods: &[k8s_openapi::api::core::v1::Pod],
     ) -> Result<DomainDecision> {
         decide_confirmed_retirements(
             std::path::Path::new("/home/user/app-1"),
@@ -311,35 +288,38 @@ mod tests {
             "pvc:p1:ff",
             pending,
             pods,
-            nodes,
         )
     }
 
     #[test]
-    fn retirement_requires_absent_pod_and_live_nodes() {
+    fn retirement_requires_container_exit_not_pod_absence_or_node_liveness() {
         let proofs = vec![proof("pod-old")];
-        // 旧 Pod 仍在（运行或 terminating）→ 不确认。
-        let decision = decide(&proofs, &[("pod-old".into(), false)], Some(&[])).unwrap();
+        // Even when every Node is Ready, a force-deleted API object says
+        // nothing about the old processes. Never manufacture an exit receipt.
+        let decision = decide(&proofs, &[]).unwrap();
         assert!(decision.confirm.is_empty());
-        assert!(decision.deferred[0].1.contains("still exists"));
-        let decision = decide(&proofs, &[("pod-old".into(), true)], Some(&[])).unwrap();
-        assert!(decision.confirm.is_empty());
-        assert!(decision.deferred[0].1.contains("terminating"));
-        // 旧 Pod 消失但有失联节点 → 不确认。
-        let decision = decide(&proofs, &[], Some(&["node-2".into()])).unwrap();
-        assert!(decision.confirm.is_empty());
-        assert!(decision.deferred[0].1.contains("unreachable"));
-        // 节点观测不可得（RBAC 拒绝等）→ 不确认。
-        let decision = decide(&proofs, &[], None).unwrap();
-        assert!(decision.confirm.is_empty());
-        assert!(decision.deferred[0].1.contains("not observable"));
-        // 全部条件满足 → 确认。
-        let decision = decide(&proofs, &[], Some(&[])).unwrap();
-        assert_eq!(decision.confirm.len(), 1);
-        assert!(decision.deferred.is_empty());
-        // 同 Pod（容器内纪元负责）→ 跳过，不 defer 不确认。
-        let decision =
-            decide(&[proof("pod-new")], &[("pod-new".into(), false)], Some(&[])).unwrap();
+        assert!(decision.deferred[0].1.contains("API deletion alone"));
+        let mut pod: k8s_openapi::api::core::v1::Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"uid":"pod-old"},
+            "spec": {"containers":[{"name":"agent","image":"test"}]},
+            "status": {"phase":"Failed", "containerStatuses":[{
+                "name":"agent", "image":"test", "imageID":"test", "ready":false,
+                "restartCount":0, "state":{"terminated":{"exitCode":137}}
+            }]}
+        }))
+        .unwrap();
+        assert_eq!(decide(&proofs, &[pod.clone()]).unwrap().confirm.len(), 1);
+        // Missing a sidecar's exit status still cannot authorize retirement.
+        pod.spec
+            .as_mut()
+            .unwrap()
+            .containers
+            .push(k8s_openapi::api::core::v1::Container {
+                name: "sidecar".into(),
+                ..Default::default()
+            });
+        assert!(decide(&proofs, &[pod]).unwrap().confirm.is_empty());
+        let decision = decide(&[proof("pod-new")], &[]).unwrap();
         assert!(decision.confirm.is_empty());
         assert!(decision.deferred.is_empty());
     }
@@ -348,7 +328,7 @@ mod tests {
     fn foreign_binding_is_rejected_not_deferred() {
         let mut foreign = proof("pod-old");
         foreign.binding.resource = "/home/user/other-app".into();
-        let error = decide(&[foreign], &[], Some(&[])).unwrap_err().to_string();
+        let error = decide(&[foreign], &[]).unwrap_err().to_string();
         assert!(error.contains("binding differs"), "{error}");
     }
 
@@ -356,13 +336,11 @@ mod tests {
     fn authority_and_volume_must_match_the_current_domain() {
         let mut wrong_volume = proof("pod-old");
         wrong_volume.domain.volume = "pvc:other:00".into();
-        let error = decide(&[wrong_volume], &[], Some(&[]))
-            .unwrap_err()
-            .to_string();
+        let error = decide(&[wrong_volume], &[]).unwrap_err().to_string();
         assert!(error.contains("binding differs"), "{error}");
         let mut wrong_authority = proof("pod-old");
         wrong_authority.domain.authority = "k8s:bb".into();
-        assert!(decide(&[wrong_authority], &[], Some(&[])).is_err());
+        assert!(decide(&[wrong_authority], &[]).is_err());
     }
 
     #[test]

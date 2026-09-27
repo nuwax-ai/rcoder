@@ -518,9 +518,7 @@ impl super::AppService {
                 step: record.stage,
                 error_code: record.error_code,
                 error_message: record.error_message,
-                // ComputeControlRecord carries no wall-clock field; the view's
-                // created_at marks the observation instant.
-                created_at: chrono::Utc::now(),
+                created_at: record.created_at,
             });
         }
         Ok(operations)

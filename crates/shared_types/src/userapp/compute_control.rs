@@ -76,6 +76,9 @@ pub struct ComputeControlRequest {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ComputeControlRecord {
+    /// Persisted admission time; legacy JSON without it retains an unknown epoch.
+    #[serde(default)]
+    pub created_at: chrono::DateTime<chrono::Utc>,
     pub app_id: String,
     pub lifecycle_id: String,
     #[serde(skip_serializing)]

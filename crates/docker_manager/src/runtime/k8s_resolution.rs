@@ -168,9 +168,7 @@ impl KubernetesRuntime {
 /// 候选择优：Running 优先，其次最新创建（平局时 `max_by` 取列表末位——
 /// 同 workload 同 rank 的候选任选其一语义等价）。
 fn pick_candidate(candidates: Vec<Pod>) -> Option<Pod> {
-    candidates
-        .into_iter()
-        .max_by(|a, b| candidate_rank(b).cmp(&candidate_rank(a)))
+    candidates.into_iter().max_by_key(candidate_rank)
 }
 
 /// Ready 策略在此层只做择优排序用途：Running > Pending > 其余；真正的
@@ -234,7 +232,7 @@ pub(crate) fn pod_label_selectors(identifier: &str, service_type: &ServiceType) 
 
 #[cfg(test)]
 mod label_selector_tests {
-    use super::pod_label_selectors;
+    use super::{Pod, pick_candidate, pod_label_selectors};
     use shared_types::ServiceType;
 
     /// Userapp 走 managed-by 维度（生产 Deployment 无 rcoder.io/service-type 标签），
@@ -278,6 +276,36 @@ mod label_selector_tests {
             assert!(selectors[0].contains("app.kubernetes.io/instance=42"));
             assert!(selectors[1].contains("rcoder.io/identifier=42"));
         }
+    }
+
+    #[test]
+    fn candidates_prefer_running_then_newest_pod() {
+        let pod = |uid: &str, phase: &str, time: &str| -> Pod {
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"uid": uid, "creationTimestamp": time},
+                "status": {"phase": phase}
+            }))
+            .unwrap()
+        };
+        let old = pod("old", "Running", "2026-09-26T01:00:00Z");
+        let new = pod("new", "Running", "2026-09-27T01:00:00Z");
+        let pending = pod("pending", "Pending", "2026-09-27T02:00:00Z");
+        assert_eq!(
+            pick_candidate(vec![new.clone(), old.clone(), pending.clone()])
+                .unwrap()
+                .metadata
+                .uid
+                .as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            pick_candidate(vec![pending, old, new])
+                .unwrap()
+                .metadata
+                .uid
+                .as_deref(),
+            Some("new")
+        );
     }
 
     /// 常规项目（ComputerNormalProject）查询的 selector 恒用族代表词——

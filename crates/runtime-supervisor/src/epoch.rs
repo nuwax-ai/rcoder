@@ -8,13 +8,9 @@
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::OnceLock;
 
-/// Stable identity of the current process space, or `None` when the platform
-/// does not expose one (retirement then stays conservative).
-///
-/// Format: `"<kind>:<integer>"`. Linux uses PID 1's start time in clock ticks
-/// (constant within one PID namespace, changes on container restart and host
-/// reboot). macOS/Windows use the computed boot wall time; small clock
-/// adjustments are tolerated by [`matches`] instead of breaking equality.
+/// Process-space identity, or `None` when no reliable evidence is available.
+/// Wall-clock time is deliberately excluded: clock corrections do not kill
+/// processes and therefore cannot authorize retirement.
 pub(crate) fn current() -> Option<String> {
     if let Some(value) = test_override() {
         return value;
@@ -22,43 +18,39 @@ pub(crate) fn current() -> Option<String> {
     platform_epoch()
 }
 
-/// Same-boot comparison. The Linux reading pairs the host boot UUID with PID
-/// 1's start time and must match exactly (the start time alone is nearly
-/// constant across reboots — both boots read ~15 ticks — so it can never
-/// identify a reboot by itself). Boot wall-time derivations on other platforms
-/// can slew slightly within one session, so nearby values count as same boot.
-/// Malformed values never match (stay conservative).
-pub(crate) fn matches(recorded: &str, current: &str) -> bool {
-    let Some((recorded_kind, recorded)) = split(recorded) else {
-        return false;
-    };
-    let Some((current_kind, current)) = split(current) else {
-        return false;
-    };
-    recorded_kind == current_kind
-        && match (recorded, current) {
-            (Payload::Pid1(boot_a, ticks_a), Payload::Pid1(boot_b, ticks_b)) => {
-                boot_a == boot_b && ticks_a == ticks_b
-            }
-            (Payload::Boot(a), Payload::Boot(b)) => a.abs_diff(b) <= 2_000,
-            _ => false,
-        }
-}
-
-enum Payload<'a> {
-    /// "<boot-uuid>:<start-time ticks>" — both must match exactly.
-    Pid1(&'a str, i128),
-    /// Boot wall-time derivation with comparison tolerance.
-    Boot(i128),
-}
-
-fn split<'a>(value: &'a str) -> Option<(&'a str, Payload<'a>)> {
-    let (kind, payload) = value.split_once(':')?;
-    if kind == "pid1" {
-        let (boot, ticks) = payload.split_once(':')?;
-        return Some((kind, Payload::Pid1(boot, ticks.parse().ok()?)));
+/// Positive evidence of replacement. Unknown/legacy formats are not evidence.
+/// Windows exposes monotonic uptime: a decrease proves a reboot, while an
+/// increase is inconclusive (the new boot may already have a longer uptime).
+pub(crate) fn proves_replacement(recorded: &str, current: &str) -> bool {
+    match (parse(recorded), parse(current)) {
+        (Some(Epoch::Pid1(a, x)), Some(Epoch::Pid1(b, y))) => a != b || x != y,
+        (Some(Epoch::MacBoot(a)), Some(Epoch::MacBoot(b))) => a != b,
+        (Some(Epoch::WindowsUptime(a)), Some(Epoch::WindowsUptime(b))) => b < a,
+        _ => false,
     }
-    Some((kind, Payload::Boot(payload.parse().ok()?)))
+}
+
+enum Epoch {
+    Pid1(uuid::Uuid, u64),
+    MacBoot(uuid::Uuid),
+    WindowsUptime(u64),
+}
+
+fn parse(value: &str) -> Option<Epoch> {
+    let (kind, payload) = value.split_once(':')?;
+    match kind {
+        "pid1" => {
+            let (boot, ticks) = payload.split_once(':')?;
+            let boot = uuid::Uuid::parse_str(boot).ok()?;
+            (!boot.is_nil()).then_some(Epoch::Pid1(boot, ticks.parse().ok()?))
+        }
+        "mac-boot" => {
+            let boot = uuid::Uuid::parse_str(payload).ok()?;
+            (!boot.is_nil()).then_some(Epoch::MacBoot(boot))
+        }
+        "win-uptime-ms" => Some(Epoch::WindowsUptime(payload.parse().ok()?)),
+        _ => None,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -69,7 +61,7 @@ fn platform_epoch() -> Option<String> {
     let tail = stat.rsplit_once(')')?.1;
     // tail fields start at overall field 3; starttime is field 22 → index 19.
     let starttime = tail.split_whitespace().nth(19)?;
-    let ticks: i128 = starttime.parse().ok()?;
+    let ticks: u64 = starttime.parse().ok()?;
     // The start time alone is nearly constant across host reboots (~15 ticks
     // on every boot); the boot UUID is what actually identifies the OS
     // session. Together they also distinguish container restarts (same boot
@@ -82,48 +74,38 @@ fn platform_epoch() -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-#[allow(unsafe_code)] // FFI 调用 C 的 sysctl（CLAUDE.md 明确允许的 FFI 例外）
+#[allow(unsafe_code)] // FFI: sysctlbyname reads the kernel's stable boot-session UUID.
 fn platform_epoch() -> Option<String> {
-    // kern.boottime 无安全 std API 可读。tv_usec 会随时钟微调漂移，只取整秒
-    // 并靠 [`matches`] 容差比较。
-    let mut name = [libc::CTL_KERN, libc::KERN_BOOTTIME];
-    let mut value = libc::timeval {
-        tv_sec: 0,
-        tv_usec: 0,
-    };
-    let mut length = size_of::<libc::timeval>() as libc::size_t;
+    let mut value = [0u8; 64];
+    let mut length = value.len();
+    // SAFETY: the named read-only sysctl writes at most `length` bytes into
+    // the live buffer. No write/new-value pointer is supplied.
     let result = unsafe {
-        libc::sysctl(
-            name.as_mut_ptr(),
-            2,
-            std::ptr::from_mut(&mut value).cast(),
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            value.as_mut_ptr().cast(),
             &mut length,
             std::ptr::null_mut(),
             0,
         )
     };
-    (result == 0).then(|| format!("boot:{}", value.tv_sec))
+    if result != 0 || length > value.len() {
+        return None;
+    }
+    let text = std::str::from_utf8(&value[..length])
+        .ok()?
+        .trim_end_matches('\0');
+    let id = uuid::Uuid::parse_str(text).ok()?;
+    (!id.is_nil()).then(|| format!("mac-boot:{id}"))
 }
 
 #[cfg(windows)]
-#[allow(unsafe_code)] // FFI 调用 Win32（CLAUDE.md 明确允许的 FFI 例外）
+#[allow(unsafe_code)] // FFI: read-only Win32 uptime, no pointers or wall-clock arithmetic.
 fn platform_epoch() -> Option<String> {
-    // 引导会话身份无安全 std API。boot ≈ now − uptime；休眠/时钟步进只会造成
-    // 无害的同向漂移（误判为换代 ⇒ 收束一个本就已死的代次），真实重启必然大幅偏离。
-    use windows_sys::Win32::Foundation::FILETIME;
-    use windows_sys::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
-    let mut now = FILETIME {
-        dwLowDateTime: 0,
-        dwHighDateTime: 0,
-    };
-    let ticks;
-    unsafe {
-        GetSystemTimeAsFileTime(&mut now);
-        ticks = GetTickCount64();
-    }
-    let now_100ns = (u64::from(now.dwHighDateTime) << 32) | u64::from(now.dwLowDateTime);
-    let boot_ms = (now_100ns.wrapping_sub(ticks.wrapping_mul(10_000)) / 10_000) as i128;
-    Some(format!("boot:{boot_ms}"))
+    // A clock step cannot change GetTickCount64. Do not infer a reboot from
+    // now - uptime; that used to falsely retire live descendants after NTP.
+    let ticks = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+    Some(format!("win-uptime-ms:{ticks}"))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -174,29 +156,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn same_kind_values_match_within_tolerance_and_kinds_never_mix() {
-        // Linux: boot UUID + start ticks must match exactly. Ticks alone are
-        // NOT identity (every boot reads ~15 ticks — real 2026-09-27 reboot
-        // finding on the personal Linux box).
-        assert!(matches("pid1:uuid-a:15", "pid1:uuid-a:15"));
-        assert!(!matches("pid1:uuid-a:15", "pid1:uuid-b:15"));
-        assert!(!matches("pid1:uuid-a:15", "pid1:uuid-a:16"));
-        assert!(!matches("pid1:uuid-a:15", "pid1:uuid-a:14"));
-        // Boot wall time: nearby values are the same session (clock slew).
-        assert!(matches("boot:1000", "boot:2900"));
-        assert!(!matches("boot:1000", "boot:4000"));
-        assert!(!matches("pid1:uuid-a:100", "boot:100"));
-        assert!(!matches("garbage", "pid1:uuid-a:100"));
+    fn only_valid_process_space_evidence_authorizes_retirement() {
+        let a = "11111111-1111-4111-8111-111111111111";
+        let b = "22222222-2222-4222-8222-222222222222";
+        assert!(!proves_replacement(
+            &format!("pid1:{a}:15"),
+            &format!("pid1:{a}:15")
+        ));
+        assert!(proves_replacement(
+            &format!("pid1:{a}:15"),
+            &format!("pid1:{b}:15")
+        ));
+        assert!(proves_replacement(
+            &format!("pid1:{a}:15"),
+            &format!("pid1:{a}:16")
+        ));
+        assert!(proves_replacement(
+            &format!("mac-boot:{a}"),
+            &format!("mac-boot:{b}")
+        ));
+        for old in [
+            "garbage",
+            "boot:1000",
+            "pid1::15",
+            "pid1:not-a-uuid:15",
+            "pid1:1:-1",
+        ] {
+            assert!(!proves_replacement(old, &format!("pid1:{a}:15")), "{old}");
+        }
+        assert!(!proves_replacement("boot:1000", "boot:999999"));
+        assert!(!proves_replacement(
+            &format!("pid1:{a}:15"),
+            &format!("mac-boot:{b}")
+        ));
+        assert!(!proves_replacement(
+            "win-uptime-ms:1000",
+            "win-uptime-ms:2000"
+        ));
+        assert!(proves_replacement(
+            "win-uptime-ms:2000",
+            "win-uptime-ms:1000"
+        ));
     }
 
     #[test]
-    fn real_epoch_is_readable_and_stable_on_this_platform() {
-        let first = current();
-        let second = current();
-        match (first, second) {
-            (Some(a), Some(b)) => assert!(matches(&a, &b), "epoch must be stable: {a} vs {b}"),
-            (None, None) => {}
-            other => panic!("epoch reading must be deterministic: {other:?}"),
-        }
+    fn real_epoch_is_readable_and_does_not_report_spurious_reboots() {
+        let first = current().expect("supported platform must expose process-space evidence");
+        let second = current().expect("second reading must also succeed");
+        assert!(parse(&first).is_some(), "{first}");
+        assert!(!proves_replacement(&first, &second), "{first} vs {second}");
     }
 }

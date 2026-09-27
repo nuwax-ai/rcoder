@@ -192,7 +192,7 @@ class Run:
         self.baseline = self.inventory()
         self.save('baseline.json', self.baseline)
         self.check('app_namespace_unused', not any(self.owned(r) for r in self.baseline))
-        dep = json.loads(self.kube('get', 'deployment', self.args.deployment, '-o', 'json'))
+        dep = json.loads(self.kube('get', self.args.workload_kind, self.args.deployment, '-o', 'json'))
         selector = ','.join(k + '=' + v for k, v in dep['spec']['selector']['matchLabels'].items())
         pods = json.loads(self.kube('get', 'pods', '-l', selector, '-o', 'json'))['items']
         ready = [p for p in pods if any(c['type'] == 'Ready' and c['status'] == 'True' for c in p['status'].get('conditions', []))]
@@ -746,7 +746,9 @@ def main():
     parser.add_argument('--namespace', default='nuwax-k8s-test')
     parser.add_argument('--context')
     parser.add_argument('--environment-id')
-    parser.add_argument('--deployment', default='nuwax-k8s-test-rcoder')
+    parser.add_argument('--deployment', default='nuwax-k8s-test-rcoder', help='RCoder workload name')
+    parser.add_argument('--workload-kind', choices=['deployment', 'statefulset'], default='deployment',
+                        help='Use statefulset for the Helm per-replica-cache deployment')
     parser.add_argument('--url', required=True)
     parser.add_argument('--proxy-url', required=True)
     parser.add_argument('--internal-url', default='http://nuwax-k8s-test-rcoder:8086')

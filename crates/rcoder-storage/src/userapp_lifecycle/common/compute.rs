@@ -43,6 +43,8 @@ pub(super) fn decode(row: models::ComputeControl) -> Result<ComputeControlRecord
         }
     }
     Ok(ComputeControlRecord {
+        created_at: chrono::DateTime::from_timestamp_micros(row.created_at_us)
+            .ok_or_else(|| invalid("Invalid compute admission timestamp"))?,
         app_id: row.app_id,
         lifecycle_id: row.lifecycle_id,
         request_id: row.request_id,

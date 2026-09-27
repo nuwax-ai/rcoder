@@ -1001,8 +1001,8 @@ path = "/"
         use std::sync::atomic::{AtomicU8, Ordering};
 
         // 固定端口：入口 9080（accept-all）与 admin 3018（进程内假 admin）。
-        let entry = std::net::TcpListener::bind("127.0.0.1:9080")
-            .expect("bind fake pingap entry 9080");
+        let entry =
+            std::net::TcpListener::bind("127.0.0.1:9080").expect("bind fake pingap entry 9080");
         std::thread::spawn(move || {
             for socket in entry.incoming() {
                 drop(socket);
@@ -1019,8 +1019,8 @@ path = "/"
         crate::proxy::compiler::record_expected_hash(&expected_hash);
 
         // 业务服务：先保留端口不监听（connect refused = starting）。
-        let service_listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("reserve service port");
+        let service_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("reserve service port");
         let service_port = service_listener.local_addr().expect("service addr").port();
         drop(service_listener);
 
