@@ -595,6 +595,7 @@ mod tests {
                 access_mode: "ReadWriteOnce".into(),
                 docker_manager_config: Default::default(),
                 kubernetes_config: Default::default(),
+                execution_authority: "k8s:test".into(),
             },
             pod_cache: Default::default(),
             subvolume_path_cache: Default::default(),

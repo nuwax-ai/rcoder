@@ -458,8 +458,14 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         snapshot: &shared_types::AppEnvSnapshot,
     ) -> ContainerRuntimeResult<()> {
         let current = self.app_env_snapshot(app_id).await?;
+        // The guarded resource is the env ConfigMap: its resourceVersion is the
+        // CAS the API server enforces, and deployment_uid fences a recreated
+        // workload. The deployment's own resourceVersion is deliberately NOT
+        // compared: status subresource writes and bookkeeping annotations
+        // (wake_on_traffic, recovery target capture) bump it without touching
+        // env, and rejecting on those broke every real hot deploy that crossed
+        // such a write (2026-09-27 personal-K8s userapp r5/r6).
         if current.deployment_uid != snapshot.deployment_uid
-            || current.deployment_version != snapshot.deployment_version
             || current.resource_name != snapshot.resource_name
             || current.resource_version != snapshot.resource_version
         {
@@ -504,8 +510,10 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
                 }
             })?;
         let committed = self.app_env_snapshot(app_id).await?;
+        // Same scoping as the pre-write check: the deployment's resourceVersion
+        // moves on status/annotation writes, so only identity + converged data
+        // are verified here.
         if committed.deployment_uid != snapshot.deployment_uid
-            || committed.deployment_version != snapshot.deployment_version
             || committed.resource_name != snapshot.resource_name
             || committed.env != *env
         {

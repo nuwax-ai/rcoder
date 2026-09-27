@@ -647,6 +647,7 @@ impl State {
                     exit_code: None,
                     error: None,
                     physical_domain: crate::domain::PhysicalDomain::from_env()?,
+                    process_epoch: crate::epoch::current(),
                 },
             )?;
             self.discovery.snapshot.generation = Some(id);

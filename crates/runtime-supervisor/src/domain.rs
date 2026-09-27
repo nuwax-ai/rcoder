@@ -15,6 +15,13 @@ pub const DOMAIN_LABEL: &str = "rcoder.io/execution-domain";
 #[serde(deny_unknown_fields)]
 pub struct PhysicalDomain {
     pub authority: String,
+    /// When the platform cannot know the execution instance at stamp time
+    /// (a K8s pod UID only exists after scheduling), the stamp references the
+    /// env var that carries it and `instance` is left empty; resolution to a
+    /// concrete value happens in [`PhysicalDomain::from_env`]. The field is
+    /// preserved on purpose so domain equality stays meaningful.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_source_env: Option<String>,
     pub instance: String,
     /// Stable mounted data sources, supplied by the runtime, not a Pod name.
     pub volume: String,
@@ -24,15 +31,19 @@ impl PhysicalDomain {
         let Some(value) = std::env::var_os(DOMAIN_ENV) else {
             return Ok(None);
         };
-        let value: Self = serde_json::from_str(
+        let mut value: Self = serde_json::from_str(
             value
                 .to_str()
                 .context("invalid execution domain encoding")?,
         )?;
+        if let Some(source) = value.instance_source_env.clone()
+            && value.instance.is_empty()
+        {
+            value.instance = std::env::var(&source)
+                .with_context(|| format!("execution domain instance source {source} missing"))?;
+        }
         ensure!(
-            !value.authority.is_empty()
-                && !value.volume.is_empty()
-                && uuid::Uuid::parse_str(&value.instance).is_ok(),
+            !value.authority.is_empty() && !value.volume.is_empty() && !value.instance.is_empty(),
             "invalid execution domain"
         );
         Ok(Some(value))
@@ -151,6 +162,7 @@ mod tests {
         };
         let domain = PhysicalDomain {
             authority: "daemon-a".into(),
+            instance_source_env: None,
             volume: "volume-a".into(),
             instance: uuid::Uuid::new_v4().to_string(),
         };
@@ -172,6 +184,7 @@ mod tests {
             exit_code: None,
             error: None,
             physical_domain: Some(domain.clone()),
+            process_epoch: None,
         };
         record::save(&root.join("generation.json"), &generation).unwrap();
         record::save(&scope.join("supervisor.json"), &serde_json::json!({

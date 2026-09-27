@@ -32,6 +32,11 @@ pub(crate) struct Generation {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physical_domain: Option<crate::domain::PhysicalDomain>,
+    /// Identity of the OS boot / PID namespace that ran this generation.
+    /// A changed epoch is positive local proof the generation's processes
+    /// cannot run again; records without it stay conservative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_epoch: Option<String>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum GenerationPhase {
@@ -147,17 +152,19 @@ pub(crate) fn reconcile(scope: &Path) -> Result<()> {
         } // legacy adapter owns legacy receipts
         let _lock = lock(&root.join("generation.lock"))?;
         let mut value = generation(&root)?;
-        if matches!(
+        let retirable = matches!(
             value.phase,
             GenerationPhase::Running | GenerationPhase::Draining
-        ) && crate::domain::has_confirmed_exit(&root, &value)?
+        );
+        if retirable
+            && (crate::domain::has_confirmed_exit(&root, &value)?
+                || local_process_space_ended(&value)?)
         {
+            // Platform receipt or process-space epoch both prove the physical
+            // runtime ended; neither invents an exit code nor touches journals.
             process_utils::command_authority::Gate::try_acquire(&root)?.close()?;
             process_utils::guardian::confirm_physical_domain_exit(&root)?;
-            value.phase = GenerationPhase::Quiescent;
-            // No exit code is invented and no business journal is edited.
-            value.error =
-                Some("physical runtime confirmed exit; business outcomes remain unchanged".into());
+            retire_confirmed(&mut value);
             save(&root.join("generation.json"), &value)?;
         }
         if value.phase == GenerationPhase::Pending {
@@ -178,4 +185,188 @@ pub(crate) fn reconcile(scope: &Path) -> Result<()> {
         process_utils::command_context::require_quiescent(&root.join("commands"))?;
     }
     Ok(())
+}
+
+/// Terminal retirement of one generation. No exit code is invented and no
+/// business journal is edited; cleanup is process evidence, not success.
+fn retire_confirmed(value: &mut Generation) {
+    value.phase = GenerationPhase::Quiescent;
+    value.error =
+        Some("physical runtime confirmed exit; business outcomes remain unchanged".into());
+}
+
+/// The generation's process space (OS boot or PID namespace) was replaced
+/// after it stopped writing, so none of its processes can still exist. This
+/// only speaks for generations that ran in OUR process space: a generation
+/// stamped with a different physical domain (another container/pod) must be
+/// retired by platform evidence, never by the local epoch.
+fn local_process_space_ended(value: &Generation) -> Result<bool> {
+    let (Some(recorded), Some(current)) = (value.process_epoch.as_deref(), crate::epoch::current())
+    else {
+        return Ok(false);
+    };
+    if crate::epoch::matches(recorded, &current) {
+        return Ok(false);
+    }
+    Ok(process_space_ended_with(
+        value,
+        crate::domain::PhysicalDomain::from_env()?.as_ref(),
+    ))
+}
+
+/// Epoch-side scoping only: a changed epoch proves the end of the process
+/// space that ran this generation, but a stamped generation belongs to one
+/// container/pod, so the local proof may only fire when that identity is the
+/// current environment's own domain.
+fn process_space_ended_with(
+    value: &Generation,
+    current_domain: Option<&crate::domain::PhysicalDomain>,
+) -> bool {
+    match value.physical_domain.as_ref() {
+        // Only native (un-stamped) scopes may use the bare local proof.
+        None => true,
+        Some(domain) => current_domain == Some(domain),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct EpochGuard;
+    impl EpochGuard {
+        fn new(value: Option<String>) -> Self {
+            crate::epoch::set_epoch_for_tests(value);
+            Self
+        }
+    }
+    impl Drop for EpochGuard {
+        fn drop(&mut self) {
+            crate::epoch::set_epoch_for_tests(None);
+        }
+    }
+
+    /// Minimal stuck-generation scope: Running, no cleanup receipts, a live
+    /// command record and an initialized admission gate.
+    fn stuck_scope(
+        domain: Option<crate::domain::PhysicalDomain>,
+        epoch: Option<String>,
+    ) -> (tempfile::TempDir, String) {
+        let temp = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let root = work_root(temp.path(), &id).unwrap();
+        std::fs::create_dir_all(root.join("commands")).unwrap();
+        process_utils::command_authority::Gate::try_acquire(&root)
+            .unwrap()
+            .initialize()
+            .unwrap();
+        save(
+            &root.join("generation.json"),
+            &Generation {
+                version: 1,
+                id: id.clone(),
+                supervisor: "gone-supervisor".into(),
+                token: "test".into(),
+                intent: Intent::Run,
+                phase: GenerationPhase::Running,
+                worker_pid: Some(4242),
+                exit_code: None,
+                error: None,
+                physical_domain: domain,
+                process_epoch: epoch,
+            },
+        )
+        .unwrap();
+        save(
+            &root.join("commands/command.json"),
+            &serde_json::json!({"version":1,"phase":"Running","identity":{"task_id":"original"}}),
+        )
+        .unwrap();
+        (temp, id)
+    }
+
+    #[test]
+    fn process_epoch_change_retires_only_local_generations_and_preserves_outcomes() {
+        // One sequential test: the epoch override is process-global.
+        // (a) native scope, epoch changed → retired, business record untouched.
+        let (_temp, id) = stuck_scope(None, Some("pid1:uuid-x:100".into()));
+        let _guard = EpochGuard::new(Some("pid1:uuid-x:9000".into()));
+        reconcile(_temp.path()).unwrap();
+        let retired = generation(&work_root(_temp.path(), &id).unwrap()).unwrap();
+        assert_eq!(retired.phase, GenerationPhase::Quiescent);
+        assert_eq!(retired.exit_code, None, "no exit code is invented");
+        assert!(
+            retired
+                .error
+                .unwrap()
+                .contains("business outcomes remain unchanged")
+        );
+        let command: serde_json::Value = read(
+            &work_root(_temp.path(), &id)
+                .unwrap()
+                .join("commands/command.json"),
+        )
+        .unwrap();
+        assert_eq!(command["phase"], "Quiescent");
+        assert_eq!(command["termination"], "PhysicalDomainExited");
+        assert_eq!(command["identity"]["task_id"], "original");
+        drop(_guard);
+
+        // (b) native scope, same epoch → still unconfirmed (hard kill only).
+        let (_temp, _id) = stuck_scope(None, Some("pid1:uuid-x:100".into()));
+        let _guard = EpochGuard::new(Some("pid1:uuid-x:100".into()));
+        let error = reconcile(_temp.path()).unwrap_err().to_string();
+        assert!(error.contains("cleanup is unconfirmed"), "{error}");
+        drop(_guard);
+
+        // (c) legacy record without epoch → conservative.
+        let (_temp, _id) = stuck_scope(None, None);
+        let _guard = EpochGuard::new(Some("pid1:uuid-x:9000".into()));
+        assert!(reconcile(_temp.path()).is_err());
+        drop(_guard);
+
+        // (d) unreadable epoch → conservative.
+        let (_temp, _id) = stuck_scope(None, Some("pid1:uuid-x:100".into()));
+        let _guard = EpochGuard::new(None);
+        assert!(reconcile(_temp.path()).is_err());
+        drop(_guard);
+    }
+
+    #[test]
+    fn local_epoch_never_retires_another_physical_domain() {
+        use crate::domain::PhysicalDomain;
+        let other = PhysicalDomain {
+            authority: "daemon-a".into(),
+            instance_source_env: None,
+            volume: "volume-a".into(),
+            instance: uuid::Uuid::new_v4().to_string(),
+        };
+        let current = other.clone();
+        let same_domain = Generation {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            supervisor: "s".into(),
+            token: "t".into(),
+            intent: Intent::Run,
+            phase: GenerationPhase::Running,
+            worker_pid: None,
+            exit_code: None,
+            error: None,
+            physical_domain: Some(other.clone()),
+            process_epoch: Some("pid1:uuid-x:100".into()),
+        };
+        // Same container identity, new incarnation → local proof applies.
+        assert!(process_space_ended_with(&same_domain, Some(&current)));
+        // A generation from a different container/pod needs platform evidence.
+        let mut foreign = same_domain.clone();
+        foreign.physical_domain = Some(PhysicalDomain {
+            authority: "daemon-a".into(),
+            instance_source_env: None,
+            volume: "volume-a".into(),
+            instance: uuid::Uuid::new_v4().to_string(),
+        });
+        assert!(!process_space_ended_with(&foreign, Some(&current)));
+        // No current domain (native reader) cannot speak for stamped records.
+        assert!(!process_space_ended_with(&foreign, None));
+    }
 }

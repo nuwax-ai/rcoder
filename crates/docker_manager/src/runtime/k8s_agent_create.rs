@@ -165,6 +165,12 @@ impl KubernetesRuntime {
             } => return Err(ContainerRuntimeError::CreationCancelled),
         }
         check_cancelled()?;
+        if service_type == ServiceType::UserappBuilder {
+            // Pod 就绪后的管理面恢复：对上一物理 Pod 遗留的执行代次做平台核验
+            // （失败只保留保护并记原因，不阻塞 ensure）。
+            self.reconcile_builder_execution_domain_bounded(identifier)
+                .await;
+        }
 
         // Host-side address materialization needs the Service's assigned
         // NodePorts. Keep the admitted builder lease while creating it; the
@@ -499,15 +505,32 @@ impl KubernetesRuntime {
                             }
                         }),
                     },
-                    env: Some(super::k8s_agent_env::build_agent_env_vars(
-                        &project_id_val,
-                        &user_id_val,
-                        &service_type_str,
-                        service_type,
-                        docker_service,
-                        k8s_service,
-                        params,
-                    )),
+                    env: {
+                        let mut env = super::k8s_agent_env::build_agent_env_vars(
+                            &project_id_val,
+                            &user_id_val,
+                            &service_type_str,
+                            service_type,
+                            docker_service,
+                            k8s_service,
+                            params,
+                        );
+                        if matches!(service_type, ServiceType::UserappBuilder) {
+                            // 执行域身份（进程域退出回执的绑定锚点）：instance 经
+                            // RCODER_PHYSICAL_POD_UID 在 Pod 内解析（调度前不可知）；
+                            // volume 绑定 per-app PVC 与其挂载视图，跨 Pod 重建稳定。
+                            env.push(k8s_openapi::api::core::v1::EnvVar {
+                                name: runtime_supervisor::domain::DOMAIN_ENV.to_string(),
+                                value: Some(super::k8s_native_domain::builder_domain_env(
+                                    &self.config.execution_authority,
+                                    &workspace_pvc,
+                                    volume_mounts.as_deref().unwrap_or_default(),
+                                )),
+                                ..Default::default()
+                            });
+                        }
+                        Some(env)
+                    },
                     ports: Some(vec![
                         ContainerPort {
                             container_port: shared_types::GRPC_DEFAULT_PORT as i32,

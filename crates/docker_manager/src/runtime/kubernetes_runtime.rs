@@ -102,6 +102,9 @@ pub struct KubernetesRuntimeConfig {
     pub docker_manager_config: DockerManagerConfig,
     /// K8s 运行时专用配置(自包含 image/env/command/卷/sidecar;K8s 构建器只读它)
     pub kubernetes_config: shared_types::KubernetesConfig,
+    /// 集群身份（API endpoint + CA 指纹）：builder 执行域 authority 的稳定
+    /// 来源，跨副本一致；部署端点变更会使旧执行域回执拒绝确认（保守）。
+    pub execution_authority: String,
 }
 
 #[cfg(feature = "kubernetes")]
@@ -113,6 +116,11 @@ impl KubernetesRuntime {
             ContainerRuntimeError::K8sError(format!("Failed to load kube config: {}", e))
         })?;
 
+        // 集群身份在 kube_config 被 move 进 Client 前取样（API endpoint + CA）。
+        let execution_authority = super::k8s_native_domain::cluster_authority(
+            &kube_config.cluster_url.to_string(),
+            kube_config.root_cert.as_deref(),
+        );
         let client = Client::try_from(kube_config).map_err(|e| {
             ContainerRuntimeError::K8sError(format!("Failed to create K8s client: {}", e))
         })?;
@@ -183,6 +191,7 @@ impl KubernetesRuntime {
                 access_mode,
                 docker_manager_config: config,
                 kubernetes_config,
+                execution_authority,
             },
             pod_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
             subvolume_path_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -872,6 +881,7 @@ mod create_lease_tests {
                 access_mode: "ReadWriteOnce".into(),
                 docker_manager_config: Default::default(),
                 kubernetes_config: Default::default(),
+                execution_authority: "k8s:test".into(),
             },
             pod_cache: Default::default(),
             subvolume_path_cache: Default::default(),

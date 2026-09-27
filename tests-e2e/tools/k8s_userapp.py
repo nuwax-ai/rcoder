@@ -514,7 +514,11 @@ startup_probe = "process"
         一切操作（09-21 app 141/154 事故形态，需人工 SQL + kubectl 解救）。"""
         lease_name = 'rcoder-operation-prod-' + self.app
         remote_path = '/tmp/rcoder-e2e-dead-lease.json'
-        stale = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 3600))
+        # coordination.Lease 的 acquireTime/renewTime 是 MicroTime（RFC3339 必须
+        # 带 6 位小数秒）；秒级时间戳会被 API server 拒绝（r7 两轮确定性复现）。
+        stale_epoch = time.time() - 3600
+        stale = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(stale_epoch)) \
+            + '.{:06d}Z'.format(int((stale_epoch % 1) * 1_000_000))
         manifest = {
             'apiVersion': 'coordination.k8s.io/v1', 'kind': 'Lease',
             'metadata': {'name': lease_name, 'namespace': self.args.namespace},
@@ -592,7 +596,10 @@ startup_probe = "process"
     def content(self, expected):
         path = f'/api/v1/userapp/proxy/app/prod/{self.user}/{self.app}/'
         def read():
-            return self.request(path, base=self.args.proxy_url.rstrip('/'), raw=True, timeout=15)
+            # Traffic wake queues the request until the replacement pod is
+            # ready (~24s observed under load); a per-request timeout tighter
+            # than that window aborts the whole case on a healthy wake path.
+            return self.request(path, base=self.args.proxy_url.rstrip('/'), raw=True, timeout=75)
         result = self.poll(read, lambda r: r[0] == 200 and r[1].decode() == expected, 180)
         return result[0] == 200
 

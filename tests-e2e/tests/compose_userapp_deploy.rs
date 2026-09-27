@@ -69,27 +69,41 @@ fn http_ok(body: &Value) -> bool {
 }
 
 async fn post_json(env: &Env, path: &str, body: Value) -> (reqwest::StatusCode, Value) {
-    let resp = env
-        .http
-        .post(format!("{}{path}", env.rcoder))
-        .timeout(Duration::from_secs(120))
-        .json(&body)
-        .send()
-        .await;
-    let resp = match resp {
-        Ok(response) => response,
-        Err(error) => {
-            if matches!(
-                path,
-                "/api/v1/userapp/workspace" | "/api/v1/userapp/ensure-workspace"
-            ) {
-                rcoder_e2e::common::resources::register_builder_attempt(
-                    body["app_id"].as_str().expect("workspace app identity"),
-                    false,
-                )
-                .expect("register uncertain workspace resource");
+    // Transport-level failures (connection refused/reset under local load) are
+    // transient: retrying the identical request is safe — writes carry stable
+    // request_id identities and reads are idempotent. HTTP status answers are
+    // never retried.
+    let mut attempt = 0;
+    let resp = loop {
+        attempt += 1;
+        match env
+            .http
+            .post(format!("{}{path}", env.rcoder))
+            .timeout(Duration::from_secs(120))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(response) => break response,
+            Err(error)
+                if error.is_connect() || error.is_request() && attempt < 3 =>
+            {
+                eprintln!("HTTP POST transport failure (attempt {attempt}): {error}; retrying");
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            panic!("HTTP POST failed: {error}");
+            Err(error) => {
+                if matches!(
+                    path,
+                    "/api/v1/userapp/workspace" | "/api/v1/userapp/ensure-workspace"
+                ) {
+                    rcoder_e2e::common::resources::register_builder_attempt(
+                        body["app_id"].as_str().expect("workspace app identity"),
+                        false,
+                    )
+                    .expect("register uncertain workspace resource");
+                }
+                panic!("HTTP POST failed: {error}");
+            }
         }
     };
     let status = resp.status();
@@ -108,13 +122,25 @@ async fn post_json(env: &Env, path: &str, body: Value) -> (reqwest::StatusCode, 
 }
 
 async fn get_json(env: &Env, path: &str) -> (reqwest::StatusCode, Value) {
-    let resp = env
-        .http
-        .get(format!("{}{path}", env.rcoder))
-        .timeout(Duration::from_secs(60))
-        .send()
-        .await
-        .expect("http get");
+    let mut attempt = 0;
+    let resp = loop {
+        attempt += 1;
+        match env
+            .http
+            .get(format!("{}{path}", env.rcoder))
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+        {
+            Ok(response) => break response,
+            Err(error)
+                if (error.is_connect() || error.is_request()) && attempt < 3 =>
+            {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(error) => panic!("http get failed: {error}"),
+        }
+    };
     let status = resp.status();
     let body = resp.json().await.unwrap_or(Value::Null);
     (status, body)
@@ -2127,6 +2153,50 @@ async fn verify_stop_and_explicit_start(env: &Env, report: &JsonlReporter, app: 
             image_after == image_before,
             format!("before={image_before:?}, after={image_after:?}"),
         );
+        // 容器恢复 ≠ restart 操作记录终态（受理即 202，执行含停止宽限与
+        // 就绪观测可持续 ~80s）。CR10 的 reset-password 受理会撞上仍在途的
+        // Prod 槽而 409——先等操作记录终态（Busy 立即返回是产品原则，由
+        // 场景侧等待，不改产品排队语义）。
+        let restart_op = cb["data"]["operation_id"].as_str().unwrap_or("").to_owned();
+        let mut settled = false;
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(150) {
+            let (s, b) = get_json(
+                env,
+                &format!("/api/v1/userapp/{app}/operations/current?user_id={user}"),
+            )
+            .await;
+            // Transient observation failures (502/connection errors under load)
+            // must not count as settled — only a successful listing without the
+            // in-flight operation does.
+            if !s.is_success() || !http_ok(&b) {
+                settled = false;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+            let blocking = b["data"].as_array().is_some_and(|ops| {
+                ops.iter().any(|op| {
+                    op["operation_id"].as_str() == Some(restart_op.as_str())
+                        && op["state"].as_str().is_some_and(|st| {
+                            st == "Running" || st == "Pending" || st == "RecoveryRequired"
+                        })
+                })
+            });
+            settled = !blocking;
+            if settled {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        report.diagnostic(
+            "prod restart 操作记录终态等待（CR10 前置）",
+            &format!("{:.0}s", t0.elapsed().as_secs_f64()),
+            if settled {
+                "settled"
+            } else {
+                "still in flight (timeout)"
+            },
+        );
     }
 }
 
@@ -2357,22 +2427,34 @@ async fn userapp_scope_isolation_during_deploy() {
     let deploy_base = env.rcoder.clone();
     let deploy_task_path = deploy_path.clone();
     let deploy_task = tokio::spawn(async move {
-        let resp = deploy_http
-            .post(format!("{deploy_base}{deploy_task_path}"))
-            .timeout(Duration::from_secs(120))
-            .json(&deploy_body)
-            .send()
-            .await;
-        match resp {
-            Ok(r) => {
-                let s = r.status();
-                let b = r.json().await.unwrap_or(Value::Null);
-                (s, b)
+        // Transport-level failures (connection refused under local load) are
+        // transient; the start body carries a stable request identity, so an
+        // identical retry cannot duplicate the deployment.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match deploy_http
+                .post(format!("{deploy_base}{deploy_task_path}"))
+                .timeout(Duration::from_secs(120))
+                .json(&deploy_body)
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    let s = r.status();
+                    let b = r.json().await.unwrap_or(Value::Null);
+                    return (s, b);
+                }
+                Err(e) if (e.is_connect() || e.is_request()) && attempt < 3 => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Err(e) => {
+                    return (
+                        reqwest::StatusCode::BAD_GATEWAY,
+                        serde_json::json!({"error": e.to_string()}),
+                    );
+                }
             }
-            Err(e) => (
-                reqwest::StatusCode::BAD_GATEWAY,
-                serde_json::json!({"error": e.to_string()}),
-            ),
         }
     });
 
@@ -2447,22 +2529,33 @@ async fn userapp_scope_isolation_during_deploy() {
         "sha256": sha256, "request_id": format!("iso-deploy-b-{app}")
     });
     let second_task = tokio::spawn(async move {
-        let resp = second_http
-            .post(format!("{second_base}{second_path}"))
-            .timeout(Duration::from_secs(120))
-            .json(&second_body)
-            .send()
-            .await;
-        match resp {
-            Ok(r) => {
-                let s = r.status();
-                let b = r.json().await.unwrap_or(Value::Null);
-                (s, b)
+        // Same transport-retry policy as the primary deploy task; the body
+        // carries its own request identity.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match second_http
+                .post(format!("{second_base}{second_path}"))
+                .timeout(Duration::from_secs(120))
+                .json(&second_body)
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    let s = r.status();
+                    let b = r.json().await.unwrap_or(Value::Null);
+                    return (s, b);
+                }
+                Err(e) if (e.is_connect() || e.is_request()) && attempt < 3 => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Err(e) => {
+                    return (
+                        reqwest::StatusCode::BAD_GATEWAY,
+                        serde_json::json!({"error": e.to_string()}),
+                    );
+                }
             }
-            Err(e) => (
-                reqwest::StatusCode::BAD_GATEWAY,
-                serde_json::json!({"error": e.to_string()}),
-            ),
         }
     });
 
@@ -2508,6 +2601,44 @@ async fn userapp_scope_isolation_during_deploy() {
         "dev restart 与 prod 部署并发 → 独立受理（无 conflicting 409）",
         not_blocked,
         format!("HTTP {rs}, body 截断: {}", trunc(&rb, 200)),
+    );
+
+    // ⑤b 的 restart 受理即返回 202；其执行（停容器 30s grace + 重建 + 就绪
+    // 观测）可持续 ~80s。⑤f 测的是"两路并发 restart 互斥"，不是"撞上第三
+    // 路的执行窗口"——先等 ⑤b 的操作到终态（有界），再发两路，语义才成立
+    //（2026-09-27 三次复现：不等则两路必然双 409 被 ⑤b 挡住）。
+    let restart_op = rb["data"]["operation_id"].as_str().unwrap_or("").to_owned();
+    let t0 = Instant::now();
+    let mut restart_settled = restart_op.is_empty();
+    while !restart_settled && t0.elapsed() < Duration::from_secs(150) {
+        let (s, b) = get_json(
+            &env,
+            &format!("/api/v1/userapp/{app}/operations/current?user_id={user}"),
+        )
+        .await;
+        let blocking = s.is_success()
+            && http_ok(&b)
+            && b["data"].as_array().is_some_and(|ops| {
+                ops.iter().any(|op| {
+                    op["operation_id"].as_str() == Some(restart_op.as_str())
+                        && op["state"].as_str().is_some_and(|st| {
+                            st == "Running" || st == "Pending" || st == "RecoveryRequired"
+                        })
+                })
+            });
+        restart_settled = !blocking;
+        if !restart_settled {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+    }
+    report.diagnostic(
+        "⑤f 前置：⑤b restart 终态等待",
+        &format!("{:.1}s", t0.elapsed().as_secs_f32()),
+        if restart_settled {
+            "settled"
+        } else {
+            "still running (timeout)"
+        },
     );
 
     // ⑤f 同域并发 dev restart 反例（required 契约步）：两路不同 request 的
@@ -2562,18 +2693,21 @@ async fn userapp_scope_isolation_during_deploy() {
     let (dra_s, dra_b) = dev_restart_a.await.expect("dev restart A join");
     let (drb_s, drb_b) = dev_restart_b.await.expect("dev restart B join");
     let a_ok = dra_s.is_success() && dra_b["success"].as_bool().unwrap_or(false);
-    let b_conflict = drb_s.is_success()
-        && drb_b["code"].as_str() == Some("ERR_CONFLICT")
-        && drb_b["blocker"]["scope"].as_str() == Some("Dev");
+    // /computer/pod/restart 的冲突契约是裸 HTTP 409 + HttpResult 信封
+    //（OpenAPI 已声明 "no internal queue"），不与 UserApp 200 信封混用。
+    let conflict_envelope = |s: reqwest::StatusCode, b: &Value| {
+        (s.as_u16() == 409 || s.is_success())
+            && b["code"].as_str() == Some("ERR_CONFLICT")
+            && b["blocker"]["scope"].as_str() == Some("Dev")
+    };
+    let b_conflict = conflict_envelope(drb_s, &drb_b);
     let b_winner = dra_s.is_success()
         && dra_b["success"].as_bool().unwrap_or(false)
         && drb_s.is_success()
         && drb_b["success"].as_bool().unwrap_or(false);
     // 两路并发自 tokio::spawn，受理顺序不保证——对称接受任一侧胜出：
     // a_conflict = A 409 + blocker.scope=Dev（B 先落地）。
-    let a_conflict = dra_s.is_success()
-        && dra_b["code"].as_str() == Some("ERR_CONFLICT")
-        && dra_b["blocker"]["scope"].as_str() == Some("Dev");
+    let a_conflict = conflict_envelope(dra_s, &dra_b);
     // 恰一胜者：一侧成功 + 另一侧结构化冲突，或时序上两路都成功（第二路
     // 赶上第一路完成后的窗口——此时胜者仍是"恰一"语义的时序边界，不算
     // 失败只要求无假 409）
@@ -2605,10 +2739,45 @@ async fn userapp_scope_isolation_during_deploy() {
         format!("HTTP {cs}, body 截断: {}", trunc(&cb, 240)),
     );
 
-    // ⑤d 部署收敛：并发 dev 操作不破坏 prod 部署
+    // ⑤d 部署收敛：并发 dev 操作不破坏 prod 部署。
+    // 响应丢失窗口：首次请求可能已被受理（响应回程被传输故障切断），同
+    // request_id 重试在原操作仍在途时按设计返回 409 Busy——此时按原操作
+    // ID 等待终态，Succeeded 视为部署成功（与 owner 重放语义一致）。
     let (ds, db) = deploy_task.await.expect("deploy task join");
-    let deploy_ok =
+    let mut deploy_ok =
         ds.is_success() && http_ok(&db) && db["data"]["status"].as_str() == Some("running");
+    if !deploy_ok {
+        let lost = db["blocker"]["operation_id"].as_str().map(str::to_owned);
+        if let Some(op) = lost {
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_secs(180) {
+                let (os, ob) = get_json(
+                    &env,
+                    &format!("/api/v1/userapp/{app}/operations/current?user_id={user}"),
+                )
+                .await;
+                if os.is_success()
+                    && http_ok(&ob)
+                    && let Some(ops) = ob["data"].as_array()
+                    && let Some(view) = ops
+                        .iter()
+                        .find(|o| o["operation_id"].as_str() == Some(op.as_str()))
+                {
+                    if view["state"].as_str() == Some("Succeeded") {
+                        deploy_ok = true;
+                        break;
+                    }
+                    if matches!(
+                        view["state"].as_str(),
+                        Some("Failed") | Some("Cancelled")
+                    ) {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
     report.assert_hard(
         "隔离场景部署终态 running（并发不破坏部署）",
         deploy_ok,

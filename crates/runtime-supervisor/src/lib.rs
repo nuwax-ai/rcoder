@@ -4,6 +4,7 @@
 //! database migration or claims that a remote operation completed successfully.
 mod control;
 pub mod domain;
+mod epoch;
 mod guardian;
 mod monitor;
 mod record;

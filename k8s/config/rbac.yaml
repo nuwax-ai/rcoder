@@ -17,6 +17,12 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumes"]
     verbs: ["get", "list", "watch"]
+  # nodes（只读）: builder 执行域恢复核验——旧 Pod 从 API 消失后，须确认无
+  # NotReady/Unknown 节点（kubelet 心跳正常才证明被删 Pod 进程已被收割），
+  # 才能签发上一执行域的物理退出回执。缺此权限时该恢复保持保守拒绝。
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["deployments", "replicasets", "statefulsets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

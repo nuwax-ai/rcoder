@@ -35,12 +35,17 @@ FROM ${COMPUTER_BASE} AS computer
 # not the potentially older published base image.
 COPY --link --from=build /out/agent_runner /out/app-cli /usr/local/bin/
 COPY --link docker/rcoder-agent-runner/pg-admin-identity.sh docker/rcoder-agent-runner/pg-supervise.py docker/rcoder-agent-runner/pg-supervisor-entry.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/pg-supervisor-entry.sh
+# Snapshot transport can deliver these as 0600 (see the runtime stage note);
+# postgres runs the entry as a non-root user and needs world-read. 2026-09-27
+# personal-K8s finding: the missing bits made every fresh builder pod's
+# postgresql FATAL at pg-supervisor-entry.sh:22.
+RUN chmod 0755 /usr/local/bin/pg-supervisor-entry.sh /usr/local/bin/pg-admin-identity.sh /usr/local/bin/pg-supervise.py
 FROM ${RUNTIME_BASE} AS runtime
 COPY --link --from=build /out/app-cli /out/file-server-proxy /usr/local/bin/
 COPY --link docker/app-runtime-base/start-app.sh /usr/local/bin/start-app.sh
 COPY --link docker/app-runtime-base/pg-admin-identity.sh docker/app-runtime-base/pg-supervise.py docker/app-runtime-base/pg-supervisor-entry.sh /usr/local/bin/
-# git 模式为 100644，COPY 保留源权限——不 chmod 则容器启动即
-# "exec: /usr/local/bin/start-app.sh: permission denied"（CrashLoop）。
-# 对齐 rcoder-master / app-runtime-base Dockerfile 的既有惯例。
-RUN chmod +x /usr/local/bin/start-app.sh /usr/local/bin/pg-supervisor-entry.sh
+# COPY 保留同步源权限，而 Mutagen 同步产物是 0700（组/其他无读位）：
+# `chmod +x` 只补执行位会得到 0711，supervisord 以 postgres 用户跑
+# /bin/sh 入口脚本时读不了文件（Permission denied → 固定 PG 永远起不来，
+# 2026-09-27 个人 K8s userapp 三连败根因）。显式 0755 并覆盖全部三脚本。
+RUN chmod 0755 /usr/local/bin/start-app.sh /usr/local/bin/pg-supervisor-entry.sh /usr/local/bin/pg-admin-identity.sh /usr/local/bin/pg-supervise.py

@@ -42,6 +42,7 @@ pub(crate) async fn stamp(client: &Docker, body: &mut ContainerCreateBody) -> Re
         .collect();
     let domain = PhysicalDomain {
         authority,
+        instance_source_env: None,
         volume,
         instance: uuid::Uuid::new_v4().to_string(),
     };

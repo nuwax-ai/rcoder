@@ -22,7 +22,9 @@ CASES = {
         'runtime::docker_builder_deletion::tests::captured_file_release_requires_inactive_original_inode_and_owner',
         'runtime::docker_builder_deletion::tests::captured_file_release_rejects_symbolic_link_even_to_original_inode',
     ),
-    'rcoder': tuple('userapp_builder::' + name for name in (
+    # 引擎拆分（rcoder→rcoder-engine）后这些用例随模块迁入 rcoder_engine 的
+    # lib 测试二进制；rcoder 自身 lib 仅 re-export（0 个测试），按 crate 拆键。
+    'rcoder_engine': tuple('userapp_builder::' + name for name in (
         'creation::tests::final_creation_evidence_survives_terminal_failure_and_rejects_wrong_identity',
         'creation::tests::expired_creation_retains_observation_and_discards_late_success',
         'creation::tests::expired_checkpoint_failure_still_observes_remote_completion',
@@ -64,7 +66,7 @@ def main():
         (directory / 'assertions.json').write_text(json.dumps(assertions, indent=2))
 
     try:
-        build = subprocess.run(['cargo', 'test', '-p', 'rcoder', '-p', 'file-server-userapp', '-p', 'docker_manager', '-p', 'app_manager',
+        build = subprocess.run(['cargo', 'test', '-p', 'rcoder-engine', '-p', 'file-server-userapp', '-p', 'docker_manager', '-p', 'app_manager',
                                 '--locked', '--lib', '--no-run', '--message-format=json'], cwd=REPO,
                                capture_output=True, text=True, timeout=1800)
         (directory / 'build.jsonl').write_text(build.stdout)

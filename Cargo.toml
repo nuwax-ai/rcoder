@@ -191,6 +191,8 @@ derive_builder = "0.20"
 # Zed 核心功能依赖
 libc = "0.2"
 nix = { version = "0.31.3", features = ["fs", "process", "term", "signal"] }
+# Windows 引导会话身份（runtime-supervisor epoch：GetTickCount64/FILETIME FFI）。
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_SystemInformation"] }
 # /proc 解析（agent_runner 统计容器内 noVNC 端口 ESTABLISHED 连接，判 VNC 桌面是否在用）。
 # 仅在 Linux target 的 agent_runner 里引入（target-gated），Mac 开发编译不拉它。
 procfs = "0.18"

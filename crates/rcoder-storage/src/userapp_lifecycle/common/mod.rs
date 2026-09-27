@@ -177,6 +177,17 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         .await
     }
 
+    async fn active_compute_controls(
+        &self,
+        app_id: &str,
+    ) -> Result<Vec<ComputeControlRecord>, UserAppStoreError> {
+        let app_id = app_id.to_owned();
+        self.run(true, move |tx, backend| {
+            Box::pin(async move { compute::active_controls(tx, backend, &app_id).await })
+        })
+        .await
+    }
+
     async fn check_compute_access(
         &self,
         app_id: &str,

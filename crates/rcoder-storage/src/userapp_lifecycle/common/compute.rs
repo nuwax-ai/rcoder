@@ -88,6 +88,32 @@ pub(super) async fn get(
         .map(decode)
         .transpose()
 }
+
+/// All non-terminal compute controls of one app. Compute operations occupy
+/// their scope's physical lease but not the userapp_operations slots, so the
+/// `/operations/current` view merges this list to make in-flight restarts and
+/// stops observable instead of surfacing only as opaque 409 blockers.
+pub(super) async fn active_controls(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    app_id: &str,
+) -> Result<Vec<ComputeControlRecord>, Error> {
+    let ids = repo::strings(toasty::sql::query(repo::sql(
+        backend,
+        "SELECT operation_id FROM userapp_compute_controls WHERE app_id=$1 AND state IN ('pending','running','recovery_required') ORDER BY created_at_us",
+    ))
+    .bind(app_id)
+    .exec(tx)
+    .await
+    .map_err(storage)?)?;
+    let mut records = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(record) = get(tx, app_id, &id).await? {
+            records.push(record);
+        }
+    }
+    Ok(records)
+}
 pub(super) async fn admit(
     tx: &mut dyn Executor,
     backend: Backend,

@@ -469,6 +469,60 @@ impl super::AppService {
             }
             operations.push(operation.into());
         }
+        // Compute controls (restart/stop of builder or production compute) hold
+        // their own physical lease instead of an operation slot; surface them so
+        // callers observe in-flight compute operations instead of discovering
+        // them as opaque 409 blockers on unrelated requests.
+        for record in self.metadata.store.active_compute_controls(app_id).await? {
+            if record.lifecycle_id != app.lifecycle_id {
+                continue;
+            }
+            let kind = match (record.scope, record.action) {
+                (
+                    shared_types::UserAppOperationScope::Dev,
+                    shared_types::ComputeControlAction::Restart,
+                ) => shared_types::UserAppOperationKind::RestartBuilder,
+                (
+                    shared_types::UserAppOperationScope::Dev,
+                    shared_types::ComputeControlAction::Stop,
+                ) => shared_types::UserAppOperationKind::StopBuilder,
+                (
+                    shared_types::UserAppOperationScope::Prod,
+                    shared_types::ComputeControlAction::Restart,
+                ) => shared_types::UserAppOperationKind::Restart,
+                (
+                    shared_types::UserAppOperationScope::Prod,
+                    shared_types::ComputeControlAction::Stop,
+                ) => shared_types::UserAppOperationKind::Stop,
+                (shared_types::UserAppOperationScope::Application, _) => continue,
+            };
+            let state = match record.state {
+                shared_types::ComputeControlState::Pending => UserAppOperationState::Pending,
+                shared_types::ComputeControlState::Running => UserAppOperationState::Running,
+                shared_types::ComputeControlState::RecoveryRequired => {
+                    UserAppOperationState::RecoveryRequired
+                }
+                shared_types::ComputeControlState::Succeeded
+                | shared_types::ComputeControlState::Failed
+                | shared_types::ComputeControlState::Superseded => continue,
+            };
+            operations.push(shared_types::UserAppOperationView {
+                operation_id: record.operation_id,
+                app_id: record.app_id,
+                lifecycle_id: record.lifecycle_id,
+                request_id: Some(record.request_id),
+                kind,
+                scope: record.scope,
+                state,
+                revision: record.revision,
+                step: record.stage,
+                error_code: record.error_code,
+                error_message: record.error_message,
+                // ComputeControlRecord carries no wall-clock field; the view's
+                // created_at marks the observation instant.
+                created_at: chrono::Utc::now(),
+            });
+        }
         Ok(operations)
     }
 

@@ -857,6 +857,19 @@ pub trait UserAppLifecycleStore: Send + Sync {
         operation_id: &str,
     ) -> Result<Option<crate::ComputeControlRecord>, UserAppStoreError>;
 
+    /// Non-terminal compute controls (restart/stop) of one app. They occupy
+    /// their scope's physical lease without entering the userapp operation
+    /// slots; callers merge them into operation views so in-flight compute
+    /// controls are observable instead of surfacing only as 409 blockers.
+    async fn active_compute_controls(
+        &self,
+        _app_id: &str,
+    ) -> Result<Vec<crate::ComputeControlRecord>, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Active compute control listing is unsupported".into(),
+        ))
+    }
+
     /// Read-only access cannot wake a manually stopped scope. Explicit user
     /// startup may clear a completed stop intent, under the same root CAS.
     async fn check_compute_access(

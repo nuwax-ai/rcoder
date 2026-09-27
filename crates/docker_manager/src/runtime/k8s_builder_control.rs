@@ -1193,6 +1193,10 @@ impl KubernetesRuntime {
                         ) {
                             continue;
                         }
+                        // Wake/Restart 后的 Pod 是新执行域：对旧 Pod 遗留代次做
+                        // 平台核验恢复（bounded，失败保留保护不阻塞控制结果）。
+                        self.reconcile_builder_execution_domain_bounded(&target.context.app_id)
+                            .await;
                         return Ok(Some(info));
                     }
                 }
@@ -2024,6 +2028,7 @@ mod tests {
                 access_mode: "ReadWriteOnce".into(),
                 docker_manager_config: Default::default(),
                 kubernetes_config: Default::default(),
+                execution_authority: "k8s:test".into(),
             },
             pod_cache: Default::default(),
             subvolume_path_cache: Default::default(),

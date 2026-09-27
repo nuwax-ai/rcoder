@@ -873,63 +873,69 @@ mod tests {
     // （9080 accept-all）+ 假 admin（/api/basic 返回匹配 hash 与 upstream 健康）。
     // 覆盖真实 HTTP 探测、admin 快照、hash 门、来源契约透出与只读纪律。
 
+    // ── 夹具承载方式（2026-09-27 归因加固）──────────────────────────────
+    //
+    // 三个假服务跑在独立 OS 线程（阻塞 IO），不挂 tokio runtime：全量并发下
+    // 机器 CPU 饥饿曾把进程内假 admin 的应答拖过观察轮 3s 总预算，全部轮次
+    // ObserveIncomplete（2026-09-26 失败窗口同批 6 个 deploy 用例 16s 级耗
+    // 时，见 native-supervision verification）。OS 线程服务端不依赖被测
+    // runtime 的调度就能备好应答；断言语义不变，只消除夹具自饥饿。
+
     /// 极简 HTTP/1.1 服务：`mode` 决定每次响应（200 健康契约 / 503 退化）。
-    async fn spawn_tiny_http(
-        listener: tokio::net::TcpListener,
+    fn spawn_tiny_http(
+        listener: std::net::TcpListener,
         mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
     ) {
-        loop {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                return;
-            };
-            let mode = mode.clone();
-            tokio::spawn(async move {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = [0u8; 2048];
-                let Ok(read) = socket.read(&mut buf).await else {
-                    return;
-                };
-                let _ = read;
-                let ok = mode.load(std::sync::atomic::Ordering::Relaxed) == 0;
-                let body = if ok { "ok" } else { "unhealthy" };
-                let status = if ok {
-                    "200 OK"
-                } else {
-                    "503 Service Unavailable"
-                };
-                let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-            });
-        }
+        std::thread::spawn(move || {
+            for socket in listener.incoming() {
+                let Ok(mut socket) = socket else { continue };
+                let mode = mode.clone();
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    let mut buf = [0u8; 2048];
+                    if socket.read(&mut buf).is_err() {
+                        return;
+                    }
+                    let ok = mode.load(std::sync::atomic::Ordering::Relaxed) == 0;
+                    let body = if ok { "ok" } else { "unhealthy" };
+                    let status = if ok {
+                        "200 OK"
+                    } else {
+                        "503 Service Unavailable"
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes());
+                });
+            }
+        });
     }
 
     /// 假 admin `/api/basic`：返回与 `expected_hash` 匹配的 hash + upstream 健康。
-    async fn spawn_fake_admin(listener: tokio::net::TcpListener, expected_hash: String) {
-        loop {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                return;
-            };
-            let expected_hash = expected_hash.clone();
-            tokio::spawn(async move {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = [0u8; 4096];
-                let Ok(read) = socket.read(&mut buf).await else {
-                    return;
-                };
-                let _ = read;
-                let body = format!(
-                    r#"{{"config_hash":"{expected_hash}","upstream_healthy_status":{{"web":{{"healthy":1,"total":1}}}}}}"#
-                );
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-            });
-        }
+    fn spawn_fake_admin(listener: std::net::TcpListener, expected_hash: String) {
+        std::thread::spawn(move || {
+            for socket in listener.incoming() {
+                let Ok(mut socket) = socket else { continue };
+                let expected_hash = expected_hash.clone();
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    let mut buf = [0u8; 4096];
+                    if socket.read(&mut buf).is_err() {
+                        return;
+                    }
+                    let body = format!(
+                        r#"{{"config_hash":"{expected_hash}","upstream_healthy_status":{{"web":{{"healthy":1,"total":1}}}}}}"#
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes());
+                });
+            }
+        });
     }
 
     fn combo_lock(service_port: u16) -> workspace_manifest::ReleaseLock {
@@ -995,22 +1001,16 @@ path = "/"
         use std::sync::atomic::{AtomicU8, Ordering};
 
         // 固定端口：入口 9080（accept-all）与 admin 3018（进程内假 admin）。
-        let entry = tokio::net::TcpListener::bind("127.0.0.1:9080")
-            .await
+        let entry = std::net::TcpListener::bind("127.0.0.1:9080")
             .expect("bind fake pingap entry 9080");
-        tokio::spawn(async move {
-            loop {
-                let Ok((socket, _)) = entry.accept().await else {
-                    return;
-                };
+        std::thread::spawn(move || {
+            for socket in entry.incoming() {
                 drop(socket);
             }
         });
-        let admin = tokio::net::TcpListener::bind("127.0.0.1:3018")
-            .await
-            .expect("bind fake admin 3018");
+        let admin = std::net::TcpListener::bind("127.0.0.1:3018").expect("bind fake admin 3018");
         let expected_hash = "COMBOHASH01".to_string();
-        tokio::spawn(spawn_fake_admin(admin, expected_hash.clone()));
+        spawn_fake_admin(admin, expected_hash.clone());
         crate::proxy::admin_probe::register_admin_endpoint(
             "127.0.0.1:3018".into(),
             "combo".into(),
@@ -1019,8 +1019,7 @@ path = "/"
         crate::proxy::compiler::record_expected_hash(&expected_hash);
 
         // 业务服务：先保留端口不监听（connect refused = starting）。
-        let service_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
+        let service_listener = std::net::TcpListener::bind("127.0.0.1:0")
             .expect("reserve service port");
         let service_port = service_listener.local_addr().expect("service addr").port();
         drop(service_listener);
@@ -1043,10 +1042,9 @@ path = "/"
 
         // 2) 服务 200 + admin hash 匹配 + 入口可达 → ready，来源契约透出。
         let mode = Arc::new(AtomicU8::new(0));
-        let service_listener = tokio::net::TcpListener::bind(("127.0.0.1", service_port))
-            .await
-            .expect("bind service port");
-        tokio::spawn(spawn_tiny_http(service_listener, mode.clone()));
+        let service_listener =
+            std::net::TcpListener::bind(("127.0.0.1", service_port)).expect("bind service port");
+        spawn_tiny_http(service_listener, mode.clone());
         let observed = await_status(&observer, UserAppReadinessStatus::Ready).await;
         assert!(observed.ready, "expected ready, got {observed:?}");
         assert!(observed.proxy.ready);

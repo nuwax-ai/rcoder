@@ -2027,10 +2027,18 @@ touch "$PROBE_STATE/database-login-confirmed"
     #[tokio::test]
     async fn pg_probe_deadline_kills_and_reaps_hung_client() {
         let directory = tempfile::tempdir().unwrap();
+        // 启动握手（对齐孙进程端口夹具的修法）：客户端先写 pid 再等 start 闸门。
+        // 否则全量并发下 150ms 预算可能在 shell 被调度前耗尽，pid 文件从未
+        // 出现，断言无法成立（2026-09-27 无界并发复现，负载敏感夹具竞态）。
         let program = probe_fixture(
             directory.path(),
             r#"#!/bin/sh
 printf '%s' "$$" > "$PROBE_STATE/pid"
+i=0
+while [ ! -f "$PROBE_STATE/start" ] && [ "$i" -lt 200 ]; do
+  sleep 0.05
+  i=$((i + 1))
+done
 exec sleep 30
 "#,
         );
@@ -2038,16 +2046,31 @@ exec sleep 30
             "PROBE_STATE".into(),
             directory.path().to_str().unwrap().into(),
         )]);
-        let result = wait_for_pg_targets(
-            &program,
-            &[target],
-            Duration::from_millis(150),
-            Duration::from_millis(10),
-            None,
-        )
-        .await;
+        let targets = vec![target];
+        let probe = tokio::spawn(async move {
+            wait_for_pg_targets(
+                &program,
+                &targets,
+                Duration::from_millis(150),
+                Duration::from_millis(10),
+                None,
+            )
+            .await
+        });
+        // pid 文件出现后客户端必然在闸门处挂起，再放行进入被测的挂起段。
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(directory.path().join("pid")) {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("probe client never started");
+        std::fs::write(directory.path().join("start"), b"1").unwrap();
+        let result = probe.await.unwrap();
         assert!(result.is_err());
-        let pid = std::fs::read_to_string(directory.path().join("pid")).unwrap();
         let status = std::process::Command::new("kill")
             .args(["-0", &pid])
             .stdout(Stdio::null())

@@ -20,6 +20,8 @@ mod k8s_builder_control;
 mod k8s_builder_restart;
 #[cfg(feature = "kubernetes")]
 mod k8s_creation_receipt;
+#[cfg(feature = "kubernetes")]
+pub(crate) mod k8s_native_domain;
 pub(crate) mod k8s_runtime_helpers;
 pub mod kubernetes_runtime;
 pub mod manager;

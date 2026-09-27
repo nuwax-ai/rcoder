@@ -394,8 +394,13 @@ impl OwnerClient {
     ) -> Result<RuntimeOperationView> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let view = self.operation(operation_id).await?;
-            if view.state.is_terminal() {
+            // The operation was just submitted to this owner; its record may
+            // not be visible on the very first polls (slow shared filesystem,
+            // loaded machine). Absence before the deadline is "keep waiting",
+            // not a failure — the deadline still bounds the total budget.
+            if let Some(view) = self.operation_if_exists(operation_id).await?
+                && view.state.is_terminal()
+            {
                 return Ok(view);
             }
             anyhow::ensure!(

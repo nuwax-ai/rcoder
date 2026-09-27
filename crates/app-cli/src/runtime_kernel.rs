@@ -652,8 +652,19 @@ fn read_json(path: &Path) -> Result<Option<serde_json::Value>> {
     if !path.is_file() {
         return Ok(None);
     }
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("read state {}", path.display()))?;
+    // A record that vanishes between the is_file check and the read (accepted
+    // operation whose file is not yet visible, replaced records) is an
+    // observation of absence, not a corrupt store — surface it as not-found so
+    // callers keep their retry semantics instead of a hard error.
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("read state {}", path.display()));
+        }
+    };
     Ok(Some(
         serde_json::from_str(&content).context("decode state record")?,
     ))
