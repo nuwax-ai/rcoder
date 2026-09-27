@@ -2043,8 +2043,8 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
                     tracing::error!(%error, "Persisted stop reconciliation remains blocked");
                 }
                 // 兜底收敛：精确路径之后仍非终态的操作（含 reconcile 失败的
-                // Stop）自动沉降为 Failed。产品环境没有操作员——quiesce 已
-                // 确认上一 owner 进程停止，结果未提交是确定性裁决；不允许
+                // Stop）自动沉降为 Failed。当前本地执行已收束；其他容器的
+                // 退役由平台处理，结果未提交不等于远端进程退出；不允许
                 // 留下"等人工删除/修复文件"的用户不可恢复状态。
                 match kernel.settle_unresolved_recoveries().await {
                     Ok(settled) if !settled.is_empty() => {

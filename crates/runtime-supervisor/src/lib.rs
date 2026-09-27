@@ -16,7 +16,7 @@ pub use control::{
     last_snapshot,
 };
 pub use monitor::{Options, Owner, Policy};
-pub use record::{Intent, Quiescence, verify_live, verify_quiescent};
+pub use record::{Intent, Quiescence, verify_live, verify_local_quiescent, verify_quiescent};
 pub use recovery::stop_work;
 pub use worker::{Worker, WorkerControl};
 

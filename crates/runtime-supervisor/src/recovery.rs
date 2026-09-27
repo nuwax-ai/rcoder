@@ -31,7 +31,7 @@ pub async fn stop_work(root: &Path, binding: &Binding, budget: Duration) -> Resu
                 "offline stop is not complete"
             );
             if let Some(generation) = &before.generation {
-                crate::verify_quiescent(root, generation)?;
+                crate::verify_local_quiescent(root, generation)?;
             }
             return Ok(result);
         }
@@ -63,7 +63,7 @@ pub async fn stop_work(root: &Path, binding: &Binding, budget: Duration) -> Resu
                     && result.operation_id.as_deref() == Some(&request.request_id));
             if completed {
                 if let Some(generation) = &before.generation {
-                    crate::verify_quiescent(root, generation)?;
+                    crate::verify_local_quiescent(root, generation)?;
                 }
                 return Ok(result);
             }

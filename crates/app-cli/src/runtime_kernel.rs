@@ -610,7 +610,7 @@ impl RuntimeStore {
         operation.view.state = RuntimeOperationState::Failed;
         operation.view.error_code = Some(ERR_INTERRUPTED_OWNER_EXIT.into());
         operation.view.error_message =
-            Some("previous owner terminated before the operation result was committed".into());
+            Some("operation result was not committed before runtime management recovery".into());
         operation.view.failure_detail = Some(RuntimeFailureDetail {
             stage: "startup_reconciled".into(),
             exit_code: None,
@@ -906,8 +906,8 @@ impl RuntimeKernel {
     }
 
     /// 启动序列末尾兜底收敛：精确收敛路径（journal receipt、持久化 Stop
-    /// 意图）之后仍非终态的操作在此沉降为 Failed。quiesce 已证明上一
-    /// owner 的进程停止，未终态记录的裁决是确定性的（结果未提交）——
+    /// 意图）之后仍非终态的操作在此沉降为 Failed。当前容器已取得管理权，
+    /// 本地旧进程已收束；其他容器的退役由平台负责。记录仅表示结果未提交——
     /// 不伪造成功，也不留 RecoveryRequired 死锁（用户/agent 的 start、
     /// 重复编译构建、停止回收后再启动都必须能继续执行）。
     pub(crate) async fn settle_unresolved_recoveries(&self) -> Result<Vec<String>> {

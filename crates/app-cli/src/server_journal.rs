@@ -400,7 +400,7 @@ impl Journal {
             .as_ref()
             .and_then(|owner| owner.worker_generation.as_deref())
         {
-            runtime_supervisor::verify_quiescent(&self.root, generation)
+            runtime_supervisor::verify_local_quiescent(&self.root, generation)
                 .context("previous native execution cleanup remains unconfirmed")?;
             return Ok(());
         }

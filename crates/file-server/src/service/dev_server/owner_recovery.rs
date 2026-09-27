@@ -258,7 +258,7 @@ impl DevServerManager {
                         && snapshot.operation_id.is_some()
                     {
                         if let Some(generation) = &snapshot.generation {
-                            runtime_supervisor::verify_quiescent(root, generation)?;
+                            runtime_supervisor::verify_local_quiescent(root, generation)?;
                         }
                         resumed_shutdown = true;
                         self.spawn_recovery_owner(project, workspace, address)

@@ -126,6 +126,32 @@ pub fn verify_quiescent(scope: &Path, id: &str) -> Result<Quiescence> {
     })
 }
 
+/// Confirm cleanup in this process domain. `None` means the record belongs to
+/// a previous container on the same managed workspace, not that it exited.
+/// The platform owns cross-container retirement; a local Stop cannot stop or
+/// wait for processes in that other container.
+pub fn verify_local_quiescent(scope: &Path, id: &str) -> Result<Option<Quiescence>> {
+    if belongs_to_previous_container(scope, id)? {
+        return Ok(None);
+    }
+    verify_quiescent(scope, id).map(Some)
+}
+
+pub(crate) fn belongs_to_previous_container(scope: &Path, id: &str) -> Result<bool> {
+    let value = generation(&work_root(scope, id)?)?;
+    Ok(previous_container(
+        &value,
+        crate::domain::PhysicalDomain::from_env()?.as_ref(),
+    ))
+}
+
+fn previous_container(value: &Generation, current: Option<&crate::domain::PhysicalDomain>) -> bool {
+    matches!((value.physical_domain.as_ref(), current), (Some(old), Some(current))
+        if old.authority == current.authority
+            && old.volume == current.volume
+            && old.instance != current.instance)
+}
+
 pub fn verify_live(scope: &Path, supervisor: &str, id: &str) -> Result<()> {
     let root = work_root(scope, id)?;
     let generation = generation(&root)?;
@@ -141,6 +167,10 @@ pub fn verify_live(scope: &Path, supervisor: &str, id: &str) -> Result<()> {
 /// Run only with the stable owner lock held. A late root guardian must obtain
 /// this same generation lock and cannot consume revoked authorization.
 pub(crate) fn reconcile(scope: &Path) -> Result<()> {
+    reconcile_local(scope, crate::domain::PhysicalDomain::from_env()?.as_ref())
+}
+
+fn reconcile_local(scope: &Path, current: Option<&crate::domain::PhysicalDomain>) -> Result<()> {
     let dir = scope.join("work");
     if !dir.try_exists()? {
         return Ok(());
@@ -150,6 +180,15 @@ pub(crate) fn reconcile(scope: &Path) -> Result<()> {
         if !root.join("generation.json").try_exists()? {
             continue;
         } // legacy adapter owns legacy receipts
+        let value = generation(&root)?;
+        if previous_container(&value, current) {
+            // Keep foreign process and command receipts unchanged. A replacement
+            // container must not interpret them as live work in its own process
+            // namespace, or depend on a deleted Pod to bootstrap management.
+            tracing::debug!(generation = %value.id,
+                "previous container execution retained as history; recovering local management");
+            continue;
+        }
         let _lock = lock(&root.join("generation.lock"))?;
         let mut value = generation(&root)?;
         let retirable = matches!(
@@ -343,6 +382,44 @@ mod tests {
         let _guard = EpochGuard::new(None);
         assert!(reconcile(_temp.path()).is_err());
         drop(_guard);
+    }
+
+    #[test]
+    fn replacement_container_preserves_foreign_history_without_blocking_local_recovery() {
+        let old = crate::domain::PhysicalDomain {
+            authority: "test-runtime".into(),
+            instance_source_env: None,
+            instance: "old-container".into(),
+            volume: "same-workspace-volume".into(),
+        };
+        let (temp, id) = stuck_scope(Some(old.clone()), None);
+        let _owner = crate::Owner::try_acquire(temp.path()).unwrap().unwrap();
+        let root = work_root(temp.path(), &id).unwrap();
+        let original = std::fs::read(root.join("generation.json")).unwrap();
+        let command = std::fs::read(root.join("commands/command.json")).unwrap();
+        // Neither another container nor a missing local process is exit proof.
+        assert!(reconcile_local(temp.path(), Some(&old)).is_err());
+        assert!(reconcile_local(temp.path(), None).is_err());
+        let mut current = old.clone();
+        current.instance = "replacement-container".into();
+        reconcile_local(temp.path(), Some(&current)).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("generation.json")).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read(root.join("commands/command.json")).unwrap(),
+            command
+        );
+        assert!(
+            verify_quiescent(temp.path(), &id).is_err(),
+            "no fabricated exit receipt"
+        );
+        current.volume = "another-volume".into();
+        assert!(reconcile_local(temp.path(), Some(&current)).is_err());
+        current.volume = old.volume;
+        current.authority = "another-runtime".into();
+        assert!(reconcile_local(temp.path(), Some(&current)).is_err());
     }
 
     #[test]

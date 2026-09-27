@@ -76,7 +76,7 @@ pub async fn drain_for_container_stop(workspace: &Path) -> Result<()> {
                 && snapshot.operation_id.as_deref() == Some(&request.request_id)
             {
                 if let Some(id) = before.generation.as_deref() {
-                    runtime_supervisor::verify_quiescent(&root, id)?;
+                    runtime_supervisor::verify_local_quiescent(&root, id)?;
                 }
                 return Ok::<_, anyhow::Error>(());
             }

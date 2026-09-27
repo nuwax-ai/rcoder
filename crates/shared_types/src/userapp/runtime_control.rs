@@ -31,8 +31,8 @@ pub const ERR_WORKSPACE_MISMATCH: &str = "ERR_WORKSPACE_MISMATCH";
 pub const ERR_STOP_PENDING: &str = "ERR_STOP_PENDING";
 /// 恢复保护：上次执行结果未知/切换中断，未恢复前拒绝新副作用（HTTP 409）。
 pub const ERR_RECOVERY_REQUIRED: &str = "ERR_RECOVERY_REQUIRED";
-/// 启动自动收敛：上一 owner 进程终止前结果未提交，恢复时裁决为 Failed
-/// （quiesce 已确认进程停止，裁决有依据；不伪造成功）。
+/// 管理恢复时旧操作未提交结果，记录为 Failed；不声称远端进程已退出、
+/// 迁移成功或已回滚。错误码保留既有客户端契约。
 pub const ERR_INTERRUPTED_OWNER_EXIT: &str = "ERR_INTERRUPTED_OWNER_EXIT";
 /// 能力缺失/协议过旧：旧客户端调新协议或反之（HTTP 400）。
 pub const ERR_PROTOCOL_UNSUPPORTED: &str = "ERR_PROTOCOL_UNSUPPORTED";

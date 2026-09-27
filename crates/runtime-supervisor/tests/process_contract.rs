@@ -52,6 +52,104 @@ async fn leaf(root: &Path) -> Result<String> {
 }
 
 #[tokio::test]
+async fn replacement_container_does_not_replay_stale_shutdown_or_block_new_stop() {
+    use runtime_supervisor::{Binding, Intent, Phase, domain::PhysicalDomain};
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let work = root.join("work").join(&id);
+    std::fs::create_dir_all(work.join("commands")).unwrap();
+    let previous = PhysicalDomain {
+        authority: "test-runtime".into(),
+        instance_source_env: None,
+        instance: "old-container".into(),
+        volume: "workspace-volume".into(),
+    };
+    let generation = serde_json::to_vec(&serde_json::json!({
+        "version": 1, "id": id, "supervisor": "previous-supervisor", "token": "test",
+        "intent": "shutdown", "phase": "Running", "exit_code": null, "error": null,
+        "physical_domain": previous
+    }))
+    .unwrap();
+    std::fs::write(work.join("generation.json"), &generation).unwrap();
+    let mut interrupted = Request::new(Action::Shutdown);
+    interrupted.expected_generation = Some(id.clone());
+    let snapshot = Snapshot {
+        version: 1,
+        binding: Binding {
+            component: "runtime".into(),
+            resource: root.clone(),
+        },
+        supervisor_id: "previous-supervisor".into(),
+        generation: Some(id),
+        phase: Phase::Stopping,
+        intent: Intent::Shutdown,
+        operation_id: Some(interrupted.request_id.clone()),
+        error: None,
+        problem: None,
+    };
+    std::fs::write(
+        root.join("supervisor.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 2, "instance": "previous-supervisor", "address": "127.0.0.1:1",
+            "token": "test", "snapshot": snapshot, "requests": [[interrupted, snapshot]]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut current = previous;
+    current.instance = "replacement-container".into();
+    let mut owner = tokio::process::Command::new(env!("CARGO_BIN_EXE_supervision-fixture"))
+        .arg(&root)
+        .env("SUPERVISION_FIXTURE_ONE_SHOT", "old-deployment")
+        .env(
+            runtime_supervisor::domain::DOMAIN_ENV,
+            serde_json::to_string(&current).unwrap(),
+        )
+        .spawn()
+        .unwrap();
+    let result = async {
+        let ready = until(&root, |s| s.phase == Phase::Ready).await?;
+        let address = leaf(&root).await?;
+        ensure!(
+            std::fs::read_to_string(root.join("one-shot-env-present"))? == "false",
+            "replacement replayed one-shot deployment input"
+        );
+        ensure!(
+            ready.operation_id.is_none(),
+            "old control still occupies current management"
+        );
+        let old = control(&root, interrupted).await?;
+        ensure!(
+            old.phase == Phase::RecoveryRequired,
+            "old unknown result was changed to success"
+        );
+        let stop = Request::new(Action::StopWork);
+        control(&root, stop.clone()).await?;
+        until(&root, |s| {
+            s.phase == Phase::Ready && s.generation != ready.generation
+        })
+        .await?;
+        ensure!(
+            control(&root, stop).await?.phase == Phase::Ready,
+            "current stop did not complete"
+        );
+        ensure!(
+            tokio::net::TcpStream::connect(&address).await.is_err(),
+            "current business survived stop"
+        );
+        ensure!(
+            std::fs::read(work.join("generation.json"))? == generation,
+            "local recovery rewrote a foreign container's cleanup history"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    shutdown(&root, &mut owner).await;
+    result.unwrap();
+}
+
+#[tokio::test]
 async fn hung_control_is_stoppable_retries_replay_and_business_stays_stopped() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("工作区 with spaces");

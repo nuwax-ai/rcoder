@@ -78,7 +78,7 @@ pub struct Owner {
 }
 impl Owner {
     /// Explicit shutdown after a supervisor crash, while holding its owner lock.
-    /// Evidence must cover every old generation before publishing completion.
+    /// Evidence must cover every local generation before publishing completion.
     pub async fn stop_offline(self, request: &control::Request) -> Result<Snapshot> {
         // Parent death closes pipes first; guardians still need a bounded drain
         // window. Wait only for a retained OS lock, never reinterpret corruption
@@ -131,6 +131,7 @@ impl Owner {
             "execution generation changed"
         );
         record::reconcile(&self.root)?;
+        detach_previous_container_control(&self.root, &mut discovery)?;
         if let Some(id) = &discovery.snapshot.operation_id {
             for (original, snapshot) in &mut discovery.requests {
                 if &original.request_id == id {
@@ -177,7 +178,7 @@ impl Owner {
 
     pub async fn run(self, options: Options) -> Result<i32> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let old: Option<Discovery> = if self.root.join("supervisor.json").try_exists()? {
+        let mut old: Option<Discovery> = if self.root.join("supervisor.json").try_exists()? {
             Some(record::read(&self.root.join("supervisor.json"))?)
         } else {
             None
@@ -199,6 +200,15 @@ impl Owner {
                 "supervisor scope belongs to another resource"
             );
         }
+        // Capture recovery before detaching another container's control slot;
+        // that reset must not turn old one-shot deployment inputs into a fresh
+        // launch (for example APP_DEPLOY_URL retained in the Pod environment).
+        let recovery_launch = old
+            .as_ref()
+            .is_some_and(|d| d.snapshot.phase != Phase::Stopped);
+        if let Some(old) = &mut old {
+            detach_previous_container_control(&self.root, old)?;
+        }
         // Resume an accepted control after parent death. Explicit launch after
         // a completed shutdown starts a new session; it cannot discard a Stop
         // still waiting for quiescence or for the worker's durable acknowledgement.
@@ -213,11 +223,6 @@ impl Owner {
                 Intent::Run
             }
         });
-        // A parent restart also needs to suppress one-shot deployment inputs
-        // when its last operation already completed but the worker later died.
-        let recovery_launch = old
-            .as_ref()
-            .is_some_and(|d| d.snapshot.phase != Phase::Stopped);
         let mut state = State {
             root: self.root.clone(),
             policy: options.policy.clone(),
@@ -299,6 +304,39 @@ impl Owner {
         }
     }
 }
+
+/// A control request targets one container's captured process tree. Preserve
+/// its unknown result as history, but never replay an old Shutdown or let its
+/// pending operation occupy the replacement container's management slot.
+fn detach_previous_container_control(root: &Path, discovery: &mut Discovery) -> Result<()> {
+    let Some(id) = discovery.snapshot.generation.as_deref() else {
+        return Ok(());
+    };
+    if !record::belongs_to_previous_container(root, id)? {
+        return Ok(());
+    }
+    for (_, snapshot) in &mut discovery.requests {
+        if !matches!(snapshot.phase, Phase::Ready | Phase::Stopped) {
+            snapshot.phase = Phase::RecoveryRequired;
+            snapshot.error = Some("control result belongs to a previous container".into());
+            snapshot.problem = Some(Problem {
+                code: FailureCode::IdentityChanged,
+                message: "container replaced before control completion; original result preserved"
+                    .into(),
+            });
+        }
+    }
+    discovery.snapshot.generation = None;
+    discovery.snapshot.operation_id = None;
+    discovery.snapshot.phase = Phase::Stopped;
+    discovery.snapshot.error = None;
+    discovery.snapshot.problem = None;
+    if discovery.snapshot.intent == Intent::Shutdown {
+        discovery.snapshot.intent = Intent::Run;
+    }
+    Ok(())
+}
+
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {

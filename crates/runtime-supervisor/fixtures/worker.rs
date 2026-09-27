@@ -51,6 +51,12 @@ async fn run() -> Result<()> {
     }
     let scope = PathBuf::from(args.first().context("scope missing")?);
     if let Some(worker) = Worker::from_env(&scope).await? {
+        std::fs::write(
+            scope.join("one-shot-env-present"),
+            std::env::var_os("SUPERVISION_FIXTURE_ONE_SHOT")
+                .is_some()
+                .to_string(),
+        )?;
         let cancel = CancellationToken::new();
         // A management restart with Stopped must never launch business work.
         let mut child = if worker.intent() != runtime_supervisor::Intent::Stopped {
@@ -74,6 +80,7 @@ async fn run() -> Result<()> {
     }
     let owner = Owner::try_acquire(&scope)?.context("owner already active")?;
     let mut options = Options::new(args);
+    options.recovery_remove_env = vec!["SUPERVISION_FIXTURE_ONE_SHOT".into()];
     options.policy.probe_interval = Duration::from_millis(100);
     options.policy.probe_timeout = Duration::from_millis(150);
     options.policy.unresponsive_for = Duration::from_millis(600);

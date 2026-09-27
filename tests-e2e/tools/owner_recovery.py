@@ -99,15 +99,23 @@ def main():
     def new_container():
         nonlocal cid
         image_id = docker('image', 'inspect', '--format', '{{.Id}}', args.image).stdout.strip()
+        # Same contract as a platform-provided Pod/container domain. Each real
+        # replacement gets a new instance, while authority and mounted data stay.
+        domain = {'authority': 'owner-recovery-test-runtime', 'volume': volume,
+                  'instance_source_env': 'RCODER_PHYSICAL_POD_UID', 'instance': ''}
+        instance = str(uuid.uuid4())
         cid = docker('run', '-d', '--name', name, '--mount', f'type=volume,src={volume},dst=/home/user,volume-nocopy',
                      '-e', f'PROJECT_ID={app}', '-e', f'USERAPP_SINGLE_APP_ID={app}',
                      '-e', f'USERAPP_WORKSPACE_DIR={workspace}', '-e', 'LOG_BASE_DIR=/home/user/logs',
                      '-e', f'APP_CLI_STATE_ROOT=/home/user/.app-cli-state/{app}',
                      '-e', f'RCODER_RUNTIME_IMAGE_DIGEST={image_id}',
+                     '-e', 'RCODER_EXECUTION_DOMAIN=' + json.dumps(domain),
+                     '-e', f'RCODER_PHYSICAL_POD_UID={instance}',
                      '-e', 'FILE_SERVER_LOG_DIR=/home/user/proxy-logs',
                      '-e', 'FILE_SERVER_APP_CLI_BIN=/usr/local/bin/app-cli',
                      '--entrypoint', 'sleep', image_id, 'infinity').stdout.strip()
-        report['containers'].append({'id': cid, 'image': docker('inspect', '--format', '{{.Image}}', cid).stdout.strip()})
+        report['containers'].append({'id': cid, 'domain_instance': instance,
+                                     'image': docker('inspect', '--format', '{{.Image}}', cid).stdout.strip()})
         docker('cp', str(args.app_cli.resolve()), f'{cid}:/usr/local/bin/app-cli')
         docker('cp', str(args.file_server_proxy.resolve()), f'{cid}:/usr/local/bin/file-server-proxy')
         write({'/tmp/owner-recovery-supervisor.conf': '''[unix_http_server]
@@ -189,6 +197,13 @@ strip_prefix = false
         write({workspace + '/web/project.manifest.toml': manifest})
         start('restart')
         check('artifact restart activates .run', execute('test -f "$1/.run/web/main.py"', workspace, check=False).returncode == 0)
+        # The first action after another hard recycle is Stop, not Start.
+        docker('rm', '-f', cid)
+        cid = None
+        new_container()
+        check('stop as first request after container replacement',
+              post('stop').get('message') == 'Stopped' and not ready())
+        start('restart')
         post('stop')
         check('final stop leaves management alive and business stopped', bool(identity()) and not ready())
         state = json.loads(execute('cat /home/user/logs/dev-server-external.json').stdout)
