@@ -41,3 +41,5 @@ python3 tests-e2e/tools/owner_recovery.py \
 ```
 
 该场景运行真实 supervisord、Pingap 和 HTTP 应用，覆盖 owner 强杀、重复停止、再次启动、同卷容器重建与产物态部署。只清理自己创建的容器，保留测试数据卷，报告包含镜像和容器 ID。它验证容器内管理链，不替代 RCoder/Java 全链路或远端 K8s 部署验收。
+
+完整的闲置回收链使用 `make test-e2e E2E_SUITE=compose_userapp_dev E2E_FILTER=userapp_dev_idle_recycle_owner_recovery`。它让隔离 RCoder 的真实清理器销毁 builder，保留旧 owner/journal 后再通过 RCoder ensure、Stop、构建 Start、重复 Stop、构建 Restart，并核验 HTTP 新内容和构建计数。配置与镜像前置见 [E2E 场景说明](../tests-e2e/tools/README.md#闲置回收后的-owner-恢复与重新构建)。该命令是验收入口，实际通过情况以对应报告为准。

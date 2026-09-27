@@ -532,5 +532,11 @@
       "scenario": "userapp_worker_supervisord_contract",
       "backend": "compose"
     }
+  ],
+  "userapp_dev_idle_recycle_owner_recovery": [
+    {
+      "scenario": "userapp_dev_idle_recycle_owner_recovery",
+      "backend": "compose"
+    }
   ]
 }

@@ -113,6 +113,26 @@ impl DevServerManager {
         project_id: &str,
         project_path: &Path,
     ) -> AppResult<StoppedDev> {
+        match self
+            .stop_userapp_dev_through_owner(project_id, project_path)
+            .await
+        {
+            Ok(stopped) => Ok(stopped),
+            Err(original) => match self.stop_supervised_owner(project_id, project_path).await {
+                Ok(Some(stopped)) => Ok(stopped),
+                Ok(None) => Err(original),
+                Err(error) => Err(AppError::business(format!(
+                    "owner stop failed: {original}; independent recovery: {error:#}"
+                ))),
+            },
+        }
+    }
+
+    async fn stop_userapp_dev_through_owner(
+        &self,
+        project_id: &str,
+        project_path: &Path,
+    ) -> AppResult<StoppedDev> {
         self.check_external_store().map_err(|error| {
             AppError::business(format!("external owner recovery required: {error:#}"))
         })?;
@@ -183,6 +203,15 @@ impl DevServerManager {
             // stop_external_owner persists registration AND the operation intent
             // before POST; unknown replies retain the same operation for recovery.
             return self.stop_external_owner(project_id, &external).await;
+        }
+        // Legacy `run` has no runtime identity endpoint but may still own a
+        // supervised execution tree. Its absence is not a successful Stop.
+        if let Some(stopped) = self
+            .stop_supervised_owner(project_id, project_path)
+            .await
+            .map_err(|error| AppError::business(format!("independent owner stop: {error:#}")))?
+        {
+            return Ok(stopped);
         }
         // 无 owner 应答：本地 spawn 登记（supervised）或无运行态都收束为无 external
         // 停止；本地登记存在时仍走 stop_dev 的登记 pid 路径（ps 扫描跳过——
@@ -428,7 +457,14 @@ impl DevServerManager {
     /// 幂等: 进程已不在也安全返回; 单项失败记 warn 不中断其余。
     pub async fn shutdown_all(&self) {
         let snapshot: Vec<String> = lock(&self.processes)
-            .map(|m| m.keys().cloned().collect())
+            .map(|m| {
+                m.iter()
+                    .filter(|(key, process)| {
+                        !key.starts_with("userapp:") && process.external_owner.is_none()
+                    })
+                    .map(|(key, _)| key.clone())
+                    .collect()
+            })
             .unwrap_or_default();
         if snapshot.is_empty() {
             return;
@@ -465,6 +501,11 @@ impl Drop for DevServerManager {
             procs.len()
         );
         for (project_id, p) in procs.iter() {
+            // UserApp has its own supervisor, including owners originally
+            // launched by this file server. Dropping transport is not a Stop.
+            if project_id.starts_with("userapp:") || p.external_owner.is_some() {
+                continue;
+            }
             // 兜底硬杀: SIGKILL 进程组 (无法 await, 故不走 SIGTERM→等→SIGKILL 升级)
             if !process::kill_process_group_force(p.pid) {
                 tracing::warn!(%project_id, pid = p.pid, "SIGKILL failed in Drop");

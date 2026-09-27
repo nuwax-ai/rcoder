@@ -225,6 +225,7 @@ version = "0.3.9"
 dependencies = [
  "anyhow",
  "async-stream",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -244,6 +245,7 @@ dependencies = [
  "reqwest",
  "roxmltree",
  "runtime-state-layout",
+ "runtime-supervisor",
  "rustix",
  "semver",
  "serde",
@@ -4029,6 +4031,22 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "runtime-supervisor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "process_utils",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

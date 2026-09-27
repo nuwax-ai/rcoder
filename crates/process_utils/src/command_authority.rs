@@ -1,0 +1,148 @@
+//! Generation-scoped command admission shared by CLI supervisors and guardians.
+//! The gate covers both registration and consumption; closing it never means
+//! previously consumed commands have stopped.
+use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
+use std::{
+    fs::File,
+    io::Write,
+    path::{Path, PathBuf},
+};
+
+pub const WORK_ROOT_ENV: &str = "RCODER_COMMAND_WORK_ROOT";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Authority {
+    version: u32,
+    generation: String,
+    accepting: bool,
+}
+
+pub struct Gate {
+    _file: File,
+    root: PathBuf,
+}
+
+impl Gate {
+    pub fn try_acquire(root: &Path) -> Result<Self> {
+        crate::command_context::create_durable_directory(root)?;
+        let file = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join("command-admission.lock"))?;
+        // Never park the control runtime behind a suspended command guardian.
+        file.try_lock().context("command admission is busy")?;
+        Ok(Self {
+            _file: file,
+            root: root.into(),
+        })
+    }
+
+    pub async fn acquire(root: &Path) -> Result<Self> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match Self::try_acquire(root) {
+                Ok(gate) => return Ok(gate),
+                Err(error)
+                    if error
+                        .downcast_ref::<std::fs::TryLockError>()
+                        .is_some_and(|e| matches!(e, std::fs::TryLockError::WouldBlock))
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    pub fn initialize(&self) -> Result<()> {
+        ensure!(
+            !self.root.join("command-admission.json").try_exists()?,
+            "command generation already initialized"
+        );
+        self.write(true)
+    }
+
+    pub fn close(&self) -> Result<()> {
+        if self.root.join("command-admission.json").try_exists()? {
+            let old: Authority =
+                serde_json::from_slice(&std::fs::read(self.root.join("command-admission.json"))?)?;
+            ensure!(
+                old.version == 1 && old.generation == self.generation()?,
+                "command generation identity changed"
+            );
+            if !old.accepting {
+                return Ok(());
+            }
+        }
+        self.write(false)
+    }
+
+    pub fn require_open(&self) -> Result<()> {
+        let value: Authority =
+            serde_json::from_slice(&std::fs::read(self.root.join("command-admission.json"))?)?;
+        ensure!(
+            value.version == 1 && value.generation == self.generation()? && value.accepting,
+            "command generation no longer accepts work"
+        );
+        Ok(())
+    }
+
+    fn generation(&self) -> Result<&str> {
+        self.root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .context("invalid command generation root")
+    }
+
+    fn write(&self, accepting: bool) -> Result<()> {
+        let mut file = tempfile::NamedTempFile::new_in(&self.root)?;
+        serde_json::to_writer(
+            &mut file,
+            &Authority {
+                version: 1,
+                generation: self.generation()?.into(),
+                accepting,
+            },
+        )?;
+        file.flush()?;
+        file.as_file().sync_all()?;
+        crate::atomic_file::persist(file, &self.root.join("command-admission.json"))
+            .context("publish command admission")?;
+        #[cfg(unix)]
+        File::open(&self.root)?.sync_all()?;
+        Ok(())
+    }
+}
+
+pub fn current_root() -> Option<PathBuf> {
+    std::env::var_os(WORK_ROOT_ENV)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+pub fn is_managed(root: &Path) -> Result<bool> {
+    let authority = root.join("command-admission.json").try_exists()?;
+    ensure!(
+        authority || !root.join("generation.json").try_exists()?,
+        "supervised command admission record is missing"
+    );
+    Ok(authority)
+}
+
+/// An independently owned CLI must not inherit its launcher's worker identity.
+pub fn detach_command(command: &mut tokio::process::Command) {
+    for name in [
+        WORK_ROOT_ENV,
+        "RCODER_SUPERVISOR_WORKER",
+        "RCODER_SUPERVISOR_TOKEN",
+        "FILE_SERVER_PROXY_OWNER_SUPERVISOR",
+        "FILE_SERVER_PROXY_LAUNCH_ID",
+    ] {
+        command.env_remove(name);
+    }
+}

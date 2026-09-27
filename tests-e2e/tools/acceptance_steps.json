@@ -626,5 +626,29 @@
     "?service_type=computer-normal-project → cwd=/home/user/normalProject/{project}（pwd 回显）",
     "?cwd= 显式初始目录含空格（%20 传输，pwd 回显）",
     "?service_type= 非法值 → 握手 400 拒绝"
+  ],
+  "userapp_dev_idle_recycle_owner_recovery": [
+    "idle recovery scenario completed",
+    "isolated idle reaper ready",
+    "before-recycle: fresh build and HTTP content",
+    "live owner registration persisted",
+    "authoritative owner state resides on retained volume",
+    "stop after recycle recovers unavailable owner",
+    "new owner replaces retired registration",
+    "after-recycle: fresh build and HTTP content",
+    "recovered application stops",
+    "independent duplicate stop succeeds",
+    "after-restart: fresh build and HTTP content",
+    "controls retain new owner and physical container",
+    "final stop keeps workspace data",
+    "workspace marker survives all operations",
+    "idle fixture cleanup confirmed with data retained",
+    "first recycle: real idle reaper removed captured builder",
+    "first recycle: stale owner registration retained",
+    "first recycle: replacement preserves lifecycle and workspace mounts",
+    "second recycle: real idle reaper removed captured builder",
+    "second recycle: stale owner registration retained",
+    "second recycle: replacement preserves lifecycle and workspace mounts",
+    "after-second-recycle: fresh build and HTTP content"
   ]
 }

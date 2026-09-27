@@ -6,7 +6,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use workspace_manifest::{PROCESS_STARTUP_OBSERVATION_SECONDS, StartupProbe};
 
-use crate::{manifest::ServiceSpec, platform::process_tree::ManagedChild};
+use crate::manifest::ServiceSpec;
+use process_utils::guardian::OwnedChild as ManagedChild;
 
 pub(crate) fn deadline(spec: &ServiceSpec, started: Instant) -> Result<Instant> {
     started
@@ -154,7 +155,7 @@ mod tests {
             .args(["-c", script])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        spawn_managed(command).unwrap()
+        ManagedChild::Direct(spawn_managed(command).unwrap())
     }
     async fn stop(child: &mut ManagedChild) {
         assert!(matches!(

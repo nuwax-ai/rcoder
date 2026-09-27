@@ -1,5 +1,7 @@
 //! Shared cross-platform owned process tree; original platform regressions remain here.
-pub(crate) use process_utils::managed_tree::{ManagedChild, StopOutcome, spawn_managed};
+pub(crate) use process_utils::managed_tree::StopOutcome;
+#[cfg(test)]
+pub(crate) use process_utils::managed_tree::spawn_managed;
 #[cfg(test)]
 use std::time::Duration;
 #[cfg(test)]

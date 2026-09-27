@@ -98,6 +98,10 @@ pub struct ServerState {
     /// 运行控制信号通道（源码编排/停止业务——api → 主循环；与部署通道并行）。
     control_tx: tokio::sync::mpsc::UnboundedSender<ControlSignal>,
     control_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<ControlSignal>>,
+    supervision_driver_started: std::sync::atomic::AtomicBool,
+    supervision_probe_tx: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
+    supervision_probe_rx:
+        tokio::sync::Mutex<tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<()>>>,
     /// 当前执行中的运行操作 ID（dispatch 写入，主循环边界收束）。
     current_runtime_operation: RwLock<Option<String>>,
 }
@@ -153,6 +157,48 @@ pub(crate) enum ControlSignal {
     },
     /// 停止业务服务（保持管理面）。
     StopBusiness { operation_id: String },
+}
+
+#[async_trait::async_trait]
+impl runtime_supervisor::WorkerControl for ServerState {
+    fn ready(&self) -> bool {
+        !self.initializing()
+    }
+    fn shutdown_grace(&self) -> std::time::Duration {
+        self.shutdown_budget(matches!(self.log_layout(), LogLayout::Supervisord))
+    }
+    async fn probe(&self) -> Result<()> {
+        {
+            let _guard = self
+                .admission
+                .try_lock()
+                .map_err(|_| anyhow::anyhow!("runtime admission is not responsive"))?;
+        }
+        if self
+            .supervision_driver_started
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self.accepting.load(std::sync::atomic::Ordering::Acquire)
+        {
+            let (acknowledge, response) = tokio::sync::oneshot::channel();
+            self.supervision_probe_tx
+                .try_send(acknowledge)
+                .map_err(|_| anyhow::anyhow!("runtime control loop is not responsive"))?;
+            response.await.context("runtime control loop exited")?;
+        }
+        Ok(())
+    }
+    async fn shutdown(&self) -> Result<()> {
+        // Physical shutdown cannot wait forever for a business admission lock.
+        // The parent retains the real execution handle if this path is stuck.
+        self.cancel.cancel();
+        let _guard = self
+            .admission
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("runtime admission is busy during shutdown"))?;
+        self.accepting
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -296,6 +342,7 @@ impl ServerState {
     pub fn new(ready: RuntimeStatusService) -> Self {
         let (deploy_tx, deploy_rx) = tokio::sync::mpsc::unbounded_channel();
         let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (supervision_probe_tx, supervision_probe_rx) = tokio::sync::mpsc::channel(4);
         Self {
             control_token: std::sync::OnceLock::new(),
             execution_project: std::sync::OnceLock::new(),
@@ -309,6 +356,9 @@ impl ServerState {
             pending_run_config: std::sync::Mutex::new(None),
             control_tx,
             control_rx: tokio::sync::Mutex::new(control_rx),
+            supervision_driver_started: std::sync::atomic::AtomicBool::new(false),
+            supervision_probe_tx,
+            supervision_probe_rx: tokio::sync::Mutex::new(supervision_probe_rx),
             current_runtime_operation: RwLock::new(None),
             admission: std::sync::Mutex::new(()),
             accepting: std::sync::atomic::AtomicBool::new(true),
@@ -1444,7 +1494,7 @@ impl ServerState {
 /// `--attach` 标志启用附着模式：已有实例占用端口时核验身份并等待退出，
 /// 然后重新执行本二进制成为新 owner。无 `--attach` 时端口冲突立即 fail-fast。
 pub async fn serve(args: &RuntimeArgs) -> Result<()> {
-    if args.attach {
+    if args.attach && std::env::var_os(runtime_supervisor::WORKER_ENV).is_none() {
         return attach_to_existing_owner(args).await;
     }
     serve_without_attach(args).await
@@ -1552,7 +1602,10 @@ async fn attach_to_existing_owner(args: &RuntimeArgs) -> Result<()> {
                     tracing::info!(
                         "attach mode: no existing instance at {addr}, proceeding as owner"
                     );
-                    return serve_without_attach(args).await;
+                    // Re-enter normal launch so an empty attach cannot create
+                    // an unsupervised owner alongside the supervised protocol.
+                    reexec_without_attach();
+                    exit(1);
                 }
                 // 端口被占但 API 不可达——实例正在启动中，等待
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -1670,10 +1723,13 @@ fn reexec_without_attach() {
     #[cfg(not(unix))]
     {
         match std::process::Command::new(current_exe).args(&args).spawn() {
-            Ok(mut child) => {
-                let _ = child.wait();
-                std::process::exit(0);
-            }
+            Ok(mut child) => match child.wait() {
+                Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+                Err(error) => {
+                    tracing::error!("attach mode: wait for replacement failed: {error}");
+                    std::process::exit(1);
+                }
+            },
             Err(error) => {
                 tracing::error!("attach mode: spawn failed: {error}");
                 std::process::exit(1);
@@ -1682,7 +1738,7 @@ fn reexec_without_attach() {
     }
 }
 
-/// serve 核心逻辑（无附着检测）：journal → OwnerGuard → API bind → 状态机主循环。
+/// serve 核心逻辑：所有权 → API bind → journal 恢复 → 状态机主循环。
 async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
     anyhow::ensure!(
         !args.control_only || !crate::deploy::deploy_requested(),
@@ -1696,36 +1752,48 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
         .unwrap_or_else(|| "unknown-app".to_string());
     let state_root =
         crate::runtime_kernel::RuntimeStore::resolve_root(&args.workspace, &application_id)?;
-    let _owner_guard = match crate::platform::owner_guard::OwnerGuard::try_acquire(&state_root)? {
-        Some(guard) => guard,
-        None => {
-            // A bootstrap race must never turn into a Start request to the winner.
-            anyhow::ensure!(
-                !args.control_only,
-                "runtime owner is already starting or running"
-            );
-            anyhow::ensure!(
-                !crate::deploy::deploy_requested(),
-                "workspace already has an owner; submit artifact deployment through its deployment API"
-            );
-            return match crate::owner_dispatch::dispatch_to_owner(
-                &args.admin_addr,
-                &args.workspace,
-                &state_root,
-                &application_id,
-            )
-            .await?
-            {
-                crate::owner_dispatch::OwnerDispatch::Terminal(view) => {
-                    crate::owner_dispatch::describe_terminal(&view)
-                }
-                crate::owner_dispatch::OwnerDispatch::NoOwner => {
-                    anyhow::bail!("owner disappeared during dispatch; no operation was submitted")
-                }
-            };
+    let supervised_worker = runtime_supervisor::Worker::from_env(&state_root).await?;
+    let stop_intent = supervised_worker
+        .as_ref()
+        .is_some_and(|worker| worker.intent() == runtime_supervisor::Intent::Stopped);
+    let _owner_guard = if supervised_worker.is_some() {
+        None
+    } else {
+        match crate::platform::owner_guard::OwnerGuard::try_acquire(&state_root)? {
+            Some(guard) => Some(guard),
+            None => {
+                // A bootstrap race must never turn into a Start request to the winner.
+                anyhow::ensure!(
+                    !args.control_only,
+                    "runtime owner is already starting or running"
+                );
+                anyhow::ensure!(
+                    !crate::deploy::deploy_requested(),
+                    "workspace already has an owner; submit artifact deployment through its deployment API"
+                );
+                return match crate::owner_dispatch::dispatch_to_owner(
+                    &args.admin_addr,
+                    &args.workspace,
+                    &state_root,
+                    &application_id,
+                )
+                .await?
+                {
+                    crate::owner_dispatch::OwnerDispatch::Terminal(view) => {
+                        crate::owner_dispatch::describe_terminal(&view)
+                    }
+                    crate::owner_dispatch::OwnerDispatch::NoOwner => {
+                        anyhow::bail!(
+                            "owner disappeared during dispatch; no operation was submitted"
+                        )
+                    }
+                };
+            }
         }
     };
 
+    // Hold the real public listener before legacy journal archival/migration.
+    let api_listener = crate::api::bind_listener(&args.admin_addr).await?;
     let journal = Journal::open_with_root(&args.workspace, state_root.clone())?;
     let ready = RuntimeStatusService::default();
     let mut initial_state = ServerState::new(ready.clone());
@@ -1750,18 +1818,10 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
     // 保留——/health 恒 200 覆盖 kubelet liveness）。serve future 运行期故障 →
     // cancel 主循环受控收束，不留"无管理面的运行态"。
     let api_state = state.clone();
-    let api_addr = args.admin_addr.clone();
     let api_workspace = args.workspace.clone();
     let api_log_dir = args.log_dir.clone();
     let api_pingap_bin = args.pingap_bin.clone();
-    let (api_listener, api_app) = crate::api::bind(
-        &api_addr,
-        api_workspace,
-        api_log_dir,
-        api_pingap_bin,
-        api_state,
-    )
-    .await?;
+    let api_app = crate::api::bound_router(api_workspace, api_log_dir, api_pingap_bin, api_state);
     let bound_api_addr = api_listener
         .local_addr()
         .context("read bound app-cli management address")?
@@ -1781,6 +1841,10 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
             api_monitor_state.cancel.cancel();
         }
     });
+    let _worker_control = match supervised_worker {
+        Some(worker) => Some(worker.serve(state.clone()).await?),
+        None => None,
+    };
 
     let migrate = state
         .journal
@@ -2040,7 +2104,24 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
             }
         }
     }
-    let mut first_request = if let Some(error) = startup_error.as_ref() {
+    if stop_intent {
+        // Only this authenticated successor writes business intent. The old
+        // worker is gone; unknown migrations and operation histories remain.
+        let store = crate::runtime_kernel::RuntimeStore::open_with_root(
+            state_root.clone(),
+            &args.workspace,
+        )?;
+        let (_, revision) = store.load_desired()?;
+        store.store_desired(
+            shared_types::DesiredState::Stopped,
+            revision
+                .checked_add(1)
+                .context("desired revision overflow")?,
+        )?;
+    }
+    let mut first_request = if stop_intent {
+        None
+    } else if let Some(error) = startup_error.as_ref() {
         state.begin_failure(format!("startup shutdown unconfirmed: {error:#}"), true);
         None
     } else if kernel_recovery_hold {
@@ -2134,7 +2215,21 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
         let driver_args = args.clone();
         let driver_state = state.clone();
         let mut driver = tokio::spawn(async move {
-            server_loop(&driver_args, &driver_state, host, first_request).await
+            driver_state
+                .supervision_driver_started
+                .store(true, std::sync::atomic::Ordering::Release);
+            // Poll challenges in the actual driver task, outside the business
+            // operation queue. Yielding downloads/migrations stay healthy; a
+            // blocked driver task or admission path cannot acknowledge them.
+            let mut probes = driver_state.supervision_probe_rx.lock().await;
+            let driver = server_loop(&driver_args, &driver_state, host, first_request);
+            tokio::pin!(driver);
+            loop {
+                tokio::select! {
+                    result = &mut driver => break result,
+                    Some(reply) = probes.recv() => { let _sent = reply.send(()); }
+                }
+            }
         });
         let mut joined = false;
         let (driver_result, shutdown_deadline) = tokio::select! {

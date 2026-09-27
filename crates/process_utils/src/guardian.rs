@@ -30,13 +30,18 @@ struct Receipt {
     phase: String,
     command_record: Option<PathBuf>,
     command_digest: String,
+    #[serde(default)]
+    root_status: Option<i64>,
+    #[serde(default)]
+    diagnostic_pid: Option<u32>,
 }
 fn save(root: &Path, receipt: &Receipt) -> Result<()> {
     let mut file = tempfile::NamedTempFile::new_in(root)?;
     serde_json::to_writer(&mut file, receipt)?;
     file.flush()?;
     file.as_file().sync_all()?;
-    file.persist(root.join("receipt.json"))?;
+    crate::atomic_file::persist(file, &root.join("receipt.json"))
+        .with_context(|| format!("publish command guardian receipt at {}", root.display()))?;
     #[cfg(unix)]
     File::open(root)?.sync_all()?;
     Ok(())
@@ -44,7 +49,7 @@ fn save(root: &Path, receipt: &Receipt) -> Result<()> {
 fn read(root: &Path) -> Result<Receipt> {
     let value: Receipt = serde_json::from_slice(&std::fs::read(root.join("receipt.json"))?)?;
     ensure!(
-        value.version == 1
+        matches!(value.version, 1 | 2)
             && matches!(
                 value.phase.as_str(),
                 "Pending" | "Running" | "Quiescent" | "Revoked"
@@ -81,7 +86,9 @@ impl OwnedChild {
     pub fn id(&self) -> Option<u32> {
         match self {
             Self::Direct(c) => c.id(),
-            Self::Guarded { child, .. } => child.id(),
+            // Expose the command's PID for logs/metrics, not its guardian's.
+            // The OS handle retained in `child` remains the stop authority.
+            Self::Guarded { root, .. } => read(root).ok().and_then(|r| r.diagnostic_pid),
         }
     }
     pub fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
@@ -99,13 +106,29 @@ impl OwnedChild {
     pub async fn wait_root(&mut self) -> std::io::Result<ExitStatus> {
         match self {
             Self::Direct(c) => c.wait_root().await.map_err(std::io::Error::other),
-            Self::Guarded { child, .. } => child.wait().await,
+            Self::Guarded { .. } => loop {
+                if let Some(status) = self.try_wait_root()? {
+                    return Ok(status);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            },
         }
     }
     pub fn try_wait_root(&mut self) -> std::io::Result<Option<ExitStatus>> {
         match self {
             Self::Direct(c) => c.try_wait_root(),
-            Self::Guarded { child, .. } => child.try_wait(),
+            Self::Guarded { child, root, .. } => {
+                let receipt = read(root).map_err(std::io::Error::other)?;
+                if let Some(raw) = receipt.root_status {
+                    return decode_status(raw).map(Some);
+                }
+                if child.try_wait()?.is_some() {
+                    return Err(std::io::Error::other(
+                        "command guardian exited without a command exit receipt",
+                    ));
+                }
+                Ok(None)
+            }
         }
     }
     pub async fn stop(&mut self, grace: Duration) -> StopOutcome {
@@ -151,7 +174,7 @@ fn confirm_command(root: &Path, receipt: &Receipt) -> Result<()> {
     serde_json::to_writer(&mut file, &value)?;
     file.flush()?;
     file.as_file().sync_all()?;
-    file.persist(path)?;
+    crate::atomic_file::persist(file, path).context("publish command cleanup receipt")?;
     #[cfg(unix)]
     File::open(parent)?.sync_all()?;
     Ok(())
@@ -174,9 +197,68 @@ fn confirmed(root: &Path) -> Result<()> {
     );
     Ok(())
 }
+
+/// Capture bounded diagnostics while continuously draining both output pipes.
+/// The deadline includes startup and execution; cleanup retains ownership even
+/// when the caller's wait expires.
+pub async fn output_owned(
+    mut command: tokio::process::Command,
+    budget: Duration,
+) -> Result<std::process::Output> {
+    let deadline = tokio::time::Instant::now() + budget;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = tokio::time::timeout_at(deadline, spawn_owned(command, None)).await??;
+    let stdout = child.take_stdout();
+    let stderr = child.take_stderr();
+    let out = tokio::spawn(capture(stdout));
+    let err = tokio::spawn(capture(stderr));
+    let result = tokio::time::timeout_at(deadline, child.wait_root()).await;
+    if child.stop(Duration::ZERO).await == StopOutcome::Unconfirmed {
+        crate::command_context::retain_cleanup(Some(child), None);
+        out.abort();
+        err.abort();
+        anyhow::bail!("owned command cleanup remains unconfirmed");
+    }
+    let status = match result {
+        Ok(result) => result?,
+        Err(error) => {
+            out.abort();
+            err.abort();
+            return Err(error).context("owned command deadline exceeded");
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out.await??,
+        stderr: err.await??,
+    })
+}
+async fn capture<R: tokio::io::AsyncRead + Unpin>(reader: Option<R>) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    if let Some(mut reader) = reader {
+        let mut buffer = [0u8; 8192];
+        loop {
+            let n = reader.read(&mut buffer).await?;
+            if n == 0 {
+                break;
+            }
+            let keep = n.min((1024 * 1024_usize).saturating_sub(output.len()));
+            output.extend_from_slice(&buffer[..keep]);
+        }
+    }
+    Ok(output)
+}
 pub async fn spawn_owned(
     command: tokio::process::Command,
     record: Option<&crate::command_context::CommandRecord>,
+) -> Result<OwnedChild> {
+    spawn_owned_with_output(command, record, true).await
+}
+
+pub async fn spawn_owned_with_output(
+    command: tokio::process::Command,
+    record: Option<&crate::command_context::CommandRecord>,
+    capture: bool,
 ) -> Result<OwnedChild> {
     match crate::command_context::CommandContext::current().and_then(|c| c.journal_root) {
         Some(commands) => {
@@ -184,11 +266,16 @@ pub async fn spawn_owned(
                 command,
                 commands.parent().context("work root missing")?,
                 record.and_then(|r| r.path()),
-                true,
+                capture,
             )
             .await
         }
-        None => Ok(OwnedChild::Direct(spawn_managed(command)?)),
+        None => match crate::command_authority::current_root() {
+            Some(root) => {
+                spawn_guarded(command, &root, record.and_then(|r| r.path()), capture).await
+            }
+            None => Ok(OwnedChild::Direct(spawn_managed(command)?)),
+        },
     }
 }
 pub async fn spawn_guarded(
@@ -197,6 +284,13 @@ pub async fn spawn_guarded(
     command_record: Option<&Path>,
     capture: bool,
 ) -> Result<OwnedChild> {
+    let admission = if crate::command_authority::is_managed(work_root)? {
+        let gate = crate::command_authority::Gate::acquire(work_root).await?;
+        gate.require_open()?;
+        Some(gate)
+    } else {
+        None
+    };
     let std = command.as_std();
     let spec = Spec {
         program: std.get_program().into(),
@@ -217,7 +311,9 @@ pub async fn spawn_guarded(
         .join(uuid::Uuid::new_v4().to_string());
     crate::command_context::create_durable_directory(&root)?;
     let receipt = Receipt {
-        version: 1,
+        version: 2,
+        root_status: None,
+        diagnostic_pid: None,
         id: root
             .file_name()
             .context("guardian id missing")?
@@ -232,6 +328,8 @@ pub async fn spawn_guarded(
             .collect::<String>(),
     };
     save(&root, &receipt)?;
+    // Registered before closure; a late guardian must consume under the same gate.
+    drop(admission);
     let mut guardian = tokio::process::Command::new(std::env::current_exe()?);
     guardian
         .arg("--native-command-guardian")
@@ -261,6 +359,22 @@ pub async fn spawn_guarded(
         .write_all(&bytes)
         .await
         .context("send guardian command")?;
+    // Spawn means the actual command has started, not merely its guardian.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let receipt = read(&root)?;
+            if receipt.diagnostic_pid.is_some() || receipt.root_status.is_some() {
+                return Ok::<_, anyhow::Error>(());
+            }
+            ensure!(
+                child.try_wait()?.is_none(),
+                "command guardian exited before command startup"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("command startup acknowledgement timed out")??;
     Ok(OwnedChild::Guarded {
         child,
         lease: Some(lease),
@@ -299,31 +413,42 @@ async fn execute_unconsumed(root: &Path, receipt: &mut Receipt) -> Result<i32> {
             "guardian command record outside original instance"
         );
     }
-    let scope = root
+    let work = root
         .parent()
         .and_then(Path::parent)
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .context("invalid guardian scope")?;
-    let owner: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(scope.join("owner.json"))?)?;
-    ensure!(
-        owner["instance_id"] == receipt.instance_id
-            && matches!(owner["phase"].as_str(), Some("Starting" | "Running")),
-        "original owner no longer authorizes spawn"
-    );
-    let owner_lock = File::options()
-        .read(true)
-        .write(true)
-        .open(scope.join("owner.lock"))?;
-    match owner_lock.try_lock() {
-        Err(std::fs::TryLockError::WouldBlock) => {}
-        Ok(()) => bail!("original owner has exited"),
-        Err(error) => bail!("cannot verify original owner lock: {error}"),
+        .context("guardian work root missing")?;
+    // Older proxy receipts keep their existing authority contract. New managed
+    // generations use the shared gate below, never proxy-specific owner.json.
+    if !crate::command_authority::is_managed(work)? {
+        let scope = root
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .context("invalid guardian scope")?;
+        let owner: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(scope.join("owner.json"))?)?;
+        ensure!(
+            owner["instance_id"] == receipt.instance_id
+                && matches!(owner["phase"].as_str(), Some("Starting" | "Running")),
+            "original owner no longer authorizes spawn"
+        );
+        let owner_lock = File::options()
+            .read(true)
+            .write(true)
+            .open(scope.join("owner.lock"))?;
+        match owner_lock.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Ok(()) => bail!("original owner has exited"),
+            Err(error) => bail!("cannot verify original owner lock: {error}"),
+        }
     }
     let mut input = tokio::io::BufReader::new(tokio::io::stdin());
     let mut bytes = Vec::new();
-    input.read_until(b'\n', &mut bytes).await?;
+    (&mut input)
+        .take(1024 * 1024 + 1)
+        .read_until(b'\n', &mut bytes)
+        .await?;
     ensure!(
         !bytes.is_empty() && bytes.len() <= 1024 * 1024 && bytes.last() == Some(&b'\n'),
         "invalid guardian command frame"
@@ -337,6 +462,17 @@ async fn execute_unconsumed(root: &Path, receipt: &mut Receipt) -> Result<i32> {
             == receipt.command_digest,
         "guardian command differs from original authorized specification"
     );
+    let work = root
+        .parent()
+        .and_then(Path::parent)
+        .context("guardian work root missing")?;
+    let admission = if crate::command_authority::is_managed(work)? {
+        let gate = crate::command_authority::Gate::acquire(work).await?;
+        gate.require_open()?;
+        Some(gate)
+    } else {
+        None
+    };
     let mut command = tokio::process::Command::new(spec.program);
     command
         .args(spec.args)
@@ -356,6 +492,7 @@ async fn execute_unconsumed(root: &Path, receipt: &mut Receipt) -> Result<i32> {
     if let Some(cwd) = spec.cwd {
         command.current_dir(cwd);
     }
+    crate::command_authority::detach_command(&mut command);
     // Mark the spawn window before the side effect. A guardian crash during
     // spawn must not be misread as unconsumed Pending during recovery.
     receipt.phase = "Running".into();
@@ -368,8 +505,18 @@ async fn execute_unconsumed(root: &Path, receipt: &mut Receipt) -> Result<i32> {
             return Err(error);
         }
     };
+    receipt.diagnostic_pid = child.id();
+    // A persistence failure must still retain and stop the actual command.
+    if let Err(error) = save(root, receipt) {
+        eprintln!("record owned root start: {error:#}");
+    }
+    drop(admission);
     let mut lease_byte = [0u8; 1];
     let exit = tokio::select! { result = child.wait_root() => result.ok(), _ = input.read(&mut lease_byte) => None };
+    receipt.root_status = exit.map(encode_status);
+    if let Err(error) = save(root, receipt) {
+        eprintln!("record owned root exit: {error:#}");
+    }
     loop {
         if !matches!(
             child.stop(Duration::from_secs(1)).await,
@@ -393,6 +540,32 @@ async fn execute_unconsumed(root: &Path, receipt: &mut Receipt) -> Result<i32> {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     Ok(exit.and_then(|s| s.code()).unwrap_or(1))
+}
+
+#[cfg(unix)]
+fn encode_status(status: ExitStatus) -> i64 {
+    use std::os::unix::process::ExitStatusExt;
+    i64::from(status.into_raw())
+}
+#[cfg(windows)]
+fn encode_status(status: ExitStatus) -> i64 {
+    // Windows always has an exit code; preserve all DWORD bits (including
+    // exception codes represented as a negative i32 by std).
+    i64::from(status.code().unwrap_or(1) as u32)
+}
+#[cfg(unix)]
+fn decode_status(raw: i64) -> std::io::Result<ExitStatus> {
+    use std::os::unix::process::ExitStatusExt;
+    Ok(ExitStatus::from_raw(
+        i32::try_from(raw).map_err(std::io::Error::other)?,
+    ))
+}
+#[cfg(windows)]
+fn decode_status(raw: i64) -> std::io::Result<ExitStatus> {
+    use std::os::windows::process::ExitStatusExt;
+    Ok(ExitStatus::from_raw(
+        u32::try_from(raw).map_err(std::io::Error::other)?,
+    ))
 }
 
 /// Called only while holding the original scope owner lock. Revocation under
@@ -447,6 +620,8 @@ mod tests {
         )
         .unwrap();
         let receipt = Receipt {
+            root_status: None,
+            diagnostic_pid: None,
             version: 1,
             id,
             instance_id: instance,
@@ -478,6 +653,8 @@ mod tests {
             &root,
             &Receipt {
                 version: 1,
+                root_status: None,
+                diagnostic_pid: None,
                 id,
                 instance_id: instance,
                 phase: "Running".into(),

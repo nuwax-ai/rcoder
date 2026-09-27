@@ -341,6 +341,7 @@ rcoder-proxy = { path = "crates/rcoder-proxy" }
 container-runtime-api = { path = "crates/container-runtime-api" }
 download_utils = { path = "crates/download_utils" }
 process_utils = { path = "crates/process_utils" }
+runtime-supervisor = { path = "crates/runtime-supervisor" }
 file-server = { path = "crates/file-server" }
 file-server-userapp = { path = "crates/file-server-userapp" }
 file-server-proxy = { path = "crates/file-server-proxy" }
@@ -372,4 +373,3 @@ debug = false
 [profile.dist]
 inherits = "release"
 lto = "thin"
-

@@ -107,3 +107,19 @@ CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_dev E2E_FILTER=userap
 一个场景复用同一临时 builder 和轻量 Python HTTP 服务：独立进程启动 app-cli owner → RCoder 停服务 → 新 HTTP 客户端重复停止 → 新 app-cli run 客户端转交启动，两轮后最终停止。核查真实 HTTP、同一 owner、只剩一个 app-cli、容器与工作区保留，并清理本次捕获的容器 ID。无 LLM、无七语言模板构建。详细阶段及镜像身份在场景目录 `manual-owner.json`。
 
 本场景验证同一项目运行目录上的多客户端顺序控制，不代表多 RCoder 副本并发、源码/制品目录切换、控制器 Stop/Restart 或 K8s 验收。
+
+### 闲置回收后的 owner 恢复与重新构建
+
+```bash
+CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_dev E2E_FILTER=userapp_dev_idle_recycle_owner_recovery
+```
+
+`idle_owner_recovery.py` 创建独立的 Compose RCoder、Turso 数据库、网络和工作目录，仅该实例采用 60 秒闲置阈值、5 秒扫描间隔。使用真实清理器连续两轮判闲置，不用 `docker rm` 代替被测回收动作，也不改日常 Compose 配置。无 LLM、外部依赖下载或七语言构建。
+
+同一场景依次验证：独立 app-cli owner → RCoder 构建并登记 → 闲置回收物理容器 → 原文件和旧 owner/journal 保留 → RCoder 重新 ensure → 直接 Start 恢复管理面并重新构建 → Stop/重复 Stop/Restart → 第二次真实回收 → 先 Stop 恢复管理面再 Restart 构建。两轮回收放在同一场景，避免先成功 Start 掩盖 Stop 自身的恢复问题。必须有不同的容器与 owner 身份、相同生命周期和挂载、构建计数实际递增，以及 HTTP 返回各轮新内容；任务 `completed` 本身不能使场景通过。
+
+为覆盖原 K8s 故障中“整卷保留”的条件，私有 builder 显式把 `APP_CLI_STATE_ROOT` 放在其持久日志挂载下。Docker 默认 `/home/user` 父目录可能不持久化，不能让 journal 随容器消失而掩盖恢复缺陷。此场景不证明 K8s PVC/STS/RBD 本身通过，个人 K8s 仍需对应验收。
+
+镜像默认是 `dev-master-rcoder:latest` 和 `dev-rcoder-agent-runner:latest`。运行前应重建与当前源码配套的 RCoder、agent_runner（内嵌 file-server）和 app-cli；可用 `E2E_IDLE_RCODER_IMAGE`、`E2E_IDLE_BUILDER_IMAGE` 指定已构建的独立测试镜像。测试固定解析后的 image ID，不在运行期间更新镜像；报告记录二进制 SHA-256，旧镜像的结果不能作为当前源码验收。
+
+报告在场景目录的 `idle-owner.json` 和 `idle-owner-runtime/`：保留每轮任务、owner、容器/挂载、回收日志及失败原因。退出或被启动器中断后只清理核验归属的测试容器/网络，保留数据库、工作区、构建计数与诊断证据，不清空登记、不手工改终态。

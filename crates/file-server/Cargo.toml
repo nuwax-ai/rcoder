@@ -31,6 +31,7 @@ path = "src/lib.rs"
 # 共享类型 (WORKSPACE_ROOT / COMPUTER_WORKSPACE_ROOT 常量)
 shared_types = { workspace = true }
 process_utils = { workspace = true }
+runtime-supervisor = { workspace = true }
 
 # Web 框架
 axum = { workspace = true }

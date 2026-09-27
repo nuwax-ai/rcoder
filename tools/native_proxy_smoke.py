@@ -85,12 +85,16 @@ def main():
             status, body = request('/api/computer/get-file-list?' + urllib.parse.urlencode(scope))
             assert status == 200 and b'hello.txt' in body, (status, body)
             result['checks'].append('HTTP write and file listing in space path')
+            scope_dir = next((root / 'state').glob('native-*'))
+            original_owner = json.loads((scope_dir / 'supervisor.json').read_text())['instance']
             with (root / 'duplicate.log').open('wb') as duplicate_log:
                 duplicate = subprocess.run(command, env=env, stdout=duplicate_log,
                                            stderr=subprocess.STDOUT, timeout=15)
-            assert duplicate.returncode != 0
+            assert duplicate.returncode == 0, 'duplicate launch should return the existing owner status'
+            observed = json.loads((root / 'duplicate.log').read_text())
+            assert observed['supervisor_id'] == original_owner
             assert process.poll() is None and request('/api/computer/fs/roots')[0] == 200
-            result['checks'].append('duplicate fixed listener fails without harming original')
+            result['checks'].append('duplicate launch reuses the same supervisor without disturbing HTTP')
             result['passed'] = True
         except Exception as error:
             result['error'] = str(error)

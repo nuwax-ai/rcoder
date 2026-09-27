@@ -3892,3 +3892,62 @@ async fn userapp_manual_owner_multi_process_control() {
     );
     assert!(report.finish(), "multi-process owner control failed");
 }
+
+/// Real two-scan idle reclamation, stale owner receipts, rebuild and controls.
+/// The short idle policy belongs only to the helper's private Compose instance.
+#[tokio::test]
+async fn userapp_dev_idle_recycle_owner_recovery() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let Some((_env, report)) =
+        Env::compose_or_skip("userapp_dev_idle_recycle_owner_recovery", "compose").await
+    else {
+        return;
+    };
+    let path = report
+        .path
+        .parent()
+        .expect("report directory")
+        .join("idle-owner.json");
+    let result = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tools/idle_owner_recovery.py"
+        ))
+        .arg("--report")
+        .arg(&path)
+        .status();
+    report.assert_hard(
+        "idle recovery scenario completed",
+        result.is_ok_and(|status| status.success()),
+        "See idle-owner.json for physical identities, task results and cleanup evidence".into(),
+    );
+    // Record missing/invalid evidence as failure instead of panicking before
+    // scenario_end; the strict launcher also checks every mandatory step.
+    let evidence = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    if let Some(evidence) = evidence {
+        if let Some(checks) = evidence["checks"].as_array() {
+            for check in checks {
+                report.assert_hard(
+                    check["name"].as_str().unwrap_or("invalid evidence check"),
+                    check["ok"] == true,
+                    check["detail"].to_string(),
+                );
+            }
+        }
+        report.assert_hard(
+            "idle fixture cleanup confirmed with data retained",
+            evidence["cleanup_ok"] == true,
+            evidence["cleanup_error"].to_string(),
+        );
+    } else {
+        report.assert_hard(
+            "idle fixture evidence readable",
+            false,
+            path.display().to_string(),
+        );
+    }
+    assert!(report.finish(), "idle owner recovery failed");
+}

@@ -136,6 +136,17 @@ def cleanup_case(case_id, run_id, directory, existing_ids=()):
             (receipt_path.parent / 'fallback-cleanup.json').write_text(json.dumps(result, indent=2))
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
             errors.append('Turso isolated runtime cleanup failed: ' + type(error).__name__)
+    idle_root = directory / 'idle-owner-runtime'
+    if (idle_root / 'ownership.json').exists():
+        try:
+            receipt = json.loads((idle_root / 'ownership.json').read_text())
+            managed_names.update({receipt['project'] + '-rcoder-1',
+                                  'rcoder-app-builder-' + receipt['app_id']})
+            from idle_owner_recovery import cleanup as cleanup_idle_owner
+            result = cleanup_idle_owner(idle_root, run_id, case_id, existing_ids)
+            (idle_root / 'fallback-cleanup.json').write_text(json.dumps(result, indent=2))
+        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+            errors.append('Idle owner fixture cleanup failed: ' + type(error).__name__)
     try:
         ids = command('docker', 'ps', '-aq', '--no-trunc').split()
         # Never persist the full inspect result, which includes secrets.

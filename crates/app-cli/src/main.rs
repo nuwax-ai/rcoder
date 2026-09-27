@@ -5,8 +5,14 @@ use clap::Parser;
 
 use app_cli::CliArgs;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    if let Some(result) = runtime_supervisor::auxiliary_entry() {
+        std::process::exit(result?);
+    }
+    runtime_supervisor::runtime()?.block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     let args = match CliArgs::parse().command {
         app_cli::config::Command::GenLock(args) => {
             return app_cli::devtool::gen_lock(&args.workspace.workspace, args.dev).await;
@@ -22,9 +28,13 @@ async fn main() -> anyhow::Result<()> {
         }
         app_cli::config::Command::Serve(args) => {
             let runtime = app_cli::RuntimeArgs::from(args);
+            if let Some(code) = app_cli::supervision::supervise(&runtime, true).await? {
+                std::process::exit(code);
+            }
             let _guard = init_tracing(&runtime.log_dir);
             return app_cli::server::serve(&runtime).await;
         }
+        app_cli::config::Command::Owner(args) => return app_cli::supervision::control(&args).await,
         app_cli::config::Command::RunService(args) => {
             let _guard = init_tracing(&args.log_dir);
             return app_cli::run_service::run(&args.release_id, &args.service_id, &args.log_dir);
@@ -58,6 +68,9 @@ async fn main() -> anyhow::Result<()> {
         }
         app_cli::config::Command::Run(args) => app_cli::RuntimeArgs::from(args),
     };
+    if let Some(code) = app_cli::supervision::supervise(&args, false).await? {
+        std::process::exit(code);
+    }
     let _guard = init_tracing(&args.log_dir);
 
     // ── legacy 直跑路径 ──
@@ -82,32 +95,39 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| "unknown-app".to_string());
         let state_root =
             app_cli::runtime_kernel::RuntimeStore::resolve_root(&args.workspace, &application_id)?;
-        match app_cli::platform::owner_guard::OwnerGuard::try_acquire(&state_root)? {
-            Some(guard) => guard,
-            None => {
-                anyhow::ensure!(
-                    !app_cli::deploy::deploy_requested(),
-                    "workspace already has an owner; submit artifact deployment through its deployment API"
-                );
-                tracing::info!(
-                    "owner lock held; dispatching to the running owner at {}",
-                    args.admin_addr
-                );
-                let dispatch = app_cli::owner_dispatch::dispatch_to_owner(
-                    &args.admin_addr,
-                    &args.workspace,
-                    &state_root,
-                    &application_id,
-                )
-                .await?;
-                match dispatch {
-                    app_cli::owner_dispatch::OwnerDispatch::Terminal(view) => {
-                        return app_cli::owner_dispatch::describe_terminal(&view);
-                    }
-                    app_cli::owner_dispatch::OwnerDispatch::NoOwner => {
-                        anyhow::bail!(
-                            "owner disappeared during dispatch; no operation was submitted"
-                        );
+        if runtime_supervisor::Worker::from_env(&state_root)
+            .await?
+            .is_some()
+        {
+            None
+        } else {
+            match app_cli::platform::owner_guard::OwnerGuard::try_acquire(&state_root)? {
+                Some(guard) => Some(guard),
+                None => {
+                    anyhow::ensure!(
+                        !app_cli::deploy::deploy_requested(),
+                        "workspace already has an owner; submit artifact deployment through its deployment API"
+                    );
+                    tracing::info!(
+                        "owner lock held; dispatching to the running owner at {}",
+                        args.admin_addr
+                    );
+                    let dispatch = app_cli::owner_dispatch::dispatch_to_owner(
+                        &args.admin_addr,
+                        &args.workspace,
+                        &state_root,
+                        &application_id,
+                    )
+                    .await?;
+                    match dispatch {
+                        app_cli::owner_dispatch::OwnerDispatch::Terminal(view) => {
+                            return app_cli::owner_dispatch::describe_terminal(&view);
+                        }
+                        app_cli::owner_dispatch::OwnerDispatch::NoOwner => {
+                            anyhow::bail!(
+                                "owner disappeared during dispatch; no operation was submitted"
+                            );
+                        }
                     }
                 }
             }
@@ -121,8 +141,9 @@ async fn main() -> anyhow::Result<()> {
             .await
             .unwrap_or(false)
     {
-        app_cli::idle::serve_forever(&args.admin_addr).await;
-        return Ok(());
+        // The supervised empty workspace still needs a cancellable management
+        // path. Reuse serve's idle API instead of an unobservable idle loop.
+        return app_cli::server::serve(&args).await;
     }
 
     // 管理 API 预绑定（P1-01）：bind 成功才进入 deploy_stage/supervisor——
@@ -164,6 +185,19 @@ async fn main() -> anyhow::Result<()> {
         }
         api_cancel.cancel();
     });
+    let worker =
+        runtime_supervisor::Worker::from_env(&app_cli::supervision::scope(&args.workspace)?)
+            .await?;
+    let _worker_control = match worker {
+        Some(worker) => Some(
+            worker
+                .serve(Arc::new(app_cli::supervision::ForegroundControl {
+                    cancellation: supervisor_cancel.clone(),
+                }))
+                .await?,
+        ),
+        None => None,
+    };
 
     // 部署段（仅 env 有 APP_DEPLOY_URL 时执行）：API 已绑定3010，kubelet
     // liveness 由 /health 覆盖；deploy 期间 /ready 503（initializing 门控）。

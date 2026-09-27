@@ -155,14 +155,17 @@ pub(crate) async fn dev_start(
 
 /// 停止开发服务
 ///
-/// 按 app_id 定位进程组，无需 pid。
+/// 按 app_id 定位运行所有者，无需 pid。新版 app-cli 的业务控制无响应时，
+/// 使用同一工作区的独立监督通道停止原执行代次；确认清理后恢复停止态的管理入口。
+/// 这不会退出 file-server-proxy、删除工作区或重跑迁移。监督控制已在处理其他
+/// 显式请求时返回冲突，不内部排队；有界等待到期不表示已经停止。
 /// **联动取消该 app 在途的 start/restart 任务**——否则编译中的任务会在
 /// 编译完成后把刚停的服务重新拉起（停止意图被异步任务推翻）。
 #[utoipa::path(
     post,
     path = "/dev/stop",
     request_body = DevOpBody,
-    responses((status = 200, body = HttpResult<UserappDevStopped>, description = "停止结果（含进程组杀灭明细）")),
+    responses((status = 200, body = HttpResult<UserappDevStopped>, description = "已确认的停止结果；未确认清理、其他控制正在执行或等待超时通过错误响应返回，不能视为停止成功")),
     tag = "Userapp · dev · 进程管理"
 )]
 pub(crate) async fn dev_stop(

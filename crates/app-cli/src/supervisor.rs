@@ -15,11 +15,12 @@ use tracing::{error, info, warn};
 use crate::config::RuntimeArgs;
 use crate::manifest::{self, ServiceSpec};
 use crate::orchestration_events::{FailedService, OrchestrationEvent, emit as emit_event};
-use crate::platform::process_tree::{ManagedChild, StopOutcome, spawn_managed};
+use crate::platform::process_tree::StopOutcome;
 use crate::proxy::admin_probe;
 use crate::proxy::compiler::compile_and_validate;
 use crate::proxy::pingap::PINGAP_PORT;
 use crate::runtime_status::RuntimeStatusService;
+use process_utils::guardian::{OwnedChild as ManagedChild, spawn_owned};
 
 /// supervisor 全部真实子进程（业务服务 / migrate / pingap）统一走受管进程树：
 /// Unix 进程组 / Windows Job Object（R01——spawn 前归属无逃逸窗口，停止收束整树）。
@@ -900,15 +901,29 @@ async fn wait_for_pg_targets(
                 // Both engines may be dropped by their owning control future.
                 // psql is invoked directly (no shell or background descendants).
                 .kill_on_drop(true);
-            let mut child = command
-                .spawn()
+            let mut child = spawn_owned(command, None)
+                .await
                 .context("spawn PostgreSQL target database probe")?;
+            if let Some(mut pipe) = child.take_stdout() {
+                tokio::spawn(async move {
+                    drop(tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await);
+                });
+            }
+            if let Some(mut pipe) = child.take_stderr() {
+                tokio::spawn(async move {
+                    drop(tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await);
+                });
+            }
             let attempt_deadline =
                 deadline.min(tokio::time::Instant::now() + Duration::from_secs(3));
             let outcome = tokio::select! {
                 _ = cancel.cancelled() => None,
-                result = tokio::time::timeout_at(attempt_deadline, child.wait()) => Some(result),
+                result = tokio::time::timeout_at(attempt_deadline, child.wait_root()) => Some(result),
             };
+            if child.stop(Duration::ZERO).await == StopOutcome::Unconfirmed {
+                process_utils::command_context::retain_cleanup(Some(child), None);
+                anyhow::bail!("PostgreSQL probe cleanup remains unconfirmed");
+            }
             match outcome {
                 Some(Ok(Ok(status))) if status.success() => {
                     anyhow::ensure!(
@@ -924,10 +939,6 @@ async fn wait_for_pg_targets(
                 _ => {
                     // kill() waits/reaps as well. Never start a migration after
                     // cancellation or an unconfirmed child cleanup.
-                    tokio::time::timeout(Duration::from_secs(2), child.kill())
-                        .await
-                        .context("PostgreSQL probe cleanup timed out")?
-                        .context("stop PostgreSQL target database probe")?;
                     anyhow::ensure!(
                         !cancel.is_cancelled(),
                         "PostgreSQL readiness wait cancelled"
@@ -1066,7 +1077,8 @@ async fn start_service(
         .env("APP_RELEASE_ID", release_id);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let mut child = spawn_managed(cmd)
+    let mut child = spawn_owned(cmd, None)
+        .await
         .with_context(|| format!("spawn {}: {}", spec.service_id, argv.join(" ")))?;
 
     // pipe → 带轮转的日志文件（append 模式，不 truncate；超 10MB rotate，保留 3 份）
@@ -1200,8 +1212,9 @@ async fn run_transient_cancellable(
         .envs(env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child =
-        spawn_managed(cmd).with_context(|| format!("spawn migrate: {}", argv.join(" ")))?;
+    let mut child = spawn_owned(cmd, None)
+        .await
+        .with_context(|| format!("spawn migrate: {}", argv.join(" ")))?;
 
     // 并发 drain stdout/stderr：防 pipe 被写满阻塞 + 捕获失败原因
     let stdout = child.take_stdout();
@@ -1320,7 +1333,9 @@ async fn start_pingap(
         .env("PINGAP_ADMIN_ADDR", &endpoint.addr)
         .env("PINGAP_ADMIN_USER", &endpoint.user)
         .env("PINGAP_ADMIN_PASSWORD", &endpoint.password);
-    let child = spawn_managed(cmd).context("spawn pingap")?;
+    let child = process_utils::guardian::spawn_owned_with_output(cmd, None, false)
+        .await
+        .context("spawn pingap")?;
     info!(
         "🚀 start pingap on :{} (pid={})",
         PINGAP_PORT,
@@ -1785,7 +1800,7 @@ mod tests {
         command
             .args(["-c", "trap '' TERM; echo ready; exec sleep 30"])
             .stdout(Stdio::piped());
-        let mut child = spawn_managed(command).unwrap();
+        let mut child = spawn_owned(command, None).await.unwrap();
         let pid = child.id().unwrap();
         let mut lines = tokio::io::BufReader::new(child.take_stdout().unwrap()).lines();
         assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("ready"));
@@ -1807,7 +1822,7 @@ mod tests {
             .args(["-c", "sleep 60 & exit 0"])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = spawn_managed(command).unwrap();
+        let mut child = spawn_owned(command, None).await.unwrap();
         let pid = child.id().unwrap();
         // 等 root 退出事实落地（孙进程仍在）
         let status = tokio::time::timeout(Duration::from_secs(5), child.wait_root())

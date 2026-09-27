@@ -53,6 +53,8 @@ struct CoordinatorOwner {
     #[serde(default)]
     state: OwnerState,
     process_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_generation: Option<String>,
 }
 
 pub(crate) struct Journal {
@@ -375,6 +377,15 @@ impl Journal {
         if self.previous_owner.is_none() && self.receipt.is_none() {
             return Ok(());
         }
+        if let Some(generation) = self
+            .previous_owner
+            .as_ref()
+            .and_then(|owner| owner.worker_generation.as_deref())
+        {
+            runtime_supervisor::verify_quiescent(&self.root, generation)
+                .context("previous native execution cleanup remains unconfirmed")?;
+            return Ok(());
+        }
         let previous = self
             .previous_owner
             .as_ref()
@@ -393,6 +404,7 @@ impl Journal {
         let owner = CoordinatorOwner {
             state: OwnerState::Active,
             process_scope: self.process_scope.clone(),
+            worker_generation: current_worker_generation(),
         };
         self.previous_owner = Some(self.write_verified(".deploy-coordinator.json", &owner)?);
         Ok(())
@@ -403,12 +415,15 @@ impl Journal {
             .as_ref()
             .context("coordinator ownership was never claimed")?;
         anyhow::ensure!(
-            previous.state == OwnerState::Active && previous.process_scope == self.process_scope,
+            previous.state == OwnerState::Active
+                && previous.process_scope == self.process_scope
+                && previous.worker_generation == current_worker_generation(),
             "coordinator ownership changed before shutdown"
         );
         let owner = CoordinatorOwner {
             state: OwnerState::Quiescent,
             process_scope: self.process_scope.clone(),
+            worker_generation: current_worker_generation(),
         };
         self.previous_owner = Some(self.write_verified(".deploy-coordinator.json", &owner)?);
         Ok(())
@@ -598,8 +613,17 @@ pub fn adopt_superseded_legacy_with_root(
     Ok(report)
 }
 
-/// A new Linux PID namespace proves that processes from the previous container
-/// cannot still own this workspace. A process restart in the same namespace does not.
+/// Current shared supervisor generation; cleanup is proved by its guardian.
+fn current_worker_generation() -> Option<String> {
+    process_utils::command_authority::current_root()?
+        .file_name()?
+        .to_str()
+        .map(str::to_owned)
+}
+
+/// Legacy container identity. This predates the shared supervisor and relies
+/// on the container orchestrator having stopped the previous instance. It is
+/// not sufficient evidence for retiring shared supervisor generations.
 fn process_scope() -> Option<String> {
     let namespace = std::fs::read_link("/proc/1/ns/pid").ok()?;
     let stat = std::fs::read_to_string("/proc/1/stat").ok()?;

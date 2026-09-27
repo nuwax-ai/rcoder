@@ -42,6 +42,9 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 tempfile = { workspace = true }
 process_utils = { workspace = true }
+runtime-supervisor = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
 
 # 轻量 HTTP 反代用 hyper: 生命周期需可编程 start/stop/restart
 # (pingora Server run_forever 无停机 API, 无法支撑运行时切换 60000 归属)

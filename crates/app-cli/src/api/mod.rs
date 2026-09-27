@@ -128,6 +128,23 @@ pub async fn bind(
     pingap_bin: PathBuf,
     server: Arc<ServerState>,
 ) -> Result<(tokio::net::TcpListener, Router)> {
+    let listener = bind_listener(addr).await?;
+    let app = bound_router(workspace, log_dir, pingap_bin, server);
+    Ok((listener, app))
+}
+
+pub(crate) async fn bind_listener(addr: &str) -> Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind app-cli API {addr}"))
+}
+
+pub(crate) fn bound_router(
+    workspace: PathBuf,
+    log_dir: PathBuf,
+    pingap_bin: PathBuf,
+    server: Arc<ServerState>,
+) -> Router {
     // Legacy run captures its startup profile here; serve replaces it when
     // an operation selects the actual execution workspace/profile.
     server.set_proxy_context(workspace, crate::supervisor::dev_run_profile());
@@ -139,12 +156,7 @@ pub async fn bind(
             server,
         )),
     };
-    let app = api_router(state);
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("bind app-cli API {addr}"))?;
-    tracing::info!("app-cli management API listening on http://{addr}");
-    Ok((listener, app))
+    api_router(state)
 }
 
 /// 便捷包装（bind + 常驻 serve）：不监督运行期故障，仅供测试等简单场景；

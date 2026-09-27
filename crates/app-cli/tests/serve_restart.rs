@@ -117,53 +117,24 @@ async fn empty_native_serve_can_restart_after_clean_sigterm() {
 }
 
 #[tokio::test]
-async fn rejected_native_serve_sigterm_does_not_clear_previous_active_owner() {
+async fn native_serve_recovers_confirmed_generation_after_supervisor_crash() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("code");
     let logs = root.path().join("logs");
     let (mut first, first_url) = start(&workspace, &logs);
     expect_phase(&mut first, &first_url, "idle").await;
-    let owner = runtime_state_layout::ensure_state_root(&workspace, None, None)
-        .unwrap()
-        .join(".deploy-coordinator.json");
-    // API 先于 ownership 落盘可答（P1-01 预绑定）——断言依赖 coordinator
-    // 已提交，先等它出现再 kill（消除 kill 早于 commit_coordinator 的竞态）。
-    let claim_deadline = Instant::now() + Duration::from_secs(10);
-    while !owner.exists() {
-        assert!(
-            Instant::now() < claim_deadline,
-            "first serve never claimed coordinator ownership"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let scope = runtime_state_layout::ensure_state_root(&workspace, None, None).unwrap();
+    let before = runtime_supervisor::last_snapshot(&scope).unwrap();
     first.0.kill().unwrap();
     first.0.wait().unwrap();
-    let before = std::fs::read(&owner).unwrap();
-    let (mut rejected, url) = start(&workspace, &logs);
-    expect_phase(&mut rejected, &url, "orchestrating").await;
-    assert!(
-        Command::new("kill")
-            .args(["-TERM", &rejected.0.id().to_string()])
-            .status()
-            .unwrap()
-            .success()
-    );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(status) = rejected.0.try_wait().unwrap() {
-            assert!(
-                !status.success(),
-                "unclaimed coordinator must report failed startup"
-            );
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "rejected server did not terminate"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(std::fs::read(&owner).unwrap(), before);
-    let (mut third, third_url) = start(&workspace, &logs);
-    expect_phase(&mut third, &third_url, "orchestrating").await;
+    // The old test expected all crash restarts to remain blocked. A supervised
+    // generation now has positive cleanup evidence; the successor may recover.
+    let (mut second, second_url) = start(&workspace, &logs);
+    expect_phase(&mut second, &second_url, "idle").await;
+    let old_generation = before.generation.as_deref().unwrap();
+    runtime_supervisor::verify_quiescent(&scope, old_generation).unwrap();
+    let after = runtime_supervisor::last_snapshot(&scope).unwrap();
+    assert_ne!(before.generation, after.generation);
+    assert_ne!(before.supervisor_id, after.supervisor_id);
+    stop_cleanly(&mut second).await;
 }

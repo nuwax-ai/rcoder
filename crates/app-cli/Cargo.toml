@@ -25,6 +25,8 @@ path = "tests/fixtures/tree_fixture.rs"
 workspace-manifest = { path = "../workspace-manifest" }
 # unix 进程组信号工具（含 PID 1 防御，与 rcoder workspace 共用同一实现）
 process_utils = { path = "../process_utils" }
+runtime-supervisor = { path = "../runtime-supervisor" }
+async-trait = "0.1"
 # 跨进程 wire 契约（日志域 DTO 单一事实源；rcoder 文档 schema 同源派生）
 shared_types = { path = "../shared_types" }
 # 运行态状态根解析契约（R09：与 file-server 同一解析规则；独立 crate 两边共用）

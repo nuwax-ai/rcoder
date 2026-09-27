@@ -3,9 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
-    io::Write,
     path::{Path, PathBuf},
-    process::Stdio,
     time::Duration,
 };
 
@@ -21,20 +19,6 @@ fn directory(root: &Path, id: &str) -> Result<PathBuf, String> {
     uuid::Uuid::parse_str(id).map_err(|e| format!("invalid supervisor identity: {e}"))?;
     Ok(root.join("supervisors").join(id))
 }
-fn write(root: &Path, value: &Witness) -> Result<(), String> {
-    let mut file = tempfile::NamedTempFile::new_in(root).map_err(|e| e.to_string())?;
-    serde_json::to_writer(&mut file, value).map_err(|e| e.to_string())?;
-    file.flush()
-        .and_then(|()| file.as_file().sync_all())
-        .map_err(|e| e.to_string())?;
-    file.persist(root.join("witness.json"))
-        .map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    File::open(root)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
 fn read(root: &Path, id: &str, instance: &str) -> Result<Witness, String> {
     let path = directory(root, id)?;
     let value: Witness = serde_json::from_slice(
@@ -47,6 +31,16 @@ fn read(root: &Path, id: &str, instance: &str) -> Result<Witness, String> {
     Ok(value)
 }
 pub fn verify_live(root: &Path, id: &str, instance: &str) -> Result<(), String> {
+    uuid::Uuid::parse_str(instance).map_err(|e| format!("invalid execution identity: {e}"))?;
+    if root
+        .join("work")
+        .join(instance)
+        .join("generation.json")
+        .try_exists()
+        .map_err(|e| e.to_string())?
+    {
+        return runtime_supervisor::verify_live(root, id, instance).map_err(|e| format!("{e:#}"));
+    }
     let value = read(root, id, instance)?;
     if !matches!(value.phase.as_str(), "SpawnPending" | "Running") {
         return Err("owner supervisor no longer authorizes launch".into());
@@ -62,6 +56,22 @@ pub fn verify_live(root: &Path, id: &str, instance: &str) -> Result<(), String> 
     }
 }
 pub fn verify_exited(root: &Path, id: &str, instance: &str) -> Result<(), String> {
+    uuid::Uuid::parse_str(instance).map_err(|e| format!("invalid execution identity: {e}"))?;
+    if root
+        .join("work")
+        .join(instance)
+        .join("generation.json")
+        .try_exists()
+        .map_err(|e| e.to_string())?
+    {
+        let receipt =
+            runtime_supervisor::verify_quiescent(root, instance).map_err(|e| format!("{e:#}"))?;
+        return if receipt.supervisor_id == id {
+            Ok(())
+        } else {
+            Err("supervisor identity mismatch".into())
+        };
+    }
     let value = read(root, id, instance)?;
     if value.phase != "OwnerExited" {
         return Err("original owner exit unconfirmed; witness preserved".into());
@@ -69,65 +79,28 @@ pub fn verify_exited(root: &Path, id: &str, instance: &str) -> Result<(), String
     Ok(())
 }
 pub async fn run(root: &Path, args: &[String]) -> Result<i32, String> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let instance = std::env::var("FILE_SERVER_PROXY_LAUNCH_ID")
-        .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
-    uuid::Uuid::parse_str(&instance).map_err(|e| e.to_string())?;
-    let path = directory(root, &id)?;
-    process_utils::command_context::create_durable_directory(&path).map_err(|e| e.to_string())?;
-    let lock = File::options()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(path.join("witness.lock"))
-        .map_err(|e| e.to_string())?;
-    lock.try_lock().map_err(|e| e.to_string())?;
-    let mut witness = Witness {
-        version: 1,
-        supervisor_id: id.clone(),
-        instance_id: instance.clone(),
-        phase: "SpawnPending".into(),
+    let owner = runtime_supervisor::Owner::try_acquire(root).map_err(|e| format!("{e:#}"))?;
+    let Some(owner) = owner else {
+        println!(
+            "{}",
+            crate::native_control::control(root, "status", None).await?
+        );
+        return Ok(0);
     };
-    write(&path, &witness)?;
-    let mut command =
-        tokio::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
-    command
-        .arg("start")
-        .arg("--native-owner")
-        .args(args)
-        .env("FILE_SERVER_PROXY_OWNER_SUPERVISOR", &id)
-        .env("FILE_SERVER_PROXY_LAUNCH_ID", &instance)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("spawn native owner: {e}"))?;
-    witness.phase = "Running".into();
-    // A failed witness write must not abandon the actual owner child handle.
-    let mut stopping = write(&path, &witness).is_err();
-    let signal = crate::shutdown_signal();
-    tokio::pin!(signal);
-    let status = loop {
-        tokio::select! {
-            result = child.wait() => break result.map_err(|e| format!("owner exit unknown: {e}"))?,
-            result = &mut signal, if !stopping => { if let Err(error) = result { eprintln!("native signal registration failed: {error}"); } stopping = true; }
-            () = tokio::time::sleep(Duration::from_millis(200)), if stopping => {
-                // Every automatic signal is bound to this launch, never the
-                // successor receipt currently occupying the same scope.
-                let _stop = crate::native_control::control(root,"stop",Some(&instance)).await;
-            }
+    let mut options = runtime_supervisor::Options::new(args.iter().map(Into::into).collect());
+    options.binding = Some(runtime_supervisor::Binding {
+        component: "file-server-proxy".into(),
+        resource: std::fs::canonicalize(root).map_err(|e| e.to_string())?,
+    });
+    options.policy.graceful_stop = Duration::from_secs(30);
+    let cancellation = options.shutdown.clone();
+    let signal = tokio::spawn(async move {
+        if let Err(error) = crate::shutdown_signal().await {
+            eprintln!("native signal error: {error}");
         }
-    };
-    witness.phase = "OwnerExited".into();
-    loop {
-        match write(&path, &witness) {
-            Ok(()) => break,
-            Err(error) => {
-                eprintln!("native owner exit receipt pending: {error}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
-    Ok(status.code().unwrap_or(1))
+        cancellation.cancel();
+    });
+    let result = owner.run(options).await.map_err(|e| format!("{e:#}"));
+    signal.abort();
+    result
 }

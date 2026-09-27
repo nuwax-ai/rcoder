@@ -17,6 +17,7 @@ mod external_store;
 pub mod log;
 mod owner_client;
 mod owner_recovery;
+mod owner_supervision;
 pub mod port_pool;
 pub mod process;
 mod start;

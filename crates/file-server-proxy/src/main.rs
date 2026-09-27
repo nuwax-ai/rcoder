@@ -187,20 +187,29 @@ fn init_tracing_plain() {
         .init();
 }
 
-#[tokio::main]
-async fn main() {
-    if std::env::args_os().nth(1).as_deref()
-        == Some(std::ffi::OsStr::new("--native-command-guardian"))
-    {
-        let Some(root) = std::env::args_os().nth(2) else {
-            fail("guardian root missing".into());
-        };
-        match process_utils::guardian::run(std::path::Path::new(&root)).await {
+fn main() {
+    if let Some(result) = runtime_supervisor::auxiliary_entry() {
+        match result {
             Ok(code) => std::process::exit(code),
             Err(error) => fail(format!("guardian failed: {error:#}")),
         }
     }
+    match runtime_supervisor::runtime() {
+        Ok(runtime) => runtime.block_on(run()),
+        Err(error) => fail(format!("initialize proxy runtime: {error}")),
+    }
+}
+async fn run() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let request_id = if let Some(index) = args.iter().position(|arg| arg == "--request-id") {
+        args.remove(index);
+        if index >= args.len() {
+            fail("missing --request-id value".into());
+        }
+        Some(args.remove(index))
+    } else {
+        None
+    };
     let expected_instance = if let Some(index) = args.iter().position(|arg| arg == "--instance-id")
     {
         args.remove(index);
@@ -211,7 +220,6 @@ async fn main() {
     } else {
         None
     };
-    let native = args.iter().any(|a| a == "--native-owner");
     args.retain(|a| a != "--native-owner");
     let action = args
         .first()
@@ -241,23 +249,29 @@ async fn main() {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "0.0.0.0".into());
-    let owner_root = if native || action.is_some() {
-        Some(native_control::directory(&host, settings.listen_port).unwrap_or_else(|e| fail(e)))
-    } else {
-        None
-    };
+    let owner_root =
+        Some(native_control::directory(&host, settings.listen_port).unwrap_or_else(|e| fail(e)));
     if let (Some(root), Some(action)) = (&owner_root, action.as_deref())
         && matches!(action, "stop" | "status" | "restart" | "recover" | "retire")
     {
-        match native_control::control(
+        let supervised = root
+            .join("supervisor.json")
+            .try_exists()
+            .unwrap_or_else(|e| fail(format!("read supervisor discovery: {e}")));
+        match native_control::control_with_request(
             root,
-            if action == "restart" { "stop" } else { action },
+            if action == "restart" && !supervised {
+                "stop"
+            } else {
+                action
+            },
             expected_instance.as_deref(),
+            request_id.as_deref(),
         )
         .await
         {
             Ok(result) => {
-                if action != "restart" {
+                if action != "restart" || supervised {
                     println!("{result}");
                     return;
                 }
@@ -266,7 +280,7 @@ async fn main() {
         }
     }
     if let Some(root) = &owner_root
-        && std::env::var_os("FILE_SERVER_PROXY_OWNER_SUPERVISOR").is_none()
+        && std::env::var_os(runtime_supervisor::WORKER_ENV).is_none()
     {
         match native_supervisor::run(root, &args).await {
             Ok(code) => std::process::exit(code),

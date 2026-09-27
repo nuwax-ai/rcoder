@@ -37,6 +37,7 @@ pub mod runtime_status;
 pub mod server;
 mod startup_probe;
 pub mod static_hosting;
+pub mod supervision;
 pub mod supervisor;
 pub mod supervisord_host;
 pub mod svc_spec;

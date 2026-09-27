@@ -37,6 +37,7 @@ include make/observability.mk
 include make/remote-k8s.mk
 include make/dev-host.mk
 include make/file-server-ab.mk
+include make/native-runtime.mk
 
 # 本地编译（仅编译，不构建镜像）
 build:

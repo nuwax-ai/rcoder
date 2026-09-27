@@ -83,11 +83,9 @@ pub async fn compile_and_validate(
         .await
         .with_context(|| format!("write Pingap config {}", temporary.display()))?;
     set_private_permissions(&temporary).await?;
-    let output = Command::new(pingap_bin)
-        .arg("-t")
-        .arg("-c")
-        .arg(&temporary)
-        .output()
+    let mut command = Command::new(pingap_bin);
+    command.arg("-t").arg("-c").arg(&temporary);
+    let output = process_utils::guardian::output_owned(command, std::time::Duration::from_secs(30))
         .await
         .with_context(|| format!("execute {} -t", pingap_bin.display()))?;
     if !output.status.success() {

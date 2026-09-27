@@ -172,6 +172,7 @@ impl DevServerManager {
             .stdin(std::process::Stdio::null())
             .stdout(output.try_clone()?)
             .stderr(output);
+        process_utils::command_authority::detach_command(&mut command);
         #[cfg(unix)]
         command.process_group(0);
         let child = command

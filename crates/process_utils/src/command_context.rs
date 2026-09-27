@@ -166,7 +166,7 @@ impl CommandRecord {
         )?;
         temp.flush()?;
         temp.as_file().sync_all()?;
-        temp.persist(path).map_err(|e| e.error)?;
+        crate::atomic_file::persist(temp, path)?;
         #[cfg(unix)]
         std::fs::File::open(root)?.sync_all()?;
         Ok(())

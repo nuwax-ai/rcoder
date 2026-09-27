@@ -91,7 +91,7 @@ fn write(root: &Path, receipt: &Receipt) -> Result<(), String> {
     file.flush()
         .and_then(|()| file.as_file().sync_all())
         .map_err(|e| format!("sync owner receipt: {e}"))?;
-    file.persist(root.join("owner.json"))
+    process_utils::atomic_file::persist(file, &root.join("owner.json"))
         .map_err(|e| format!("publish owner receipt: {e}"))?;
     #[cfg(unix)]
     File::open(root)
@@ -122,7 +122,8 @@ async fn send<T: Serialize>(stream: &mut tokio::net::TcpStream, value: &T) -> Re
 }
 
 pub struct Owner {
-    _lock: File,
+    _lock: Option<File>,
+    worker: Option<runtime_supervisor::Worker>,
     root: PathBuf,
     receipt: Receipt,
     listener: tokio::net::TcpListener,
@@ -130,33 +131,171 @@ pub struct Owner {
     #[cfg(feature = "embed-file-server")]
     embedded: Option<file_server_userapp::EmbeddedRuntimeHandle>,
 }
+
+struct ProxyControl {
+    probe: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
+    shutdown: CancellationToken,
+}
+#[async_trait::async_trait]
+impl runtime_supervisor::WorkerControl for ProxyControl {
+    async fn probe(&self) -> Result<(), anyhow::Error> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.probe
+            .try_send(reply)
+            .map_err(|_| anyhow::anyhow!("proxy control loop is busy or stopped"))?;
+        receiver.await.map_err(Into::into)
+    }
+    async fn shutdown(&self) -> Result<(), anyhow::Error> {
+        self.shutdown.cancel();
+        Ok(())
+    }
+}
+
+async fn supervised_control(
+    root: &Path,
+    action: &str,
+    expected: Option<&str>,
+    request_id: Option<&str>,
+) -> Result<String, String> {
+    use runtime_supervisor::{Action, Request, control as request};
+    let action = match action {
+        "status" => Action::Status,
+        "stop" | "retire" => Action::Shutdown,
+        "restart" | "recover" => Action::Recover,
+        _ => return Err("unsupported supervisor action".into()),
+    };
+    let mut command = Request::new(action);
+    if let Some(id) = request_id {
+        command.request_id = id.into();
+    }
+    command.expected_generation = expected.map(str::to_owned);
+    let accepted = match request(root, command.clone()).await {
+        Ok(value) => value,
+        Err(error) => {
+            let Some(owner) =
+                runtime_supervisor::Owner::try_acquire(root).map_err(|e| format!("{e:#}"))?
+            else {
+                return Err(format!("{error:#}"));
+            };
+            if action == Action::Shutdown {
+                return supervisor_reply(
+                    owner
+                        .stop_offline(&command)
+                        .await
+                        .map_err(|e| format!("{e:#}"))?,
+                );
+            }
+            if action == Action::Status {
+                let mut value =
+                    runtime_supervisor::last_snapshot(root).map_err(|e| format!("{e:#}"))?;
+                if value.phase != "stopped" {
+                    value.phase = "recovery_required".into();
+                    value.error = Some(
+                        "supervisor is offline; start it to reconcile the previous execution"
+                            .into(),
+                    );
+                }
+                return supervisor_reply(value);
+            }
+            return Err(format!(
+                "supervisor is offline; run start to recover management: {error:#}"
+            ));
+        }
+    };
+    if action == Action::Status || (action == Action::Recover && accepted.phase == "ready") {
+        return supervisor_reply(accepted);
+    }
+    let previous = accepted.generation.clone();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let current = match request(root, command.clone()).await {
+            Ok(value) => value,
+            Err(_) => runtime_supervisor::last_snapshot(root).map_err(|e| format!("{e:#}"))?,
+        };
+        if current.supervisor_id != accepted.supervisor_id {
+            return Err("supervisor changed while control was pending".into());
+        }
+        if action == Action::Shutdown && current.phase == "stopped" {
+            if let Some(generation) = current.generation.as_deref() {
+                runtime_supervisor::verify_quiescent(root, generation)
+                    .map_err(|e| format!("{e:#}"))?;
+            }
+            return supervisor_reply(current);
+        }
+        if action == Action::Recover && current.phase == "ready" && current.generation != previous {
+            return supervisor_reply(current);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "control remains pending (operation={}, phase={}): {}",
+                accepted.operation_id.as_deref().unwrap_or("unknown"),
+                current.phase,
+                current.error.as_deref().unwrap_or("awaiting cleanup")
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+fn supervisor_reply(snapshot: runtime_supervisor::Snapshot) -> Result<String, String> {
+    let phase = match snapshot.phase.as_str() {
+        "ready" => "Running",
+        "stopped" => "Stopped",
+        "starting" => "Starting",
+        "stopping" | "cleanup_pending" => "Stopping",
+        _ => "RecoveryRequired",
+    };
+    serde_json::to_string(
+        &serde_json::json!({"version":2,"instance_id":snapshot.generation,
+        "supervisor_id":snapshot.supervisor_id,"phase":phase,"stage":snapshot.phase,
+        "operation_id":snapshot.operation_id,"error":snapshot.error}),
+    )
+    .map_err(|e| e.to_string())
+}
 impl Owner {
     pub async fn acquire(root: PathBuf) -> Result<Self, String> {
         process_utils::command_context::create_durable_directory(&root)
             .map_err(|e| format!("create owner directory: {e}"))?;
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(root.join("owner.lock"))
-            .map_err(|e| format!("open owner lock: {e}"))?;
-        lock.try_lock()
-            .map_err(|e| format!("native owner already held or inaccessible: {e}"))?;
-        if read(&root)?.is_some_and(|r| r.phase != "Stopped") {
-            return Err("previous owner outcome unknown; receipt preserved, explicit reconciliation required".into());
+        let root = std::fs::canonicalize(root)
+            .map_err(|e| format!("canonicalize owner directory: {e}"))?;
+        let worker = runtime_supervisor::Worker::from_env(&root)
+            .await
+            .map_err(|e| format!("worker authorization: {e:#}"))?;
+        let lock = if worker.is_some() {
+            None
+        } else {
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(root.join("owner.lock"))
+                .map_err(|e| format!("open owner lock: {e}"))?;
+            lock.try_lock()
+                .map_err(|e| format!("native owner already held or inaccessible: {e}"))?;
+            Some(lock)
+        };
+        if let Some(previous) = read(&root)?.filter(|r| r.phase != "Stopped") {
+            if worker.is_some() {
+                recover_under_owner_lock(&root, Some(&previous.instance_id))?;
+            } else {
+                return Err("previous owner outcome unknown; receipt preserved, explicit reconciliation required".into());
+            }
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| format!("bind native control: {e}"))?;
         let receipt = Receipt {
             version: VERSION,
-            instance_id: match std::env::var("FILE_SERVER_PROXY_LAUNCH_ID") {
-                Ok(value) => uuid::Uuid::parse_str(&value)
-                    .map_err(|_| "invalid native launch identity")?
-                    .to_string(),
-                Err(std::env::VarError::NotPresent) => uuid::Uuid::new_v4().to_string(),
-                Err(error) => return Err(format!("read launch identity: {error}")),
+            instance_id: if let Some(worker) = &worker {
+                worker.generation().to_owned()
+            } else {
+                match std::env::var("FILE_SERVER_PROXY_LAUNCH_ID") {
+                    Ok(value) => uuid::Uuid::parse_str(&value)
+                        .map_err(|_| "invalid native launch identity")?
+                        .to_string(),
+                    Err(std::env::VarError::NotPresent) => uuid::Uuid::new_v4().to_string(),
+                    Err(error) => return Err(format!("read launch identity: {error}")),
+                }
             },
             token: format!(
                 "{}{}",
@@ -169,7 +308,10 @@ impl Owner {
                 .to_string(),
             address: String::new(),
             phase: "Starting".into(),
-            supervisor_id: std::env::var("FILE_SERVER_PROXY_OWNER_SUPERVISOR").ok(),
+            supervisor_id: worker
+                .as_ref()
+                .map(|w| w.supervisor_id().to_owned())
+                .or_else(|| std::env::var("FILE_SERVER_PROXY_OWNER_SUPERVISOR").ok()),
             retirement_requested: false,
         };
         if let Some(id) = &receipt.supervisor_id {
@@ -178,6 +320,7 @@ impl Owner {
         write(&root, &receipt)?;
         Ok(Self {
             _lock: lock,
+            worker,
             root,
             receipt,
             listener,
@@ -261,6 +404,20 @@ impl Owner {
         write(&self.root, &self.receipt)
     }
     pub async fn run(mut self, shutdown: CancellationToken) -> Result<(), String> {
+        let (probe_tx, mut probes) =
+            tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<()>>(4);
+        let _control = match self.worker.take() {
+            Some(worker) => Some(
+                worker
+                    .serve(std::sync::Arc::new(ProxyControl {
+                        probe: probe_tx,
+                        shutdown: shutdown.clone(),
+                    }))
+                    .await
+                    .map_err(|e| format!("supervision endpoint: {e:#}"))?,
+            ),
+            None => None,
+        };
         let mut shutdown_observed = false;
         let mut fatal_error: Option<String> = None;
         let mut cleanup_retry = tokio::time::interval(Duration::from_secs(1));
@@ -268,6 +425,7 @@ impl Owner {
         let mut observation = tokio::time::interval(Duration::from_millis(200));
         loop {
             tokio::select! {
+                Some(reply) = probes.recv() => { let _sent = reply.send(()); }
                 _ = cleanup_retry.tick(), if fatal_error.is_some() => {
                     match self.stop().await {
                         Ok(()) => return Err(fatal_error.take().unwrap_or_default()),
@@ -449,6 +607,14 @@ fn recover(root: &Path, expected_instance: Option<&str>) -> Result<String, Strin
         .map_err(|e| e.to_string())?;
     lock.try_lock()
         .map_err(|e| format!("owner remains active or inaccessible: {e}"))?;
+    recover_under_owner_lock(root, Some(expected))
+}
+
+fn recover_under_owner_lock(
+    root: &Path,
+    expected_instance: Option<&str>,
+) -> Result<String, String> {
+    let expected = expected_instance.ok_or("original owner instance required")?;
     let mut receipt = read(root)?.ok_or("original owner receipt missing")?;
     if receipt.instance_id != expected {
         return Err("recover identity differs from original owner".into());
@@ -502,7 +668,7 @@ fn recover(root: &Path, expected_instance: Option<&str>) -> Result<String, Strin
                 temp.flush()
                     .and_then(|()| temp.as_file().sync_all())
                     .map_err(|e| e.to_string())?;
-                temp.persist(path).map_err(|e| e.to_string())?;
+                process_utils::atomic_file::persist(temp, &path).map_err(|e| e.to_string())?;
             }
         }
         #[cfg(unix)]
@@ -595,6 +761,25 @@ pub async fn control(
     action: &str,
     expected_instance: Option<&str>,
 ) -> Result<String, String> {
+    control_with_request(root, action, expected_instance, None).await
+}
+
+pub async fn control_with_request(
+    root: &Path,
+    action: &str,
+    expected_instance: Option<&str>,
+    request_id: Option<&str>,
+) -> Result<String, String> {
+    if root
+        .join("supervisor.json")
+        .try_exists()
+        .map_err(|e| e.to_string())?
+    {
+        return supervised_control(root, action, expected_instance, request_id).await;
+    }
+    if request_id.is_some() {
+        return Err("request identity requires the supervised owner protocol".into());
+    }
     if action == "recover" {
         return recover(root, expected_instance);
     }

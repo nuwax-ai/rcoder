@@ -24,11 +24,34 @@ pub enum Command {
     RunService(RunServiceArgs),
     /// 纯只读业务就绪查询（GET 管理 API；不进入 serve/run、不启动 owner）。
     Readiness(ReadinessArgs),
+    /// 独立监督控制，不依赖 3010 API 能否响应。
+    Owner(OwnerArgs),
     /// 部署 journal 运维（双权威域裁决等）。
     Journal {
         #[command(subcommand)]
         command: JournalCommand,
     },
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+pub enum OwnerAction {
+    Status,
+    Recover,
+    Stop,
+    Shutdown,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct OwnerArgs {
+    #[arg(value_enum)]
+    pub action: OwnerAction,
+    #[command(flatten)]
+    pub workspace: WorkspaceArgs,
+    /// 重试同一操作时沿用；不提供则生成新的请求 ID。
+    #[arg(long)]
+    pub request_id: Option<String>,
+    #[arg(long)]
+    pub generation: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]

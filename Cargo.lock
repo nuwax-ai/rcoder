@@ -3556,6 +3556,7 @@ dependencies = [
  "regex",
  "reqwest",
  "runtime-state-layout",
+ "runtime-supervisor",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -3602,6 +3603,8 @@ dependencies = [
 name = "file-server-proxy"
 version = "0.2.3"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "axum",
  "bytes",
  "file-server",
@@ -3611,6 +3614,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "process_utils",
+ "runtime-supervisor",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -11539,6 +11543,22 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "runtime-supervisor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "process_utils",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
