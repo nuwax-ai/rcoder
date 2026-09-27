@@ -104,7 +104,7 @@ OrbStack 首次创建 UserApp PVC/Pod 可能超过默认 90 秒，运行前可�
 CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_dev E2E_FILTER=userapp_manual_owner_multi_process_control
 ```
 
-一个场景复用同一临时 builder 和轻量 Python HTTP 服务：独立进程启动 app-cli owner → RCoder 停服务 → 新 HTTP 客户端重复停止 → 新 app-cli run 客户端转交启动，两轮后最终停止。核查真实 HTTP、同一 owner、只剩一个 app-cli、容器与工作区保留，并清理本次捕获的容器 ID。无 LLM、无七语言模板构建。详细阶段及镜像身份在场景目录 `manual-owner.json`。
+一个场景复用同一临时 builder 和轻量 Python HTTP 服务：独立进程启动 app-cli owner → RCoder 停服务 → 新 HTTP 客户端重复停止 → 新 app-cli run 客户端转交启动，两轮后最终停止。核查真实 HTTP、同一 owner/监督父进程、唯一活动执行代次、容器与工作区保留，并清理本次捕获的容器 ID。无 LLM、无七语言模板构建。详细阶段及镜像身份在场景目录 `manual-owner.json`。
 
 本场景验证同一项目运行目录上的多客户端顺序控制，不代表多 RCoder 副本并发、源码/制品目录切换、控制器 Stop/Restart 或 K8s 验收。
 
@@ -115,6 +115,8 @@ CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_dev E2E_FILTER=userap
 ```
 
 `idle_owner_recovery.py` 创建独立的 Compose RCoder、Turso 数据库、网络和工作目录，仅该实例采用 60 秒闲置阈值、5 秒扫描间隔。使用真实清理器连续两轮判闲置，不用 `docker rm` 代替被测回收动作，也不改日常 Compose 配置。无 LLM、外部依赖下载或七语言构建。
+
+第一轮额外挂起捕获的 root guardian，确保真实回收后必须消费绑定原物理容器和挂载的退出证据，不能只依赖优雅关闭碰巧成功。
 
 同一场景依次验证：独立 app-cli owner → RCoder 构建并登记 → 闲置回收物理容器 → 原文件和旧 owner/journal 保留 → RCoder 重新 ensure → 直接 Start 恢复管理面并重新构建 → Stop/重复 Stop/Restart → 第二次真实回收 → 先 Stop 恢复管理面再 Restart 构建。两轮回收放在同一场景，避免先成功 Start 掩盖 Stop 自身的恢复问题。必须有不同的容器与 owner 身份、相同生命周期和挂载、构建计数实际递增，以及 HTTP 返回各轮新内容；任务 `completed` 本身不能使场景通过。
 

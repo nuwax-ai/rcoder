@@ -6,6 +6,35 @@ use clap::Parser;
 use app_cli::CliArgs;
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new("--app-cli-container-stop"))
+    {
+        anyhow::ensure!(
+            std::env::args_os().count() == 3,
+            "container stop requires workspace"
+        );
+        let root = std::env::args_os()
+            .nth(2)
+            .context("container stop workspace missing")?;
+        return runtime_supervisor::runtime()?.block_on(
+            app_cli::supervision::drain_for_container_stop(std::path::Path::new(&root)),
+        );
+    }
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new("--app-cli-domain-recovery"))
+    {
+        return app_cli::supervision::physical_domain_recovery(std::env::args_os().skip(2));
+    }
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new("--app-cli-cleanup-engine"))
+    {
+        anyhow::ensure!(
+            std::env::args_os().count() == 2,
+            "unexpected cleanup argument"
+        );
+        return runtime_supervisor::runtime()?
+            .block_on(app_cli::supervision::cleanup_external_engine());
+    }
     if let Some(result) = runtime_supervisor::auxiliary_entry() {
         std::process::exit(result?);
     }

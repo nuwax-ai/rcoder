@@ -89,7 +89,9 @@ glob = "web*.log*"
 format = "jsonl"
 
 [services.env]
-"#
+TREE_FIXTURE_READY = "{}/grandchild-ready"
+"#,
+        root.display()
     );
     std::fs::write(workspace.join("release.lock.toml"), lock).expect("write lock");
     workspace
@@ -338,13 +340,23 @@ fn startup_failure_cleanup_converges_service_tree() {
     let workspace = fixture_workspace(root.path(), svc_port, gc_port);
     let mut cli = spawn_cli(&workspace, root.path(), &admin_addr, "/bin/false", false);
 
-    // pingap -t（/bin/false）立即失败 → run_inner Err → shutdown_all(children)
-    // → 非零退出。服务 root 可能刚 spawn 就被兜底清理（端口转瞬即逝），
-    // 不能把"端口曾可达"当启动证据——以孙进程占口（pingap 阶段前必达）
-    // + 进程进入退出路径为启动/清理链证据。
+    // The fixture acknowledges the real bind before its health endpoint is
+    // available. Keep that durable evidence: a fast cleanup can release the
+    // port before this test process is scheduled to observe it.
     let startup = Instant::now() + Duration::from_secs(20);
-    wait_port_taken(gc_port, startup, "grandchild");
-    // 孙进程持口 = 编排已进入服务启动阶段（root 已 spawn，无论是否已被清理）
+    let receipt = root.path().join("grandchild-ready");
+    while !receipt.exists() {
+        assert!(
+            Instant::now() < startup,
+            "grandchild never acknowledged bind"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let bound = std::fs::read_to_string(receipt).expect("grandchild bind evidence");
+    assert_eq!(
+        bound.split_whitespace().nth(1),
+        Some(gc_port.to_string().as_str())
+    );
 
     // pingap -t 必然失败 → run_inner Err → shutdown_all(children) → 非零退出
     let exit_deadline = Instant::now() + Duration::from_secs(20);

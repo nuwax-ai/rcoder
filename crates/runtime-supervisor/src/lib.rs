@@ -3,12 +3,16 @@
 //! This crate proves local process quiescence. It never authorizes replay of a
 //! database migration or claims that a remote operation completed successfully.
 mod control;
+pub mod domain;
 mod guardian;
 mod monitor;
 mod record;
 mod worker;
 
-pub use control::{Action, Binding, Request, Snapshot, control, last_snapshot};
+pub use control::{
+    Action, Binding, FailureCode, Phase, Problem, RecoveryError, Request, Snapshot, control,
+    last_snapshot,
+};
 pub use monitor::{Options, Owner, Policy};
 pub use record::{Intent, Quiescence, verify_live, verify_quiescent};
 pub use worker::{Worker, WorkerControl};
@@ -16,6 +20,28 @@ pub use worker::{Worker, WorkerControl};
 pub const WORKER_ENV: &str = "RCODER_SUPERVISOR_WORKER";
 pub const TOKEN_ENV: &str = "RCODER_SUPERVISOR_TOKEN";
 const GUARDIAN_ARG: &str = "--runtime-worker-guardian";
+
+/// Validate a cleanup-only callback launched by the guardian retaining the
+/// original generation lock. This grants no right to spawn business commands.
+pub fn verify_cleanup_callback() -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    let root = std::env::var_os("RCODER_SUPERVISOR_CLEANUP_ROOT")
+        .context("cleanup callback root missing")?;
+    let root = std::path::Path::new(&root);
+    let value = record::generation(root)?;
+    ensure!(
+        value.phase == record::GenerationPhase::Draining,
+        "cleanup callback generation is not draining"
+    );
+    ensure!(
+        std::env::var("RCODER_SUPERVISOR_CLEANUP_TOKEN")
+            .ok()
+            .as_deref()
+            == Some(value.token.as_str()),
+        "cleanup callback identity mismatch"
+    );
+    record::is_locked(&root.join("generation.lock"))
+}
 
 /// Supervisors and short-lived control clients do little work. Do not allocate
 /// one scheduler thread per CPU for each additional parent process. The actual

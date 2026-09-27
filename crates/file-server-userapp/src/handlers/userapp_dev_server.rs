@@ -165,7 +165,7 @@ pub(crate) async fn dev_start(
     post,
     path = "/dev/stop",
     request_body = DevOpBody,
-    responses((status = 200, body = HttpResult<UserappDevStopped>, description = "已确认的停止结果；未确认清理、其他控制正在执行或等待超时通过错误响应返回，不能视为停止成功")),
+    responses((status = 200, body = HttpResult<UserappDevStopped>, description = "成功信封表示已确认停止；冲突返回 ERR_CONFLICT。监督恢复受阻时 data 包含 supervisor_id、generation、operation_id、phase 和 problem.code/message；不能将未确认清理或超时当作停止成功")),
     tag = "Userapp · dev · 进程管理"
 )]
 pub(crate) async fn dev_stop(
@@ -836,7 +836,7 @@ mod precheck_reply_tests {
     params(("operation_id" = String, Path, description = "Original runtime operation ID")),
     request_body = DevOpBody,
     responses(
-        (status = 200, body = HttpResult<DevOperationRecovery>, description = "Original operation observed or replayed; inspect state, this is not a promise of success"),
+        (status = 200, body = HttpResult<DevOperationRecovery>, description = "Original operation observed or replayed; inspect state, not a promise of success. ERR_CONFLICT recovery data includes supervisor_id, generation, operation_id, phase and problem; cleanup_pending is still in progress, recovery_required needs physical evidence."),
         (status = 400, description = "Invalid app, original credential mismatch, owner changed or recovery protected")
     ),
     description = "Explicitly resume the original operation after lost response or file-server restart. No source rebuild, no new operation ID. app_id identifies the application; optional pg must match the originally captured credentials. base_path is unused. Return state may still be running or RecoveryRequired.",

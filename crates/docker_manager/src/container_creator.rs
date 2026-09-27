@@ -162,6 +162,13 @@ impl<'a> ContainerCreator<'a> {
         // 与 K8s build_standard_labels 的身份载体，rcoder 重启后 Docker API list
         // 仍可按 label 还原身份（当前消费侧未切换，铺重启窗口 label 直读）
         container_body.labels = config_labels;
+        if protected_builder {
+            crate::native_domain::stamp(&self.manager.docker, &mut container_body)
+                .await
+                .map_err(|e| {
+                    DockerError::ConfigurationError(format!("bind builder execution domain: {e:#}"))
+                })?;
+        }
 
         // 10. 创建并启动容器
         debug!(

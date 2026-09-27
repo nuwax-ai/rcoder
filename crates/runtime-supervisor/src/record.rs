@@ -30,6 +30,8 @@ pub(crate) struct Generation {
     pub worker_pid: Option<u32>,
     pub exit_code: Option<i32>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_domain: Option<crate::domain::PhysicalDomain>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum GenerationPhase {
@@ -145,6 +147,19 @@ pub(crate) fn reconcile(scope: &Path) -> Result<()> {
         } // legacy adapter owns legacy receipts
         let _lock = lock(&root.join("generation.lock"))?;
         let mut value = generation(&root)?;
+        if matches!(
+            value.phase,
+            GenerationPhase::Running | GenerationPhase::Draining
+        ) && crate::domain::has_confirmed_exit(&root, &value)?
+        {
+            process_utils::command_authority::Gate::try_acquire(&root)?.close()?;
+            process_utils::guardian::confirm_physical_domain_exit(&root)?;
+            value.phase = GenerationPhase::Quiescent;
+            // No exit code is invented and no business journal is edited.
+            value.error =
+                Some("physical runtime confirmed exit; business outcomes remain unchanged".into());
+            save(&root.join("generation.json"), &value)?;
+        }
         if value.phase == GenerationPhase::Pending {
             process_utils::command_authority::Gate::try_acquire(&root)?.close()?;
             value.phase = GenerationPhase::Revoked;

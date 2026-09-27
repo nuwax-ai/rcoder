@@ -31,7 +31,9 @@ impl IntoResponse for UserAppError {
             AppError::Validation(..) | AppError::ValidationI18n(..) | AppError::Business(_) => {
                 (ec::ERR_VALIDATION, StatusCode::BAD_REQUEST)
             }
-            AppError::Conflict(_) => (ec::ERR_CONFLICT, StatusCode::CONFLICT),
+            AppError::Conflict(_) | AppError::RuntimeRecovery(..) => {
+                (ec::ERR_CONFLICT, StatusCode::CONFLICT)
+            }
             AppError::Resource(_) => (ec::ERR_NOT_FOUND, StatusCode::NOT_FOUND),
             AppError::Network(_) => (ec::ERR_SERVICE_UNAVAILABLE, StatusCode::BAD_GATEWAY),
             AppError::Permission(_)
@@ -43,7 +45,10 @@ impl IntoResponse for UserAppError {
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
         };
-        let result = HttpResult::<()>::error(code, &self.0.to_string());
+        let mut result = HttpResult::<serde_json::Value>::error(code, &self.0.to_string());
+        if let AppError::RuntimeRecovery(_, details) = &self.0 {
+            result.data = Some(details.clone());
+        }
         Json(result).into_response()
     }
 }
@@ -61,5 +66,36 @@ pub fn reply<T: Serialize>(
     match r {
         Ok(data) => Ok(success_reply(data)),
         Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn management_recovery_preserves_identity_and_reason_in_userapp_envelope() {
+        let details = serde_json::json!({
+            "supervisor_id": "original-owner", "generation": "original-generation",
+            "operation_id": "original-stop", "phase": "recovery_required",
+            "problem": {"code": "cleanup_unconfirmed", "message": "physical exit unconfirmed"}
+        });
+        let response = UserAppError::from(AppError::RuntimeRecovery(
+            "management recovery required".into(),
+            details.clone(),
+        ))
+        .into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "preserve UserApp envelope contract"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], shared_types::error_codes::ERR_CONFLICT);
+        assert_eq!(body["success"], false);
+        assert_eq!(body["data"], details);
     }
 }

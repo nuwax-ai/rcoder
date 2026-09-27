@@ -4,7 +4,7 @@
 
 两个 CLI 共用 `runtime-supervisor` Rust 库，不需要安装第三个守护服务。每个 CLI 有自己的监督父进程、执行进程和按需启动的命令 guardian；“单实例”指同一状态根只有一个有效执行者，不是整个应用只有一个操作系统进程。
 
-当前实现面向 native 故障恢复。macOS、Linux、Windows 使用同一复合场景验证，具体源码与实机记录见本轮交付说明。**容器整体强杀/宿主机重启的恢复交接尚未闭环，暂不能据此升级容器镜像或宣布完整部署验收。**
+当前实现覆盖 native 管理进程恢复、Docker builder 整体退出后的身份核验，以及容器回收前的有界收束。macOS、Linux、Windows 使用同一复合场景；源码检查、组件测试和实际部署验收分别记录。K8s 非优雅整体退出、宿主机重启等缺少正向退出证据的情形仍有下述边界，不能只凭组件测试升级生产镜像。
 
 ## 正常使用
 
@@ -22,7 +22,7 @@ file-server-proxy stop --request-id proxy-stop-20260927
 
 app-cli 的 `owner stop` 停止业务执行，并恢复管理入口到已停止状态；随后可显式启动业务。`owner recover` 收束旧执行进程，再恢复管理入口，业务能否继续由既有 journal 决定。`owner shutdown` 结束该 CLI。停止 file-server-proxy 不等于停止 app-cli，即使后者最初由 proxy 启动。
 
-CLI `owner` 命令返回包含 `operation_id`、`generation` 和 `phase` 的 JSON。受理的 `stopping` 不是完成；使用同一请求 ID 和参数重试可读取原结果。不要把一次退出码 0 当成业务停止已经完成。相同 ID 改参数会拒绝；不同控制请求在已有用户控制尚未完成时返回 Busy，不做内部排队。
+CLI `owner` 命令返回包含 `operation_id`、`generation`、`supervisor_id` 和 `phase` 的 JSON；有恢复缺口时还包含结构化 `problem.code/message`。受理的 `stopping` 不是完成；使用同一请求 ID 和参数重试可读取原结果。不要把一次退出码 0 当成业务停止已经完成。相同 ID 改参数会拒绝；不同控制请求在已有用户控制尚未完成时返回 Busy，不做内部排队。
 
 状态根应位于固定、可写且不随部署目录替换的位置。app-cli 沿用 `APP_CLI_STATE_ROOT`/原工作区解析；proxy 沿用 `FILE_SERVER_PROXY_STATE_DIR`。不能删除或换名 `owner.lock` 来解除占用。
 
@@ -35,7 +35,7 @@ CLI `owner` 命令返回包含 `operation_id`、`generation` 和 `phase` 的 JSO
 
 父监督进程意外退出时，其专用 pipe 关闭，guardian 继续完成清理。下一次启动/停止可接续原控制记录。PID 仅用于诊断和启动握手，不是事后杀进程的凭据；不通过进程名、端口号猜测清理对象。
 
-监督父进程使用 2 个 Tokio 工作线程，guardian 使用轻量单线程 runtime；业务执行进程沿用原调度配置。Windows 回执原子替换遇到临时共享冲突最多重试 500ms，失败保留旧文件并上报。
+监督父进程使用 2 个 Tokio 工作线程，guardian 使用轻量单线程 runtime；业务执行进程沿用原调度配置。Windows 回执原子替换遇到临时共享冲突最多重试 500ms，失败保留旧文件并上报。命令的原回执在共享文件系统上暂时不可见时，启动/退出观察最多重读 250ms，仍持有原 Child；持续缺失或内容损坏明确失败，不生成替代命令、不推断退出成功。
 
 默认控制探测每 2 秒一次，连续至少三次且无响应持续 15 秒才进入收束；首次管理初始化有 30 秒观察预算。自动恢复限额为 10 分钟内三次。睡眠或长调度间隔后重新采样，不累计补发过期心跳。
 
@@ -43,9 +43,12 @@ CLI `owner` 命令返回包含 `operation_id`、`generation` 和 `phase` 的 JSO
 
 - 收束过程返回 `cleanup_pending` 时，仍可通过独立控制通道查询。不要将其当成业务 Ready。
 - 旧版没有监督回执的挂起进程，不能升级后凭 PID 自动接管；保留已有身份诊断与处置要求。
-- 若整个容器、宿主机或 guardian 同时被强杀，可能没有正向清理回执。当前会保留 `cleanup_pending`。**更换 Pod UID、PID namespace、端口拒连或取得文件锁，都不会自动使旧代次变为已清理。**后续需接入运行时确认原物理实例已退出的交接；不能清空整个状态目录绕过。
-- supervisord 引擎的动态 program 是另一种进程归属，尚需完成独立适配及 Compose/K8s 验收；固定 PG/dbx/ttyd 不属于 app-cli 业务 Stop 的清理范围。
-- 外层系统服务管理器必须给内部收束留出预算，不能用无条件 autorestart 抵消显式 shutdown。本轮未修改部署仓的外层配置。
+- Docker 新建/重建的受管理 builder 会记录 Docker daemon 身份、独立执行域标记和原数据挂载指纹。平台确认旧执行域的容器已经删除、同一 daemon 上没有仍可启动的旧容器，且新容器数据绑定一致后，通过捕获的容器 ID 写入对应监督代次的物理退出回执。原运行代次与命令才能退役；迁移结果、发布 journal 和业务期望状态不改成成功。
+- 旧版无执行域标记的容器不补造退出证据。K8s 在闲置回收前尝试有界管理收束，随后只删除预先捕获的资源 UID；收束失败不阻止物理停止。**K8s 整体非优雅退出、宿主机断电，以及仍存在但已停止的 Docker 旧容器，尚不能自动签发物理退出回执。**更换 Pod UID、端口拒连或取得文件锁均不是退出证明，不应清空状态目录绕过。
+- supervisord 引擎收束先撤回动态配置，再停止和移除 `app-svc-*`/`app-pingap` 组，并复核进程表。配置撤回或 reload 失败时仍尝试停止动态组，但保留失败结果。worker 在第一次外部变更前记录所用引擎；该引擎的 socket 消失不能被视作 builtin 清理成功。root guardian 在 worker 与命令退出后执行同一清理适配器，外部清理未确认时不提交 Quiescent；固定 PG/dbx/ttyd 保留。
+- `cleanup_pending` 表示仍在收束；`recovery_required` 表示当前缺少继续恢复所需的证据。file-server Start/Stop/Recover 同时查询独立监督通道，返回监督代次、操作和原因；不能只轮询公共 3010 并给出泛化超时。仍在清理的状态在同一总预算内等待。
+- 私有监督控制协议现为 v2（结构化错误）。磁盘 v1 记录可读，新旧活动监督进程不混用私有控制协议；部署时两个 CLI、agent_runner 与 RCoder 需要配套更新并重启旧管理父进程。公开业务协议版本没有因此改变。
+- 外层系统服务管理器必须给内部收束留出预算，不能用无条件 autorestart 抵消显式 shutdown。部署仓的 app-cli 与 proxy program 已调整为 `autorestart=unexpected`、`exitcodes=0`、`startsecs=0`，并留出 90 秒外层停止预算；仍需随配套镜像实测。
 - 正常 HTTP/SSE 仍由执行进程提供；换代期间可能短暂断连，不重放用户 POST。
 
 ## 快速复合验收
@@ -63,3 +66,14 @@ make test-native-runtime NATIVE_PYTHON=/path/to/python \
 同一测试依次覆盖真实 app-cli 启动、文件服务 Stop、重复控制、挂起后强制收束、原监督退出后的管理恢复、proxy 重新拉起独立 app-cli、proxy 被杀/停止时 app-cli 继续运行，以及工作区标记保留。报告包含二进制 SHA-256、平台和每条断言，输出到指定目录的独立用例子目录。
 
 本场景是 native 进程与 HTTP 复合验证，不替代完整 UserApp 构建部署、未知迁移恢复、Compose/K8s 或容器整体断电场景。
+
+## 容器闲置回收回归
+
+构建包含同一源码版本的 RCoder、agent_runner、app-cli 的测试镜像后执行：
+
+```bash
+E2E_SUITE=compose_userapp_dev \
+E2E_FILTER=userapp_dev_idle_recycle_owner_recovery make test-e2e
+```
+
+可用 `E2E_IDLE_RCODER_IMAGE` 和 `E2E_IDLE_BUILDER_IMAGE` 指定隔离镜像。该场景由真实闲置回收器完成两次回收：第一轮挂起捕获的 guardian，强制验证原卷上未完成代次通过物理退出证据恢复；第二轮验证优雅退出后首次 Stop、再次 Restart。断言包含真实构建计数、HTTP 新内容、原生命周期/卷/文件保留。它不代替 K8s 节点失联或 RBD 挂载验收。

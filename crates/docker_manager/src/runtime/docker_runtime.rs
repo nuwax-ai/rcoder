@@ -584,6 +584,12 @@ impl AgentContainerRuntime for DockerRuntime {
                 let result = match (result, context.as_ref()) {
                     (Ok(info), Some(context)) => {
                         let recorded = async {
+                            crate::native_domain::reconcile_bounded(
+                                inner.get_docker_client(),
+                                &info.container_id,
+                                &context.app_id,
+                            )
+                            .await;
                             let target = Self::new(inner.clone())
                                 .capture_builder_compute_with_binding(
                                     context,
@@ -814,13 +820,37 @@ impl AgentContainerRuntime for DockerRuntime {
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<()> {
         match service_type {
-            // Userapp/UserappBuilder 的 identifier=app_id/project_id，复用 WebAgentRunner 的 stop_container 路径
-            ServiceType::WebAgentRunner | ServiceType::Userapp | ServiceType::UserappBuilder => {
-                self.inner
-                    .stop_container(identifier)
-                    .await
-                    .map_err(|e| ContainerRuntimeError::ContainerStopError(e.to_string()))
+            ServiceType::UserappBuilder => {
+                if let Some(container) = self.find_container(identifier, service_type).await? {
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(8),
+                        super::docker_app_runtime::execute_container_command(
+                            self.inner.get_docker_client(),
+                            &container.container_id,
+                            vec![
+                                "app-cli".into(),
+                                "--app-cli-container-stop".into(),
+                                format!("/home/user/{identifier}"),
+                            ],
+                        ),
+                    )
+                    .await;
+                    if !matches!(&result, Ok(Ok(exit)) if exit.exit_code == 0) {
+                        tracing::warn!(%identifier, ?result, "Owner drain incomplete; proceeding with physical idle stop");
+                    }
+                    self.inner
+                        .stop_container_by_id(&container.container_id)
+                        .await
+                        .map_err(|e| ContainerRuntimeError::ContainerStopError(e.to_string()))?;
+                }
+                Ok(())
             }
+            // Userapp/UserappBuilder 的 identifier=app_id/project_id，复用 WebAgentRunner 的 stop_container 路径
+            ServiceType::WebAgentRunner | ServiceType::Userapp => self
+                .inner
+                .stop_container(identifier)
+                .await
+                .map_err(|e| ContainerRuntimeError::ContainerStopError(e.to_string())),
             ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
                 if let Some(container) = self
                     .inner

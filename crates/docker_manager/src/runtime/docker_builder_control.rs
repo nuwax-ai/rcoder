@@ -427,6 +427,8 @@ impl DockerRuntime {
         if only_start {
             super::docker_compute_receipt::save_start(target).await?;
         }
+        crate::native_domain::reconcile_bounded(client, &resource.uid, &target.context.app_id)
+            .await;
         // A Docker start acknowledgment can precede IP/port publication. Do
         // not report a successful restart until its new physical reach is
         // verified and registered.

@@ -1,5 +1,5 @@
 use crate::{
-    control::{self, Action, Discovery, Envelope, Reply, Snapshot},
+    control::{self, Action, Discovery, Envelope, FailureCode, Phase, Problem, Reply, Snapshot},
     guardian,
     record::{self, Generation, GenerationPhase, Intent},
     worker,
@@ -48,6 +48,9 @@ pub struct Options {
     pub worker_args: Vec<OsString>,
     /// One-shot deployment inputs must not be replayed on automatic recovery.
     pub recovery_remove_env: Vec<OsString>,
+    /// Same-binary cleanup adapter for programs owned by an external engine.
+    /// The guardian runs it after worker/command exit, before acknowledging stop.
+    pub external_cleanup_args: Option<Vec<OsString>>,
     pub policy: Policy,
     pub shutdown: CancellationToken,
     /// One-shot foreground commands preserve their normal exit behavior.
@@ -59,6 +62,7 @@ impl Options {
             binding: None,
             worker_args,
             recovery_remove_env: Vec::new(),
+            external_cleanup_args: None,
             policy: Policy::default(),
             shutdown: CancellationToken::new(),
             restart_on_exit: true,
@@ -101,7 +105,10 @@ impl Owner {
             "offline action must stop execution"
         );
         let mut discovery: Discovery = record::read(&self.root.join("supervisor.json"))?;
-        ensure!(discovery.version == 1, "unsupported supervisor receipt");
+        ensure!(
+            matches!(discovery.version, 1 | control::CONTROL_VERSION),
+            "unsupported supervisor receipt"
+        );
         if let Some((original, snapshot)) = discovery
             .requests
             .iter()
@@ -111,7 +118,7 @@ impl Owner {
                 original == request,
                 "request identity already used with different parameters"
             );
-            if matches!(snapshot.phase.as_str(), "ready" | "stopped") {
+            if matches!(snapshot.phase, Phase::Ready | Phase::Stopped) {
                 return Ok(snapshot.clone());
             }
         }
@@ -124,7 +131,7 @@ impl Owner {
         if let Some(id) = &discovery.snapshot.operation_id {
             for (original, snapshot) in &mut discovery.requests {
                 if &original.request_id == id {
-                    snapshot.phase = "recovery_required".into();
+                    snapshot.phase = Phase::RecoveryRequired;
                     snapshot.error = Some("supervisor exited before control completed".into());
                 }
             }
@@ -134,8 +141,9 @@ impl Owner {
         } else {
             Intent::Shutdown
         };
-        discovery.snapshot.phase = "stopped".into();
+        discovery.snapshot.phase = Phase::Stopped;
         discovery.snapshot.error = None;
+        discovery.snapshot.problem = None;
         discovery.snapshot.operation_id = Some(request.request_id.clone());
         discovery
             .requests
@@ -172,7 +180,10 @@ impl Owner {
             None
         };
         if let Some(old) = &old {
-            ensure!(old.version == 1, "unsupported supervisor receipt");
+            ensure!(
+                matches!(old.version, 1 | control::CONTROL_VERSION),
+                "unsupported supervisor receipt"
+            );
         }
         let instance = uuid::Uuid::new_v4().to_string();
         let binding = options.binding.clone().unwrap_or(control::Binding {
@@ -190,7 +201,7 @@ impl Owner {
         // still waiting for quiescence or for the worker's durable acknowledgement.
         let pending = old
             .as_ref()
-            .filter(|d| d.snapshot.phase != "stopped")
+            .filter(|d| d.snapshot.phase != Phase::Stopped)
             .and_then(|d| d.snapshot.operation_id.clone());
         let intent = old.as_ref().map_or(Intent::Run, |d| {
             if pending.is_some() || d.snapshot.intent == Intent::Stopped {
@@ -199,11 +210,16 @@ impl Owner {
                 Intent::Run
             }
         });
+        // A parent restart also needs to suppress one-shot deployment inputs
+        // when its last operation already completed but the worker later died.
+        let recovery_launch = old
+            .as_ref()
+            .is_some_and(|d| d.snapshot.phase != Phase::Stopped);
         let mut state = State {
             root: self.root.clone(),
             policy: options.policy.clone(),
             discovery: Discovery {
-                version: 1,
+                version: control::CONTROL_VERSION,
                 instance: instance.clone(),
                 address: listener.local_addr()?.to_string(),
                 token: format!(
@@ -216,14 +232,15 @@ impl Owner {
                     binding,
                     supervisor_id: instance,
                     generation: old.as_ref().and_then(|d| d.snapshot.generation.clone()),
-                    phase: "reconciling".into(),
+                    phase: Phase::Reconciling,
                     intent,
                     operation_id: pending.clone(),
                     error: None,
+                    problem: None,
                 },
                 requests: old.map_or_else(Vec::new, |d| d.requests),
             },
-            recovery_launch: pending.is_some(),
+            recovery_launch,
             child: None,
             stopping: None,
             probe: None,
@@ -247,6 +264,7 @@ impl Owner {
             args: options.worker_args,
             cwd: std::env::current_dir()?,
             remove_env: Vec::new(),
+            external_cleanup_args: options.external_cleanup_args,
         };
         let mut tick = tokio::time::interval(Duration::from_millis(200));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -265,7 +283,7 @@ impl Owner {
                 Some(incoming) = rx.recv() => {
                     let outcome = state.request(&incoming.request);
                     let snapshot = outcome.as_ref().ok().cloned().unwrap_or_else(|| state.discovery.snapshot.clone());
-                    drop(incoming.reply.send(Reply { instance: state.discovery.instance.clone(), snapshot, error: outcome.err().map(|e| format!("{e:#}")) }));
+                    drop(incoming.reply.send(Reply { instance: state.discovery.instance.clone(), snapshot, error: outcome.err().as_ref().map(Problem::from_error) }));
                 }
                 _ = options.shutdown.cancelled(), if state.discovery.snapshot.intent != Intent::Shutdown => {
                     // Physical stop still proceeds if recording the intent fails.
@@ -354,17 +372,24 @@ impl State {
         record::save(&self.root.join("supervisor.json"), &self.discovery)
     }
     fn request(&mut self, envelope: &Envelope) -> Result<Snapshot> {
-        ensure!(
-            envelope.version == 1
-                && envelope.instance == self.discovery.instance
-                && envelope.token == self.discovery.token,
-            "supervisor request identity mismatch"
-        );
+        if envelope.version != control::CONTROL_VERSION
+            || envelope.instance != self.discovery.instance
+            || envelope.token != self.discovery.token
+        {
+            return Err(Problem {
+                code: FailureCode::IdentityChanged,
+                message: "supervisor request identity mismatch".into(),
+            }
+            .into());
+        }
         let request = &envelope.request;
-        ensure!(
-            !request.request_id.is_empty() && request.request_id.len() <= 128,
-            "invalid control request identity"
-        );
+        if request.request_id.is_empty() || request.request_id.len() > 128 {
+            return Err(Problem {
+                code: FailureCode::InvalidRequest,
+                message: "invalid control request identity".into(),
+            }
+            .into());
+        }
         if request.action == Action::Status {
             return Ok(self.discovery.snapshot.clone());
         }
@@ -374,28 +399,37 @@ impl State {
             .iter()
             .find(|(r, _)| r.request_id == request.request_id)
         {
-            ensure!(
-                original.action == request.action
-                    && original.expected_generation == request.expected_generation,
-                "request identity already used with different parameters"
-            );
+            if original.action != request.action
+                || original.expected_generation != request.expected_generation
+            {
+                return Err(Problem {
+                    code: FailureCode::IdentityChanged,
+                    message: "request identity already used with different parameters".into(),
+                }
+                .into());
+            }
             return Ok(snapshot.clone());
         }
-        ensure!(
-            request.expected_generation.is_none()
-                || request.expected_generation == self.discovery.snapshot.generation,
-            "execution generation changed; inspect current owner before retrying"
-        );
-        ensure!(
-            self.discovery.snapshot.operation_id.is_none(),
-            "supervisor is busy with operation {} ({})",
-            self.discovery
-                .snapshot
-                .operation_id
-                .as_deref()
-                .unwrap_or("unknown"),
-            self.discovery.snapshot.phase
-        );
+        if request.expected_generation.is_some()
+            && request.expected_generation != self.discovery.snapshot.generation
+        {
+            return Err(Problem {
+                code: FailureCode::IdentityChanged,
+                message: "execution generation changed; inspect current owner before retrying"
+                    .into(),
+            }
+            .into());
+        }
+        if let Some(operation) = &self.discovery.snapshot.operation_id {
+            return Err(Problem {
+                code: FailureCode::Busy,
+                message: format!(
+                    "supervisor is busy with operation {operation} ({})",
+                    self.discovery.snapshot.phase
+                ),
+            }
+            .into());
+        }
         let intent = match request.action {
             Action::Recover => self.discovery.snapshot.intent,
             Action::StopWork => Intent::Stopped,
@@ -409,7 +443,7 @@ impl State {
             .push((request.clone(), self.discovery.snapshot.clone()));
         // Receipt failure cannot manufacture an accepted queued operation.
         self.discovery.snapshot.intent = intent;
-        self.discovery.snapshot.phase = "stopping".into();
+        self.discovery.snapshot.phase = Phase::Stopping;
         if let Err(error) = self.persist() {
             self.discovery = previous;
             return Err(error);
@@ -420,8 +454,9 @@ impl State {
         Ok(self.discovery.snapshot.clone())
     }
     fn begin_stop(&mut self, intent: Intent) -> Result<()> {
+        self.discovery.snapshot.problem = None;
         self.discovery.snapshot.intent = intent;
-        self.discovery.snapshot.phase = "stopping".into();
+        self.discovery.snapshot.phase = Phase::Stopping;
         if let Some(task) = self.probe.take() {
             task.abort();
         }
@@ -442,6 +477,30 @@ impl State {
             }
         }
         self.persist()
+    }
+    fn record_cleanup_problem(&mut self, error: &anyhow::Error) -> Result<()> {
+        let waiting = error
+            .downcast_ref::<std::fs::TryLockError>()
+            .is_some_and(|e| matches!(e, std::fs::TryLockError::WouldBlock));
+        let problem = Problem {
+            code: if waiting {
+                FailureCode::CleanupInProgress
+            } else {
+                FailureCode::CleanupUnconfirmed
+            },
+            message: format!("{error:#}"),
+        };
+        if self.discovery.snapshot.problem.as_ref() != Some(&problem) {
+            self.discovery.snapshot.phase = if waiting {
+                Phase::CleanupPending
+            } else {
+                Phase::RecoveryRequired
+            };
+            self.discovery.snapshot.error = Some(problem.message.clone());
+            self.discovery.snapshot.problem = Some(problem);
+            self.persist()?;
+        }
+        Ok(())
     }
     async fn tick(
         &mut self,
@@ -485,10 +544,29 @@ impl State {
                 *deadline = (*deadline).max(declared);
             }
         }
+        if self.child.is_some() {
+            let generation = record::generation(&self.work()?)?;
+            if generation.phase == GenerationPhase::Draining {
+                let problem = Problem {
+                    code: FailureCode::CleanupInProgress,
+                    message: generation.error.unwrap_or_else(|| {
+                        "guardian is verifying command and external engine cleanup".into()
+                    }),
+                };
+                if self.discovery.snapshot.problem.as_ref() != Some(&problem)
+                    || self.discovery.snapshot.phase != Phase::CleanupPending
+                {
+                    self.discovery.snapshot.phase = Phase::CleanupPending;
+                    self.discovery.snapshot.error = Some(problem.message.clone());
+                    self.discovery.snapshot.problem = Some(problem);
+                    self.persist()?;
+                }
+            }
+        }
         if let Some(child) = &mut self.child {
             if self.stopping.is_some_and(|deadline| now >= deadline) {
                 child.lease.take();
-                self.discovery.snapshot.phase = "cleanup_pending".into();
+                self.discovery.snapshot.phase = Phase::CleanupPending;
             }
             if let Some(status) = child.process.try_wait()? {
                 let exit = status.code().unwrap_or(1);
@@ -506,16 +584,16 @@ impl State {
                     .clone()
                     .context("exited generation missing")?;
                 if let Err(error) = record::verify_quiescent(&self.root, &id) {
-                    self.discovery.snapshot.phase = "cleanup_pending".into();
-                    self.discovery.snapshot.error = Some(format!("{error:#}"));
-                    self.persist()?;
+                    self.record_cleanup_problem(&error)?;
                     return Ok(None);
                 }
                 if self.discovery.snapshot.intent == Intent::Shutdown
                     || !restart_on_exit
                     || self.initial_launch
                 {
-                    self.discovery.snapshot.phase = "stopped".into();
+                    self.discovery.snapshot.phase = Phase::Stopped;
+                    self.discovery.snapshot.problem = None;
+                    self.discovery.snapshot.error = None;
                     self.persist()?;
                     return Ok(Some(if self.stopping.is_some() { 0 } else { exit }));
                 }
@@ -528,16 +606,12 @@ impl State {
         }
         if self.child.is_none() {
             if let Err(error) = record::reconcile(&self.root) {
-                let message = format!("{error:#}");
-                if self.discovery.snapshot.error.as_deref() != Some(&message) {
-                    self.discovery.snapshot.phase = "cleanup_pending".into();
-                    self.discovery.snapshot.error = Some(message);
-                    self.persist()?;
-                }
+                self.record_cleanup_problem(&error)?;
                 return Ok(None);
             }
+            self.discovery.snapshot.problem = None;
             if self.discovery.snapshot.intent == Intent::Shutdown {
-                self.discovery.snapshot.phase = "stopped".into();
+                self.discovery.snapshot.phase = Phase::Stopped;
                 self.persist()?;
                 return Ok(Some(0));
             }
@@ -549,8 +623,8 @@ impl State {
                 self.restarts.pop_front();
             }
             if !self.restart_allowed || self.restarts.len() >= self.policy.restart_limit {
-                if self.discovery.snapshot.phase != "recovery_required" {
-                    self.discovery.snapshot.phase = "recovery_required".into();
+                if self.discovery.snapshot.phase != Phase::RecoveryRequired {
+                    self.discovery.snapshot.phase = Phase::RecoveryRequired;
                     self.persist()?;
                 }
                 return Ok(None);
@@ -572,10 +646,11 @@ impl State {
                     worker_pid: None,
                     exit_code: None,
                     error: None,
+                    physical_domain: crate::domain::PhysicalDomain::from_env()?,
                 },
             )?;
             self.discovery.snapshot.generation = Some(id);
-            self.discovery.snapshot.phase = "starting".into();
+            self.discovery.snapshot.phase = Phase::Starting;
             self.persist()?;
             let recovery_launch = guardian::Launch {
                 program: launch.program.clone(),
@@ -586,6 +661,7 @@ impl State {
                 } else {
                     launch.remove_env.clone()
                 },
+                external_cleanup_args: launch.external_cleanup_args.clone(),
             };
             self.child = Some(guardian::spawn(&work, &recovery_launch).await?);
             self.recovery_launch = true;
@@ -611,9 +687,10 @@ impl State {
                 self.failures = 0;
                 self.failed_since = None;
                 self.observed_ready = true;
-                if observation.ready && self.discovery.snapshot.phase != "ready" {
-                    self.discovery.snapshot.phase = "ready".into();
+                if observation.ready && self.discovery.snapshot.phase != Phase::Ready {
+                    self.discovery.snapshot.phase = Phase::Ready;
                     self.discovery.snapshot.error = None;
+                    self.discovery.snapshot.problem = None;
                     self.persist()?;
                     // The operation is now terminal. Preserve its final snapshot for replay.
                     self.discovery.snapshot.operation_id = None;

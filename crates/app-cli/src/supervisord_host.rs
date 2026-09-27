@@ -40,6 +40,16 @@ pub(crate) struct SupervisordHost {
     conf_path: PathBuf,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EngineReceipt {
+    generation: String,
+    supervisor_id: String,
+    socket: PathBuf,
+}
+
+const ENGINE_RECEIPT: &str = "supervisord-engine.json";
+
 impl SupervisordHost {
     /// 引擎探测：socket 存在 + XML-RPC ping 成功（serve 启动时调用一次）。
     pub(crate) async fn detect() -> Result<Option<Self>> {
@@ -51,6 +61,30 @@ impl SupervisordHost {
             .ping()
             .await
             .context("supervisord socket exists but RPC is unavailable")?;
+        // Remember the engine before the first runtime mutation. Losing its
+        // socket later cannot turn external programs into a builtin-only run.
+        if let Some(root) = std::env::var_os(runtime_supervisor::WORKER_ENV) {
+            let root = Path::new(&root);
+            let scope = root
+                .parent()
+                .and_then(Path::parent)
+                .context("supervisord worker scope missing")?;
+            let worker = runtime_supervisor::Worker::from_env(scope)
+                .await?
+                .context("supervisord worker authorization missing")?;
+            let receipt = EngineReceipt {
+                generation: worker.generation().into(),
+                supervisor_id: worker.supervisor_id().into(),
+                socket: crate::xmlrpc::default_socket_path(),
+            };
+            let mut file = tempfile::NamedTempFile::new_in(worker.work_root())?;
+            serde_json::to_writer(&mut file, &receipt)?;
+            std::io::Write::flush(&mut file)?;
+            file.as_file().sync_all()?;
+            process_utils::atomic_file::persist(file, &root.join(ENGINE_RECEIPT))?;
+            #[cfg(unix)]
+            std::fs::File::open(root)?.sync_all()?;
+        }
         info!("service host: supervisord {version} detected (engine=supervisord)");
         Ok(Some(Self {
             client,
@@ -58,16 +92,68 @@ impl SupervisordHost {
         }))
     }
 
+    /// Called only after the guardian authenticated the draining generation.
+    pub(crate) async fn cleanup_generation(root: &Path) -> Result<()> {
+        match std::fs::read(root.join(ENGINE_RECEIPT)) {
+            Ok(bytes) => {
+                let receipt: EngineReceipt = serde_json::from_slice(&bytes)?;
+                let generation: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(root.join("generation.json"))?)?;
+                anyhow::ensure!(
+                    generation["id"] == receipt.generation
+                        && generation["supervisor"] == receipt.supervisor_id,
+                    "supervisord cleanup generation identity differs"
+                );
+                let client = SupervisorClient::new(receipt.socket);
+                client.ping().await.context(
+                    "recorded supervisord engine is unavailable; cleanup is unconfirmed",
+                )?;
+                Self {
+                    client,
+                    conf_path: CONF_PATH.into(),
+                }
+                .stop_all()
+                .await
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // No external-engine mutation was accepted by this worker.
+                // Existing installations may still have a reachable engine.
+                if let Some(host) = Self::detect().await? {
+                    host.stop_all().await?;
+                }
+                Ok(())
+            }
+            Err(error) => Err(error).context("read supervisord engine receipt"),
+        }
+    }
+
     /// 停掉全部动态组（热部署切换 / 容器停服级联）。
     pub(crate) async fn stop_all(&self) -> Result<()> {
+        // Remove the restart source before stopping the live groups. Keeping the
+        // old fragment after removeProcessGroup lets a supervisord restart or a
+        // later reload resurrect the retired release. Do not touch fixed groups.
         let mut failures = Vec::new();
+        if let Err(error) =
+            write_conf(&self.conf_path, "# app-cli dynamic services stopped\n").await
+        {
+            failures.push(format!("withdraw dynamic configuration: {error:#}"));
+        }
+        if let Err(error) = mutation_result(self.client.reload_config().await) {
+            failures.push(format!("reload dynamic configuration: {error:#}"));
+        }
+        // A broken configuration must not prevent stopping live groups. Keep
+        // the withdrawal failure, but attempt the physical stop before returning
+        // it; an external cleanup receipt still requires every part to succeed.
         for name in self.dynamic_groups().await? {
             if let Err(error) = self.client.stop_remove_group(&name).await {
                 failures.push(format!("{name}: {error:#}"));
             }
         }
         if !failures.is_empty() {
-            bail!("dynamic groups did not stop: {}", failures.join("; "));
+            bail!(
+                "dynamic groups did not stop or configuration withdrawal failed: {}",
+                failures.join("; ")
+            );
         }
         let remaining = self.dynamic_groups().await?;
         if !remaining.is_empty() {
@@ -755,6 +841,143 @@ NODE_ENV = "production"
         s.services.remove(0)
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recorded_engine_loss_never_becomes_builtin_cleanup_success() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt = EngineReceipt {
+            generation: "original-generation".into(),
+            supervisor_id: "original-owner".into(),
+            socket: root.path().join("missing-supervisord.sock"),
+        };
+        std::fs::write(
+            root.path().join(ENGINE_RECEIPT),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        let generation = root.path().join("generation.json");
+        std::fs::write(
+            &generation,
+            r#"{"id":"original-generation","supervisor":"original-owner"}"#,
+        )
+        .unwrap();
+        let error = SupervisordHost::cleanup_generation(root.path())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("engine is unavailable"));
+        std::fs::write(
+            generation,
+            r#"{"id":"replacement","supervisor":"original-owner"}"#,
+        )
+        .unwrap();
+        let error = SupervisordHost::cleanup_generation(root.path())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("identity differs"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_withdraws_dynamic_restart_source_and_preserves_fixed_programs() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("supervisor.sock");
+        let conf = root.path().join("dynamic.conf");
+        std::fs::write(&conf, "[program:app-svc-web]\nautorestart=true\n").unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let group = |name: &str| {
+            format!(
+                "<value><struct><member><name>group</name><value><string>{name}</string></value></member></struct></value>"
+            )
+        };
+        let array = |values: String| format!("<array><data>{values}</data></array>");
+        let fixed = array(group("postgres"));
+        let requests = vec![
+            ("reloadConfig", "", array(String::new())),
+            (
+                "getAllProcessInfo",
+                "",
+                array(group("postgres") + &group("app-pingap") + &group("app-svc-web")),
+            ),
+            (
+                "stopProcessGroup",
+                "app-pingap",
+                "<boolean>1</boolean>".into(),
+            ),
+            (
+                "removeProcessGroup",
+                "app-pingap",
+                "<boolean>1</boolean>".into(),
+            ),
+            (
+                "stopProcessGroup",
+                "app-svc-web",
+                "<boolean>1</boolean>".into(),
+            ),
+            (
+                "removeProcessGroup",
+                "app-svc-web",
+                "<boolean>1</boolean>".into(),
+            ),
+            ("getAllProcessInfo", "", fixed.clone()),
+            ("reloadConfig", "", array(String::new())),
+            ("getAllProcessInfo", "", fixed.clone()),
+            ("getAllProcessInfo", "", fixed),
+        ];
+        let checked_conf = conf.clone();
+        let server = tokio::spawn(async move {
+            for (method, target, value) in requests {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    header.push(stream.read_u8().await.unwrap());
+                }
+                let header = String::from_utf8(header).unwrap();
+                let size: usize = header
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let mut bytes = vec![0; size];
+                stream.read_exact(&mut bytes).await.unwrap();
+                let request = String::from_utf8(bytes).unwrap();
+                assert!(
+                    request.contains(&format!("<methodName>supervisor.{method}</methodName>")),
+                    "{request}"
+                );
+                if !target.is_empty() {
+                    assert!(request.contains(&format!("<string>{target}</string>")));
+                }
+                assert!(
+                    !request.contains("<string>postgres</string>"),
+                    "must not stop fixed PG"
+                );
+                assert!(
+                    !std::fs::read_to_string(&checked_conf)
+                        .unwrap()
+                        .contains("[program:"),
+                    "withdraw config before RPC"
+                );
+                let body = format!(
+                    "<methodResponse><params><param><value>{value}</value></param></params></methodResponse>"
+                );
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let host = SupervisordHost {
+            client: SupervisorClient::new(socket),
+            conf_path: conf,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            host.stop_all().await.unwrap();
+            host.stop_all().await.unwrap();
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
     #[test]
     #[cfg(unix)] // supervisord 引擎 Unix-only（xmlrpc 走 Unix socket）；断言含 Unix 路径字符串
     fn renders_service_and_pingap_programs() {
@@ -844,12 +1067,16 @@ NODE_ENV = "production"
         let path = root.path().join("supervisor.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let server = tokio::spawn(async move {
-            for failed in [false, true] {
+            for step in 0..3 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = [0u8; 8192];
                 let size = stream.read(&mut request).await.unwrap();
                 let request = String::from_utf8_lossy(&request[..size]);
-                let body = if failed {
+                let body = if step == 0 {
+                    assert!(request.contains("supervisor.reloadConfig"));
+                    // An unrelated malformed config cannot skip the stop RPC.
+                    r#"<methodResponse><fault><value><struct><member><name>faultString</name><value><string>invalid fixed supervisor config</string></value></member></struct></value></fault></methodResponse>"#
+                } else if step == 2 {
                     assert!(request.contains("supervisor.stopProcessGroup"));
                     r#"<methodResponse><fault><value><struct><member><name>faultString</name><value><string>stop failed</string></value></member></struct></value></fault></methodResponse>"#
                 } else {
@@ -863,13 +1090,10 @@ NODE_ENV = "production"
             client: SupervisorClient::new(path),
             conf_path: root.path().join("unused.conf"),
         };
-        assert!(
-            host.stop_all()
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("did not stop")
-        );
+        let error = host.stop_all().await.unwrap_err().to_string();
+        assert!(error.contains("did not stop"));
+        assert!(error.contains("invalid fixed supervisor config"));
+        assert!(error.contains("stop failed"));
         server.await.unwrap();
     }
 }

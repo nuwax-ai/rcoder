@@ -925,6 +925,72 @@ mod create_lease_tests {
             .expect("response");
     }
 
+    #[tokio::test]
+    async fn idle_builder_drain_failure_still_stops_only_captured_resources() {
+        drop(rustls::crypto::ring::default_provider().install_default());
+        for replaced in [false, true] {
+            tokio::time::timeout(std::time::Duration::from_secs(6), async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let mut writes = Vec::new();
+                    let mut pod_reads = 0;
+                    let mut drained = false;
+                    loop {
+                        let Ok(Ok((mut stream, _))) = tokio::time::timeout(
+                            std::time::Duration::from_secs(1), listener.accept()).await else { break };
+                        let (head, body) = read_request(&mut stream).await;
+                        let first = head.lines().next().unwrap();
+                        assert!(!first.contains("persistentvolumeclaims"), "{first}");
+                        let path = first.split_whitespace().nth(1).unwrap();
+                        let name = path.split('?').next().unwrap().rsplit('/').next().unwrap();
+                        let mut code = 200;
+                        let reply = if path.contains("/exec?") {
+                            drained = true;
+                            code = 400; // Management failure cannot block physical retirement.
+                            serde_json::json!({"kind":"Status","apiVersion":"v1","code":400,"reason":"BadRequest","message":"owner unavailable"})
+                        } else if first.starts_with("DELETE ") {
+                            assert!(drained, "capture and bounded drain precede deletion");
+                            let params: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                            assert_eq!(params["preconditions"]["uid"], format!("original-{name}"));
+                            assert_eq!(params["preconditions"]["resourceVersion"], "7");
+                            assert!(!path.contains("/pods/"), "must not force-delete a possibly replaced Pod");
+                            writes.push(path.to_owned());
+                            if replaced { code = 409; }
+                            serde_json::json!({"kind":"Status","apiVersion":"v1","code":code,
+                                "status":if replaced { "Failure" } else { "Success" },"message":"captured delete"})
+                        } else if path.contains("/pods/") {
+                            pod_reads += 1;
+                            if pod_reads > 1 {
+                                code = 404;
+                                serde_json::json!({"kind":"Status","apiVersion":"v1","code":404,"reason":"NotFound","message":"gone"})
+                            } else {
+                                serde_json::json!({"kind":"Pod","apiVersion":"v1","metadata":{
+                                    "name":name,"uid":"original-pod","resourceVersion":"7",
+                                    "ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet",
+                                        "name":"rcoder-app-builder-review","uid":"original-rcoder-app-builder-review","controller":true}]}})
+                            }
+                        } else {
+                            assert!(first.starts_with("GET "), "{first}");
+                            assert!(!drained, "never refresh deletion targets after drain");
+                            serde_json::json!({"kind":if path.contains("/statefulsets/") { "StatefulSet" } else { "Service" },
+                                "apiVersion":if path.contains("/statefulsets/") { "apps/v1" } else { "v1" },
+                                "metadata":{"name":name,"uid":format!("original-{name}"),"resourceVersion":"7"}})
+                        };
+                        write_reply(&mut stream, code, &reply).await;
+                    }
+                    assert!(drained);
+                    assert_eq!(writes.len(), if replaced { 1 } else { 3 });
+                    assert!(writes[0].contains("/statefulsets/"));
+                });
+                let client = Client::try_from(Config::new(format!("http://{address}").parse().unwrap())).unwrap();
+                let result = runtime(client).stop_container_by_identifier_inner("review", &ServiceType::UserappBuilder).await;
+                assert_eq!(result.is_err(), replaced, "{result:?}");
+                server.await.unwrap();
+            }).await.unwrap();
+        }
+    }
+
     /// create 中途确定性失败（claim builder storage 被 API server 403 拒——线上
     /// 0.1.264 实测形态）时，operation lease 必须被显式释放：Err 只 drop 会把
     /// ConfigMap 锁留在集群里，该 app 的后续 ensure 全部 409（5 把 builder 锁

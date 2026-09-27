@@ -22,6 +22,8 @@ pub(crate) struct Launch {
     pub args: Vec<OsString>,
     pub cwd: PathBuf,
     pub remove_env: Vec<OsString>,
+    #[serde(default)]
+    pub external_cleanup_args: Option<Vec<OsString>>,
 }
 pub(crate) struct Child {
     pub process: tokio::process::Child,
@@ -80,13 +82,13 @@ pub(crate) async fn run(root: &Path) -> Result<i32> {
     gate.require_open()?;
     generation.phase = GenerationPhase::Running;
     record::save(&root.join("generation.json"), &generation)?;
-    let mut command = tokio::process::Command::new(launch.program);
-    for name in launch.remove_env {
+    let mut command = tokio::process::Command::new(&launch.program);
+    for name in &launch.remove_env {
         command.env_remove(name);
     }
     command
-        .args(launch.args)
-        .current_dir(launch.cwd)
+        .args(&launch.args)
+        .current_dir(&launch.cwd)
         .stdin(Stdio::null())
         .env(WORKER_ENV, root)
         .env(TOKEN_ENV, &generation.token)
@@ -98,7 +100,7 @@ pub(crate) async fn run(root: &Path) -> Result<i32> {
         Err(error) => {
             generation.error = Some(format!("spawn execution process: {error}"));
             generation.exit_code = Some(1);
-            finish(root, &mut generation).await;
+            finish(root, &mut generation, &launch).await;
             return Err(error.into());
         }
     };
@@ -134,22 +136,44 @@ pub(crate) async fn run(root: &Path) -> Result<i32> {
         result = child.wait().await;
     }
     generation.exit_code = result.as_ref().ok().and_then(|s| s.code());
-    finish(root, &mut generation).await;
+    finish(root, &mut generation, &launch).await;
     Ok(generation.exit_code.unwrap_or(1))
 }
 
-async fn finish(root: &Path, generation: &mut record::Generation) {
+async fn finish(root: &Path, generation: &mut record::Generation, launch: &Launch) {
     generation.phase = GenerationPhase::Draining;
     loop {
-        let cleanup = (|| -> Result<()> {
+        let cleanup = async {
             process_utils::command_authority::Gate::try_acquire(root)?.close()?;
             process_utils::guardian::recover(root)?;
             // After root exit and every guardian's cleanup, SpawnPending local
             // receipts can only be registrations interrupted before spawn.
             settle_unspawned(root)?;
             process_utils::command_context::require_quiescent(&root.join("commands"))?;
+            if let Some(args) = &launch.external_cleanup_args {
+                record::save(&root.join("generation.json"), generation)?;
+                let mut command = tokio::process::Command::new(&launch.program);
+                command
+                    .args(args)
+                    .current_dir(&launch.cwd)
+                    .stdin(Stdio::null());
+                process_utils::command_authority::detach_command(&mut command);
+                command
+                    .env("RCODER_SUPERVISOR_CLEANUP_ROOT", root)
+                    .env("RCODER_SUPERVISOR_CLEANUP_TOKEN", &generation.token);
+                command.kill_on_drop(true);
+                let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+                    .await
+                    .context("external engine cleanup timed out")??;
+                ensure!(
+                    output.status.success(),
+                    "external engine cleanup failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
             Ok(())
-        })();
+        }
+        .await;
         match cleanup {
             Ok(()) => {
                 generation.phase = GenerationPhase::Quiescent;

@@ -96,9 +96,47 @@ strip_prefix = true
         def owner_identity():
             return json.loads(execute('curl -fsS --max-time 5 http://127.0.0.1:3010/v1/runtime/identity').stdout)['data']
 
+        def supervisor_identity():
+            return json.loads(execute('app-cli owner status --workspace "$1/.local-deploy"', ws).stdout)
+
+        def single_owner(snapshot):
+            # The approved architecture has a parent, worker and guardians.
+            # Count active execution generations, not every app-cli OS process.
+            probe = """
+import json, pathlib, sys
+expected = json.loads(sys.argv[1])
+parent = pathlib.Path('/tmp/manual-owner.pid').read_text().strip()
+roots = set()
+for fd in pathlib.Path('/proc', parent, 'fd').iterdir():
+    try:
+        path = pathlib.Path(fd.readlink())
+        if path.name == 'owner.lock' and (path.parent/'supervisor.json').is_file():
+            roots.add(path.parent)
+    except FileNotFoundError:
+        pass
+assert len(roots) == 1, 'original supervisor no longer owns its scope'
+root = roots.pop()
+discovery = json.loads((root/'supervisor.json').read_text())
+assert discovery['instance'] == expected['supervisor_id']
+active = []
+for path in (root/'work').glob('*/generation.json'):
+    value = json.loads(path.read_text())
+    if value['phase'] in ('Running', 'Draining'):
+        active.append(value)
+assert len(active) == 1 and active[0]['id'] == expected['generation']
+worker = pathlib.Path('/proc', str(active[0]['worker_pid']))
+assert worker.exists(), 'active worker absent'
+print(json.dumps({'supervisor_id': discovery['instance'], 'generation': active[0]['id'],
+                  'worker_pid': active[0]['worker_pid']}))
+"""
+            result = docker('exec', cid, 'python3', '-c', probe, json.dumps(snapshot), check=False)
+            return result.returncode == 0, result.stdout if result.returncode == 0 else result.stderr
+
         check('manual service serves actual HTTP', service_ready())
         identity = owner_identity()
         records['owner_before'] = identity
+        supervisor_before = supervisor_identity()
+        records['supervisor_before'] = supervisor_before
         for cycle in range(1, 3):
             body = post('/api/v1/userapp/dev/stop')
             check(f'cycle {cycle}: RCoder stops owner services', (body.get('data') or {}).get('message') == 'Stopped', body)
@@ -110,7 +148,12 @@ strip_prefix = true
             check(f'cycle {cycle}: new CLI client starts services', result.returncode == 0, result.stderr[-2000:])
             check(f'cycle {cycle}: actual HTTP restored', service_ready())
             check(f'cycle {cycle}: same owner retained', identity['runtime_instance_id'] == owner_identity()['runtime_instance_id'])
-            check(f'cycle {cycle}: only one app-cli remains', execute('pgrep -x app-cli', check=False).stdout.split() == execute('cat /tmp/manual-owner.pid').stdout.split())
+            snapshot = supervisor_identity()
+            sole_owner, details = single_owner(snapshot)
+            check(f'cycle {cycle}: single owner execution retained', sole_owner
+                  and snapshot['phase'] == 'ready'
+                  and snapshot['supervisor_id'] == supervisor_before['supervisor_id']
+                  and snapshot['generation'] == supervisor_before['generation'], details)
         body = post('/api/v1/userapp/dev/stop')
         check('final services stopped', (body.get('data') or {}).get('message') == 'Stopped'
               and execute('curl -fsS --max-time 2 http://127.0.0.1:9080/api/go/ready', check=False).returncode != 0)

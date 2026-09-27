@@ -36,6 +36,12 @@ impl KubernetesRuntime {
             pod_name, identifier, service_type
         );
 
+        if *service_type == ServiceType::UserappBuilder {
+            return self
+                .stop_idle_builder(identifier, &pod_name, &agent_pod)
+                .await;
+        }
+
         // Step 0: 删除 ClusterIP Service（先摘流量 / 移除 DNS，再销毁 pod）
         if let Err(e) = self.delete_agent_service(identifier, service_type).await {
             warn!(
@@ -89,6 +95,124 @@ impl KubernetesRuntime {
             total_start.elapsed().as_secs_f64()
         );
 
+        Ok(())
+    }
+
+    /// Idle retirement captures every deletion target before the bounded owner
+    /// drain. A replacement created during drain is never another delete target.
+    async fn stop_idle_builder(
+        &self,
+        identifier: &str,
+        sts_name: &str,
+        pod_name: &str,
+    ) -> ContainerRuntimeResult<()> {
+        use super::k8s_runtime_helpers::conditioned_delete_params;
+        use kube::api::PropagationPolicy;
+        let map_error = |error| {
+            super::builder_completion::k8s_error("Retire captured idle builder".into(), error)
+        };
+        let sts = self
+            .statefulsets()
+            .get_opt(sts_name)
+            .await
+            .map_err(map_error)?;
+        let pod = self.pods().get_opt(pod_name).await.map_err(map_error)?;
+        let mut services = Vec::new();
+        for name in [
+            self.agent_service_name(identifier, &ServiceType::UserappBuilder)?,
+            self.agent_headless_svc_name(identifier, &ServiceType::UserappBuilder)?,
+        ] {
+            if let Some(service) = self
+                .services_api()
+                .get_opt(&name)
+                .await
+                .map_err(map_error)?
+            {
+                services.push((name, conditioned_delete_params(&service.metadata, None)?));
+            }
+        }
+        let deletion = sts
+            .as_ref()
+            .map(|sts| {
+                conditioned_delete_params(&sts.metadata, Some(PropagationPolicy::Foreground))
+            })
+            .transpose()?;
+        let pod_uid = pod.as_ref().and_then(|pod| pod.metadata.uid.as_deref());
+        if let Some(uid) = pod_uid
+            && pod.as_ref().is_some_and(|pod| {
+                pod.metadata
+                    .owner_references
+                    .as_ref()
+                    .is_some_and(|owners| {
+                        owners.iter().any(|owner| {
+                            owner.controller == Some(true)
+                                && sts.as_ref().and_then(|sts| sts.metadata.uid.as_ref())
+                                    == Some(&owner.uid)
+                        })
+                    })
+            })
+        {
+            // Independent of business readiness. Failure must not prevent the
+            // physical stop. The in-container UID check fences a replaced Pod.
+            let drain = self.exec_pod_container(pod_name, "agent", vec![
+                "sh".into(), "-c".into(),
+                "[ \"$RCODER_PHYSICAL_POD_UID\" = \"$1\" ] || exit 75; exec app-cli --app-cli-container-stop \"$2\"".into(),
+                "--".into(), uid.into(), format!("/home/user/{identifier}"),
+            ]);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(8), drain).await;
+            if !matches!(&result, Ok(Ok(exit)) if exit.exit_code == 0) {
+                warn!(%identifier, ?result, "Owner drain incomplete; continuing physical idle stop");
+            }
+        }
+        if let Some(params) = deletion {
+            match self.statefulsets().delete(sts_name, &params).await {
+                Ok(_) => {}
+                Err(kube::Error::Api(response)) if response.code == 404 => {}
+                Err(error) => return Err(map_error(error)),
+            }
+        } else if pod.is_some() {
+            return Err(ContainerRuntimeError::Conflict(
+                "Idle builder Pod has no captured controller; use physical control recovery".into(),
+            ));
+        }
+        // Service cleanup is UID/version-bound too. It cannot delete resources
+        // published by a concurrent new ensure. PVC is never a deletion target.
+        for (name, params) in services {
+            match self.services_api().delete(&name, &params).await {
+                Ok(_) => {}
+                Err(kube::Error::Api(response)) if response.code == 404 => {}
+                Err(error) => {
+                    warn!(%identifier, %name, %error, "Captured idle Service cleanup incomplete");
+                }
+            }
+        }
+        if let Some(uid) = pod_uid {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    match self.pods().get_opt(pod_name).await.map_err(map_error)? {
+                        None => break Ok(()),
+                        Some(live) if live.metadata.uid.as_deref() != Some(uid) => {
+                            break Err(ContainerRuntimeError::Conflict(
+                                "Builder Pod replaced during idle retirement".into(),
+                            ));
+                        }
+                        Some(_) => tokio::time::sleep(std::time::Duration::from_millis(300)).await,
+                    }
+                }
+            })
+            .await
+            .map_err(|_| {
+                ContainerRuntimeError::Timeout(
+                    "Captured idle builder Pod remains terminating".into(),
+                )
+            })??;
+            let mut cache = self.pod_cache.write().await;
+            if cache.get(identifier).is_some_and(|entry| {
+                entry.service_type == ServiceType::UserappBuilder && entry.info.container_id == uid
+            }) {
+                cache.remove(identifier);
+            }
+        }
         Ok(())
     }
 

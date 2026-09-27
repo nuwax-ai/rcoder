@@ -8,7 +8,7 @@ mod builder_creation_receipt;
 pub(crate) mod docker_app_create;
 pub(crate) mod docker_app_mounts;
 mod docker_app_restart;
-mod docker_app_runtime;
+pub(crate) mod docker_app_runtime;
 mod docker_builder_control;
 mod docker_builder_restart;
 mod docker_compute_receipt;

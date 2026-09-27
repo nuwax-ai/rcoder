@@ -49,7 +49,8 @@ impl DevServerManager {
         if let Some(owner) = offline {
             let stopped = owner.stop_offline(&request).await?;
             ensure!(
-                stopped.phase == "stopped" && stopped.intent == runtime_supervisor::Intent::Stopped,
+                stopped.phase == runtime_supervisor::Phase::Stopped
+                    && stopped.intent == runtime_supervisor::Intent::Stopped,
                 "offline stop is not complete"
             );
             runtime_supervisor::verify_quiescent(&root, &generation)?;
@@ -73,28 +74,24 @@ impl DevServerManager {
                         ensure!(
                             snapshot.supervisor_id == before.supervisor_id
                                 && snapshot.operation_id.as_deref() == Some(&request.request_id)
-                                && snapshot.phase == "stopped"
+                                && snapshot.phase == runtime_supervisor::Phase::Stopped
                                 && snapshot.intent == runtime_supervisor::Intent::Stopped,
                             "stop response unavailable and no matching completion: {error:#}"
                         );
                         snapshot
                     }
                 };
-                if (snapshot.phase == "ready"
+                if (snapshot.phase == runtime_supervisor::Phase::Ready
                     && snapshot.generation.as_deref() != Some(&generation))
-                    || (snapshot.phase == "stopped"
+                    || (snapshot.phase == runtime_supervisor::Phase::Stopped
                         && snapshot.intent == runtime_supervisor::Intent::Stopped
                         && snapshot.operation_id.as_deref() == Some(&request.request_id))
                 {
                     runtime_supervisor::verify_quiescent(&root, &generation)?;
                     return Ok::<_, anyhow::Error>(snapshot);
                 }
-                if snapshot.phase == "recovery_required" {
-                    anyhow::bail!(
-                        "supervisor recovery required (operation {}): {}",
-                        request.request_id,
-                        snapshot.error.as_deref().unwrap_or("inspect owner status")
-                    );
+                if snapshot.phase == runtime_supervisor::Phase::RecoveryRequired {
+                    return Err(snapshot.recovery_error());
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }

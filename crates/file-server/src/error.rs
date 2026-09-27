@@ -28,6 +28,9 @@ pub enum AppError {
     Business(String),
     /// CONFLICT (409): an existing identified operation must be resolved first.
     Conflict(String),
+    /// Management recovery needs physical cleanup evidence (409), with the
+    /// original supervisor/generation/operation and recovery stage in details.
+    RuntimeRecovery(String, Value),
     /// PERMISSION_ERROR (403)
     Permission(String),
     /// RESOURCE_ERROR (404)
@@ -47,6 +50,21 @@ pub enum AppError {
 }
 
 impl AppError {
+    pub(crate) fn owner_error(context: &str, error: anyhow::Error) -> Self {
+        if let Some(recovery) = error.downcast_ref::<runtime_supervisor::RecoveryError>() {
+            return Self::RuntimeRecovery(
+                format!("{context}: {error:#}"),
+                json!(&recovery.snapshot),
+            );
+        }
+        if error
+            .downcast_ref::<runtime_supervisor::Problem>()
+            .is_some_and(|p| p.code == runtime_supervisor::FailureCode::Busy)
+        {
+            return Self::Conflict(format!("{context}: {error:#}"));
+        }
+        Self::business(format!("{context}: {error:#}"))
+    }
     pub fn validation(msg: impl Into<String>) -> Self {
         AppError::Validation(msg.into(), None)
     }
@@ -84,7 +102,7 @@ impl AppError {
         match self {
             AppError::Validation(..) | AppError::ValidationI18n(..) => "VALIDATION_ERROR",
             AppError::Business(_) => "BUSINESS_ERROR",
-            AppError::Conflict(_) => "CONFLICT",
+            AppError::Conflict(_) | AppError::RuntimeRecovery(..) => "CONFLICT",
             AppError::Permission(_) => "PERMISSION_ERROR",
             AppError::Resource(_) => "RESOURCE_ERROR",
             AppError::Network(_) => "NETWORK_ERROR",
@@ -100,7 +118,7 @@ impl AppError {
                 StatusCode::BAD_REQUEST
             }
             AppError::Permission(_) => StatusCode::FORBIDDEN,
-            AppError::Conflict(_) => StatusCode::CONFLICT,
+            AppError::Conflict(_) | AppError::RuntimeRecovery(..) => StatusCode::CONFLICT,
             AppError::Resource(_) => StatusCode::NOT_FOUND,
             AppError::Network(_) => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -113,6 +131,7 @@ impl AppError {
             // 返回英文 fallback; 实际翻译在 into_response 里按 locale 做。
             AppError::ValidationI18n(fallback, _) => fallback,
             AppError::Business(m) | AppError::Conflict(m) => m,
+            AppError::RuntimeRecovery(m, _) => m,
             AppError::Permission(m) => m,
             AppError::Resource(m) => m,
             AppError::Network(m) => m,
@@ -126,6 +145,7 @@ impl AppError {
     fn details(&self) -> Option<&Value> {
         match self {
             AppError::Validation(_, d) => d.as_ref(),
+            AppError::RuntimeRecovery(_, d) => Some(d),
             _ => None,
         }
     }

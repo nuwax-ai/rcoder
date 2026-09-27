@@ -355,10 +355,34 @@ strip_prefix=false
         check('authoritative owner state resides on retained volume',
               any(path.endswith('/.deploy-coordinator.json') for path in kernel_before), kernel_before)
         evidence['owner_before'] = original_owner
+        # Suspend the captured root guardian, not the whole container. The real
+        # idle stop will exhaust its bounded drain and remove the container; no
+        # process is left to write Quiescent. This exercises physical-exit proof
+        # rather than passing solely because graceful shutdown now works.
+        frozen = execute('python3', '-c', '''
+import json, os, pathlib, signal
+scope = pathlib.Path('/home/user/logs/.app-cli-state')
+snapshot = json.loads((scope/'supervisor.json').read_text())['snapshot']
+work = scope/'work'/snapshot['generation']
+generation = json.loads((work/'generation.json').read_text())
+worker = generation['worker_pid']
+status = pathlib.Path('/proc', str(worker), 'status').read_text()
+parent = int(next(line.split()[1] for line in status.splitlines() if line.startswith('PPid:')))
+cmd = pathlib.Path('/proc', str(parent), 'cmdline').read_bytes().split(b'\\0')
+assert b'--runtime-worker-guardian' in cmd and str(work).encode() in cmd
+assert generation.get('physical_domain'), 'runtime did not stamp physical domain'
+os.kill(parent, signal.SIGSTOP)
+print(json.dumps({'generation': generation['id'], 'guardian': parent}))
+''')
+        evidence['frozen_guardian'] = json.loads(frozen.stdout)
         after = recycle_and_ensure(before, original_owner, 'first recycle')
         # No preparatory Stop: Start itself must repair the unavailable owner.
         write({'web/version.txt': 'after-recycle'})
         count = start('start', 'after-recycle', count)
+        physical_exit = read_json('/home/user/logs/.app-cli-state/work/' + evidence['frozen_guardian']['generation'] + '/physical-exit.json')
+        if physical_exit['generation'] != evidence['frozen_guardian']['generation']:
+            raise RuntimeError('physical exit receipt belongs to another generation')
+        evidence['physical_exit'] = physical_exit
         recovered_owner = owner()
         check('new owner replaces retired registration', recovered_owner != original_owner and
               original_owner in json.dumps(read_json('/home/user/logs/dev-server-external.json').get('retired', {})),

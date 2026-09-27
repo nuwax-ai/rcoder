@@ -20,6 +20,7 @@ pub mod deploy_host_ports;
 pub mod health;
 pub mod image_management;
 pub mod manager_cleanup;
+mod native_domain;
 pub mod network;
 pub mod network_management;
 pub mod runtime_selection;

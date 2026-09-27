@@ -47,7 +47,11 @@ fn save(root: &Path, receipt: &Receipt) -> Result<()> {
     Ok(())
 }
 fn read(root: &Path) -> Result<Receipt> {
-    let value: Receipt = serde_json::from_slice(&std::fs::read(root.join("receipt.json"))?)?;
+    let path = root.join("receipt.json");
+    let value: Receipt = serde_json::from_slice(
+        &std::fs::read(&path)
+            .with_context(|| format!("read command receipt {}", path.display()))?,
+    )?;
     ensure!(
         matches!(value.version, 1 | 2)
             && matches!(
@@ -61,6 +65,38 @@ fn read(root: &Path) -> Result<Receipt> {
         "guardian identity mismatch"
     );
     Ok(value)
+}
+
+const RECEIPT_VISIBILITY_BUDGET: Duration = Duration::from_millis(250);
+
+fn missing_receipt(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Poll only the original registered receipt. Shared filesystem observations
+/// may briefly miss a concurrently replaced file. Absence never proves exit:
+/// retain the same Child and return Pending for a short, non-resetting window.
+fn observe_receipt(
+    root: &Path,
+    unavailable_since: &mut Option<std::time::Instant>,
+) -> Result<Option<Receipt>> {
+    match read(root) {
+        Ok(receipt) => {
+            *unavailable_since = None;
+            Ok(Some(receipt))
+        }
+        Err(error) if missing_receipt(&error) => {
+            let since = unavailable_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() < RECEIPT_VISIBILITY_BUDGET {
+                Ok(None)
+            } else {
+                Err(error).context("command receipt remains unavailable")
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 fn lock(root: &Path) -> Result<File> {
     let lock = File::options()
@@ -80,6 +116,7 @@ pub enum OwnedChild {
         child: tokio::process::Child,
         lease: Option<tokio::process::ChildStdin>,
         root: PathBuf,
+        receipt_unavailable_since: Option<std::time::Instant>,
     },
 }
 impl OwnedChild {
@@ -117,8 +154,17 @@ impl OwnedChild {
     pub fn try_wait_root(&mut self) -> std::io::Result<Option<ExitStatus>> {
         match self {
             Self::Direct(c) => c.try_wait_root(),
-            Self::Guarded { child, root, .. } => {
-                let receipt = read(root).map_err(std::io::Error::other)?;
+            Self::Guarded {
+                child,
+                root,
+                receipt_unavailable_since,
+                ..
+            } => {
+                let Some(receipt) = observe_receipt(root, receipt_unavailable_since)
+                    .map_err(std::io::Error::other)?
+                else {
+                    return Ok(None);
+                };
                 if let Some(raw) = receipt.root_status {
                     return decode_status(raw).map(Some);
                 }
@@ -134,15 +180,39 @@ impl OwnedChild {
     pub async fn stop(&mut self, grace: Duration) -> StopOutcome {
         match self {
             Self::Direct(child) => child.stop(grace).await,
-            Self::Guarded { child, lease, root } => {
+            Self::Guarded {
+                child, lease, root, ..
+            } => {
                 // Closing our exact pipe asks the guardian to stop. Killing the
                 // guardian would destroy the only authoritative tree handle.
                 lease.take();
-                match tokio::time::timeout(grace + Duration::from_secs(6), child.wait()).await {
-                    Ok(Ok(status)) if confirmed(root).is_ok() => StopOutcome::Graceful(status),
+                let deadline = tokio::time::Instant::now() + grace + Duration::from_secs(6);
+                match tokio::time::timeout_at(deadline, child.wait()).await {
+                    Ok(Ok(status))
+                        if confirm_visible(
+                            root,
+                            deadline.min(tokio::time::Instant::now() + RECEIPT_VISIBILITY_BUDGET),
+                        )
+                        .await
+                        .is_ok() =>
+                    {
+                        StopOutcome::Graceful(status)
+                    }
                     _ => StopOutcome::Unconfirmed,
                 }
             }
+        }
+    }
+}
+
+async fn confirm_visible(root: &Path, deadline: tokio::time::Instant) -> Result<()> {
+    loop {
+        match confirmed(root) {
+            Ok(()) => return Ok(()),
+            Err(error) if missing_receipt(&error) && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -284,9 +354,14 @@ pub async fn spawn_guarded(
     command_record: Option<&Path>,
     capture: bool,
 ) -> Result<OwnedChild> {
-    let admission = if crate::command_authority::is_managed(work_root)? {
-        let gate = crate::command_authority::Gate::acquire(work_root).await?;
-        gate.require_open()?;
+    let admission = if crate::command_authority::is_managed(work_root)
+        .with_context(|| format!("read command authority at {}", work_root.display()))?
+    {
+        let gate = crate::command_authority::Gate::acquire(work_root)
+            .await
+            .with_context(|| format!("acquire command authority at {}", work_root.display()))?;
+        gate.require_open()
+            .context("check command admission before guardian registration")?;
         Some(gate)
     } else {
         None
@@ -309,7 +384,8 @@ pub async fn spawn_guarded(
     let root = work_root
         .join("guardians")
         .join(uuid::Uuid::new_v4().to_string());
-    crate::command_context::create_durable_directory(&root)?;
+    crate::command_context::create_durable_directory(&root)
+        .with_context(|| format!("create command guardian directory {}", root.display()))?;
     let receipt = Receipt {
         version: 2,
         root_status: None,
@@ -327,10 +403,13 @@ pub async fn spawn_guarded(
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>(),
     };
-    save(&root, &receipt)?;
+    save(&root, &receipt)
+        .with_context(|| format!("register command guardian at {}", root.display()))?;
     // Registered before closure; a late guardian must consume under the same gate.
     drop(admission);
-    let mut guardian = tokio::process::Command::new(std::env::current_exe()?);
+    let mut guardian = tokio::process::Command::new(
+        std::env::current_exe().context("resolve command guardian executable")?,
+    );
     guardian
         .arg("--native-command-guardian")
         .arg(&root)
@@ -361,8 +440,14 @@ pub async fn spawn_guarded(
         .context("send guardian command")?;
     // Spawn means the actual command has started, not merely its guardian.
     tokio::time::timeout(Duration::from_secs(10), async {
+        let mut unavailable_since = None;
         loop {
-            let receipt = read(&root)?;
+            let receipt = observe_receipt(&root, &mut unavailable_since)
+                .with_context(|| format!("read command startup receipt at {}", root.display()))?;
+            let Some(receipt) = receipt else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            };
             if receipt.diagnostic_pid.is_some() || receipt.root_status.is_some() {
                 return Ok::<_, anyhow::Error>(());
             }
@@ -379,6 +464,7 @@ pub async fn spawn_guarded(
         child,
         lease: Some(lease),
         root,
+        receipt_unavailable_since: None,
     })
 }
 
@@ -598,9 +684,120 @@ pub fn recover(work_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Platform-confirmed termination of the entire captured physical domain.
+/// Caller must hold the original scope/generation lock and close admission.
+/// Never use this for a refused port, missing PID or changed namespace alone.
+pub fn confirm_physical_domain_exit(work_root: &Path) -> Result<()> {
+    let dir = work_root.join("guardians");
+    if dir.try_exists()? {
+        for entry in std::fs::read_dir(dir)? {
+            let root = entry?.path();
+            let _lock = lock(&root)?;
+            let mut receipt = read(&root)?;
+            ensure!(
+                work_root.file_name().and_then(|s| s.to_str()) == Some(&receipt.instance_id),
+                "physical exit guardian identity mismatch"
+            );
+            receipt.phase = "Quiescent".into();
+            // root_status remains unknown if it was not observed. Cleanup is
+            // not evidence that a command or migration returned success.
+            save(&root, &receipt)?;
+            confirm_command(&root, &receipt)?;
+        }
+    }
+    let commands = work_root.join("commands");
+    if commands.try_exists()? {
+        for entry in std::fs::read_dir(&commands)? {
+            let path = entry?.path();
+            let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            ensure!(
+                value["version"] == 1
+                    && matches!(
+                        value["phase"].as_str(),
+                        Some("SpawnPending" | "Running" | "Quiescent")
+                    ),
+                "invalid command cleanup record"
+            );
+            value["phase"] = "Quiescent".into();
+            value["termination"] = "PhysicalDomainExited".into();
+            let mut temp = tempfile::NamedTempFile::new_in(&commands)?;
+            serde_json::to_writer(&mut temp, &value)?;
+            temp.flush()?;
+            temp.as_file().sync_all()?;
+            crate::atomic_file::persist(temp, &path)?;
+        }
+        #[cfg(unix)]
+        File::open(commands)?.sync_all()?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn receipt_visibility_gap_retains_child_but_missing_or_corrupt_receipt_is_not_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&root).unwrap();
+        let receipt = Receipt {
+            version: 2,
+            id: root.file_name().unwrap().to_str().unwrap().into(),
+            instance_id: "test-instance".into(),
+            phase: "Running".into(),
+            command_record: None,
+            command_digest: "0".repeat(64),
+            root_status: None,
+            diagnostic_pid: None,
+        };
+        save(&root, &receipt).unwrap();
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let original_pid = child.id();
+        let mut owned = OwnedChild::Guarded {
+            child,
+            lease: None,
+            root: root.clone(),
+            receipt_unavailable_since: None,
+        };
+        assert!(owned.try_wait_root().unwrap().is_none());
+        let path = root.join("receipt.json");
+        let retained = root.join("retained.json");
+        std::fs::rename(&path, &retained).unwrap();
+        assert!(owned.try_wait_root().unwrap().is_none());
+        std::fs::rename(&retained, &path).unwrap();
+        assert!(owned.try_wait_root().unwrap().is_none());
+        std::fs::write(&path, "corrupt").unwrap();
+        assert!(owned.try_wait_root().is_err());
+        save(&root, &receipt).unwrap();
+        assert!(owned.try_wait_root().unwrap().is_none());
+        std::fs::rename(path, retained).unwrap();
+        assert!(owned.try_wait_root().unwrap().is_none());
+        if let OwnedChild::Guarded {
+            receipt_unavailable_since,
+            ..
+        } = &mut owned
+        {
+            *receipt_unavailable_since = Some(std::time::Instant::now() - Duration::from_secs(1));
+        }
+        assert!(
+            owned.try_wait_root().is_err(),
+            "permanent absence must fail"
+        );
+        if let OwnedChild::Guarded { child, .. } = &mut owned {
+            assert_eq!(
+                child.id(),
+                original_pid,
+                "never launch a replacement command"
+            );
+            child.kill().await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn stopping_owner_revokes_unconsumed_guardian_without_spawning() {
         let scope = tempfile::tempdir().unwrap();

@@ -58,7 +58,7 @@ async fn hung_control_is_stoppable_retries_replay_and_business_stays_stopped() {
     std::fs::create_dir(&root).unwrap();
     let mut owner = start(&root).unwrap();
     let result = async {
-        let old = until(&root, |s| s.phase == "ready").await?;
+        let old = until(&root, |s| s.phase == runtime_supervisor::Phase::Ready).await?;
         let address = leaf(&root).await?;
         let work = root
             .join("work")
@@ -88,9 +88,22 @@ async fn hung_control_is_stoppable_retries_replay_and_business_stays_stopped() {
             accepted.operation_id.as_deref() == Some(&request.request_id),
             "stop identity lost"
         );
+        let busy = control(&root, Request::new(Action::Recover))
+            .await
+            .unwrap_err();
         ensure!(
-            control(&root, Request::new(Action::Recover)).await.is_err(),
-            "conflicting request was queued"
+            busy.downcast_ref::<runtime_supervisor::Problem>()
+                .is_some_and(|p| p.code == runtime_supervisor::FailureCode::Busy),
+            "conflicting request must return typed Busy, not queue or opaque text"
+        );
+        let blocker = busy
+            .downcast_ref::<runtime_supervisor::RecoveryError>()
+            .context("Busy must retain the structured blocker snapshot")?;
+        ensure!(
+            blocker.snapshot.generation == old.generation
+                && blocker.snapshot.operation_id == accepted.operation_id
+                && blocker.snapshot.supervisor_id == old.supervisor_id,
+            "Busy lost the original generation or operation identity"
         );
         ensure!(
             control(&root, request.clone()).await?.operation_id == accepted.operation_id,
@@ -104,7 +117,7 @@ async fn hung_control_is_stoppable_retries_replay_and_business_stays_stopped() {
         );
         until(&root, |s| s.generation != old.generation).await?;
         std::fs::remove_file(root.join("hang"))?;
-        until(&root, |s| s.phase == "ready").await?;
+        until(&root, |s| s.phase == runtime_supervisor::Phase::Ready).await?;
         ensure!(
             tokio::net::TcpStream::connect(&address).await.is_err(),
             "old owned command survived Stop"
@@ -116,14 +129,17 @@ async fn hung_control_is_stoppable_retries_replay_and_business_stays_stopped() {
                 .context("old generation missing")?,
         )?;
         ensure!(
-            control(&root, request).await?.phase == "ready",
+            control(&root, request).await?.phase == runtime_supervisor::Phase::Ready,
             "completed retry lost terminal result"
         );
         let stopped = status(&root).await?;
         let recover = control(&root, Request::new(Action::Recover)).await?;
-        ensure!(recover.phase == "stopping", "recover not admitted");
+        ensure!(
+            recover.phase == runtime_supervisor::Phase::Stopping,
+            "recover not admitted"
+        );
         until(&root, |s| {
-            s.phase == "ready" && s.generation != stopped.generation
+            s.phase == runtime_supervisor::Phase::Ready && s.generation != stopped.generation
         })
         .await?;
         leaf(&root).await?;
@@ -141,7 +157,7 @@ async fn parent_death_drains_hung_worker_and_allows_verified_successor() {
     std::fs::create_dir(&root).unwrap();
     let mut parent = start(&root).unwrap();
     let result = async {
-        let original = until(&root, |s| s.phase == "ready").await?;
+        let original = until(&root, |s| s.phase == runtime_supervisor::Phase::Ready).await?;
         let address = leaf(&root).await?;
         std::fs::write(root.join("hang"), "unresponsive worker")?;
         let mut stop = Request::new(Action::StopWork);
@@ -172,13 +188,13 @@ async fn parent_death_drains_hung_worker_and_allows_verified_successor() {
         );
         std::fs::remove_file(root.join("hang"))?;
         parent = start(&root)?;
-        let next = until(&root, |s| s.phase == "ready").await?;
+        let next = until(&root, |s| s.phase == runtime_supervisor::Phase::Ready).await?;
         ensure!(
             next.supervisor_id != original.supervisor_id && next.generation != original.generation,
             "successor reused identity"
         );
         ensure!(
-            control(&root, stop).await?.phase == "ready",
+            control(&root, stop).await?.phase == runtime_supervisor::Phase::Ready,
             "accepted Stop was lost across supervisor death"
         );
         ensure!(

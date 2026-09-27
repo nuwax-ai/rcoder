@@ -656,7 +656,7 @@ impl DevServerManager {
         }
         .await;
         recover.map_err(|error| {
-            crate::error::AppError::business(format!("runtime operation recovery: {error:#}"))
+            crate::error::AppError::owner_error("runtime operation recovery", error)
         })
     }
 }

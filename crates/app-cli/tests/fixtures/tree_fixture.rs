@@ -13,7 +13,7 @@
 // 仅测试 fixture 允许 unsafe：SIG_IGN 无 std API（生产代码不受此豁免）。
 #![allow(unsafe_code)]
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
 
@@ -51,6 +51,19 @@ fn hold_port(port: u16, ignore_term: bool) {
             std::process::exit(3);
         }
     };
+    if let Some(path) = std::env::var_os("TREE_FIXTURE_READY") {
+        let path = std::path::PathBuf::from(path);
+        let temporary = path.with_extension("tmp");
+        std::fs::write(&temporary, format!("{} {port}", std::process::id()))
+            .expect("record actual grandchild bind");
+        std::fs::rename(temporary, path).expect("publish grandchild bind evidence");
+    }
+    // A real handshake: the service must not report readiness before the
+    // TERM-ignoring grandchild has installed its handler and bound its port.
+    println!("READY {port}");
+    std::io::stdout()
+        .flush()
+        .expect("flush bind acknowledgement");
     for stream in listener.incoming() {
         // 只消费连接，不响应——纯端口持有者
         drop(stream);
@@ -62,10 +75,15 @@ fn serve_with_grandchild(svc_port: u16, gc_port: u16) {
     let exe = std::env::current_exe().expect("fixture path");
     let mut grandchild = Command::new(exe)
         .args(["hold", &gc_port.to_string(), "--ignore-term"])
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn grandchild holder");
+    let mut ready = String::new();
+    std::io::BufReader::new(grandchild.stdout.take().expect("grandchild handshake"))
+        .read_line(&mut ready)
+        .expect("read grandchild bind acknowledgement");
+    assert_eq!(ready.trim(), format!("READY {gc_port}"));
     let listener = match TcpListener::bind(("0.0.0.0", svc_port)) {
         Ok(listener) => listener,
         Err(error) => {

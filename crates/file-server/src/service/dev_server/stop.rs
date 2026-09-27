@@ -121,9 +121,10 @@ impl DevServerManager {
             Err(original) => match self.stop_supervised_owner(project_id, project_path).await {
                 Ok(Some(stopped)) => Ok(stopped),
                 Ok(None) => Err(original),
-                Err(error) => Err(AppError::business(format!(
-                    "owner stop failed: {original}; independent recovery: {error:#}"
-                ))),
+                Err(error) => Err(AppError::owner_error(
+                    &format!("owner stop failed: {original}; independent recovery"),
+                    error,
+                )),
             },
         }
     }
@@ -209,7 +210,7 @@ impl DevServerManager {
         if let Some(stopped) = self
             .stop_supervised_owner(project_id, project_path)
             .await
-            .map_err(|error| AppError::business(format!("independent owner stop: {error:#}")))?
+            .map_err(|error| AppError::owner_error("independent owner stop", error))?
         {
             return Ok(stopped);
         }

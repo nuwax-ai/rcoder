@@ -188,8 +188,8 @@ async fn supervised_control(
             if action == Action::Status {
                 let mut value =
                     runtime_supervisor::last_snapshot(root).map_err(|e| format!("{e:#}"))?;
-                if value.phase != "stopped" {
-                    value.phase = "recovery_required".into();
+                if value.phase != runtime_supervisor::Phase::Stopped {
+                    value.phase = runtime_supervisor::Phase::RecoveryRequired;
                     value.error = Some(
                         "supervisor is offline; start it to reconcile the previous execution"
                             .into(),
@@ -202,7 +202,9 @@ async fn supervised_control(
             ));
         }
     };
-    if action == Action::Status || (action == Action::Recover && accepted.phase == "ready") {
+    if action == Action::Status
+        || (action == Action::Recover && accepted.phase == runtime_supervisor::Phase::Ready)
+    {
         return supervisor_reply(accepted);
     }
     let previous = accepted.generation.clone();
@@ -215,14 +217,17 @@ async fn supervised_control(
         if current.supervisor_id != accepted.supervisor_id {
             return Err("supervisor changed while control was pending".into());
         }
-        if action == Action::Shutdown && current.phase == "stopped" {
+        if action == Action::Shutdown && current.phase == runtime_supervisor::Phase::Stopped {
             if let Some(generation) = current.generation.as_deref() {
                 runtime_supervisor::verify_quiescent(root, generation)
                     .map_err(|e| format!("{e:#}"))?;
             }
             return supervisor_reply(current);
         }
-        if action == Action::Recover && current.phase == "ready" && current.generation != previous {
+        if action == Action::Recover
+            && current.phase == runtime_supervisor::Phase::Ready
+            && current.generation != previous
+        {
             return supervisor_reply(current);
         }
         if tokio::time::Instant::now() >= deadline {
@@ -237,17 +242,19 @@ async fn supervised_control(
     }
 }
 fn supervisor_reply(snapshot: runtime_supervisor::Snapshot) -> Result<String, String> {
-    let phase = match snapshot.phase.as_str() {
-        "ready" => "Running",
-        "stopped" => "Stopped",
-        "starting" => "Starting",
-        "stopping" | "cleanup_pending" => "Stopping",
+    let phase = match snapshot.phase {
+        runtime_supervisor::Phase::Ready => "Running",
+        runtime_supervisor::Phase::Stopped => "Stopped",
+        runtime_supervisor::Phase::Starting => "Starting",
+        runtime_supervisor::Phase::Stopping | runtime_supervisor::Phase::CleanupPending => {
+            "Stopping"
+        }
         _ => "RecoveryRequired",
     };
     serde_json::to_string(
         &serde_json::json!({"version":2,"instance_id":snapshot.generation,
         "supervisor_id":snapshot.supervisor_id,"phase":phase,"stage":snapshot.phase,
-        "operation_id":snapshot.operation_id,"error":snapshot.error}),
+        "operation_id":snapshot.operation_id,"error":snapshot.error,"problem":snapshot.problem}),
     )
     .map_err(|e| e.to_string())
 }

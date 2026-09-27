@@ -524,7 +524,10 @@ impl DockerRuntime {
                 .map_err(|error| {
                     Error::DockerError(format!("Prepare restart image {image}: {error}"))
                 })?;
-            let body = restore_body(template, &archive)?;
+            let mut body = restore_body(template, &archive)?;
+            crate::native_domain::stamp(client, &mut body)
+                .await
+                .map_err(|e| fail(format!("bind replacement execution domain: {e:#}")))?;
             let options = bollard::query_parameters::CreateContainerOptions {
                 name: Some(original.name.clone()),
                 platform: self.inner.config.default_platform.clone(),

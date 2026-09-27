@@ -26,9 +26,7 @@ impl DevServerManager {
     ) -> AppResult<Option<AvailableOwner>> {
         self.recover_owner_inner(project, workspace)
             .await
-            .map_err(|error| {
-                AppError::business(format!("recover app-cli management service: {error:#}"))
-            })
+            .map_err(|error| AppError::owner_error("recover app-cli management service", error))
     }
 
     async fn recover_owner_inner(
@@ -112,7 +110,8 @@ impl DevServerManager {
                             self.spawn_recovery_owner(project, workspace, address)
                                 .await?;
                         }
-                        self.wait_for_recovery_owner(project, address).await?
+                        self.wait_for_recovery_owner(project, workspace, address, &root)
+                            .await?
                     }
                 }
             }
@@ -192,20 +191,74 @@ impl DevServerManager {
     async fn wait_for_recovery_owner(
         &self,
         project: &str,
+        workspace: &Path,
         address: &str,
+        root: &Path,
     ) -> Result<RuntimeIdentityView> {
-        tokio::time::timeout(Duration::from_secs(45), async {
+        let origin = runtime_state_layout::resolve_project_origin(workspace)?;
+        let mut diagnostic = None;
+        let mut resumed_shutdown = false;
+        let result = tokio::time::timeout(Duration::from_secs(45), async {
             loop {
                 // Check the winner first: another managed supervisor can win the
                 // OwnerGuard race while our control-only candidate exits.
                 if let OwnerProbe::Ready(identity) = owner_client::observe_owner(address).await? {
                     return Ok(identity);
                 }
+                let observation = runtime_supervisor::control(
+                    root,
+                    runtime_supervisor::Request::new(runtime_supervisor::Action::Status),
+                )
+                .await;
+                let observation = match observation {
+                    Err(error)
+                        if error
+                            .downcast_ref::<runtime_supervisor::Problem>()
+                            .is_some_and(|problem| {
+                                problem.code == runtime_supervisor::FailureCode::ProtocolMismatch
+                            }) =>
+                    {
+                        return Err(error);
+                    }
+                    result => result,
+                };
+                if let Ok(snapshot) = observation {
+                    ensure!(
+                        snapshot.binding.component == "app-cli"
+                            && snapshot.binding.resource == origin,
+                        "recovery supervisor belongs to another workspace"
+                    );
+                    diagnostic = Some(snapshot.diagnostic());
+                    if snapshot.phase == runtime_supervisor::Phase::RecoveryRequired {
+                        return Err(snapshot.recovery_error());
+                    }
+                }
                 let exited = lock(&self.owner_children)
                     .map_err(|e| anyhow::anyhow!("{e}"))?
                     .get(project)
                     .and_then(|child| child.exited());
                 if let Some(exit) = exited {
+                    // The first bootstrap may finish the original container's
+                    // already accepted Shutdown. Only its confirmed terminal
+                    // receipt permits one new management-only launch. This does
+                    // not queue/replay a business operation or erase its journal.
+                    if !resumed_shutdown
+                        && matches!(&exit, super::ChildExit::Exited(status) if status.success())
+                        && let Ok(snapshot) = runtime_supervisor::last_snapshot(root)
+                        && snapshot.binding.component == "app-cli"
+                        && snapshot.binding.resource == origin
+                        && snapshot.phase == runtime_supervisor::Phase::Stopped
+                        && snapshot.intent == runtime_supervisor::Intent::Shutdown
+                        && snapshot.operation_id.is_some()
+                    {
+                        if let Some(generation) = &snapshot.generation {
+                            runtime_supervisor::verify_quiescent(root, generation)?;
+                        }
+                        resumed_shutdown = true;
+                        self.spawn_recovery_owner(project, workspace, address)
+                            .await?;
+                        continue;
+                    }
                     anyhow::bail!(
                         "app-cli management recovery {}; see {}/app-cli/owner-recovery.log",
                         exit.describe(),
@@ -215,8 +268,15 @@ impl DevServerManager {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         })
-        .await
-        .context("app-cli management recovery timed out; original runtime state retained")?
+        .await;
+        result.with_context(|| {
+            format!(
+                "app-cli management recovery timed out; original runtime state retained; {}",
+                diagnostic
+                    .as_deref()
+                    .unwrap_or("supervisor control is unavailable")
+            )
+        })?
     }
 
     /// Async preflight belongs before expensive build commands. Recheck at

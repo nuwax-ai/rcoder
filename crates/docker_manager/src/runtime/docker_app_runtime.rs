@@ -1189,7 +1189,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
     }
 }
 
-pub(super) async fn execute_container_command(
+pub(crate) async fn execute_container_command(
     client: &bollard::Docker,
     name: &str,
     command: Vec<String>,
