@@ -11095,6 +11095,7 @@ dependencies = [
  "futures-util",
  "http",
  "matchit",
+ "opentelemetry",
  "percent-encoding",
  "pingora",
  "pingora-core",
@@ -11106,6 +11107,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "tracing-opentelemetry",
  "url",
  "uuid",
 ]
