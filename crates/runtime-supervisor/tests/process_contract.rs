@@ -142,7 +142,29 @@ async fn hung_control_is_stoppable_retries_replay_and_business_stays_stopped() {
             s.phase == runtime_supervisor::Phase::Ready && s.generation != stopped.generation
         })
         .await?;
-        leaf(&root).await?;
+        let latest_address = leaf(&root).await?;
+        // A responsive worker may acknowledge Stop but keep running and ask for
+        // two minutes. Interactive policy must keep its own force-stop deadline.
+        std::fs::write(root.join("slow-shutdown"), "acknowledge without exiting")?;
+        let current = status(&root).await?;
+        let start = std::time::Instant::now();
+        let done =
+            runtime_supervisor::stop_work(&root, &current.binding, Duration::from_secs(8)).await?;
+        ensure!(
+            start.elapsed() < Duration::from_secs(5),
+            "worker extended the stop grace"
+        );
+        ensure!(
+            done.generation != current.generation,
+            "independent stop did not replace the worker"
+        );
+        ensure!(
+            tokio::net::TcpStream::connect(&latest_address)
+                .await
+                .is_err(),
+            "owned work survived stop"
+        );
+        std::fs::remove_file(root.join("slow-shutdown"))?;
         Ok::<_, anyhow::Error>(())
     }
     .await;

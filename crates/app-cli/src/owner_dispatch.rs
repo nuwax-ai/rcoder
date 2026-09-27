@@ -186,6 +186,16 @@ pub async fn dispatch_to_owner(
     state_root: &std::path::Path,
     application_id: &str,
 ) -> Result<OwnerDispatch> {
+    dispatch_to_owner_inner(admin_addr, workspace, state_root, application_id, true).await
+}
+
+async fn dispatch_to_owner_inner(
+    admin_addr: &str,
+    workspace: &std::path::Path,
+    state_root: &std::path::Path,
+    application_id: &str,
+    allow_recovery: bool,
+) -> Result<OwnerDispatch> {
     let connect_addr = connect_address(admin_addr);
     let admin_addr = connect_addr.as_str();
     // R09/XP10：发现记录（endpoint.json）是线索不是证明——身份核验全字段
@@ -279,6 +289,41 @@ pub async fn dispatch_to_owner(
         status.runtime_instance_id == identity.runtime_instance_id,
         "owner changed while preparing dispatch; no operation was submitted"
     );
+    if allow_recovery && state_root.join("supervisor.json").try_exists()? {
+        let response = client
+            .get(format!("http://{admin_addr}/v1/runtime/recovery"))
+            .header("X-Deploy-Token", &token)
+            .send()
+            .await?
+            .error_for_status()?;
+        let body: serde_json::Value = response.json().await?;
+        let recovery: shared_types::RuntimeRecoveryView =
+            serde_json::from_value(envelope_data(&body)?)?;
+        if status.recovery_protection
+            || (recovery.owner_protected && !recovery.credentials_required)
+        {
+            runtime_supervisor::stop_work(
+                state_root,
+                &runtime_supervisor::Binding {
+                    component: "app-cli".into(),
+                    resource: runtime_state_layout::resolve_project_origin(workspace)?,
+                },
+                std::time::Duration::from_secs(90),
+            )
+            .await
+            .context("restore owner before explicit start")?;
+            // No request was submitted to the old owner. Discover fresh identity
+            // and credentials after its captured execution has actually stopped.
+            return Box::pin(dispatch_to_owner_inner(
+                admin_addr,
+                workspace,
+                state_root,
+                application_id,
+                false,
+            ))
+            .await;
+        }
+    }
     let operation_id = format!("cli-dispatch-{}", uuid::Uuid::new_v4().simple());
     let request = RuntimeOperationRequest {
         operation_id: operation_id.clone(),
@@ -350,7 +395,7 @@ pub async fn dispatch_to_owner(
                 && view.kind == RuntimeOperationKind::Start,
             "owner returned a different operation or runtime identity while observing {operation_id}"
         );
-        if view.state.is_terminal() {
+        if view.state.is_terminal() || view.state == RuntimeOperationState::RecoveryRequired {
             return Ok(OwnerDispatch::Terminal(view));
         }
         tokio::time::sleep_until(std::cmp::min(

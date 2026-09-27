@@ -1,7 +1,7 @@
 //! Durable external-owner intents. File transactions are short and never span HTTP.
 use std::{collections::HashMap, fs::OpenOptions, io::Write, path::Path};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shared_types::{RuntimeOperationKind, RuntimeOperationRequest, RuntimeOperationView};
@@ -110,6 +110,23 @@ fn read(path: &Path) -> Result<State> {
     }
 }
 
+/// This file is a transport cache. The app-cli operation store remains the
+/// authority for execution and replay. Call only under the retained file lock.
+fn read_or_quarantine(path: &Path) -> Result<State> {
+    match read(path) {
+        Ok(state) => Ok(state),
+        Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => {
+            let backup =
+                path.with_extension(format!("corrupt-{}.json", uuid::Uuid::new_v4().simple()));
+            std::fs::rename(path, &backup)
+                .context("preserve damaged external owner registration")?;
+            tracing::warn!(backup = %backup.display(), %error, "rebuilding external owner cache from the runtime owner");
+            Ok(State::default())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 impl DevServerManager {
     pub(super) fn external_state_path(&self) -> std::path::PathBuf {
         self.config.log_base_dir.join("dev-server-external.json")
@@ -131,7 +148,7 @@ impl DevServerManager {
             .open(path.with_extension("lock"))
             .context("open external state lock")?;
         lock.try_lock().context("external owner state is busy")?;
-        let mut state = read(&path)?;
+        let mut state = read_or_quarantine(&path)?;
         let result = mutate(&mut state)?;
         let mut temporary =
             tempfile::NamedTempFile::new_in(parent).context("create external state transaction")?;
@@ -154,7 +171,14 @@ impl DevServerManager {
     }
 
     pub(super) fn read_external_state(&self) -> Result<State> {
-        read(&self.external_state_path())
+        match read(&self.external_state_path()) {
+            Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => {
+                // Re-read under the transaction lock so a concurrent repair or
+                // newly published registration cannot be overwritten.
+                self.external_transaction(|state| Ok(state.clone()))
+            }
+            result => result,
+        }
     }
     pub(super) fn check_external_store(&self) -> Result<()> {
         self.read_external_state().map(|_| ())
@@ -237,28 +261,39 @@ impl DevServerManager {
             let root = runtime_state_layout::canonical_project_root(workspace);
             let slot = key(project, candidate.kind);
             if let Some(intent) = state.intents.get(&slot) {
-                ensure!(intent.project_root.as_ref() == Some(&root), "pending operation workspace root differs; recovery required");
                 ensure!(
-                    intent.address == owner.address
-                        && intent.request.expected_runtime_instance_id == owner.runtime_instance_id,
-                    "pending runtime intent belongs to a different owner; recovery required"
+                    intent.project_root.as_ref() == Some(&root),
+                    "pending operation workspace root differs"
                 );
+                let same_owner = intent.address == owner.address
+                    && intent.request.expected_runtime_instance_id == owner.runtime_instance_id;
+                let same_request = intent.request.operation_id == candidate.operation_id
+                    || (candidate.request_context.is_some()
+                        && intent.request.request_context == candidate.request_context);
                 ensure!(
-                    intent.request.workspace_id == candidate.workspace_id
-                        && serde_json::to_value(&intent.request.profile)?
-                            == serde_json::to_value(&candidate.profile)?,
-                    "pending runtime intent has a different profile; recovery required"
+                    !same_request || same_owner,
+                    "original runtime request belongs to a retired owner; query its result before replay"
                 );
-                if matches!(candidate.kind, RuntimeOperationKind::Restart | RuntimeOperationKind::Deploy) {
-                    ensure!(intent.request.request_context == candidate.request_context
-                        && (candidate.request_context.is_some() || intent.request.operation_id == candidate.operation_id),
-                        "another build request has pending operation {}; resume that operation before a new build request", intent.request.operation_id);
+                if same_owner && same_request {
+                    ensure!(
+                        intent.request.workspace_id == candidate.workspace_id
+                            && serde_json::to_value(&intent.request.profile)?
+                                == serde_json::to_value(&candidate.profile)?,
+                        "retry changed the runtime request profile"
+                    );
+                    return Ok(intent.clone());
                 }
-                return Ok(intent.clone());
+                // A new user action is allowed to replace the local transport
+                // slot. Keep the old request queryable; the owner serializes
+                // execution and a late response must not remove the new slot.
+                let previous = intent.clone();
+                state.completed.insert(
+                    format!("{project}|{}", previous.request.operation_id),
+                    previous,
+                );
             }
-            if candidate.kind == RuntimeOperationKind::Stop && state.stops.contains_key(project) {
-                bail!("legacy stop intent requires query-only recovery");
-            }
+            // Legacy stop observations are not an active runtime operation.
+            state.stops.remove(project);
             let mut redacted = candidate.clone();
             redacted.run_config = None;
             let intent = Intent {
@@ -372,11 +407,9 @@ impl DevServerManager {
         let removed = self.external_transaction(|state| {
             let slot = key(project, request.kind);
             let completed_key = format!("{project}|{}", request.operation_id);
-            if !state.intents.contains_key(&slot)
-                && state.completed.get(&completed_key).is_some_and(|old| {
-                    old.request.expected_runtime_instance_id == request.expected_runtime_instance_id
-                })
-            {
+            if state.completed.get(&completed_key).is_some_and(|old| {
+                old.request.expected_runtime_instance_id == request.expected_runtime_instance_id
+            }) {
                 let remove_registration = remove_owner
                     && state.owners.get(project).is_some_and(|owner| {
                         owner.registration_operation_id.as_deref()
@@ -434,26 +467,12 @@ pub(super) fn verify_view(
 }
 
 impl DevServerManager {
-    pub fn ensure_new_build_admissible(&self, project: &str) -> crate::error::AppResult<()> {
-        let state = self.read_external_state().map_err(|e| {
-            crate::error::AppError::business(format!("external recovery required: {e:#}"))
-        })?;
-        if let Some(intent) = state
-            .intents
-            .get(&key(project, RuntimeOperationKind::Restart))
-            .or_else(|| {
-                state
-                    .intents
-                    .get(&key(project, RuntimeOperationKind::Deploy))
-            })
-            .or_else(|| state.intents.get(&key(project, RuntimeOperationKind::Stop)))
-        {
-            return Err(crate::error::AppError::Conflict(format!(
-                "pending runtime operation {}; recover this operation before creating another build task",
-                intent.request.operation_id
-            )));
-        }
-        Ok(())
+    /// Historical transport intents do not own the workspace. The runtime
+    /// owner handles active execution when the new build is submitted.
+    pub fn ensure_new_build_admissible(&self, _project: &str) -> crate::error::AppResult<()> {
+        self.check_external_store().map_err(|error| {
+            crate::error::AppError::business(format!("read external runtime state: {error:#}"))
+        })
     }
 
     /// A local child must still be owned, and the management API must confirm the same release is Ready.
@@ -739,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_task_context_cannot_be_replaced_by_new_or_anonymous_request() {
+    fn new_build_replaces_transport_intent_and_late_completion_preserves_it() {
         let dir = tempfile::tempdir().unwrap();
         let manager = manager(dir.path());
         let original = request();
@@ -747,58 +766,71 @@ mod tests {
         manager
             .prepare_external_intent("project", dir.path(), &owner, &original)
             .unwrap();
-        for context in [Some("another-task".to_owned()), None] {
-            let mut candidate = original.clone();
-            candidate.request_context = context;
-            candidate.operation_id = "replacement-operation".into();
-            let error = manager
-                .prepare_external_intent("project", dir.path(), &owner, &candidate)
-                .err()
-                .unwrap();
-            assert!(error.to_string().contains(&original.operation_id));
-            let state = manager.read_external_state().unwrap();
-            assert_eq!(
-                state.intents[&key("project", original.kind)]
-                    .request
-                    .operation_id,
-                original.operation_id
-            );
-        }
-        let mut same_task = original.clone();
-        same_task.operation_id = "discarded-new-id".into();
-        same_task.expected_revision = 100;
+        // Retrying the same task keeps its immutable request, including revision.
+        let mut retry = original.clone();
+        retry.operation_id = "discarded-new-id".into();
+        retry.expected_revision = 100;
         let resumed = manager
-            .prepare_external_intent("project", dir.path(), &owner, &same_task)
+            .prepare_external_intent("project", dir.path(), &owner, &retry)
             .unwrap();
         assert_eq!(resumed.request.operation_id, original.operation_id);
         assert_eq!(
             resumed.request.expected_revision,
             original.expected_revision
         );
+        for (id, context) in [
+            ("next-task", Some("another-task".into())),
+            ("manual-start", None),
+        ] {
+            let mut next = original.clone();
+            next.operation_id = id.into();
+            next.request_context = context;
+            let intent = manager
+                .prepare_external_intent("project", dir.path(), &owner, &next)
+                .unwrap();
+            assert_eq!(intent.request.operation_id, id);
+            manager
+                .finish_external_intent("project", &original, true)
+                .unwrap();
+            let state = manager.read_external_state().unwrap();
+            assert_eq!(
+                state.intents[&key("project", next.kind)]
+                    .request
+                    .operation_id,
+                id
+            );
+            assert_eq!(
+                state.owners["project"].registration_operation_id.as_deref(),
+                Some(id)
+            );
+            manager.ensure_new_build_admissible("project").unwrap();
+        }
     }
 
     #[test]
-    fn anonymous_retry_requires_original_operation_identity() {
+    fn corrupt_transport_cache_is_preserved_and_rebuilt() {
         let dir = tempfile::tempdir().unwrap();
         let manager = manager(dir.path());
-        let mut original = request();
-        original.request_context = None;
-        let owner = owner("127.0.0.1:1");
+        let path = manager.external_state_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{truncated").unwrap();
         manager
-            .prepare_external_intent("project", dir.path(), &owner, &original)
+            .prepare_external_intent("project", dir.path(), &owner("127.0.0.1:1"), &request())
             .unwrap();
         assert!(
             manager
-                .prepare_external_intent("project", dir.path(), &owner, &original)
-                .is_ok()
+                .read_external_state()
+                .unwrap()
+                .owners
+                .contains_key("project")
         );
-        let mut candidate = original.clone();
-        candidate.operation_id = "another-operation".into();
-        assert!(
-            manager
-                .prepare_external_intent("project", dir.path(), &owner, &candidate)
-                .is_err()
-        );
+        let backups: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains(".corrupt-"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), b"{truncated");
     }
 
     #[test]
@@ -1020,7 +1052,14 @@ mod tests {
                         .is_ok()
                 );
             } else {
-                assert!(manager.ensure_new_build_admissible("project").is_err());
+                // History remains unresolved, but it cannot veto a fresh build.
+                manager.ensure_new_build_admissible("project").unwrap();
+                assert_eq!(
+                    state.intents[&key("project", original.kind)]
+                        .request
+                        .operation_id,
+                    original.operation_id
+                );
             }
             server.abort();
         }
@@ -1239,20 +1278,9 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_unwritable_and_contended_state_prevent_intent_creation() {
+    fn unwritable_and_contended_state_prevent_intent_creation() {
         let dir = tempfile::tempdir().unwrap();
         let manager = manager(dir.path());
-        std::fs::write(manager.external_state_path(), "broken").unwrap();
-        assert!(
-            manager
-                .prepare_external_intent("project", dir.path(), &owner("127.0.0.1:1"), &request())
-                .is_err()
-        );
-        assert_eq!(
-            std::fs::read_to_string(manager.external_state_path()).unwrap(),
-            "broken"
-        );
-        std::fs::remove_file(manager.external_state_path()).unwrap();
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)

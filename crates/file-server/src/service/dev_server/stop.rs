@@ -113,10 +113,17 @@ impl DevServerManager {
         project_id: &str,
         project_path: &Path,
     ) -> AppResult<StoppedDev> {
-        match self
-            .stop_userapp_dev_through_owner(project_id, project_path)
-            .await
-        {
+        let attempt = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.stop_userapp_dev_through_owner(project_id, project_path),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(AppError::business(
+                "owner stop is still pending; using independent control",
+            ))
+        });
+        match attempt {
             Ok(stopped) => Ok(stopped),
             Err(original) => match self.stop_supervised_owner(project_id, project_path).await {
                 Ok(Some(stopped)) => Ok(stopped),

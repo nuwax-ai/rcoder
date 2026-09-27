@@ -27,6 +27,8 @@ pub struct Policy {
     pub unresponsive_for: Duration,
     pub initialization_timeout: Duration,
     pub graceful_stop: Duration,
+    /// Allow a worker to extend grace for non-interactive shutdowns.
+    pub negotiate_shutdown_grace: bool,
     pub restart_limit: usize,
     pub restart_window: Duration,
 }
@@ -38,6 +40,7 @@ impl Default for Policy {
             unresponsive_for: Duration::from_secs(15),
             initialization_timeout: Duration::from_secs(30),
             graceful_stop: Duration::from_secs(10),
+            negotiate_shutdown_grace: true,
             restart_limit: 3,
             restart_window: Duration::from_secs(600),
         }
@@ -540,7 +543,9 @@ impl State {
         {
             // A responsive adapter may already have a longer, service-derived
             // cleanup budget. Negotiate once; a hung adapter gets the fallback.
-            if let Some(declared) = now.checked_add(observation.shutdown_grace) {
+            if self.policy.negotiate_shutdown_grace
+                && let Some(declared) = now.checked_add(observation.shutdown_grace)
+            {
                 *deadline = (*deadline).max(declared);
             }
         }

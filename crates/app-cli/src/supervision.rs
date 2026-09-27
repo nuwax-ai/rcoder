@@ -4,6 +4,9 @@ use anyhow::Result;
 use runtime_supervisor::{Action, Options, Owner, Request, Worker};
 use std::path::{Path, PathBuf};
 
+/// Interactive service shutdown grace, shared by both execution engines.
+pub(crate) const STOP_GRACE_SECONDS: u64 = 3;
+
 /// Called by the retained guardian, including after a stuck worker is killed.
 pub async fn cleanup_external_engine() -> Result<()> {
     use anyhow::Context;
@@ -119,8 +122,11 @@ pub async fn supervise(args: &crate::RuntimeArgs, restart_on_exit: bool) -> Resu
     .into_iter()
     .map(Into::into)
     .collect();
-    // Allow the existing graceful engine shutdown to finish before force.
-    options.policy.graceful_stop = std::time::Duration::from_secs(30);
+    // Interactive controls must not inherit long per-service shutdown budgets.
+    // After 3s the guardian terminates the captured worker; owned command
+    // guardians then stop their trees and publish cleanup receipts.
+    options.policy.graceful_stop = std::time::Duration::from_secs(STOP_GRACE_SECONDS);
+    options.policy.negotiate_shutdown_grace = false;
     let cancel = options.shutdown.clone();
     let signals = tokio::spawn(async move {
         tokio::select! { () = crate::supervisor::sigterm_watch() => {}, _ = tokio::signal::ctrl_c() => {} }

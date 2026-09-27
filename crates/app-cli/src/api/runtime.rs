@@ -202,7 +202,7 @@ pub(super) async fn status(
     request_body = RuntimeOperationBody,
     params(("X-Deploy-Token" = String, Header, description = "Owner control token (APP_CLI_DEPLOY_TOKEN or owner state file)")),
     responses(
-        (status = 202, description = "Operation accepted or idempotent replay. Explicit Source start/restart or Artifact deployment with PG credentials can resolve a credentials-only owner hold for the confirmed artifact; uncertain operations remain protected.", body = serde_json::Value),
+        (status = 202, description = "Operation accepted or idempotent replay. A new Start/Restart replaces the pending start intent and runs after the current execution or Stop finishes; confirmed failure does not discard the newer request. Explicit Source start/restart or Artifact deployment with PG credentials can resolve a credentials-only owner hold for the confirmed artifact; uncertain operations remain protected.", body = serde_json::Value),
         (status = 409, description = "Conflict: id/replay/busy/revision/instance/recovery. Owner startup recovery blocks new business operations before persistence; Stop retains kernel safety checks.", body = serde_json::Value),
     ),
     tag = "Runtime Control"

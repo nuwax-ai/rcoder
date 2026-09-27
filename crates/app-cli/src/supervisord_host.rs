@@ -144,8 +144,17 @@ impl SupervisordHost {
         // A broken configuration must not prevent stopping live groups. Keep
         // the withdrawal failure, but attempt the physical stop before returning
         // it; an external cleanup receipt still requires every part to succeed.
-        for name in self.dynamic_groups().await? {
-            if let Err(error) = self.client.stop_remove_group(&name).await {
+        let groups = self.dynamic_groups().await?;
+        // Begin shutdown together; one slow service must not multiply the grace
+        // period by the number of application modules.
+        for (name, result) in futures::future::join_all(
+            groups
+                .iter()
+                .map(|name| async move { (name, self.client.stop_remove_group(name).await) }),
+        )
+        .await
+        {
+            if let Err(error) = result {
                 failures.push(format!("{name}: {error:#}"));
             }
         }
@@ -644,7 +653,9 @@ pub(crate) fn render_programs_conf(
              stdout_logfile_backups={LOG_BACKUPS}\n\
              redirect_stderr=true\n\n",
             workspace.join(&spec.dir).display(),
-            spec.run.shutdown_timeout_seconds,
+            spec.run
+                .shutdown_timeout_seconds
+                .min(crate::supervision::STOP_GRACE_SECONDS),
             service_log.display(),
         ));
     }
@@ -660,7 +671,7 @@ pub(crate) fn render_programs_conf(
          stopsignal=TERM\n\
          stopasgroup=true\n\
          killasgroup=true\n\
-         stopwaitsecs=15\n\
+         stopwaitsecs=3\n\
          stdout_logfile={}\n\
          stdout_logfile_maxbytes={LOG_MAXBYTES}\n\
          stdout_logfile_backups={LOG_BACKUPS}\n\
@@ -926,7 +937,9 @@ NODE_ENV = "production"
         ];
         let checked_conf = conf.clone();
         let server = tokio::spawn(async move {
-            for (method, target, value) in requests {
+            let mut pending = requests;
+            let mut stopped = std::collections::BTreeSet::new();
+            while !pending.is_empty() {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut header = Vec::new();
                 while !header.ends_with(b"\r\n\r\n") {
@@ -942,10 +955,33 @@ NODE_ENV = "production"
                 let mut bytes = vec![0; size];
                 stream.read_exact(&mut bytes).await.unwrap();
                 let request = String::from_utf8(bytes).unwrap();
+                // Groups now stop concurrently. Preserve per-group stop/remove
+                // ordering while allowing either group to make progress first.
+                let index = if matches!(pending[0].0, "stopProcessGroup" | "removeProcessGroup") {
+                    pending
+                        .iter()
+                        .position(|(method, target, _)| {
+                            request
+                                .contains(&format!("<methodName>supervisor.{method}</methodName>"))
+                                && request.contains(&format!("<string>{target}</string>"))
+                        })
+                        .expect("expected an outstanding group request")
+                } else {
+                    0
+                };
+                let (method, target, value) = pending.remove(index);
                 assert!(
                     request.contains(&format!("<methodName>supervisor.{method}</methodName>")),
                     "{request}"
                 );
+                if method == "stopProcessGroup" {
+                    assert!(stopped.insert(target));
+                } else if method == "removeProcessGroup" {
+                    assert!(
+                        stopped.remove(target),
+                        "remove must follow stop for this group"
+                    );
+                }
                 if !target.is_empty() {
                     assert!(request.contains(&format!("<string>{target}</string>")));
                 }
@@ -1006,7 +1042,7 @@ NODE_ENV = "production"
         );
         assert!(conf.contains("[program:app-svc-web]"));
         assert!(conf.contains("run-service rel-t web"));
-        assert!(conf.contains("stopwaitsecs=45"));
+        assert!(conf.contains("stopwaitsecs=3"));
         assert!(conf.contains("directory=/app/code/web"));
         assert!(conf.contains("stdout_logfile=/app/logs/services/web.log"));
         assert!(conf.contains("redirect_stderr=true"));

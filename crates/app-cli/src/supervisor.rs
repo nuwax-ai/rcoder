@@ -1419,7 +1419,8 @@ impl std::error::Error for ShutdownUnconfirmed {}
 async fn shutdown_all(children: ManagedChildren, shutdown_timeout_seconds: u64) -> Result<()> {
     // 并发停止：每个 stop 的首个 poll 即发出信号，宽限窗口共享同一时刻起算
     //（与旧实现"先全体 TERM、再并行等宽限、超时全体 KILL"等时序）。
-    let grace = Duration::from_secs(shutdown_timeout_seconds);
+    let grace =
+        Duration::from_secs(shutdown_timeout_seconds.min(crate::supervision::STOP_GRACE_SECONDS));
     let results =
         futures::future::join_all(children.into_iter().map(|(name, mut child)| async move {
             let outcome = child.stop(grace).await;

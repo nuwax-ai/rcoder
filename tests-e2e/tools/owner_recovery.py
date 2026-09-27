@@ -165,8 +165,13 @@ strip_prefix = false
         original = wait_control()
         start()
         execute('kill -KILL "$(cat /tmp/original-owner.pid)"')
-        check('owner death leaves supervised business running', ready())
+        # The independent guardian may already be stopping business processes.
+        # Persistence, not their transient liveness, reproduces the stale-owner bug.
+        state = json.loads(execute('cat /home/user/logs/dev-server-external.json').stdout)
+        check('owner death retains registration for recovery', bool(state.get('owners')))
+        stopped_at = time.monotonic()
         result = post('stop')
+        report['stop_elapsed_seconds'] = round(time.monotonic() - stopped_at, 3)
         replacement = identity()
         check('stop recovers management and stops old children',
               result.get('message') == 'Stopped' and not ready() and replacement != original, result)
@@ -188,6 +193,13 @@ strip_prefix = false
         check('final stop leaves management alive and business stopped', bool(identity()) and not ready())
         state = json.loads(execute('cat /home/user/logs/dev-server-external.json').stdout)
         check('old registration evidence retained', len(state.get('retired', {})) >= 2 and bool(state.get('completed')))
+        # A damaged transport cache must not require users to delete workspace data.
+        write({'/home/user/logs/dev-server-external.json': '{interrupted-write'})
+        start()
+        check('damaged registration retained as backup', execute(
+            'find /home/user/logs -maxdepth 1 -name "dev-server-external.corrupt-*.json"'
+        ).stdout.strip() != '')
+        check('stop works after cache repair', post('stop').get('message') == 'Stopped' and not ready())
         report['success'] = True
     except (Exception, KeyboardInterrupt) as error:
         report.update(success=False, error=str(error))

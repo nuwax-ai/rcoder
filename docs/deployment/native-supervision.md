@@ -24,13 +24,15 @@ app-cli 的 `owner stop` 停止业务执行，并恢复管理入口到已停止�
 
 CLI `owner` 命令返回包含 `operation_id`、`generation`、`supervisor_id` 和 `phase` 的 JSON；有恢复缺口时还包含结构化 `problem.code/message`。受理的 `stopping` 不是完成；使用同一请求 ID 和参数重试可读取原结果。不要把一次退出码 0 当成业务停止已经完成。相同 ID 改参数会拒绝；不同控制请求在已有用户控制尚未完成时返回 Busy，不做内部排队。
 
+业务操作入口与上述监督控制命令不同：新 Start/Restart 可以替换单个待执行意图；旧操作明确失败或取消后继续执行新的请求。Stop 执行期间收到的新启动在停止完成后执行，旧 Stop 不会再停止新服务。尚未确认的进程收束仍由独立监督器处理。
+
 状态根应位于固定、可写且不随部署目录替换的位置。app-cli 沿用 `APP_CLI_STATE_ROOT`/原工作区解析；proxy 沿用 `FILE_SERVER_PROXY_STATE_DIR`。不能删除或换名 `owner.lock` 来解除占用。
 
 ## 如何恢复挂起
 
 1. 监督层通过独立 loopback 通道发带 nonce 的控制探测。app-cli 探测实际控制循环，慢构建、PG 等待、业务尚未 Ready 不直接判为进程挂起。
 2. 连续失败达到预算后，先关闭该代次的新命令受理，再请求优雅停止。显式 Stop 走相同机制。
-3. 超过已协商的清理预算后，root guardian 使用保留的真实 Child 收束执行进程；每条受管命令的 guardian 用原进程组/Windows Job 收束进程树。
+3. app-cli 最多给 3 秒优雅退出宽限，不接受执行进程延长宽限；随后 root guardian 使用保留的真实 Child 强制停止执行进程，每条受管命令的 guardian 用原进程组/Windows Job 收束进程树。builtin 和 supervisord 的业务服务也并发停止，单服务宽限最多 3 秒。进程退出后的回执、外部引擎确认与新管理进程初始化另有观察预算，不等于继续允许旧进程运行。
 4. 旧代次及命令收束回执确认后，才启动新执行代次。未知数据库迁移、部署切换结果不因物理进程退出而改成成功或自动重跑。
 
 父监督进程意外退出时，其专用 pipe 关闭，guardian 继续完成清理。下一次启动/停止可接续原控制记录。PID 仅用于诊断和启动握手，不是事后杀进程的凭据；不通过进程名、端口号猜测清理对象。
@@ -44,7 +46,7 @@ CLI `owner` 命令返回包含 `operation_id`、`generation`、`supervisor_id` �
 - 收束过程返回 `cleanup_pending` 时，仍可通过独立控制通道查询。不要将其当成业务 Ready。
 - 旧版没有监督回执的挂起进程，不能升级后凭 PID 自动接管；保留已有身份诊断与处置要求。
 - Docker 新建/重建的受管理 builder 会记录 Docker daemon 身份、独立执行域标记和原数据挂载指纹。平台确认旧执行域的容器已经删除、同一 daemon 上没有仍可启动的旧容器，且新容器数据绑定一致后，通过捕获的容器 ID 写入对应监督代次的物理退出回执。原运行代次与命令才能退役；迁移结果、发布 journal 和业务期望状态不改成成功。
-- 旧版无执行域标记的容器不补造退出证据。K8s 在闲置回收前尝试有界管理收束，随后只删除预先捕获的资源 UID；收束失败不阻止物理停止。更换 Pod UID、端口拒连或取得文件锁单独均不是退出证明，不应清空状态目录绕过。
+- 旧版无执行域标记的容器不补造退出证据。K8s 在闲置回收前最多等待 8 秒管理收束（内部观察为 7 秒），随后只删除预先捕获的资源 UID；收束失败不阻止物理停止。更换 Pod UID、端口拒连或取得文件锁单独均不是退出证明，不应清空状态目录绕过。
 - **进程空间纪元证明（两 CLI 共用）**：每个执行代次记录其 OS 引导/PID 命名空间身份（Linux 为 `/proc/1/stat` 启动时刻，macOS/Windows 为引导时间推导）。在持有 owner 锁且无清理回执时，纪元变化本身就是本地正向证据——宿主机断电重启、容器内整体硬杀后重启（同一 Docker 容器或同一 K8s Pod 的容器重启）都在此列，监督进程据此收束旧代次；业务 journal、迁移结果与退出码不受影响。该证明只对「本进程空间内」的代次生效：带有其他容器/Pod 执行域标记的记录仍必须走平台核验。
 - **K8s Pod 更替的核验回执**：builder Pod 注入执行域（集群身份 + per-app PVC 挂载指纹，instance 解析自 `RCODER_PHYSICAL_POD_UID`）。Pod 重建后（ensure/wake/restart），平台核验「旧 Pod UID 已从 API 消失，且集群没有 NotReady/Unknown 节点（活 kubelet 已收割被删 Pod 的进程）」才向新容器签发物理退出回执。旧 Pod 对象仍存在（含 terminating）、节点失联或 nodes 只读权限缺失（需在 RBAC 授予 `nodes get/list/watch`）时保留 `recovery_required` 并给出具体原因；管理面、文件访问与物理停止不受影响。
 - supervisord 引擎收束先撤回动态配置，再停止和移除 `app-svc-*`/`app-pingap` 组，并复核进程表。配置撤回或 reload 失败时仍尝试停止动态组，但保留失败结果。worker 在第一次外部变更前记录所用引擎；该引擎的 socket 消失不能被视作 builtin 清理成功。root guardian 在 worker 与命令退出后执行同一清理适配器，外部清理未确认时不提交 Quiescent；固定 PG/dbx/ttyd 保留。

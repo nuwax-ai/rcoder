@@ -20,8 +20,13 @@ impl WorkerControl for Adapter {
         if self.scope.join("hang").exists() {
             std::future::pending::<()>().await;
         }
-        self.cancel.cancel();
+        if !self.scope.join("slow-shutdown").exists() {
+            self.cancel.cancel();
+        }
         Ok(())
+    }
+    fn shutdown_grace(&self) -> Duration {
+        Duration::from_secs(120)
     }
 }
 fn main() -> Result<()> {
@@ -74,6 +79,7 @@ async fn run() -> Result<()> {
     options.policy.unresponsive_for = Duration::from_millis(600);
     options.policy.initialization_timeout = Duration::from_secs(5);
     options.policy.graceful_stop = Duration::from_millis(250);
+    options.policy.negotiate_shutdown_grace = false;
     let shutdown = options.shutdown.clone();
     tokio::spawn(async move {
         drop(tokio::signal::ctrl_c().await);

@@ -16,11 +16,11 @@
 
 use anyhow::{Context, Result};
 use shared_types::{
-    DesiredState, ERR_OPERATION_ID_CONFLICT, ERR_OPERATION_IN_PROGRESS, ERR_RECOVERY_REQUIRED,
-    ERR_REVISION_MISMATCH, ERR_RUNTIME_INSTANCE_MISMATCH, ERR_WORKSPACE_MISMATCH,
-    RUNTIME_CONTROL_PROTOCOL_VERSION, RuntimeEventRecord, RuntimeFailureDetail,
-    RuntimeIdentityView, RuntimeOperationKind, RuntimeOperationRequest, RuntimeOperationState,
-    RuntimeOperationView, RuntimeStatusView, runtime_request_digest,
+    DesiredState, ERR_INTERRUPTED_OWNER_EXIT, ERR_OPERATION_ID_CONFLICT, ERR_OPERATION_IN_PROGRESS,
+    ERR_RECOVERY_REQUIRED, ERR_REVISION_MISMATCH, ERR_RUNTIME_INSTANCE_MISMATCH,
+    ERR_WORKSPACE_MISMATCH, RUNTIME_CONTROL_PROTOCOL_VERSION, RuntimeEventRecord,
+    RuntimeFailureDetail, RuntimeIdentityView, RuntimeOperationKind, RuntimeOperationRequest,
+    RuntimeOperationState, RuntimeOperationView, RuntimeStatusView, runtime_request_digest,
     validate_runtime_operation_request,
 };
 use std::path::{Path, PathBuf};
@@ -74,13 +74,16 @@ pub struct RuntimeStore {
     _legacy_owner: Option<crate::platform::owner_guard::OwnerGuard>,
 }
 
-/// 扫描结果（R04）：读取/解码失败不再静默跳过——以 `blocked` 上报，
-/// 调用方（[`RuntimeKernel::recover`]）据此保持恢复保护（阻断写操作）。
+/// 扫描结果（R04）：读取/解码失败不再静默跳过——损坏记录**隔离**进
+/// `operations-quarantine/`（原文件保留可查，不再阻断启动：产品环境没有
+/// 操作员，任何"等人工裁决"的状态都是用户不可恢复的死锁）。
 pub(crate) struct RecoveryScan {
-    /// 被转 RecoveryRequired 的在途操作。
+    /// 被转 RecoveryRequired 的在途操作（Stop 交精确收敛；其余由启动序列
+    /// 末尾的 [`RuntimeKernel::settle_unresolved_recoveries`] 自动收敛）。
     pub recovered: Vec<String>,
-    /// 无法读取/解码的记录（fail closed：保留文件，写操作被阻断直至
-    /// 操作员裁决——查询/重放不是清理完成证明）。
+    /// 已隔离的损坏记录（移入 quarantine 目录，业务不受阻断）。
+    pub quarantined: Vec<String>,
+    /// 隔离失败的记录（存储层故障——此时才保持恢复保护阻断写）。
     pub blocked: Vec<String>,
 }
 
@@ -436,6 +439,29 @@ impl RuntimeStore {
         }
     }
 
+    /// Startup owns the runtime exclusively and has stopped old processes.
+    /// Preserve malformed intent for diagnosis and start management in Stopped;
+    /// an explicit request can then choose Running without deleting user data.
+    fn repair_desired_after_quiescence(&self) -> Result<()> {
+        let path = self.desired_path();
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("read desired state during recovery"),
+        };
+        let decoded = serde_json::from_slice::<serde_json::Value>(&bytes);
+        let valid = decoded.as_ref().is_ok_and(|value| {
+            serde_json::from_value::<DesiredState>(value["desired"].clone()).is_ok()
+                && value["revision"].as_u64().is_some()
+        });
+        if !valid {
+            let saved = self.quarantine_record(&path)?;
+            self.store_desired(DesiredState::Stopped, 0)?;
+            tracing::warn!(backup = %saved.display(), "repaired invalid desired state; waiting for explicit start");
+        }
+        Ok(())
+    }
+
     /// 持久化 desired + revision（单文件覆盖写，先 fsync 再可见）。
     pub(crate) fn store_desired(&self, desired: DesiredState, revision: u64) -> Result<()> {
         let value = serde_json::json!({ "desired": desired, "revision": revision });
@@ -513,6 +539,7 @@ impl RuntimeStore {
     pub(crate) fn recover_unfinished_operations(&self) -> Result<RecoveryScan> {
         let mut scan = RecoveryScan {
             recovered: Vec::new(),
+            quarantined: Vec::new(),
             blocked: Vec::new(),
         };
         let dir = self.root.join("operations");
@@ -525,28 +552,18 @@ impl RuntimeStore {
                 Ok(content) => content,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
-                    tracing::error!(
-                        "runtime state: unreadable operation record {}: {error}",
-                        path.display()
-                    );
-                    scan.blocked.push(path.display().to_string());
+                    self.report_unreadable_record(&path, error, &mut scan);
                     continue;
                 }
             };
-            let operation = match serde_json::from_str::<StoredOperation>(
-                content.trim_end_matches('\n'),
-            ) {
-                Ok(operation) => operation,
-                Err(error) => {
-                    // 损坏记录 fail closed：保留文件、阻断写、不猜状态。
-                    tracing::error!(
-                        "runtime state: undecodable operation record kept untouched {}: {error}",
-                        path.display()
-                    );
-                    scan.blocked.push(path.display().to_string());
-                    continue;
-                }
-            };
+            let operation =
+                match serde_json::from_str::<StoredOperation>(content.trim_end_matches('\n')) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        self.report_unreadable_record(&path, error, &mut scan);
+                        continue;
+                    }
+                };
             let mut operation = operation;
             if !operation.view.state.is_terminal() {
                 operation.view.state = RuntimeOperationState::RecoveryRequired;
@@ -559,6 +576,66 @@ impl RuntimeStore {
             }
         }
         Ok(scan)
+    }
+
+    /// 损坏记录处置：隔离进 `operations-quarantine/`（同状态根 rename，原
+    /// 文件保留可查）。隔离失败（存储层故障）才计入 `blocked` 保持保护。
+    fn report_unreadable_record(
+        &self,
+        path: &Path,
+        error: impl std::fmt::Display,
+        scan: &mut RecoveryScan,
+    ) {
+        match self.quarantine_record(path) {
+            Ok(moved) => {
+                tracing::error!(
+                    "runtime state: unreadable operation record quarantined to {}: {error}",
+                    moved.display()
+                );
+                scan.quarantined.push(moved.display().to_string());
+            }
+            Err(quarantine_error) => {
+                tracing::error!(
+                    "runtime state: operation record could not be read or quarantined {}: {error}; {quarantine_error:#}",
+                    path.display()
+                );
+                scan.blocked.push(path.display().to_string());
+            }
+        }
+    }
+
+    /// End an interrupted request without claiming rollback of SQL or directory
+    /// changes. Their receipts remain available to the corresponding recovery step.
+    fn settle_interrupted_operation(&self, operation: &mut StoredOperation) -> Result<()> {
+        operation.view.state = RuntimeOperationState::Failed;
+        operation.view.error_code = Some(ERR_INTERRUPTED_OWNER_EXIT.into());
+        operation.view.error_message =
+            Some("previous owner terminated before the operation result was committed".into());
+        operation.view.failure_detail = Some(RuntimeFailureDetail {
+            stage: "startup_reconciled".into(),
+            exit_code: None,
+            stderr_tail: None,
+            cleanup_confirmed: false,
+        });
+        self.store_operation(operation)
+    }
+
+    /// 隔离损坏的操作记录（保留原件，业务不受阻断）。
+    fn quarantine_record(&self, path: &Path) -> Result<PathBuf> {
+        let dir = self.root.join("operations-quarantine");
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create quarantine dir {}", dir.display()))?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("record");
+        let target = dir.join(format!(
+            "{}-{name}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%S%3f")
+        ));
+        std::fs::rename(path, &target)
+            .with_context(|| format!("quarantine {} -> {}", path.display(), target.display()))?;
+        Ok(target)
     }
 }
 
@@ -723,11 +800,11 @@ struct AdmissionState {
     /// 在执行者的身份（旧 A 的提交屏障因此不再被误判 NotActive）。
     active_operation_id: Option<String>,
     /// 已受理待执行的 Stop（V03）：持有者等待 server 主循环停服后按自身 ID
-    /// 收束。pending 期间新操作（含第二个 Stop）一律 ERR_OPERATION_IN_PROGRESS。
+    /// 收束。新启动保留最新意图，等待 Stop 完成；重复 Stop 重放原请求。
     pending_stop: Option<String>,
     /// R02"最后受理生效"：active 执行期间受理的 Start/Restart 排队槽
     /// （单槽，最新覆盖旧的——被覆盖者收束 Cancelled/ERR_SUPERSEDED）。
-    /// active Succeeded 收束且无 pending_stop 时派发；Stop 受理时清空
+    /// active 确定收束且无 pending_stop 时派发；Stop 受理时清空
     /// （停止意图胜过排队启动）。
     pending_restart: Option<String>,
     /// Original execution inputs never reconstructed from redacted disk records.
@@ -735,6 +812,9 @@ struct AdmissionState {
     /// 恢复保护中（上次结果未知）。V03：由**结果未知**决定，不依赖 active
     /// 恰好匹配——任何操作的 RecoveryRequired 终态都会挂起保护。
     recovery_protection: bool,
+    /// Only records discovered before this owner's execution began may be
+    /// settled by admission recovery. An admission mutex is not a worker lock.
+    recovered_operations: std::collections::HashSet<String>,
 }
 
 impl RuntimeKernel {
@@ -762,13 +842,26 @@ impl RuntimeKernel {
     }
 
     /// 启动恢复入口（serve 主流程在 quiescence/ownership 之后调用）。
-    /// 启动恢复（R04）：返回 RecoveryRequired 操作清单；**不可读/损坏记录
-    /// 不再被视为"无事发生"**——恢复保护保持置位，写操作被阻断（`blocked`
-    /// 数量经日志暴露，操作员裁决后删除/修复对应文件并重启解除）。
+    /// 启动恢复（R04）：非终态操作置 RecoveryRequired（精确收敛路径——
+    /// journal receipt、持久化 Stop——随后裁决）；损坏记录隔离进
+    /// quarantine 目录（不再阻断）。启动序列末尾由
+    /// [`RuntimeKernel::settle_unresolved_recoveries`] 把一切仍非终态的
+    /// 操作自动收敛为 Failed——产品环境没有操作员，不允许留下"等人工
+    /// 裁决"的死锁状态。
     pub(crate) async fn recover(&self) -> Result<Vec<String>> {
-        let mut scan = self.store.recover_unfinished_operations()?;
         let mut guard = self.admission.lock().await;
-        // 恢复保护：在途操作被标记 RecoveryRequired，或存在不可判定记录
+        anyhow::ensure!(
+            guard.active_operation_id.is_none()
+                && guard.pending_stop.is_none()
+                && guard.pending_restart.is_none(),
+            "startup recovery cannot run while this owner is executing"
+        );
+        self.store.repair_desired_after_quiescence()?;
+        let mut scan = self.store.recover_unfinished_operations()?;
+        guard
+            .recovered_operations
+            .extend(scan.recovered.iter().cloned());
+        // 恢复保护：在途操作待精确/兜底收敛，或隔离失败（存储层故障）
         // 时拒绝新写（spec §3.3 崩溃注入语义；R04 把 fail-closed 从注释
         // 变成实际行为）。
         guard.recovery_protection = !scan.recovered.is_empty() || !scan.blocked.is_empty();
@@ -795,14 +888,92 @@ impl RuntimeKernel {
                     .insert(id.clone());
             }
         }
+        if !scan.quarantined.is_empty() {
+            tracing::warn!(
+                count = scan.quarantined.len(),
+                paths = ?scan.quarantined,
+                "runtime state: damaged operation records were quarantined; originals are preserved"
+            );
+        }
         if !scan.blocked.is_empty() {
             tracing::error!(
                 count = scan.blocked.len(),
                 paths = ?scan.blocked,
-                "runtime state has unreadable operation records; writes are blocked until resolved"
+                "runtime state records could not be read or quarantined; writes are blocked until storage recovers"
             );
         }
         Ok(scan.recovered)
+    }
+
+    /// 启动序列末尾兜底收敛：精确收敛路径（journal receipt、持久化 Stop
+    /// 意图）之后仍非终态的操作在此沉降为 Failed。quiesce 已证明上一
+    /// owner 的进程停止，未终态记录的裁决是确定性的（结果未提交）——
+    /// 不伪造成功，也不留 RecoveryRequired 死锁（用户/agent 的 start、
+    /// 重复编译构建、停止回收后再启动都必须能继续执行）。
+    pub(crate) async fn settle_unresolved_recoveries(&self) -> Result<Vec<String>> {
+        let mut guard = self.admission.lock().await;
+        self.settle_unresolved_recoveries_locked(&mut guard)
+    }
+
+    /// Retry startup bookkeeping after a transient storage failure. Never settle
+    /// the current owner's active or queued work, even while recovery is latched.
+    fn settle_unresolved_recoveries_locked(
+        &self,
+        guard: &mut tokio::sync::MutexGuard<'_, AdmissionState>,
+    ) -> Result<Vec<String>> {
+        let mut settled = Vec::new();
+        for entry in
+            std::fs::read_dir(self.store.root.join("operations")).context("scan operations dir")?
+        {
+            let entry = entry.context("read operations dir entry")?;
+            let path = entry.path();
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    anyhow::bail!("read operation record {}: {error}", path.display())
+                }
+            };
+            let mut operation: StoredOperation = match serde_json::from_slice(&bytes) {
+                Ok(operation) => operation,
+                Err(error) => {
+                    anyhow::bail!("decode operation record {}: {error}", path.display())
+                }
+            };
+            let id = &operation.view.operation_id;
+            if operation.view.state.is_terminal()
+                || !guard.recovered_operations.contains(id)
+                || guard.active_operation_id.as_ref() == Some(id)
+                || guard.pending_stop.as_ref() == Some(id)
+                || guard.pending_restart.as_ref() == Some(id)
+            {
+                continue;
+            }
+            let requested = match self.store.cancellation_recorded(&operation) {
+                Ok(requested) => requested,
+                Err(error) => {
+                    tracing::warn!(operation_id = %id, %error, "interrupted cancellation record retained for diagnosis");
+                    true
+                }
+            };
+            let id = operation.view.operation_id.clone();
+            self.store.settle_interrupted_operation(&mut operation)?;
+            if requested && let Ok(mut set) = self.cancelled.lock() {
+                set.insert(id.clone());
+            }
+            self.emit_terminal_record(&operation);
+            guard.recovered_operations.remove(&id);
+            settled.push(id);
+        }
+        if !settled.is_empty() {
+            tracing::warn!(
+                count = settled.len(),
+                operations = ?settled,
+                "startup settled interrupted operations as Failed (previous owner exit)"
+            );
+        }
+        self.refresh_recovery_protection(guard);
+        Ok(settled)
     }
 
     pub(crate) async fn status(&self) -> Result<RuntimeStatusView> {
@@ -1098,12 +1269,30 @@ impl RuntimeKernel {
             });
         }
         if guard.recovery_protection && request.kind != RuntimeOperationKind::Stop {
-            return Err(AdmissionRejection {
-                code: ERR_RECOVERY_REQUIRED,
-                message: "a previous operation has an unconfirmed result; recovery is required"
-                    .into(),
-                active_operation_id: None,
-            });
+            // Retry only startup records. Current work must finish or be stopped
+            // by the independent supervisor; admission does not prove its exit.
+            let settled = self
+                .settle_unresolved_recoveries_locked(&mut guard)
+                .map_err(|error| AdmissionRejection {
+                    code: ERR_RECOVERY_REQUIRED,
+                    message: format!("automatic recovery failed: {error:#}"),
+                    active_operation_id: None,
+                })?;
+            if !settled.is_empty() {
+                tracing::warn!(
+                    count = settled.len(),
+                    operations = ?settled,
+                    "admission settled interrupted operations before accepting a new request"
+                );
+            }
+            if guard.recovery_protection {
+                return Err(AdmissionRejection {
+                    code: ERR_RECOVERY_REQUIRED,
+                    message: "a previous operation has an unconfirmed result; recovery is required"
+                        .into(),
+                    active_operation_id: None,
+                });
+            }
         }
         let (_desired, revision) =
             self.store
@@ -1115,31 +1304,17 @@ impl RuntimeKernel {
                 })?;
         // Stop 屏障例外（spec §3.3）：active 执行期间仍可受理持久化停止意图
         // ——Stop 只占 pending 槽，绝不抢走执行者身份（V03）。
-        // 待执行 Stop 存在期间：第二个 Stop 与一切新操作均拒绝（停服动作
-        // 尚未完成，受理即排队语义不成立）。
+        // 第二个 Stop 应复用原请求查询；新启动可保留最新意图。
         let is_stop = request.kind == RuntimeOperationKind::Stop;
-        if is_stop {
-            if let Some(pending) = guard.pending_stop.clone() {
-                return Err(AdmissionRejection {
-                    code: ERR_OPERATION_IN_PROGRESS,
-                    message: "another runtime operation is in progress".into(),
-                    active_operation_id: Some(pending),
-                });
-            }
-        } else if guard.pending_stop.is_some() {
-            // Stop 意图已受理（停服未完成）：一切新操作拒绝——受理即排队语义
-            // 不成立（排队启动会在停止后复活业务，绕过停止意图）
+        if is_stop && let Some(pending) = guard.pending_stop.clone() {
             return Err(AdmissionRejection {
                 code: ERR_OPERATION_IN_PROGRESS,
-                message: "stop intent is pending execution".into(),
-                active_operation_id: guard.pending_stop.clone(),
+                message: "another runtime operation is in progress".into(),
+                active_operation_id: Some(pending),
             });
-        } else if guard.active_operation_id.is_some() {
-            // R02"最后受理生效"：active 执行期间的新 Start/Restart 进排队槽
-            // （不忙拒）。旧排队者被覆盖收束（Cancelled/ERR_SUPERSEDED）——
-            // 持久化后返回 Accepted，执行由 active Succeeded 收束时派发。
-            // revision 校验仍执行（旧请求不得借排队复活）。
         }
+        // A new start accepted during Stop occupies the single latest-intent
+        // slot. The execution loop dispatches it only after Stop actually ends.
         if request.expected_revision != revision {
             // 所有 kind 的 revision 校验统一执行（旧实例的 stop 不复活/不重复推进）。
             return Err(AdmissionRejection {
@@ -1227,7 +1402,7 @@ impl RuntimeKernel {
             }
             guard.queued_input = None;
             guard.pending_stop = Some(stored.view.operation_id.clone());
-        } else if guard.active_operation_id.is_some() {
+        } else if guard.active_operation_id.is_some() || guard.pending_stop.is_some() {
             // R02"最后受理生效"：排队槽单值——旧排队者收束 Superseded 语义
             // （Cancelled + ERR_SUPERSEDED），新受理者占槽
             if let Some(superseded) = guard
@@ -1331,13 +1506,11 @@ impl RuntimeKernel {
         }
         if guard.active_operation_id.as_deref() == Some(operation_id) {
             guard.active_operation_id = None;
-            // R02"最后受理生效"：active Succeeded 且无待执行 Stop → 派发
-            // 排队的最新启动请求；失败/取消/未知收束不派发——排队者持久
-            // 沉降为 Superseded（不留永远 Accepted 的滞留者）。
-            if stored.view.state == RuntimeOperationState::Succeeded && guard.pending_stop.is_none()
-            {
+            // A completed (including failed/cancelled) execution must not discard
+            // a newer accepted start. Stop and uncertain cleanup remain barriers.
+            if stored.view.state.is_terminal() && guard.pending_stop.is_none() {
                 self.promote_queued(&mut guard)?;
-            } else if stored.view.state != RuntimeOperationState::Succeeded {
+            } else if stored.view.state == RuntimeOperationState::RecoveryRequired {
                 self.settle_queued_restart_on_terminal_failure(
                     &mut guard,
                     "active failed, cancelled or unknown outcome",
@@ -1346,6 +1519,11 @@ impl RuntimeKernel {
         }
         if guard.pending_stop.as_deref() == Some(operation_id) {
             guard.pending_stop = None;
+            if stored.view.state.is_terminal() && guard.active_operation_id.is_none() {
+                self.promote_queued(&mut guard)?;
+            } else if stored.view.state == RuntimeOperationState::RecoveryRequired {
+                self.settle_queued_restart_on_terminal_failure(&mut guard, "stop cleanup unknown")?;
+            }
         }
         Ok(())
     }
@@ -1436,9 +1614,8 @@ impl RuntimeKernel {
         Ok(())
     }
 
-    /// R02 排队槽终局：active 已确认失败/取消/未知收束时，滞留的排队
-    /// 启动请求不再派发（最后受理生效——重新发起才是最新意图），持久
-    /// 收束为 Cancelled/ERR_SUPERSEDED 并清槽。
+    /// Cleanup remains unknown: settle the queued request explicitly rather than
+    /// leave it permanently Accepted. Confirmed failure/cancellation promotes it.
     ///
     /// 落盘失败必须传播（不能只打日志留下永远 Accepted 的排队者）；
     /// 失败时把排队者放回槽位，下一次受理/收束路径重试沉降。
@@ -1515,13 +1692,11 @@ impl RuntimeKernel {
         }
         if guard.active_operation_id.as_deref() == Some(operation_id) {
             guard.active_operation_id = None;
-            // R02"最后受理生效"：active Succeeded 且无待执行 Stop → 派发
-            // 排队的最新启动请求；失败/取消/未知收束不派发——排队者持久
-            // 沉降为 Superseded（不留永远 Accepted 的滞留者）。
-            if stored.view.state == RuntimeOperationState::Succeeded && guard.pending_stop.is_none()
-            {
+            // A completed (including failed/cancelled) execution must not discard
+            // a newer accepted start. Stop and uncertain cleanup remain barriers.
+            if stored.view.state.is_terminal() && guard.pending_stop.is_none() {
                 self.promote_queued(guard)?;
-            } else if stored.view.state != RuntimeOperationState::Succeeded {
+            } else if stored.view.state == RuntimeOperationState::RecoveryRequired {
                 self.settle_queued_restart_on_terminal_failure(
                     guard,
                     "active failed, cancelled or unknown outcome",
@@ -1530,6 +1705,11 @@ impl RuntimeKernel {
         }
         if guard.pending_stop.as_deref() == Some(operation_id) {
             guard.pending_stop = None;
+            if stored.view.state.is_terminal() && guard.active_operation_id.is_none() {
+                self.promote_queued(guard)?;
+            } else if stored.view.state == RuntimeOperationState::RecoveryRequired {
+                self.settle_queued_restart_on_terminal_failure(guard, "stop cleanup unknown")?;
+            }
         }
         Ok(())
     }
@@ -2173,148 +2353,166 @@ mod tests {
 
     // ===== 2026-09-19 批 9：排队槽终局反例（batch8-followup §2）=====
 
-    /// 反例（修复前失败）：A 执行、B 排队 → A Failed → B 必须持久收束
-    /// Superseded（不得滞留 Accepted），此后 C 新受理成功也绝不派发 B。
+    /// A failed/cancelled older request must not discard a newer explicit start.
     #[tokio::test]
-    async fn queued_operation_settles_when_active_fails_and_never_dispatches_after_c() {
-        let captured: std::sync::Arc<std::sync::Mutex<Vec<DispatchAction>>> = Default::default();
-        let sink = captured.clone();
-        let (dir, _keep) = temp_store();
-        let workspace = dir.path().join("workspace");
-        let kernel = RuntimeKernel::new(
-            open_store(&workspace),
-            identity(),
-            Box::new(move |action| {
-                sink.lock().unwrap().push(action);
-            }),
-        );
-        kernel
-            .admit(request(RuntimeOperationKind::Start, "op-a"))
-            .await
-            .expect("admit op-a");
-        kernel
-            .admit(request(RuntimeOperationKind::Restart, "op-b"))
-            .await
-            .expect("admit op-b (queued)");
-        // A Failed 收束
-        kernel
-            .finish(
-                "op-a",
-                RuntimeOperationState::Failed,
-                Some(("ERR_BACKEND_ERROR".into(), "injected failure".into())),
-                None,
-                2,
-            )
-            .await
-            .expect("finish op-a");
-        // B 必须已被持久收束（不滞留 Accepted）
-        let settled = kernel
-            .store
-            .load_operation("op-b")
-            .expect("load op-b")
-            .expect("stored op-b");
-        assert_eq!(
-            settled.view.state,
+    async fn latest_start_runs_after_previous_terminal_failure() {
+        for terminal in [
+            RuntimeOperationState::Failed,
             RuntimeOperationState::Cancelled,
-            "queued op must settle when active fails: {:?}",
-            settled.view
-        );
-        assert_eq!(settled.view.error_code.as_deref(), Some("ERR_SUPERSEDED"));
-        // C 新受理（无 active）→ 成功收束
-        kernel
-            .admit(request(RuntimeOperationKind::Start, "op-c"))
-            .await
-            .expect("admit op-c");
-        kernel
-            .finish("op-c", RuntimeOperationState::Succeeded, None, None, 2)
-            .await
-            .expect("finish op-c");
-        let actions = captured.lock().unwrap();
-        let dispatched: Vec<&str> = actions
-            .iter()
-            .filter_map(|action| match action {
-                DispatchAction::OrchestrateSource { operation_id, .. } => {
-                    Some(operation_id.as_str())
-                }
-                _ => None,
-            })
-            .collect();
-        assert!(
-            !dispatched.contains(&"op-b"),
-            "settled op-b must never dispatch after a newer success: {dispatched:?}"
-        );
-        assert!(
-            dispatched.contains(&"op-c"),
-            "op-c must run: {dispatched:?}"
-        );
-    }
-
-    /// 反例：A Cancelled 收束 → 排队 B 同样收束；RecoveryRequired 收束 →
-    /// 排队 B 收束且恢复保护生效（新受理被 ERR_RECOVERY_REQUIRED 拒绝）。
-    #[tokio::test]
-    async fn queued_settles_on_cancelled_and_recovery_required_sets_protection() {
-        for (terminal, expect_protection) in [
-            (RuntimeOperationState::Cancelled, false),
-            (RuntimeOperationState::RecoveryRequired, true),
+            RuntimeOperationState::RecoveryRequired,
         ] {
-            let captured: std::sync::Arc<std::sync::Mutex<Vec<DispatchAction>>> =
-                Default::default();
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let sink = captured.clone();
             let (dir, _keep) = temp_store();
-            let workspace = dir.path().join("workspace");
             let kernel = RuntimeKernel::new(
-                open_store(&workspace),
+                open_store(&dir.path().join("workspace")),
                 identity(),
-                Box::new(move |action| {
-                    sink.lock().unwrap().push(action);
-                }),
+                Box::new(move |action| sink.lock().unwrap().push(action)),
             );
             kernel
-                .admit(request(RuntimeOperationKind::Start, "op-a"))
+                .admit(request(RuntimeOperationKind::Start, "a"))
                 .await
-                .expect("admit op-a");
+                .unwrap();
             kernel
-                .admit(request(RuntimeOperationKind::Restart, "op-b"))
+                .admit(request(RuntimeOperationKind::Restart, "b"))
                 .await
-                .expect("admit op-b (queued)");
-            kernel
-                .finish("op-a", terminal, None, None, 2)
-                .await
-                .expect("finish op-a");
-            let settled = kernel
-                .store
-                .load_operation("op-b")
-                .expect("load op-b")
-                .expect("stored op-b");
-            assert_eq!(
-                settled.view.state,
-                RuntimeOperationState::Cancelled,
-                "{terminal:?}: queued op must settle"
-            );
-            let admission = kernel
-                .admit(request(RuntimeOperationKind::Start, "op-new"))
-                .await;
-            if expect_protection {
-                let Err(rejection) = admission else {
-                    panic!("{terminal:?}: recovery protection must reject new admission")
-                };
-                assert_eq!(rejection.code, ERR_RECOVERY_REQUIRED);
+                .unwrap();
+            kernel.finish("a", terminal, None, None, 2).await.unwrap();
+            let guard = kernel.admission.lock().await;
+            if terminal == RuntimeOperationState::RecoveryRequired {
+                assert!(guard.recovery_protection);
+                assert_eq!(captured.lock().unwrap().len(), 1);
+                assert_eq!(
+                    kernel
+                        .store
+                        .load_operation("b")
+                        .unwrap()
+                        .unwrap()
+                        .view
+                        .state,
+                    RuntimeOperationState::Cancelled
+                );
             } else {
-                admission.expect("{terminal:?}: admission after clean cancel must pass");
+                assert_eq!(guard.active_operation_id.as_deref(), Some("b"));
+                assert!(guard.pending_restart.is_none());
+                assert_eq!(captured.lock().unwrap().len(), 2);
             }
         }
     }
 
-    /// 反例：A Failed 后无人收束 B 的崩溃残留路径——C 直接受理时必须先沉降
-    /// 滞留 B（无 active 分支补漏），B 不得在 C 成功后被派发。
     #[tokio::test]
-    async fn stale_queued_slot_settled_by_next_admission_when_idle() {
+    async fn latest_start_waits_for_stop_completion_without_rejection() {
+        for stop_result in [
+            RuntimeOperationState::Succeeded,
+            RuntimeOperationState::Failed,
+            RuntimeOperationState::Cancelled,
+        ] {
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = captured.clone();
+            let (dir, _keep) = temp_store();
+            let kernel = RuntimeKernel::new(
+                open_store(&dir.path().join("workspace")),
+                identity(),
+                Box::new(move |action| sink.lock().unwrap().push(action)),
+            );
+            kernel
+                .admit(request(RuntimeOperationKind::Stop, "stop"))
+                .await
+                .unwrap();
+            let mut start = request(RuntimeOperationKind::Start, "start");
+            start.expected_revision = 1;
+            kernel.admit(start).await.unwrap();
+            assert_eq!(captured.lock().unwrap().len(), 1);
+            kernel
+                .finish("stop", stop_result, None, None, 2)
+                .await
+                .unwrap();
+            assert_eq!(
+                kernel
+                    .status()
+                    .await
+                    .unwrap()
+                    .active_operation_id
+                    .as_deref(),
+                Some("start")
+            );
+            assert_eq!(captured.lock().unwrap().len(), 2);
+            kernel
+                .finish("start", RuntimeOperationState::Succeeded, None, None, 2)
+                .await
+                .unwrap();
+            assert_eq!(
+                kernel.store.load_desired().unwrap().0,
+                DesiredState::Running
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn live_cancel_persistence_failure_cannot_be_settled_as_owner_exit() {
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "live"))
+            .await
+            .unwrap();
+        let path = kernel.store.cancellation_path("live");
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(kernel.request_cancel("live").await.is_err());
+        assert!(
+            kernel
+                .settle_unresolved_recoveries()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            kernel.get("live").await.unwrap().unwrap().state,
+            RuntimeOperationState::Accepted
+        );
+        assert_eq!(
+            kernel
+                .status()
+                .await
+                .unwrap()
+                .active_operation_id
+                .as_deref(),
+            Some("live")
+        );
+        kernel
+            .admit(request(RuntimeOperationKind::Stop, "stop"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_desired_is_preserved_and_explicit_start_works() {
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        std::fs::write(kernel.store.desired_path(), b"{broken").unwrap();
+        kernel.recover().await.unwrap();
+        assert_eq!(
+            kernel.store.load_desired().unwrap(),
+            (DesiredState::Stopped, 0)
+        );
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "start"))
+            .await
+            .unwrap();
+        assert_eq!(
+            kernel.store.load_desired().unwrap().0,
+            DesiredState::Running
+        );
+    }
+
+    /// A late completion from the failed request cannot discard later requests.
+    #[tokio::test]
+    async fn late_failed_request_completion_preserves_newer_execution() {
         let captured: std::sync::Arc<std::sync::Mutex<Vec<DispatchAction>>> = Default::default();
         let sink = captured.clone();
         let (dir, _keep) = temp_store();
-        let workspace = dir.path().join("workspace");
         let kernel = RuntimeKernel::new(
-            open_store(&workspace),
+            open_store(&dir.path().join("workspace")),
             identity(),
             Box::new(move |action| {
                 sink.lock().unwrap().push(action);
@@ -2323,37 +2521,53 @@ mod tests {
         kernel
             .admit(request(RuntimeOperationKind::Start, "op-a"))
             .await
-            .expect("admit op-a");
+            .unwrap();
         kernel
             .admit(request(RuntimeOperationKind::Restart, "op-b"))
             .await
-            .expect("admit op-b (queued)");
-        // 模拟崩溃残留：直接操纵 admission 状态重建（active 清空但 B 仍在槽）——
-        // 通过重开 kernel 不够（内存态丢失），这里用真实路径近似：A Failed
-        // 收束已由前测覆盖；本测直接验证"无 active + 槽有 B"的受理沉降。
-        // 构造：A 收束后（B 已沉降）不再适用——改为直接测 admission 路径：
-        // 用 pending_stop 覆盖分支无法构造；因此以持久层构造：
-        // B 处于 Accepted 且 desired=Running、无 active（模拟上一进程崩溃）。
+            .unwrap();
         kernel
             .finish("op-a", RuntimeOperationState::Failed, None, None, 2)
             .await
-            .expect("finish op-a");
-        // 正常路径 B 已沉降；再验证新一轮 A2+B2 崩溃残留（B2 Accepted 持久、
-        // 内存槽残留）：直接调用内核私有状态不可行，改为验证重启扫描语义
-        // 之外的 admission 补漏：将 B2 手动塞回槽（通过再次受理 active+排队
-        // 后 kill 模拟不可行）——本测退化为：验证 Failed 后槽确已清空，
-        // 新受理不再受残留影响（与首测互补）。
-        let admission = kernel
-            .admit(request(RuntimeOperationKind::Start, "op-c2"))
+            .unwrap();
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-c"))
             .await
-            .expect("admission after settle must succeed");
-        assert!(
-            matches!(admission, AdmissionOutcome::Accepted(ref v) if v.operation_id == "op-c2")
+            .unwrap();
+        kernel
+            .finish("op-a", RuntimeOperationState::Succeeded, None, None, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            kernel
+                .status()
+                .await
+                .unwrap()
+                .active_operation_id
+                .as_deref(),
+            Some("op-b")
+        );
+        assert_eq!(
+            kernel.get("op-a").await.unwrap().unwrap().state,
+            RuntimeOperationState::Failed
         );
         kernel
-            .finish("op-c2", RuntimeOperationState::Succeeded, None, None, 2)
+            .finish("op-b", RuntimeOperationState::Succeeded, None, None, 2)
             .await
-            .expect("finish op-c2");
+            .unwrap();
+        assert_eq!(
+            kernel
+                .status()
+                .await
+                .unwrap()
+                .active_operation_id
+                .as_deref(),
+            Some("op-c")
+        );
+        kernel
+            .finish("op-c", RuntimeOperationState::Succeeded, None, None, 2)
+            .await
+            .unwrap();
         let actions = captured.lock().unwrap();
         let dispatched: Vec<&str> = actions
             .iter()
@@ -2364,10 +2578,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(
-            !dispatched.contains(&"op-b"),
-            "op-b must stay settled: {dispatched:?}"
-        );
+        assert_eq!(dispatched, ["op-a", "op-b", "op-c"]);
     }
 
     /// R03：ArtifactId 制品部署派发（owner 侧激活——不经网络下载）。
@@ -2615,7 +2826,7 @@ mod tests {
             .await
             .expect("admit start");
         // R02"最后受理生效"后：active 期间的 start/restart/deploy 进排队槽
-        // （不再 busy 拒）；旧断言的拒绝语义由 pending_stop 场景与恢复保护
+        // （不再 busy 拒）；旧断言的拒绝语义由未知清理结果的恢复保护
         // 承担。本测试改锁排队语义（详见 last_accepted_start_wins 测试）。
         // stop 可受理（意图屏障），且推进 revision；排队者被 stop 覆盖收束
         kernel
@@ -2781,11 +2992,14 @@ mod tests {
             .expect("get")
             .expect("present");
         assert_eq!(view.state, RuntimeOperationState::RecoveryRequired);
-        let rejection = kernel
+        kernel
             .admit(request(RuntimeOperationKind::Start, "op-new"))
             .await
-            .expect_err("recovery protection");
-        assert_eq!(rejection.code, ERR_RECOVERY_REQUIRED);
+            .expect("startup recovery permits an explicit new request");
+        let old = kernel.get("op-pending").await.unwrap().unwrap();
+        assert_eq!(old.state, RuntimeOperationState::Failed);
+        assert_eq!(old.error_code.as_deref(), Some(ERR_INTERRUPTED_OWNER_EXIT));
+        assert!(!old.failure_detail.unwrap().cleanup_confirmed);
     }
 
     #[tokio::test]
@@ -3240,10 +3454,10 @@ mod tests {
         assert_eq!(status.active_operation_id, None);
     }
 
-    // ── R04：损坏记录阻断写入；部分提交保持保护 ────────────────────────────────
+    // ── R04：损坏记录隔离（残留容忍）；部分提交保持保护 ──────────────────────
 
     #[tokio::test]
-    async fn corrupt_operation_record_blocks_new_writes() {
+    async fn corrupt_operation_record_is_quarantined_and_writes_proceed() {
         let (dir, _keep) = temp_store();
         {
             let workspace = dir.path().join("workspace");
@@ -3259,18 +3473,103 @@ mod tests {
         }
         let kernel = kernel(dir.path());
         let recovered = kernel.recover().await.expect("recover");
-        // 损坏记录不产生 recovered 条目，但必须阻断写
+        // 损坏记录不产生 recovered 条目：被隔离，不再阻断（产品环境没有
+        // 操作员可以等，残留文件不得让用户无法编译/启动）。
         assert!(recovered.is_empty());
         let status = kernel.status().await.expect("status");
         assert!(
-            status.recovery_protection,
-            "corrupt record must keep recovery protection"
+            !status.recovery_protection,
+            "quarantined corrupt record must not keep recovery protection"
         );
-        let rejection = kernel
+        // 原件保留在 quarantine 目录（可查），operations 目录不再含它
+        let root = app_state_root(&dir.path().join("workspace"));
+        let quarantine: Vec<_> = std::fs::read_dir(root.join("operations-quarantine"))
+            .expect("quarantine dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert!(
+            quarantine
+                .iter()
+                .any(|name| name.to_string_lossy().ends_with("op-corrupt.json")),
+            "corrupt record must be preserved under operations-quarantine: {quarantine:?}"
+        );
+        assert!(
+            !root.join("operations").join("op-corrupt.json").exists(),
+            "corrupt record must be moved out of operations"
+        );
+        // 后续受理正常进行（用户可恢复使用）
+        kernel
             .admit(request(RuntimeOperationKind::Start, "op-after-corrupt"))
             .await
-            .expect_err("writes blocked");
-        assert_eq!(rejection.code, ERR_RECOVERY_REQUIRED);
+            .expect("writes proceed after quarantine");
+    }
+
+    /// 非终态残留（容器停止回收后重启）在启动收敛后必须放行——不再等
+    /// 任何人工裁决；显式 start 直接受理，旧记录沉降为 Failed。
+    #[tokio::test]
+    async fn settle_unresolved_recoveries_unblocks_admission() {
+        let (dir, _keep) = temp_store();
+        {
+            let kernel = kernel(dir.path());
+            kernel
+                .admit(request(RuntimeOperationKind::Start, "op-interrupted"))
+                .await
+                .expect("admit");
+            // 不 finish——模拟上一 owner 在执行前/中终止，留下非终态记录
+        }
+        let kernel = kernel(dir.path());
+        let recovered = kernel.recover().await.expect("recover");
+        assert_eq!(recovered, vec!["op-interrupted".to_string()]);
+        let status = kernel.status().await.expect("status");
+        assert!(status.recovery_protection, "recover marks protection first");
+        // 启动序列末尾兜底收敛：保护解除，操作沉降为 Failed
+        let settled = kernel.settle_unresolved_recoveries().await.expect("settle");
+        assert_eq!(settled, vec!["op-interrupted".to_string()]);
+        let status = kernel.status().await.expect("status");
+        assert!(
+            !status.recovery_protection,
+            "settled operations must release protection"
+        );
+        let view = kernel.get("op-interrupted").await.expect("get");
+        let view = view.expect("view");
+        assert_eq!(view.state, RuntimeOperationState::Failed);
+        assert_eq!(view.error_code.as_deref(), Some(ERR_INTERRUPTED_OWNER_EXIT));
+        // 继任编译/启动正常受理
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-successor"))
+            .await
+            .expect("successor must be admitted after settle");
+    }
+
+    /// owner 活着但保护卡住（如瞬时写失败后磁盘恢复）时，新请求触发
+    /// admit 兜底收敛——不拒绝，不让用户/agent 卡死。
+    #[tokio::test]
+    async fn admission_settles_stale_protection_instead_of_rejecting() {
+        let (dir, _keep) = temp_store();
+        {
+            let kernel = kernel(dir.path());
+            kernel
+                .admit(request(RuntimeOperationKind::Start, "op-held"))
+                .await
+                .expect("admit");
+            // 不 finish：留下非终态记录 + recover 开启保护（模拟 owner 存活
+            // 但上一次执行结果未确认的窗口）
+        }
+        let kernel = kernel(dir.path());
+        kernel.recover().await.expect("recover");
+        // 不显式调 settle——admit 自身兜底收敛并受理
+        let outcome = kernel
+            .admit(request(RuntimeOperationKind::Restart, "op-next"))
+            .await
+            .expect("admission must settle stale protection instead of rejecting");
+        match outcome {
+            AdmissionOutcome::Accepted(view) => {
+                assert_eq!(view.kind, RuntimeOperationKind::Restart)
+            }
+            AdmissionOutcome::Replayed(_) => panic!("fresh operation must not replay"),
+        }
+        let held = kernel.get("op-held").await.expect("get").expect("view");
+        assert_eq!(held.state, RuntimeOperationState::Failed);
     }
 
     #[tokio::test]

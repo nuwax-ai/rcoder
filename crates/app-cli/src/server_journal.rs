@@ -82,6 +82,25 @@ impl Drop for Journal {
         }
     }
 }
+fn read_record<T: serde::de::DeserializeOwned>(path: &Path, supervised: bool) -> Result<Option<T>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if supervised => {
+            let backup =
+                path.with_extension(format!("corrupt-{}.json", uuid::Uuid::new_v4().simple()));
+            std::fs::rename(path, &backup).context("preserve damaged deployment record")?;
+            tracing::warn!(backup = %backup.display(), %error, "rebuilding damaged deployment bookkeeping after supervisor takeover");
+            Ok(None)
+        }
+        Err(error) => Err(error).with_context(|| format!("decode {}", path.display())),
+    }
+}
+
 impl Journal {
     #[cfg(test)]
     pub fn open(workspace: &Path) -> Result<Self> {
@@ -100,7 +119,14 @@ impl Journal {
     /// Caller already holds the common OwnerGuard. Merely opening never moves
     /// records: migration waits until the management listener has bound.
     pub fn open_with_root(workspace: &Path, root: PathBuf) -> Result<Self> {
-        let mut journal = Self::open_root(root)?;
+        Self::open_recovering(workspace, root, false)
+    }
+
+    /// The independent supervisor has retired preceding managed executions.
+    /// Malformed bookkeeping can be preserved and reconstructed without making
+    /// the public management API depend on an intact business journal.
+    pub fn open_recovering(workspace: &Path, root: PathBuf, supervised: bool) -> Result<Self> {
+        let mut journal = Self::open_root_recovering(root, supervised)?;
         let project = runtime_state_layout::canonical_project_root(workspace);
         let mut candidates = vec![project.clone()];
         if let Some(parent) = project.parent() {
@@ -120,7 +146,7 @@ impl Journal {
                 && journal.previous_owner.is_none()
                 && journal.legacy_root.is_none()
             {
-                let mut old = Self::open_root(legacy.clone())?;
+                let mut old = Self::open_root_recovering(legacy.clone(), supervised)?;
                 journal.receipt = old.receipt.take();
                 journal.previous_owner = old.previous_owner.take();
                 let lease = old
@@ -141,7 +167,7 @@ impl Journal {
             //   serve 正常启动，重部署路径恢复；
             // - 任一侧在途、或 legacy 反而更新（旧运行时在新布局之后又跑过，
             //   降级混跑）→ 仍显式拒绝，文案给出两侧路径。
-            let mut old = Self::open_root(legacy.clone())?;
+            let mut old = Self::open_root_recovering(legacy.clone(), supervised)?;
             let legacy_settled = domain_settled(
                 old.receipt.as_ref().map(|receipt| &receipt.boundary),
                 old.previous_owner.as_ref(),
@@ -205,6 +231,10 @@ impl Journal {
     }
 
     fn open_root(root: PathBuf) -> Result<Self> {
+        Self::open_root_recovering(root, false)
+    }
+
+    fn open_root_recovering(root: PathBuf, supervised: bool) -> Result<Self> {
         std::fs::create_dir_all(&root)?;
         let lease = OpenOptions::new()
             .read(true)
@@ -215,20 +245,8 @@ impl Journal {
         lease
             .try_lock()
             .context("another deployment coordinator owns this volume")?;
-        let receipt = match std::fs::read(root.join(".deploy-operation.json")) {
-            Ok(bytes) => {
-                Some(serde_json::from_slice(&bytes).context("invalid deployment journal")?)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error).context("read deployment journal"),
-        };
-        let previous_owner = match std::fs::read(root.join(".deploy-coordinator.json")) {
-            Ok(bytes) => Some(
-                serde_json::from_slice(&bytes).context("invalid deployment coordinator owner")?,
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error).context("read deployment coordinator owner"),
-        };
+        let receipt = read_record(&root.join(".deploy-operation.json"), supervised)?;
+        let previous_owner = read_record(&root.join(".deploy-coordinator.json"), supervised)?;
         Ok(Self {
             root,
             lease: Some(lease),
@@ -1074,5 +1092,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".deploy-operation.json"), b"invalid").unwrap();
         assert!(Journal::open(&dir.path().join("code")).is_err());
+        // A supervised successor has independently retired the old processes.
+        // Rebuild bookkeeping without destroying the original diagnostic record.
+        let journal =
+            Journal::open_recovering(&dir.path().join("code"), dir.path().into(), true).unwrap();
+        assert!(journal.receipt.is_none());
+        let backup = std::fs::read_dir(dir.path())
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.unwrap().path();
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".corrupt-")
+                    .then_some(path)
+            })
+            .expect("original receipt preserved");
+        assert_eq!(std::fs::read(backup).unwrap(), b"invalid");
     }
 }

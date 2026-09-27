@@ -57,11 +57,11 @@ pub use userapp::forward_contract::{
 pub use userapp::metadata::AppMetadataRecord;
 pub use userapp::runtime_configuration::*;
 pub use userapp::runtime_control::{
-    ArtifactInput, DesiredState, ERR_OPERATION_ID_CONFLICT, ERR_OPERATION_IN_PROGRESS,
-    ERR_PROTOCOL_UNSUPPORTED, ERR_RECOVERY_REQUIRED, ERR_REVISION_MISMATCH,
-    ERR_RUNTIME_INSTANCE_MISMATCH, ERR_STOP_PENDING, ERR_WORKSPACE_MISMATCH, ObservedHealth,
-    OperationRunConfig, RUNTIME_CONTROL_PROTOCOL_VERSION, RunProfileInput, RuntimeEventRecord,
-    RuntimeFailureDetail, RuntimeIdentityView, RuntimeMigrationRecoveryState,
+    ArtifactInput, DesiredState, ERR_INTERRUPTED_OWNER_EXIT, ERR_OPERATION_ID_CONFLICT,
+    ERR_OPERATION_IN_PROGRESS, ERR_PROTOCOL_UNSUPPORTED, ERR_RECOVERY_REQUIRED,
+    ERR_REVISION_MISMATCH, ERR_RUNTIME_INSTANCE_MISMATCH, ERR_STOP_PENDING, ERR_WORKSPACE_MISMATCH,
+    ObservedHealth, OperationRunConfig, RUNTIME_CONTROL_PROTOCOL_VERSION, RunProfileInput,
+    RuntimeEventRecord, RuntimeFailureDetail, RuntimeIdentityView, RuntimeMigrationRecoveryState,
     RuntimeOperationAccepted, RuntimeOperationKind, RuntimeOperationRequest, RuntimeOperationState,
     RuntimeOperationView, RuntimeRecoveryView, RuntimeStatusView, runtime_request_digest,
     validate_runtime_operation_request,

@@ -8,6 +8,7 @@ mod epoch;
 mod guardian;
 mod monitor;
 mod record;
+mod recovery;
 mod worker;
 
 pub use control::{
@@ -16,6 +17,7 @@ pub use control::{
 };
 pub use monitor::{Options, Owner, Policy};
 pub use record::{Intent, Quiescence, verify_live, verify_quiescent};
+pub use recovery::stop_work;
 pub use worker::{Worker, WorkerControl};
 
 pub const WORKER_ENV: &str = "RCODER_SUPERVISOR_WORKER";

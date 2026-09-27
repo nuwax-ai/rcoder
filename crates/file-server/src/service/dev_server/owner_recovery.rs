@@ -81,9 +81,6 @@ impl DevServerManager {
             OwnerProbe::Ready(identity) => identity,
             OwnerProbe::Legacy => return Ok(None), // registered local run is stopped by its retained child
             OwnerProbe::Absent if !required => return Ok(None),
-            OwnerProbe::Initializing if !required => {
-                anyhow::bail!("owner is initializing; retry after startup completes")
-            }
             OwnerProbe::Absent | OwnerProbe::Initializing => {
                 let root = runtime_state_layout::ensure_state_root(
                     workspace,
@@ -97,9 +94,18 @@ impl DevServerManager {
                     .read(true)
                     .write(true)
                     .open(root.join("owner-bootstrap.lock"))?;
-                bootstrap
-                    .try_lock()
-                    .context("owner bootstrap already in progress; retry after it completes")?;
+                match bootstrap.try_lock() {
+                    Ok(()) => {}
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        // Another caller is restoring the same management service.
+                        // Observe its result instead of failing an ordinary start.
+                        return self
+                            .wait_for_recovery_owner(project, workspace, address, &root)
+                            .await
+                            .map(Some);
+                    }
+                    Err(error) => return Err(error).context("lock owner bootstrap"),
+                }
                 // Recheck after claiming bootstrap. app-cli also takes its own
                 // authoritative OwnerGuard before binding or any runtime write.
                 match owner_client::observe_owner(address).await? {
@@ -279,11 +285,41 @@ impl DevServerManager {
         })?
     }
 
-    /// Async preflight belongs before expensive build commands. Recheck at
-    /// submission as well; this observation does not authorize a later write.
+    /// Restore a usable management plane before building. Old business failure
+    /// is diagnostic, not a permanent ban on a new build or explicit activation.
     pub async fn preflight_userapp_build(&self, project: &str, workspace: &Path) -> AppResult<()> {
-        let owner = self.recover_owner_if_needed(project, workspace).await?;
+        let mut owner = self.recover_owner_if_needed(project, workspace).await?;
         self.ensure_new_build_admissible(project)?;
+        if let Some(available) = &owner {
+            let identity = &available.identity;
+            let expected_app = std::env::var("PROJECT_ID")
+                .ok()
+                .filter(|app| !app.trim().is_empty())
+                .unwrap_or_else(|| "unknown-app".into());
+            let app = expected_app.as_str();
+            owner_client::verify_project_identity(identity, workspace, app)
+                .map_err(|e| AppError::owner_error("verify build owner", e))?;
+            let (_, token) = owner_client::find_owner_token(Path::new(&identity.source_root), app)
+                .ok_or_else(|| AppError::business("owner control credentials unavailable"))?;
+            let evidence = async {
+                OwnerClient::new(&available.address, &token)?
+                    .recovery()
+                    .await
+            }
+            .await
+            .map_err(|e| AppError::owner_error("inspect build owner", e))?;
+            if evidence.kernel_protected
+                || (evidence.owner_protected && !evidence.credentials_required)
+            {
+                // StopWork captures the actual worker generation and confirms its
+                // exit before rebooting management. No process-name cleanup and
+                // no replay of an uncertain deployment or migration.
+                self.stop_supervised_owner(project, workspace)
+                    .await
+                    .map_err(|e| AppError::owner_error("restore build control service", e))?;
+                owner = self.recover_owner_if_needed(project, workspace).await?;
+            }
+        }
         let address = owner
             .as_ref()
             .map(|owner| owner.address.as_str())
@@ -296,23 +332,6 @@ impl DevServerManager {
             return Err(AppError::business(format!(
                 "owner preflight failed: {reason}"
             )));
-        }
-        if let Some(owner) = owner {
-            let identity = owner.identity;
-            let app = identity.application_id.as_str();
-            let (_, token) = owner_client::find_owner_token(Path::new(&identity.source_root), app)
-                .ok_or_else(|| AppError::business("owner control credentials unavailable"))?;
-            let evidence = async { OwnerClient::new(&owner.address, &token)?.recovery().await }
-                .await
-                .map_err(|e| AppError::business(format!("owner preflight: {e:#}")))?;
-            if evidence.kernel_protected
-                || (evidence.owner_protected && !evidence.credentials_required)
-            {
-                return Err(AppError::business(format!(
-                    "runtime recovery required before build (operation {:?}, boundary {:?})",
-                    evidence.operation_id, evidence.boundary
-                )));
-            }
         }
         Ok(())
     }

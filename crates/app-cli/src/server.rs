@@ -1061,9 +1061,9 @@ impl ServerState {
             .map_err(|error| {
                 AdmissionError::Busy(format!("verify deployment credential recovery: {error:#}"))
             })?;
-        // B05：恢复保护约束**所有**写入口——旧部署链不得绕过（损坏记录/
-        // 未终态操作/部分提交围栏期间，legacy 受理同样拒绝；显式部署也
-        // 必须等操作员裁决恢复后进行）。
+        // B05：恢复保护约束**所有**写入口——旧部署链不得绕过（启动序列已
+        // 自动收敛未终态操作并隔离损坏记录；到达此门说明存储级故障仍在，
+        // 旧链与显式部署同样拒绝，直至存储恢复并重启）。
         // R05：kernel 不可用（状态根打开失败）同样 fail-closed——旧链只在
         // Some(kernel) 上检查保护会把"可信状态不可读"当成"无保护可查"放行。
         match self.runtime_kernel() {
@@ -1794,7 +1794,11 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
 
     // Hold the real public listener before legacy journal archival/migration.
     let api_listener = crate::api::bind_listener(&args.admin_addr).await?;
-    let journal = Journal::open_with_root(&args.workspace, state_root.clone())?;
+    let journal = if supervised_worker.is_some() {
+        Journal::open_recovering(&args.workspace, state_root.clone(), true)?
+    } else {
+        Journal::open_with_root(&args.workspace, state_root.clone())?
+    };
     let ready = RuntimeStatusService::default();
     let mut initial_state = ServerState::new(ready.clone());
     initial_state.initialize_owner_token()?;
@@ -2038,13 +2042,29 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
                 if let Err(error) = kernel.reconcile_quiesced_stop().await {
                     tracing::error!(%error, "Persisted stop reconciliation remains blocked");
                 }
+                // 兜底收敛：精确路径之后仍非终态的操作（含 reconcile 失败的
+                // Stop）自动沉降为 Failed。产品环境没有操作员——quiesce 已
+                // 确认上一 owner 进程停止，结果未提交是确定性裁决；不允许
+                // 留下"等人工删除/修复文件"的用户不可恢复状态。
+                match kernel.settle_unresolved_recoveries().await {
+                    Ok(settled) if !settled.is_empty() => {
+                        tracing::warn!(
+                            count = settled.len(),
+                            "startup settled interrupted operations; automatic business startup proceeds"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "Interrupted operations could not be settled automatically");
+                    }
+                }
                 if kernel.recovery_protection_active() {
-                    // B05：恢复保护（含损坏记录 blocked）压制自动启动——
-                    // 不撤销已受理的操作记录（可查询），业务保持 Idle 直至
-                    // 操作员裁决。显式 env 部署同样被 try_accept 门控拒绝。
+                    // 保护此刻只剩存储级故障（记录读不出且隔离失败）——自动
+                    // 收敛不可信，保留压制。正常残留（未终态/损坏记录）已在
+                    // 上方被收敛或隔离，不会到达此门。
                     kernel_recovery_hold = true;
                     tracing::error!(
-                        "runtime state requires recovery; automatic business startup suppressed"
+                        "runtime state requires storage-level recovery; automatic business startup suppressed"
                     );
                 }
                 let credential_result = state
@@ -2103,6 +2123,13 @@ async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
                 );
             }
         }
+    }
+    if stop_intent || args.control_only {
+        // Old writers are stopped. Keep historical deployment/migration receipts
+        // but let an explicit new operation repair the application.
+        state
+            .runtime_recovery_hold
+            .fetch_and(1, std::sync::atomic::Ordering::AcqRel);
     }
     if stop_intent {
         // Only this authenticated successor writes business intent. The old
@@ -2850,31 +2877,11 @@ async fn initialize_startup(
     args: &RuntimeArgs,
     state: &ServerState,
 ) -> Result<Option<InitialAction>> {
-    // Resolve the owner directory without demanding redacted startup secrets.
-    // An explicitly stopped owner does not execute migrations or business code;
-    // missing old credentials must not latch a hold that rejects the next
-    // explicit operation carrying fresh credentials.
-    let stopped_args = restored_runtime_args_inner(args, state, false)?;
     if args.control_only {
-        // Recover the control channel without replaying business startup. Keep
-        // journal/migration uncertainty visible; Stop remains available.
-        if let Err(error) =
-            crate::migration_journal::require_confirmed_migrations(&stopped_args.workspace)
-        {
-            state.begin_runtime_recovery_hold();
-            return Err(error).context("database migration requires reconciliation");
-        }
-        state
-            .journal
-            .lock()
-            .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
-            .as_ref()
-            .context("deployment journal missing")?
-            .resume(&state.generation)
-            .inspect_err(|_| state.begin_runtime_recovery_hold())?;
         state.set_phase(ServerPhase::Idle);
         return Ok(None);
     }
+    let stopped_args = restored_runtime_args_inner(args, state, false)?;
     // Decide automatic recovery before generating Switching. Stopped must not
     // leave a false interrupted-switch journal when no business was started.
     if !crate::deploy::deploy_requested()
@@ -3505,20 +3512,28 @@ async fn server_loop(
     host: Option<SupervisordHost>,
     first: Option<InitialAction>,
 ) -> Result<()> {
-    let mut active_args = match restored_runtime_args_inner(owner_args, state, false) {
-        Ok(args) => args,
-        Err(error) => {
-            state.begin_runtime_recovery_hold();
-            state.begin_failure(
-                format!("runtime execution target recovery failed: {error:#}"),
-                true,
-            );
-            state.cancel.cancelled().await;
-            return Ok(());
+    let mut pending = first;
+    let mut active_args = if pending.is_none() {
+        // Idle management has no business runtime to resume. A fresh Source or
+        // Deploy action selects its own directory; Stop needs no old manifest.
+        owner_args.clone()
+    } else {
+        match restored_runtime_args_inner(owner_args, state, false) {
+            Ok(args) => args,
+            Err(error) => {
+                state.begin_runtime_recovery_hold();
+                state.begin_failure(
+                    format!("runtime execution target recovery failed: {error:#}"),
+                    true,
+                );
+                // Keep consuming Stop and explicit replacement requests even when
+                // automatic restoration cannot choose the old execution directory.
+                pending = None;
+                owner_args.clone()
+            }
         }
     };
     let args = &mut active_args;
-    let mut pending: Option<InitialAction> = first;
     loop {
         if state.cancel.is_cancelled() {
             return Ok(());
