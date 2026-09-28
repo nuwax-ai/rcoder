@@ -1,44 +1,4 @@
-//! Docker 侧 Userapp Deployment 运行时（从 docker_runtime.rs 拆出）。
-//!
-//! `UserAppDeploymentRuntime` 的 trait 壳：**变更组**（create/patch/scale/
-//! recycle/restart/delete）一行委托 docker_app_create.rs 的自有 impl；
-//! **观测组**（status/spec/list/logs/exec/stream）在本文件。与 K8s 侧
-//! k8s_app_*.rs 文件群对称；工具函数在 docker_runtime.rs（pub(crate) 共享）。
-
-use async_trait::async_trait;
-use container_runtime_api::{
-    AppPortStatus, ContainerCreateParams, ContainerLogEntry, ContainerRuntimeError,
-    ContainerRuntimeResult, ContainerSpecSnapshot, DeploymentStatus, ExposeType,
-    UserAppDeploymentRuntime,
-};
-use shared_types::ContainerBasicInfo;
-use std::collections::HashMap;
-
-use super::docker_runtime::DockerRuntime;
-use super::docker_runtime::{
-    APP_COMMAND_LABEL, APP_PORTS_LABEL, app_deployment_name, docker_cpus_to_quantity,
-    docker_memory_to_quantity, extract_container_ip, extract_container_ports, parse_ports_label,
-};
-
-/// Docker reports published ports as TCP regardless of their application
-/// protocol. The persisted app port label determines which ports use Pingora.
-fn merge_http_port_labels(ports: &mut Vec<AppPortStatus>, raw: &str) {
-    for port in parse_ports_label(raw) {
-        if port.expose_type != ExposeType::Http {
-            continue;
-        }
-        if let Some(existing) = ports.iter_mut().find(|existing| existing.port == port.port) {
-            existing.expose_type = ExposeType::Http;
-        } else {
-            ports.push(AppPortStatus {
-                name: format!("http-{}", port.port),
-                port: port.port,
-                expose_type: ExposeType::Http,
-                external_port: None,
-            });
-        }
-    }
-}
+use super::*;
 
 #[async_trait]
 impl UserAppDeploymentRuntime for DockerRuntime {
@@ -67,21 +27,22 @@ impl UserAppDeploymentRuntime for DockerRuntime {
     async fn list_builder_creation_receipt_contexts(
         &self,
     ) -> ContainerRuntimeResult<Vec<shared_types::UserAppExecutionContext>> {
-        super::docker_compute_receipt::list_builder_creation_receipt_contexts().await
+        crate::runtime::docker_compute_receipt::list_builder_creation_receipt_contexts().await
     }
 
     async fn cleanup_builder_creation_receipts(
         &self,
         context: &shared_types::UserAppExecutionContext,
     ) -> ContainerRuntimeResult<()> {
-        super::docker_compute_receipt::cleanup_builder_creation_receipt_files(context).await
+        crate::runtime::docker_compute_receipt::cleanup_builder_creation_receipt_files(context)
+            .await
     }
 
     async fn cleanup_compute_receipt_files(
         &self,
         context: &shared_types::UserAppExecutionContext,
     ) -> ContainerRuntimeResult<()> {
-        super::docker_compute_receipt::cleanup_compute_receipt_files(context).await
+        crate::runtime::docker_compute_receipt::cleanup_compute_receipt_files(context).await
     }
 
     async fn capture_app_adoption(
@@ -136,7 +97,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         {
             return Ok(None);
         }
-        let volumes = super::docker_builder_restart::bind_witness(&inspect)?;
+        let volumes = crate::runtime::docker_builder_restart::bind_witness(&inspect)?;
         Ok(Some(shared_types::AppAdoptionTarget {
             context: context.clone(),
             resource: shared_types::AppResourceIdentity {
@@ -334,7 +295,7 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                 .state
                 .as_ref()
                 .is_some_and(|s| s.running == Some(false) && s.restarting != Some(true));
-            let context = super::lifecycle_discovery::include(
+            let context = crate::runtime::lifecycle_discovery::include(
                 &mut found,
                 app_id,
                 scope,
@@ -614,14 +575,14 @@ impl UserAppDeploymentRuntime for DockerRuntime {
                 "Application start is not yet confirmed".into(),
             ));
         }
-        super::docker_compute_receipt::save_app_start(&target.target).await
+        crate::runtime::docker_compute_receipt::save_app_start(&target.target).await
     }
 
     async fn reconcile_app_compute_start(
         &self,
         target: &shared_types::UserAppMutationTarget,
     ) -> ContainerRuntimeResult<bool> {
-        if !super::docker_compute_receipt::matches_app_start(target).await? {
+        if !crate::runtime::docker_compute_receipt::matches_app_start(target).await? {
             return Ok(false);
         }
         self.captured_start_is_running(target).await
@@ -702,14 +663,14 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         // service activity state; there is no mutable container annotation API.
         self.stop_captured_target(target).await?;
         self.confirm_app_compute_stopped(target).await?;
-        super::docker_compute_receipt::save_app_stop(target).await
+        crate::runtime::docker_compute_receipt::save_app_stop(target).await
     }
 
     async fn reconcile_app_compute_stop(
         &self,
         target: &shared_types::UserAppMutationTarget,
     ) -> ContainerRuntimeResult<bool> {
-        if !super::docker_compute_receipt::matches_app_stop(target).await? {
+        if !crate::runtime::docker_compute_receipt::matches_app_stop(target).await? {
             return Ok(false);
         }
         self.confirm_app_compute_stopped(target).await?;
@@ -722,11 +683,12 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         starting: bool,
     ) -> ContainerRuntimeResult<bool> {
         if starting {
-            super::docker_compute_receipt::matches_app_start(target).await
+            crate::runtime::docker_compute_receipt::matches_app_start(target).await
         } else {
             Ok(
-                super::docker_compute_receipt::matches_app_stop(target).await?
-                    && super::docker_compute_receipt::app_replacement_settled(target).await?,
+                crate::runtime::docker_compute_receipt::matches_app_stop(target).await?
+                    && crate::runtime::docker_compute_receipt::app_replacement_settled(target)
+                        .await?,
             )
         }
     }
@@ -1201,220 +1163,5 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             }
         });
         Ok(rx)
-    }
-}
-
-pub(crate) async fn execute_container_command(
-    client: &bollard::Docker,
-    name: &str,
-    command: Vec<String>,
-) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
-    use bollard::container::LogOutput;
-    use bollard::exec::{CreateExecOptions, StartExecResults};
-    use futures_util::StreamExt;
-
-    // 1. create exec(容器不存在 → ContainerNotFound,与 get_deployment_status 404 处理一致)
-    let exec = client
-        .create_exec(
-            name,
-            CreateExecOptions {
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                cmd: Some(command),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| match e {
-            bollard::errors::Error::DockerResponseServerError {
-                status_code: 404, ..
-            } => ContainerRuntimeError::ContainerNotFound(name.to_owned()),
-            _ => ContainerRuntimeError::ContainerExecError(format!("create_exec: {e}")),
-        })?;
-
-    // 2. start exec + 读输出流(LogOutput 分桶 stdout/stderr,同 get_app_logs)
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    match client
-        .start_exec(&exec.id, None)
-        .await
-        .map_err(|e| ContainerRuntimeError::ContainerExecError(format!("start_exec: {e}")))?
-    {
-        StartExecResults::Attached { mut output, .. } => {
-            while let Some(item) = output.next().await {
-                match item {
-                    Ok(LogOutput::StdOut { message }) | Ok(LogOutput::Console { message }) => {
-                        stdout.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    Ok(LogOutput::StdErr { message }) => {
-                        stderr.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        return Err(ContainerRuntimeError::ContainerExecError(format!(
-                            "stream: {e}"
-                        )));
-                    }
-                }
-            }
-        }
-        StartExecResults::Detached => {
-            return Err(ContainerRuntimeError::ContainerExecError(
-                "unexpected Detached".into(),
-            ));
-        }
-    }
-
-    // 3. exit code(stream 结束后 inspect 单独取)
-    let inspect = client
-        .inspect_exec(&exec.id)
-        .await
-        .map_err(|e| ContainerRuntimeError::ContainerExecError(format!("inspect_exec: {e}")))?;
-    if inspect.running != Some(false) {
-        return Err(ContainerRuntimeError::ContainerExecError(
-            "Exec has no confirmed stopped state; outcome is unknown".into(),
-        ));
-    }
-    let exit_code = inspect.exit_code.filter(|code| *code >= 0).ok_or_else(|| {
-        ContainerRuntimeError::ContainerExecError(
-            "Exec has no exit code; outcome is unknown".into(),
-        )
-    })?;
-
-    Ok(container_runtime_api::ExecResult {
-        stdout,
-        stderr,
-        exit_code,
-    })
-}
-
-fn validate_configuration_exec_target(
-    context: &shared_types::UserAppExecutionContext,
-    target: &shared_types::RuntimeConfigurationTarget,
-    container: &bollard::models::ContainerInspectResponse,
-) -> ContainerRuntimeResult<()> {
-    let mismatch =
-        || ContainerRuntimeError::Conflict("Configuration exec target identity changed".into());
-    if container.id.as_deref() != Some(target.physical_uid.as_str()) {
-        return Err(mismatch());
-    }
-    let config = container.config.as_ref().ok_or_else(mismatch)?;
-    let labels = config.labels.as_ref().ok_or_else(mismatch)?;
-    if labels.get("managed-by").map(String::as_str) != Some("rcoder-app-manager")
-        || labels.get("service-type").map(String::as_str)
-            != Some(shared_types::ServiceType::Userapp.to_string().as_str())
-        || labels.get(shared_types::USERAPP_DOCKER_APP_ID_LABEL) != Some(&context.app_id)
-    {
-        return Err(mismatch());
-    }
-    context
-        .validate_application_metadata(
-            &labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-        )
-        .map_err(ContainerRuntimeError::Conflict)?;
-    let expected = format!(
-        "{}={}",
-        shared_types::APP_DEPLOY_GENERATION_ID,
-        target.deployment_generation
-    );
-    let generations: Vec<_> = config
-        .env
-        .iter()
-        .flatten()
-        .filter(|entry| {
-            entry
-                .split_once('=')
-                .is_some_and(|(key, _)| key == shared_types::APP_DEPLOY_GENERATION_ID)
-        })
-        .collect();
-    if generations.len() != 1 || generations[0] != &expected {
-        return Err(mismatch());
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod configuration_exec_tests {
-    use super::*;
-
-    #[test]
-    fn http_port_label_overrides_docker_tcp_port_observation() {
-        let mut ports = vec![AppPortStatus {
-            name: String::new(),
-            port: 9080,
-            expose_type: ExposeType::Tcp,
-            external_port: Some(32080),
-        }];
-        merge_http_port_labels(&mut ports, "9080:http,60000:http,5432:tcp,9999:unknown");
-        assert_eq!(ports.len(), 2);
-        assert_eq!(ports[0].expose_type, ExposeType::Http);
-        assert_eq!(ports[0].external_port, Some(32080));
-        assert_eq!(ports[1].port, 60000);
-        assert_eq!(ports[1].expose_type, ExposeType::Http);
-    }
-
-    #[test]
-    fn configuration_exec_requires_physical_lifecycle_and_generation_match() {
-        let context = shared_types::UserAppExecutionContext {
-            app_id: "app1".into(),
-            lifecycle_id: "life1".into(),
-            operation_id: "operation1".into(),
-            executor_id: "executor1".into(),
-            request_fingerprint: "a".repeat(64),
-        };
-        let target = shared_types::RuntimeConfigurationTarget {
-            physical_uid: "container1".into(),
-            deployment_generation: "generation1".into(),
-        };
-        let mut labels = context.resource_metadata();
-        labels.insert("managed-by".into(), "rcoder-app-manager".into());
-        labels.insert(
-            "service-type".into(),
-            shared_types::ServiceType::Userapp.to_string(),
-        );
-        labels.insert(
-            shared_types::USERAPP_DOCKER_APP_ID_LABEL.into(),
-            "app1".into(),
-        );
-        let fixture = serde_json::json!({
-            "Id":"container1", "Config":{"Labels": labels,
-            "Env":[format!("{}=generation1",shared_types::APP_DEPLOY_GENERATION_ID)]}
-        });
-        let inspected = serde_json::from_value(fixture.clone()).unwrap();
-        validate_configuration_exec_target(&context, &target, &inspected).unwrap();
-        for (pointer, replacement) in [
-            ("/Id", serde_json::json!("container2")),
-            (
-                "/Config/Labels/rcoder.io~1lifecycle-id",
-                serde_json::json!("life2"),
-            ),
-            (
-                "/Config/Labels/service-type",
-                serde_json::json!(shared_types::ServiceType::UserappBuilder.to_string()),
-            ),
-            ("/Config/Env", serde_json::json!([])),
-            (
-                "/Config/Env",
-                serde_json::json!([format!(
-                    "{}=generation2",
-                    shared_types::APP_DEPLOY_GENERATION_ID
-                )]),
-            ),
-            (
-                "/Config/Env",
-                serde_json::json!([
-                    format!("{}=generation1", shared_types::APP_DEPLOY_GENERATION_ID),
-                    format!("{}=generation2", shared_types::APP_DEPLOY_GENERATION_ID)
-                ]),
-            ),
-        ] {
-            let mut changed = fixture.clone();
-            *changed.pointer_mut(pointer).unwrap() = replacement;
-            let inspected = serde_json::from_value(changed).unwrap();
-            assert!(
-                validate_configuration_exec_target(&context, &target, &inspected).is_err(),
-                "{pointer}"
-            );
-        }
     }
 }

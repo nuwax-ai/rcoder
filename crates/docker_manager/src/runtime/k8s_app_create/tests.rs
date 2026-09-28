@@ -1,7 +1,7 @@
 use super::*;
 
 #[cfg(test)]
-mod tests {
+mod cases {
     use super::*;
 
     #[test]

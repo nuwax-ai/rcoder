@@ -1,157 +1,4 @@
-//! Docker runtime implementation
-//!
-//! This module provides `DockerRuntime` that wraps the existing `DockerManager`
-//! and implements the `ContainerRuntime` trait.
-
-use async_trait::async_trait;
-use container_runtime_api::{
-    AgentContainerRuntime, AppPortSpec, AppPortStatus, ContainerCreateParams,
-    ContainerRuntimeError, ContainerRuntimeResult, ContainerRuntimeStatus, ExposeType,
-    RemovedContainerInfo, RuntimeContainerInfo,
-};
-use moka::future::Cache;
-use shared_types::{ContainerBasicInfo, ServiceType};
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-
-use crate::DockerManager;
-
-/// Docker runtime implementation wrapping DockerManager
-pub struct DockerRuntime {
-    pub(super) inner: Arc<DockerManager>,
-    /// TTL cache for list_containers result (15 seconds)
-    /// 列表缓存携带状态代次：命中时与 [`ContainerStateHandle::list_epoch`]
-    /// 比对，变更（创建/删除/更新）后立即可见，不再单靠 TTL。
-    list_cache: Cache<(), (u64, Vec<RuntimeContainerInfo>)>,
-}
-
-impl DockerRuntime {
-    /// Create a new DockerRuntime wrapping the given DockerManager
-    pub fn new(inner: Arc<DockerManager>) -> Self {
-        Self {
-            inner,
-            list_cache: Cache::builder()
-                .max_capacity(1)
-                .time_to_live(Duration::from_secs(15))
-                .build(),
-        }
-    }
-}
-
-// Only the final write's explicit rejection, or a read after successful writes,
-// proves that no daemon mutation remains outstanding. Never inspect-and-guess
-// after a transport failure, timeout, or server error from start.
-fn acknowledged_partial_creation(error: &crate::DockerError) -> Option<&str> {
-    let crate::DockerError::ContainerCreationIncomplete {
-        container_id,
-        phase,
-        source,
-    } = error
-    else {
-        return None;
-    };
-    match phase {
-        crate::ContainerCreationPhase::Observe => Some(container_id),
-        crate::ContainerCreationPhase::Start => {
-            if let crate::DockerError::BollardError(
-                bollard::errors::Error::DockerResponseServerError { status_code, .. },
-            ) = source.as_ref()
-                && shared_types::RuntimeRequestRejection::from_status(*status_code, String::new())
-                    .is_some()
-            {
-                Some(container_id)
-            } else {
-                None
-            }
-        }
-    }
-}
-
-impl DockerRuntime {
-    async fn record_partial_creation(
-        &self,
-        context: &shared_types::UserAppExecutionContext,
-        physical_id: &str,
-        lease: Option<shared_types::UserAppOperationLeaseReceipt>,
-    ) -> ContainerRuntimeResult<()> {
-        let target = self
-            .capture_builder_compute_with_binding(context, None, false)
-            .await?;
-        let resource = target
-            .workload
-            .as_ref()
-            .filter(|resource| resource.uid == physical_id)
-            .ok_or_else(|| {
-                ContainerRuntimeError::Conflict("Partial builder creation identity differs".into())
-            })?;
-        let inspected = self
-            .inner
-            .get_docker_client()
-            .inspect_container(physical_id, None)
-            .await
-            .map_err(|error| {
-                ContainerRuntimeError::DockerError(format!(
-                    "Inspect partial builder creation: {error}"
-                ))
-            })?;
-        if inspected.id.as_deref() != Some(physical_id) {
-            return Err(ContainerRuntimeError::Conflict(
-                "Partial builder physical ID differs".into(),
-            ));
-        }
-        let created = inspected.created.as_deref().ok_or_else(|| {
-            ContainerRuntimeError::Conflict("Partial builder creation timestamp missing".into())
-        })?;
-        let created_at = chrono::DateTime::parse_from_rfc3339(created)
-            .map_err(|error| ContainerRuntimeError::ConfigurationError(error.to_string()))?
-            .with_timezone(&chrono::Utc);
-        let running = inspected
-            .state
-            .as_ref()
-            .and_then(|state| state.running)
-            .ok_or_else(|| {
-                ContainerRuntimeError::Conflict("Partial builder running state missing".into())
-            })?;
-        let network = inspected
-            .host_config
-            .as_ref()
-            .and_then(|config| config.network_mode.as_deref());
-        let address = extract_container_ip(&inspected, network);
-        let container = ContainerBasicInfo {
-            container_id: physical_id.into(),
-            container_name: resource.name.clone(),
-            container_ip: address.clone(),
-            internal_port: shared_types::GRPC_DEFAULT_PORT,
-            external_port: 0,
-            project_id: context.app_id.clone(),
-            status: if running { "Running" } else { "Stopped" }.into(),
-            created_at,
-            service_url: if address.is_empty() {
-                String::new()
-            } else {
-                format!("http://{address}:{}", shared_types::GRPC_DEFAULT_PORT)
-            },
-            workload_uid: None,
-        };
-        let after = self
-            .capture_builder_compute_with_binding(context, None, false)
-            .await?;
-        if target != after {
-            return Err(ContainerRuntimeError::Conflict(
-                "Partial builder changed during observation".into(),
-            ));
-        }
-        let receipt = super::builder_creation_receipt::BuilderCreationReceipt {
-            target,
-            container,
-            lease: lease.ok_or_else(|| {
-                ContainerRuntimeError::ConfigurationError("Partial builder lease missing".into())
-            })?,
-        };
-        super::docker_compute_receipt::save_creation(&receipt).await
-    }
-}
+use super::*;
 
 #[async_trait]
 impl AgentContainerRuntime for DockerRuntime {
@@ -341,12 +188,15 @@ impl AgentContainerRuntime for DockerRuntime {
         &self,
         context: &shared_types::UserAppExecutionContext,
     ) -> ContainerRuntimeResult<Option<shared_types::BuilderCreationEvidence>> {
-        if let Some(receipt) = super::docker_compute_receipt::read_cancellation(context).await? {
+        if let Some(receipt) =
+            crate::runtime::docker_compute_receipt::read_cancellation(context).await?
+        {
             self.release_captured_file_lease(context, &receipt.lease)
                 .await?;
             return Err(ContainerRuntimeError::CreationCancelled);
         }
-        let Some(receipt) = super::docker_compute_receipt::read_creation(context).await? else {
+        let Some(receipt) = crate::runtime::docker_compute_receipt::read_creation(context).await?
+        else {
             return Ok(None);
         };
         // Active local writers retain their flock; release checks original
@@ -402,9 +252,9 @@ impl AgentContainerRuntime for DockerRuntime {
         starting: bool,
     ) -> ContainerRuntimeResult<bool> {
         if starting {
-            super::docker_compute_receipt::matches_start(target).await
+            crate::runtime::docker_compute_receipt::matches_start(target).await
         } else {
-            super::docker_compute_receipt::matches_stop(target).await
+            crate::runtime::docker_compute_receipt::matches_stop(target).await
         }
     }
 
@@ -472,7 +322,7 @@ impl AgentContainerRuntime for DockerRuntime {
                     ))
                 })?;
             if inspect.id.as_deref() != Some(resource.uid.as_str())
-                || super::docker_builder_control::control_identity_with_binding(
+                || crate::runtime::docker_builder_control::control_identity_with_binding(
                     &inspect,
                     &resource.name,
                     &target.context,
@@ -490,7 +340,7 @@ impl AgentContainerRuntime for DockerRuntime {
             // A builder without its original workspace bind is not a safe
             // automatic repair candidate. The durable restart checks the exact
             // witness again before and after replacement.
-            super::docker_builder_restart::bind_witness(&inspect)?;
+            crate::runtime::docker_builder_restart::bind_witness(&inspect)?;
             return Ok(Some(crate::deploy_host_ports::missing_builder_ports(
                 &inspect,
             )));
@@ -570,7 +420,7 @@ impl AgentContainerRuntime for DockerRuntime {
                             .record_partial_creation(context, physical_id, lease.receipt())
                             .await
                         {
-                            return super::builder_completion::finish(
+                            return crate::runtime::builder_completion::finish(
                                 lease,
                                 Err(ContainerRuntimeError::ContainerCreationError(format!(
                                     "{error}; persist partial creation evidence: {record_error}"
@@ -579,7 +429,7 @@ impl AgentContainerRuntime for DockerRuntime {
                             .await;
                         }
                     }
-                    result.map_err(super::builder_completion::docker_error)
+                    result.map_err(crate::runtime::builder_completion::docker_error)
                 };
                 let result = match (result, context.as_ref()) {
                     (Ok(info), Some(context)) => {
@@ -597,7 +447,7 @@ impl AgentContainerRuntime for DockerRuntime {
                                     false,
                                 )
                                 .await?;
-                            let receipt = super::builder_creation_receipt::BuilderCreationReceipt {
+                            let receipt = crate::runtime::builder_creation_receipt::BuilderCreationReceipt {
                                 target,
                                 container: info.clone(),
                                 lease: lease.receipt().ok_or_else(|| {
@@ -606,7 +456,7 @@ impl AgentContainerRuntime for DockerRuntime {
                                     )
                                 })?,
                             };
-                            super::docker_compute_receipt::save_creation(&receipt).await
+                            crate::runtime::docker_compute_receipt::save_creation(&receipt).await
                         }
                         .await;
                         recorded.map(|()| info)
@@ -614,7 +464,7 @@ impl AgentContainerRuntime for DockerRuntime {
                     (Err(ContainerRuntimeError::CreationCancelled), Some(context)) => {
                         let recorded = async {
                             let receipt =
-                                super::builder_creation_receipt::BuilderCancellationReceipt {
+                                crate::runtime::builder_creation_receipt::BuilderCancellationReceipt {
                                     context: context.clone(),
                                     lease: lease.receipt().ok_or_else(|| {
                                         ContainerRuntimeError::ConfigurationError(
@@ -622,7 +472,7 @@ impl AgentContainerRuntime for DockerRuntime {
                                         )
                                     })?,
                                 };
-                            super::docker_compute_receipt::save_cancellation(&receipt).await
+                            crate::runtime::docker_compute_receipt::save_cancellation(&receipt).await
                         }
                         .await;
                         match recorded {
@@ -632,7 +482,7 @@ impl AgentContainerRuntime for DockerRuntime {
                     }
                     (result, _) => result,
                 };
-                super::builder_completion::finish(lease, result).await
+                crate::runtime::builder_completion::finish(lease, result).await
             })
             .await
             .map_err(|e| {
@@ -824,7 +674,7 @@ impl AgentContainerRuntime for DockerRuntime {
                 if let Some(container) = self.find_container(identifier, service_type).await? {
                     let result = tokio::time::timeout(
                         Duration::from_secs(8),
-                        super::docker_app_runtime::execute_container_command(
+                        crate::runtime::docker_app_runtime::execute_container_command(
                             self.inner.get_docker_client(),
                             &container.container_id,
                             vec![
@@ -924,302 +774,5 @@ impl AgentContainerRuntime for DockerRuntime {
             ContainerRuntimeError::ConnectionError(format!("Docker ping failed: {}", e))
         })?;
         Ok(())
-    }
-}
-
-// UserAppDeploymentRuntime 完整实现拆至 docker_app_runtime.rs（与 K8s 侧
-// k8s_app_*.rs 文件群对称——Docker 语义映射的 app 域自成一档）。
-impl DockerRuntime {
-    /// Fetch containers from Docker API (used as cache loader)
-    async fn fetch_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>> {
-        let containers = self.inner.list_containers().await;
-        let mut result = Vec::with_capacity(containers.len());
-        for c in containers {
-            let container_ip = self
-                .inner
-                .get_container_connection_info(&c)
-                .await
-                .map_err(|e| ContainerRuntimeError::ConnectionError(e.to_string()))?
-                .unwrap_or_default();
-
-            // 构建环境变量映射（包含 project_id 和 service_type）+ 结构化身份。
-            // 身份真源 = 内存缓存：c.project_id 槽存的是创建时的派生主键
-            // （container_identifier 单一事实源），c.service_type 还原语义槽位；
-            // rcoder 重启后缓存空 → 此函数无条目，名字反解兜底由消费方处理
-            let mut env_vars = HashMap::new();
-            // 容器内契约要纯 app_id：builder 场景 project_id 槽是复合串——
-            // 缓存条目创建时若带显式 builder_app_id 则直用，否则右切还原
-            let project_id_env = c.project_id.clone();
-            env_vars.insert("PROJECT_ID".to_string(), project_id_env);
-            if let Some(ref user_id) = c.user_id {
-                env_vars.insert("USER_ID".to_string(), user_id.clone());
-            }
-            if let Some(ref service_type) = c.service_type {
-                env_vars.insert("SERVICE_TYPE".to_string(), service_type.to_string());
-            }
-            let slots = c
-                .service_type
-                .as_ref()
-                .map(|st| container_runtime_api::slots_from_identifier(st, &c.project_id))
-                .unwrap_or_default();
-
-            result.push(RuntimeContainerInfo {
-                container_id: c.container_id,
-                container_name: c.container_name,
-                container_ip,
-                status: map_container_status(&c.status),
-                created_at: c.created_at,
-                env_vars: Some(env_vars),
-                service_type: c.service_type,
-                project_id: slots.project_id,
-                user_id: slots.user_id,
-                pod_id: slots.pod_id,
-                app_id: slots.app_id,
-                workload_uid: None,
-            });
-        }
-        Ok(result)
-    }
-}
-
-/// Userapp 容器/Deployment 命名（单一来源，与 K8s 侧 `KubernetesRuntime::app_deployment_name` 对称）。
-///
-/// 前缀取自 `ServiceType::Userapp::container_prefix()`，避免散落硬编码；改前缀只需改一处。
-pub(super) fn app_deployment_name(app_id: &str) -> String {
-    format!("{}-{app_id}", ServiceType::Userapp.container_prefix())
-}
-
-/// 容器 ports 元数据 label（update live 回退数据源；编码 "8080:http,5432:tcp"，
-/// 与 K8s `rcoder.io/port-expose` 注解同构——Docker 侧 Http/Tcp 均无完整运行时
-/// 落地可反推，见 create_deployment 内注释）。
-pub(super) const APP_PORTS_LABEL: &str = "rcoder.io/app-ports";
-/// 容器 command 元数据 label（JSON 数组；create 时用户显式设置才写入）。
-pub(super) const APP_COMMAND_LABEL: &str = "rcoder.io/app-command";
-
-/// ports → label 值（按端口排序编码，顺序无关 → 字符串稳定，避免无谓容器 diff）。
-pub(super) fn encode_ports_label(ports: &[AppPortSpec]) -> String {
-    let mut entries: Vec<(u16, &ExposeType)> =
-        ports.iter().map(|p| (p.port, &p.expose_type)).collect();
-    entries.sort_by_key(|(port, _)| *port);
-    entries
-        .iter()
-        .map(|(port, et)| format!("{port}:{}", expose_type_str(et)))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// label 值 → ports（容错：非法条目跳过；name 空串/strip_prefix None——Docker 单机
-/// 模式这两项无运行时语义）。
-pub(super) fn parse_ports_label(raw: &str) -> Vec<AppPortSpec> {
-    raw.split(',')
-        .filter_map(|entry| {
-            let mut it = entry.split(':');
-            let port: u16 = it.next()?.trim().parse().ok()?;
-            let et = match it.next()?.trim() {
-                "tcp" => ExposeType::Tcp,
-                "http" => ExposeType::Http,
-                _ => return None,
-            };
-            if it.next().is_some() {
-                return None;
-            }
-            Some(AppPortSpec {
-                name: String::new(),
-                port,
-                expose_type: et,
-                strip_prefix: None,
-            })
-        })
-        .collect()
-}
-
-pub(super) fn expose_type_str(e: &ExposeType) -> &'static str {
-    match e {
-        ExposeType::Http => "http",
-        ExposeType::Tcp => "tcp",
-    }
-}
-
-/// Docker `NanoCpus`（1 核 = 1e9）→ K8s Quantity 核数字符串（"1"/"0.5"）。
-/// update 回退用：读回的值将再次下发为 K8s/Docker 资源限制。
-pub(super) fn docker_cpus_to_quantity(nano_cpus: i64) -> String {
-    let cores = nano_cpus as f64 / 1e9;
-    if cores.fract() == 0.0 {
-        format!("{}", cores as i64)
-    } else {
-        format!("{cores}")
-    }
-}
-
-/// Docker 字节内存限制 → K8s Quantity 字符串（无损换算：优先整 Gi/Mi/Ki 档，非整档
-/// 用更细档位精确表示——1.5Gi=1536Mi 而非缩水成 1Gi；非 Ki 整数倍的罕见值直接输出
-/// 字节数，K8s Quantity 合法且无损）。
-pub(super) fn docker_memory_to_quantity(bytes: i64) -> String {
-    const KI: i64 = 1024;
-    const MI: i64 = 1024 * 1024;
-    const GI: i64 = 1024 * 1024 * 1024;
-    if bytes >= GI && bytes % GI == 0 {
-        format!("{}Gi", bytes / GI)
-    } else if bytes >= MI && bytes % MI == 0 {
-        format!("{}Mi", bytes / MI)
-    } else if bytes >= KI && bytes % KI == 0 {
-        format!("{}Ki", bytes / KI)
-    } else {
-        format!("{bytes}")
-    }
-}
-
-/// 将内部 `ContainerStatus` 映射为运行时 `ContainerRuntimeStatus`
-fn map_container_status(status: &crate::types::ContainerStatus) -> ContainerRuntimeStatus {
-    match status {
-        crate::types::ContainerStatus::Running => ContainerRuntimeStatus::Running,
-        crate::types::ContainerStatus::Stopped => ContainerRuntimeStatus::Failed,
-        crate::types::ContainerStatus::Creating => ContainerRuntimeStatus::Pending,
-        crate::types::ContainerStatus::Restarting => ContainerRuntimeStatus::Pending,
-        crate::types::ContainerStatus::Paused => {
-            ContainerRuntimeStatus::Unknown("paused".to_string())
-        }
-        crate::types::ContainerStatus::Dead => ContainerRuntimeStatus::Failed,
-        crate::types::ContainerStatus::Removing => ContainerRuntimeStatus::Failed,
-        crate::types::ContainerStatus::Exited => ContainerRuntimeStatus::Failed,
-        crate::types::ContainerStatus::Unknown(s) => ContainerRuntimeStatus::Unknown(s.clone()),
-    }
-}
-
-/// 从容器 inspect 结果提取 IP：优先取 `preferred_network` 网卡，回退任意网卡。
-///
-/// Docker 容器可能同时连接多个网络（主网络 + 自定义），`networks.values().next()`
-/// 会非确定性地取一个。优先按主网络名定位，确保拿到 Pingora backend 应指向的 IP。
-pub(crate) fn extract_container_ip(
-    inspect: &bollard::models::ContainerInspectResponse,
-    preferred_network: Option<&str>,
-) -> String {
-    let Some(nets) = inspect
-        .network_settings
-        .as_ref()
-        .and_then(|n| n.networks.as_ref())
-    else {
-        return String::new();
-    };
-    if let Some(net) = preferred_network
-        && let Some(entry) = nets.get(net)
-        && let Some(ip) = entry.ip_address.as_ref()
-        && !ip.is_empty()
-    {
-        return ip.clone();
-    }
-    nets.values()
-        .next()
-        .and_then(|e| e.ip_address.clone())
-        .filter(|ip| !ip.is_empty())
-        .unwrap_or_default()
-}
-
-/// 从容器 inspect 提取 TCP 端口状态（Docker port_bindings → host_port）。
-///
-/// Docker 仅对 TCP 端口做 port_bindings（create_deployment 时），HTTP 端口走 Pingora
-/// 不做 binding，故此处只还原 TCP；name 用 `tcp-{port}`（Docker 无端口名概念，调用方
-/// 按 port 而非 name 匹配 external_port）。
-pub(super) fn extract_container_ports(
-    inspect: &bollard::models::ContainerInspectResponse,
-) -> Vec<AppPortStatus> {
-    let Some(ports_map) = inspect
-        .network_settings
-        .as_ref()
-        .and_then(|n| n.ports.as_ref())
-    else {
-        return vec![];
-    };
-    ports_map
-        .iter()
-        .filter_map(|(key, bindings)| {
-            // key 形如 "80/tcp"
-            let port: u16 = key.trim_end_matches("/tcp").parse().ok()?;
-            let host_port = bindings
-                .as_ref()
-                .and_then(|b| b.first())
-                .and_then(|pb| pb.host_port.as_deref())
-                .and_then(|s| s.parse::<u16>().ok())?;
-            Some(AppPortStatus {
-                name: format!("tcp-{port}"),
-                port,
-                expose_type: ExposeType::Tcp,
-                external_port: Some(host_port),
-            })
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// ports label 编解码往返：Http/Tcp 类型精确保留、编码按端口排序稳定。
-    #[test]
-    fn ports_label_roundtrip_preserves_expose_types() {
-        let ports = vec![
-            AppPortSpec {
-                name: "http".into(),
-                port: 8080,
-                expose_type: ExposeType::Http,
-                strip_prefix: Some(true),
-            },
-            AppPortSpec {
-                name: "db".into(),
-                port: 5432,
-                expose_type: ExposeType::Tcp,
-                strip_prefix: None,
-            },
-        ];
-        let encoded = encode_ports_label(&ports);
-        assert_eq!(encoded, "5432:tcp,8080:http");
-        let parsed = parse_ports_label(&encoded);
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].port, 5432);
-        assert!(matches!(parsed[0].expose_type, ExposeType::Tcp));
-        assert_eq!(parsed[1].port, 8080);
-        assert!(matches!(parsed[1].expose_type, ExposeType::Http));
-    }
-
-    /// 解码容错：非法条目（非数字端口/缺类型）跳过，其余保留。
-    #[test]
-    fn ports_label_parse_skips_invalid_entries() {
-        let parsed = parse_ports_label("8080:http,abc:tcp,:http,9090:tcp");
-        assert_eq!(parsed.len(), 2);
-        assert!(parsed.iter().all(|p| p.port == 8080 || p.port == 9090));
-    }
-
-    /// dev 树 identifier 扫描：跨 uid 去重、跳过 data/logs/agent-store 兄弟目录、
-    /// 排序稳定；树不存在返回空（幂等）。
-    #[tokio::test]
-    async fn dev_workspace_scan_collects_apps_across_uids_skipping_siblings() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        // 两个 uid 各持有不同 app；data/logs/agent-store 下也有按 app_id 键的目录，
-        // 但它们是兄弟段不是 uid，不得进入结果；文件与非 dev 内容忽略
-        for (uid, app) in [("u1", "app-a"), ("u2", "app-b"), ("u1", "app-c")] {
-            std::fs::create_dir_all(root.join(uid).join(app)).expect("mkdir app");
-        }
-        for sibling in ["data", "logs", "agent-store"] {
-            std::fs::create_dir_all(root.join("u1").join(sibling).join("app-a"))
-                .expect("mkdir sibling");
-        }
-        std::fs::write(root.join("u1").join("notes.txt"), "").expect("write file");
-
-        let ids = crate::runtime::docker_workspace::scan_dev_workspace_identifiers(root)
-            .await
-            .expect("scan");
-        assert_eq!(ids, vec!["app-a", "app-b", "app-c"]);
-    }
-
-    #[tokio::test]
-    async fn dev_workspace_scan_empty_when_tree_missing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let ids = crate::runtime::docker_workspace::scan_dev_workspace_identifiers(
-            &dir.path().join("dev"),
-        )
-        .await
-        .expect("scan");
-        assert!(ids.is_empty());
     }
 }

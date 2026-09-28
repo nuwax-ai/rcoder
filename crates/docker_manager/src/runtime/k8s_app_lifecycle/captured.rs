@@ -1,28 +1,7 @@
-//! Userapp Deployment 生命周期(从 k8s_deployment.rs 拆出)。
-//!
-//! Scale/restart and removal of obsolete port resources. Identity-bound deletion
-//! lives in k8s_app_deletion.
-
-#[cfg(feature = "kubernetes")]
-use container_runtime_api::{
-    ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult, ExposeType,
-};
-#[cfg(feature = "kubernetes")]
-use kube::api::{Patch, PatchParams};
-#[cfg(feature = "kubernetes")]
-use tracing::info;
-
-#[cfg(feature = "kubernetes")]
-use super::k8s_app_helpers::{
-    IDLE_TIMEOUT_ANNOTATION, RECYCLE_ENABLED_ANNOTATION, WAKE_ON_TRAFFIC_ANNOTATION,
-};
-#[cfg(feature = "kubernetes")]
-use super::k8s_deployment::APP_CONTAINER_NAME;
-
-use super::kubernetes_runtime::KubernetesRuntime;
+use super::*;
 
 impl KubernetesRuntime {
-    pub(super) async fn patch_captured_policy(
+    pub(crate) async fn patch_captured_policy(
         &self,
         target: &shared_types::UserAppMutationTarget,
         policy: &shared_types::UserAppRuntimePolicy,
@@ -60,7 +39,7 @@ impl KubernetesRuntime {
         .await
     }
 
-    pub(super) async fn capture_stop_target(
+    pub(crate) async fn capture_stop_target(
         &self,
         context: &shared_types::UserAppExecutionContext,
         expected_version: Option<&str>,
@@ -75,7 +54,7 @@ impl KubernetesRuntime {
     }
 
     /// Capture lifecycle ownership once, before staging any replacement config.
-    pub(super) async fn capture_owned_app_identity(
+    pub(crate) async fn capture_owned_app_identity(
         &self,
         context: &shared_types::UserAppExecutionContext,
         expected_version: Option<&str>,
@@ -122,7 +101,7 @@ impl KubernetesRuntime {
         Ok(resource)
     }
 
-    pub(super) async fn restart_captured_target(
+    pub(crate) async fn restart_captured_target(
         &self,
         target: &shared_types::UserAppMutationTarget,
         image: Option<&str>,
@@ -157,21 +136,21 @@ impl KubernetesRuntime {
         }
     }
 
-    pub(super) async fn start_captured_target(
+    pub(crate) async fn start_captured_target(
         &self,
         target: &shared_types::UserAppMutationTarget,
     ) -> ContainerRuntimeResult<()> {
         self.start_captured_with_policy(target, true, None).await
     }
 
-    pub(super) async fn start_captured_management_target(
+    pub(crate) async fn start_captured_management_target(
         &self,
         target: &shared_types::UserAppMutationTarget,
     ) -> ContainerRuntimeResult<()> {
         self.start_captured_with_policy(target, false, None).await
     }
 
-    pub(super) async fn start_captured_with_policy(
+    pub(crate) async fn start_captured_with_policy(
         &self,
         target: &shared_types::UserAppMutationTarget,
         enable_traffic_wake: bool,
@@ -212,7 +191,7 @@ impl KubernetesRuntime {
         }
     }
 
-    pub(super) async fn stop_captured_target(
+    pub(crate) async fn stop_captured_target(
         &self,
         target: &shared_types::UserAppMutationTarget,
         wake_on_traffic: bool,
@@ -235,7 +214,7 @@ impl KubernetesRuntime {
         })).await
     }
 
-    pub(super) async fn prepare_captured_compute_start(
+    pub(crate) async fn prepare_captured_compute_start(
         &self,
         target: &shared_types::UserAppMutationTarget,
     ) -> ContainerRuntimeResult<shared_types::UserAppComputeStartTarget> {
@@ -319,7 +298,7 @@ impl KubernetesRuntime {
         })
     }
 
-    pub(super) async fn prepare_captured_compute_retry(
+    pub(crate) async fn prepare_captured_compute_retry(
         &self,
         captured: &shared_types::UserAppComputeStartTarget,
     ) -> ContainerRuntimeResult<Option<shared_types::UserAppComputeStartTarget>> {
@@ -381,7 +360,7 @@ impl KubernetesRuntime {
         Ok(Some(prepared))
     }
 
-    pub(super) async fn fence_captured_compute_write(
+    pub(crate) async fn fence_captured_compute_write(
         &self,
         captured: &shared_types::UserAppComputeStartTarget,
     ) -> ContainerRuntimeResult<bool> {
@@ -469,7 +448,7 @@ impl KubernetesRuntime {
         )
     }
 
-    pub(super) async fn start_captured_compute(
+    pub(crate) async fn start_captured_compute(
         &self,
         captured: &shared_types::UserAppComputeStartTarget,
     ) -> ContainerRuntimeResult<()> {
@@ -509,7 +488,7 @@ impl KubernetesRuntime {
         }
     }
 
-    pub(super) async fn reconcile_captured_compute_start(
+    pub(crate) async fn reconcile_captured_compute_start(
         &self,
         target: &shared_types::UserAppMutationTarget,
     ) -> ContainerRuntimeResult<bool> {
@@ -673,7 +652,7 @@ impl KubernetesRuntime {
             }))
     }
 
-    pub(super) async fn reconcile_captured_compute_stop(
+    pub(crate) async fn reconcile_captured_compute_stop(
         &self,
         target: &shared_types::UserAppMutationTarget,
     ) -> ContainerRuntimeResult<bool> {
@@ -721,7 +700,7 @@ impl KubernetesRuntime {
         Ok(after.as_ref().is_some_and(matches))
     }
 
-    pub(super) async fn confirm_captured_compute_stopped(
+    pub(crate) async fn confirm_captured_compute_stopped(
         &self,
         target: &shared_types::UserAppMutationTarget,
     ) -> ContainerRuntimeResult<()> {
@@ -808,463 +787,5 @@ impl KubernetesRuntime {
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
-    }
-
-    /// scale Deployment replicas
-    pub async fn scale_app(&self, app_id: &str, replicas: i32) -> ContainerRuntimeResult<()> {
-        if replicas < 0 {
-            return Err(ContainerRuntimeError::ConfigurationError(
-                "Replica count must be nonnegative".into(),
-            ));
-        }
-        let identity = self.capture_app_mutation_identity(app_id).await?;
-        if replicas > 0 {
-            self.claim_app_storage(app_id).await?;
-        }
-        let name = &identity.name;
-        let patch = serde_json::json!({ "spec": { "replicas": replicas } });
-        self.patch_captured_app(&identity, patch).await?;
-        info!("[K8S-APP] Deployment {name} scaled to {replicas}");
-        Ok(())
-    }
-
-    /// patch Deployment 的闲置回收策略注解(strategic merge:只改指定注解键,不碰 pod template → 不触发 rollout)。
-    /// 字段 None=不改该键;两者皆 None 由上层 service 校验拒绝(此处防御性早返 Ok)。
-    pub async fn patch_app_recycle_policy(
-        &self,
-        app_id: &str,
-        recycle_enabled: Option<bool>,
-        idle_timeout_seconds: Option<u64>,
-    ) -> ContainerRuntimeResult<()> {
-        let name = self.app_deployment_name(app_id);
-        let mut ann = serde_json::Map::new();
-        if let Some(b) = recycle_enabled {
-            ann.insert(
-                RECYCLE_ENABLED_ANNOTATION.to_string(),
-                serde_json::Value::from(b.to_string()),
-            );
-        }
-        if let Some(s) = idle_timeout_seconds {
-            ann.insert(
-                IDLE_TIMEOUT_ANNOTATION.to_string(),
-                serde_json::Value::from(s.to_string()),
-            );
-        }
-        if ann.is_empty() {
-            return Ok(()); // 防御:两字段皆 None(service 层已校验)
-        }
-        let identity = self.capture_app_mutation_identity(app_id).await?;
-        let patch = serde_json::json!({ "metadata": { "annotations": ann } });
-        self.patch_captured_app(&identity, patch).await?;
-        info!(
-            "[K8S-APP] Deployment {name} recycle policy patched (enabled={:?}, idle_timeout={:?})",
-            recycle_enabled, idle_timeout_seconds
-        );
-        Ok(())
-    }
-
-    pub async fn patch_app_wake_on_traffic(
-        &self,
-        app_id: &str,
-        enabled: bool,
-    ) -> ContainerRuntimeResult<()> {
-        let identity = self.capture_app_mutation_identity(app_id).await?;
-        let annotations =
-            std::collections::BTreeMap::from([(WAKE_ON_TRAFFIC_ANNOTATION, enabled.to_string())]);
-        let patch = serde_json::json!({ "metadata": { "annotations": annotations } });
-        self.patch_captured_app(&identity, patch).await?;
-        Ok(())
-    }
-
-    /// 触发滚动重启（rollout annotation）
-    pub async fn restart_app(&self, app_id: &str) -> ContainerRuntimeResult<()> {
-        let identity = self.capture_app_mutation_identity(app_id).await?;
-        self.claim_app_storage(app_id).await?;
-        let name = &identity.name;
-        // kubectl 风格固定秒精度:注解值仅要求"变化即触发",但可变小数位
-        // 是纳秒时间戳事故的同款模式(手拼时间戳一律定精度)。
-        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let patch = serde_json::json!({
-            "spec": { "template": { "metadata": { "annotations": {
-                "kubectl.kubernetes.io/restartedAt": now
-            } } } }
-        });
-        self.patch_captured_app(&identity, patch).await?;
-        info!("[K8S-APP] Deployment {name} restarted");
-        Ok(())
-    }
-
-    /// Capture the physical target before any storage claim or workload mutation.
-    async fn capture_app_mutation_identity(
-        &self,
-        app_id: &str,
-    ) -> ContainerRuntimeResult<shared_types::AppResourceIdentity> {
-        let name = self.app_deployment_name(app_id);
-        let deployment = self.deployments_api().get(&name).await.map_err(|error| {
-            ContainerRuntimeError::K8sError(format!("Read application mutation target: {error}"))
-        })?;
-        let expected = self.build_app_labels(app_id, None, None);
-        if !deployment.metadata.labels.as_ref().is_some_and(|labels| {
-            expected
-                .iter()
-                .all(|(key, value)| labels.get(key) == Some(value))
-        }) {
-            return Err(ContainerRuntimeError::Conflict(
-                "Application mutation target ownership changed".into(),
-            ));
-        }
-        app_mutation_identity(name, &deployment.metadata)
-    }
-
-    pub(super) async fn patch_captured_app(
-        &self,
-        identity: &shared_types::AppResourceIdentity,
-        patch: serde_json::Value,
-    ) -> ContainerRuntimeResult<()> {
-        let patch = condition_app_patch(identity, patch)?;
-        self.deployments_api()
-            .patch(
-                &identity.name,
-                &PatchParams::default(),
-                &Patch::Merge(patch),
-            )
-            .await
-            .map_err(|error| match &error {
-                kube::Error::Api(response) if response.code == 409 => {
-                    ContainerRuntimeError::Conflict(format!(
-                        "Application mutation precondition failed: {error}"
-                    ))
-                }
-                _ => super::builder_completion::k8s_error(
-                    format!("Patch captured application: {error}"),
-                    error,
-                ),
-            })?;
-        Ok(())
-    }
-
-    /// Same identity-fenced patch as [`Self::patch_captured_app`] but with the
-    /// strategic merge type: `containers` entries merge by container name
-    /// instead of the array being replaced atomically.
-    pub(super) async fn patch_captured_app_strategic(
-        &self,
-        identity: &shared_types::AppResourceIdentity,
-        patch: serde_json::Value,
-    ) -> ContainerRuntimeResult<()> {
-        let patch = condition_app_patch(identity, patch)?;
-        self.deployments_api()
-            .patch(
-                &identity.name,
-                &PatchParams::default(),
-                &Patch::Strategic(patch),
-            )
-            .await
-            .map_err(|error| match &error {
-                kube::Error::Api(response) if response.code == 409 => {
-                    ContainerRuntimeError::Conflict(format!(
-                        "Application mutation precondition failed: {error}"
-                    ))
-                }
-                _ => super::builder_completion::k8s_error(
-                    format!("Patch captured application: {error}"),
-                    error,
-                ),
-            })?;
-        Ok(())
-    }
-
-    /// Remove obsolete port resources after a successful update.
-    pub async fn cleanup_orphan_port_resources(
-        &self,
-        app_id: &str,
-        params: &ContainerCreateParams,
-    ) -> ContainerRuntimeResult<()> {
-        let has_http = params
-            .ports
-            .as_ref()
-            .is_some_and(|ps| ps.iter().any(|p| p.expose_type == ExposeType::Http));
-        let has_tcp = params
-            .ports
-            .as_ref()
-            .is_some_and(|ps| ps.iter().any(|p| p.expose_type == ExposeType::Tcp));
-        let has_env = params.env.as_ref().is_some_and(|e| !e.is_empty());
-        let has_secrets = params.secrets.as_ref().is_some_and(|s| !s.is_empty());
-        // step-D 写面 fencing：清理删除一律 uid+RV 前置（对齐 delete_captured）
-        // ——接管后的迟到删除被前置拒绝，不会误删同名新代资源。
-        if !has_http {
-            let name = self.app_http_route_name(app_id);
-            let api = self.httproute_api();
-            if let Some(live) = api.get_opt(&name).await.map_err(|e| {
-                ContainerRuntimeError::K8sError(format!("get httproute {name} before cleanup: {e}"))
-            })? {
-                let dp =
-                    super::k8s_runtime_helpers::conditioned_delete_params(&live.metadata, None)?;
-                self.ignore_404(api.delete(&name, &dp).await).await?;
-            }
-        }
-        if !has_tcp {
-            let name = self.app_nodeport_name(app_id);
-            let api = self.services_api();
-            if let Some(live) = api.get_opt(&name).await.map_err(|e| {
-                ContainerRuntimeError::K8sError(format!("get nodeport {name} before cleanup: {e}"))
-            })? {
-                let dp =
-                    super::k8s_runtime_helpers::conditioned_delete_params(&live.metadata, None)?;
-                self.ignore_404(api.delete(&name, &dp).await).await?;
-            }
-        }
-        if !has_env {
-            let name = self.app_config_name(app_id);
-            let api = self.configmaps_api();
-            if let Some(live) = api.get_opt(&name).await.map_err(|e| {
-                ContainerRuntimeError::K8sError(format!("get configmap {name} before cleanup: {e}"))
-            })? {
-                let dp =
-                    super::k8s_runtime_helpers::conditioned_delete_params(&live.metadata, None)?;
-                self.ignore_404(api.delete(&name, &dp).await).await?;
-            }
-        }
-        if !has_secrets {
-            let name = self.app_secret_name(app_id);
-            let api = self.secrets_api();
-            if let Some(live) = api.get_opt(&name).await.map_err(|e| {
-                ContainerRuntimeError::K8sError(format!("get secret {name} before cleanup: {e}"))
-            })? {
-                let dp =
-                    super::k8s_runtime_helpers::conditioned_delete_params(&live.metadata, None)?;
-                self.ignore_404(api.delete(&name, &dp).await).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// 等 app Pod 容器全部退出（按 rcoder.io/app-id label 轮询 Pod phase），best-effort：
-    /// 容器退出（phase != Running）或 Pod 消失即返回；超时/API 错误仅 warn 不阻塞删除
-    /// （app 复用共享 PVC 子目录，残留写入影响可控）。
-    /// 仅容忍 404（视为已删除/幂等），其余 K8s 错误透传
-    async fn ignore_404<T>(&self, r: Result<T, kube::Error>) -> ContainerRuntimeResult<()> {
-        match r {
-            Ok(_) => Ok(()),
-            Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
-            Err(e) => Err(ContainerRuntimeError::K8sError(format!("delete: {e}"))),
-        }
-    }
-}
-
-fn app_mutation_identity(
-    name: String,
-    metadata: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
-) -> ContainerRuntimeResult<shared_types::AppResourceIdentity> {
-    if metadata.deletion_timestamp.is_some() || metadata.name.as_ref() != Some(&name) {
-        return Err(ContainerRuntimeError::Conflict(
-            "Application mutation target is deleting or changed".into(),
-        ));
-    }
-    let uid = metadata
-        .uid
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            ContainerRuntimeError::ConfigurationError(
-                "Application mutation target has no UID".into(),
-            )
-        })?;
-    let version = metadata
-        .resource_version
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            ContainerRuntimeError::ConfigurationError(
-                "Application mutation target has no resource version".into(),
-            )
-        })?;
-    Ok(shared_types::AppResourceIdentity {
-        kind: shared_types::AppResourceKind::Deployment,
-        name,
-        uid: uid.into(),
-        resource_version: Some(version.into()),
-    })
-}
-
-/// Restart patch body: wake annotation + replicas=1 + per-operation template
-/// annotation (guarantees a rollout even when the image is unchanged). With an
-/// image the pod-template container image joins the same write — the caller
-/// must dispatch via strategic merge (containers merge by name; an RFC 7386
-/// merge patch would replace the array atomically).
-fn app_restart_patch(operation_id: &str, image: Option<&str>) -> serde_json::Value {
-    let template = match image {
-        Some(image) => serde_json::json!({
-            "metadata":{"annotations":{"rcoder.io/restart-operation":operation_id}},
-            "spec":{"containers":[{"name":APP_CONTAINER_NAME,"image":image}]}
-        }),
-        None => serde_json::json!({
-            "metadata":{"annotations":{"rcoder.io/restart-operation":operation_id}}
-        }),
-    };
-    serde_json::json!({
-        "metadata":{"annotations":{(WAKE_ON_TRAFFIC_ANNOTATION):"true"}},
-        "spec":{"replicas":1,"template":template}
-    })
-}
-
-/// Compute-start patch body: wake + start receipt annotations + replicas=1,
-/// optionally rolling the pod-template container image in the same single
-/// write (strategic merge required, same as [`app_restart_patch`]).
-fn app_compute_start_patch(receipt: &str, image: Option<&str>) -> serde_json::Value {
-    match image {
-        Some(image) => serde_json::json!({
-            "metadata":{"annotations":{
-                (WAKE_ON_TRAFFIC_ANNOTATION):"true",
-                "rcoder.io/compute-start-receipt":receipt
-            }},
-            "spec":{"replicas":1,"template":{"spec":{"containers":[
-                {"name":APP_CONTAINER_NAME,"image":image}
-            ]}}}
-        }),
-        None => serde_json::json!({
-            "metadata":{"annotations":{
-                (WAKE_ON_TRAFFIC_ANNOTATION):"true",
-                "rcoder.io/compute-start-receipt":receipt
-            }},
-            "spec":{"replicas":1}
-        }),
-    }
-}
-
-fn condition_app_patch(
-    identity: &shared_types::AppResourceIdentity,
-    mut patch: serde_json::Value,
-) -> ContainerRuntimeResult<serde_json::Value> {
-    let version = identity
-        .resource_version
-        .as_deref()
-        .filter(|value| !value.is_empty());
-    if identity.kind != shared_types::AppResourceKind::Deployment
-        || identity.uid.is_empty()
-        || identity.name.is_empty()
-        || version.is_none()
-    {
-        return Err(ContainerRuntimeError::ConfigurationError(
-            "Incomplete application mutation identity".into(),
-        ));
-    }
-    let object = patch.as_object_mut().ok_or_else(|| {
-        ContainerRuntimeError::ConfigurationError("Application patch must be an object".into())
-    })?;
-    let metadata = object
-        .entry("metadata")
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .ok_or_else(|| {
-            ContainerRuntimeError::ConfigurationError(
-                "Application patch metadata must be an object".into(),
-            )
-        })?;
-    metadata.insert("uid".into(), identity.uid.clone().into());
-    metadata.insert("resourceVersion".into(), serde_json::json!(version));
-    Ok(patch)
-}
-
-#[cfg(test)]
-mod mutation_identity_tests {
-    use super::*;
-
-    /// 镜像滚动版 restart patch：同一写携带镜像+重启注解+replicas；
-    /// containers 只含 name/image 两个键（Strategic merge-by-name 语义，
-    /// 误用 Merge patch 会整组替换 containers——此处固化形状防回退）。
-    #[test]
-    fn restart_patch_carries_image_annotation_and_replicas_in_one_write() {
-        let patch = app_restart_patch("op-restart", Some("registry.test/app-runtime:0.2.0"));
-        assert_eq!(
-            patch["metadata"]["annotations"][WAKE_ON_TRAFFIC_ANNOTATION],
-            "true"
-        );
-        assert_eq!(patch["spec"]["replicas"], 1);
-        assert_eq!(
-            patch["spec"]["template"]["metadata"]["annotations"]["rcoder.io/restart-operation"],
-            "op-restart"
-        );
-        let containers = patch["spec"]["template"]["spec"]["containers"]
-            .as_array()
-            .expect("containers array");
-        assert_eq!(containers.len(), 1);
-        assert_eq!(containers[0]["name"], APP_CONTAINER_NAME);
-        assert_eq!(containers[0]["image"], "registry.test/app-runtime:0.2.0");
-        assert_eq!(
-            containers[0].as_object().expect("container object").len(),
-            2,
-            "container entry must carry only name+image"
-        );
-    }
-
-    /// 无镜像版保持既有形状：template 只含 metadata 注解，不出现 containers
-    /// 键（走 Merge patch 的判定依据）。
-    #[test]
-    fn restart_patch_without_image_keeps_plain_shape() {
-        let patch = app_restart_patch("op-restart", None);
-        assert_eq!(patch["spec"]["replicas"], 1);
-        assert_eq!(
-            patch["spec"]["template"]["metadata"]["annotations"]["rcoder.io/restart-operation"],
-            "op-restart"
-        );
-        assert!(
-            patch["spec"]["template"].get("spec").is_none(),
-            "no container template spec without an image roll"
-        );
-    }
-
-    #[test]
-    fn compute_start_patch_carries_image_only_when_present() {
-        let plain = app_compute_start_patch("{\"op\":\"a\"}", None);
-        assert_eq!(plain["spec"]["replicas"], 1);
-        assert_eq!(
-            plain["metadata"]["annotations"]["rcoder.io/compute-start-receipt"],
-            "{\"op\":\"a\"}"
-        );
-        assert!(plain["spec"].get("template").is_none());
-
-        let rolled = app_compute_start_patch("{\"op\":\"b\"}", Some("registry.test/app-runtime:9"));
-        let containers = rolled["spec"]["template"]["spec"]["containers"]
-            .as_array()
-            .expect("containers array");
-        assert_eq!(containers[0]["name"], APP_CONTAINER_NAME);
-        assert_eq!(containers[0]["image"], "registry.test/app-runtime:9");
-        assert_eq!(
-            rolled["metadata"]["annotations"][WAKE_ON_TRAFFIC_ANNOTATION],
-            "true"
-        );
-    }
-
-    #[test]
-    fn conditional_workload_patch_retains_requested_changes_and_captured_identity() {
-        let metadata = k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
-            name: Some("rcoder-app-one".into()),
-            uid: Some("original-uid".into()),
-            resource_version: Some("17".into()),
-            ..Default::default()
-        };
-        let identity = app_mutation_identity("rcoder-app-one".into(), &metadata).expect("identity");
-        for change in [
-            serde_json::json!({"spec":{"replicas":0}}),
-            serde_json::json!({"metadata":{"annotations":{"rcoder.io/wake-on-traffic":"false"}}}),
-            serde_json::json!({"spec":{"template":{"metadata":{"annotations":{"restart":"now"}}}}}),
-        ] {
-            let patch = condition_app_patch(&identity, change.clone()).expect("patch");
-            assert_eq!(patch["metadata"]["uid"], "original-uid");
-            assert_eq!(patch["metadata"]["resourceVersion"], "17");
-            if let Some(spec) = change.get("spec") {
-                assert_eq!(&patch["spec"], spec);
-            }
-            if let Some(annotations) = change.pointer("/metadata/annotations") {
-                assert_eq!(&patch["metadata"]["annotations"], annotations);
-            }
-        }
-        let mut missing = metadata.clone();
-        missing.uid = None;
-        assert!(app_mutation_identity("rcoder-app-one".into(), &missing).is_err());
-        let mut missing = metadata;
-        missing.resource_version = None;
-        assert!(app_mutation_identity("rcoder-app-one".into(), &missing).is_err());
-        assert!(app_mutation_identity("replacement-name".into(), &missing).is_err());
     }
 }
