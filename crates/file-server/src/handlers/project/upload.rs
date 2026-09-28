@@ -90,7 +90,7 @@ pub(crate) async fn upload_single_file(
                     file_field(
                         field,
                         state.config.upload_max_file_size_bytes,
-                        &state.config.upload_project_dir.join("temp"),
+                        &state.config.upload_temp_dir(),
                     )
                     .await?,
                 )
@@ -172,7 +172,7 @@ pub(crate) async fn upload_batch_files(
                 file_field(
                     field,
                     state.config.upload_max_file_size_bytes,
-                    &state.config.upload_project_dir.join("temp"),
+                    &state.config.upload_temp_dir(),
                 )
                 .await?,
             ),
@@ -262,7 +262,7 @@ pub(crate) async fn upload_attachment_file(
                     file_field(
                         field,
                         state.config.upload_max_file_size_bytes,
-                        &state.config.upload_project_dir.join("temp"),
+                        &state.config.upload_temp_dir(),
                     )
                     .await?,
                 );
@@ -352,7 +352,7 @@ pub(crate) async fn upload_project(
                     file_field(
                         field,
                         state.config.upload_max_file_size_bytes,
-                        &state.config.upload_project_dir.join("temp"),
+                        &state.config.upload_temp_dir(),
                     )
                     .await?,
                 );

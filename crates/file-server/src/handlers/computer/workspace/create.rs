@@ -69,7 +69,7 @@ pub(crate) async fn create_workspace(
                     file_field(
                         field,
                         state.config.upload_max_file_size_bytes,
-                        &state.config.upload_project_dir.join("temp"),
+                        &state.config.upload_temp_dir(),
                     )
                     .await?,
                 );
@@ -153,7 +153,7 @@ pub(crate) async fn create_workspace_v2(
                     file_field(
                         field,
                         state.config.upload_max_file_size_bytes,
-                        &state.config.upload_project_dir.join("temp"),
+                        &state.config.upload_temp_dir(),
                     )
                     .await?,
                 );

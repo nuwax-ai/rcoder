@@ -10,6 +10,19 @@ use tokio_util::sync::CancellationToken;
 
 const VERSION: u32 = 1;
 const MAX_FRAME: u64 = 8192;
+// —— 时长常量（语义命名，替代散落的魔法值）——
+/// supervised control 提交后等待快照收敛的轮询间隔。
+const CONTROL_POLL_INTERVAL_MS: Duration = Duration::from_millis(100);
+/// owner 接管时校验 live supervisor 的有界观察窗口。
+const VERIFY_LIVE_BUDGET_SECS: Duration = Duration::from_secs(3);
+/// TS 就绪探针（/health 单次 TCP 往返）超时。
+const TS_PROBE_TIMEOUT_SECS: Duration = Duration::from_secs(1);
+/// TS 就绪探针失败后的重试间隔。
+const TS_PROBE_RETRY_MS: Duration = Duration::from_millis(100);
+/// retire 后等待原 owner 退出见证的轮询间隔。
+const OWNER_EXIT_POLL_INTERVAL_MS: Duration = Duration::from_millis(100);
+/// owner 控制响应总超时（stop 可含完整代理排水预算）。
+const OWNER_RESPONSE_TIMEOUT_SECS: Duration = Duration::from_secs(60);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Receipt {
@@ -245,7 +258,7 @@ async fn supervised_control(
                 current.error.as_deref().unwrap_or("awaiting cleanup")
             ));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(CONTROL_POLL_INTERVAL_MS).await;
     }
 }
 fn supervisor_reply(snapshot: runtime_supervisor::Snapshot) -> Result<String, String> {
@@ -339,7 +352,7 @@ impl Owner {
                 let scope = root.clone();
                 process_utils::observe::observe(
                     "proxy verify live",
-                    Duration::from_secs(3),
+                    VERIFY_LIVE_BUDGET_SECS,
                     move || {
                         let scope = scope.clone();
                         let id = id.clone();
@@ -420,7 +433,7 @@ impl Owner {
                 Ok::<bool, std::io::Error>(line.split_whitespace().nth(1) == Some("200"))
             };
             if matches!(
-                tokio::time::timeout(Duration::from_secs(1), probe).await,
+                tokio::time::timeout(TS_PROBE_TIMEOUT_SECS, probe).await,
                 Ok(Ok(true))
             ) {
                 // A listener is readiness evidence only; ownership remains the
@@ -433,7 +446,7 @@ impl Owner {
             if tokio::time::Instant::now() >= deadline {
                 return Err("owned TS readiness deadline exceeded".into());
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(TS_PROBE_RETRY_MS).await;
         }
     }
     pub fn started(&mut self, address: String) -> Result<(), String> {
@@ -782,7 +795,7 @@ async fn retire_control(root: &Path, expected: Option<&str>) -> Result<String, S
         if tokio::time::Instant::now() >= deadline {
             return Err("original owner exit unknown; retirement preserved".into());
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(OWNER_EXIT_POLL_INTERVAL_MS).await;
     }
     serde_json::to_string(&Reply {
         version: VERSION,
@@ -893,7 +906,7 @@ pub async fn control_with_request(
         }
         serde_json::to_string(&reply).map_err(|e| e.to_string())
     };
-    tokio::time::timeout(Duration::from_secs(60), result)
+    tokio::time::timeout(OWNER_RESPONSE_TIMEOUT_SECS, result)
         .await
         .map_err(|_| "owner response unknown; receipt preserved".to_owned())?
 }

@@ -299,4 +299,10 @@ impl Config {
         list.iter()
             .any(|candidate| candidate.eq_ignore_ascii_case(ext))
     }
+
+    /// 上传/构建共享临时目录（`{upload_project_dir}/temp`）——收敛各处
+    /// `upload_project_dir.join("temp")` 咒语的单一事实源。
+    pub fn upload_temp_dir(&self) -> PathBuf {
+        self.upload_project_dir.join("temp")
+    }
 }

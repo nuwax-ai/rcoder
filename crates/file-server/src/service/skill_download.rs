@@ -39,7 +39,7 @@ impl SkillDownloader {
             .map_err(|error| AppError::system(format!("build skill HTTP client: {error}")))?;
         Ok(Self {
             client,
-            temp_dir: config.upload_project_dir.join("temp"),
+            temp_dir: config.upload_temp_dir(),
             max_bytes: config.skill_download_max_bytes,
             max_redirects: config.skill_download_max_redirects,
             max_url_count: config.skill_url_max_count,

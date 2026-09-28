@@ -42,8 +42,9 @@ pub(crate) async fn delete_workspace(
         },
     )
     .await?;
-    // 不存在视为已删除 (对齐 nuwax, 只 warn)
-    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+    // 不存在视为已删除 (对齐 nuwax, 只 warn)；存在性探测的 IO 错误传播——
+    // 否则删除接口会把真实错误伪装成"本来就不存在"的已删除成功。
+    if crate::service::fs_util::path_exists(&path).await? {
         tokio::fs::remove_dir_all(&path)
             .await
             .map_err(|e| AppError::system(format!("delete workspace failed: {e}")))?;

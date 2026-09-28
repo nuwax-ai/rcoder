@@ -20,7 +20,7 @@ pub async fn execute_command_core(
     cwd: PathBuf,
     command: &str,
 ) -> Result<CaptureResult, AppError> {
-    if !tokio::fs::try_exists(&cwd).await.unwrap_or(false) {
+    if !crate::service::fs_util::path_exists(&cwd).await? {
         return Err(AppError::resource("workspace does not exist"));
     }
     let timeout_secs = state.config.dev_command_timeout_secs;

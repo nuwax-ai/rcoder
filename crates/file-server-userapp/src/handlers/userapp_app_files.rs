@@ -63,7 +63,7 @@ pub(crate) async fn upload(
                     file_field(
                         field,
                         state.fs.config.upload_max_file_size_bytes,
-                        &state.fs.config.upload_project_dir.join("temp"),
+                        &state.fs.config.upload_temp_dir(),
                     )
                     .await?,
                 )
@@ -247,7 +247,8 @@ pub(crate) async fn list(
         .read_owned()
         .await;
     let root = resolve_userapp_dev(&params.app_id, None, &state.fs.config)?;
-    if !tokio::fs::try_exists(&root).await.unwrap_or(false) {
+    // 存在性探测的 IO 错误传播——否则会把真实错误伪装成"空清单"。
+    if !file_server::service::fs_util::path_exists(&root).await? {
         return Ok(Json(json!({"success": true, "files": []})));
     }
     let canonical_root = tokio::fs::canonicalize(&root)
@@ -261,7 +262,7 @@ pub(crate) async fn list(
     let target_dir = match sub {
         Some(p) => {
             let full = root.join(p);
-            if !tokio::fs::try_exists(&full).await.unwrap_or(false) {
+            if !file_server::service::fs_util::path_exists(&full).await? {
                 return Ok(Json(json!({"success": true, "files": []})));
             }
             ensure_within_root(&full, &canonical_root).await?
@@ -325,14 +326,15 @@ pub(crate) async fn delete(
         .read_owned()
         .await;
     let root = resolve_userapp_dev(&body.app_id, None, &state.fs.config)?;
-    if !tokio::fs::try_exists(&root).await.unwrap_or(false) {
+    // 存在性探测的 IO 错误传播——否则删除接口会把真实错误伪装成"目标不存在"。
+    if !file_server::service::fs_util::path_exists(&root).await? {
         return Err(AppError::resource(format!(
             "app root does not exist: {}",
             root.display()
         )));
     }
     let full = root.join(&body.path);
-    if !tokio::fs::try_exists(&full).await.unwrap_or(false) {
+    if !file_server::service::fs_util::path_exists(&full).await? {
         return Err(AppError::resource(format!(
             "file does not exist: {}",
             body.path

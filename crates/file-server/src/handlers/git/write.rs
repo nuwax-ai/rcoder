@@ -1,11 +1,14 @@
 //! git 写 handlers: init / add / commit / unstage / discard / diff / reset / checkout / revert。
 
+use std::path::Path;
+
 use axum::extract::State;
 use garde::Validate;
+use gix::Repository;
 
 use super::resolve_body;
 use crate::AppState;
-use crate::error::AppError;
+use crate::error::{AppError, AppResult};
 use crate::extract::AppJson as Json;
 use crate::models::{
     CommitBody, DiffBody, DiscardResult, FilesBody, GitAddResult, GitCheckoutResult,
@@ -14,6 +17,17 @@ use crate::models::{
     GitWriteBody, ResetBody, RevertBody, TargetBody,
 };
 use crate::service::git;
+
+/// 写 handler 共享前奏：工作区存在 → `ensure_repo` → `ensure_gitignore`，再执行 body。
+/// 目录不存在 = Resource 错（git 操作只面向已存在工作区，不创建）。
+fn with_repo<T>(path: &Path, f: impl FnOnce(&Repository) -> AppResult<T>) -> AppResult<T> {
+    if !path.exists() {
+        return Err(AppError::resource("workspace does not exist"));
+    }
+    let repo = git::ensure_repo(path)?;
+    git::ensure_gitignore(path)?;
+    f(&repo)
+}
 
 /// 初始化仓库
 #[utoipa::path(post, path = "/init", request_body = GitWriteBody, description = r#"
@@ -52,16 +66,9 @@ pub(crate) async fn add(
 ) -> Result<Json<GitAddResult>, AppError> {
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let files = body.files.unwrap_or_default();
-    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-        if !path.exists() {
-            return Err(AppError::resource("workspace does not exist"));
-        }
-        let repo = git::ensure_repo(&path)?;
-        git::ensure_gitignore(&path)?;
-        git::stage_files(&repo, &files)
-    })
-    .await
-    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    tokio::task::spawn_blocking(move || with_repo(&path, |repo| git::stage_files(repo, &files)))
+        .await
+        .map_err(|e| AppError::system(format!("git join: {e}")))??;
     Ok(Json(GitAddResult {
         success: true,
         message: "Files staged successfully".to_string(),
@@ -88,19 +95,16 @@ pub(crate) async fn commit(
     let ae = body
         .author_email
         .unwrap_or_else(|| state.config.git_default_author_email.clone());
-    let result = tokio::task::spawn_blocking(move || -> Result<Option<String>, AppError> {
-        if !path.exists() {
-            return Err(AppError::resource("workspace does not exist"));
-        }
-        let repo = git::ensure_repo(&path)?;
-        git::ensure_gitignore(&path)?;
-        git::stage_files(&repo, &files)?;
-        let st = git::get_status(&repo)?;
-        if st.staged.is_empty() {
-            return Ok(None);
-        }
-        let hash = git::commit_indexed(&repo, &message, &an, &ae)?;
-        Ok(Some(hash))
+    let result = tokio::task::spawn_blocking(move || {
+        with_repo(&path, |repo| {
+            git::stage_files(repo, &files)?;
+            let st = git::get_status(repo)?;
+            if st.staged.is_empty() {
+                return Ok(None);
+            }
+            let hash = git::commit_indexed(repo, &message, &an, &ae)?;
+            Ok(Some(hash))
+        })
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
@@ -134,16 +138,9 @@ pub(crate) async fn unstage(
     let files = body.files.unwrap_or_default();
     let all = files.is_empty();
     let files_echo = files.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-        if !path.exists() {
-            return Err(AppError::resource("workspace does not exist"));
-        }
-        let repo = git::ensure_repo(&path)?;
-        git::ensure_gitignore(&path)?;
-        git::unstage_files(&repo, &files)
-    })
-    .await
-    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    tokio::task::spawn_blocking(move || with_repo(&path, |repo| git::unstage_files(repo, &files)))
+        .await
+        .map_err(|e| AppError::system(format!("git join: {e}")))??;
     let (message, files_val) = if all {
         (
             "All files unstaged successfully",
@@ -174,13 +171,8 @@ pub(crate) async fn discard(
 ) -> Result<Json<DiscardResult>, AppError> {
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let files = body.files.unwrap_or_default();
-    let buckets = tokio::task::spawn_blocking(move || -> Result<git::DiscardBuckets, AppError> {
-        if !path.exists() {
-            return Err(AppError::resource("workspace does not exist"));
-        }
-        let repo = git::ensure_repo(&path)?;
-        git::ensure_gitignore(&path)?;
-        git::discard_files(&repo, &files)
+    let buckets = tokio::task::spawn_blocking(move || {
+        with_repo(&path, |repo| git::discard_files(repo, &files))
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
@@ -220,13 +212,8 @@ pub(crate) async fn diff(
         max_total_bytes: state.config.git_diff_max_total_bytes,
         max_output_bytes: state.config.git_diff_max_output_bytes,
     };
-    let result = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
-        if !path.exists() {
-            return Err(AppError::resource("workspace does not exist"));
-        }
-        let repo = git::ensure_repo(&path)?;
-        git::ensure_gitignore(&path)?;
-        git::compute_diff(&repo, &params)
+    let result = tokio::task::spawn_blocking(move || {
+        with_repo(&path, |repo| git::compute_diff(repo, &params))
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
@@ -268,13 +255,10 @@ pub(crate) async fn reset(
     let mode_label = mode.to_string();
     let author_name = state.config.git_default_author_name.clone();
     let author_email = state.config.git_default_author_email.clone();
-    let outcome = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
-        if !path.exists() {
-            return Err(AppError::resource("workspace does not exist"));
-        }
-        let repo = git::ensure_repo(&path)?;
-        git::ensure_gitignore(&path)?;
-        git::reset(&repo, &target, mode, &author_name, &author_email)
+    let outcome = tokio::task::spawn_blocking(move || {
+        with_repo(&path, |repo| {
+            git::reset(repo, &target, mode, &author_name, &author_email)
+        })
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
@@ -299,16 +283,9 @@ pub(crate) async fn checkout(
     body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let target = body.target.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-        if !path.exists() {
-            return Err(AppError::resource("workspace does not exist"));
-        }
-        let repo = git::ensure_repo(&path)?;
-        git::ensure_gitignore(&path)?;
-        git::checkout_tree(&repo, &target)
-    })
-    .await
-    .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    tokio::task::spawn_blocking(move || with_repo(&path, |repo| git::checkout_tree(repo, &target)))
+        .await
+        .map_err(|e| AppError::system(format!("git join: {e}")))??;
     Ok(Json(GitCheckoutResult {
         success: true,
         message: format!("Checkout files from {} successful", body.target),
@@ -335,13 +312,10 @@ pub(crate) async fn revert(
     let ae = body
         .author_email
         .unwrap_or_else(|| state.config.git_default_author_email.clone());
-    let outcome = tokio::task::spawn_blocking(move || -> Result<_, AppError> {
-        if !path.exists() {
-            return Err(AppError::resource("workspace does not exist"));
-        }
-        let repo = git::ensure_repo(&path)?;
-        git::ensure_gitignore(&path)?;
-        git::revert_to_commit(&repo, &target, message.as_deref(), &an, &ae)
+    let outcome = tokio::task::spawn_blocking(move || {
+        with_repo(&path, |repo| {
+            git::revert_to_commit(repo, &target, message.as_deref(), &an, &ae)
+        })
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;

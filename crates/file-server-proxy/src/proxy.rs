@@ -319,5 +319,5 @@ fn error_response(status: hyper::StatusCode, msg: &str) -> hyper::Response<Proxy
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
         .body(body)
-        .expect("static error response parts are valid")
+        .unwrap_or_else(|_| unreachable!("static error response"))
 }

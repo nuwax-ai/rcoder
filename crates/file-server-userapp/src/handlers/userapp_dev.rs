@@ -288,7 +288,7 @@ pub(crate) async fn init_project_template(
                     file_field(
                         field,
                         state.fs.config.upload_max_file_size_bytes,
-                        &state.fs.config.upload_project_dir.join("temp"),
+                        &state.fs.config.upload_temp_dir(),
                     )
                     .await?,
                 )
@@ -358,7 +358,7 @@ pub(crate) async fn push_skills_to_workspace(
                     file_field(
                         field,
                         state.fs.config.upload_max_file_size_bytes,
-                        &state.fs.config.upload_project_dir.join("temp"),
+                        &state.fs.config.upload_temp_dir(),
                     )
                     .await?,
                 )

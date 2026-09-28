@@ -165,6 +165,17 @@ pub(super) struct ViewGuard {
     pub(super) token: String,
 }
 
+/// 读视图锁 token：NotFound（锁已被释放/尚未写入）按空串参与后续校验；
+/// 其他读错误返回 None——IO 抖动不构成接管依据（保守跳过本轮接管，
+/// 与 acquire 内 metadata 读错误不当 stale 的姿态一致）。
+async fn read_lock_token(lock: &Path) -> Option<String> {
+    match fs::read_to_string(lock).await {
+        Ok(content) => Some(content),
+        Err(e) if e.kind() == ErrorKind::NotFound => Some(String::new()),
+        Err(_) => None,
+    }
+}
+
 impl ViewGuard {
     pub(super) async fn acquire(project_store_root: &Path) -> AppResult<Self> {
         let lock = project_store_root.join(VIEW_LOCK_NAME);
@@ -202,26 +213,40 @@ impl ViewGuard {
                         // 接管：读旧 token → 写临时文件（自己的 token）→
                         // 校验旧 token 未变 → rename 原子替换。校验失败说明
                         // 别人刚接管/释放，回锁竞争循环。
-                        let observed = fs::read_to_string(&lock).await.unwrap_or_default();
-                        let candidate = lock.with_extension(format!("takeover-{token}"));
-                        fs::write(&candidate, &token).await?;
-                        let current = fs::read_to_string(&lock).await.unwrap_or_default();
-                        if current == observed {
-                            match fs::rename(&candidate, &lock).await {
-                                Ok(()) => return Ok(ViewGuard { path: lock, token }),
-                                Err(e) if e.kind() == ErrorKind::NotFound => {
-                                    // 锁在接管窗口被持有人正常释放——重试创建
+                        // 锁内容读失败（非 NotFound）不构成接管依据：跳过本轮
+                        // 接管、按仍被持有保守等待（走下方 deadline/sleep 重试）。
+                        match read_lock_token(&lock).await {
+                            Some(observed) => {
+                                let candidate = lock.with_extension(format!("takeover-{token}"));
+                                fs::write(&candidate, &token).await?;
+                                // 二次读失败 → "token 未变"校验依据缺失，放弃本轮接管
+                                let unchanged = read_lock_token(&lock)
+                                    .await
+                                    .is_some_and(|current| current == observed);
+                                if unchanged {
+                                    match fs::rename(&candidate, &lock).await {
+                                        Ok(()) => return Ok(ViewGuard { path: lock, token }),
+                                        Err(e) if e.kind() == ErrorKind::NotFound => {
+                                            // 锁在接管窗口被持有人正常释放——重试创建
+                                            fs::remove_file(&candidate).await.ok();
+                                        }
+                                        Err(e) => {
+                                            fs::remove_file(&candidate).await.ok();
+                                            return Err(e.into());
+                                        }
+                                    }
+                                } else {
                                     fs::remove_file(&candidate).await.ok();
                                 }
-                                Err(e) => {
-                                    fs::remove_file(&candidate).await.ok();
-                                    return Err(e.into());
-                                }
+                                continue;
                             }
-                        } else {
-                            fs::remove_file(&candidate).await.ok();
+                            None => {
+                                tracing::debug!(
+                                    lock = %lock.display(),
+                                    "read view lock for takeover failed; deferring takeover"
+                                );
+                            }
                         }
-                        continue;
                     }
                 }
                 Err(e) => return Err(e.into()),

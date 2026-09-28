@@ -105,7 +105,7 @@ async fn resolve_target(
         workspace_path.as_deref(),
     )
     .await?;
-    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+    if !crate::service::fs_util::path_exists(&path).await? {
         return Err(AppError::resource("Workspace does not exist"));
     }
     // logId 与 TS 会话分支同形态（`computer:{userId}:{cId}`）

@@ -66,7 +66,7 @@ async fn push_skills_to_workspace_impl(
                     file_field(
                         field,
                         state.config.upload_max_file_size_bytes,
-                        &state.config.upload_project_dir.join("temp"),
+                        &state.config.upload_temp_dir(),
                     )
                     .await?,
                 )

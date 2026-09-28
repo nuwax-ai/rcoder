@@ -131,12 +131,12 @@ pub async fn try_start() -> Result<String, String> {
     // N06：跨进程实例锁——同配置空间（listen host:port 语义）单实例；
     // 锁文件随进程退出释放（std 文件锁）。JS 启动器的 PID 文件只是
     // 观察线索，不再是归属权威——锁竞争方在此处决出唯一胜者。
-    let config_for_lock = CONFIG.get().cloned().unwrap_or_default();
-    let lock_file = instance_lock_path(&config_for_lock)?;
+    // 配置只读一次（锁域与后续 bind 共用同一份，避免两次读取间被 init 的窗口）。
     let config = CONFIG.get().cloned().unwrap_or_else(|| {
         warn!("file-server-proxy 配置未 init, 回落默认端口 (60000 → 8086/60001)");
         FileServerProxyConfig::default()
     });
+    let lock_file = instance_lock_path(&config)?;
 
     // N07（修订）：非 loopback + 无令牌 + **显式 public_bind_declared:false**
     // 才拒启——默认受管放行（09-19 实战结论：本服务部署形态以容器/编排为

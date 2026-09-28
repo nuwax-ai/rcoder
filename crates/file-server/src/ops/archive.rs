@@ -13,7 +13,7 @@ use crate::service::zip;
 
 async fn computer_tmp_zip(state: &AppState) -> Result<TemporaryFile, AppError> {
     TemporaryFileWriter::create(
-        &state.config.upload_project_dir.join("temp"),
+        &state.config.upload_temp_dir(),
         "computer-download-",
         u64::MAX,
     )
@@ -68,7 +68,7 @@ pub async fn zip_workspace_impl(
     extra_exclude_dirs: Vec<String>,
     filename: String,
 ) -> Result<Response, AppError> {
-    if !tokio::fs::try_exists(&src).await.unwrap_or(false) {
+    if !crate::service::fs_util::path_exists(&src).await? {
         return Err(AppError::resource("workspace does not exist"));
     }
     let tmp = computer_tmp_zip(state).await?;
@@ -103,8 +103,9 @@ pub async fn download_all_files_impl(
 ) -> Result<Response, AppError> {
     let tmp = computer_tmp_zip(state).await?;
 
-    // 工作区不存在 → 空 zip 兜底 (仅含顶层目录条目, 对齐 nuwax)
-    if !tokio::fs::try_exists(&src).await.unwrap_or(false) {
+    // 工作区不存在 → 空 zip 兜底 (仅含顶层目录条目, 对齐 nuwax)；
+    // 存在性探测的 IO 错误必须传播——否则会把真实错误伪装成"空工作区"。
+    if !crate::service::fs_util::path_exists(&src).await? {
         zip::write_empty_zip(tmp.path().to_path_buf(), prefix.clone()).await?;
         return zip_response(&filename, tmp).await;
     }

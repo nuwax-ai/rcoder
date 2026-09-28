@@ -27,8 +27,10 @@ impl AllocGuard<'_> {
 }
 impl Drop for AllocGuard<'_> {
     fn drop(&mut self) {
-        if self.armed {
-            self.pool.release(&self.project_id);
+        if self.armed
+            && let Err(e) = self.pool.release(&self.project_id)
+        {
+            tracing::warn!(project_id = %self.project_id, "port release failed in Drop: {e}");
         }
     }
 }

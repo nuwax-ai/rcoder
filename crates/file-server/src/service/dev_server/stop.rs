@@ -67,7 +67,7 @@ impl DevServerManager {
             killed.push(KilledPid { pid, killed: k });
         }
         if let Some(p) = proc {
-            self.port_pool.release(project_id);
+            self.port_pool.release(project_id)?;
             log::cleanup_temp_logs(&p.log_dir).await;
         }
         // stdout 管道有界排空（进程组已停；后代持有写端时窗口到期放弃）。
@@ -251,7 +251,7 @@ impl DevServerManager {
                 killed: ok,
             });
         }
-        self.port_pool.release(project_id);
+        self.port_pool.release(project_id)?;
         log::cleanup_temp_logs(&proc.log_dir).await;
         if let Some(supervised) = supervised {
             let drain_timeout = std::time::Duration::from_secs(
@@ -518,7 +518,9 @@ impl Drop for DevServerManager {
             if !process::kill_process_group_force(p.pid) {
                 tracing::warn!(%project_id, pid = p.pid, "SIGKILL failed in Drop");
             }
-            self.port_pool.release(project_id);
+            if let Err(e) = self.port_pool.release(project_id) {
+                tracing::warn!(%project_id, "port release failed in Drop: {e}");
+            }
         }
         procs.clear();
     }
