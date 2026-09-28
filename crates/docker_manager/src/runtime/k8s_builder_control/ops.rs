@@ -1,21 +1,7 @@
-//! UID/version-fenced builder compute controls; PVC is untouched.
-use super::{
-    k8s_pod::K8sPodOps, k8s_service::K8sServiceOps, kubernetes_runtime::KubernetesRuntime,
-};
-use container_runtime_api::{ContainerRuntimeError as Error, ContainerRuntimeResult as Result};
-use k8s_openapi::api::{apps::v1::StatefulSet, core::v1::Pod};
-use kube::{
-    Api,
-    api::{DeleteParams, Patch, PatchParams, Preconditions},
-};
-use shared_types::{
-    AppResourceIdentity, AppResourceKind, BuilderControlTarget, BuilderPodIdentity,
-    ContainerBasicInfo, ServiceType, UserAppExecutionContext,
-};
-use std::time::Duration;
+use super::*;
 
 impl KubernetesRuntime {
-    pub(super) async fn capture_builder_volume_witness(
+    pub(crate) async fn capture_builder_volume_witness(
         &self,
         target: &BuilderControlTarget,
     ) -> Result<Vec<AppResourceIdentity>> {
@@ -84,7 +70,7 @@ impl KubernetesRuntime {
             .await
     }
 
-    pub(super) async fn prepare_builder_conditional_retry(
+    pub(crate) async fn prepare_builder_conditional_retry(
         &self,
         target: &BuilderControlTarget,
     ) -> Result<Option<BuilderControlTarget>> {
@@ -162,7 +148,7 @@ impl KubernetesRuntime {
         Ok(Some(fresh))
     }
 
-    pub(super) async fn fence_builder_conditional_write(
+    pub(crate) async fn fence_builder_conditional_write(
         &self,
         target: &BuilderControlTarget,
     ) -> Result<bool> {
@@ -223,7 +209,7 @@ impl KubernetesRuntime {
             && after.metadata.resource_version != workload.resource_version)
     }
 
-    pub(super) async fn reconcile_builder_start_receipt(
+    pub(crate) async fn reconcile_builder_start_receipt(
         &self,
         target: &BuilderControlTarget,
     ) -> Result<Option<ContainerBasicInfo>> {
@@ -348,7 +334,7 @@ impl KubernetesRuntime {
         Ok(Some(info))
     }
 
-    pub(super) async fn reconcile_builder_stop_receipt(
+    pub(crate) async fn reconcile_builder_stop_receipt(
         &self,
         target: &BuilderControlTarget,
     ) -> Result<bool> {
@@ -408,7 +394,7 @@ impl KubernetesRuntime {
         confirm(&after)
     }
 
-    pub(super) async fn exec_bound_builder(
+    pub(crate) async fn exec_bound_builder(
         &self,
         target: &BuilderControlTarget,
         command: Vec<String>,
@@ -480,7 +466,7 @@ impl KubernetesRuntime {
         .await
     }
 
-    pub(super) async fn resume_bound_builder(
+    pub(crate) async fn resume_bound_builder(
         &self,
         params: &container_runtime_api::ContainerCreateParams,
     ) -> Result<ContainerBasicInfo> {
@@ -553,7 +539,7 @@ impl KubernetesRuntime {
         Ok(info)
     }
 
-    pub(super) async fn capture_builder_compute(
+    pub(crate) async fn capture_builder_compute(
         &self,
         context: &UserAppExecutionContext,
     ) -> Result<BuilderControlTarget> {
@@ -561,7 +547,7 @@ impl KubernetesRuntime {
             .await
     }
 
-    pub(super) async fn capture_builder_compute_with_binding(
+    pub(crate) async fn capture_builder_compute_with_binding(
         &self,
         context: &UserAppExecutionContext,
         binding: Option<&shared_types::UserAppResourceBinding>,
@@ -603,7 +589,7 @@ impl KubernetesRuntime {
         })
     }
 
-    pub(super) async fn capture_orphan_stop(
+    pub(crate) async fn capture_orphan_stop(
         &self,
         context: &UserAppExecutionContext,
         binding: Option<&shared_types::UserAppResourceBinding>,
@@ -681,7 +667,7 @@ impl KubernetesRuntime {
         }
     }
 
-    pub(super) async fn apply_orphan_stop(
+    pub(crate) async fn apply_orphan_stop(
         &self,
         target: &shared_types::BuilderOrphanStopTarget,
     ) -> Result<()> {
@@ -725,7 +711,7 @@ impl KubernetesRuntime {
         .map_err(|_| Error::Timeout("Orphan Pod termination is unconfirmed".into()))?
     }
 
-    pub(super) async fn observe_orphan_stopped(
+    pub(crate) async fn observe_orphan_stopped(
         &self,
         target: &shared_types::BuilderOrphanStopTarget,
     ) -> Result<bool> {
@@ -745,7 +731,7 @@ impl KubernetesRuntime {
 
     /// A missing controller alone does not prove compute has stopped: its Pods
     /// can still be terminating, or have been orphaned by controller deletion.
-    pub(super) async fn confirm_builder_compute_absent(
+    pub(crate) async fn confirm_builder_compute_absent(
         &self,
         context: &UserAppExecutionContext,
     ) -> Result<()> {
@@ -789,14 +775,14 @@ impl KubernetesRuntime {
         }
     }
 
-    pub(super) async fn start_builder_compute(
+    pub(crate) async fn start_builder_compute(
         &self,
         target: &BuilderControlTarget,
     ) -> Result<Option<ContainerBasicInfo>> {
         self.apply_builder_compute_mode(target, true, true).await
     }
 
-    pub(super) async fn apply_builder_compute(
+    pub(crate) async fn apply_builder_compute(
         &self,
         target: &BuilderControlTarget,
         restart: bool,
@@ -809,7 +795,7 @@ impl KubernetesRuntime {
     /// 发布；失败区分明确拒绝（RequestRejected/Conflict）与不可确认
     /// （Timeout/传输错误，对齐 RecoveryRequired 语义）。非阻塞 fire-and-
     /// forget，发布失败绝不改变控制结果。
-    async fn apply_builder_compute_mode(
+    pub(crate) async fn apply_builder_compute_mode(
         &self,
         target: &BuilderControlTarget,
         restart: bool,
@@ -822,7 +808,7 @@ impl KubernetesRuntime {
         outcome
     }
 
-    fn report_control_outcome(
+    pub(crate) fn report_control_outcome(
         &self,
         target: &BuilderControlTarget,
         restart: bool,
@@ -839,19 +825,19 @@ impl KubernetesRuntime {
         };
         let (type_, reason) = match outcome {
             Ok(None) => (
-                super::k8s_event_publisher::DiagnosticEventType::Normal,
+                crate::runtime::k8s_event_publisher::DiagnosticEventType::Normal,
                 "ComputeStopped",
             ),
             Ok(Some(_)) => (
-                super::k8s_event_publisher::DiagnosticEventType::Normal,
+                crate::runtime::k8s_event_publisher::DiagnosticEventType::Normal,
                 "ComputeStarted",
             ),
             Err(Error::RequestRejected(_) | Error::Conflict(_)) => (
-                super::k8s_event_publisher::DiagnosticEventType::Warning,
+                crate::runtime::k8s_event_publisher::DiagnosticEventType::Warning,
                 "ControlRejected",
             ),
             Err(_) => (
-                super::k8s_event_publisher::DiagnosticEventType::Warning,
+                crate::runtime::k8s_event_publisher::DiagnosticEventType::Warning,
                 "ControlUncertain",
             ),
         };
@@ -865,7 +851,7 @@ impl KubernetesRuntime {
             target.context.app_id, target.context.lifecycle_id, target.context.operation_id
         );
         self.event_publisher
-            .publish(super::k8s_event_publisher::DiagnosticEvent::new(
+            .publish(crate::runtime::k8s_event_publisher::DiagnosticEvent::new(
                 type_,
                 reason,
                 action,
@@ -881,7 +867,7 @@ impl KubernetesRuntime {
             ));
     }
 
-    async fn apply_builder_compute_mode_inner(
+    pub(crate) async fn apply_builder_compute_mode_inner(
         &self,
         target: &BuilderControlTarget,
         restart: bool,
@@ -972,7 +958,7 @@ impl KubernetesRuntime {
                         .await
                 }
                 .map_err(|error| {
-                    super::builder_completion::k8s_error(
+                    crate::runtime::builder_completion::k8s_error(
                         format!("Wake captured builder workload: {error}"),
                         error,
                     )
@@ -997,7 +983,7 @@ impl KubernetesRuntime {
             pods.delete(&pod.name, &pod_delete_params(pod))
                 .await
                 .map_err(|error| {
-                    super::builder_completion::k8s_error(
+                    crate::runtime::builder_completion::k8s_error(
                         format!("Restart captured builder pod: {error}"),
                         error,
                     )
@@ -1017,7 +1003,7 @@ impl KubernetesRuntime {
                 )
                 .await
                 .map_err(|error| {
-                    super::builder_completion::k8s_error(
+                    crate::runtime::builder_completion::k8s_error(
                         format!("Stop captured builder workload: {error}"),
                         error,
                     )
@@ -1044,7 +1030,7 @@ impl KubernetesRuntime {
                     let binding = target.resource_binding.clone();
                     let captured_pod = target.pod.clone();
                     let expected_image = target.restart_image.clone();
-                    match super::k8s_observation::await_builder_verdict(
+                    match crate::runtime::k8s_observation::await_builder_verdict(
                         &sts_api,
                         &sts_name,
                         &pods,
@@ -1069,11 +1055,11 @@ impl KubernetesRuntime {
                     )
                     .await
                     {
-                        Ok(super::k8s_observation::Verdict::Complete(outcome)) => outcome,
-                        Ok(super::k8s_observation::Verdict::Rejected(reason)) => {
+                        Ok(crate::runtime::k8s_observation::Verdict::Complete(outcome)) => outcome,
+                        Ok(crate::runtime::k8s_observation::Verdict::Rejected(reason)) => {
                             return Err(Error::Conflict(reason));
                         }
-                        Ok(super::k8s_observation::Verdict::Pending) => {
+                        Ok(crate::runtime::k8s_observation::Verdict::Pending) => {
                             return Err(Error::K8sError(
                                 "Builder observation ended while pending".into(),
                             ));
@@ -1215,1051 +1201,6 @@ impl KubernetesRuntime {
                 }
             } => Err(Error::CreationCancelled),
             result = observation => result,
-        }
-    }
-}
-
-/// 双流观察的业务判定产物（分类闭包的 T）。
-#[derive(Clone)]
-enum BuilderObservation {
-    /// stop 完成：Pod 消失。
-    Stopped,
-    /// Pod 就绪：基本信息 + 观察到它时的物理身份（供最后复核比对）。
-    Ready(Box<(ContainerBasicInfo, BuilderPodIdentity)>),
-}
-
-/// 就绪 Pod → 运行信息（Ready 条件已由调用方核验）。
-fn ready_builder_info(
-    pod: &Pod,
-    workload: &AppResourceIdentity,
-    context: &UserAppExecutionContext,
-    binding: Option<&shared_types::UserAppResourceBinding>,
-    require_ready: bool,
-) -> std::result::Result<BuilderObservation, String> {
-    let endpoint = super::k8s_builder_deletion::workspace_endpoint_from_bound_pod_with_readiness(
-        pod,
-        workload,
-        context,
-        binding,
-        require_ready,
-    )
-    .map_err(|error| error.to_string())?;
-    let identity = pod_identity(pod, workload).map_err(|error| error.to_string())?;
-    let created_at = pod
-        .metadata
-        .creation_timestamp
-        .as_ref()
-        .ok_or_else(|| "Builder pod creation time is missing".to_string())?
-        .0;
-    let created_at = chrono::DateTime::from_timestamp(
-        created_at.as_second(),
-        created_at.subsec_nanosecond() as u32,
-    )
-    .ok_or_else(|| "Builder pod creation time is out of range".to_string())?;
-    Ok(BuilderObservation::Ready(Box::new((
-        ContainerBasicInfo {
-            container_id: endpoint.container_id,
-            // 契约一：container_name ≡ 稳定 workload 名（寻址基名）；物理
-            // Pod 名保留在 BuilderPodIdentity，不再泄漏进注册表名。
-            container_name: workload.name.clone(),
-            container_ip: endpoint.address.to_string(),
-            internal_port: shared_types::GRPC_DEFAULT_PORT,
-            external_port: 0,
-            project_id: context.app_id.clone(),
-            status: "Running".into(),
-            created_at,
-            service_url: format!(
-                "http://{}:{}",
-                endpoint.address,
-                shared_types::GRPC_DEFAULT_PORT
-            ),
-            // §1.1：workload UID（STS metadata.uid）与 Pod UID（container_id）
-            // 一同捕获——契约二代次守卫与契约三对账按此判"同 workload"。
-            workload_uid: Some(workload.uid.clone()),
-        },
-        identity,
-    ))))
-}
-
-/// 双流分类闭包：Err = 身份/配置冲突（Fatal 快速失败）；Ok(Pending) 继续
-/// 观察；Ok(Complete) 给出完成候选（仍需调用方 GET 复核）。
-#[derive(Clone, Copy)]
-struct BuilderVerdictMode {
-    restart: bool,
-    only_start: bool,
-    require_ready: bool,
-}
-
-fn builder_verdict(
-    event: super::k8s_observation::BuilderWatchEvent<'_>,
-    workload: &AppResourceIdentity,
-    context: &UserAppExecutionContext,
-    binding: Option<&shared_types::UserAppResourceBinding>,
-    captured_pod: Option<&BuilderPodIdentity>,
-    expected_image: Option<&str>,
-    mode: BuilderVerdictMode,
-) -> std::result::Result<super::k8s_observation::Verdict<BuilderObservation>, String> {
-    match event {
-        super::k8s_observation::BuilderWatchEvent::Sts(current) => {
-            let identity = workload_identity_with_binding(current, context, binding, false)
-                .map_err(|error| error.to_string())?;
-            if identity.uid != workload.uid {
-                return Err("Builder workload replaced during control".into());
-            }
-            if mode.only_start
-                && current
-                    .spec
-                    .as_ref()
-                    .and_then(|spec| spec.replicas)
-                    .unwrap_or(1)
-                    != 1
-            {
-                return Err("Builder replicas changed while waking".into());
-            }
-            if !mode.restart && current.spec.as_ref().and_then(|spec| spec.replicas) != Some(0) {
-                return Err("Builder replicas changed while stopping".into());
-            }
-            Ok(super::k8s_observation::Verdict::Pending)
-        }
-        super::k8s_observation::BuilderWatchEvent::PodAbsent => {
-            if mode.restart {
-                // 旧 Pod 删除是 restart 的前置，等待新 Pod 就绪。
-                Ok(super::k8s_observation::Verdict::Pending)
-            } else {
-                Ok(super::k8s_observation::Verdict::Complete(
-                    BuilderObservation::Stopped,
-                ))
-            }
-        }
-        super::k8s_observation::BuilderWatchEvent::Pod(pod) => {
-            let observed = pod_identity(pod, workload).map_err(|error| error.to_string())?;
-            if mode.restart {
-                if !mode.only_start && captured_pod.is_some_and(|old| old.uid == observed.uid) {
-                    // 旧 Pod 仍在终止窗口——等新 Pod。
-                    return Ok(super::k8s_observation::Verdict::Pending);
-                }
-                if pod.metadata.deletion_timestamp.is_none()
-                    && pod_agent_image_matches(pod, expected_image)
-                    && (if mode.require_ready {
-                        pod.status
-                            .as_ref()
-                            .and_then(|status| status.conditions.as_ref())
-                            .is_some_and(|conditions| {
-                                conditions.iter().any(|condition| {
-                                    condition.type_ == "Ready" && condition.status == "True"
-                                })
-                            })
-                    } else {
-                        builder_agent_running(pod)
-                    })
-                {
-                    return ready_builder_info(pod, workload, context, binding, mode.require_ready)
-                        .map(super::k8s_observation::Verdict::Complete);
-                }
-                Ok(super::k8s_observation::Verdict::Pending)
-            } else if captured_pod.is_some_and(|old| old.uid != observed.uid) {
-                Err("A replacement builder pod appeared while stopping".into())
-            } else {
-                Ok(super::k8s_observation::Verdict::Pending)
-            }
-        }
-    }
-}
-
-fn builder_agent_running(pod: &Pod) -> bool {
-    pod.status.as_ref().is_some_and(|status| {
-        status.phase.as_deref() == Some("Running")
-            && status
-                .container_statuses
-                .as_ref()
-                .is_some_and(|containers| {
-                    containers.iter().any(|container| {
-                        container.name == "agent"
-                            && container
-                                .state
-                                .as_ref()
-                                .and_then(|state| state.running.as_ref())
-                                .is_some()
-                    })
-                })
-    })
-}
-
-/// 完成候选后的 STS 复核：身份未替换；`require_replicas` 给出动作方向
-/// （stop=0 / wake=1；restart 不约束 replicas）。
-fn verify_workload_stable(
-    current: &StatefulSet,
-    context: &UserAppExecutionContext,
-    binding: Option<&shared_types::UserAppResourceBinding>,
-    workload: &AppResourceIdentity,
-    require_replicas: Option<i32>,
-) -> std::result::Result<(), String> {
-    let identity = workload_identity_with_binding(current, context, binding, false)
-        .map_err(|error| error.to_string())?;
-    if identity.uid != workload.uid {
-        return Err("Builder workload replaced during control".into());
-    }
-    if let Some(required) = require_replicas
-        && current.spec.as_ref().and_then(|spec| spec.replicas) != Some(required)
-    {
-        return Err("Builder replicas changed after control".into());
-    }
-    Ok(())
-}
-
-/// 观察层结构化错误 → 运行时错误（超时不授权租约释放，仅报告不可确认）。
-fn observation_error(error: super::k8s_observation::ObservationError) -> Error {
-    match error {
-        super::k8s_observation::ObservationError::Deadline { .. } => {
-            Error::Timeout("Builder compute confirmation timed out; reconciliation required".into())
-        }
-        super::k8s_observation::ObservationError::Cancelled => {
-            Error::Timeout("Builder compute observation cancelled".into())
-        }
-        super::k8s_observation::ObservationError::Fatal { code, message } => {
-            Error::K8sError(format!("Builder observation failed ({code:?}): {message}"))
-        }
-        super::k8s_observation::ObservationError::StreamEnded { message } => {
-            Error::K8sError(format!("Builder observation stream ended: {message}"))
-        }
-    }
-}
-
-/// Kubernetes may populate omitted defaults, but every explicitly requested
-/// field and ordered list entry must match. Sidecars/config changes are rejected.
-fn configured_fields_match(desired: &serde_json::Value, actual: &serde_json::Value) -> bool {
-    match (desired, actual) {
-        (serde_json::Value::Object(expected), serde_json::Value::Object(observed)) => {
-            expected.iter().all(|(key, value)| {
-                observed
-                    .get(key)
-                    .is_some_and(|actual| configured_fields_match(value, actual))
-            })
-        }
-        (serde_json::Value::Array(expected), serde_json::Value::Array(observed)) => {
-            expected.len() == observed.len()
-                && expected
-                    .iter()
-                    .zip(observed)
-                    .all(|(value, actual)| configured_fields_match(value, actual))
-        }
-        _ => desired == actual,
-    }
-}
-
-fn rejected_before_write(message: String) -> Error {
-    Error::RequestRejected(shared_types::RuntimeRequestRejection {
-        status: 409,
-        message,
-    })
-}
-
-fn stop_patch(workload: &AppResourceIdentity) -> serde_json::Value {
-    serde_json::json!({"metadata":{"uid":workload.uid,"resourceVersion":workload.resource_version},"spec":{"replicas":0}})
-}
-
-/// The old Pod is already gone when this write runs. Updating the template and
-/// scaling from zero in one conditional write avoids an intermediate rollout
-/// and keeps the StatefulSet/PVC identities unchanged.
-fn builder_compute_start_patch(
-    workload: &AppResourceIdentity,
-    receipt: &str,
-    image: Option<&str>,
-) -> serde_json::Value {
-    let mut patch = serde_json::json!({
-        "metadata": {
-            "uid": workload.uid,
-            "resourceVersion": workload.resource_version,
-            "annotations": {"rcoder.io/compute-start-receipt": receipt}
-        },
-        "spec": {"replicas": 1}
-    });
-    if let Some(image) = image {
-        patch["spec"]["template"] = serde_json::json!({
-            "spec": {"containers": [{"name": "agent", "image": image}]}
-        });
-    }
-    patch
-}
-
-fn statefulset_agent_image_matches(sts: &StatefulSet, expected: Option<&str>) -> bool {
-    expected.is_none_or(|image| {
-        sts.spec
-            .as_ref()
-            .and_then(|spec| spec.template.spec.as_ref())
-            .and_then(|spec| {
-                spec.containers
-                    .iter()
-                    .find(|container| container.name == "agent")
-            })
-            .and_then(|container| container.image.as_deref())
-            == Some(image)
-    })
-}
-
-fn pod_agent_image_matches(pod: &Pod, expected: Option<&str>) -> bool {
-    expected.is_none_or(|image| {
-        pod.spec
-            .as_ref()
-            .and_then(|spec| {
-                spec.containers
-                    .iter()
-                    .find(|container| container.name == "agent")
-            })
-            .and_then(|container| container.image.as_deref())
-            == Some(image)
-    })
-}
-fn pod_delete_params(pod: &BuilderPodIdentity) -> DeleteParams {
-    DeleteParams {
-        preconditions: Some(Preconditions {
-            uid: Some(pod.uid.clone()),
-            resource_version: Some(pod.resource_version.clone()),
-        }),
-        ..Default::default()
-    }
-}
-fn required(value: Option<&str>, field: &str) -> Result<String> {
-    value
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| Error::ConfigurationError(format!("Builder {field} is missing")))
-}
-#[cfg(test)]
-fn workload_identity(
-    sts: &StatefulSet,
-    context: &UserAppExecutionContext,
-) -> Result<AppResourceIdentity> {
-    workload_identity_with_binding(sts, context, None, false)
-}
-
-/// 语义契约服务器场景：object/ready_pod 为集群状态模板，标志位决定动作
-/// 分支，`patched` 记录成功的 STS PATCH（此后单对象 GET 反映动作后 replicas）。
-#[cfg(test)]
-#[derive(Clone)]
-struct ContractScenario {
-    object: serde_json::Value,
-    ready_pod: serde_json::Value,
-    reject_patch: bool,
-    restart: bool,
-    wake: bool,
-    image_roll: Option<String>,
-    replaced: bool,
-    patched: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    recorder: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
-}
-
-#[cfg(test)]
-impl ContractScenario {
-    fn post_action_replicas(&self) -> i64 {
-        if self.wake { 1 } else { 0 }
-    }
-
-    fn post_action_sts(&self) -> serde_json::Value {
-        let mut observed = self.object.clone();
-        observed["spec"]["replicas"] = serde_json::json!(self.post_action_replicas());
-        if let Some(image) = &self.image_roll {
-            observed["spec"]["template"]["spec"]["containers"][0]["image"] =
-                serde_json::json!(image);
-        }
-        observed
-    }
-}
-
-#[cfg(test)]
-async fn handle_contract_connection(mut stream: tokio::net::TcpStream, scenario: ContractScenario) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut bytes = Vec::new();
-    let mut buffer = [0u8; 4096];
-    let mut headers = String::new();
-    let mut body = Vec::new();
-    loop {
-        let n = stream.read(&mut buffer).await.expect("read");
-        if n == 0 {
-            // 连接池探测/复用半关闭——无请求，丢弃该连接
-            headers.clear();
-            break;
-        }
-        bytes.extend_from_slice(&buffer[..n]);
-        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
-            let head = String::from_utf8_lossy(&bytes[..end]).to_string();
-            let length = head
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(|value| value.trim().parse::<usize>().expect("length"))
-                })
-                .unwrap_or(0);
-            if bytes.len() >= end + 4 + length {
-                headers = head;
-                body = bytes[end + 4..end + 4 + length].to_vec();
-                break;
-            }
-        }
-    }
-    if headers.is_empty() {
-        return;
-    }
-    let first = headers.lines().next().expect("request line");
-    assert!(
-        !first.contains("persistentvolumeclaims") && !first.contains("/services"),
-        "storage/service mutation is fenced: {first}"
-    );
-    scenario.recorder.lock().expect("recorder").push((
-        first.to_string(),
-        headers.clone(),
-        String::from_utf8_lossy(&body).to_string(),
-    ));
-
-    let is_watch = first.contains("watch=true");
-    let (method, path_query) = {
-        let mut parts = first.split_whitespace();
-        (
-            parts.next().expect("method").to_string(),
-            parts.next().expect("path").to_string(),
-        )
-    };
-    let path = path_query.split('?').next().expect("path").to_string();
-
-    // WATCH 流：chunked 开头 + 按场景投递一个触发事件后保持连接
-    if is_watch {
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
-            )
-            .await
-            .expect("watch header");
-        let event = if path.ends_with("/statefulsets") {
-            // STS 流：投递当前身份（identity 闸门验证；replicas 已按场景推进）
-            let observed = scenario.post_action_sts();
-            Some(serde_json::json!({"type":"MODIFIED","object":observed}))
-        } else if scenario.restart || scenario.wake {
-            // restart/wake：新 ready Pod 上线（name=agent_pod_name 派生名——
-            // watcher 按名单投递；uid ready-pod 与旧 pod-original 区分新旧）
-            let mut fresh = scenario.ready_pod.clone();
-            fresh["metadata"]["name"] = serde_json::json!("rcoder-app-builder-app-0");
-            fresh["metadata"]["uid"] = serde_json::json!("ready-pod");
-            Some(serde_json::json!({"type":"ADDED","object":fresh}))
-        } else {
-            // stop：Pod 消失完成（DELETED——kube-runtime ListWatch 只对
-            // 已入册对象投递 Delete，LIST 必须先含旧 Pod）
-            let mut gone = scenario.ready_pod.clone();
-            gone["metadata"]["name"] = serde_json::json!("rcoder-app-builder-app-0");
-            gone["metadata"]["uid"] = serde_json::json!("pod-original");
-            Some(serde_json::json!({"type":"DELETED","object":gone}))
-        };
-        if let Some(event) = event {
-            let payload = format!("{}\n", event);
-            let chunk = format!("{:x}\r\n{}\r\n", payload.len(), payload);
-            stream
-                .write_all(chunk.as_bytes())
-                .await
-                .expect("watch event");
-        }
-        let mut drain = [0u8; 512];
-        loop {
-            if stream.read(&mut drain).await.unwrap_or(0) == 0 {
-                break;
-            }
-        }
-        return;
-    }
-
-    let single_sts = path.ends_with("/statefulsets/builder");
-    let list_sts = path.ends_with("/statefulsets");
-    let single_pod = {
-        let tail = path.rsplit('/').next().unwrap_or("");
-        path.contains("/pods/") && !tail.is_empty()
-    };
-    let list_pods = path.ends_with("/pods");
-    // 动作后状态：成功的 STS PATCH 之后，单对象 GET 反映推进的 replicas
-    let patched = scenario.patched.load(std::sync::atomic::Ordering::SeqCst) > 0;
-
-    let (code, response): (u16, serde_json::Value) = if method == "DELETE" {
-        if scenario.reject_patch {
-            // 写操作整体被拒（restart 的 DELETE 同 PATCH 一道受拒——
-            // 拒绝必须传播为 RequestRejected，绝不静默成功）
-            (
-                403,
-                serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Forbidden","message":"Delete denied","code":403}),
-            )
-        } else {
-            (
-                200,
-                serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Success"}),
-            )
-        }
-    } else if method == "PATCH" {
-        if scenario.reject_patch {
-            (
-                403,
-                serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Forbidden","message":"Patch denied","code":403}),
-            )
-        } else {
-            scenario
-                .patched
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let observed = scenario.post_action_sts();
-            (200, observed)
-        }
-    } else if scenario.replaced && single_sts && !list_sts {
-        let mut replacement = scenario.object.clone();
-        replacement["metadata"]["uid"] = serde_json::json!("replacement-sts");
-        (200, replacement)
-    } else if single_sts {
-        let mut observed = scenario.object.clone();
-        if patched {
-            observed = scenario.post_action_sts();
-        }
-        (200, observed)
-    } else if list_sts {
-        let observed = scenario.post_action_sts();
-        (
-            200,
-            serde_json::json!({"apiVersion":"v1","kind":"StatefulSetList","metadata":{"resourceVersion":"8"},"items":[observed]}),
-        )
-    } else if single_pod && path.ends_with("/builder-0") {
-        // 旧 Pod（restart 删除前置的身份复核对象：name/uid/rv 必须与捕获一致）
-        let mut old = scenario.ready_pod.clone();
-        old["metadata"]["name"] = serde_json::json!("builder-0");
-        old["metadata"]["uid"] = serde_json::json!("pod-original");
-        old["metadata"]["resourceVersion"] = serde_json::json!("9");
-        (200, old)
-    } else if single_pod {
-        if scenario.restart || scenario.wake {
-            (200, scenario.ready_pod.clone())
-        } else {
-            (
-                404,
-                serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","message":"Pod absent","code":404}),
-            )
-        }
-    } else if list_pods {
-        let items = if scenario.restart || scenario.wake {
-            // restart/wake（apply 侧 restart=true）：旧 Pod 已删——空集，
-            // 新 ready Pod 由 watch ADDED 事件驱动（KR07：旧 Pod Ready 不能
-            // 完成新 restart）
-            serde_json::json!([])
-        } else {
-            // stop：旧 Pod 在册（DELETED 事件才能被 ListWatch 识别）
-            let mut current = scenario.ready_pod.clone();
-            current["metadata"]["name"] = serde_json::json!("rcoder-app-builder-app-0");
-            current["metadata"]["uid"] = serde_json::json!("pod-original");
-            serde_json::json!([current])
-        };
-        (
-            200,
-            serde_json::json!({"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"10"},"items":items}),
-        )
-    } else {
-        (
-            200,
-            serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Success"}),
-        )
-    };
-    let body = response.to_string();
-    stream
-        .write_all(
-            format!(
-                "HTTP/1.1 {code} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .as_bytes(),
-        )
-        .await
-        .expect("respond");
-}
-
-fn workload_identity_with_binding(
-    sts: &StatefulSet,
-    context: &UserAppExecutionContext,
-    binding: Option<&shared_types::UserAppResourceBinding>,
-    adoption: bool,
-) -> Result<AppResourceIdentity> {
-    if sts.metadata.deletion_timestamp.is_some() {
-        return Err(Error::Conflict("Builder workload is deleting".into()));
-    }
-    let labels = sts
-        .metadata
-        .labels
-        .as_ref()
-        .ok_or_else(|| Error::Conflict("Builder workload labels missing".into()))?;
-    if labels.get("rcoder.io/service-type").map(String::as_str)
-        != Some(ServiceType::UserappBuilder.to_string().as_str())
-        || labels.get("rcoder.io/identifier").map(String::as_str) != Some(context.app_id.as_str())
-    {
-        return Err(Error::Conflict(
-            "Builder workload ownership mismatch".into(),
-        ));
-    }
-    let metadata = sts.metadata.annotations.clone().unwrap_or_default();
-    let uid = required(sts.metadata.uid.as_deref(), "workload UID")?;
-    if !shared_types::builder_identity_is_bound(context, &metadata, &uid, binding)
-        .map_err(Error::Conflict)?
-        && !adoption
-    {
-        return Err(Error::Conflict(
-            "Builder requires explicit physical resource adoption".into(),
-        ));
-    }
-    Ok(AppResourceIdentity {
-        kind: AppResourceKind::StatefulSet,
-        name: required(sts.metadata.name.as_deref(), "workload name")?,
-        uid: required(sts.metadata.uid.as_deref(), "workload UID")?,
-        resource_version: Some(required(
-            sts.metadata.resource_version.as_deref(),
-            "workload version",
-        )?),
-    })
-}
-fn pod_identity(pod: &Pod, workload: &AppResourceIdentity) -> Result<BuilderPodIdentity> {
-    if !pod
-        .metadata
-        .owner_references
-        .as_ref()
-        .is_some_and(|owners| {
-            owners.iter().any(|owner| {
-                owner.controller == Some(true)
-                    && owner.api_version == "apps/v1"
-                    && owner.kind == "StatefulSet"
-                    && owner.name == workload.name
-                    && owner.uid == workload.uid
-            })
-        })
-    {
-        return Err(Error::Conflict(
-            "Builder pod belongs to another workload".into(),
-        ));
-    }
-    Ok(BuilderPodIdentity {
-        name: required(pod.metadata.name.as_deref(), "pod name")?,
-        uid: required(pod.metadata.uid.as_deref(), "pod UID")?,
-        resource_version: required(pod.metadata.resource_version.as_deref(), "pod version")?,
-    })
-}
-fn api_error(context: &str, error: kube::Error) -> Error {
-    if matches!(&error, kube::Error::Api(response) if response.code == 409) {
-        Error::Conflict(format!("{context}: {error}"))
-    } else {
-        Error::K8sError(format!("{context}: {error}"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn physical_builder_start_accepts_running_agent_without_business_ready() {
-        let context = UserAppExecutionContext {
-            app_id: "app".into(),
-            lifecycle_id: "life".into(),
-            operation_id: "restart".into(),
-            executor_id: "worker".into(),
-            request_fingerprint: "a".repeat(64),
-        };
-        let workload = AppResourceIdentity {
-            kind: AppResourceKind::StatefulSet,
-            name: "builder".into(),
-            uid: "sts-one".into(),
-            resource_version: Some("1".into()),
-        };
-        let pod: Pod = serde_json::from_value(serde_json::json!({
-            "metadata": {
-                "name": "builder-0", "uid": "pod-two", "resourceVersion": "2",
-                "creationTimestamp": "2026-01-01T00:00:00Z",
-                "labels": {"rcoder.io/service-type": ServiceType::UserappBuilder.to_string(), "rcoder.io/identifier": "app"},
-                "annotations": context.resource_metadata(),
-                "ownerReferences": [{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "builder", "uid": "sts-one", "controller": true}]
-            },
-            "status": {
-                "phase": "Running", "podIP": "10.0.0.9",
-                "conditions": [{"type": "Ready", "status": "False"}],
-                "containerStatuses": [{"name": "agent", "ready": false, "restartCount": 0, "image": "agent:latest", "imageID": "image-id", "containerID": "container-id", "state": {"running": {"startedAt": "2026-01-01T00:00:01Z"}}}]
-            }
-        }))
-        .expect("pod fixture");
-        assert!(builder_agent_running(&pod));
-        assert!(matches!(
-            ready_builder_info(&pod, &workload, &context, None, false),
-            Ok(BuilderObservation::Ready(_))
-        ));
-        assert!(ready_builder_info(&pod, &workload, &context, None, true).is_err());
-    }
-
-    #[test]
-    fn bound_wake_accepts_api_defaults_but_rejects_changed_container_or_storage() {
-        let expected = serde_json::json!({
-            "containers": [{"name":"builder", "image":"builder:verified", "volumeMounts":[{"name":"workspace","mountPath":"/workspace"}]}],
-            "volumes": [{"name":"workspace", "persistentVolumeClaim":{"claimName":"original-pvc"}}]
-        });
-        let mut actual = expected.clone();
-        actual["restartPolicy"] = serde_json::json!("Always");
-        actual["containers"][0]["imagePullPolicy"] = serde_json::json!("IfNotPresent");
-        assert!(configured_fields_match(&expected, &actual));
-        for replacement in [
-            serde_json::json!({"containers": [{"name":"builder", "image":"builder:other"}]}),
-            serde_json::json!({"containers": []}),
-        ] {
-            assert!(!configured_fields_match(&expected, &replacement));
-        }
-        actual["volumes"][0]["persistentVolumeClaim"]["claimName"] =
-            serde_json::json!("replacement-pvc");
-        assert!(!configured_fields_match(&expected, &actual));
-        actual = expected.clone();
-        actual["containers"]
-            .as_array_mut()
-            .expect("containers")
-            .push(serde_json::json!({"name":"injected-sidecar"}));
-        assert!(!configured_fields_match(&expected, &actual));
-    }
-
-    #[tokio::test]
-    async fn actual_stop_patch_is_fenced_and_never_touches_storage() {
-        stop_api_contract(false, false, false, false).await;
-        stop_api_contract(true, false, false, false).await;
-        stop_api_contract(true, true, false, false).await;
-    }
-
-    #[tokio::test]
-    async fn actual_bound_wake_fences_uid_and_version_and_preserves_storage() {
-        stop_api_contract(false, false, true, false).await;
-        stop_api_contract(true, false, true, false).await;
-        stop_api_contract(false, false, true, true).await;
-    }
-
-    #[tokio::test]
-    async fn bound_start_rolls_image_in_the_same_fenced_write() {
-        stop_api_contract_with_image(false, false, true, false, Some("agent:new")).await;
-    }
-
-    async fn stop_api_contract(reject_patch: bool, restart: bool, wake: bool, replaced: bool) {
-        stop_api_contract_with_image(reject_patch, restart, wake, replaced, None).await;
-    }
-
-    async fn stop_api_contract_with_image(
-        reject_patch: bool,
-        restart: bool,
-        wake: bool,
-        replaced: bool,
-        image_roll: Option<&str>,
-    ) {
-        let context = UserAppExecutionContext {
-            app_id: "app".into(),
-            lifecycle_id: "life".into(),
-            operation_id: "stop".into(),
-            executor_id: "worker".into(),
-            request_fingerprint: "a".repeat(64),
-        };
-        let mut object = serde_json::json!({"apiVersion":"apps/v1","kind":"StatefulSet","metadata":{"name":"builder","uid":"sts-original","resourceVersion":"8","labels":{"rcoder.io/service-type":ServiceType::UserappBuilder.to_string(),"rcoder.io/identifier":"app"},"annotations":context.resource_metadata()},"spec":{"replicas":1,"serviceName":"builder","selector":{"matchLabels":{}},"template":{"metadata":{},"spec":{"containers":[]}}}});
-        if wake {
-            object["spec"]["replicas"] = serde_json::json!(0);
-        }
-        let mut ready_pod = serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"rcoder-app-builder-app-0","uid":"ready-pod","resourceVersion":"10","creationTimestamp":"2026-01-01T00:00:00Z","labels":{"rcoder.io/service-type":ServiceType::UserappBuilder.to_string(),"rcoder.io/identifier":"app"},"annotations":context.resource_metadata(),"ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"builder","uid":"sts-original","controller":true}]},"status":{"phase":"Running","podIP":"10.0.0.9","conditions":[{"type":"Ready","status":"True"}],"containerStatuses":[{"name":"agent","ready":true,"restartCount":0,"image":"agent:latest","imageID":"image-id","containerID":"container-id","state":{"running":{"startedAt":"2026-01-01T00:00:01Z"}}}]}});
-        if wake {
-            object["metadata"]["annotations"] = serde_json::json!({});
-            object["spec"]["template"]["spec"]["containers"] =
-                serde_json::json!([{"name":"agent","env":[{"name":"USER_ID","value":"owner"}]}]);
-            ready_pod["metadata"]["annotations"] = serde_json::json!({});
-            ready_pod["spec"] = serde_json::json!({"containers":[{"name":"agent","env":[{"name":"USER_ID","value":"owner"}]}]});
-        }
-        if let Some(image) = image_roll {
-            ready_pod["spec"]["containers"][0]["image"] = serde_json::json!(image);
-        }
-        let workload = workload_identity_with_binding(
-            &serde_json::from_value(object.clone()).expect("workload"),
-            &context,
-            None,
-            wake,
-        )
-        .expect("identity");
-        if replaced {
-            object["metadata"]["uid"] = serde_json::json!("replacement-sts");
-        }
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let address = listener.local_addr().expect("address");
-        let recorded =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String, String)>::new()));
-        let scenario = ContractScenario {
-            object: object.clone(),
-            ready_pod: ready_pod.clone(),
-            reject_patch,
-            restart,
-            wake,
-            image_roll: image_roll.map(str::to_string),
-            replaced,
-            patched: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            recorder: recorded.clone(),
-        };
-        // 批次 B：语义分类服务器——按 method/path/query 分类应答（单对象 GET /
-        // 集合 LIST / watch 流 / PATCH / DELETE），watch 流按场景投递触发事件
-        //（wake/restart=新 ready Pod ADDED、stop=Pod DELETED）。每连接独立
-        // task——watch 长连接不能阻塞 accept；连接 task detach（语义断言在
-        // 主任务对 recorder 的复核里，服务器由 abort 终止）。
-        let server = tokio::spawn(async move {
-            loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(accepted) => accepted,
-                    Err(_) => return,
-                };
-                tokio::spawn(handle_contract_connection(stream, scenario.clone()));
-            }
-        });
-        drop(rustls::crypto::ring::default_provider().install_default());
-        let client = kube::Client::try_from(kube::Config::new(
-            format!("http://{address}").parse().expect("uri"),
-        ))
-        .expect("client");
-        let runtime = KubernetesRuntime {
-            client,
-            namespace: "review-test".into(),
-            config: super::super::kubernetes_runtime::KubernetesRuntimeConfig {
-                namespace: "review-test".into(),
-                cluster_domain: "cluster.local".into(),
-                pod_ttl_seconds: None,
-                image_pull_secret: None,
-                service_account_name: "test".into(),
-                nfs_server: "unused".into(),
-                nfs_path: "/unused".into(),
-                storage_class: "unused".into(),
-                access_mode: "ReadWriteOnce".into(),
-                docker_manager_config: Default::default(),
-                kubernetes_config: Default::default(),
-                execution_authority: "k8s:test".into(),
-            },
-            pod_cache: Default::default(),
-            subvolume_path_cache: Default::default(),
-            event_publisher: Default::default(),
-            event_counters: std::sync::Arc::new(
-                crate::runtime::k8s_event_publisher::PublisherCounters::default(),
-            ),
-        };
-        let target = BuilderControlTarget {
-            resource_binding: wake.then(|| shared_types::UserAppResourceBinding {
-                app_id: "app".into(),
-                lifecycle_id: "life".into(),
-                service_type: ServiceType::UserappBuilder,
-                physical_uid: "sts-original".into(),
-                adopted_by_operation: "adopt".into(),
-            }),
-            context,
-            workload: Some(workload),
-            pod: restart.then(|| BuilderPodIdentity {
-                name: "builder-0".into(),
-                uid: "pod-original".into(),
-                resource_version: "9".into(),
-            }),
-            restart_image: image_roll.map(str::to_string),
-        };
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let outcome = runtime
-                .apply_builder_compute_mode(&target, restart || wake, wake)
-                .await;
-            if reject_patch || replaced {
-                assert!(
-                    matches!(outcome, Err(Error::RequestRejected(_))),
-                    "expected rejection, got: {outcome:?}"
-                );
-            } else if wake {
-                assert_eq!(
-                    outcome.expect("wake").expect("ready").container_id,
-                    "ready-pod"
-                );
-            } else if restart {
-                assert_eq!(
-                    outcome.expect("restart").expect("ready").container_id,
-                    "ready-pod"
-                );
-            } else {
-                assert!(outcome.expect("stop").is_none());
-            }
-            // 语义复核：写操作必须按场景出现且携带物理前置；绝无存储/服务变更
-            let requests = recorded.lock().expect("recorder").clone();
-            assert!(!requests.is_empty(), "no requests were recorded");
-            let mut sts_patch: Option<(String, String, String)> = None;
-            let mut pod_delete: Option<(String, String, String)> = None;
-            for request in &requests {
-                let lower = request.0.to_ascii_lowercase();
-                assert!(
-                    !lower.contains("persistentvolumeclaims") && !lower.contains("/services"),
-                    "storage/service mutation is fenced: {request:?}"
-                );
-                if lower.starts_with("patch ") && lower.contains("/statefulsets/builder") {
-                    assert!(
-                        sts_patch.is_none(),
-                        "workload patched at most once: {requests:?}"
-                    );
-                    sts_patch = Some(request.clone());
-                }
-                if lower.starts_with("delete ") && lower.contains("/pods/") {
-                    assert!(
-                        pod_delete.is_none(),
-                        "pod deleted at most once: {requests:?}"
-                    );
-                    pod_delete = Some(request.clone());
-                }
-            }
-            if replaced {
-                // 替换的 STS 在任何写之前被拒——绝无写操作
-                assert!(
-                    sts_patch.is_none() && pod_delete.is_none(),
-                    "replacement must be fenced before any write: {requests:?}"
-                );
-            } else if wake || !restart {
-                let (first, headers, body) = sts_patch.expect("workload patch required").clone();
-                assert!(first.contains("PATCH"), "recorded: {first}");
-                assert!(
-                    body.contains("\"uid\":\"sts-original\""),
-                    "patch carries UID precondition: {body}"
-                );
-                assert!(
-                    body.contains("\"resourceVersion\":\"8\""),
-                    "patch carries version precondition: {body}"
-                );
-                assert!(
-                    body.contains(&format!("\"replicas\":{}", if wake { 1 } else { 0 })),
-                    "patch scales in the action direction: {body}"
-                );
-                assert!(
-                    !body.contains("volumes") && !body.contains("persistentVolumeClaim"),
-                    "patch must not touch storage: {body}"
-                );
-                if let Some(image) = image_roll {
-                    assert!(
-                        headers
-                            .to_ascii_lowercase()
-                            .contains("application/strategic-merge-patch+json"),
-                        "image update must merge the named container: {headers}"
-                    );
-                    let patch: serde_json::Value = serde_json::from_str(&body).expect("patch json");
-                    assert_eq!(
-                        patch["spec"]["template"]["spec"]["containers"][0]["image"],
-                        image
-                    );
-                }
-                assert!(
-                    pod_delete.is_none(),
-                    "stop/wake never deletes the pod: {requests:?}"
-                );
-            } else {
-                let (first, _, body) = pod_delete.expect("pod delete required").clone();
-                assert!(first.contains("DELETE"), "recorded: {first}");
-                assert!(
-                    first.contains("/pods/builder-0"),
-                    "delete targets the captured pod: {first}"
-                );
-                let params: serde_json::Value =
-                    serde_json::from_str(&body).expect("delete body json");
-                assert_eq!(
-                    params["preconditions"]["uid"], "pod-original",
-                    "delete carries UID precondition: {body}"
-                );
-                assert_eq!(
-                    params["preconditions"]["resourceVersion"], "9",
-                    "delete carries version precondition: {body}"
-                );
-                assert!(
-                    sts_patch.is_none(),
-                    "restart never patches the workload: {requests:?}"
-                );
-            }
-            // 服务器是常驻 accept 循环——显式中止并确认未 panic
-            server.abort();
-            match server.await {
-                Err(join) if join.is_cancelled() => {}
-                other => panic!("contract server task must end aborted: {other:?}"),
-            }
-        })
-        .await
-        .expect("total contract deadline");
-    }
-
-    #[test]
-    fn workload_and_pod_identity_reject_replacement_ownership() {
-        let context = UserAppExecutionContext {
-            app_id: "app".into(),
-            lifecycle_id: "life".into(),
-            operation_id: "stop".into(),
-            executor_id: "worker".into(),
-            request_fingerprint: "a".repeat(64),
-        };
-        let sts: StatefulSet = serde_json::from_value(serde_json::json!({"metadata":{"name":"builder", "uid":"sts-original", "resourceVersion":"8", "labels":{"rcoder.io/service-type":ServiceType::UserappBuilder.to_string(),"rcoder.io/identifier":"app"}, "annotations":context.resource_metadata()}})).expect("workload");
-        let identity = workload_identity(&sts, &context).expect("identity");
-        let mut replacement = context.clone();
-        replacement.lifecycle_id = "replacement".into();
-        assert!(workload_identity(&sts, &replacement).is_err());
-        let mut pod: Pod = serde_json::from_value(serde_json::json!({"metadata":{"name":"builder-0","uid":"pod-original","resourceVersion":"9","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"builder","uid":"sts-original","controller":true}]}})).expect("pod");
-        assert!(pod_identity(&pod, &identity).is_ok());
-        pod.metadata.owner_references.as_mut().expect("owners")[0].uid = "replacement-sts".into();
-        assert!(pod_identity(&pod, &identity).is_err());
-    }
-
-    #[test]
-    fn stop_and_restart_requests_carry_physical_preconditions() {
-        let workload = AppResourceIdentity {
-            kind: AppResourceKind::StatefulSet,
-            name: "builder".into(),
-            uid: "original-sts".into(),
-            resource_version: Some("17".into()),
-        };
-        let patch = stop_patch(&workload);
-        assert_eq!(patch["metadata"]["uid"], "original-sts");
-        assert_eq!(patch["metadata"]["resourceVersion"], "17");
-        assert_eq!(patch["spec"]["replicas"], 0);
-        let params = pod_delete_params(&BuilderPodIdentity {
-            name: "builder-0".into(),
-            uid: "original-pod".into(),
-            resource_version: "24".into(),
-        });
-        let preconditions = params.preconditions.expect("preconditions");
-        assert_eq!(preconditions.uid.as_deref(), Some("original-pod"));
-        assert_eq!(preconditions.resource_version.as_deref(), Some("24"));
-    }
-}
-
-fn builder_exec_guard(uid: &str, command: Vec<String>) -> Vec<String> {
-    let mut guarded = vec!["sh".into(), "-c".into(),
-        "if [ \"${RCODER_PHYSICAL_POD_UID:-}\" != \"$1\" ]; then printf '%s\\n' 'Builder physical identity changed' >&2; exit 125; fi; shift; exec \"$@\"".into(),
-        "rcoder-builder-exec".into(), uid.into()];
-    guarded.extend(command);
-    guarded
-}
-
-#[cfg(all(test, unix))]
-mod database_exec_tests {
-    use super::builder_exec_guard;
-    use std::process::Command;
-
-    #[test]
-    fn builder_exec_guard_fences_replacement_and_preserves_arguments() {
-        let literal = "spaces ' quote $HOME $(touch must_not_execute)";
-        let args = builder_exec_guard(
-            "original",
-            vec!["printf".into(), "%s".into(), literal.into()],
-        );
-        for (uid, success) in [
-            (Some("original"), true),
-            (Some("replacement"), false),
-            (None, false),
-        ] {
-            let mut command = Command::new(&args[0]);
-            command
-                .args(&args[1..])
-                .env_remove("RCODER_PHYSICAL_POD_UID");
-            if let Some(uid) = uid {
-                command.env("RCODER_PHYSICAL_POD_UID", uid);
-            }
-            let result = command.output().unwrap();
-            assert_eq!(result.status.success(), success);
-            if success {
-                assert_eq!(result.stdout, literal.as_bytes());
-            } else {
-                assert_eq!(result.status.code(), Some(125));
-                assert!(result.stdout.is_empty());
-            }
         }
     }
 }
