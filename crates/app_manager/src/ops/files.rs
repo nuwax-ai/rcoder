@@ -8,6 +8,9 @@
 //! - `app_stage=prod`：唤醒（闲置回收的 app 自动拉起）→ 运行容器；target 相对 /app 根
 //! - `app_stage=dev`：幂等 ensure 开发容器（UserappBuilder）；target 相对 workspace 根
 
+use std::sync::LazyLock;
+use std::time::Duration;
+
 use tracing::{info, instrument, warn};
 
 use serde::Deserialize;
@@ -19,6 +22,30 @@ use crate::utils::*;
 
 /// 运行容器 file-server-proxy 端口（与 ttyd 7681 / dbx 4224 同为固定端口）。
 const APP_FILE_SERVER_PORT: u16 = shared_types::AGENT_FILE_SERVER_PORT;
+
+/// 共享客户端连接建立超时（秒）——目标为集群内/本机容器，短连接超时足够。
+const FILE_FORWARD_CONNECT_TIMEOUT_SECS: u64 = 5;
+
+/// upload / upload-from-url 总超时（秒）。
+/// upload：路由层放行至 1GiB 压缩包，含传输 + 容器侧解压/flatten；
+/// upload-from-url：容器内流式下载外部 URL 再走上传核心，大制品耗时由下载侧
+/// 决定，600s（≥300s 下限）覆盖两者。
+const FILE_TRANSFER_TIMEOUT_SECS: u64 = 600;
+
+/// list / delete 总超时（秒）——轻量元数据操作，短超时快速暴露失联容器。
+const FILE_OPS_TIMEOUT_SECS: u64 = 30;
+
+/// 文件转发共享客户端（对齐 rcoder-engine `http_client::shared_client` 风格：
+/// 仅设连接超时 + 连接池复用，**不设全局总超时**——upload 是大文件长传，总超时
+/// 会误杀；一次性请求按操作分级在 `RequestBuilder` 上单独 `.timeout(...)`）。
+/// `reqwest::Client` 内部持有连接池且 Clone 廉价（Arc），全模块复用同一实例。
+static FILE_FORWARD_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(FILE_FORWARD_CONNECT_TIMEOUT_SECS))
+        .build()
+        // builder 失败仅可能在 TLS 后端初始化异常时发生；退化为无超时 client 保持可用
+        .unwrap_or_else(|_| reqwest::Client::new())
+});
 
 /// file-server app-files 族响应 DTO（形状对齐 app_manager DTO，snake 键；
 /// 请求侧同为 snake——本族为 userApp 专属新契约，未上线不做旧键兼容）。
@@ -139,8 +166,9 @@ impl AppService {
             .text("target", target.to_string())
             .text("flatten", flatten.to_string())
             .part("file", part);
-        let resp = reqwest::Client::new()
+        let resp = FILE_FORWARD_CLIENT
             .post(format!("{base}/api/v1/userapp/app-files/upload"))
+            .timeout(Duration::from_secs(FILE_TRANSFER_TIMEOUT_SECS))
             .multipart(form)
             .send()
             .await
@@ -180,8 +208,9 @@ impl AppService {
             "target": target,
             "flatten": flatten,
         });
-        let resp = reqwest::Client::new()
+        let resp = FILE_FORWARD_CLIENT
             .post(format!("{base}/api/v1/userapp/app-files/upload-from-url"))
+            .timeout(Duration::from_secs(FILE_TRANSFER_TIMEOUT_SECS))
             .json(&body)
             .send()
             .await
@@ -226,8 +255,9 @@ impl AppService {
             url.push_str("&path=");
             url.push_str(&urlencode(p));
         }
-        let resp = reqwest::Client::new()
+        let resp = FILE_FORWARD_CLIENT
             .get(url)
+            .timeout(Duration::from_secs(FILE_OPS_TIMEOUT_SECS))
             .send()
             .await
             .map_err(|e| forward_error("list-files", app_id, e))?;
@@ -263,8 +293,9 @@ impl AppService {
         }
         let base = self.app_files_base(app_stage, app_id).await?;
         let body = serde_json::json!({"app_id": app_id, "path": file_path});
-        let resp = reqwest::Client::new()
+        let resp = FILE_FORWARD_CLIENT
             .post(format!("{base}/api/v1/userapp/app-files/delete"))
+            .timeout(Duration::from_secs(FILE_OPS_TIMEOUT_SECS))
             .json(&body)
             .send()
             .await

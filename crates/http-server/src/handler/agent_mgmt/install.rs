@@ -342,7 +342,7 @@ pub async fn install_from_url(
     validate_routing_params(&body.routing)?;
     require_field(Some(&body.agent.agent_id), "agent_id")?;
     require_field(Some(&body.agent.command), "command")?;
-    require_field(body.agent.version.as_deref(), "version")?;
+    let version = require_field(body.agent.version.as_deref(), "version")?;
     if body.platforms.is_empty() {
         return Err(AppError::with_message(
             ec::ERR_VALIDATION,
@@ -372,13 +372,6 @@ pub async fn install_from_url(
     );
 
     // 调用核心安装函数（复用 ensure_agent_installed 的逻辑）
-    // 上方 require_field 已校验 version 非空——此处 unwrap 不可达（防御性 expect 便于溯源）
-    let version = body
-        .agent
-        .version
-        .as_deref()
-        .expect("version checked non-empty by require_field above");
-
     let (download_result, platform_key) = agent_provisioning::install_agent(
         &state.agent_download_manager,
         &body.agent.agent_id,
@@ -544,14 +537,11 @@ pub async fn uninstall_agent(
 
 // === 工具函数 ===
 
-fn require_field(value: Option<&str>, name: &str) -> Result<(), AppError> {
-    if value.filter(|s| !s.is_empty()).is_none() {
-        return Err(AppError::with_message(
-            ec::ERR_VALIDATION,
-            format!("{name} is required"),
-        ));
-    }
-    Ok(())
+fn require_field<'a>(value: Option<&'a str>, name: &str) -> Result<&'a str, AppError> {
+    // 返回校验后的非空值，调用方直接绑定使用（避免"先校验后 expect"的模式）
+    value
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::with_message(ec::ERR_VALIDATION, format!("{name} is required")))
 }
 
 fn parse_install_type(

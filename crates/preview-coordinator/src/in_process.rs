@@ -195,7 +195,7 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
         base_path: Option<&str>,
     ) -> Result<PreviewInstanceRecord, Error> {
         let mut state = self.state.lock().await;
-        {
+        let updated = {
             let Some(record) = state.instances.get_mut(preview_key) else {
                 return Err(Error::Invalid(format!("preview {preview_key} not found")));
             };
@@ -214,17 +214,14 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
             record.last_heartbeat_at = Some(now());
             record.last_activity_at = now();
             record.updated_at = now();
-        }
+            record.clone()
+        };
         if let Some(op) = state.operations.get_mut(operation_id) {
             op.state = PreviewOperationState::Succeeded;
             op.result = Some(format!("pid={pid} port={port}"));
             op.updated_at = now();
         }
-        Ok(state
-            .instances
-            .get(preview_key)
-            .cloned()
-            .expect("record was just updated"))
+        Ok(updated)
     }
 
     async fn accept_stop(
@@ -233,12 +230,19 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
         operation_id: &str,
     ) -> Result<PreviewInstanceRecord, Error> {
         let mut state = self.state.lock().await;
-        let Some(record) = state.instances.get(preview_key) else {
+        // 单次 get_mut 完成观察与变更。guard 经 Deref 不再做字段级借用拆分，
+        // 先解构出 instances/operations 两个不相交借用（消除原 get→get_mut+expect
+        // 的二次查找，同一锁内无观测窗口）。
+        let State {
+            instances,
+            operations,
+        } = &mut *state;
+        let Some(record) = instances.get_mut(preview_key) else {
             return Err(Error::Invalid(format!(
                 "preview {preview_key} has no instance to stop"
             )));
         };
-        if let Some(operation) = state.operations.get(operation_id) {
+        if let Some(operation) = operations.get(operation_id) {
             if operation.kind != PreviewOperationKind::Stop
                 || operation.preview_key != preview_key
                 || record.operation_id != operation_id
@@ -257,10 +261,6 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
             return Err(conflict("Another stop operation is in progress", record));
         }
         let (host_id, port) = (record.host_id.clone(), record.port);
-        let record = state
-            .instances
-            .get_mut(preview_key)
-            .expect("row observed under lock");
         record.state = PreviewInstanceState::Stopping;
         record.operation_id = operation_id.to_string();
         record.revision = record
@@ -268,8 +268,9 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
             .checked_add(1)
             .ok_or_else(|| Error::Unavailable("Preview revision exhausted".into()))?;
         record.updated_at = now();
+        let updated = record.clone();
         let timestamp = now();
-        state.operations.insert(
+        operations.insert(
             operation_id.to_string(),
             PreviewOperationRecord {
                 operation_id: operation_id.to_string(),
@@ -284,11 +285,7 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
                 updated_at: timestamp,
             },
         );
-        Ok(state
-            .instances
-            .get(preview_key)
-            .cloned()
-            .expect("record was just updated"))
+        Ok(updated)
     }
 
     async fn mark_stopped(
@@ -298,7 +295,7 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
         revision: i64,
     ) -> Result<PreviewInstanceRecord, Error> {
         let mut state = self.state.lock().await;
-        {
+        let updated = {
             let Some(record) = state.instances.get_mut(preview_key) else {
                 return Err(Error::Invalid(format!("preview {preview_key} not found")));
             };
@@ -317,17 +314,14 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
             } else {
                 return Err(conflict("mark_stopped lost the race", record));
             }
-        }
+            record.clone()
+        };
         if let Some(op) = state.operations.get_mut(operation_id) {
             op.state = PreviewOperationState::Succeeded;
             op.result = Some("stopped".into());
             op.updated_at = now();
         }
-        Ok(state
-            .instances
-            .get(preview_key)
-            .cloned()
-            .expect("record was just updated"))
+        Ok(updated)
     }
 
     async fn mark_failed(
@@ -338,7 +332,7 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
         detail: &str,
     ) -> Result<PreviewInstanceRecord, Error> {
         let mut state = self.state.lock().await;
-        {
+        let updated = {
             let Some(record) = state.instances.get_mut(preview_key) else {
                 return Err(Error::Invalid(format!("preview {preview_key} not found")));
             };
@@ -355,7 +349,8 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
             record.pid = None;
             record.detail = Some(detail.to_string());
             record.updated_at = now();
-        }
+            record.clone()
+        };
         for op in state.operations.values_mut() {
             if op.preview_key == preview_key
                 && matches!(
@@ -368,11 +363,7 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
                 op.updated_at = now();
             }
         }
-        Ok(state
-            .instances
-            .get(preview_key)
-            .cloned()
-            .expect("record was just updated"))
+        Ok(updated)
     }
 
     async fn mark_unknown(

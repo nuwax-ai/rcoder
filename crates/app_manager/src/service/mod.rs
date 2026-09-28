@@ -260,12 +260,12 @@ impl AppService {
     /// 清理该 app 全部 scope 的条目。
     pub(crate) fn remove_unused_process_release_lock(&self, app_id: &str) {
         for scope in shared_types::UserAppOperationScope::ALL {
-            if let Some(entry) = self.release_locks.get(&(app_id.to_owned(), scope))
-                && Arc::strong_count(entry.value()) == 1
-            {
-                drop(entry);
-                self.release_locks.remove(&(app_id.to_owned(), scope));
-            }
+            // remove_if 在同一分片锁内完成判定与移除：原 get→count→drop→remove
+            // 的窗口里并发 acquire 可 clone 出 Arc 随后被 remove 孤立，破坏互斥。
+            self.release_locks
+                .remove_if(&(app_id.to_owned(), scope), |_, lock| {
+                    Arc::strong_count(lock) == 1
+                });
         }
     }
 }

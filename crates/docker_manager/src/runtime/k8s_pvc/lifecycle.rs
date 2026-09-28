@@ -92,7 +92,7 @@ impl KubernetesRuntime {
                     && existing != expected
                 {
                     warn!(
-                        "[K8S] PVC {} storageClassName={existing:?} differs from expected {expected:?} (service_type={service_type_label}):                          reusing existing, storage semantics may drift",
+                        "[K8S] PVC {} storageClassName={existing:?} differs from expected {expected:?} (service_type={service_type_label}): reusing existing, storage semantics may drift",
                         pvc_name
                     );
                 }

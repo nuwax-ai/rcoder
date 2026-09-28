@@ -15,6 +15,11 @@ pub struct CleanupResult {
     pub failed_removals: usize,
     /// 跳过的运行中容器数量（仅在非强制删除时）
     pub skipped_running: usize,
+    /// 命中 409 冲突（容器已在删除中）的容器数量——既非本次成功删除也非失败，
+    /// 与 `successfully_removed` 分开统计；对应 ID 不进入 `removed_container_ids`
+    /// （serde default 兼容旧序列化数据）
+    #[serde(default)]
+    pub already_removing: usize,
     /// 被删除的容器ID列表
     pub removed_container_ids: Vec<String>,
     /// 失败的容器及错误信息

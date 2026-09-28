@@ -174,7 +174,7 @@ impl AppService {
         let mut has_progress_v1 = false; // 能力固定后的值
         let mut last_progress_at = now; // 最后有效进展时刻
         let mut in_sql_stage = false; // 当前是否在 SQL 阶段
-        let mut _sql_stage_start: Option<tokio::time::Instant> = None; // SQL 阶段起点
+        let mut sql_stage_start: Option<tokio::time::Instant> = None; // SQL 阶段起点
         let mut last_activity: u64 = 0; // 高水位 activity
         let mut last_step = String::new(); // 高水位 step
 
@@ -302,10 +302,35 @@ impl AppService {
                 if let Some(token) = token {
                     req = req.header("X-Deploy-Token", token);
                 }
-                if let Ok(resp) = req.send().await
-                    && resp.status().is_success()
-                    && let Ok(body) = resp.json::<serde_json::Value>().await
-                {
+                // 非 2xx / 解码失败不再静默 continue：预算耗尽前的最后线索往往
+                // 只有这批 warn（连接类失败仍是冷启动窗口的常态，维持静默）。
+                let body = match req.send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        match resp.json::<serde_json::Value>().await {
+                            Ok(body) => Some(body),
+                            Err(error) => {
+                                warn!(
+                                    app_id,
+                                    operation_id,
+                                    %error,
+                                    "deploy status response decode failed; continuing within budget"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Ok(resp) => {
+                        warn!(
+                            app_id,
+                            operation_id,
+                            status = %resp.status(),
+                            "deploy status endpoint returned non-success; continuing within budget"
+                        );
+                        None
+                    }
+                    Err(_) => None,
+                };
+                if let Some(body) = body {
                     let probe = parse_deploy_status(&body);
                     // 部署声明未消费看门狗：端点成功应答但持续不出现本次操作。
                     // 与 judge_stage 的 Pending 不同，这是"声明根本没被接受"的
@@ -367,7 +392,7 @@ impl AppService {
                         // SQL 阶段切换：经身份校验进入 running_sql → SQL 预算
                         if has_progress_v1 && progress.step == "running_sql" && !in_sql_stage {
                             in_sql_stage = true;
-                            _sql_stage_start = Some(tokio::time::Instant::now());
+                            sql_stage_start = Some(tokio::time::Instant::now());
                             effective_budget = sql_stage_budget;
                             info!(
                                 app_id,
@@ -379,13 +404,22 @@ impl AppService {
                         // 经身份校验明确离开 running_sql → 恢复普通看门狗
                         if has_progress_v1 && progress.step != "running_sql" && in_sql_stage {
                             in_sql_stage = false;
-                            _sql_stage_start = None;
+                            let sql_stage_elapsed =
+                                sql_stage_start.take().map(|start| start.elapsed());
                             effective_budget = no_progress_budget;
                             last_progress_at = tokio::time::Instant::now();
-                            info!(
-                                app_id,
-                                operation_id, "leaving SQL stage; restoring no-progress budget"
-                            );
+                            match sql_stage_elapsed {
+                                Some(elapsed) => info!(
+                                    app_id,
+                                    operation_id,
+                                    sql_stage_secs = elapsed.as_secs_f64(),
+                                    "leaving SQL stage; restoring no-progress budget"
+                                ),
+                                None => info!(
+                                    app_id,
+                                    operation_id, "leaving SQL stage; restoring no-progress budget"
+                                ),
+                            }
                         }
                     }
                     match judge_stage(&probe, operation_id) {

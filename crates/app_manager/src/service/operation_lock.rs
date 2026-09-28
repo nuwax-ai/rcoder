@@ -22,6 +22,16 @@ pub(crate) struct AppOperationGuard {
 struct SharedBuilderLease {
     lease: std::sync::Mutex<Option<Box<dyn shared_types::AppOperationLease>>>,
 }
+impl SharedBuilderLease {
+    /// 读取内部租约回执；锁中毒显式返回 Err（与 `release` 的中毒语义一致），
+    /// 不把毒化静默降级成"租约无持久身份"。
+    fn receipt_result(&self) -> Result<Option<shared_types::UserAppOperationLeaseReceipt>, String> {
+        self.lease
+            .lock()
+            .map_err(|_| "builder lease lock poisoned".to_owned())
+            .map(|lease| lease.as_ref().and_then(|lease| lease.receipt()))
+    }
+}
 struct SharedBuilderLeaseHandle {
     shared: std::sync::Arc<SharedBuilderLease>,
     owner: bool,
@@ -29,11 +39,10 @@ struct SharedBuilderLeaseHandle {
 #[async_trait::async_trait]
 impl shared_types::AppOperationLease for SharedBuilderLeaseHandle {
     fn receipt(&self) -> Option<shared_types::UserAppOperationLeaseReceipt> {
-        self.shared
-            .lease
-            .lock()
-            .ok()
-            .and_then(|lease| lease.as_ref().and_then(|lease| lease.receipt()))
+        // trait 契约为 Option（无法携带错误）：毒化在此路径仍退化为 None；
+        // 持久身份绑定消费方（`AppOperationGuard::lease_receipt`）走
+        // `receipt_result` 的 Err 语义，不经过此处。
+        self.shared.receipt_result().ok().flatten()
     }
     async fn release(self: Box<Self>) -> Result<(), String> {
         // Borrow completion drops only its reference. The owning guard releases
@@ -56,6 +65,17 @@ impl shared_types::AppOperationLease for SharedBuilderLeaseHandle {
 
 impl AppOperationGuard {
     pub(crate) fn lease_receipt(&self) -> AppResult<shared_types::UserAppOperationLeaseReceipt> {
+        // builder 家族：runtime 句柄是 SharedBuilderLeaseHandle，trait 的 Option
+        // 契约会把锁中毒误报成"租约无持久身份"；改走 receipt_result 的 Err
+        // 语义（与同 struct release 的中毒报错一致）。
+        if let Some(builder) = &self.builder_lease {
+            let receipt = builder.receipt_result().map_err(|error| {
+                AppOperationError::Backend(format!("read builder lease receipt: {error}"))
+            })?;
+            return receipt.ok_or_else(|| {
+                AppOperationError::Backend("Builder lease has no durable identity".into())
+            });
+        }
         if let Some(runtime) = &self.runtime {
             return runtime.receipt().ok_or_else(|| {
                 AppOperationError::Backend("Runtime lease has no durable identity".into())

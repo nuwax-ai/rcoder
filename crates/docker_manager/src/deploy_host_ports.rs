@@ -189,25 +189,28 @@ pub fn register_reach_from_inspect(
             value.as_str() != container_name && docker_name.as_deref() != Some(value.as_str())
         })
         .cloned();
+    // 以下均为 inspect 数据形状问题（字段缺失/解析失败/身份不符），不是
+    // Docker 连接故障——误用 ConnectionError 会与真正的连接失败混淆，
+    // 统一归类 ConfigurationError。
     let physical_uid = inspect.id.as_deref().ok_or_else(|| {
-        crate::DockerError::ConnectionError("Container inspect has no physical ID".into())
+        crate::DockerError::ConfigurationError("Container inspect has no physical ID".into())
     })?;
     let created_at = inspect
         .created
         .as_deref()
         .ok_or_else(|| {
-            crate::DockerError::ConnectionError("Container inspect has no creation time".into())
+            crate::DockerError::ConfigurationError("Container inspect has no creation time".into())
         })?
         .parse::<chrono::DateTime<chrono::Utc>>()
         .map_err(|error| {
-            crate::DockerError::ConnectionError(format!(
+            crate::DockerError::ConfigurationError(format!(
                 "Invalid Docker container creation time: {error}"
             ))
         })?;
     if observation.physical_uid() != physical_uid
         || inspect.state.as_ref().and_then(|state| state.running) != Some(true)
     {
-        return Err(crate::DockerError::ConnectionError(
+        return Err(crate::DockerError::ConfigurationError(
             "Container address observation is not for the running physical instance".into(),
         ));
     }
