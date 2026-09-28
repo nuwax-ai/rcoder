@@ -21,13 +21,25 @@ pub(super) fn render_changes(
     for ch in changes {
         let old_bytes = ch.old.bytes.as_deref();
         let new_bytes = ch.new.bytes.as_deref();
-        let content_changed = old_bytes != new_bytes;
+        // 任一侧超限降级（内容未加载）→ 无法比较内容，视为已变更并按 binary 渲染。
+        let oversized = ch.old.oversized || ch.new.oversized;
+        let content_changed = oversized || old_bytes != new_bytes;
         let mode_changed = ch.old.mode != ch.new.mode;
         if !content_changed && !mode_changed {
             continue;
         }
 
-        let rendered = render_blob_diff(old_bytes, new_bytes)?;
+        let rendered = if oversized {
+            // 超限侧已在 content 层 warn；此处与真二进制同一语义（对齐 TS）。
+            Rendered {
+                hunks: String::new(),
+                insertions: 0,
+                deletions: 0,
+                binary: true,
+            }
+        } else {
+            render_blob_diff(old_bytes, new_bytes)?
+        };
         let old_hash = match old_bytes {
             Some(bytes) => short_hash(repo, bytes)?,
             None => "0000000".to_string(),

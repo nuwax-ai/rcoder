@@ -11,6 +11,10 @@
 //!
 //! gix `UnifiedDiff` 负责 hunk 边界，定制 `ConsumeHunk` delegate 负责 Git 无尾换行标记与统计；
 //! 文件级头和 JSON summary 由本模块按 API 契约组织。
+//!
+//! 单文件超限（`GIT_DIFF_MAX_FILE_SIZE_BYTES`）不报错：超限侧 warn 后按
+//! binary 标记渲染（对齐 TS git CLI 的 Binary files differ 语义，生产反例：
+//! 会话提交了 >16MiB PDF 后 commit diff 整体 500）；总量与输出上限仍 fail-fast。
 
 use std::collections::BTreeSet;
 
@@ -176,8 +180,8 @@ fn collect_commit_changes(repo: &Repository, params: &DiffParams) -> AppResult<V
         if !includes_path(&params.paths, &path) {
             continue;
         }
-        let old = read_blob(repo, old_id, old_mode, params.max_file_size_bytes)?;
-        let new = read_blob(repo, new_id, new_mode, params.max_file_size_bytes)?;
+        let old = read_blob(repo, &path, old_id, old_mode, params.max_file_size_bytes)?;
+        let new = read_blob(repo, &path, new_id, new_mode, params.max_file_size_bytes)?;
         let change = FileChange { path, old, new };
         account_change(&change, &mut total_bytes, params.max_total_bytes)?;
         out.push(change);

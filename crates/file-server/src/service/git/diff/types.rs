@@ -78,6 +78,10 @@ pub struct DiffResult {
 pub(super) struct Side {
     pub(super) bytes: Option<Vec<u8>>,
     pub(super) mode: Option<EntryMode>,
+    /// 超出单文件上限被降级的一侧（内容未加载，按 binary 标记渲染）。
+    /// 语义对齐 TS git CLI：超限/二进制文件不报错、不出内容，仅出
+    /// "Binary files ... differ" 标记（降级时在 content 层打 warn 日志）。
+    pub(super) oversized: bool,
 }
 
 impl Side {
@@ -85,6 +89,7 @@ impl Side {
         Self {
             bytes: None,
             mode: None,
+            oversized: false,
         }
     }
 
@@ -92,6 +97,16 @@ impl Side {
         Self {
             bytes: Some(bytes),
             mode: Some(mode),
+            oversized: false,
+        }
+    }
+
+    /// 超限降级侧：mode 在场（参与文件头/路径判定），内容缺席。
+    pub(super) fn present_oversized(mode: EntryMode) -> Self {
+        Self {
+            bytes: None,
+            mode: Some(mode),
+            oversized: true,
         }
     }
 

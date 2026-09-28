@@ -266,7 +266,7 @@ impl Default for Config {
             git_enabled: false,
             git_default_author_name: "Nuwax File Server".to_string(),
             git_default_author_email: "git@nuwax.com".to_string(),
-            git_diff_max_file_size_bytes: 16 * 1024 * 1024,
+            git_diff_max_file_size_bytes: 1024 * 1024,
             git_diff_max_total_bytes: 64 * 1024 * 1024,
             git_diff_max_output_bytes: 64 * 1024 * 1024,
             git_file_content_max_bytes: 64 * 1024 * 1024,

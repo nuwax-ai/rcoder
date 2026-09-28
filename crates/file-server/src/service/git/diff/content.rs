@@ -13,13 +13,28 @@ use super::types::Side;
 
 pub(super) fn read_blob(
     repo: &Repository,
+    path: &str,
     id: Option<ObjectId>,
     mode: Option<EntryMode>,
     max_bytes: u64,
 ) -> AppResult<Side> {
     match (id, mode) {
         (Some(id), Some(mode)) => {
-            ensure_blob_size(repo, id, max_bytes)?;
+            // 超限降级（对齐 TS git CLI 的 Binary files differ 语义）：
+            // 单文件超限不终止整个 diff，warn 后按 binary 标记渲染。
+            let size = repo
+                .find_header(id)
+                .map_err(|error| map_git_err(error, "git find blob header"))?
+                .size();
+            if size > max_bytes {
+                tracing::warn!(
+                    path,
+                    size,
+                    limit = max_bytes,
+                    "git diff blob exceeds per-file limit; degraded to binary marker"
+                );
+                return Ok(Side::present_oversized(mode));
+            }
             let blob = repo
                 .find_blob(id)
                 .map_err(|error| map_git_err(error, "git find_blob"))?;
@@ -52,6 +67,7 @@ pub(super) fn read_head_blob(
     match entry {
         Some(entry) => read_blob(
             repo,
+            path,
             Some(entry.id().detach()),
             Some(entry.mode()),
             max_bytes,
@@ -75,7 +91,7 @@ pub(super) fn read_index_blob(
         .mode
         .to_tree_entry_mode()
         .ok_or_else(|| AppError::system(format!("unsupported git index mode for {path}")))?;
-    read_blob(repo, Some(entry.id), Some(mode), max_bytes)
+    read_blob(repo, path, Some(entry.id), Some(mode), max_bytes)
 }
 
 pub(super) fn read_worktree_file(workdir: &Path, path: &str, max_bytes: u64) -> AppResult<Side> {
@@ -99,7 +115,18 @@ pub(super) fn read_worktree_file(workdir: &Path, path: &str, max_bytes: u64) -> 
     }
     let size = usize::try_from(metadata.len())
         .map_err(|_| AppError::validation("git diff file size overflow"))?;
-    ensure_worktree_size(&full_path, size, max_bytes)?;
+    let size_bytes =
+        u64::try_from(size).map_err(|_| AppError::validation("git diff file size overflow"))?;
+    if size_bytes > max_bytes {
+        // 超限降级（对齐 TS git CLI 的 Binary files differ 语义），warn 不报错。
+        tracing::warn!(
+            path = %full_path.display(),
+            size = size_bytes,
+            limit = max_bytes,
+            "git diff worktree file exceeds per-file limit; degraded to binary marker"
+        );
+        return Ok(Side::present_oversized(regular_file_mode(&metadata)));
+    }
     let bytes = std::fs::read(&full_path)?;
     Ok(Side::present(bytes, regular_file_mode(&metadata)))
 }
@@ -136,17 +163,4 @@ fn regular_file_mode(_metadata: &std::fs::Metadata) -> EntryMode {
         }
     }
     EntryKind::Blob.into()
-}
-
-fn ensure_blob_size(repo: &Repository, id: ObjectId, max_bytes: u64) -> AppResult<()> {
-    let size = repo
-        .find_header(id)
-        .map_err(|error| map_git_err(error, "git find blob header"))?
-        .size();
-    if size > max_bytes {
-        return Err(AppError::validation(format!(
-            "git diff blob exceeds limit (max {max_bytes} bytes)"
-        )));
-    }
-    Ok(())
 }

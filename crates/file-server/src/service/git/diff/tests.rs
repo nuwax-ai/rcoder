@@ -80,11 +80,63 @@ fn commit_diff_handles_nested_tree_and_preserves_from_to_direction() {
             max_total_bytes: 2,
             max_output_bytes: 64 * 1024 * 1024,
         },
+    )
+    .expect("超限工作区文件降级为 binary 标记而非报错（对齐 TS git CLI）");
+    assert!(
+        oversized
+            .diff
+            .contains("Binary files a/src/app.txt and b/src/app.txt differ")
     );
-    assert!(oversized.is_err());
+    assert!(
+        oversized
+            .files
+            .iter()
+            .any(|file| file.file == "src/app.txt" && file.binary)
+    );
 
     drop(repo);
     drop(std::fs::remove_dir_all(root));
+}
+
+/// 反例 (线上 cid 1694931): 提交了 >16MiB PDF 后 `from` 提交里的 blob 超限，
+/// commit diff 曾报 "git diff blob exceeds limit (max 16777216 bytes)" 整体
+/// 500——降级为 binary 标记 + warn（两侧均超限也必须呈现为变更，不能静默跳过）。
+#[test]
+fn oversized_committed_blob_degrades_to_binary_marker_instead_of_error() {
+    let directory = tempfile::tempdir().expect("create test directory");
+    let root = directory.path();
+    init_repo(root, "Test", "test@example.com").expect("init repo");
+    let repo = open(root).expect("open repo");
+
+    std::fs::write(root.join("big.bin"), vec![b'x'; 64]).expect("write big old");
+    stage_path(&repo, "big.bin").expect("stage big old");
+    commit_indexed(&repo, "c1", "Test", "test@example.com").expect("commit c1");
+    std::fs::write(root.join("big.bin"), vec![b'y'; 64]).expect("write big new");
+    stage_path(&repo, "big.bin").expect("stage big new");
+    let head = commit_indexed(&repo, "c2", "Test", "test@example.com").expect("commit c2");
+
+    let result = compute_diff(
+        &repo,
+        &DiffParams {
+            source: DiffSource::Commit,
+            from: Some(head),
+            to: None,
+            paths: Vec::new(),
+            max_file_size_bytes: 32,
+            max_total_bytes: 64 * 1024 * 1024,
+            max_output_bytes: 64 * 1024 * 1024,
+        },
+    )
+    .expect("超限 blob 降级为 binary 标记而非报错");
+    assert!(
+        result
+            .diff
+            .contains("Binary files a/big.bin and b/big.bin differ")
+    );
+    assert_eq!(result.files.len(), 1);
+    assert!(result.files[0].binary);
+    assert_eq!(result.insertions, 0);
+    assert_eq!(result.deletions, 0);
 }
 
 #[test]

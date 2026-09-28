@@ -256,10 +256,9 @@ impl Config {
             git_enabled: env_bool("GIT_ENABLED", false)?,
             git_default_author_name: env_str("GIT_DEFAULT_AUTHOR_NAME", "Nuwax File Server")?,
             git_default_author_email: env_str("GIT_DEFAULT_AUTHOR_EMAIL", "git@nuwax.com")?,
-            git_diff_max_file_size_bytes: env_parse(
-                "GIT_DIFF_MAX_FILE_SIZE_BYTES",
-                16 * 1024 * 1024,
-            )?,
+            // 单文件超限已降级为 binary 标记（不加载内容、不跑 diff 算法），
+            // 阈值语义 = "多大以上的文本 diff 已无呈现意义"；env 可覆盖。
+            git_diff_max_file_size_bytes: env_parse("GIT_DIFF_MAX_FILE_SIZE_BYTES", 1024 * 1024)?,
             git_diff_max_total_bytes: env_parse("GIT_DIFF_MAX_TOTAL_BYTES", 64 * 1024 * 1024)?,
             git_diff_max_output_bytes: env_parse("GIT_DIFF_MAX_OUTPUT_BYTES", 64 * 1024 * 1024)?,
             git_file_content_max_bytes: env_parse("GIT_FILE_CONTENT_MAX_BYTES", 64 * 1024 * 1024)?,
