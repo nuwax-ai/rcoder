@@ -172,12 +172,8 @@ pub async fn handle_audio_upstream(
     ));
 
     // 音频流长连接优化配置
-    // 音频流可能持续数小时，需要宽松的超时设置
-    peer.options.connection_timeout = Some(Duration::from_secs(10));
-    peer.options.read_timeout = None; // 无限等待（音频流可能持续数小时）
-    peer.options.write_timeout = None; // 无限等待（WebSocket 双向流）
-    peer.options.total_connection_timeout = Some(Duration::from_secs(15));
-    peer.options.idle_timeout = Some(Duration::from_secs(3600)); // 1 小时空闲超时
+    // 音频流可能持续数小时，需要宽松的超时设置（idle 1 小时）
+    super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
 
     debug!("[AUDIO] connection to: {}", peer_addr);
 

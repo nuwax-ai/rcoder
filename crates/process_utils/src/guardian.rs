@@ -636,15 +636,35 @@ async fn execute_unconsumed(root: &Path, receipt: &mut Receipt) -> Result<i32> {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     receipt.phase = "Quiescent".into();
+    // 观测性：两段无限重试各补首败 + 每 ~50 次重试（约 50 秒）一条 warn 心跳；
+    // 退出条件不变（成功才 break）。
+    let mut save_retries: u32 = 0;
     loop {
-        if save(root, receipt).is_ok() {
-            break;
+        match save(root, receipt) {
+            Ok(()) => break,
+            Err(error) => {
+                save_retries += 1;
+                crate::warn_retry_pending(
+                    "guardian quiescent save",
+                    save_retries,
+                    format_args!("{error:#}"),
+                );
+            }
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+    let mut confirm_retries: u32 = 0;
     loop {
-        if confirm_command(root, receipt).is_ok() {
-            break;
+        match confirm_command(root, receipt) {
+            Ok(()) => break,
+            Err(error) => {
+                confirm_retries += 1;
+                crate::warn_retry_pending(
+                    "guardian command confirm",
+                    confirm_retries,
+                    format_args!("{error:#}"),
+                );
+            }
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }

@@ -180,4 +180,16 @@ mod tests {
     }
 }
 
+/// 无限重试循环的失败观测心跳：首次失败与此后每 50 次重试各落一条 warn。
+///
+/// 只补可观测性，不参与任何退出条件判定；重试节奏由调用方控制
+/// （100ms 间隔约 5 秒一条心跳，1s 间隔约 50 秒一条）。
+pub(crate) fn warn_retry_pending(operation: &str, retries: u32, detail: impl std::fmt::Display) {
+    if retries == 1 {
+        tracing::warn!("[{operation}] attempt failed ({detail}), retrying");
+    } else if retries.is_multiple_of(50) {
+        tracing::warn!("[{operation}] still failing after {retries} retries ({detail})");
+    }
+}
+
 pub mod guardian;

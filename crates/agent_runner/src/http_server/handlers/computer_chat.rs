@@ -179,7 +179,7 @@ pub(crate) async fn handle_computer_chat_internal(
     let session_id_str = output.session_id.clone();
     if output.success && !session_id_str.is_empty() && !SESSION_CACHE.contains_key(&session_id_str)
     {
-        let data = SessionData::new(1000).await;
+        let data = SessionData::new(crate::service::RING_BUFFER_SIZE).await;
         match SESSION_CACHE.entry(session_id_str.clone()) {
             Entry::Occupied(_entry) => {
                 // 其他任务已创建，丢弃我们创建的 data

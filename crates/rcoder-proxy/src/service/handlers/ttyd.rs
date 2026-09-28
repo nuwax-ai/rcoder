@@ -318,12 +318,8 @@ pub async fn handle_ttyd_upstream(
         "".to_string(), // SNI
     );
 
-    // ttyd WebSocket 长连接优化配置（与 vnc 一致）
-    peer.options.connection_timeout = Some(Duration::from_secs(10));
-    peer.options.read_timeout = None; // 无限等待（持续双向流）
-    peer.options.write_timeout = None; // 无限等待（WebSocket 双向流）
-    peer.options.total_connection_timeout = Some(Duration::from_secs(15));
-    peer.options.idle_timeout = Some(Duration::from_secs(3600)); // 1小时空闲超时
+    // ttyd WebSocket 长连接优化配置（与 vnc 一致；idle 1 小时）
+    super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
 
     Ok(Box::new(peer))
 }
@@ -399,12 +395,8 @@ pub async fn handle_web_ttyd_upstream(
         "".to_string(), // SNI
     );
 
-    // ttyd WebSocket 长连接优化配置（与 agent-runner ttyd 一致）
-    peer.options.connection_timeout = Some(Duration::from_secs(10));
-    peer.options.read_timeout = None;
-    peer.options.write_timeout = None;
-    peer.options.total_connection_timeout = Some(Duration::from_secs(15));
-    peer.options.idle_timeout = Some(Duration::from_secs(3600));
+    // ttyd WebSocket 长连接优化配置（与 agent-runner ttyd 一致；idle 1 小时）
+    super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
 
     Ok(Box::new(peer))
 }

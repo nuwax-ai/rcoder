@@ -56,11 +56,7 @@ pub(crate) async fn handle_preview_forward_upstream(
         ));
     };
     let mut peer = HttpPeer::new(("127.0.0.1", vite_port), false, "".to_string());
-    peer.options.connection_timeout = Some(Duration::from_secs(10));
-    peer.options.read_timeout = None;
-    peer.options.write_timeout = None;
-    peer.options.total_connection_timeout = Some(Duration::from_secs(15));
-    peer.options.idle_timeout = Some(Duration::from_secs(3600));
+    super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
     ctx.upstream_host = Some("127.0.0.1".to_string());
     Ok(Box::new(peer))
 }

@@ -198,8 +198,8 @@ impl Worker {
                     }
                 });
             }
-            #[allow(unreachable_code)]
-            Ok::<_, anyhow::Error>(())
+            // loop 无 break：accept 循环即块尾表达式（never 类型收敛到 Result<()>），
+            // accept 出错经 `?` 直接以 Err 结束本任务。
         });
         Ok(WorkerServer { task })
     }

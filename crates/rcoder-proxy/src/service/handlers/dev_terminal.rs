@@ -239,11 +239,7 @@ pub async fn handle_dev_ttyd_upstream(
         false,
         "".to_string(),
     );
-    peer.options.connection_timeout = Some(Duration::from_secs(10));
-    peer.options.read_timeout = None;
-    peer.options.write_timeout = None;
-    peer.options.total_connection_timeout = Some(Duration::from_secs(15));
-    peer.options.idle_timeout = Some(Duration::from_secs(3600));
+    super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
     Ok(Box::new(peer))
 }
 
@@ -301,11 +297,7 @@ pub async fn handle_dev_vnc_upstream(
         false,
         "".to_string(),
     );
-    peer.options.connection_timeout = Some(Duration::from_secs(10));
-    peer.options.read_timeout = None;
-    peer.options.write_timeout = None;
-    peer.options.total_connection_timeout = Some(Duration::from_secs(15));
-    peer.options.idle_timeout = Some(Duration::from_secs(3600));
+    super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
     Ok(Box::new(peer))
 }
 
@@ -376,11 +368,7 @@ pub async fn handle_dev_audio_upstream(
     metrics.inc_active();
 
     let mut peer = HttpPeer::new(addr, false, "".to_string());
-    peer.options.connection_timeout = Some(Duration::from_secs(10));
-    peer.options.read_timeout = None;
-    peer.options.write_timeout = None;
-    peer.options.total_connection_timeout = Some(Duration::from_secs(15));
-    peer.options.idle_timeout = Some(Duration::from_secs(3600));
+    super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
     Ok(Box::new(peer))
 }
 
@@ -444,11 +432,7 @@ pub async fn handle_dev_ime_upstream(
     metrics.inc_active();
 
     let mut peer = HttpPeer::new(addr, false, "".to_string());
-    peer.options.connection_timeout = Some(Duration::from_secs(10));
-    peer.options.read_timeout = None;
-    peer.options.write_timeout = None;
-    peer.options.total_connection_timeout = Some(Duration::from_secs(15));
-    peer.options.idle_timeout = Some(Duration::from_secs(3600));
+    super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
     Ok(Box::new(peer))
 }
 
@@ -557,12 +541,8 @@ pub async fn handle_runtime_ttyd_upstream(
         false,
         "".to_string(),
     );
-    peer.options.connection_timeout = Some(Duration::from_secs(10));
-    peer.options.read_timeout = None;
-    peer.options.write_timeout = None;
-    peer.options.total_connection_timeout = Some(Duration::from_secs(15));
-    // 终端会话可长开；与开发域 ttyd 同档
-    peer.options.idle_timeout = Some(Duration::from_secs(3600));
+    // 终端会话可长开；与开发域 ttyd 同档（idle 1 小时）
+    super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
     Ok(Box::new(peer))
 }
 

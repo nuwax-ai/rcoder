@@ -115,12 +115,8 @@ pub async fn handle_ime_upstream(
     let peer_addr = super::super::upstream::dial_addr(&container_ip, IME_PORT)?;
     let mut peer = Box::new(HttpPeer::new(peer_addr.clone(), false, "".to_string()));
 
-    // IME WebSocket 长连接优化配置
-    peer.options.connection_timeout = Some(Duration::from_secs(10));
-    peer.options.read_timeout = None; // 无限等待（WebSocket 持续流）
-    peer.options.write_timeout = None; // 无限等待（WebSocket 双向流）
-    peer.options.total_connection_timeout = Some(Duration::from_secs(15));
-    peer.options.idle_timeout = Some(Duration::from_secs(3600)); // 1小时空闲超时
+    // IME WebSocket 长连接优化配置（idle 1 小时）
+    super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
 
     debug!("IME connection from: {}", peer_addr);
 

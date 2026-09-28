@@ -165,13 +165,9 @@ pub async fn handle_prod_app_upstream(
 
     debug!("prod app route: app_id={}, {}", app_id, resolved_addr);
 
-    // 创建 HTTP Peer（长连接配置，支持 WebSocket / HMR）
+    // 创建 HTTP Peer（长连接配置，支持 WebSocket / HMR；idle 1 小时）
     let mut peer = HttpPeer::new(resolved_addr, false, "".to_string());
-    peer.options.connection_timeout = Some(Duration::from_secs(10));
-    peer.options.read_timeout = None;
-    peer.options.write_timeout = None;
-    peer.options.total_connection_timeout = Some(Duration::from_secs(15));
-    peer.options.idle_timeout = Some(Duration::from_secs(3600));
+    super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
 
     Ok(Box::new(peer))
 }

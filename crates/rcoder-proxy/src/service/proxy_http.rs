@@ -178,14 +178,8 @@ impl ProxyHttp for PortProxy {
                     )
                     | Err(_) => {
                         // 未获得可用上游（包括操作占用）；返回 503，不宣称仍在启动。
-                        let detail = if wake_pending {
-                            "wake ensure_running did not reach Ready before the deadline"
-                                .to_string()
-                        } else {
-                            format!(
-                                "wake ensure_running outcome was not Ready (pending={wake_pending})"
-                            )
-                        };
+                        // 能走到这里必然 wake_pending（false 已在上方提前 return）。
+                        let detail = "wake ensure_running did not reach Ready before the deadline";
                         self.respond_userapp_error(
                             session,
                             ctx,
@@ -193,7 +187,7 @@ impl ProxyHttp for PortProxy {
                             crate::error_page::ErrorPageCause::Generic,
                             "wake did not produce a ready upstream",
                             Some(15),
-                            &detail,
+                            detail,
                         )
                         .await;
                         return Ok(true); // 已直接响应，跳过 upstream

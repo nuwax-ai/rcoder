@@ -16,5 +16,7 @@ pub use agent_session_service::{AgentRequest, AgentSessionService};
 pub use chat_handler::{ChatHandlerContext, ChatHandlerInput, handle_chat_core};
 pub use logging_diagnostics_listener::LoggingDiagnosticsListener;
 pub use permission_manager::PERMISSION_MANAGER;
+/// 会话 ring buffer 生产容量（仅 crate 内使用，不进公共 API）。
+pub(crate) use session_cache::RING_BUFFER_SIZE;
 pub use session_cache::{SESSION_CACHE, SessionData, push_session_update_with_project};
 pub use state_aware_notifier::StateAwareNotifier;

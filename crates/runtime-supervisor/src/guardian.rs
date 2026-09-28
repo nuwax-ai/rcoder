@@ -200,16 +200,22 @@ async fn finish(root: &Path, generation: &mut record::Generation, launch: &Launc
         match cleanup {
             Ok(()) => {
                 generation.phase = GenerationPhase::Quiescent;
-                if record::save(&root.join("generation.json"), generation).is_ok() {
-                    return;
+                match record::save(&root.join("generation.json"), generation) {
+                    Ok(()) => return,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not persist quiescent generation record");
+                        generation.phase = GenerationPhase::Draining;
+                    }
                 }
-                generation.phase = GenerationPhase::Draining;
             }
             Err(error) => {
                 let message = format!("command cleanup pending: {error:#}");
                 if generation.error.as_deref() != Some(&message) {
                     generation.error = Some(message);
-                    drop(record::save(&root.join("generation.json"), generation));
+                    if let Err(save_error) = record::save(&root.join("generation.json"), generation)
+                    {
+                        tracing::warn!(%save_error, "could not persist cleanup pending state");
+                    }
                 }
             }
         }

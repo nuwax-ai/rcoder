@@ -109,7 +109,7 @@ pub async fn subscribe_progress(
                     "[gRPC] SESSION_CACHE not found, creating new SessionData: session_id={}",
                     session_id_clone
                 );
-                let session_data = crate::service::SessionData::new(1000).await;
+                let session_data = crate::service::SessionData::new(crate::service::RING_BUFFER_SIZE).await;
                 match SESSION_CACHE.entry(session_id_clone.clone()) {
                     Entry::Occupied(entry) => {
                         info!(

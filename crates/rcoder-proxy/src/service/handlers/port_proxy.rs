@@ -152,11 +152,7 @@ pub async fn handle_port_proxy_upstream(
         // 表键）——直连不经 dial_peer（误接会把 Pod IP 当键查表回退
         // 127.0.0.1，preview_forward_tests 实测暴露）
         let mut peer = HttpPeer::new((host_ip.as_str(), peer_port), false, "".to_string());
-        peer.options.connection_timeout = Some(Duration::from_secs(10));
-        peer.options.read_timeout = None;
-        peer.options.write_timeout = None;
-        peer.options.total_connection_timeout = Some(Duration::from_secs(15));
-        peer.options.idle_timeout = Some(Duration::from_secs(3600));
+        super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
         ctx.upstream_host = Some(host_ip);
         // 与 legacy 分支同款指标——response 阶段无条件 dec_active，此处不补
         // 则 Forward 流量的 dec 会吃掉 legacy 的 inc（active_connections 失真）
@@ -189,12 +185,8 @@ pub async fn handle_port_proxy_upstream(
     );
 
     // 端口代理长连接优化配置（支持 WebSocket、Vite HMR 等）
-    // 与音频/IME WebSocket 场景保持一致
-    peer.options.connection_timeout = Some(Duration::from_secs(10));
-    peer.options.read_timeout = None; // 无限等待（WebSocket/Vite HMR 需要长连接）
-    peer.options.write_timeout = None; // 无限等待（WebSocket 双向流）
-    peer.options.total_connection_timeout = Some(Duration::from_secs(15));
-    peer.options.idle_timeout = Some(Duration::from_secs(3600)); // 1小时空闲超时
+    // 与音频/IME WebSocket 场景保持一致（idle 1 小时）
+    super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
 
     Ok(Box::new(peer))
 }

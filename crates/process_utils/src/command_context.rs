@@ -222,19 +222,34 @@ pub fn retain_cleanup(
     record: Option<CommandRecord>,
 ) {
     tokio::spawn(async move {
+        // 观测性：首败与每 ~50 次重试（约 5 秒）各一条 warn 心跳；不改退出条件
+        let mut retries: u32 = 0;
         loop {
             if let Some(owned) = &mut child {
                 if matches!(
                     owned.stop(std::time::Duration::ZERO).await,
                     crate::managed_tree::StopOutcome::Unconfirmed
                 ) {
+                    retries += 1;
+                    crate::warn_retry_pending(
+                        "retain_cleanup stop",
+                        retries,
+                        "stop outcome still unconfirmed",
+                    );
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
                 child.take();
             }
-            if record.as_ref().is_none_or(|r| r.quiescent().is_ok()) {
-                break;
+            match record.as_ref() {
+                None => break,
+                Some(record) => match record.quiescent() {
+                    Ok(()) => break,
+                    Err(error) => {
+                        retries += 1;
+                        crate::warn_retry_pending("retain_cleanup quiescent", retries, &error);
+                    }
+                },
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }

@@ -51,6 +51,12 @@ fn truncate_message_for_log(data: &serde_json::Value, max_len: usize) -> String 
 /// 全局Session缓存 - LazyLock初始化
 pub static SESSION_CACHE: LazyLock<DashMap<String, Arc<SessionData>>> = LazyLock::new(DashMap::new);
 
+/// 会话 ring buffer（UnifiedSessionMessage 循环缓冲）的生产容量。
+///
+/// 所有生产路径（session_cache / gRPC 订阅 / computer_chat / 本地 agent 服务）
+/// 统一引用本常量，禁止散落新的字面量。
+pub(crate) const RING_BUFFER_SIZE: usize = 1000;
+
 /// Session命令通道的缓冲区大小
 ///
 /// 与 ring buffer 大小一致，提供足够的缓冲同时防止 OOM
@@ -408,8 +414,6 @@ impl SessionData {
 /// 便捷函数：添加SessionNotify消息并管理Project-Session映射
 ///
 /// 这个函数会自动确保project_id只对应一个活跃的session_id
-///
-/// 这个函数会自动确保project_id只对应一个活跃的session_id
 /// 当检测到session_id变化时，会自动清理旧session的数据
 pub async fn push_session_update_with_project(
     project_id: &str,
@@ -552,7 +556,7 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
                 "[push_session_update] SessionWorker panicked for session_id={}, recreating...",
                 session_id
             );
-            let new_data = SessionData::new(1000).await;
+            let new_data = SessionData::new(RING_BUFFER_SIZE).await;
             // entry API 原子替换（语义更明确）
             SESSION_CACHE
                 .entry(session_id.to_string())
@@ -566,7 +570,7 @@ pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Res
     }
 
     // 慢速路径：session 不存在 → 在 entry() 外部 await 创建
-    let data = SessionData::new(1000).await;
+    let data = SessionData::new(RING_BUFFER_SIZE).await;
     info!(
         "[push_session_update] SESSION_CACHE auto-created: session_id={}",
         session_id

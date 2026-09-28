@@ -159,7 +159,7 @@ impl AgentHttpService for LocalAgentHttpService {
             && !session_id_str.is_empty()
             && !SESSION_CACHE.contains_key(&session_id_str)
         {
-            let session_data = SessionData::new(1000).await;
+            let session_data = SessionData::new(super::RING_BUFFER_SIZE).await;
             match SESSION_CACHE.entry(session_id_str) {
                 dashmap::mapref::entry::Entry::Occupied(_) => {
                     // 其他任务已创建，丢弃我们创建的 session_data

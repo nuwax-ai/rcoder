@@ -17,6 +17,22 @@ use tracing::{debug, error, info, warn};
 use crate::service::types::{ProxyMetrics, TrackingCtx};
 use crate::service::utils;
 
+/// 逐条输出 header 调试日志（`x-api-key` / `authorization` 脱敏，其余原样）。
+fn log_masked_headers(headers: &http::HeaderMap) {
+    for (name, value) in headers.iter() {
+        let val_str = value.to_str().unwrap_or("<binary>");
+        // 对敏感 header 做脱敏
+        if name.as_str().eq_ignore_ascii_case("x-api-key")
+            || name.as_str().eq_ignore_ascii_case("authorization")
+        {
+            let masked = utils::mask_header_value(val_str);
+            debug!("[API_PROXY_DEBUG]   {} = {}", name, masked);
+        } else {
+            debug!("[API_PROXY_DEBUG]   {} = {}", name, val_str);
+        }
+    }
+}
+
 /// 处理 API 密钥代理请求
 ///
 /// 路径格式: `/api/{service_name}/{*path}`
@@ -49,26 +65,12 @@ pub async fn handle_api_proxy_request(
     debug!("API proxy request: service_name={}", service_name);
 
     // [DEBUG] 打印原始请求的所有 headers
-    {
-        let method = upstream_request.method.as_str();
-        debug!(
-            "[API_PROXY_DEBUG] ====== Original request ======\n  Method: {}\n  Path: {}",
-            method,
-            original_uri.path()
-        );
-        for (name, value) in upstream_request.headers.iter() {
-            let val_str = value.to_str().unwrap_or("<binary>");
-            // 对敏感 header 做脱敏
-            if name.as_str().eq_ignore_ascii_case("x-api-key")
-                || name.as_str().eq_ignore_ascii_case("authorization")
-            {
-                let masked = utils::mask_header_value(val_str);
-                debug!("[API_PROXY_DEBUG]   Header: {} = {}", name, masked);
-            } else {
-                debug!("[API_PROXY_DEBUG]   Header: {} = {}", name, val_str);
-            }
-        }
-    }
+    debug!(
+        "[API_PROXY_DEBUG] ====== Original request ======\n  Method: {}\n  Path: {}",
+        upstream_request.method.as_str(),
+        original_uri.path()
+    );
+    log_masked_headers(&upstream_request.headers);
 
     // 3. 从 ApiKeyManager 查询 API 密钥配置
     let api_config = api_key_manager.get(service_name).ok_or_else(|| {
@@ -119,14 +121,14 @@ pub async fn handle_api_proxy_request(
 
     if use_anthropic_auth {
         upstream_request.insert_header("x-api-key", &config.api_key)?;
-        info!(
+        debug!(
             "[API_PROXY] Injected Anthropic format x-api-key: {} (api_protocol={:?})",
             utils::mask_header_value(&config.api_key),
             config.api_protocol
         );
     } else {
         upstream_request.insert_header("authorization", format!("Bearer {}", config.api_key))?;
-        info!(
+        debug!(
             "[API_PROXY] Injected OpenAI format Bearer: {} (api_protocol={:?})",
             utils::mask_header_value(&config.api_key),
             config.api_protocol
@@ -177,23 +179,21 @@ pub async fn handle_api_proxy_request(
     );
 
     // [DEBUG] 打印最终发送到上游的所有 headers
-    {
-        debug!("[API_PROXY_DEBUG] ====== request Headers ======");
-        for (name, value) in upstream_request.headers.iter() {
-            let val_str = value.to_str().unwrap_or("<binary>");
-            if name.as_str().eq_ignore_ascii_case("x-api-key")
-                || name.as_str().eq_ignore_ascii_case("authorization")
-            {
-                let masked = utils::mask_header_value(val_str);
-                debug!("[API_PROXY_DEBUG]   {} = {}", name, masked);
-            } else {
-                debug!("[API_PROXY_DEBUG]   {} = {}", name, val_str);
-            }
-        }
-        debug!("[API_PROXY_DEBUG] ====== response Headers ======");
-    }
+    debug!("[API_PROXY_DEBUG] ====== request Headers ======");
+    log_masked_headers(&upstream_request.headers);
+    debug!("[API_PROXY_DEBUG] ====== response Headers ======");
 
     Ok(())
+}
+
+/// 解析 base_url 中的显式端口段；非法（非 u16）时返回 400 配置错误，
+/// 错误信息携带原始 base_url 与非法端口，绝不静默回落默认端口。
+fn parse_explicit_port(port_str: &str, base_url: &str) -> PingoraResult<u16> {
+    port_str.parse::<u16>().map_err(|_| {
+        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400)).more_context(format!(
+            "invalid port '{port_str}' in base_url '{base_url}'"
+        ))
+    })
 }
 
 /// 处理 API 密钥代理的上游选择
@@ -225,10 +225,11 @@ pub async fn handle_api_proxy_upstream(
 
     // 3. 解析真实 API 端点的 host 和 port
     // 支持 https://api.anthropic.com 和 https://api.openai.com:443 格式
+    // 显式端口非法时 fail-fast 报错，不静默回落默认端口
     let (host, port, use_tls) = if let Some(https_url) = base_url.strip_prefix("https://") {
         let host_part = https_url.split('/').next().unwrap_or(https_url);
         if let Some(port_str) = host_part.split(':').nth(1) {
-            let port = port_str.parse::<u16>().unwrap_or(443);
+            let port = parse_explicit_port(port_str, base_url)?;
             let host = host_part.split(':').next().unwrap_or(host_part);
             (host, port, true)
         } else {
@@ -237,7 +238,7 @@ pub async fn handle_api_proxy_upstream(
     } else if let Some(http_url) = base_url.strip_prefix("http://") {
         let host_part = http_url.split('/').next().unwrap_or(http_url);
         if let Some(port_str) = host_part.split(':').nth(1) {
-            let port = port_str.parse::<u16>().unwrap_or(80);
+            let port = parse_explicit_port(port_str, base_url)?;
             let host = host_part.split(':').next().unwrap_or(host_part);
             (host, port, false)
         } else {
