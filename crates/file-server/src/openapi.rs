@@ -219,7 +219,18 @@ mod tests {
             .get("/api/computer/get-file-list")
             .and_then(|item| item.get.as_ref())
             .and_then(|operation| operation.parameters.as_ref())
-            .expect("get-file-list query parameters");
+            .expect("get-file-list query parameters")
+            .iter()
+            .map(|parameter| match parameter {
+                utoipa::openapi::RefOr::T(parameter) => parameter,
+                utoipa::openapi::RefOr::Ref(reference) => {
+                    panic!(
+                        "expected inline query parameter, got {}",
+                        reference.ref_location
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
         assert!(list_params.iter().any(|param| param.name == "type"));
         assert!(list_params.iter().any(|param| param.name == "limit"));
         assert!(!list_params.iter().any(|param| param.name == "file_type"));

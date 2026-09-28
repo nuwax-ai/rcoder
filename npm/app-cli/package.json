@@ -1,7 +1,7 @@
 {
   "name": "@nuwax-ai/app-cli",
   "version": "0.0.0",
-  "description": "UserApp workspace runtime orchestrator (service orchestration + pingap routing + admin API; local build tool)",
+  "description": "Cross-platform UserApp build and service manager (service orchestration, Pingap routing and management API)",
   "main": "./bin/cli.js",
   "bin": {
     "app-cli": "./bin/cli.js"

@@ -57,7 +57,7 @@ All packages share the same version number. The CI automatically updates version
 
 # @nuwax-ai/app-cli Packages
 
-UserApp 容器运行时编排器（服务编排 + pingap 路由 + 管理 API + `build` 本地编译工具）的 npm 分发。
+跨平台 UserApp 构建与服务管理器的 npm 分发，支持宿主机和容器中的服务编排、Pingap 路由及管理 API。
 
 ## Package Structure
 
@@ -69,7 +69,8 @@ npm/
 ├── app-cli-linux-x64/            # Linux x86_64 二进制
 ├── app-cli-linux-arm64/          # Linux ARM64 二进制
 ├── app-cli-darwin-x64/           # macOS x86_64 二进制
-└── app-cli-darwin-arm64/         # macOS ARM64 二进制
+├── app-cli-darwin-arm64/         # macOS ARM64 二进制
+└── app-cli-windows-x64/          # Windows x86_64 二进制
 ```
 
 ## Installation
@@ -86,6 +87,25 @@ app-cli gen-lock --workspace <workspace>          # manifest 校验 + release.lo
 app-cli build --workspace <workspace> --deploy-dir <dir>        # 逐服务编译 + 产物态部署布局（或 --dev 三分派）
 app-cli serve --workspace <dir>         # 产物态运行（pingap :9080 / admin :3010）
 ```
+
+### 如何选择子命令
+
+| 命令 | 用途 |
+|---|---|
+| `serve` | 常驻服务管理器，统一处理启动、停止、重启与部署；平台和长期运行优先使用 |
+| `run` | 前台运行当前工作区服务，本地编排时持续监督到停止或退出；不执行构建 |
+| `build` | 构建服务，可生成部署目录；不启动服务 |
+| `gen-lock` | 校验 manifest 并生成 `release.lock.toml`；不构建、不启动服务 |
+| `readiness` | 只读查询业务就绪状态；不启动管理器或业务服务 |
+| `owner` | 通过独立监督通道查询状态、停止、恢复或关闭 CLI；管理 API 不可用时仍可使用 |
+| `run-service` | supervisord 调用的内部服务执行入口 |
+| `journal adopt` | 处理部署日志的状态冲突，属于运维命令 |
+
+`run` 不是启动后立即退出的短命令，也不天然代表开发模式。
+开发模式由 `APP_CLI_RUN_PROFILE=dev` 选择，优先使用 `[devrun]`；未设置时使用 `[run]`。
+`run` 和 `serve` 都参与同一工作区的所有者协调，不应用另起进程的方式绕过已有所有者。
+`serve` 同样以前台常驻方式运行，不会自动把自己变成后台服务；后台托管由调用方负责。
+参数统一放在子命令后，例如 `app-cli run --workspace <workspace>`。
 
 ## CI/CD
 

@@ -1,7 +1,8 @@
 # Toasty T0 独立探针
 
 此目录是独立 Cargo workspace，不接入 RCoder 的运行时。生产依赖没有因此切换。
-锁定 Toasty 0.10.0，Cargo.lock 解析 Turso 0.7.2。
+当前依赖与生产存储层对齐为 Toasty 0.11，Cargo.lock 解析 Turso 0.7.2。
+下文各轮结果保留当时的验证范围，不代表升级后的整轮验证已通过。
 
 ## 运行边界
 

@@ -1080,7 +1080,7 @@ format = "jsonl"
     async fn marker_hit_skips_download() {
         let (_dir, workspace) = make_volume();
         let zip_bytes = build_zip(&[("release.lock.toml", MINIMAL_LOCK)]);
-        let sha = format!("{:x}", Sha256::digest(&zip_bytes));
+        let sha = hex::encode(Sha256::digest(&zip_bytes));
         let url = serve_once(zip_bytes).await;
         deploy(&workspace, &url, "rel-001", None)
             .await

@@ -208,7 +208,7 @@ crates/
 ├── frontend-detector/       # 前端项目框架探测（纯函数）
 ├── download_utils/          # 下载工具
 ├── process_utils/           # 进程工具
-├── app-cli/                 # UserApp 构建 CLI（独立 workspace，npm 分发）
+├── app-cli/                 # 跨平台 UserApp 构建与服务管理器（独立 workspace，npm 分发）
 tests-e2e/                   # e2e 测试（Docker Compose 真实环境）
 ```
 

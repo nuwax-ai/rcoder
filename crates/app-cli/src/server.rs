@@ -2369,10 +2369,7 @@ fn runtime_workspace_id(workspace: &std::path::Path) -> String {
     }
     // Hash the platform's lossless path encoding, not a lossy display string.
     // A full SHA-256 hex digest fits the protocol's 64-byte identifier limit.
-    format!(
-        "{:x}",
-        Sha256::digest(project_root.as_os_str().as_encoded_bytes())
-    )
+    hex::encode(Sha256::digest(project_root.as_os_str().as_encoded_bytes()))
 }
 
 /// 装配运行操作内核（serve 专用；dispatch 把内核动作翻译进既有执行通道）。

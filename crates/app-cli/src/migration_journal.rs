@@ -146,7 +146,7 @@ impl MigrationJournal {
 
 pub(crate) fn identity(release: &crate::manifest::ReleaseLock, service_id: &str) -> Result<String> {
     let bytes = shared_types::encode_userapp_intent(&(release, service_id))?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 #[cfg(test)]

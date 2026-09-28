@@ -159,7 +159,7 @@ bytes = "1.12"
 arrayvec = "0.7"
 arc-swap = "1.9"
 md5 = "0.8"
-process-wrap = { version = "9.1", features = ["tokio1", "process-group", "job-object"] }
+process-wrap = { version = "10.0.1", features = ["tokio1", "process-group", "job-object"] }
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
 
 url = { version = "2.5", features = ["serde"] }
@@ -172,13 +172,13 @@ rustls = { version = "0.23", features = ["ring"] }
 indoc = "2.0"
 parking_lot = "0.12"
 lockmap = "0.2.3"
-convert_case = "0.11"
+convert_case = "0.12"
 # Persistent data structures for CoW-friendly multi-session tracking (C2/M3 fix)
 # imbl = im 的活跃维护 fork（im 15.1 已 unmaintained，RUSTSEC-2026-0248）
 imbl = { version = "7.0", features = ["serde"] }
 handlebars = { version = "6.4", features = ["rust-embed"] }
 rust-embed = "8.12"
-zstd = "0.13"
+zstd = "0.14"
 
 # Kubernetes
 kube = { version = "4.2", features = ["runtime", "client", "kube-runtime", "config", "ws"] }
@@ -208,7 +208,7 @@ hex = "0.4"
 walkdir = "2.5"
 # 并行目录遍历 (work-stealing 线程池), 用于 file-server search-files。
 # 取代手写 BFS: 零 syscall d_type + 多线程并行, dua-cli (gitoxide 作者 Byron 维护) 的核心库。
-dua-core = "3.3"
+dua-core = "4.1"
 # HTTP client。reqwest 0.13 的 default-tls 本就是 rustls(aws-lc-rs + rustls-platform-verifier 读 OS 根证书)，
 # 并无 openssl/native-tls。这里 default-features=false + 显式 rustls 固化“全 workspace 用 rustls”，
 # 防止未来 reqwest 改默认后悄悄回退；charset/http2/system-proxy 补回原默认特性。
@@ -262,20 +262,20 @@ tokio-test = "0.4"
 expect-test = "1.5"
 
 # File system utilities
-dirs = "6.0"
+dirs = "7.0"
 
 # Archive utilities
 flate2 = "1.1"
 tar = "0.4"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
-utoipa = { version = "5.5", features = ["axum_extras", "uuid", "chrono"] }
-utoipa-axum = "0.2"
+utoipa = { version = "6", features = ["axum_extras", "uuid", "chrono"] }
+utoipa-axum = "0.3"
 # vendored：swagger-ui 资源随 utoipa-swagger-ui-vendored crate 内嵌（include_bytes），
 # 构建期零 GitHub 依赖——build.rs 默认会用 curl 从 github.com 下载 swagger-ui zip，
 # Docker 构建/离线环境概率性失败；四个 workspace 成员经 workspace = true 统一继承
-utoipa-swagger-ui = { version = "9.0", features = ["axum", "vendored"] }
-utoipa-scalar = { version = "0.3", features = ["axum"] }
+utoipa-swagger-ui = { version = "10.0.1", features = ["axum", "vendored"] }
+utoipa-scalar = { version = "0.4", features = ["axum"] }
 
 
 ringbuf = "0.5"
@@ -288,7 +288,7 @@ pingora-core = { version = "0.9", features = ["rustls"] }
 pingora-http = "0.9"
 pingora-proxy = { version = "0.9", features = ["rustls"] }
 pingora-load-balancing = { version = "0.9", features = ["rustls"] }
-matchit = "0.8"
+matchit = "0.9"
 
 bollard = { version = "0.21" }
 
@@ -313,15 +313,16 @@ mime_guess = "2"
 # 0.87 起 tree-editor feature 名被上游移除（API 本体无条件可用——MSRV 超过 1.75 后
 # 不再需要 gate，见 gitoxide 3a4350cd），声明里不得再带该 feature；
 # 升级同时带走 gix-protocol 0.65.1（其依赖已无 bisync yanked）
-gix = "0.87.1"
+gix = "0.88"
 
 # i18n (国际化)
 rust-i18n = "4"
 
 # Control storage ORM and official drivers. Backend features are selected by rcoder-storage.
-toasty = { version = "=0.10.0", default-features = false }
-toasty-core = "=0.10.0"
-toasty-driver-turso = "=0.10.0"
+toasty = { version = "=0.11", default-features = false }
+toasty-core = "=0.11"
+# Toasty 0.11 不再默认开启 Turso features；保留既有 FTS 能力，使用系统分配器。
+toasty-driver-turso = { version = "=0.11", features = ["fts"] }
 
 # Internal crates
 rcoder-telemetry = { path = "crates/rcoder-telemetry" }
@@ -352,7 +353,7 @@ model_probe = { path = "crates/model_probe" }
 # Hotpath 本地性能剖析（hotpath-rs，本地开发观测；见 AGENTS.md「AI 调试路由」）。
 # 非 optional（官方推荐）：不开 feature 时宏全 no-op、内部依赖零编译；
 # 不进 default features → 生产构建（build-agent-docker）完全无感。
-hotpath = { version = "0.25.1", default-features = false }
+hotpath = { version = "0.26.1", default-features = false }
 
 # dial9 事件级 Tokio tracing（本地开发观测，取代已移除的 tokio-console）。
 # default=[] 必须显式开 `tokio`（runtime hooks + recorder_from_env）；不开

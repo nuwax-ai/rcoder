@@ -90,6 +90,17 @@ pub fn document() -> utoipa::openapi::OpenApi {
 mod tests {
     use super::*;
 
+    fn inline_parameter(
+        value: &utoipa::openapi::RefOr<utoipa::openapi::path::Parameter>,
+    ) -> &utoipa::openapi::path::Parameter {
+        match value {
+            utoipa::openapi::RefOr::T(parameter) => parameter,
+            utoipa::openapi::RefOr::Ref(reference) => {
+                panic!("expected inline parameter, got {}", reference.ref_location)
+            }
+        }
+    }
+
     /// 路径锚点 + 计数守卫（自 file-server openapi.rs 迁入）：路由全量注册且
     /// 路径规约（无 `{*}` 通配残留——OpenAPI path template 写作 `{rest}`）。
     #[test]
@@ -259,6 +270,7 @@ mod tests {
             .map(|params| {
                 params
                     .iter()
+                    .map(inline_parameter)
                     .map(|p| (p.name.as_str(), &p.parameter_in, &p.required))
                     .collect::<Vec<_>>()
             })
@@ -301,10 +313,10 @@ mod tests {
             .and_then(|item| item.get.as_ref())
             .expect("static path missing");
         assert!(
-            static_op
-                .parameters
-                .as_ref()
-                .is_some_and(|params| params.iter().any(|p| p.name == "release_id"
+            static_op.parameters.as_ref().is_some_and(|params| params
+                .iter()
+                .map(inline_parameter)
+                .any(|p| p.name == "release_id"
                     && matches!(p.parameter_in, utoipa::openapi::path::ParameterIn::Query))),
             "static 接口参数缺 release_id Query 声明（按版本取包是对外契约）"
         );
@@ -314,7 +326,10 @@ mod tests {
             .get("/api/v1/userapp/get-file-list")
             .and_then(|item| item.get.as_ref())
             .and_then(|operation| operation.parameters.as_ref())
-            .expect("userapp get-file-list query parameters");
+            .expect("userapp get-file-list query parameters")
+            .iter()
+            .map(inline_parameter)
+            .collect::<Vec<_>>();
         assert!(list_params.iter().any(|param| param.name == "type"));
         assert!(list_params.iter().any(|param| param.name == "limit"));
         assert!(!list_params.iter().any(|param| param.name == "file_type"));
@@ -335,7 +350,7 @@ mod tests {
                 let Some(params) = &op.parameters else {
                     continue;
                 };
-                for p in params {
+                for p in params.iter().map(inline_parameter) {
                     if matches!(p.parameter_in, utoipa::openapi::path::ParameterIn::Path)
                         && !path.contains(&format!("{{{}}}", p.name))
                     {
@@ -361,7 +376,7 @@ mod tests {
         for (path, item) in &document.paths.paths {
             for operation in [&item.get, &item.post].into_iter().flatten() {
                 if let Some(params) = &operation.parameters {
-                    for p in params {
+                    for p in params.iter().map(inline_parameter) {
                         assert!(
                             p.description.as_ref().is_some_and(|d| !d.trim().is_empty()),
                             "{path} 参数 {:?} 缺少 description（补 doc comment）",

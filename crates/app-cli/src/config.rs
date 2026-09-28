@@ -4,7 +4,12 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "app-cli", version, about = "UserApp 构建与运行管理器")]
+#[command(
+    name = "app-cli",
+    version,
+    about = "跨平台 UserApp 构建与服务管理器",
+    after_help = "常用流程：\n  app-cli build --workspace <工作区> --deploy-dir <部署目录>\n  app-cli serve --workspace <部署目录>\n\n参数放在子命令后；用 app-cli <子命令> --help 查看详细说明。"
+)]
 pub struct CliArgs {
     #[command(subcommand)]
     pub command: Command,
@@ -12,21 +17,32 @@ pub struct CliArgs {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
-    /// 启动常驻运行态所有者及管理 API。
+    /// 启动常驻服务管理器，处理启动、停止、重启和部署。
+    ///
+    /// 服务管理器持续运行并提供管理 API。仅恢复管理入口、不自动启动业务时，
+    /// 使用 --control-only。此命令不执行工作区构建。
     Serve(ServeArgs),
-    /// 直接前台编排服务（平台开发链路入口）。
+    /// 前台运行工作区服务，持续监督到停止或退出。
+    ///
+    /// 不执行构建；按 release.lock.toml 启动服务。本地编排时进程持续运行，
+    /// 不会在服务启动后立即退出；已有所有者时通过所有者协调。
+    /// 设置 APP_CLI_RUN_PROFILE=dev 可优先使用 [devrun]，否则使用 [run]。
+    /// 需要常驻管理、反复启停和部署时，优先使用 serve。
     Run(RunArgs),
-    /// 构建 workspace 服务，不启动服务。
+    /// 构建工作区服务，可生成部署目录；不启动服务。
     Build(BuildArgs),
     /// 校验 manifest 并生成 release.lock.toml，不启动服务。
     GenLock(GenLockArgs),
-    /// 执行 supervisord 管理的服务 spec。
+    /// 内部服务执行入口，由 supervisord 调用。
     RunService(RunServiceArgs),
-    /// 纯只读业务就绪查询（GET 管理 API；不进入 serve/run、不启动 owner）。
+    /// 查询业务服务是否就绪，不启动或停止服务。
     Readiness(ReadinessArgs),
-    /// 独立监督控制，不依赖 3010 API 能否响应。
+    /// 通过独立监督通道查询、恢复、停止业务或关闭 CLI。
+    ///
+    /// 不依赖业务管理 API 是否可用。stop 停止业务并保留管理入口，
+    /// shutdown 关闭整个 CLI；recover 收束旧执行并恢复管理入口。
     Owner(OwnerArgs),
-    /// 部署 journal 运维（双权威域裁决等）。
+    /// 处理部署日志的状态冲突（运维命令）。
     Journal {
         #[command(subcommand)]
         command: JournalCommand,
@@ -35,9 +51,13 @@ pub enum Command {
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy)]
 pub enum OwnerAction {
+    /// 查询监督进程、业务进程代次与恢复状态。
     Status,
+    /// 收束旧执行，恢复管理入口。
     Recover,
+    /// 停止业务，保留管理入口。
     Stop,
+    /// 停止业务并关闭 CLI。
     Shutdown,
 }
 
@@ -50,6 +70,7 @@ pub struct OwnerArgs {
     /// 重试同一操作时沿用；不提供则生成新的请求 ID。
     #[arg(long)]
     pub request_id: Option<String>,
+    /// 期望的业务进程代次；不匹配时拒绝操作，避免影响新代次。
     #[arg(long)]
     pub generation: Option<String>,
 }

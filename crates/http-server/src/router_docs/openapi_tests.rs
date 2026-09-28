@@ -3,6 +3,20 @@
 use super::*;
 use axum::Router;
 
+/// These generated parameters and request bodies are inline. Fail explicitly
+/// if that contract changes instead of silently skipping a referenced object.
+fn inline<T>(value: &utoipa::openapi::RefOr<T>) -> &T {
+    match value {
+        utoipa::openapi::RefOr::T(value) => value,
+        utoipa::openapi::RefOr::Ref(reference) => {
+            panic!(
+                "expected an inline OpenAPI object, got {}",
+                reference.ref_location
+            )
+        }
+    }
+}
+
 fn operations_of(
     item: &utoipa::openapi::PathItem,
 ) -> Vec<(&'static str, &utoipa::openapi::path::Operation)> {
@@ -261,7 +275,7 @@ fn userapp_params_app_id_visible() {
             continue;
         }
         for (method, op) in operations_of(item) {
-            let params = op.parameters.iter().flatten();
+            let params = op.parameters.iter().flatten().map(inline);
             let mut has_app_id =
                 APP_ID_EXEMPT.contains(&path.as_str()) || path.contains("{app_id}");
             for p in params {
@@ -276,7 +290,9 @@ fn userapp_params_app_id_visible() {
                 let body_ref = op
                     .request_body
                     .as_ref()
+                    .map(inline)
                     .and_then(|rb| rb.content.values().next())
+                    .map(inline)
                     .and_then(|c| c.schema.as_ref())
                     .and_then(|s| match s {
                         utoipa::openapi::RefOr::Ref(r) => Some(r.clone()),
@@ -299,7 +315,9 @@ fn userapp_params_app_id_visible() {
                 && let Some(schema) = op
                     .request_body
                     .as_ref()
+                    .map(inline)
                     .and_then(|body| body.content.values().next())
+                    .map(inline)
                     .and_then(|content| content.schema.as_ref())
             {
                 fn nested_required_app_id(
@@ -765,7 +783,7 @@ fn pod_endpoints_fields_are_documented() {
         }
         for operation in [&item.get, &item.post].into_iter().flatten() {
             if let Some(params) = &operation.parameters {
-                for p in params {
+                for p in params.iter().map(inline) {
                     assert!(
                         p.description.as_ref().is_some_and(|d| !d.trim().is_empty()),
                         "{path} 参数 {:?} 缺少 description（补 doc comment）",

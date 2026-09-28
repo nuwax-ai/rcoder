@@ -132,13 +132,13 @@ fn resolve_base_rev(repo: &Repository, base: &str) -> AppResult<Option<ObjectId>
             ))
         };
     }
-    match repo.find_reference(base) {
-        Ok(mut r) => Ok(Some(
+    match repo.try_find_reference(base) {
+        Ok(Some(mut r)) => Ok(Some(
             r.peel_to_id()
                 .map_err(|e| map_git_err(e, "git peel ref"))?
                 .detach(),
         )),
-        Err(gix::reference::find::existing::Error::NotFound { .. }) => resolve_oid(repo, base),
+        Ok(None) => resolve_oid(repo, base),
         Err(e) => Err(map_git_err(e, "git find_reference")),
     }
 }
@@ -148,9 +148,9 @@ fn resolve_base_rev(repo: &Repository, base: &str) -> AppResult<Option<ObjectId>
 /// ODB 真错误传播（不吞成缺席）。
 fn resolve_oid(repo: &Repository, spec: &str) -> AppResult<Option<ObjectId>> {
     if let Ok(oid) = ObjectId::from_hex(spec.as_bytes()) {
-        return match repo.find_object(oid) {
-            Ok(_) => Ok(Some(oid)),
-            Err(gix::object::find::existing::Error::NotFound { .. }) => Ok(None),
+        return match repo.try_find_object(oid) {
+            Ok(Some(_)) => Ok(Some(oid)),
+            Ok(None) => Ok(None),
             Err(e) => Err(map_git_err(e, "git find_object")),
         };
     }
@@ -192,9 +192,9 @@ fn apply_parent_step(
 
 /// commit 的第 index 个 parent（0 基）。缺席/越界 → Ok(None)。
 fn parent_at(repo: &Repository, oid: ObjectId, index: usize) -> AppResult<Option<ObjectId>> {
-    let obj = match repo.find_object(oid) {
-        Ok(obj) => obj,
-        Err(gix::object::find::existing::Error::NotFound { .. }) => return Ok(None),
+    let obj = match repo.try_find_object(oid) {
+        Ok(Some(obj)) => obj,
+        Ok(None) => return Ok(None),
         Err(e) => return Err(map_git_err(e, "git find_object")),
     };
     if obj.kind != gix::object::Kind::Commit {
@@ -788,6 +788,27 @@ mod tests {
         let r = log_history(&repo, 50, 0, Some("no-such-branch"), None)
             .expect("缺分支必须空列表而非报错");
         assert!(r.is_empty(), "缺失分支: {r:?}");
+    }
+
+    /// gix 升级后的 Option 查询只把缺席映射为空，损坏的 ref/对象仍须报错。
+    #[test]
+    fn log_history_corrupt_reference_and_object_are_errors() {
+        let t = TestRepo::new();
+        std::fs::write(t.0.join(".git/refs/heads/broken"), "invalid object id\n")
+            .expect("write corrupt reference");
+        let oid = "a".repeat(40);
+        let object_dir = t.0.join(".git/objects/aa");
+        std::fs::create_dir_all(&object_dir).expect("create loose object directory");
+        std::fs::write(object_dir.join(&oid[2..]), b"invalid compressed object")
+            .expect("write corrupt object");
+
+        for revision in ["broken", oid.as_str()] {
+            let repo = t.open();
+            assert!(
+                log_history(&repo, 50, 0, Some(revision), None).is_err(),
+                "corrupt {revision} must not be reported as empty history"
+            );
+        }
     }
 
     #[test]

@@ -102,7 +102,7 @@ async fn run() -> anyhow::Result<()> {
     }
     let _guard = init_tracing(&args.log_dir);
 
-    // ── legacy 直跑路径 ──
+    // ── run 前台服务会话：持续编排与监督，直到停止或退出 ──
     let runtime_status = app_cli::runtime_status::RuntimeStatusService::default();
 
     tracing::info!(

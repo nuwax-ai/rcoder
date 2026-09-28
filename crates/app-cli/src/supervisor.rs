@@ -43,7 +43,7 @@ pub struct RunProfile {
     pub pg: Option<shared_types::StartPgCredential>,
 }
 
-/// legacy 直跑形态的档位：migrate 恒执行、dev 由 env 信号、无操作级凭据。
+/// run 前台会话的档位：migrate 恒执行、dev 由 env 信号、无操作级凭据。
 pub fn legacy_run_profile() -> RunProfile {
     RunProfile {
         run_migrations: true,
@@ -52,7 +52,7 @@ pub fn legacy_run_profile() -> RunProfile {
     }
 }
 
-/// 编排主入口（legacy 直跑形态：一次性编排，无外部取消源）。
+/// 前台编排入口：启动服务后持续监督到停止或退出，无外部取消源。
 pub async fn run(args: &RuntimeArgs, runtime_status: RuntimeStatusService) -> Result<()> {
     // 直跑形态（无操作上下文）：env 兜底（R08 显式 profile/凭据仅经 server 形态）
     run_inner(args, runtime_status, None, None, legacy_run_profile()).await

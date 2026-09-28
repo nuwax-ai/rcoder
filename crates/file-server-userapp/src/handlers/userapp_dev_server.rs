@@ -953,6 +953,23 @@ mod operation_recovery_tests {
             let get_committed = committed.clone();
             let owner = Router::new()
                 .route("/v1/runtime/identity", axum::routing::get(move || { let identity = identity.clone(); async move { axum::Json(serde_json::json!({"data": identity})) } }))
+                .route("/v1/runtime/recovery", axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"data": shared_types::RuntimeRecoveryView {
+                        runtime_instance_id: "original-instance".into(),
+                        deployment_generation_id: "generation".into(), revision: 7,
+                        kernel_protected: false, owner_protected: false,
+                        operation_id: None, boundary: None, generation_matches: Some(true),
+                        credentials_required: false, migrations: Default::default(),
+                    }}))
+                }))
+                .route("/v1/runtime/status", axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"data": shared_types::RuntimeStatusView {
+                        desired: shared_types::DesiredState::Stopped,
+                        observed: shared_types::ObservedHealth::Stopped,
+                        active_target: None, revision: 7, active_operation_id: None,
+                        recovery_protection: false, runtime_instance_id: "original-instance".into(),
+                    }}))
+                }))
                 .route("/v1/runtime/operations", axum::routing::post(move |axum::Json(request): axum::Json<shared_types::RuntimeOperationRequest>| {
                     let posts = post_sink.clone(); let committed = post_committed.clone();
                     async move {
@@ -1009,22 +1026,15 @@ mod operation_recovery_tests {
             .unwrap();
             let state = make_state(config.clone());
             assert_eq!(state.fs.dev_server.list_dev().unwrap().len(), 1);
-            // Real outer coordinator must not accept another task or claim this registration is started.
-            let error = spawn_dev_task(
-                state.clone(),
-                "app123",
-                None,
-                None,
-                DevTaskAction::Start,
-                crate::service::userapp::DevWorkspacePrecheck {
-                    ws: workspace.clone(),
-                    dev_source_mode: true,
-                },
-            )
-            .await
-            .unwrap_err();
-            assert!(matches!(error, AppError::Conflict(_)));
-            assert!(error.to_string().contains("original-op"));
+            // A historical transport intent cannot veto a new build. Preflight
+            // observes the live owner without replaying or losing the old request;
+            // the recovery endpoint below must still resume its original identity.
+            state
+                .fs
+                .dev_server
+                .preflight_userapp_build(&dev_key("app123"), &workspace)
+                .await
+                .unwrap();
             assert!(posts.lock().unwrap().is_empty());
             let first = http_recover(state, "original-op", "app123").await;
             assert_eq!(first["success"], false);

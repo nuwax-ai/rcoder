@@ -16,7 +16,7 @@ deploy-host = ["shared_types/deploy-host"]
 # rcoder 侧经 feature `rcoder-pg = ["kubernetes", "rcoder-storage/pg"]` 转发开启。
 pg = ["dep:tokio-postgres", "moka", "dep:toasty", "toasty/postgresql", "dep:toasty-core", "dep:futures", "dep:sha2"]
 # 本地 Turso 控制存储（specs/userapp-turso-local-storage，替代 SQLx SQLite）。
-# default-features = false 裁掉 FTS/分配器等无需求项；nix 供独占目录锁使用。
+# 官方驱动显式开启 FTS、使用系统分配器；nix 供独占目录锁使用。
 userapp-turso = ["dep:toasty", "toasty/turso", "dep:toasty-core", "dep:toasty-driver-turso", "dep:futures", "dep:sha2", "dep:nix"]
 
 [lints]
