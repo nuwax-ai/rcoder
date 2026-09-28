@@ -25,6 +25,8 @@ pub struct FileListParams<'a> {
     pub relative_path: Option<&'a str>,
     /// 原始 recursive 串: 缺省/非 "false" 均按递归 (对齐 TS)。
     pub recursive: Option<&'a str>,
+    /// 受限展开层级原始串 (TS 1.5.4): 仅单层模式生效, 1-10 整数, 缺省不展开。
+    pub depth: Option<&'a str>,
     /// `type`: all/file/dir (directory 为 dir 别名)，缺省 all。
     pub file_type: Option<&'a str>,
     /// `limit`: 非负整数，缺省不限；上限由 usize 表示范围决定。
@@ -36,6 +38,8 @@ pub struct FileListParams<'a> {
 pub struct FileListOutcome {
     pub files: Vec<tree::FileEntry>,
     pub recursive: bool,
+    /// 生效的受限展开层级 (仅单层模式非空); 递归模式恒 None。
+    pub depth: Option<usize>,
     pub file_type: tree::MetaListType,
     pub limit: Option<usize>,
 }
@@ -65,11 +69,73 @@ fn parse_file_list_limit(raw: Option<&str>) -> Result<Option<usize>, AppError> {
     }
 }
 
+/// depth 归一 (对齐 TS 1.5.4 `Number(depth)` 契约): 仅单层模式 (`!recursive`)
+/// 下解析——`None`/空串 = 不展开 (None)；trim 后十进制数值且整数值域 [1,10] →
+/// 生效；其余 (非数值/小数/越界/纯空白, TS Number 空白=0<1 同样报错) → 400。
+/// 已知刻意分歧: TS `Number` 还接受 "0x3"/"1e1" 这类形式, 我方按十进制拒绝。
+/// 递归模式由调用方跳过本函数 (不校验不生效, 回显 null)。
+fn parse_file_list_depth(recursive: bool, raw: Option<&str>) -> Result<Option<usize>, AppError> {
+    if recursive {
+        return Ok(None);
+    }
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let trimmed = value.trim();
+    let invalid = || {
+        AppError::validation_with(
+            "depth 需为 1-10 的整数",
+            json!({ "field": "depth", "value": value }),
+        )
+    };
+    let parsed = trimmed.parse::<f64>().map_err(|_| invalid())?;
+    if parsed.fract() != 0.0 || !(1.0..=10.0).contains(&parsed) {
+        return Err(invalid());
+    }
+    Ok(Some(parsed as usize))
+}
+
 #[cfg(test)]
 mod file_list_options_tests {
-    use super::{parse_file_list_limit, parse_file_list_type};
+    use super::{parse_file_list_depth, parse_file_list_limit, parse_file_list_type};
     use crate::error::AppError;
     use crate::service::tree::MetaListType;
+
+    #[test]
+    fn depth_parses_boundaries_and_rejects_invalid_like_ts_number() {
+        // 缺省/空串 → 不展开
+        assert_eq!(parse_file_list_depth(false, None).unwrap(), None);
+        assert_eq!(parse_file_list_depth(false, Some("")).unwrap(), None);
+        // 边界 1/10 生效; trim/整数值小数形式 ("3.0") 对齐 TS Number
+        assert_eq!(parse_file_list_depth(false, Some("1")).unwrap(), Some(1));
+        assert_eq!(parse_file_list_depth(false, Some("10")).unwrap(), Some(10));
+        assert_eq!(parse_file_list_depth(false, Some(" 3 ")).unwrap(), Some(3));
+        assert_eq!(parse_file_list_depth(false, Some("3.0")).unwrap(), Some(3));
+        // 越界/非整数/非数值/纯空白 (TS Number("  ")=0<1) 均 400
+        for bad in ["0", "11", "3.5", "abc", "  ", "-1"] {
+            let err = parse_file_list_depth(false, Some(bad)).unwrap_err();
+            assert!(matches!(err, AppError::Validation(..)), "{bad}: {err:?}");
+        }
+        // 递归模式: 不校验不生效 (非法值也返回 None, 回显 null)
+        assert_eq!(parse_file_list_depth(true, Some("abc")).unwrap(), None);
+        assert_eq!(parse_file_list_depth(true, Some("3")).unwrap(), None);
+    }
+
+    #[test]
+    fn invalid_depth_echoes_raw_input_in_details() {
+        let AppError::Validation(message, details) =
+            parse_file_list_depth(false, Some("99")).unwrap_err()
+        else {
+            panic!("invalid depth must produce a validation error");
+        };
+        assert_eq!(message, "depth 需为 1-10 的整数");
+        let details = details.expect("validation details");
+        assert_eq!(details["field"], "depth");
+        assert_eq!(details["value"], "99");
+    }
 
     #[test]
     fn options_reject_invalid_values_and_accept_boundary_values() {
@@ -127,11 +193,14 @@ pub async fn get_file_list_core(
     // 注: query 参数经 serde 解析均为字符串, 故只需匹配 "false"。
     // 提前计算: 所有返回点 (含目录不存在的早返回) 都需带上 recursive (对齐 TS 1.3.7)。
     let recursive = !matches!(p.recursive, Some("false"));
+    // depth 仅单层模式生效; 递归模式不校验不生效 (回显 null, 对齐 TS 1.5.4)。
+    let depth = parse_file_list_depth(recursive, p.depth)?;
     // 对齐 nuwax: 目标根目录不存在 → 返回空数组 (非报错), 带 recursive
     if !crate::service::fs_util::path_exists(path).await? {
         return Ok(FileListOutcome {
             files: Vec::new(),
             recursive,
+            depth,
             file_type,
             limit,
         });
@@ -144,6 +213,8 @@ pub async fn get_file_list_core(
         p.relative_path,
         tree::MetaListOptions {
             recursive,
+            // 受限展开层级: 单层模式 + depth 生效时向下展开 N-1 级, 否则 1=纯单层
+            levels_left: depth.unwrap_or(1),
             file_type,
             limit,
         },
@@ -152,6 +223,7 @@ pub async fn get_file_list_core(
     Ok(FileListOutcome {
         files,
         recursive,
+        depth,
         file_type,
         limit,
     })
@@ -182,6 +254,7 @@ pub async fn get_file_list_impl(
         success: true,
         files: computer_file_entries(result.files),
         recursive: result.recursive,
+        depth: result.depth,
         file_type: result.file_type.as_str().to_string(),
         limit: result.limit,
     }))
@@ -252,6 +325,8 @@ pub struct SearchFilesParams<'a> {
     pub max_visit: &'a str,
     pub timeout_ms: &'a str,
     pub custom_target_dir: Option<&'a str>,
+    /// 命中类型过滤 (TS 104d285 `type`): file/dir/directory; 空/非法=全部。
+    pub search_type: Option<&'a str>,
 }
 
 /// search-files 结果（customTargetDir 后缀归各域拼装层）。
@@ -289,6 +364,7 @@ pub async fn search_files_core(
         limit,
         max_visit,
         timeout_ms: timeout_ms as u64,
+        kind_filter: tree::SearchKindFilter::parse(p.search_type),
     })
     .await?;
     Ok(SearchOutcome {

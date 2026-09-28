@@ -60,6 +60,7 @@ pub(crate) async fn get_file_list(
             proxy_path: q.proxy_path.as_deref(),
             relative_path: q.relative_path.as_deref(),
             recursive: q.recursive.as_deref(),
+            depth: q.depth.as_deref(),
             file_type: q.file_type.as_deref(),
             limit: q.limit.as_deref(),
             custom_target_dir: q.custom_target_dir.as_deref(),
@@ -72,6 +73,7 @@ pub(crate) async fn get_file_list(
         "success": true,
         "files": files,
         "recursive": result.recursive,
+        "depth": result.depth,
         "type": result.file_type.as_str(),
         "limit": result.limit,
     })))
@@ -152,6 +154,7 @@ pub(crate) async fn search_files(
             max_visit: &q.max_visit,
             timeout_ms: &q.timeout_ms,
             custom_target_dir: q.custom_target_dir.as_deref(),
+            search_type: q.search_type.as_deref(),
         },
     )
     .await?;
@@ -647,6 +650,7 @@ mod tests {
             custom_target_dir: None,
             relative_path: None,
             recursive: Some("false".into()),
+            depth: None,
             file_type: Some("dir".into()),
             limit: Some("1".into()),
         });

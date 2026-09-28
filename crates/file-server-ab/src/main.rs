@@ -2125,6 +2125,48 @@ fn core_scenarios(fixtures: &Path) -> Result<Vec<(&'static str, RequestSpec)>> {
             )),
         ),
         (
+            "computer-file-list-depth-two",
+            get(format!(
+                "/api/computer/get-file-list?userId={user}&cId={cid}&recursive=false&depth=2"
+            )),
+        ),
+        (
+            "computer-file-list-depth-file-type-descends",
+            get(format!(
+                "/api/computer/get-file-list?userId={user}&cId={cid}&recursive=false&depth=2&type=file"
+            )),
+        ),
+        (
+            "computer-file-list-depth-invalid",
+            get_client_error(format!(
+                "/api/computer/get-file-list?userId={user}&cId={cid}&recursive=false&depth=11"
+            )),
+        ),
+        (
+            "computer-file-list-depth-ignored-in-recursive",
+            get(format!(
+                "/api/computer/get-file-list?userId={user}&cId={cid}&recursive=true&depth=99"
+            )),
+        ),
+        (
+            "computer-search-files-type-file",
+            get(format!(
+                "/api/computer/search-files?userId={user}&cId={cid}&kw=hello&limit=10&maxVisit=100&timeoutMs=1000&type=file"
+            )),
+        ),
+        (
+            "computer-search-files-type-dir",
+            get(format!(
+                "/api/computer/search-files?userId={user}&cId={cid}&kw=hello&limit=10&maxVisit=100&timeoutMs=1000&type=directory"
+            )),
+        ),
+        (
+            "computer-search-files-type-invalid",
+            get(format!(
+                "/api/computer/search-files?userId={user}&cId={cid}&kw=hello&limit=10&maxVisit=100&timeoutMs=1000&type=bogus"
+            )),
+        ),
+        (
             "fs-roots",
             get("/api/computer/fs/roots".to_string()),
         ),

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "typescript_revision": "9f636bfab6dd19f2c3fe916a371e99f604230470",
+  "typescript_revision": "55ac510c916b83f6e50c23e9288983e4f98d67f6",
   "route_sources": [
     "src/routes/*.js",
     "src/server.js"
@@ -928,6 +928,7 @@
   "notes": [
     "Rust-only /api/v1/userapp routes are validated by existing UserApp tests and are outside this TS parity inventory.",
     "A route is covered only when at least one listed A/B case executes it; all others remain pending.",
-    "Revision 9f636bf vs 0cffa11 touched only src/utils (search exclusion + git quoting); route inventory re-verified unchanged (no src/routes or server.js deltas)."
+    "Revision 9f636bf vs 0cffa11 touched only src/utils (search exclusion + git quoting); route inventory re-verified unchanged (no src/routes or server.js deltas).",
+    "Revision 55ac510 (1.5.4) adds get-file-list depth and search-files type params over 104d285/9f636bf; route paths unchanged, new-param cases registered per entry."
   ]
 }

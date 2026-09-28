@@ -220,6 +220,11 @@ pub struct UserappFileListQuery {
     #[garde(skip)]
     /// 是否递归展开子目录；缺省 true，显式 "false" 仅当前层
     pub recursive: Option<String>,
+    #[serde(default)]
+    #[garde(skip)]
+    /// 受限展开层级（TS 1.5.4）：仅单层模式（recursive=false）下生效，1-10
+    /// 整数；缺省不展开。递归模式忽略不校验、回显 null。
+    pub depth: Option<String>,
     #[serde(default, rename = "type")]
     #[garde(skip)]
     /// 输出类型：all（缺省）/file/dir；directory 是 dir 别名。
@@ -268,6 +273,11 @@ pub struct UserappSearchFilesQuery {
     #[garde(skip)]
     /// 相对 workspace 根的子目录（可多级）；缺省列根目录
     pub relative_path: Option<String>,
+    #[serde(default, rename = "type")]
+    #[garde(skip)]
+    /// 命中类型过滤（TS 104d285，userapp 复用同端点语义）：file=仅文件、
+    /// dir/directory=仅目录；空/all/非法=全部（默认，不报错）。仅过滤命中输出。
+    pub search_type: Option<String>,
     #[garde(custom(file_server::validation_rules::not_blank))]
     /// 搜索关键字（文件名/相对路径子串，大小写不敏感；必填非空）
     pub kw: String,

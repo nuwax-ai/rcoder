@@ -99,6 +99,11 @@ pub struct FileListQuery {
     #[serde(default)]
     #[garde(skip)]
     pub recursive: Option<String>,
+    /// 受限展开层级 (可选, TS 1.5.4)：仅单层模式 (recursive=false) 下生效,
+    /// 1-10 整数 (N=目录向下再展开 N-1 级); 缺省不展开。递归模式忽略不校验。
+    #[serde(default)]
+    #[garde(skip)]
+    pub depth: Option<String>,
     /// 输出类型：all（缺省）/file/dir；directory 是 dir 别名。
     /// 递归模式仅返回原扁平结果中的目录（空目录）。
     #[serde(default, rename = "type")]
@@ -201,6 +206,12 @@ pub struct SearchFilesQuery {
     #[serde(default)]
     #[garde(skip)]
     pub relative_path: Option<String>,
+    /// 命中类型过滤 (可选, TS 104d285)：`file`=仅文件、`dir`/`directory`=仅目录；
+    /// 空/all/非法 = 全部 (默认, 保持既有行为, 不报错)。仅过滤命中输出,
+    /// 不影响遍历下钻——type=file 时目录仍递归, 深层文件才搜得到。
+    #[serde(default, rename = "type")]
+    #[garde(skip)]
+    pub search_type: Option<String>,
     /// 关键词（对文件名做大小写敏感包含匹配）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub kw: String,

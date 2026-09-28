@@ -496,6 +496,9 @@ pub struct FileListResult {
     pub files: Vec<ComputerFileEntry>,
     /// 是否递归列出
     pub recursive: bool,
+    /// 生效的受限展开层级（TS 1.5.4）：仅单层模式（recursive=false）下非空，
+    /// 1-10；递归模式恒 null（不校验不生效）。键恒存在（null 表示未启用）。
+    pub depth: Option<usize>,
     /// 生效的过滤类型（all/file/dir）
     #[serde(rename = "type")]
     pub file_type: String,
@@ -1444,10 +1447,11 @@ mod wire_shape_tests {
                     is_dir: true,
                 }],
                 recursive: true,
+                depth: None,
                 file_type: "all".into(),
                 limit: None,
             }),
-            ["success", "files", "recursive", "type", "limit"]
+            ["success", "files", "recursive", "depth", "type", "limit"]
         );
         let file_entry = ComputerFileEntry::File {
             name: "a.txt".into(),

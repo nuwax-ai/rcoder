@@ -57,6 +57,36 @@ fn is_search_noise_dir(name: &str) -> bool {
     SEARCH_NOISE_DIR_NAMES.contains(&name)
 }
 
+/// search-files 命中类型过滤 (TS 104d285 `type` 参数归一后的两种有效形态):
+/// File=仅文件命中 / Dir=仅目录命中; None=全部 (空/all/非法, 保持既有行为)。
+/// 仅过滤命中输出, 不影响遍历下钻——type=file 时目录仍递归, 深层文件才搜得到。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchKindFilter {
+    File,
+    Dir,
+}
+
+impl SearchKindFilter {
+    /// 归一化解析 (口径同 get-file-list 的 MetaListType): trim + 小写后
+    /// `file`→File、`dir`/`directory`→Dir; 空/all/非法→None (不过滤, 不报错)。
+    pub fn parse(raw: Option<&str>) -> Option<Self> {
+        let raw = raw?.trim().to_lowercase();
+        match super::MetaListType::parse_normalized(&raw) {
+            Some(super::MetaListType::File) => Some(Self::File),
+            Some(super::MetaListType::Dir) => Some(Self::Dir),
+            _ => None,
+        }
+    }
+
+    /// 条目类别是否允许进入命中输出 (对齐 TS allowsMatch)。
+    fn allows(self, is_dir: bool) -> bool {
+        match self {
+            Self::File => !is_dir,
+            Self::Dir => is_dir,
+        }
+    }
+}
+
 /// 搜索结果 (对齐 TS `{files, truncated, visited}`)。
 #[derive(Serialize)]
 pub struct SearchResult {
@@ -85,6 +115,8 @@ pub struct SearchParams<'a> {
     pub max_visit: usize,
     /// 超时毫秒数。
     pub timeout_ms: u64,
+    /// 命中类型过滤 (TS 104d285 `type`); None=全部。仅过滤命中输出, 不影响遍历。
+    pub kind_filter: Option<SearchKindFilter>,
 }
 
 /// 无索引有界实时搜索 (并行遍历): 返回命中项, 受 `limit`/`max_visit`/`timeout_ms` 三重边界约束。
@@ -110,6 +142,7 @@ pub async fn search_files(params: SearchParams<'_>) -> AppResult<SearchResult> {
         limit,
         max_visit,
         timeout_ms,
+        kind_filter,
     } = params;
     let kw_lower = kw.to_lowercase();
     let timeout = Duration::from_millis(timeout_ms);
@@ -149,6 +182,7 @@ pub async fn search_files(params: SearchParams<'_>) -> AppResult<SearchResult> {
         limit,
         max_visit,
         timeout,
+        kind_filter,
     };
 
     // 同步遍历放在 spawn_blocking 里: 目录遍历是 syscall 密集型, 在专用线程跑
@@ -186,6 +220,8 @@ struct BlockingCtx {
     limit: usize,
     max_visit: usize,
     timeout: Duration,
+    /// 命中类型过滤; None=全部 (TS 104d285)。
+    kind_filter: Option<SearchKindFilter>,
 }
 
 /// 阻塞线程内的同步遍历 + 关键字过滤。
@@ -285,6 +321,12 @@ fn search_blocking(ctx: &BlockingCtx) -> (Vec<FileEntry>, bool, usize) {
         // TS 原版的两查在结果上等价于单查 rel。零分配大小写不敏感匹配
         // (ASCII 快速路径; 非 ASCII fallback Unicode to_lowercase 保持语义)。
         if !contains_ignore_case(&rel, &ctx.kw_lower) {
+            continue;
+        }
+
+        // 类型过滤仅作用于命中输出 (TS 104d285 allowsMatch): 类别不符的条目
+        // 不进结果也不占用 limit; visited/遍历下钻不受影响; 无过滤(None)全放行。
+        if ctx.kind_filter.is_some_and(|f| !f.allows(is_dir)) {
             continue;
         }
 
@@ -432,6 +474,7 @@ mod tests {
             limit: 100,
             max_visit: 1000,
             timeout_ms: 5000,
+            kind_filter: None,
         })
         .await
         .unwrap();
@@ -460,6 +503,7 @@ mod tests {
             limit: 100,
             max_visit: 1000,
             timeout_ms: 5000,
+            kind_filter: None,
         })
         .await
         .unwrap();
@@ -483,6 +527,7 @@ mod tests {
             limit: 1,
             max_visit: 1000,
             timeout_ms: 5000,
+            kind_filter: None,
         })
         .await
         .unwrap();
@@ -513,6 +558,7 @@ mod tests {
             limit: 100,
             max_visit: 1000,
             timeout_ms: 5000,
+            kind_filter: None,
         })
         .await
         .unwrap();
@@ -545,6 +591,7 @@ mod tests {
             limit: 100,
             max_visit: 1000,
             timeout_ms: 5000,
+            kind_filter: None,
         })
         .await
         .unwrap();
@@ -587,6 +634,7 @@ mod tests {
                 limit: 100,
                 max_visit: 1000,
                 timeout_ms: 5000,
+                kind_filter: None,
             })
             .await
             .unwrap();
@@ -629,6 +677,7 @@ mod tests {
             limit: 100,
             max_visit: 1000,
             timeout_ms: 5000,
+            kind_filter: None,
         })
         .await
         .unwrap();
@@ -654,6 +703,7 @@ mod tests {
             limit: 100,
             max_visit: 1000,
             timeout_ms: 5000,
+            kind_filter: None,
         })
         .await
         .unwrap();
@@ -688,6 +738,7 @@ mod tests {
             limit: 100,
             max_visit: 1000,
             timeout_ms: 5000,
+            kind_filter: None,
         })
         .await
         .unwrap();
@@ -697,6 +748,81 @@ mod tests {
             "撞排除文件名的目录子树不应可见: {names:?}"
         );
         assert!(names.contains(&"keep-target.txt"));
+    }
+
+    #[tokio::test]
+    async fn search_files_kind_filter_selects_output_type() {
+        // TS 104d285: type=file/dir 只过滤命中输出——kw 同时命中目录节点与
+        // 文件时按类别筛; type=file 时目录仍下钻, 深层文件必须能搜到。
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("sub").join("nested"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("sub").join("nested").join("sub.txt"), "x")
+            .await
+            .unwrap();
+        let cfg = default_test_config();
+        let run = |kind_filter| {
+            search_files(SearchParams {
+                root: tmp.path(),
+                config: &cfg,
+                proxy_path: None,
+                kw: "sub",
+                relative_path: None,
+                limit: 100,
+                max_visit: 1000,
+                timeout_ms: 5000,
+                kind_filter,
+            })
+        };
+        let all = run(None).await.unwrap();
+        let names: Vec<&str> = all.files.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"sub"), "默认含目录节点: {names:?}");
+        assert!(
+            names.contains(&"sub/nested/sub.txt"),
+            "默认含文件: {names:?}"
+        );
+
+        let files_only = run(Some(SearchKindFilter::File)).await.unwrap();
+        assert!(
+            files_only.files.iter().all(|f| !f.is_dir),
+            "type=file 不应有目录命中: {:?}",
+            files_only
+                .files
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<Vec<_>>()
+        );
+        let names: Vec<&str> = files_only.files.iter().map(|f| f.name.as_str()).collect();
+        assert!(
+            names.contains(&"sub/nested/sub.txt"),
+            "type=file 深层文件必须能搜到 (目录仍下钻): {names:?}"
+        );
+
+        let dirs_only = run(Some(SearchKindFilter::Dir)).await.unwrap();
+        let names: Vec<&str> = dirs_only.files.iter().map(|f| f.name.as_str()).collect();
+        // kw="sub" 同时命中 sub 与 sub/nested 两个目录节点 (rel 含 "sub")
+        assert_eq!(
+            names,
+            vec!["sub", "sub/nested"],
+            "type=dir 仅目录节点: {names:?}"
+        );
+    }
+
+    #[test]
+    fn search_kind_filter_parse_matches_ts_normalization() {
+        use SearchKindFilter::{Dir, File};
+        assert_eq!(SearchKindFilter::parse(None), None);
+        assert_eq!(SearchKindFilter::parse(Some("")), None);
+        assert_eq!(SearchKindFilter::parse(Some("   ")), None);
+        assert_eq!(SearchKindFilter::parse(Some("all")), None);
+        assert_eq!(SearchKindFilter::parse(Some("bogus")), None);
+        assert_eq!(SearchKindFilter::parse(Some("file")), Some(File));
+        assert_eq!(SearchKindFilter::parse(Some("FILE")), Some(File));
+        assert_eq!(SearchKindFilter::parse(Some(" File ")), Some(File));
+        assert_eq!(SearchKindFilter::parse(Some("dir")), Some(Dir));
+        assert_eq!(SearchKindFilter::parse(Some("directory")), Some(Dir));
+        assert_eq!(SearchKindFilter::parse(Some(" Directory ")), Some(Dir));
     }
 
     #[tokio::test]
@@ -713,6 +839,7 @@ mod tests {
             limit: 100,
             max_visit: 1000,
             timeout_ms: 5000,
+            kind_filter: None,
         })
         .await
         .unwrap();
@@ -735,6 +862,7 @@ mod tests {
             limit: 100,
             max_visit: 1000,
             timeout_ms: 5000,
+            kind_filter: None,
         })
         .await
         .unwrap();

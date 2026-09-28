@@ -13,7 +13,7 @@ pub mod resolve;
 pub mod search;
 
 pub use resolve::{FileResolveResult, resolve_existing_file};
-pub use search::{SearchParams, SearchResult, search_files};
+pub use search::{SearchKindFilter, SearchParams, SearchResult, search_files};
 
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
@@ -126,6 +126,9 @@ impl std::fmt::Display for MetaListType {
 #[derive(Clone, Copy, Debug)]
 pub struct MetaListOptions {
     pub recursive: bool,
+    /// 受限展开层级 (TS 1.5.4 `depth`): 默认 1=纯单层; N>1 时单层模式下目录
+    /// 向下再展开 N-1 级 (DFS, 目录条目后紧跟其子项)。递归模式忽略此值。
+    pub levels_left: usize,
     pub file_type: MetaListType,
     pub limit: Option<usize>,
 }
@@ -158,6 +161,7 @@ pub async fn list_files_meta(
         relative_path,
         MetaListOptions {
             recursive,
+            levels_left: 1,
             file_type: MetaListType::All,
             limit: None,
         },
@@ -317,8 +321,12 @@ pub(super) fn build_file_proxy_url(proxy_path: Option<&str>, relative: &str) -> 
 
 // ── 内部遍历实现 ────────────────────────────────────────────────────────────────
 
-/// 单层遍历 (对齐 nuwax computer `listDirectoryLevel`): 仅列出 `dir` 下一层条目, 不递归。
+/// 单层/受限层级遍历 (对齐 nuwax computer `listDirectoryLevel`): `levels_left=1`
+/// 仅列 `dir` 下一层; N>1 时目录向下再展开 N-1 级 (TS 1.5.4 `depth`, DFS——
+/// 目录条目后紧跟其子项)。
 /// 空目录 (无任何可见条目) 不会产生节点 (TS listDirectoryLevel 同样不返回空目录自身)。
+/// type=file 时目录条目不输出但**仍下钻** (深层文件取得到, 与 search 的 type 口径
+/// 一致); 达 limit 后不再下钻; 单个子目录不可读 → WARN 跳过其子树不拖垮请求。
 async fn list_directory_level(
     root: &Path,
     dir: &Path,
@@ -332,25 +340,44 @@ async fn list_directory_level(
         if options.reached_limit(out.len()) {
             break;
         }
-        if (is_dir && options.file_type == MetaListType::File)
-            || (!is_dir && options.file_type == MetaListType::Dir)
-        {
-            continue;
+        if !is_dir && options.file_type == MetaListType::Dir {
+            continue; // type=dir 下文件不输出; type=file 下目录仍需下钻 (下方统一处理)
         }
         let relative = make_relative_path(root, &path);
         if !is_safe_list_link(root, &relative, is_link).await {
             continue;
         }
         if is_dir {
-            out.push(FileEntry {
-                name: relative,
-                is_dir: true,
-                binary: None,
-                size_exceeded: None,
-                contents: None,
-                file_proxy_url: None,
-                is_link: Some(is_link),
-            });
+            if options.file_type != MetaListType::File {
+                out.push(FileEntry {
+                    name: relative.clone(),
+                    is_dir: true,
+                    binary: None,
+                    size_exceeded: None,
+                    contents: None,
+                    file_proxy_url: None,
+                    is_link: Some(is_link),
+                });
+            }
+            // 层级未用尽且未达 limit 时下钻; 子目录读失败保留目录条目、跳过子树
+            if options.levels_left > 1 && !options.reached_limit(out.len()) {
+                let child_options = MetaListOptions {
+                    levels_left: options.levels_left - 1,
+                    ..options
+                };
+                if let Err(error) = Box::pin(list_directory_level(
+                    root,
+                    &path,
+                    config,
+                    proxy_path,
+                    child_options,
+                    out,
+                ))
+                .await
+                {
+                    tracing::warn!(error = %error, subtree = %relative, "depth descent failed, skip subtree");
+                }
+            }
         } else {
             out.push(FileEntry {
                 name: relative.to_string(),
@@ -606,6 +633,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_files_meta_depth_expands_levels_in_dfs_order() {
+        // TS 1.5.4 depth: 单层模式 levels_left=2 时目录向下展开一层,
+        // DFS 顺序 (目录条目后紧跟其子项); 层级用尽不再深入 (nested 子项不出现)。
+        let tmp = tempfile::tempdir().unwrap();
+        make_test_tree(tmp.path()).await;
+        let cfg = default_test_config();
+        let entries = list_files_meta_filtered(
+            tmp.path(),
+            &cfg,
+            None,
+            None,
+            MetaListOptions {
+                recursive: false,
+                levels_left: 2,
+                file_type: MetaListType::All,
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        // 根层排序目录在前 (sub 先于文件); DFS: sub 条目后紧跟其子项
+        // (nested 目录在前, 再 c.txt/d.log); 层级用尽不再深入
+        assert_eq!(
+            names,
+            vec![
+                "sub",
+                "sub/nested",
+                "sub/c.txt",
+                "sub/d.log",
+                "a.txt",
+                "b.md"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_files_meta_depth_with_file_type_still_descends_dirs() {
+        // type=file 时目录条目不输出但**仍下钻** (深层文件取得到, 与 search 口径一致)
+        let tmp = tempfile::tempdir().unwrap();
+        make_test_tree(tmp.path()).await;
+        let cfg = default_test_config();
+        let entries = list_files_meta_filtered(
+            tmp.path(),
+            &cfg,
+            None,
+            None,
+            MetaListOptions {
+                recursive: false,
+                levels_left: 2,
+                file_type: MetaListType::File,
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        // sub 先处理 (不输出目录条目但下钻), 其子项后于根层文件之前
+        assert_eq!(names, vec!["sub/c.txt", "sub/d.log", "a.txt", "b.md"]);
+    }
+
+    #[tokio::test]
+    async fn list_files_meta_depth_descent_stops_at_limit() {
+        // 达 limit 后停止: 目录在前的根层序 sub 先 push(1), 下钻 nested(2),
+        // c.txt(3) 推满即停; 外层与子层后续条目都不再输出
+        let tmp = tempfile::tempdir().unwrap();
+        make_test_tree(tmp.path()).await;
+        let cfg = default_test_config();
+        let entries = list_files_meta_filtered(
+            tmp.path(),
+            &cfg,
+            None,
+            None,
+            MetaListOptions {
+                recursive: false,
+                levels_left: 2,
+                file_type: MetaListType::All,
+                limit: Some(3),
+            },
+        )
+        .await
+        .unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["sub", "sub/nested", "sub/c.txt"]);
+    }
+
+    #[tokio::test]
     async fn list_files_meta_type_filter_keeps_natural_empty_dir_and_limits_output() {
         let tmp = tempfile::tempdir().unwrap();
         make_test_tree(tmp.path()).await;
@@ -614,6 +728,7 @@ mod tests {
 
         let dir_options = MetaListOptions {
             recursive: true,
+            levels_left: 1,
             file_type: MetaListType::Dir,
             limit: None,
         };

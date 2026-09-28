@@ -60,6 +60,7 @@ pub(crate) async fn get_file_list(
             proxy_path: q.proxy_path.as_deref(),
             relative_path: q.relative_path.as_deref(),
             recursive: q.recursive.as_deref(),
+            depth: q.depth.as_deref(),
             file_type: q.file_type.as_deref(),
             limit: q.limit.as_deref(),
             custom_target_dir: q.custom_target_dir.as_deref(),
@@ -112,7 +113,7 @@ pub(crate) async fn resolve_file(
 
 /// 搜索文件
 ///
-/// 对齐 nuwax searchFiles, commit ba08d0c:
+/// 对齐 nuwax searchFiles, commit ba08d0c + 104d285 (type 命中类型过滤):
 /// 无索引有界实时搜索; `limit`/`maxVisit`/`timeoutMs` 为必填正整数 (由网关传入)。
 #[utoipa::path(
     get,
@@ -150,6 +151,7 @@ pub(crate) async fn search_files(
             max_visit: &q.max_visit,
             timeout_ms: &q.timeout_ms,
             custom_target_dir: q.custom_target_dir.as_deref(),
+            search_type: q.search_type.as_deref(),
         },
     )
     .await
@@ -269,6 +271,7 @@ mod tests {
             app_id: None,
             relative_path: None,
             recursive: None, // 缺省 = 递归
+            depth: None,
             file_type: None,
             limit: None,
         });
@@ -313,6 +316,7 @@ mod tests {
             app_id: None,
             relative_path: None,
             recursive: Some("false".into()),
+            depth: None,
             file_type: None,
             limit: None,
         });
@@ -347,6 +351,7 @@ mod tests {
             app_id: None,
             relative_path: None,
             recursive: None,
+            depth: None,
             file_type: None,
             limit: None,
         });
@@ -376,6 +381,7 @@ mod tests {
             app_id: None,
             relative_path: None,
             recursive: Some("false".into()),
+            depth: None,
             file_type: None,
             limit: None,
         });
@@ -411,6 +417,7 @@ mod tests {
             app_id: None,
             relative_path: None,
             recursive: Some("false".into()),
+            depth: None,
             file_type: Some("FiLe".into()),
             limit: Some("1".into()),
         });
@@ -544,6 +551,7 @@ mod tests {
             workspace_type: None,
             app_id: None,
             relative_path: None,
+            search_type: None,
             kw: ".txt".into(),
             limit: "100".into(),
             max_visit: "1000".into(),
@@ -585,6 +593,7 @@ mod tests {
             workspace_type: None,
             app_id: None,
             relative_path: None,
+            search_type: None,
             kw: "x".into(),
             limit: "0".into(), // 非正
             max_visit: "1000".into(),
@@ -612,6 +621,7 @@ mod tests {
             workspace_type: None,
             app_id: None,
             relative_path: None,
+            search_type: None,
             kw: "".into(),
             limit: "100".into(),
             max_visit: "1000".into(),
@@ -651,6 +661,7 @@ mod tests {
             app_id: None,
             relative_path: None,
             recursive: None,
+            depth: None,
             file_type: None,
             limit: None,
         });
@@ -682,6 +693,7 @@ mod tests {
             app_id: None,
             relative_path: None,
             recursive: None,
+            depth: None,
             file_type: None,
             limit: None,
         });
