@@ -119,6 +119,7 @@ jobs:
         shell: bash
         run: |
           choco install protoc nasm -y --no-progress
+          echo 'C:\ProgramData\chocolatey\bin' >> "$GITHUB_PATH"
           echo "C:\Program Files\NASM" >> "$GITHUB_PATH"
 
       # linux 双架构走 cargo-zigbuild（glibc 钉 2.17，见文件头注释）。
@@ -215,7 +216,10 @@ jobs:
           ref: ${{ env.PINGAP_REV }}
 
       - name: Install protoc
-        run: choco install protoc -y --no-progress
+        shell: bash
+        run: |
+          choco install protoc -y --no-progress
+          echo 'C:\ProgramData\chocolatey\bin' >> "$GITHUB_PATH"
 
       - name: Show Rust toolchain
         shell: bash
