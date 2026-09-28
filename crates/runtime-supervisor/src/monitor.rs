@@ -697,8 +697,21 @@ impl State {
             }
         }
         if self.child.is_some() {
-            let generation = record::generation(&self.work()?)?;
-            if generation.phase == GenerationPhase::Draining {
+            // 收据可见性（2026-09-28）：共享挂载上周期读可能短暂 NotFound。
+            // 一次缺失不退出监督循环（`?` 会终止整个 Owner::run，丢掉 Child
+            // 与控制入口），也不得当作已清理；短窗内重读，持续缺失上报
+            // Problem 并保留监督。非 NotFound（损坏/权限）照常传播。
+            let generation = match record::generation(&self.work()?) {
+                Ok(generation) => Some(generation),
+                Err(error) if process_utils::observe::is_not_found(&error) => {
+                    tracing::warn!(error = %error, "generation receipt briefly unreadable");
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(generation) = generation
+                && generation.phase == GenerationPhase::Draining
+            {
                 let problem = Problem {
                     code: FailureCode::CleanupInProgress,
                     message: generation.error.unwrap_or_else(|| {

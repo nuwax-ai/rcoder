@@ -53,17 +53,29 @@ pub(crate) async fn spawn(root: &Path, launch: &Launch) -> Result<Child> {
 }
 
 pub(crate) async fn run(root: &Path) -> Result<i32> {
-    let _lock = record::lock(&root.join("generation.lock"))?;
-    let mut generation = record::generation(root)?;
+    // 启动首读纳入有界观察（收据可见性，2026-09-28）：monitor 在 spawn 本进程
+    // 前刚写 Pending 收据并重写 supervisor 状态，共享挂载上 lock/generation/
+    // owner 锁可能短暂不可见。每轮重新取锁（轮间释放）；phase 身份检查在观察
+    // 之外——已消费/已撤销不是可见性问题，立即拒绝。
+    let (_lock, mut generation) = process_utils::observe::observe(
+        "root guardian startup",
+        Duration::from_secs(3),
+        || async {
+            let lock = record::lock(&root.join("generation.lock"))?;
+            let generation = record::generation(root)?;
+            let scope = root
+                .parent()
+                .and_then(Path::parent)
+                .context("worker scope missing")?;
+            record::is_locked(&scope.join("owner.lock"))?;
+            Ok(Some((lock, generation)))
+        },
+    )
+    .await?;
     ensure!(
         generation.phase == GenerationPhase::Pending,
         "worker authorization already consumed"
     );
-    let scope = root
-        .parent()
-        .and_then(Path::parent)
-        .context("worker scope missing")?;
-    record::is_locked(&scope.join("owner.lock"))?;
     let mut input = tokio::io::BufReader::new(tokio::io::stdin());
     let mut bytes = Vec::new();
     tokio::time::timeout(
@@ -78,8 +90,19 @@ pub(crate) async fn run(root: &Path) -> Result<i32> {
         "invalid worker launch frame"
     );
     let launch: Launch = serde_json::from_slice(&bytes)?;
-    let gate = process_utils::command_authority::Gate::acquire(root).await?;
-    gate.require_open()?;
+    // 准入读取纳入有界观察（收据可见性）：command-admission 由 monitor 在
+    // spawn 本进程前初始化，共享挂载上可能短暂不可见/锁短暂忙碌；拒绝
+    // （no longer accepts work）不在观察内。try_acquire 无内建等待。
+    let gate = process_utils::observe::observe(
+        "guardian command admission",
+        Duration::from_secs(3),
+        || async {
+            let gate = process_utils::command_authority::Gate::try_acquire(root)?;
+            gate.require_open()?;
+            Ok(Some(gate))
+        },
+    )
+    .await?;
     generation.phase = GenerationPhase::Running;
     record::save(&root.join("generation.json"), &generation)?;
     let mut command = tokio::process::Command::new(&launch.program);

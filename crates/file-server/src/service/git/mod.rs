@@ -141,24 +141,43 @@ pub fn ensure_gitignore(path: &Path) -> AppResult<()> {
 /// 打开或初始化仓库 (对齐 nuwax ensureGitRepo 的 open/init 部分; initial commit 见 write::commit_indexed)。
 pub fn ensure_repo(path: &Path) -> AppResult<Repository> {
     if is_git_repo(path) {
-        open(path).map_err(|e| AppError::system(format!("git open failed: {e}")))
+        let repo = open(path).map_err(|e| AppError::system(format!("git open failed: {e}")))?;
+        ensure_index_file(&repo)?;
+        Ok(repo)
     } else {
         let repo = init(path).map_err(|e| AppError::system(format!("git init failed: {e}")))?;
         // nuwax 显式 defaultBranch=main；覆盖宿主机/镜像中的 init.defaultBranch 配置。
         set_unborn_head_to_main(&repo)?;
-        // 新 repo 无 .git/index 文件, 从空 tree 创建空 index (否则首次 stage 的 open_index 失败)
-        let empty_id = repo
-            .head_tree_id_or_empty()
-            .map_err(|e| AppError::system(format!("git head_tree: {e}")))?
-            .detach();
-        let mut idx = repo
-            .index_from_tree(&empty_id)
-            .map_err(|e| AppError::system(format!("git index_from_tree: {e}")))?;
-        idx.remove_tree();
-        idx.write(IndexWriteOptions::default())
-            .map_err(|e| AppError::system(format!("git index write: {e}")))?;
+        write_initial_index(&repo)?;
         Ok(repo)
     }
+}
+
+/// gix `open_index` 严格失败，而 git CLI 把缺失的 index 视为合法空态——TS 时代
+/// (git CLI/isomorphic-git init) 与外部工具创建的仓库只有 `.git` 没有 index 文件，
+/// 首次 gix 读操作即报 "An IO error occurred while opening the index"。在所有
+/// git 操作的必经收口自愈一次：unborn HEAD → 空 index；有提交 → 从 HEAD tree
+/// 重建 (git reset 语义，未提交改动按 modified/untracked 正常呈现)。
+fn ensure_index_file(repo: &Repository) -> AppResult<()> {
+    if repo.index_path().exists() {
+        return Ok(());
+    }
+    write_initial_index(repo)
+}
+
+/// 从 HEAD tree 写出 index (无 .git/index 文件时补齐; 否则首次 stage 的 open_index 失败)。
+fn write_initial_index(repo: &Repository) -> AppResult<()> {
+    let tree_id = repo
+        .head_tree_id_or_empty()
+        .map_err(|e| AppError::system(format!("git head_tree: {e}")))?
+        .detach();
+    let mut idx = repo
+        .index_from_tree(&tree_id)
+        .map_err(|e| AppError::system(format!("git index_from_tree: {e}")))?;
+    idx.remove_tree();
+    idx.write(IndexWriteOptions::default())
+        .map_err(|e| AppError::system(format!("git index write: {e}")))?;
+    Ok(())
 }
 
 fn set_unborn_head_to_main(repo: &Repository) -> AppResult<()> {
@@ -225,5 +244,62 @@ mod tests {
 
         assert!(matches!(error, AppError::Resource(_)));
         assert!(!project_root.join("missing").exists());
+    }
+
+    fn fresh_repo_dir(kind: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "file-server-git-mod-test-{kind}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create test repo");
+        path
+    }
+
+    /// 反例 (线上 app-1694246): TS 时代/git CLI 创建的仓库只有 .git 没有 index
+    /// 文件 (gix init 亦然)，gix open_index 严格失败——修复前 get_status 报
+    /// "git status open_index: An IO error occurred while opening the index"。
+    #[test]
+    fn ensure_repo_backfills_missing_index_for_index_less_unborn_repo() {
+        let dir = fresh_repo_dir("ts-era");
+        let repo = init(&dir).expect("gix init (不写 index)");
+        set_unborn_head_to_main(&repo).expect("HEAD → main");
+        drop(repo);
+        std::fs::write(dir.join("note.md"), "工作区已有文件").expect("写工作区文件");
+        assert!(
+            !dir.join(".git/index").exists(),
+            "前置: git CLI/gix init 均不写 .git/index"
+        );
+
+        let repo = ensure_repo(&dir).expect("打开无 index 的既有仓库");
+        assert!(dir.join(".git/index").exists(), "自愈: 补写 index 文件");
+        let status = get_status(&repo).expect("补写后 status 可用");
+        assert_eq!(status.untracked, vec!["note.md".to_string()]);
+        assert!(status.staged.is_empty());
+        assert!(status.conflicted.is_empty());
+    }
+
+    /// 有提交的仓库丢了 index: 从 HEAD tree 重建 (git reset 语义)，
+    /// 已提交文件回到干净态，未提交改动按 modified/untracked 呈现。
+    #[test]
+    fn ensure_repo_rebuilds_missing_index_from_head_tree_for_born_repo() {
+        let dir = fresh_repo_dir("born-lost-index");
+        let repo = ensure_repo(&dir).expect("init");
+        std::fs::write(dir.join("app.txt"), "v1").expect("写文件");
+        stage_path(&repo, "app.txt").expect("stage");
+        commit_indexed(&repo, "c1", "Test", "test@example.com").expect("commit");
+        std::fs::remove_file(dir.join(".git/index")).expect("模拟 index 丢失");
+        std::fs::write(dir.join("app.txt"), "v2").expect("提交后修改");
+        std::fs::write(dir.join("new.txt"), "n").expect("新增未跟踪");
+
+        let repo = ensure_repo(&dir).expect("重开丢 index 仓库");
+        let status = get_status(&repo).expect("status");
+        assert_eq!(status.modified, vec!["app.txt".to_string()]);
+        assert_eq!(status.untracked, vec!["new.txt".to_string()]);
+        assert!(status.staged.is_empty());
+        assert!(status.deleted.is_empty());
     }
 }

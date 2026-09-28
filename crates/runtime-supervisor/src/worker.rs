@@ -62,48 +62,66 @@ pub struct Worker {
 impl Worker {
     /// Environment variables select a candidate; held execution authorization,
     /// generation identity, and a live supervisor must all agree before bypass.
+    ///
+    /// 启动观察（收据可见性，2026-09-28）：monitor/guardian 在 spawn 本进程
+    /// 前数十毫秒内刚写收据与 supervisor.json，共享挂载上可能短暂不可见。
+    /// 每轮 attempt 完整重查（resolve/收据/PID/scope/token/phase/锁/父身份/
+    /// 准入），仅 NotFound 与准入锁短暂忙碌在单一预算内重试；身份不符立即
+    /// 拒绝；不拼接两轮观察放行。Gate 用 try_acquire（无内建等待），避免
+    /// 预算叠加。
     pub async fn from_env(scope: &Path) -> Result<Option<Self>> {
         let Some(path) = std::env::var_os(WORKER_ENV) else {
             return Ok(None);
         };
-        let root = std::fs::canonicalize(PathBuf::from(path)).context("resolve worker scope")?;
-        let scope = std::fs::canonicalize(scope).context("resolve supervisor scope")?;
-        let mut record = record::generation(&root)?;
-        // The guardian persists the actual child PID immediately after spawn.
-        // A copied environment cannot authorize a second worker for this scope.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        while record.worker_pid.is_none() && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            record = record::generation(&root)?;
-        }
-        ensure!(
-            record.worker_pid == Some(std::process::id()),
-            "worker is not the guardian's authorized child"
-        );
-        ensure!(
-            record::work_root(&scope, &record.id)? == root,
-            "worker belongs to a different scope"
-        );
-        ensure!(
-            std::env::var(TOKEN_ENV).ok().as_deref() == Some(&record.token),
-            "invalid worker launch token"
-        );
-        ensure!(
-            record.phase == GenerationPhase::Running,
-            "worker launch is not active"
-        );
-        record::is_locked(&root.join("generation.lock"))?;
-        record::is_locked(&scope.join("owner.lock"))?;
-        let parent: control::Discovery = record::read(&scope.join("supervisor.json"))?;
-        ensure!(
-            parent.instance == record.supervisor
-                && parent.snapshot.generation.as_deref() == Some(&record.id),
-            "worker launch belongs to a retired supervisor"
-        );
-        process_utils::command_authority::Gate::acquire(&root)
-            .await?
-            .require_open()?;
-        Ok(Some(Self { root, record }))
+        let worker =
+            process_utils::observe::observe("worker authorization", Duration::from_secs(3), || {
+                let root_env = PathBuf::from(&path);
+                let scope = scope.to_path_buf();
+                async move {
+                    let root = std::fs::canonicalize(&root_env).context("resolve worker scope")?;
+                    let scope =
+                        std::fs::canonicalize(&scope).context("resolve supervisor scope")?;
+                    let record = record::generation(&root)?;
+                    // The guardian persists the actual child PID immediately after
+                    // spawn; until then the observation is not ready. A copied
+                    // environment cannot authorize a second worker for this scope.
+                    let Some(worker_pid) = record.worker_pid else {
+                        return Ok(None);
+                    };
+                    ensure!(
+                        worker_pid == std::process::id(),
+                        "worker is not the guardian's authorized child"
+                    );
+                    ensure!(
+                        record::work_root(&scope, &record.id)? == root,
+                        "worker belongs to a different scope"
+                    );
+                    ensure!(
+                        std::env::var(TOKEN_ENV).ok().as_deref() == Some(&record.token),
+                        "invalid worker launch token"
+                    );
+                    ensure!(
+                        record.phase == GenerationPhase::Running,
+                        "worker launch is not active"
+                    );
+                    record::is_locked(&root.join("generation.lock"))?;
+                    record::is_locked(&scope.join("owner.lock"))?;
+                    let parent: control::Discovery = record::read(&scope.join("supervisor.json"))?;
+                    ensure!(
+                        parent.instance == record.supervisor
+                            && parent.snapshot.generation.as_deref() == Some(&record.id),
+                        "worker launch belongs to a retired supervisor"
+                    );
+                    // 准入：try_acquire（忙碌=瞬态）+ require_open（记录未可见=瞬态）；
+                    // 每轮重建并释放，不携带跨轮句柄。
+                    let gate = process_utils::command_authority::Gate::try_acquire(&root)?;
+                    gate.require_open()?;
+                    drop(gate);
+                    Ok(Some(Self { root, record }))
+                }
+            })
+            .await?;
+        Ok(Some(worker))
     }
     pub fn generation(&self) -> &str {
         &self.record.id

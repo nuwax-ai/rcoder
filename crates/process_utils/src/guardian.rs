@@ -471,8 +471,19 @@ pub async fn spawn_guarded(
 /// Private binary entry: hold the authorization lock before checking owner and
 /// before spawning any business command. EOF on the exact parent pipe cancels.
 pub async fn run(root: &Path) -> Result<i32> {
-    let _lock = lock(root)?;
-    let mut receipt = read(root)?;
+    // 启动首读纳入有界观察（收据可见性，2026-09-28）：父进程刚写收据即 spawn
+    // 本 guardian，共享挂载上 lock/receipt 可能短暂不可见。每轮重新取锁（轮间
+    // 释放）；phase 已消费/撤销是身份拒绝，不在观察内。
+    let (_lock, mut receipt) = crate::observe::observe(
+        "command guardian startup",
+        Duration::from_secs(3),
+        || async {
+            let lock = lock(root)?;
+            let receipt = read(root)?;
+            Ok(Some((lock, receipt)))
+        },
+    )
+    .await?;
     ensure!(
         receipt.phase == "Pending",
         "guardian authorization already consumed/revoked"
@@ -553,8 +564,20 @@ async fn execute_unconsumed(root: &Path, receipt: &mut Receipt) -> Result<i32> {
         .and_then(Path::parent)
         .context("guardian work root missing")?;
     let admission = if crate::command_authority::is_managed(work)? {
-        let gate = crate::command_authority::Gate::acquire(work).await?;
-        gate.require_open()?;
+        // 准入读取纳入有界观察（收据可见性）：command-admission 记录可能短暂
+        // 不可见/锁短暂忙碌；"no longer accepts work" 是拒绝，不在观察内。
+        // try_acquire 无内建等待，避免预算叠加。
+        let work = work.to_path_buf();
+        let gate =
+            crate::observe::observe("command admission", Duration::from_secs(3), move || {
+                let work = work.clone();
+                async move {
+                    let gate = crate::command_authority::Gate::try_acquire(&work)?;
+                    gate.require_open()?;
+                    Ok(Some(gate))
+                }
+            })
+            .await?;
         Some(gate)
     } else {
         None

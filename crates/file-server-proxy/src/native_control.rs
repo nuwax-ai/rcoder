@@ -329,7 +329,31 @@ impl Owner {
             retirement_requested: false,
         };
         if let Some(id) = &receipt.supervisor_id {
-            crate::native_supervisor::verify_live(&root, id, &receipt.instance_id)?;
+            if let Some(worker) = &worker {
+                // Worker 上下文已证明新协议收据代次存在：直连新协议校验，不按
+                // try_exists 探测——共享挂载上收据短暂不可见会把新协议误降级到
+                // 旧 witness 路径（收据可见性修复，2026-09-28）。校验读同样
+                // 纳入有界观察（刚授权成功不能被同一收据的一次 ENOENT 打回）。
+                let generation = worker.generation().to_owned();
+                let id = id.clone();
+                let scope = root.clone();
+                process_utils::observe::observe(
+                    "proxy verify live",
+                    Duration::from_secs(3),
+                    move || {
+                        let scope = scope.clone();
+                        let id = id.clone();
+                        let generation = generation.clone();
+                        async move {
+                            runtime_supervisor::verify_live(&scope, &id, &generation).map(Some)
+                        }
+                    },
+                )
+                .await
+                .map_err(|e| format!("verify live supervisor: {e:#}"))?;
+            } else {
+                crate::native_supervisor::verify_live(&root, id, &receipt.instance_id)?;
+            }
         }
         write(&root, &receipt)?;
         Ok(Self {
