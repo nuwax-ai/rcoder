@@ -180,7 +180,14 @@ async fn supervised_control(
             if action == Action::Shutdown {
                 return supervisor_reply(
                     owner
-                        .stop_offline(&command)
+                        .stop_offline(
+                            &runtime_supervisor::Binding {
+                                component: "file-server-proxy".into(),
+                                resource: std::fs::canonicalize(root)
+                                    .map_err(|e| format!("{e:#}"))?,
+                            },
+                            &command,
+                        )
                         .await
                         .map_err(|e| format!("{e:#}"))?,
                 );

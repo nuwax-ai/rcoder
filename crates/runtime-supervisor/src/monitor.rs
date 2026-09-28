@@ -79,13 +79,17 @@ pub struct Owner {
 impl Owner {
     /// Explicit shutdown after a supervisor crash, while holding its owner lock.
     /// Evidence must cover every local generation before publishing completion.
-    pub async fn stop_offline(self, request: &control::Request) -> Result<Snapshot> {
+    pub async fn stop_offline(
+        self,
+        binding: &control::Binding,
+        request: &control::Request,
+    ) -> Result<Snapshot> {
         // Parent death closes pipes first; guardians still need a bounded drain
         // window. Wait only for a retained OS lock, never reinterpret corruption
         // or missing cleanup evidence as success.
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            match self.try_stop_offline(request) {
+            match self.try_stop_offline(binding, request) {
                 Err(error)
                     if error
                         .downcast_ref::<std::fs::TryLockError>()
@@ -98,7 +102,11 @@ impl Owner {
             }
         }
     }
-    fn try_stop_offline(&self, request: &control::Request) -> Result<Snapshot> {
+    fn try_stop_offline(
+        &self,
+        binding: &control::Binding,
+        request: &control::Request,
+    ) -> Result<Snapshot> {
         ensure!(
             !request.request_id.is_empty() && request.request_id.len() <= 128,
             "invalid control request identity"
@@ -107,11 +115,8 @@ impl Owner {
             matches!(request.action, Action::Shutdown | Action::StopWork),
             "offline action must stop execution"
         );
-        let mut discovery: Discovery = record::read(&self.root.join("supervisor.json"))?;
-        ensure!(
-            matches!(discovery.version, 1 | control::CONTROL_VERSION),
-            "unsupported supervisor receipt"
-        );
+        let (old, _) = self.load_discovery(binding)?;
+        let mut discovery = old.unwrap_or_else(|| inactive_discovery(binding.clone()));
         if let Some((original, snapshot)) = discovery
             .requests
             .iter()
@@ -176,36 +181,74 @@ impl Owner {
         }
     }
 
+    /// Discovery locates the management endpoint; generation receipts prove
+    /// process cleanup. Only the owner-lock holder may rebuild discovery.
+    fn load_discovery(&self, binding: &control::Binding) -> Result<(Option<Discovery>, bool)> {
+        let path = self.root.join("supervisor.json");
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Also covers a crash between preserving a damaged record and
+                // publishing its replacement. Never replay one-shot deployment
+                // inputs just because discovery was lost.
+                return Ok((None, self.root.join("work").try_exists()?));
+            }
+            Err(error) => return Err(error).context("read supervisor discovery"),
+        };
+        let old: Discovery = match serde_json::from_slice(&bytes) {
+            Ok(old) => old,
+            Err(error) => {
+                // A newer schema may add fields rejected by Discovery's strict
+                // decoder. Inspect readable identity/version before classifying
+                // the record as damaged, rather than erasing a valid new schema.
+                if let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(version) = raw.get("version").and_then(serde_json::Value::as_u64) {
+                        ensure!(
+                            version == 1 || version == u64::from(control::CONTROL_VERSION),
+                            "unsupported supervisor receipt"
+                        );
+                    }
+                    if let Some(raw_binding) = raw.pointer("/snapshot/binding")
+                        && let Ok(recorded) =
+                            serde_json::from_value::<control::Binding>(raw_binding.clone())
+                    {
+                        ensure!(
+                            &recorded == binding,
+                            "supervisor scope belongs to another resource"
+                        );
+                    }
+                }
+                preserve_discovery(&path)?;
+                tracing::warn!(%error, "rebuilding damaged supervisor discovery under owner lock");
+                return Ok((None, true));
+            }
+        };
+        ensure!(
+            matches!(old.version, 1 | control::CONTROL_VERSION),
+            "unsupported supervisor receipt"
+        );
+        ensure!(
+            &old.snapshot.binding == binding,
+            "supervisor scope belongs to another resource"
+        );
+        Ok((Some(old), false))
+    }
+
     pub async fn run(self, options: Options) -> Result<i32> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let mut old: Option<Discovery> = if self.root.join("supervisor.json").try_exists()? {
-            Some(record::read(&self.root.join("supervisor.json"))?)
-        } else {
-            None
-        };
-        if let Some(old) = &old {
-            ensure!(
-                matches!(old.version, 1 | control::CONTROL_VERSION),
-                "unsupported supervisor receipt"
-            );
-        }
         let instance = uuid::Uuid::new_v4().to_string();
         let binding = options.binding.clone().unwrap_or(control::Binding {
             component: "runtime".into(),
             resource: self.root.clone(),
         });
-        if let Some(old) = &old {
-            ensure!(
-                old.snapshot.binding == binding,
-                "supervisor scope belongs to another resource"
-            );
-        }
+        let (mut old, rebuilt) = self.load_discovery(&binding)?;
         // Capture recovery before detaching another container's control slot;
         // that reset must not turn old one-shot deployment inputs into a fresh
         // launch (for example APP_DEPLOY_URL retained in the Pod environment).
-        let recovery_launch = old
-            .as_ref()
-            .is_some_and(|d| d.snapshot.phase != Phase::Stopped);
+        let recovery_launch = rebuilt
+            || old
+                .as_ref()
+                .is_some_and(|d| d.snapshot.phase != Phase::Stopped);
         if let Some(old) = &mut old {
             detach_previous_container_control(&self.root, old)?;
         }
@@ -214,15 +257,22 @@ impl Owner {
         // still waiting for quiescence or for the worker's durable acknowledgement.
         let pending = old
             .as_ref()
-            .filter(|d| d.snapshot.phase != Phase::Stopped)
+            .filter(|d| !matches!(d.snapshot.phase, Phase::Stopped | Phase::RecoveryRequired))
             .and_then(|d| d.snapshot.operation_id.clone());
-        let intent = old.as_ref().map_or(Intent::Run, |d| {
-            if pending.is_some() || d.snapshot.intent == Intent::Stopped {
-                d.snapshot.intent
+        let intent = old.as_ref().map_or(
+            if rebuilt {
+                Intent::Stopped
             } else {
                 Intent::Run
-            }
-        });
+            },
+            |d| {
+                if pending.is_some() || d.snapshot.intent == Intent::Stopped {
+                    d.snapshot.intent
+                } else {
+                    Intent::Run
+                }
+            },
+        );
         let mut state = State {
             root: self.root.clone(),
             policy: options.policy.clone(),
@@ -256,6 +306,7 @@ impl Owner {
             next_probe: Instant::now(),
             started: Instant::now(),
             last_tick: Instant::now(),
+            next_discovery_check: Instant::now() + Duration::from_secs(2),
             failed_since: None,
             failures: 0,
             restarts: VecDeque::new(),
@@ -302,6 +353,35 @@ impl Owner {
                 }
             }
         }
+    }
+}
+
+fn preserve_discovery(path: &Path) -> Result<()> {
+    let backup = path.with_extension(format!("corrupt-{}.json", uuid::Uuid::new_v4().simple()));
+    std::fs::rename(path, &backup).context("preserve damaged supervisor discovery")?;
+    tracing::warn!(backup = %backup.display(), "preserved replaced supervisor discovery");
+    Ok(())
+}
+
+fn inactive_discovery(binding: control::Binding) -> Discovery {
+    let instance = uuid::Uuid::new_v4().to_string();
+    Discovery {
+        version: control::CONTROL_VERSION,
+        instance: instance.clone(),
+        address: String::new(),
+        token: String::new(),
+        snapshot: Snapshot {
+            version: 1,
+            binding,
+            supervisor_id: instance,
+            generation: None,
+            phase: Phase::Reconciling,
+            intent: Intent::Stopped,
+            operation_id: None,
+            error: None,
+            problem: None,
+        },
+        requests: Vec::new(),
     }
 }
 
@@ -384,6 +464,7 @@ struct State {
     next_probe: Instant,
     started: Instant,
     last_tick: Instant,
+    next_discovery_check: Instant,
     failed_since: Option<Instant>,
     failures: u32,
     restarts: VecDeque<Instant>,
@@ -461,7 +542,12 @@ impl State {
             }
             .into());
         }
-        if let Some(operation) = &self.discovery.snapshot.operation_id {
+        // A failed attempt remains replayable as failure, but cannot reserve
+        // the control slot forever. A retry still has to reconcile the exact
+        // process receipts before it can start a successor.
+        if let Some(operation) = &self.discovery.snapshot.operation_id
+            && (self.discovery.snapshot.phase != Phase::RecoveryRequired || self.child.is_some())
+        {
             return Err(Problem {
                 code: FailureCode::Busy,
                 message: format!(
@@ -559,6 +645,10 @@ impl State {
             self.next_probe = now; // fresh challenge after sleep/scheduling starvation
         }
         self.last_tick = now;
+        if now >= self.next_discovery_check {
+            self.repair_discovery()?;
+            self.next_discovery_check = now + Duration::from_secs(2);
+        }
         if self.stopping.is_some() && self.child.is_some() {
             let work = self.work()?;
             if let Err(error) = process_utils::command_authority::Gate::try_acquire(&work)
@@ -772,8 +862,67 @@ impl State {
         }
         Ok(None)
     }
+
+    fn repair_discovery(&mut self) -> Result<()> {
+        // The live owner is authoritative for endpoint discovery. Repair from
+        // memory without rotating identity, stopping work, or trusting a stale
+        // PID. Contenders never rewrite this file while owner.lock is held.
+        let path = self.root.join("supervisor.json");
+        match std::fs::read(&path) {
+            Ok(bytes) if bytes == serde_json::to_vec(&self.discovery)? => return Ok(()),
+            Ok(_) => preserve_discovery(&path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("check supervisor discovery"),
+        }
+        self.persist()
+    }
 }
 
 async fn worker_shutdown(work: PathBuf) -> Result<worker::Observation> {
     worker::challenge(&work, true).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rebuilding_discovery_preserves_binding_version_and_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Owner::try_acquire(dir.path()).unwrap().unwrap();
+        let binding = control::Binding {
+            component: "test".into(),
+            resource: owner.root.clone(),
+        };
+        let path = dir.path().join("supervisor.json");
+        let mut saved = inactive_discovery(binding.clone());
+        saved.snapshot.binding.component = "another-cli".into();
+        record::save(&path, &saved).unwrap();
+        assert!(owner.load_discovery(&binding).is_err());
+        assert_eq!(
+            record::read::<Discovery>(&path)
+                .unwrap()
+                .snapshot
+                .binding
+                .component,
+            "another-cli"
+        );
+        saved.snapshot.binding = binding.clone();
+        saved.version = 999;
+        record::save(&path, &saved).unwrap();
+        assert!(owner.load_discovery(&binding).is_err());
+        assert_eq!(record::read::<Discovery>(&path).unwrap().version, 999);
+        let mut future = serde_json::to_value(&saved).unwrap();
+        future["new_protocol_field"] = true.into();
+        record::save(&path, &future).unwrap();
+        assert!(owner.load_discovery(&binding).is_err());
+        assert_eq!(record::read::<serde_json::Value>(&path).unwrap(), future);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            owner.load_discovery(&binding).is_err(),
+            "I/O error is not corrupt JSON"
+        );
+        assert!(path.is_dir());
+    }
 }

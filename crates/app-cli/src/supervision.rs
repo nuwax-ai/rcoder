@@ -153,7 +153,19 @@ pub async fn control(args: &crate::config::OwnerArgs) -> Result<()> {
         Ok(result) => result,
         Err(error) if matches!(action, Action::Shutdown | Action::StopWork) => {
             match Owner::try_acquire(&root)? {
-                Some(owner) => owner.stop_offline(&request).await?,
+                Some(owner) => {
+                    owner
+                        .stop_offline(
+                            &runtime_supervisor::Binding {
+                                component: "app-cli".into(),
+                                resource: runtime_state_layout::resolve_project_origin(
+                                    &args.workspace.workspace,
+                                )?,
+                            },
+                            &request,
+                        )
+                        .await?
+                }
                 None => return Err(error),
             }
         }

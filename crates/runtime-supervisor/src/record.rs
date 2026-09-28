@@ -118,8 +118,13 @@ pub fn verify_quiescent(scope: &Path, id: &str) -> Result<Quiescence> {
         ),
         "execution generation has no cleanup receipt"
     );
-    process_utils::guardian::recover(&root)?;
-    process_utils::command_context::require_quiescent(&root.join("commands"))?;
+    if record.phase == GenerationPhase::Revoked {
+        process_utils::guardian::recover(&root)?;
+        process_utils::command_context::require_quiescent(&root.join("commands"))?;
+    }
+    // Quiescent is the aggregate receipt written only after the worker,
+    // command trees and external engine finished cleanup. Historical command
+    // diagnostics cannot invalidate that completed cleanup later.
     Ok(Quiescence {
         generation: record.id,
         supervisor_id: record.supervisor,
@@ -220,8 +225,10 @@ fn reconcile_local(scope: &Path, current: Option<&crate::domain::PhysicalDomain>
             value.id,
             value.phase
         );
-        process_utils::guardian::recover(&root)?;
-        process_utils::command_context::require_quiescent(&root.join("commands"))?;
+        if value.phase == GenerationPhase::Revoked {
+            process_utils::guardian::recover(&root)?;
+            process_utils::command_context::require_quiescent(&root.join("commands"))?;
+        }
     }
     Ok(())
 }
@@ -322,6 +329,27 @@ mod tests {
         )
         .unwrap();
         (temp, id)
+    }
+
+    #[test]
+    fn completed_generation_receipt_outlives_command_diagnostics_but_not_a_live_guardian() {
+        let (temp, id) = stuck_scope(None, None);
+        let root = work_root(temp.path(), &id).unwrap();
+        std::fs::write(root.join("commands/command.json"), "{damaged").unwrap();
+        assert!(reconcile(temp.path()).is_err(), "Running is not exit proof");
+        let mut value = generation(&root).unwrap();
+        value.phase = GenerationPhase::Quiescent;
+        save(&root.join("generation.json"), &value).unwrap();
+        let held = lock(&root.join("generation.lock")).unwrap();
+        assert!(verify_quiescent(temp.path(), &id).is_err());
+        assert!(reconcile(temp.path()).is_err());
+        drop(held);
+        verify_quiescent(temp.path(), &id).unwrap();
+        reconcile(temp.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("commands/command.json")).unwrap(),
+            "{damaged"
+        );
     }
 
     #[test]

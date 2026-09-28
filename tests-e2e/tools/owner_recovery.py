@@ -172,6 +172,27 @@ strip_prefix = false
                'exec app-cli serve --control-only --workspace "$1" > /tmp/manual-owner.log 2>&1', '--', workspace)
         original = wait_control()
         start()
+        # Discovery is repairable management metadata. Losing it while the
+        # owner is live must neither replace services nor disable owner Stop.
+        discovery = execute('find /home/user/.app-cli-state -name supervisor.json').stdout.strip().splitlines()
+        check('one app-cli supervisor discovery', len(discovery) == 1, discovery)
+        discovery_path = discovery[0]
+        saved_discovery = json.loads(execute('cat "$1"', discovery_path).stdout)
+        write({discovery_path: '{damaged-supervisor-discovery'})
+        deadline = time.monotonic() + 10
+        repaired = False
+        while time.monotonic() < deadline:
+            try:
+                current = json.loads(execute('cat "$1"', discovery_path, check=False).stdout)
+                repaired = (current['instance'] == saved_discovery['instance']
+                            and current['snapshot']['generation'] == saved_discovery['snapshot']['generation'])
+            except (ValueError, KeyError):
+                repaired = False
+            if repaired:
+                break
+            time.sleep(0.2)
+        check('live supervisor repairs discovery without replacing services',
+              repaired and identity() == original and ready())
         execute('kill -KILL "$(cat /tmp/original-owner.pid)"')
         # The independent guardian may already be stopping business processes.
         # Persistence, not their transient liveness, reproduces the stale-owner bug.
@@ -201,8 +222,13 @@ strip_prefix = false
         docker('rm', '-f', cid)
         cid = None
         new_container()
+        # Corrupt only discovery; generation and business journals remain intact.
+        write({discovery_path: '{damaged-supervisor-discovery'})
         check('stop as first request after container replacement',
               post('stop').get('message') == 'Stopped' and not ready())
+        check('damaged supervisor discovery preserved as backup', execute(
+            'find /home/user/.app-cli-state -name "supervisor.corrupt-*.json"'
+        ).stdout.strip() != '')
         start('restart')
         post('stop')
         check('final stop leaves management alive and business stopped', bool(identity()) and not ready())

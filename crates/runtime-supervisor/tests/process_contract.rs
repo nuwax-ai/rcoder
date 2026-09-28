@@ -327,3 +327,215 @@ async fn parent_death_drains_hung_worker_and_allows_verified_successor() {
     shutdown(&root, &mut parent).await;
     result.unwrap();
 }
+
+#[tokio::test]
+async fn damaged_discovery_and_completed_command_history_do_not_disable_controls() {
+    use runtime_supervisor::{Intent, Phase};
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let mut parent = start(&root).unwrap();
+    let result = async {
+        let original = until(&root, |s| s.phase == Phase::Ready).await?;
+        let address = leaf(&root).await?;
+        let broken = b"{interrupted-discovery";
+        std::fs::write(root.join("supervisor.json"), broken)?;
+        let repaired = until(&root, |s| s.phase == Phase::Ready).await?;
+        ensure!(
+            repaired.supervisor_id == original.supervisor_id
+                && repaired.generation == original.generation
+                && tokio::net::TcpStream::connect(&address).await.is_ok(),
+            "live discovery repair replaced running work"
+        );
+        ensure!(
+            runtime_supervisor::Owner::try_acquire(&root)?.is_none(),
+            "discovery repair released ownership"
+        );
+        let backups: Vec<_> = std::fs::read_dir(&root)?
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("supervisor.corrupt-")
+            })
+            .collect();
+        ensure!(
+            backups.len() == 1 && std::fs::read(backups[0].path())? == broken,
+            "original damaged discovery was not preserved"
+        );
+
+        let stopped =
+            runtime_supervisor::stop_work(&root, &original.binding, Duration::from_secs(10))
+                .await?;
+        ensure!(
+            stopped.phase == Phase::Ready && stopped.intent == Intent::Stopped,
+            "repaired owner could not stop work"
+        );
+        ensure!(
+            tokio::net::TcpStream::connect(&address).await.is_err(),
+            "business survived stop"
+        );
+        let completed = original
+            .generation
+            .as_deref()
+            .context("generation missing")?;
+        runtime_supervisor::verify_quiescent(&root, completed)?;
+        let commands = root.join("work").join(completed).join("commands");
+        std::fs::create_dir_all(&commands)?;
+        let history = commands.join("damaged-history.json");
+        std::fs::write(&history, "{damaged-historical-command")?;
+
+        // Finish all actual processes first. With discovery damaged again,
+        // offline Stop must use generation evidence, not endpoint metadata.
+        shutdown(&root, &mut parent).await;
+        ensure!(parent.try_wait()?.is_some(), "supervisor did not exit");
+        std::fs::write(root.join("supervisor.json"), broken)?;
+        let done = runtime_supervisor::stop_work(&root, &original.binding, Duration::from_secs(10))
+            .await?;
+        ensure!(
+            done.phase == Phase::Stopped && done.intent == Intent::Stopped,
+            "offline Stop depended on damaged discovery"
+        );
+        ensure!(
+            std::fs::read_to_string(&history)? == "{damaged-historical-command",
+            "historical evidence was rewritten"
+        );
+
+        // Corruption on startup suppresses one-shot env replay and restores
+        // management first. A later explicit request can restart normally.
+        std::fs::write(root.join("supervisor.json"), broken)?;
+        parent = tokio::process::Command::new(env!("CARGO_BIN_EXE_supervision-fixture"))
+            .arg(&root)
+            .env("SUPERVISION_FIXTURE_ONE_SHOT", "must-not-replay")
+            .spawn()?;
+        let next = until(&root, |s| s.phase == Phase::Ready).await?;
+        ensure!(
+            next.supervisor_id != original.supervisor_id,
+            "startup reused old owner"
+        );
+        ensure!(
+            std::fs::read_to_string(root.join("one-shot-env-present"))? == "false",
+            "damaged discovery replayed deployment input"
+        );
+        ensure!(
+            tokio::net::TcpStream::connect(&address).await.is_err(),
+            "management recovery started business implicitly"
+        );
+        control(&root, Request::new(Action::Recover)).await?;
+        until(&root, |s| {
+            s.phase == Phase::Ready && s.generation != next.generation
+        })
+        .await?;
+        let restarted = leaf(&root).await?;
+        runtime_supervisor::stop_work(&root, &original.binding, Duration::from_secs(10)).await?;
+        ensure!(
+            tokio::net::TcpStream::connect(&restarted).await.is_err(),
+            "new execution could not be stopped"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    shutdown(&root, &mut parent).await;
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn failed_cleanup_attempt_can_be_retried_without_losing_original_failure() {
+    use runtime_supervisor::{Binding, Intent, Phase};
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    // Fixture for a cleanup result that arrives late. No real process is
+    // represented by this record; only the admission/retry contract is tested.
+    let id = uuid::Uuid::new_v4().to_string();
+    let work = root.join("work").join(&id);
+    std::fs::create_dir_all(&work).unwrap();
+    let mut receipt = serde_json::json!({
+        "version": 1, "id": id, "supervisor": "fixture-old", "token": "fixture",
+        "intent": "run", "phase": "Running", "exit_code": null, "error": null
+    });
+    std::fs::write(
+        work.join("generation.json"),
+        serde_json::to_vec(&receipt).unwrap(),
+    )
+    .unwrap();
+    let binding = Binding {
+        component: "runtime".into(),
+        resource: root.clone(),
+    };
+    let old = Snapshot {
+        version: 1,
+        binding: binding.clone(),
+        supervisor_id: "fixture-old".into(),
+        generation: Some(id.clone()),
+        phase: Phase::RecoveryRequired,
+        intent: Intent::Stopped,
+        operation_id: None,
+        error: None,
+        problem: None,
+    };
+    std::fs::write(
+        root.join("supervisor.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 2, "instance": "fixture-old", "address": "127.0.0.1:1",
+            "token": "fixture", "snapshot": old, "requests": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut parent = start(&root).unwrap();
+    let result = async {
+        until(&root, |s| s.phase == Phase::RecoveryRequired).await?;
+        let mut attempts = Vec::new();
+        for _ in 0..2 {
+            let error = runtime_supervisor::stop_work(&root, &binding, Duration::from_secs(5))
+                .await
+                .unwrap_err();
+            let failure = &error
+                .downcast_ref::<runtime_supervisor::RecoveryError>()
+                .context("cleanup must report its real failure, not permanent Busy")?
+                .snapshot;
+            ensure!(
+                failure.phase == Phase::RecoveryRequired,
+                "cleanup falsely succeeded"
+            );
+            attempts.push(Request {
+                request_id: failure
+                    .operation_id
+                    .clone()
+                    .context("failure identity missing")?,
+                action: Action::StopWork,
+                expected_generation: Some(id.clone()),
+            });
+        }
+        let first = attempts[0].clone();
+        let retry = attempts[1].clone();
+        ensure!(
+            first.request_id != retry.request_id,
+            "a new user retry replayed the old failed request"
+        );
+        ensure!(
+            control(&root, first.clone()).await?.phase == Phase::RecoveryRequired,
+            "new request changed prior failure to success"
+        );
+        receipt["phase"] = "Quiescent".into();
+        // Use an atomic write like the real guardian so partial test writes
+        // cannot manufacture a generation corruption unrelated to this case.
+        let file = tempfile::NamedTempFile::new_in(&work)?;
+        std::fs::write(file.path(), serde_json::to_vec(&receipt)?)?;
+        file.persist(work.join("generation.json"))?;
+        until(&root, |s| s.phase == Phase::Ready).await?;
+        ensure!(
+            control(&root, retry).await?.phase == Phase::Ready,
+            "retry never completed"
+        );
+        ensure!(
+            control(&root, first).await?.phase == Phase::RecoveryRequired,
+            "old failure lost after recovery"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    shutdown(&root, &mut parent).await;
+    result.unwrap();
+}
