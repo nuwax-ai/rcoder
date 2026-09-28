@@ -54,6 +54,18 @@ pub async fn get_app_health(
     Ok(Json(HttpResult::success(health)))
 }
 
+/// readiness 查询参数
+///
+/// `user_id` 必填：userapp 业务调用方身份（对齐 stats 系接口的必填口径；当前
+/// 就绪观察按 app_id 定位不消费该值，预留后续按用户维度的扩展使用）。
+#[derive(Debug, Deserialize, utoipa::IntoParams, garde::Validate)]
+#[into_params(parameter_in = Query)]
+pub struct ReadinessParams {
+    /// 用户 ID（必填；userapp 业务调用方身份，预留扩展使用）
+    #[garde(pattern(shared_types::IDENTIFIER_RE))]
+    pub user_id: String,
+}
+
 /// 获取应用业务就绪状态（只读观察：服务健康契约 + Pingap 入口/生效配置）
 #[utoipa::path(
     get,
@@ -61,6 +73,7 @@ pub async fn get_app_health(
     params(
         ("app_id" = String, Path, description = "应用 ID"),
         ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）；`prod`=运行容器（Userapp）"),
+        ReadinessParams
     ),
     description = r#"
 业务就绪查询（只读）：由当前物理实例内 app-cli 的业务观察（服务 HTTP 健康契约
@@ -88,14 +101,79 @@ pub async fn get_app_health(
 pub async fn get_app_readiness(
     State(state): State<Arc<AppManagerState>>,
     Path((app_id, app_stage)): Path<(String, String)>,
+    Query(params): Query<ReadinessParams>,
 ) -> Response {
     let app_stage = match super::parse_app_stage_param(&app_stage) {
         Ok(stage) => stage,
         Err(error) => return error.into_response(),
     };
+    // 标识符白名单校验（user_id 为调用方身份段，含 `/` 即逃逸）
+    if let Err(error) = params
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)
+    {
+        return error.into_response();
+    }
+    info!(
+        "[APP] getting app readiness: {} (user_id={})",
+        app_id, params.user_id
+    );
     match state
         .app_service
         .get_app_readiness(app_stage, &app_id)
+        .await
+    {
+        Ok(readiness) => (
+            StatusCode::OK,
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(HttpResult::success(readiness)),
+        )
+            .into_response(),
+        Err(error) => AppError::from(error).into_response(),
+    }
+}
+
+/// 获取 dbx-web（DBX 数据库 GUI，容器内恒起 :4224）就绪状态（只读探测）
+///
+/// 只读不唤醒：容器未运行 → `stopped`；运行中但 dbx 未应答 → `starting`；
+/// 4224 应答 → `ready`。前端据 `data.ready` 决定 DB 面板呈现，唤醒由
+/// dbx 代理路径的"有请求即唤醒"承担。
+#[utoipa::path(
+    get,
+    path = "/api/v1/userapp/{app_id}/{app_stage}/dbx/readiness",
+    params(
+        ("app_id" = String, Path, description = "应用 ID"),
+        ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）；`prod`=运行容器（UserApp）"),
+        ReadinessParams
+    ),
+    responses(
+        (status = 200, description = "观察完成（data.ready 才是 dbx 可用）", body = HttpResult<shared_types::DbxReadinessResponse>)
+    ),
+    tag = "Userapp · 双态 · 生命周期"
+)]
+#[instrument(skip(state, params))]
+pub async fn get_app_dbx_readiness(
+    State(state): State<Arc<AppManagerState>>,
+    Path((app_id, app_stage)): Path<(String, String)>,
+    Query(params): Query<ReadinessParams>,
+) -> Response {
+    let app_stage = match super::parse_app_stage_param(&app_stage) {
+        Ok(stage) => stage,
+        Err(error) => return error.into_response(),
+    };
+    if let Err(error) = params
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)
+    {
+        return error.into_response();
+    }
+    info!(
+        "[APP] getting app dbx readiness: {} (user_id={})",
+        app_id, params.user_id
+    );
+    match state
+        .app_service
+        .get_app_dbx_readiness(app_stage, &app_id)
         .await
     {
         Ok(readiness) => (
@@ -192,4 +270,24 @@ pub async fn get_app_events(
     info!("[APP] getting app events: {}", app_id);
     let events = state.app_service.get_app_events(&app_id).await?;
     Ok(Json(HttpResult::success(events)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// readiness 的 user_id 必填口径（userapp 业务）：标识符白名单拒绝
+    /// 路径逃逸与空值；缺失由 Query 反序列化直接 400。
+    #[test]
+    fn readiness_params_user_id_must_be_identifier_shaped() {
+        let mut params = ReadinessParams {
+            user_id: "1754545591".to_string(),
+        };
+        assert!(params.validate().is_ok());
+
+        for invalid in ["", "../escape", "a/b"] {
+            params.user_id = invalid.to_string();
+            assert!(params.validate().is_err(), "user_id={invalid:?} 应被拒绝");
+        }
+    }
 }

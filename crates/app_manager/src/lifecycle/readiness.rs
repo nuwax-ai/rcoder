@@ -39,6 +39,53 @@ impl AppService {
             .and_then(|slot| slot.clone())
     }
 
+    pub fn set_dbx_prober(
+        &self,
+        prober: Arc<dyn shared_types::DbxReadinessProber>,
+    ) -> AppResult<()> {
+        let mut slot = self
+            .dbx_prober
+            .write()
+            .map_err(|_| AppOperationError::Backend("dbx prober lock poisoned".into()))?;
+        *slot = Some(prober);
+        Ok(())
+    }
+
+    /// dbx-web（容器内恒起 :4224）只读就绪查询：不唤醒、不建 dev 容器、
+    /// 不刷新闲置计时（对齐业务 readiness 族"观察不是准入"的语义）。
+    pub async fn get_app_dbx_readiness(
+        &self,
+        app_stage: UserappStage,
+        app_id: &str,
+    ) -> AppResult<shared_types::DbxReadinessResponse> {
+        validate_app_id(app_id)?;
+        // 权威记录不存在或已删除 → 404 错误信封（对齐 readiness 族的失败形态）。
+        let _record = self
+            .metadata
+            .store
+            .get_application(app_id)
+            .await?
+            .filter(|record| record.state != UserAppLifecycleState::Deleted)
+            .ok_or_else(|| AppOperationError::NotFound(format!("app {app_id} not found")))?;
+        let Some(prober) = self.dbx_prober.read().ok().and_then(|slot| slot.clone()) else {
+            return Err(AppOperationError::Backend(
+                "dbx prober is not wired (host assembly missing)".into(),
+            ));
+        };
+        let (status, reason_code) = match prober.probe(app_id, app_stage).await {
+            Ok(status) => (status, None),
+            Err(reason) => {
+                tracing::warn!("[APP] dbx readiness probe failed: app {app_id}: {reason}");
+                (shared_types::DbxReadinessStatus::Unknown, Some(reason))
+            }
+        };
+        Ok(shared_types::DbxReadinessResponse {
+            ready: status == shared_types::DbxReadinessStatus::Ready,
+            status,
+            reason_code,
+        })
+    }
+
     pub async fn get_app_readiness(
         &self,
         app_stage: UserappStage,
@@ -345,6 +392,7 @@ fn merge_observation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared_types::UserAppLifecycleStore;
     use shared_types::{
         UserAppBusinessReadiness, UserAppOperationState, UserAppReadinessChannel,
         UserAppReadinessPhysical,
@@ -669,5 +717,79 @@ mod tests {
                 .state,
             shared_types::ComputeControlState::Pending
         );
+    }
+
+    /// dbx readiness：prober 三态映射 + 探测失败降级 unknown（带原因码）+
+    /// 权威记录缺失 404 + 全程只读（runtime 零写调用）。
+    #[tokio::test]
+    async fn dbx_readiness_maps_probe_outcomes_and_missing_app() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        struct Probe(AtomicU8);
+        #[async_trait::async_trait]
+        impl shared_types::DbxReadinessProber for Probe {
+            async fn probe(
+                &self,
+                _: &str,
+                _: UserappStage,
+            ) -> Result<shared_types::DbxReadinessStatus, String> {
+                match self.0.load(Ordering::SeqCst) {
+                    0 => Ok(shared_types::DbxReadinessStatus::Ready),
+                    1 => Ok(shared_types::DbxReadinessStatus::Stopped),
+                    _ => Err("probe transport blew up".into()),
+                }
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::test_support::MockRuntime::default());
+        let (service, store) =
+            crate::test_support::test_service_with_store(root.path(), runtime.clone()).await;
+        store.ensure_identity("dbx1").await.unwrap();
+
+        // 权威记录不存在 → NotFound（错误信封 404），不触发探测。
+        assert!(
+            service
+                .get_app_dbx_readiness(UserappStage::Prod, "ghost")
+                .await
+                .is_err()
+        );
+
+        service
+            .set_dbx_prober(Arc::new(Probe(AtomicU8::new(0))))
+            .unwrap();
+        let response = service
+            .get_app_dbx_readiness(UserappStage::Prod, "dbx1")
+            .await
+            .unwrap();
+        assert!(response.ready);
+        assert_eq!(response.status, shared_types::DbxReadinessStatus::Ready);
+        assert!(response.reason_code.is_none());
+
+        service
+            .set_dbx_prober(Arc::new(Probe(AtomicU8::new(1))))
+            .unwrap();
+        let response = service
+            .get_app_dbx_readiness(UserappStage::Dev, "dbx1")
+            .await
+            .unwrap();
+        assert!(!response.ready);
+        assert_eq!(response.status, shared_types::DbxReadinessStatus::Stopped);
+
+        service
+            .set_dbx_prober(Arc::new(Probe(AtomicU8::new(2))))
+            .unwrap();
+        let response = service
+            .get_app_dbx_readiness(UserappStage::Prod, "dbx1")
+            .await
+            .unwrap();
+        assert!(!response.ready);
+        assert_eq!(response.status, shared_types::DbxReadinessStatus::Unknown);
+        assert!(response.reason_code.is_some());
+
+        // 只读性：查询不产生任何 runtime 写调用（不唤醒、不建容器）。
+        assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
     }
 }

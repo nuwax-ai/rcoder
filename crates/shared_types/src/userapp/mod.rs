@@ -20,6 +20,7 @@ pub mod business_readiness;
 pub mod db_admin;
 pub mod db_align;
 pub mod db_password;
+pub mod dbx_readiness;
 pub mod dev_cleanup;
 pub mod dev_locator;
 pub mod forward_contract;

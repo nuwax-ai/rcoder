@@ -655,6 +655,7 @@ async fn test_service_with_mode(
         dev_locator: std::sync::RwLock::new(None),
         builder_recovery: std::sync::RwLock::new(None),
         readiness_reader: std::sync::RwLock::new(None),
+        dbx_prober: std::sync::RwLock::new(None),
         deploy_list_cache: tokio::sync::Mutex::new(None),
     }
 }

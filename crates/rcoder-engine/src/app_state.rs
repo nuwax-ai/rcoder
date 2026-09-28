@@ -231,6 +231,11 @@ impl AppState {
         app_service_arc.set_readiness_reader(Arc::new(
             crate::userapp_readiness::UserAppReadinessReaderImpl::new(Arc::downgrade(&state)),
         ))?;
+        // dbx-web 只读就绪探测回调（/{app_id}/{app_stage}/dbx/readiness）：同源
+        // runtime 观察定位实例后探测 4224，不唤醒不建容器。Weak 挂接同上。
+        app_service_arc.set_dbx_prober(Arc::new(
+            crate::userapp_dbx_probe::DbxReadinessProberImpl::new(Arc::downgrade(&state)),
+        ))?;
         let recovery_handle =
             crate::userapp_builder::start_recovery(Arc::downgrade(&state), shutdown_tx.subscribe());
         *state

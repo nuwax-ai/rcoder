@@ -30,6 +30,7 @@ pub mod shutdown;
 pub mod skill_sync_reconciler;
 pub mod storage;
 pub mod userapp_builder;
+pub mod userapp_dbx_probe;
 pub mod userapp_error_page;
 #[cfg(feature = "kubernetes")]
 pub mod userapp_error_page_configmap;

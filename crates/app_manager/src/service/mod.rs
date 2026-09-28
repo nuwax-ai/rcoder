@@ -66,6 +66,10 @@ pub struct AppService {
     /// 的 runtime 视图无 agent 定位能力，且观察不得走 ensure/wake 写路径）。
     pub(crate) readiness_reader:
         std::sync::RwLock<Option<Arc<dyn shared_types::UserAppReadinessReader>>>,
+    /// dbx-web 只读探测回调（宿主注入；`/{app_id}/{app_stage}/dbx/readiness`
+    /// 经此定位实例并探测 4224——同 readiness_reader 的委托根因：定位必须
+    /// 复用 runtime 观察链且不得走 ensure/wake 写路径）。
+    pub(crate) dbx_prober: std::sync::RwLock<Option<Arc<dyn shared_types::DbxReadinessProber>>>,
     /// Deployment 列表查询缓存（TTL + 写路径失效 + single-flight）。防查询面
     /// 轮询频繁穿透到 Docker daemon/K8s apiserver——Docker daemon 高负载下
     /// API 可能无响应，穿透查询会挂死调用方（实战踩过：编译镜像期间 daemon
@@ -140,6 +144,7 @@ impl AppService {
             dev_locator: std::sync::RwLock::new(None),
             builder_recovery: std::sync::RwLock::new(None),
             readiness_reader: std::sync::RwLock::new(None),
+            dbx_prober: std::sync::RwLock::new(None),
         };
         // Rebuild routes from the actual runtime in both Docker and K8s.
         if svc.config.http_expose == HttpExpose::Pingora {
@@ -569,6 +574,14 @@ impl super::AppServiceTrait for AppService {
         app_id: &str,
     ) -> AppResult<shared_types::UserAppReadinessResponse> {
         self.get_app_readiness(app_stage, app_id).await
+    }
+
+    async fn get_app_dbx_readiness(
+        &self,
+        app_stage: shared_types::UserappStage,
+        app_id: &str,
+    ) -> AppResult<shared_types::DbxReadinessResponse> {
+        self.get_app_dbx_readiness(app_stage, app_id).await
     }
 
     fn readiness_reader(&self) -> Option<Arc<dyn shared_types::UserAppReadinessReader>> {

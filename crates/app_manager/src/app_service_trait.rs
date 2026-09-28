@@ -278,6 +278,13 @@ pub trait AppServiceTrait: Send + Sync {
         app_id: &str,
     ) -> AppResult<shared_types::UserAppReadinessResponse>;
 
+    /// dbx-web（容器内恒起 :4224）只读就绪查询：不唤醒、不建容器。
+    async fn get_app_dbx_readiness(
+        &self,
+        app_stage: shared_types::UserappStage,
+        app_id: &str,
+    ) -> AppResult<shared_types::DbxReadinessResponse>;
+
     /// 只读观察器句柄（宿主注入后的回读；代理失败诊断顾问等消费）。
     fn readiness_reader(&self) -> Option<Arc<dyn shared_types::UserAppReadinessReader>> {
         None
