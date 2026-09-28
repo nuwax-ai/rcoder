@@ -40,7 +40,12 @@ services:
       npm_config_store_dir: /pnpm-cache
       XDG_CACHE_HOME: /pnpm-metadata
       FILE_SERVER_PROXY_HOST: 0.0.0.0
-      FILE_SERVER_PROXY_STATE_DIR: /data/file-server-proxy-state
+      # Native supervision 的收据是 temp+rename 发布、worker 启动即回读；macOS
+      # 宿主 bind mount（OrbStack virtiofs）对跨进程 rename 可见性不保证，
+      # 确定性触发 "read receipt generation.json: ENOENT"。state 放容器原生
+      # overlayfs（/var/tmp），与生产容器文件系统语义一致（实证：原生 fs 通过、
+      # bind mount 必崩；A/B 证据链不消费 state 目录）。
+      FILE_SERVER_PROXY_STATE_DIR: /var/tmp/file-server-proxy-state
       NODE_ENV: ab
       PROJECT_SOURCE_DIR: /data/project-workspace
       COMPUTER_WORKSPACE_DIR: /data/computer-workspace

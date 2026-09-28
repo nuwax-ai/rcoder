@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "typescript_revision": "0cffa11c7340b032a69121f60bff8194ebbd2d13",
+  "typescript_revision": "9f636bfab6dd19f2c3fe916a371e99f604230470",
   "route_sources": [
     "src/routes/*.js",
     "src/server.js"
@@ -927,6 +927,7 @@
   ],
   "notes": [
     "Rust-only /api/v1/userapp routes are validated by existing UserApp tests and are outside this TS parity inventory.",
-    "A route is covered only when at least one listed A/B case executes it; all others remain pending."
+    "A route is covered only when at least one listed A/B case executes it; all others remain pending.",
+    "Revision 9f636bf vs 0cffa11 touched only src/utils (search exclusion + git quoting); route inventory re-verified unchanged (no src/routes or server.js deltas)."
   ]
 }
