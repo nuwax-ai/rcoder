@@ -666,6 +666,32 @@ mod tests {
     }
 
     #[test]
+    fn get_status_paths_preserve_non_ascii_utf8() {
+        // nuwax commit 4e05db7 修复了 system-git porcelain 输出在 core.quotePath
+        // 默认开启时把中文路径 C-quote 成 "\346\207..." 八进制转义、且逐码点解码
+        // 产生 Latin-1 mojibake 的问题。gix 程序化 API 的路径是原始字节 (无
+        // C-quote 文本层), 本测试锁定中文路径在各 status bucket 原样 UTF-8 透出。
+        let t = TestRepo::new();
+        std::fs::create_dir_all(t.0.join("数据")).expect("建父目录");
+        commit_file(&t, "数据/成都天气.md", "v1", "c1");
+        std::fs::write(t.0.join("数据/新文件.md"), "new").expect("写未跟踪");
+        std::fs::write(t.0.join("数据/成都天气.md"), "v2-dirty").expect("改文件");
+        let repo = t.open();
+
+        let s = get_status(&repo).expect("status 不应失败");
+        assert!(
+            s.untracked.iter().any(|p| p == "数据/新文件.md"),
+            "untracked 应含原样 UTF-8 中文路径 (不得八进制转义/mojibake): {:?}",
+            s.untracked
+        );
+        assert!(
+            s.modified.iter().any(|p| p == "数据/成都天气.md"),
+            "modified 应含原样 UTF-8 中文路径: {:?}",
+            s.modified
+        );
+    }
+
+    #[test]
     fn get_status_reports_unmerged_index_paths_as_staged_conflicts() {
         let t = TestRepo::new();
         commit_file(&t, "README.md", "base", "base");

@@ -316,3 +316,40 @@ fn commit_diff_missing_from_is_explicit_and_bad_expression_is_validation() {
         "坏修订表达式应 Validation: {malformed:?}"
     );
 }
+
+#[test]
+fn diff_paths_preserve_non_ascii_utf8() {
+    // nuwax commit 4e05db7 给 parseNumstat 补了 porcelain 路径解码 (system-git 在
+    // core.quotePath 默认开启时把中文路径 C-quote, 逐码点解码成 Latin-1 mojibake)。
+    // gix 程序化 diff 无 CLI 文本层, 本测试锁定 numstat 摘要 (files[].file) 与
+    // unified diff 文件头 (---/+++) 对中文路径原样 UTF-8 输出。
+    let directory = tempfile::tempdir().expect("create test directory");
+    init_repo(directory.path(), "Test", "test@example.com").expect("init repo");
+    std::fs::create_dir_all(directory.path().join("数据")).expect("建父目录");
+    std::fs::write(directory.path().join("数据/成都天气.md"), "v1\n").expect("write v1");
+    let repo = open(directory.path()).expect("open repo");
+    stage_path(&repo, "数据/成都天气.md").expect("stage v1");
+    commit_indexed(&repo, "c1", "Test", "test@example.com").expect("commit v1");
+    std::fs::write(directory.path().join("数据/成都天气.md"), "v2\n").expect("write v2");
+
+    let params = DiffParams {
+        source: DiffSource::Worktree,
+        from: None,
+        to: None,
+        paths: Vec::new(),
+        max_file_size_bytes: 16 * 1024 * 1024,
+        max_total_bytes: 64 * 1024 * 1024,
+        max_output_bytes: 64 * 1024 * 1024,
+    };
+    let r = compute_diff(&repo, &params).expect("worktree diff 不应失败");
+    assert!(
+        r.files.iter().any(|f| f.file == "数据/成都天气.md"),
+        "numstat 摘要应含原样 UTF-8 中文路径 (不得八进制转义/mojibake): {:?}",
+        r.files
+    );
+    assert!(
+        r.diff.contains("+++ b/数据/成都天气.md"),
+        "unified diff 文件头应原样输出中文路径: {}",
+        r.diff
+    );
+}

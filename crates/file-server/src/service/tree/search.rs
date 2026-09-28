@@ -22,6 +22,41 @@ use super::{FileEntry, build_file_proxy_url, resolve_subdir};
 /// 并行遍历线程上限: 取 CPU 并行度但封顶, 避免小目录过度开线程的调度开销。
 const MAX_SEARCH_THREADS: usize = 8;
 
+/// 搜索遍历的目录黑名单: 仅纯噪音目录 (VCS 元数据/依赖/解释器缓存)。
+/// 刻意放行产品运行时目录 (.claude/.agents/.codex/.opencode/.local-deploy 等) ——
+/// 其下的技能 (SKILL.md) 与配置文件正是搜索要找的目标; 与浏览列表的隐藏口径
+/// (listDirectoryLevel 对点开头条目的整体隐藏) 解耦, 各管各的。
+/// 与 env TRAVERSE_EXCLUDE_DIRS 合并生效: 配置可追加排除项, 不可放行内置噪音项。
+/// (对齐 TS SEARCH_NOISE_DIR_NAMES, nuwax commit 9f636bf)
+const SEARCH_NOISE_DIR_NAMES: &[&str] = &[
+    ".git",
+    ".svn",
+    ".hg",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "virtualenv",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".cache",
+];
+
+/// 搜索遍历的文件黑名单: 系统生成的噪音文件 (点开头条目不再整体排除)。
+/// (对齐 TS SEARCH_NOISE_FILE_NAMES, nuwax commit 9f636bf)
+const SEARCH_NOISE_FILE_NAMES: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
+
+/// 条目名是否命中搜索噪音文件黑名单 (不区分条目类型, 目录撞名同样整体排除)。
+fn is_search_noise_file(name: &str) -> bool {
+    SEARCH_NOISE_FILE_NAMES.contains(&name)
+}
+
+/// 目录名是否命中搜索噪音目录黑名单。
+fn is_search_noise_dir(name: &str) -> bool {
+    SEARCH_NOISE_DIR_NAMES.contains(&name)
+}
+
 /// 搜索结果 (对齐 TS `{files, truncated, visited}`)。
 #[derive(Serialize)]
 pub struct SearchResult {
@@ -54,9 +89,11 @@ pub struct SearchParams<'a> {
 
 /// 无索引有界实时搜索 (并行遍历): 返回命中项, 受 `limit`/`max_visit`/`timeout_ms` 三重边界约束。
 ///
-/// 对齐 TS `searchFiles`:
+/// 对齐 TS `searchFiles` (排除口径 nuwax commit 9f636bf 起与浏览列表解耦):
 /// - 关键字匹配文件名或相对路径 (大小写不敏感, 子串包含)。
-/// - 排除规则同遍历 (隐藏文件除 .gitignore / traverse_exclude_dirs / content_traverse_exclude_files)。
+/// - 排除 = 噪音黑名单 (SEARCH_NOISE_DIR_NAMES / SEARCH_NOISE_FILE_NAMES,
+///   配置不可放行) + traverse_exclude_dirs / content_traverse_exclude_files;
+///   点开头条目不再整体排除 —— .claude 等产品运行时目录下的技能与配置可被搜到。
 /// - 硬停止: `visited >= max_visit` 或超时; 命中达 `limit` 标记 truncated。
 /// - `truncated` 综合判定: 迭代器提前终止 / visited 达上限 / 超时。
 ///
@@ -158,12 +195,18 @@ fn search_blocking(ctx: &BlockingCtx) -> (Vec<FileEntry>, bool, usize) {
     let start = Instant::now();
 
     // descend: 排除目录不展开子项 (但仍会被产出 → 消费时跳过)。
+    // 排除 = 噪音目录 ∪ 配置排除目录 ∪ 撞上噪音文件/配置排除文件名的目录 ——
+    // TS 侧这些目录不入队 (isExcludedSearchEntry 先于 childDirs.push), 子树整体不可见。
     // 闭包要求 'static + Send + Sync, 故 clone 一份所有权 (几十项, 成本可忽略)。
     let exclude_dirs_for_descend = ctx.exclude_dirs.clone();
+    let exclude_files_for_descend = ctx.exclude_files.clone();
     let descend = move |entry: &dua_core::Entry| {
         if entry.file_type.is_dir() {
             let name = entry.file_name.to_string_lossy();
-            !exclude_dirs_for_descend.contains(&*name)
+            !(exclude_dirs_for_descend.contains(&*name)
+                || is_search_noise_dir(&name)
+                || exclude_files_for_descend.contains(&*name)
+                || is_search_noise_file(&name))
         } else {
             true
         }
@@ -214,11 +257,12 @@ fn search_blocking(ctx: &BlockingCtx) -> (Vec<FileEntry>, bool, usize) {
         // Cow 借用, 不做 OsString→String 堆分配 (仅命中项最终进入结果)
         let name = entry.file_name.to_string_lossy();
 
-        // 隐藏文件 (除 .gitignore) 跳过 (对齐 TS isExcludedSearchEntry)
-        if name.starts_with('.') && name != super::KEEP_HIDDEN_FILE {
+        // 噪音文件 (系统生成) 跳过; 不区分条目类型 —— 目录撞名同样整体排除
+        // (对齐 TS SEARCH_NOISE_FILE_NAMES 未按 isDirectory 门控)
+        if is_search_noise_file(&name) {
             continue;
         }
-        // 排除文件跳过
+        // 排除文件跳过 (同样不区分类型, 对齐 TS excludeFiles 判定)
         if ctx.exclude_files.contains(&*name) {
             continue;
         }
@@ -226,8 +270,9 @@ fn search_blocking(ctx: &BlockingCtx) -> (Vec<FileEntry>, bool, usize) {
         let is_dir = entry.file_type.is_dir();
         let is_link = entry.file_type.is_symlink();
 
-        // 排除目录: descend 已产出但不应出现在结果 (对齐 TS 完全跳过语义)
-        if is_dir && ctx.exclude_dirs.contains(&*name) {
+        // 噪音目录 / 排除目录: descend 已拒绝但仍会产出条目 → 显式跳过
+        // (对齐 TS 完全跳过语义; 内置噪音项不因配置缺失而放行)
+        if is_dir && (is_search_noise_dir(&name) || ctx.exclude_dirs.contains(&*name)) {
             continue;
         }
 
@@ -509,6 +554,149 @@ mod tests {
             !names.iter().any(|n| n.contains("node_modules")),
             "excluded dir should not be yielded, got {names:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn search_files_finds_entries_in_hidden_product_dirs() {
+        // TS 9f636bf: 搜索放行产品运行时目录 (.claude 等), 其下的 SKILL.md 与配置
+        // 正是搜索目标; 点开头文件 (.env.example / .gitignore) 不再整体排除。
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join(".claude").join("skills").join("deploy");
+        tokio::fs::create_dir_all(&skill_dir).await.unwrap();
+        tokio::fs::write(skill_dir.join("SKILL.md"), "skill")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join(".env.example"), "env")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join(".gitignore"), "ignore")
+            .await
+            .unwrap();
+        let cfg = default_test_config();
+        for (kw, expected) in [
+            ("skill", ".claude/skills/deploy/SKILL.md"),
+            ("env.example", ".env.example"),
+            ("gitignore", ".gitignore"),
+        ] {
+            let r = search_files(SearchParams {
+                root: tmp.path(),
+                config: &cfg,
+                proxy_path: None,
+                kw,
+                relative_path: None,
+                limit: 100,
+                max_visit: 1000,
+                timeout_ms: 5000,
+            })
+            .await
+            .unwrap();
+            let names: Vec<&str> = r.files.iter().map(|f| f.name.as_str()).collect();
+            assert!(
+                names.contains(&expected),
+                "kw={kw} 应命中 {expected}, 实际: {names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_files_skips_noise_files_and_dirs() {
+        // TS 9f636bf: 噪音黑名单 —— .DS_Store 等噪音文件、.venv/__pycache__/.git 等
+        // 噪音目录 (含整个子树) 即便关键字命中也不可见。.venv/__pycache__/.cache
+        // 不在默认 traverse_exclude_dirs, 只有噪音表能挡住 —— 本测试即锁定该表。
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join(".DS_Store"), "junk")
+            .await
+            .unwrap();
+        for noise_dir in [".venv", "__pycache__", ".git"] {
+            tokio::fs::create_dir_all(tmp.path().join(noise_dir))
+                .await
+                .unwrap();
+            tokio::fs::write(tmp.path().join(noise_dir).join("target.txt"), "x")
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(tmp.path().join("keep-target.txt"), "x")
+            .await
+            .unwrap();
+        let cfg = default_test_config();
+        // kw=target: 正常文件命中 + 噪音条目全部不可见
+        let r = search_files(SearchParams {
+            root: tmp.path(),
+            config: &cfg,
+            proxy_path: None,
+            kw: "target",
+            relative_path: None,
+            limit: 100,
+            max_visit: 1000,
+            timeout_ms: 5000,
+        })
+        .await
+        .unwrap();
+        let names: Vec<&str> = r.files.iter().map(|f| f.name.as_str()).collect();
+        assert!(
+            names.contains(&"keep-target.txt"),
+            "正常文件应命中: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains(".DS_Store")
+                || n.starts_with(".venv")
+                || n.starts_with("__pycache__")
+                || n.starts_with(".git")),
+            "噪音条目不应出现: {names:?}"
+        );
+        // kw=store: 唯一含 "store" 的条目是噪音文件 .DS_Store → 结果必须为空
+        let r = search_files(SearchParams {
+            root: tmp.path(),
+            config: &cfg,
+            proxy_path: None,
+            kw: "store",
+            relative_path: None,
+            limit: 100,
+            max_visit: 1000,
+            timeout_ms: 5000,
+        })
+        .await
+        .unwrap();
+        let names: Vec<&str> = r.files.iter().map(|f| f.name.as_str()).collect();
+        assert!(
+            names.is_empty(),
+            "噪音文件 .DS_Store 即便关键字命中也不应出现: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_files_dir_named_like_excluded_file_hides_subtree() {
+        // 对齐 TS: 噪音文件/排除文件判定不区分条目类型 —— 目录撞名 (如默认
+        // content_traverse_exclude_files 中的 CLAUDE.md) 同样整体排除, 子树不可见。
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("CLAUDE.md"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("CLAUDE.md").join("inner-target.txt"), "x")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("keep-target.txt"), "x")
+            .await
+            .unwrap();
+        let cfg = default_test_config();
+        let r = search_files(SearchParams {
+            root: tmp.path(),
+            config: &cfg,
+            proxy_path: None,
+            kw: "target",
+            relative_path: None,
+            limit: 100,
+            max_visit: 1000,
+            timeout_ms: 5000,
+        })
+        .await
+        .unwrap();
+        let names: Vec<&str> = r.files.iter().map(|f| f.name.as_str()).collect();
+        assert!(
+            !names.iter().any(|n| n.contains("CLAUDE.md")),
+            "撞排除文件名的目录子树不应可见: {names:?}"
+        );
+        assert!(names.contains(&"keep-target.txt"));
     }
 
     #[tokio::test]
