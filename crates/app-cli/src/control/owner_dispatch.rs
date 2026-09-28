@@ -520,7 +520,7 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::write(
             ws.join("release.lock.toml"),
-            include_str!("../../workspace-manifest/tests/fixtures/lock_v1.toml"),
+            include_str!("../../../workspace-manifest/tests/fixtures/lock_v1.toml"),
         )
         .unwrap();
         let application_id = std::env::var("PROJECT_ID")

@@ -136,7 +136,7 @@ mod tests {
 
     fn worker() -> ServiceSpec {
         let mut lock = workspace_manifest::load_release_lock(include_str!(
-            "../../workspace-manifest/tests/fixtures/lock_v1.toml"
+            "../../../workspace-manifest/tests/fixtures/lock_v1.toml"
         ))
         .unwrap();
         let mut spec = lock.services.remove(0);

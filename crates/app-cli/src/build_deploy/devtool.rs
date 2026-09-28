@@ -151,7 +151,7 @@ mod tests {
     /// build-agent-docker 16-app-runtime.mk）必须一起改，CI 在此绑定。
     #[test]
     fn pingap_commit_constant_matches_cargo_toml_pin() {
-        let cargo_toml = include_str!("../Cargo.toml");
+        let cargo_toml = include_str!("../../Cargo.toml");
         let pin_line = cargo_toml
             .lines()
             .find(|l| l.trim_start().starts_with("pingap-config"))
