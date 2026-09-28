@@ -187,7 +187,7 @@ impl SubmissionRejected {
 }
 
 /// 认证后的运行操作客户端。
-pub(super) struct OwnerClient {
+pub(crate) struct OwnerClient {
     address: String,
     token: String,
     client: reqwest::Client,
