@@ -18,9 +18,17 @@ pub struct BootstrapResult {
 }
 
 pub async fn bootstrap() -> anyhow::Result<BootstrapResult> {
+    // 此处不用 expect/panic：此刻 telemetry 尚未初始化，panic 只会留下裸
+    // stderr 输出、断掉 tracing 日志链；以错误返回向上传播，由 main 的统一
+    // 错误出口记录。install_default 仅在已有其他 provider 抢先安装时失败
+    //（错误值即已安装的 provider，无 Display/name 字段可格式化，不外带）。
     rustls::crypto::ring::default_provider()
         .install_default()
-        .expect("Failed to install rustls crypto provider");
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "install rustls crypto provider: a crypto provider is already installed"
+            )
+        })?;
 
     let mut cli_args = CliArgs::parse();
 

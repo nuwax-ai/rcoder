@@ -31,6 +31,13 @@ const CHANNEL_TTL_SECS: u64 = 300;
 /// 大量并发容器（K8s 模式下每 project 一个 Pod）时上限保护。
 const MAX_CAPACITY: usize = 8000;
 
+/// HTTP/2 keep-alive 探测间隔（秒）：链路死亡检测的主动心跳周期。
+const HTTP2_KEEP_ALIVE_INTERVAL_SECS: u64 = 30;
+/// HTTP/2 keep-alive 探测超时（秒）：心跳在此窗口内无应答即判定连接死亡。
+const KEEP_ALIVE_TIMEOUT_SECS: u64 = 10;
+/// TCP keepalive（秒）：内核级保活，覆盖 HTTP/2 心跳覆盖不到的底层链路。
+const TCP_KEEPALIVE_SECS: u64 = 60;
+
 /// 创建配置好的 gRPC 客户端（设置消息大小限制）
 ///
 /// tonic 的消息大小限制是在 AgentServiceClient 级别配置的，
@@ -138,10 +145,12 @@ impl GrpcChannelPool {
                             shared_types::GRPC_CONNECT_TIMEOUT_SECS,
                         ))
                         .timeout(Duration::from_secs(shared_types::GRPC_REQUEST_TIMEOUT_SECS))
-                        .http2_keep_alive_interval(Duration::from_secs(30))
-                        .keep_alive_timeout(Duration::from_secs(10))
+                        .http2_keep_alive_interval(Duration::from_secs(
+                            HTTP2_KEEP_ALIVE_INTERVAL_SECS,
+                        ))
+                        .keep_alive_timeout(Duration::from_secs(KEEP_ALIVE_TIMEOUT_SECS))
                         .keep_alive_while_idle(true)
-                        .tcp_keepalive(Some(Duration::from_secs(60)))
+                        .tcp_keepalive(Some(Duration::from_secs(TCP_KEEPALIVE_SECS)))
                         .tcp_nodelay(true)
                         .connect()
                         .await

@@ -175,7 +175,12 @@ pub async fn start_all_background_tasks(
         if state.projects.is_postgres() {
             #[cfg(feature = "rcoder-pg")]
             {
-                let leader_store = state.projects.postgres().expect("is_postgres 为真");
+                // is_postgres() 为真时 postgres() 必有值；防御性错误传播而非
+                // expect（此处 panic 会击穿整个后台任务装配）。
+                let leader_store = state
+                    .projects
+                    .postgres()
+                    .ok_or_else(|| anyhow::anyhow!("postgres backend expected but absent"))?;
                 let election = Arc::new(
                     rcoder_storage::pg::leader_selection::PgLeaderElection::spawn(
                         leader_store.postgres_config().clone(),
@@ -217,7 +222,12 @@ pub async fn start_all_background_tasks(
     let pg_sync_handle = if state.projects.is_postgres() {
         #[cfg(feature = "rcoder-pg")]
         {
-            let store = Arc::clone(state.projects.postgres().expect("is_postgres 为真"));
+            let store = Arc::clone(
+                state
+                    .projects
+                    .postgres()
+                    .ok_or_else(|| anyhow::anyhow!("postgres backend expected but absent"))?,
+            );
             let shutdown_rx = shutdown_tx.subscribe();
             Some(tokio::spawn(async move {
                 rcoder_storage::pg::sync::run_sync_loop(store, shutdown_rx).await;

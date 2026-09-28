@@ -206,7 +206,14 @@ pub fn to_grpc_chat_agent_server_config(
                 action: serde_json::to_value(&r.action)
                     .ok()
                     .and_then(|v| v.as_str().map(String::from))
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|| {
+                        // 序列化失败/非字符串静默降级为空 action 会让 agent 侧
+                        // 规则失明——debug 留痕（正常数据不会走到这里）。
+                        tracing::debug!(
+                            "[gRPC-CONVERT] tool approval rule action was not a serializable string; sending empty action"
+                        );
+                        String::new()
+                    }),
                 tool_kind: r.tool_kind,
             })
             .collect(),
@@ -215,7 +222,15 @@ pub fn to_grpc_chat_agent_server_config(
             .platforms
             .map(|p| {
                 p.into_iter()
-                    .filter_map(|(k, v)| serde_json::to_vec(&v).ok().map(|bytes| (k, bytes)))
+                    .filter_map(|(k, v)| match serde_json::to_vec(&v) {
+                        Ok(bytes) => Some((k, bytes)),
+                        Err(error) => {
+                            tracing::debug!(
+                                "[gRPC-CONVERT] platform entry dropped: serialization failed for {k}: {error}"
+                            );
+                            None
+                        }
+                    })
                     .collect()
             })
             .unwrap_or_default(),

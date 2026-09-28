@@ -194,14 +194,12 @@ async fn fetch_once(
 
 async fn fetch_direct(addr: &str, budget: Duration) -> FetchOutcome {
     let query = async {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(budget)
-            .timeout(budget)
-            .build()
-            .map_err(|error| error.to_string())?;
+        // 共享探测客户端（不跟随重定向、无全局总超时）；总预算由 per-request
+        // .timeout 与外层 tokio timeout 共同收紧。
+        let client = crate::http_client::probe_client();
         let response = client
             .get(format!("http://{addr}/v1/app/readiness"))
+            .timeout(budget)
             .send()
             .await
             .map_err(|error| error.to_string())?;

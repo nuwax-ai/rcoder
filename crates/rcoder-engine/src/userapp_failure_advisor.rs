@@ -77,7 +77,7 @@ impl UserAppProxyFailureAdvisor for UserAppProxyFailureAdvisorImpl {
                 .await,
         );
         cache.insert(
-            key,
+            key.clone(),
             CachedHint {
                 at: Instant::now(),
                 hint: hint.clone(),
@@ -88,6 +88,13 @@ impl UserAppProxyFailureAdvisor for UserAppProxyFailureAdvisorImpl {
         if cache.len() > 512 {
             cache.clear();
         }
+        // 单飞行闸回收：等待者各自持有 gate 的 Arc 克隆——仅当本 key 无
+        // 其他等待者（strong_count == 2 即 map 持有 + 当前持有者）时移除
+        // 条目，避免 inflight 随历史 (app, stage) 键慢泄漏；有等待者时保
+        // 留，由最后一个离开者回收。DashMap 分片锁把 entry 克隆与
+        // remove_if 串行化，计数判定不存在竞态窗口。
+        self.inflight
+            .remove_if(&key, |_, gate| Arc::strong_count(gate) == 2);
         (*hint).clone()
     }
 }

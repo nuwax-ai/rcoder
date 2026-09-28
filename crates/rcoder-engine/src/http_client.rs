@@ -44,3 +44,28 @@ static FORWARD_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 pub fn forward_client() -> &'static reqwest::Client {
     &FORWARD_CLIENT
 }
+
+/// 探测类客户端连接建立超时（秒）：探测目标（容器内管理 API）要么秒级
+/// 应答要么视为不通，不做长等待。
+pub const PROBE_CONNECT_TIMEOUT_SECS: u64 = 2;
+
+/// 探测类请求专用共享客户端（dbx 就绪探测 / userapp readiness 直连）。
+///
+/// - 只设 2s 连接超时 + 短 pool 空闲超时（目标多为易逝容器 IP，陈旧空闲
+///   连接无复用价值），**不设全局总超时**——两处调用方各自按次请求
+///   `.timeout(...)` 控制预算（dbx 1.5s、readiness 按剩余预算）；
+/// - 不跟随重定向：readiness 语义要求把 3xx 原样分类（redirect 即非
+///   就绪信号）；dbx 探测任意状态码即 ready，同样不受影响。
+static PROBE_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(PROBE_CONNECT_TIMEOUT_SECS))
+        .pool_idle_timeout(Duration::from_secs(3))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+});
+
+/// 探测类（就绪探测）专用 HTTP 客户端。
+pub fn probe_client() -> &'static reqwest::Client {
+    &PROBE_CLIENT
+}

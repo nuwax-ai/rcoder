@@ -54,7 +54,7 @@ fn replay_result(
                     .with_operation_id(record.operation_id.clone()),
             );
         }
-        return Ok("密码已设置".into());
+        return Ok("Database password has been set".into());
     }
     if record.state == UserAppOperationState::Failed {
         return Err(backend(
@@ -622,7 +622,7 @@ async fn coordinated(
         )
         .await?;
         uncertain = false;
-        Ok("密码已设置".into())
+        Ok("Database password has been set".into())
     })
     .await;
     let result = match outcome {

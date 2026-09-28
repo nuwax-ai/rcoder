@@ -322,12 +322,16 @@ pub async fn assemble(
     let activity_for_shutdown = state.activity.clone();
     // R02：在途协调门闸 + 恢复扫描器句柄（take——扫描器随关机退出）
     let userapp_op_flight = state.userapp_op_flight.clone();
-    let userapp_recovery = state
-        .userapp_recovery_handle
-        .lock()
-        .map(|mut guard| guard.take())
-        .ok()
-        .flatten();
+    // poison 时保底 None（关机协调退化为不等恢复扫描器），但必须可见。
+    let userapp_recovery = match state.userapp_recovery_handle.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => {
+            warn!(
+                "userapp recovery handle lock poisoned; shutdown will not await the recovery scanner"
+            );
+            None
+        }
+    };
 
     Ok(AssembledEngine {
         state,

@@ -12,6 +12,19 @@ const MAX_RECOVERIES: usize = 8;
 const SCAN_PAGE_SIZE: u32 = 128;
 const MAX_PAGES_PER_TICK: usize = 4;
 const SCAN_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// 恢复任务对底层 runtime 调用的统一卡死预算。kube 请求无总超时
+/// （kube-rs 默认 read_timeout=None），一个 stall 调用不加界会把恢复任务
+/// 永久挂死——占满 `MAX_RECOVERIES` 槽位后瘫痪整个恢复管线。
+const STALL_BUDGET: Duration = Duration::from_secs(60);
+
+/// 以 [`STALL_BUDGET`] 为界执行恢复期的 runtime 调用；超时统一按
+/// `{label} timed out (stalled runtime call)` 传播错误，由下一扫描周期
+/// 重试（错误不吞、任务收束、槽位释放）。
+async fn with_stall_budget<F: Future>(label: &str, fut: F) -> anyhow::Result<F::Output> {
+    tokio::time::timeout(STALL_BUDGET, fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("{label} timed out (stalled runtime call)"))
+}
 
 type RecoveryResult = (String, anyhow::Result<()>);
 
@@ -292,16 +305,11 @@ async fn discover(
                     // 兜底 settler 永远轮不到（测试环境 20 个站立围栏的
                     // 直接成因之一）。
                     if !super::creation::reconcile_runtime_receipt(&state, &operation).await? {
-                        tokio::time::timeout(
-                            Duration::from_secs(60),
+                        with_stall_budget(
+                            "reconcile_fenced_ensure",
                             super::creation::reconcile_fenced_ensure(&state, &operation),
                         )
-                        .await
-                        .map_err(|_| {
-                            anyhow::anyhow!(
-                                "reconcile_fenced_ensure timed out (stalled runtime call)"
-                            )
-                        })??;
+                        .await??;
                     }
                     Ok(())
                 });
@@ -313,14 +321,11 @@ async fn discover(
             {
                 let state = state.clone();
                 tasks.push(operation.operation_id.clone(), async move {
-                    tokio::time::timeout(
-                        Duration::from_secs(60),
+                    with_stall_budget(
+                        "reconcile_created",
                         super::creation::reconcile_created(&state, &operation),
                     )
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!("reconcile_created timed out (stalled runtime call)")
-                    })??;
+                    .await??;
                     Ok(())
                 });
                 continue;
@@ -333,28 +338,20 @@ async fn discover(
                 let state = state.clone();
                 tasks.push(operation.operation_id.clone(), async move {
                     if operation.kind == UserAppOperationKind::EnsureBuilder {
-                        tokio::time::timeout(
-                            Duration::from_secs(60),
+                        with_stall_budget(
+                            "reconcile_completed",
                             super::creation::reconcile_completed(&state, &operation),
                         )
-                        .await
-                        .map_err(|_| {
-                            anyhow::anyhow!("reconcile_completed timed out (stalled runtime call)")
-                        })??;
+                        .await??;
                     } else if matches!(
                         operation.kind,
                         UserAppOperationKind::StopBuilder | UserAppOperationKind::RestartBuilder
                     ) {
-                        tokio::time::timeout(
-                            Duration::from_secs(60),
+                        with_stall_budget(
+                            "control reconcile_completed",
                             super::control::reconcile_completed(&state, &operation),
                         )
-                        .await
-                        .map_err(|_| {
-                            anyhow::anyhow!(
-                                "control reconcile_completed timed out (stalled runtime call)"
-                            )
-                        })??;
+                        .await??;
                     } else {
                         state.app_service.resume_pending_control(&operation).await?;
                     }
@@ -375,14 +372,11 @@ async fn discover(
                 // evidence) — frees the slot without operator action.
                 let state = state.clone();
                 tasks.push(operation.operation_id.clone(), async move {
-                    tokio::time::timeout(
-                        Duration::from_secs(60),
+                    with_stall_budget(
+                        "reconcile_fenced_ensure",
                         super::creation::reconcile_fenced_ensure(&state, &operation),
                     )
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!("reconcile_fenced_ensure timed out (stalled runtime call)")
-                    })??;
+                    .await??;
                     Ok(())
                 });
                 continue;

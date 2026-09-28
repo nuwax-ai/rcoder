@@ -29,13 +29,18 @@ impl shared_types::AppRuntimeIpResolver for DockerRuntimeIpResolver {
             tracing::debug!("[RUNTIME_IP] invalid app_id: {e}");
             return None;
         }
-        self.runtime
+        match self
+            .runtime
             .get_container_info_by_identifier(app_id, &shared_types::ServiceType::Userapp)
             .await
-            .ok()
-            .flatten()
-            .map(|info| info.container_ip)
-            .filter(|ip| !ip.is_empty())
+        {
+            Ok(Some(found)) if !found.container_ip.is_empty() => Some(found.container_ip),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::debug!("[RUNTIME_IP] resolve failed: app_id={app_id} error={e}");
+                None
+            }
+        }
     }
 }
 

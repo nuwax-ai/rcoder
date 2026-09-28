@@ -26,7 +26,9 @@ impl DbxReadinessProberImpl {
     pub(crate) fn new(state: Weak<AppState>) -> Self {
         Self {
             state,
-            http: reqwest::Client::new(),
+            // 探测专用共享客户端（http_client.rs 约定：消灭裸 Client::new；
+            // 无全局总超时，预算由下方 per-request .timeout(PROBE_TIMEOUT) 控制）。
+            http: crate::http_client::probe_client().clone(),
         }
     }
 
