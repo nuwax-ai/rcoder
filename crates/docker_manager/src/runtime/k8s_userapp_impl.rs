@@ -23,6 +23,21 @@ use super::kubernetes_runtime::{KubernetesRuntime, read_app_expose_env};
 #[cfg(feature = "kubernetes")]
 #[async_trait]
 impl UserAppDeploymentRuntime for KubernetesRuntime {
+    async fn observe_userapp_readiness(
+        &self,
+        app_id: &str,
+        stage: shared_types::UserappStage,
+    ) -> ContainerRuntimeResult<container_runtime_api::UserAppRuntimeReadiness> {
+        self.inspect_readiness(app_id, stage).await
+    }
+
+    async fn exec_userapp_readiness(
+        &self,
+        target: &container_runtime_api::UserAppReadinessTarget,
+    ) -> ContainerRuntimeResult<Option<container_runtime_api::ExecResult>> {
+        self.exec_readiness(target).await
+    }
+
     async fn cleanup_builder_restart_archive(
         &self,
         template: &shared_types::BuilderRestartTemplate,

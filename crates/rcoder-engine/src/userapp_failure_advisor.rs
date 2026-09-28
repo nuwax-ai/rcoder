@@ -112,11 +112,8 @@ impl UserAppProxyFailureAdvisorImpl {
             }
             // 无快照（停止/不可达/换代/不支持）= 无来源证据：不确认替换，
             // 停止态本身可作为文案证据返回。
-            Ok(UserAppReadinessObservation::NoCompute { detail }) => {
-                let stopped = matches!(
-                    detail.as_deref(),
-                    Some("scaled-to-zero") | Some("container-stopped") | Some("stopped")
-                );
+            Ok(UserAppReadinessObservation::NoCompute { state }) => {
+                let stopped = state == shared_types::UserAppNoComputeState::Stopped;
                 stopped.then_some(UserAppProxyFailureHint {
                     readiness_status: Some(shared_types::UserAppReadinessStatus::Stopped),
                     error_origin_confirmed: false,

@@ -72,6 +72,8 @@ pub async fn get_app_health(
 - `status`：`not_deployed` / `starting` / `stopping` / `stopped` / `ready` /
   `degraded` / `failed` / `unknown` / `unsupported`；`reason_code` 为结构化原因。
 - 只读保证：不启动/唤醒/停止容器，不刷新闲置计时，不阻塞 Stop/Restart。
+- 已停止的计算资源（含 Stop 后删除的开发容器）→ `stopped`；调度中/创建中 → `starting`。
+- 查询包含定位、控制意图复核的总预算为 8 秒，耗尽返回 `unknown/OBSERVE_INCOMPLETE`，不改变业务状态。
 - 查询期间停止已受理 → `stopping`；旧运行时无新接口 → `unsupported`
   （`RUNTIME_UPGRADE_REQUIRED`）。
 - 应用权威记录不存在或已删除、`app_stage` 非法、查询系统故障分别走错误信封

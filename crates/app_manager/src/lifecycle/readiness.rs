@@ -1,32 +1,25 @@
-//! UserApp 业务就绪查询：`GET /api/v1/userapp/{app_id}/{app_stage}/readiness`。
-//!
-//! 只读合并链：权威 lifecycle 记录（存在性/删除态）→ scope 在途操作
-//! （Stop 受理/启动中）→ 宿主注入的 [`UserAppReadinessReader`] 物理观察
-//! （app-cli 业务快照）→ 统一 [`UserAppReadinessResponse`]。
-//!
-//! 只读纪律（Spec §4）：不复用 `log_api_base`/`app_files_base`/`ensure_running`
-//! 等写路径；不申请业务锁（busy/RecoveryRequired 不阻塞查询）；不刷新闲置
-//! 计时；Stop/Restart 照常运行。观察结果只描述一次时间窗口，不作为准入或
-//! 恢复依据。
+//! 业务就绪查询只读合并平台控制意图和实际实例的 app-cli 快照。
+//! 不申请操作锁，不刷新闲置计时，也不推进恢复/启停。观察不是准入依据。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use shared_types::{
-    UserAppOperationKind, UserAppOperationRecord, UserAppOperationScope, UserAppProxyReadiness,
+    ComputeControlAction, UserAppLifecycleState, UserAppNoComputeState, UserAppOperationKind,
+    UserAppOperationRecord, UserAppOperationScope, UserAppProxyReadiness,
     UserAppReadinessObservation, UserAppReadinessReason, UserAppReadinessResponse,
     UserAppReadinessStatus, UserappStage,
 };
+use tokio::time::Instant;
 
 use crate::error::AppOperationError;
 use crate::models::AppResult;
 use crate::service::AppService;
 use crate::utils::validate_app_id;
 
-/// RCoder 侧总查询预算（含物理定位、app-cli 观察与换代复核；Plan §4.5）。
-pub(crate) const READINESS_QUERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+pub(crate) const READINESS_QUERY_BUDGET: Duration = Duration::from_secs(8);
 
 impl AppService {
-    /// 注入业务就绪只读观察器（rcoder-engine 装配；幂等覆盖仅装配期使用）。
     pub fn set_readiness_reader(
         &self,
         reader: Arc<dyn shared_types::UserAppReadinessReader>,
@@ -46,114 +39,192 @@ impl AppService {
             .and_then(|slot| slot.clone())
     }
 
-    /// 业务就绪查询（Spec §5：成功观察恒 HTTP 200 + `data.ready` 才是业务可用）。
     pub async fn get_app_readiness(
         &self,
         app_stage: UserappStage,
         app_id: &str,
     ) -> AppResult<UserAppReadinessResponse> {
+        self.get_readiness_with_budget(app_stage, app_id, READINESS_QUERY_BUDGET)
+            .await
+    }
+
+    async fn get_readiness_with_budget(
+        &self,
+        stage: UserappStage,
+        app_id: &str,
+        budget: Duration,
+    ) -> AppResult<UserAppReadinessResponse> {
         validate_app_id(app_id)?;
-        // 权威存在性：记录不存在或已删除 → 404（不把容器暂缺误报成应用不存在）。
+        let deadline = Instant::now() + budget;
+        let observe = async {
+            let Some(reader) = self.readiness_reader() else {
+                return Err(AppOperationError::Backend(
+                    "readiness reader is not wired (host assembly missing)".into(),
+                ));
+            };
+            let mut before = self.read_readiness_control(app_id, stage).await?;
+            for attempt in 0..2 {
+                let observation = reader
+                    .observe(
+                        app_id,
+                        stage,
+                        deadline.saturating_duration_since(Instant::now()),
+                    )
+                    .await
+                    .map_err(|error| {
+                        AppOperationError::Backend(format!(
+                            "Readiness observation (app {app_id}): {error}"
+                        ))
+                    })?;
+                // Stop/Restart use independent compute controls, not business
+                // slots. Reread both after I/O so an old ready cannot hide Stop.
+                let after = self.read_readiness_control(app_id, stage).await?;
+                if before.lifecycle_id != after.lifecycle_id {
+                    return Ok(merge_observation(
+                        app_id,
+                        stage,
+                        &after,
+                        UserAppReadinessObservation::InstanceChanged,
+                    ));
+                }
+                if before == after || after.intent == ControlIntent::StopAccepted {
+                    return Ok(merge_observation(app_id, stage, &after, observation));
+                }
+                if attempt == 1 {
+                    return Ok(merge_observation(
+                        app_id,
+                        stage,
+                        &after,
+                        UserAppReadinessObservation::InstanceChanged,
+                    ));
+                }
+                before = after;
+            }
+            Ok(merge_observation(
+                app_id,
+                stage,
+                &before,
+                UserAppReadinessObservation::InstanceChanged,
+            ))
+        };
+        // Covers storage reads too; observation timeout cannot mutate lifecycle
+        // or turn an unknown business result into Failed/RecoveryRequired.
+        match tokio::time::timeout_at(deadline, observe).await {
+            Ok(result) => result,
+            Err(_) => Ok(merge_observation(
+                app_id,
+                stage,
+                &ReadinessControl::ordinary(None),
+                UserAppReadinessObservation::TimedOut,
+            )),
+        }
+    }
+
+    async fn read_readiness_control(
+        &self,
+        app_id: &str,
+        stage: UserappStage,
+    ) -> AppResult<ReadinessControl> {
         let record = self
             .metadata
             .store
             .get_application(app_id)
             .await?
+            .filter(|record| record.state != UserAppLifecycleState::Deleted)
             .ok_or_else(|| AppOperationError::NotFound(format!("app {app_id} not found")))?;
-        if record.state == shared_types::UserAppLifecycleState::Deleted {
-            return Err(AppOperationError::NotFound(format!(
-                "app {app_id} has been deleted"
-            )));
-        }
-
-        // scope 在途操作（只读；无在途时为空——不因 busy 拒绝查询）。
-        let scope = match app_stage {
+        let scope = match stage {
             UserappStage::Dev => UserAppOperationScope::Dev,
             UserappStage::Prod => UserAppOperationScope::Prod,
         };
-        let scope_operation = self
-            .scope_active_operation(app_id, &record.lifecycle_id, scope)
-            .await?;
-
-        let Some(reader) = self.readiness_reader() else {
-            return Err(AppOperationError::Backend(
-                "readiness reader is not wired (host assembly missing)".into(),
-            ));
+        let operation = match record.active_operations.slot(scope) {
+            Some(id) => self
+                .metadata
+                .store
+                .get_operation(app_id, id)
+                .await?
+                .filter(|operation| {
+                    operation.lifecycle_id == record.lifecycle_id && !operation.state.is_terminal()
+                }),
+            None => None,
         };
-        let observation = reader
-            .observe(app_id, app_stage, READINESS_QUERY_BUDGET)
-            .await
-            .map_err(|message| {
-                AppOperationError::Backend(format!(
-                    "readiness observation system failure (app {app_id}): {message}"
-                ))
-            })?;
-
-        Ok(merge_observation(
-            app_id,
-            app_stage,
-            scope_operation.as_ref(),
-            observation,
-        ))
-    }
-
-    /// 读取 scope 槽位当前操作记录（存储缺失视为无在途，不阻塞观察）。
-    async fn scope_active_operation(
-        &self,
-        app_id: &str,
-        lifecycle_id: &str,
-        scope: UserAppOperationScope,
-    ) -> AppResult<Option<UserAppOperationRecord>> {
-        let Some(operation_id) = self
+        let mut control = ReadinessControl::ordinary(operation.as_ref());
+        control.lifecycle_id = record.lifecycle_id.clone();
+        if let Some(compute) = self
             .metadata
             .store
-            .get_application(app_id)
+            .active_compute_controls(app_id)
             .await?
-            .filter(|record| record.lifecycle_id == lifecycle_id)
-            .and_then(|record| record.active_operations.slot(scope).cloned())
-        else {
-            return Ok(None);
-        };
-        let operation = self
+            .into_iter()
+            .filter(|control| {
+                control.lifecycle_id == record.lifecycle_id
+                    && control.scope == scope
+                    && !control.state.is_terminal()
+            })
+            .max_by_key(|control| control.generation)
+        {
+            control.intent = match compute.action {
+                ComputeControlAction::Stop => ControlIntent::StopAccepted,
+                ComputeControlAction::Restart => ControlIntent::Restarting,
+            };
+            control.operation_id = Some(compute.operation_id);
+        }
+        control.desired_stopped = self
             .metadata
             .store
-            .get_operation(app_id, &operation_id)
+            .compute_desired_stopped(app_id, &record.lifecycle_id, scope)
             .await?;
-        // 记录缺失/换代：无在途证据，观察按物理事实回答。
-        Ok(operation
-            .filter(|record| record.lifecycle_id == lifecycle_id && !record.state.is_terminal()))
+        if record.state == UserAppLifecycleState::Deleting {
+            control.intent = ControlIntent::StopAccepted;
+        }
+        Ok(control)
     }
 }
 
-/// 平台侧控制意图快照（合并用；从 scope 操作派生）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ControlIntent {
-    /// 无在途操作
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlIntent {
     None,
-    /// Stop 类意图已受理尚未收束
     StopAccepted,
-    /// 启动/更新类操作执行中
     Starting,
+    Restarting,
 }
 
-pub(crate) fn control_intent(operation: Option<&UserAppOperationRecord>) -> ControlIntent {
-    let Some(operation) = operation else {
-        return ControlIntent::None;
-    };
-    match operation.kind {
-        UserAppOperationKind::Stop
-        | UserAppOperationKind::StopBuilder
-        | UserAppOperationKind::DeleteCompute => ControlIntent::StopAccepted,
-        UserAppOperationKind::Create
-        | UserAppOperationKind::StartDeployment
-        | UserAppOperationKind::RestartDeployment
-        | UserAppOperationKind::Start
-        | UserAppOperationKind::Restart
-        | UserAppOperationKind::EnsureBuilder
-        | UserAppOperationKind::Update
-        | UserAppOperationKind::HotDeploy => ControlIntent::Starting,
-        // 存储/密码/清理类操作不构成目标环境启停意图；观察照常。
-        _ => ControlIntent::None,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadinessControl {
+    lifecycle_id: String,
+    intent: ControlIntent,
+    operation_id: Option<String>,
+    desired_stopped: bool,
+}
+
+impl ReadinessControl {
+    fn ordinary(operation: Option<&UserAppOperationRecord>) -> Self {
+        let intent = match operation.map(|operation| operation.kind) {
+            Some(
+                UserAppOperationKind::Stop
+                | UserAppOperationKind::StopBuilder
+                | UserAppOperationKind::DeleteCompute,
+            ) => ControlIntent::StopAccepted,
+            Some(
+                UserAppOperationKind::Restart
+                | UserAppOperationKind::RestartDeployment
+                | UserAppOperationKind::RestartBuilder,
+            ) => ControlIntent::Restarting,
+            Some(
+                UserAppOperationKind::Create
+                | UserAppOperationKind::StartDeployment
+                | UserAppOperationKind::Start
+                | UserAppOperationKind::EnsureBuilder
+                | UserAppOperationKind::Update
+                | UserAppOperationKind::HotDeploy,
+            ) => ControlIntent::Starting,
+            _ => ControlIntent::None,
+        };
+        Self {
+            lifecycle_id: String::new(),
+            intent,
+            operation_id: operation.map(|op| op.operation_id.clone()),
+            desired_stopped: false,
+        }
     }
 }
 
@@ -161,119 +232,114 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-/// 观察结果 + 控制意图 → 最终响应（纯函数，测试覆盖合并边界）。
-pub(crate) fn merge_observation(
+fn merge_observation(
     app_id: &str,
     app_stage: UserappStage,
-    scope_operation: Option<&UserAppOperationRecord>,
+    control: &ReadinessControl,
     observation: UserAppReadinessObservation,
 ) -> UserAppReadinessResponse {
-    let intent = control_intent(scope_operation);
-    let operation_id = scope_operation.map(|operation| operation.operation_id.clone());
-    let base_unknown = |status: UserAppReadinessStatus, reason: Option<UserAppReadinessReason>| {
-        UserAppReadinessResponse {
-            app_id: app_id.to_string(),
-            app_stage: app_stage.as_str().to_string(),
+    use UserAppReadinessReason as Reason;
+    use UserAppReadinessStatus as Status;
+    let base = |status: Status, reason: Option<Reason>| UserAppReadinessResponse {
+        app_id: app_id.into(),
+        app_stage: app_stage.as_str().into(),
+        ready: false,
+        status,
+        reason_code: reason,
+        checked_at: now_rfc3339(),
+        runtime_instance_id: None,
+        serving_release_id: None,
+        target_release_id: None,
+        operation_id: control.operation_id.clone(),
+        runtime_operation_id: None,
+        observation_revision: 0,
+        proxy: UserAppProxyReadiness {
             ready: false,
             status,
             reason_code: reason,
-            checked_at: now_rfc3339(),
-            runtime_instance_id: None,
-            serving_release_id: None,
-            target_release_id: None,
-            operation_id: operation_id.clone(),
-            runtime_operation_id: None,
-            observation_revision: 0,
-            proxy: UserAppProxyReadiness {
-                ready: false,
-                status,
-                reason_code: reason,
-                error_origin_contract: None,
-            },
-            services: Vec::new(),
-        }
+            error_origin_contract: None,
+        },
+        services: Vec::new(),
     };
-
-    match observation {
-        UserAppReadinessObservation::InstanceChanged => base_unknown(
-            UserAppReadinessStatus::Unknown,
-            Some(UserAppReadinessReason::InstanceChanged),
-        ),
-        UserAppReadinessObservation::UnsupportedRuntime { physical } => {
-            // 旧运行时不支持新接口：明确 unsupported，不影响用户直接访问。
-            let mut response = base_unknown(
-                UserAppReadinessStatus::Unsupported,
-                Some(UserAppReadinessReason::RuntimeUpgradeRequired),
-            );
-            response.runtime_instance_id = physical.instance_id;
-            response
+    let starting = matches!(
+        control.intent,
+        ControlIntent::Starting | ControlIntent::Restarting
+    );
+    let mut response = match observation {
+        UserAppReadinessObservation::InstanceChanged => {
+            base(Status::Unknown, Some(Reason::InstanceChanged))
         }
-        UserAppReadinessObservation::AdminUnreachable { physical } => {
-            // 计算资源在运行但管理面不可达：unknown（有停止事实时以停止为准）。
-            if intent == ControlIntent::StopAccepted {
-                base_unknown(
-                    UserAppReadinessStatus::Stopping,
-                    Some(UserAppReadinessReason::StopAccepted),
-                )
+        UserAppReadinessObservation::TimedOut => {
+            base(Status::Unknown, Some(Reason::ObserveIncomplete))
+        }
+        UserAppReadinessObservation::UnsupportedRuntime { .. } => {
+            base(Status::Unsupported, Some(Reason::RuntimeUpgradeRequired))
+        }
+        UserAppReadinessObservation::AdminUnreachable { .. } => {
+            if starting {
+                base(Status::Starting, Some(Reason::ServiceStarting))
             } else {
-                let mut response = base_unknown(
-                    UserAppReadinessStatus::Unknown,
-                    Some(UserAppReadinessReason::AdminUnreachable),
-                );
-                response.runtime_instance_id = physical.instance_id;
-                response
+                base(Status::Unknown, Some(Reason::AdminUnreachable))
             }
         }
-        UserAppReadinessObservation::NoCompute { detail } => {
-            // 无运行中的计算资源：以控制意图与细节区分 stopping/stopped/not_deployed/starting。
-            let status = match &intent {
-                ControlIntent::StopAccepted => UserAppReadinessStatus::Stopping,
-                ControlIntent::Starting => UserAppReadinessStatus::Starting,
-                ControlIntent::None => match detail.as_deref() {
-                    Some("scaled-to-zero") | Some("container-stopped") | Some("stopped") => {
-                        UserAppReadinessStatus::Stopped
-                    }
-                    Some("no-pod-ip") | Some("scheduling") => UserAppReadinessStatus::Starting,
-                    // 部署缺失且无启停意图：目标环境未部署。
-                    _ => UserAppReadinessStatus::NotDeployed,
-                },
+        UserAppReadinessObservation::NoCompute { state } => {
+            let status = match state {
+                UserAppNoComputeState::Starting => Status::Starting,
+                UserAppNoComputeState::Stopping => Status::Stopping,
+                UserAppNoComputeState::Unknown => Status::Unknown,
+                UserAppNoComputeState::Missing
+                | UserAppNoComputeState::Stopped
+                | UserAppNoComputeState::Failed
+                    if control.desired_stopped =>
+                {
+                    Status::Stopped
+                }
+                UserAppNoComputeState::Missing | UserAppNoComputeState::Stopped if starting => {
+                    Status::Starting
+                }
+                UserAppNoComputeState::Missing => Status::NotDeployed,
+                UserAppNoComputeState::Stopped => Status::Stopped,
+                UserAppNoComputeState::Failed => Status::Failed,
             };
             let reason = match status {
-                UserAppReadinessStatus::Stopping => Some(UserAppReadinessReason::StopAccepted),
-                UserAppReadinessStatus::Starting => Some(UserAppReadinessReason::ServiceStarting),
+                Status::Starting => Some(Reason::ServiceStarting),
+                Status::Stopping => Some(Reason::StopAccepted),
+                Status::Failed => Some(Reason::OrchestrationFailed),
+                Status::Unknown => Some(Reason::ObserveIncomplete),
                 _ => None,
             };
-            base_unknown(status, reason)
+            base(status, reason)
         }
-        UserAppReadinessObservation::Snapshot { snapshot, .. } => {
-            // 业务快照为准；Stop 已受理时旧 ready 不可沿（即使 Pod UID 未变）。
-            let (status, reason) =
-                if intent == ControlIntent::StopAccepted && snapshot.status.is_ready() {
-                    (
-                        UserAppReadinessStatus::Stopping,
-                        Some(UserAppReadinessReason::StopAccepted),
-                    )
-                } else {
-                    (snapshot.status, snapshot.reason_code)
-                };
-            UserAppReadinessResponse {
-                app_id: app_id.to_string(),
-                app_stage: app_stage.as_str().to_string(),
-                ready: status.is_ready(),
-                status,
-                reason_code: reason,
-                checked_at: snapshot.checked_at,
-                runtime_instance_id: snapshot.runtime_instance_id,
-                serving_release_id: snapshot.serving_release_id,
-                target_release_id: snapshot.target_release_id,
-                operation_id,
-                runtime_operation_id: snapshot.operation_id,
-                observation_revision: snapshot.observation_revision,
-                proxy: snapshot.proxy,
-                services: snapshot.services,
-            }
-        }
+        UserAppReadinessObservation::Snapshot { snapshot, .. } => UserAppReadinessResponse {
+            app_id: app_id.into(),
+            app_stage: app_stage.as_str().into(),
+            ready: snapshot.ready && snapshot.status.is_ready(),
+            status: snapshot.status,
+            reason_code: snapshot.reason_code,
+            checked_at: snapshot.checked_at,
+            runtime_instance_id: snapshot.runtime_instance_id,
+            serving_release_id: snapshot.serving_release_id,
+            target_release_id: snapshot.target_release_id,
+            operation_id: control.operation_id.clone(),
+            runtime_operation_id: snapshot.operation_id,
+            observation_revision: snapshot.observation_revision,
+            proxy: snapshot.proxy,
+            services: snapshot.services,
+        },
+    };
+    // Only an in-flight Stop overrides a live snapshot. A historical desired
+    // state helps classify a removed container, but must not mask a later
+    // manually started owner or pretend a completed/failed Stop is still active.
+    if control.intent == ControlIntent::StopAccepted {
+        response.ready = false;
+        response.status = Status::Stopping;
+        response.reason_code = Some(Reason::StopAccepted);
+    } else if control.intent == ControlIntent::Restarting {
+        response.ready = false;
+        response.status = Status::Starting;
+        response.reason_code = Some(Reason::ServiceStarting);
     }
+    response
 }
 
 #[cfg(test)]
@@ -336,7 +402,7 @@ mod tests {
         let response = merge_observation(
             "194",
             UserappStage::Prod,
-            Some(&stop),
+            &ReadinessControl::ordinary(Some(&stop)),
             UserAppReadinessObservation::Snapshot {
                 physical: UserAppReadinessPhysical {
                     instance_id: Some("pod-uid".into()),
@@ -366,7 +432,7 @@ mod tests {
         let response = merge_observation(
             "194",
             UserappStage::Prod,
-            None,
+            &ReadinessControl::ordinary(None),
             UserAppReadinessObservation::Snapshot {
                 physical: UserAppReadinessPhysical {
                     instance_id: None,
@@ -394,17 +460,19 @@ mod tests {
         let response = merge_observation(
             "194",
             UserappStage::Prod,
-            Some(&stop),
-            UserAppReadinessObservation::NoCompute { detail: None },
+            &ReadinessControl::ordinary(Some(&stop)),
+            UserAppReadinessObservation::NoCompute {
+                state: UserAppNoComputeState::Missing,
+            },
         );
         assert_eq!(response.status, UserAppReadinessStatus::Stopping);
 
         let response = merge_observation(
             "194",
             UserappStage::Prod,
-            None,
+            &ReadinessControl::ordinary(None),
             UserAppReadinessObservation::NoCompute {
-                detail: Some("scaled-to-zero".into()),
+                state: UserAppNoComputeState::Stopped,
             },
         );
         assert_eq!(response.status, UserAppReadinessStatus::Stopped);
@@ -412,9 +480,9 @@ mod tests {
         let response = merge_observation(
             "194",
             UserappStage::Dev,
-            None,
+            &ReadinessControl::ordinary(None),
             UserAppReadinessObservation::NoCompute {
-                detail: Some("builder-missing".into()),
+                state: UserAppNoComputeState::Missing,
             },
         );
         assert_eq!(response.status, UserAppReadinessStatus::NotDeployed);
@@ -422,9 +490,9 @@ mod tests {
         let response = merge_observation(
             "194",
             UserappStage::Prod,
-            Some(&start),
+            &ReadinessControl::ordinary(Some(&start)),
             UserAppReadinessObservation::NoCompute {
-                detail: Some("deployment-missing".into()),
+                state: UserAppNoComputeState::Missing,
             },
         );
         assert_eq!(response.status, UserAppReadinessStatus::Starting);
@@ -441,7 +509,7 @@ mod tests {
         let response = merge_observation(
             "194",
             UserappStage::Prod,
-            None,
+            &ReadinessControl::ordinary(None),
             UserAppReadinessObservation::AdminUnreachable {
                 physical: physical.clone(),
             },
@@ -455,7 +523,7 @@ mod tests {
         let response = merge_observation(
             "194",
             UserappStage::Prod,
-            None,
+            &ReadinessControl::ordinary(None),
             UserAppReadinessObservation::UnsupportedRuntime { physical },
         );
         assert_eq!(response.status, UserAppReadinessStatus::Unsupported);
@@ -468,7 +536,7 @@ mod tests {
         let response = merge_observation(
             "194",
             UserappStage::Prod,
-            Some(&stop),
+            &ReadinessControl::ordinary(Some(&stop)),
             UserAppReadinessObservation::AdminUnreachable {
                 physical: UserAppReadinessPhysical {
                     instance_id: None,
@@ -478,5 +546,128 @@ mod tests {
             },
         );
         assert_eq!(response.status, UserAppReadinessStatus::Stopping);
+    }
+
+    #[test]
+    fn stopped_builder_and_removed_container_are_not_undeployed() {
+        let mut control = ReadinessControl::ordinary(None);
+        let response = merge_observation(
+            "194",
+            UserappStage::Dev,
+            &control,
+            UserAppReadinessObservation::NoCompute {
+                state: UserAppNoComputeState::Stopped,
+            },
+        );
+        assert_eq!(response.status, UserAppReadinessStatus::Stopped);
+        control.desired_stopped = true;
+        let response = merge_observation(
+            "194",
+            UserappStage::Dev,
+            &control,
+            UserAppReadinessObservation::NoCompute {
+                state: UserAppNoComputeState::Missing,
+            },
+        );
+        assert_eq!(response.status, UserAppReadinessStatus::Stopped);
+        let response = merge_observation(
+            "194",
+            UserappStage::Dev,
+            &control,
+            UserAppReadinessObservation::Snapshot {
+                physical: UserAppReadinessPhysical {
+                    instance_id: None,
+                    address: None,
+                    channel: UserAppReadinessChannel::Exec,
+                },
+                snapshot: ready_snapshot(),
+            },
+        );
+        assert_eq!(
+            response.status,
+            UserAppReadinessStatus::Ready,
+            "historical Stop intent must not hide a later live owner"
+        );
+        assert!(response.ready);
+    }
+
+    #[tokio::test]
+    async fn query_rereads_compute_stop_admitted_during_observation_and_isolates_prod() {
+        use shared_types::UserAppLifecycleStore;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Reader {
+            store: Arc<dyn UserAppLifecycleStore>,
+            request: shared_types::ComputeControlRequest,
+            first: AtomicBool,
+        }
+        #[async_trait::async_trait]
+        impl shared_types::UserAppReadinessReader for Reader {
+            async fn observe(
+                &self,
+                _: &str,
+                _: UserappStage,
+                _: Duration,
+            ) -> Result<UserAppReadinessObservation, String> {
+                if self.first.swap(false, Ordering::SeqCst) {
+                    self.store
+                        .admit_compute_control(&self.request)
+                        .await
+                        .map_err(|err| err.to_string())?;
+                }
+                Ok(UserAppReadinessObservation::Snapshot {
+                    physical: UserAppReadinessPhysical {
+                        instance_id: Some("old-pod".into()),
+                        address: None,
+                        channel: UserAppReadinessChannel::Exec,
+                    },
+                    snapshot: ready_snapshot(),
+                })
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::test_support::MockRuntime::default());
+        let (service, store) =
+            crate::test_support::test_service_with_store(root.path(), runtime.clone()).await;
+        let identity = store.ensure_identity("194").await.unwrap();
+        service
+            .set_readiness_reader(Arc::new(Reader {
+                store: store.clone(),
+                first: AtomicBool::new(true),
+                request: shared_types::ComputeControlRequest {
+                    app_id: "194".into(),
+                    lifecycle_id: identity.lifecycle_id,
+                    scope: UserAppOperationScope::Dev,
+                    operation_id: "stopdev".into(),
+                    request_id: "stoprequest".into(),
+                    request_fingerprint: "a".repeat(64),
+                    action: ComputeControlAction::Stop,
+                    restart_image_roll: false,
+                },
+            }))
+            .unwrap();
+        let response = service
+            .get_app_readiness(UserappStage::Dev, "194")
+            .await
+            .unwrap();
+        assert_eq!(response.status, UserAppReadinessStatus::Stopping);
+        assert!(!response.ready);
+        assert_eq!(response.operation_id.as_deref(), Some("stopdev"));
+        let response = service
+            .get_app_readiness(UserappStage::Prod, "194")
+            .await
+            .unwrap();
+        assert_eq!(response.status, UserAppReadinessStatus::Ready);
+        assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store
+                .get_compute_control("194", "stopdev")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            shared_types::ComputeControlState::Pending
+        );
     }
 }

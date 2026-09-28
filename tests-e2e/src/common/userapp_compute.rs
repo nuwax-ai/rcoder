@@ -213,6 +213,32 @@ pub async fn run_dev_compute_cycle<P: DevComputeProbe + Send>(
         return Some(lifecycle_id);
     }
 
+    // Docker Stop may remove the builder; K8s retains a zero-replica STS.
+    // Both must report stopped, and observing must not wake the workspace.
+    let readiness = request(
+        env,
+        reqwest::Method::GET,
+        &format!("/api/v1/userapp/{app_id}/dev/readiness"),
+        None,
+    )
+    .await;
+    report.assert_hard(
+        "stopped dev readiness is read-only",
+        readiness.as_ref().is_ok_and(|(status, body)| {
+            success(*status, body)
+                && body["data"]["app_stage"] == "dev"
+                && body["data"]["status"] == "stopped"
+                && body["data"]["ready"] == false
+        }),
+        format!("{readiness:?}"),
+    );
+    let still_stopped = probe.stopped(app_id).await;
+    report.assert_hard(
+        "readiness did not wake stopped compute",
+        still_stopped.is_ok(),
+        format!("{still_stopped:?}"),
+    );
+
     let restarted = control(env, app_id, &lifecycle_id, "restart").await;
     report.assert_hard(
         "userapp dev restart completed",

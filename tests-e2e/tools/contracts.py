@@ -276,6 +276,8 @@ USERAPP_COMPUTE = {
     'userapp physical workspace marked',
     'userapp dev stop completed',
     'userapp compute stopped with storage retained',
+    'stopped dev readiness is read-only',
+    'readiness did not wake stopped compute',
     'userapp dev restart completed',
     'userapp workspace and address survived restart',
     'userapp lifecycle unchanged',

@@ -248,11 +248,8 @@ pub struct UserAppReadinessPhysical {
 #[derive(Debug, Clone)]
 pub enum UserAppReadinessObservation {
     /// 目标 scope 没有运行中的计算资源（未部署/已停止/完全缺失）。
-    /// detail 说明是哪一种（供 starting/stopped/not_deployed 与控制态合并）。
-    NoCompute {
-        /// `stopped`（资源保留但停）/ `missing`（无部署）等判别说明
-        detail: Option<String>,
-    },
+    /// 结构化运行态与平台控制意图一起合并，不能从诊断字符串推导状态。
+    NoCompute { state: UserAppNoComputeState },
     /// 计算资源在运行，app-cli 返回了业务快照。
     Snapshot {
         physical: UserAppReadinessPhysical,
@@ -264,6 +261,19 @@ pub enum UserAppReadinessObservation {
     UnsupportedRuntime { physical: UserAppReadinessPhysical },
     /// 观察期间物理实例换代且预算内重读仍不一致 → unknown/INSTANCE_CHANGED。
     InstanceChanged,
+    /// The shared observation deadline expired; this is not a business failure.
+    TimedOut,
+}
+
+/// Internal runtime facts. Keep strings for diagnostics, never for state control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserAppNoComputeState {
+    Missing,
+    Starting,
+    Stopping,
+    Stopped,
+    Failed,
+    Unknown,
 }
 
 /// 只读业务观察回调契约（rcoder-engine 实现、app_manager 消费）。
@@ -276,7 +286,7 @@ pub trait UserAppReadinessReader: Send + Sync {
     /// 观察指定 app+stage 当前物理实例内的业务就绪。
     ///
     /// `budget` 是本次查询剩余预算（含 rcoder 侧复核）；实现不得超预算
-    /// 等待，预算不足优先返回 `NoCompute`/`AdminUnreachable` 而非挂起。
+    /// 等待；总预算耗尽返回 `TimedOut`，不能伪装为计算资源缺失。
     async fn observe(
         &self,
         app_id: &str,

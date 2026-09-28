@@ -12,6 +12,7 @@ pub(crate) mod docker_app_runtime;
 mod docker_builder_control;
 mod docker_builder_restart;
 mod docker_compute_receipt;
+mod docker_readiness;
 pub mod docker_runtime;
 pub(crate) mod docker_workspace;
 #[cfg(feature = "kubernetes")]
@@ -66,6 +67,8 @@ pub(crate) mod k8s_observation;
 pub(crate) mod k8s_pod;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_pvc;
+#[cfg(feature = "kubernetes")]
+mod k8s_readiness;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_resolution;
 #[cfg(feature = "kubernetes")]

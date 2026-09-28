@@ -1,19 +1,15 @@
-//! [`UserAppReadinessReader`] 实现：按 app+stage 只读定位当前物理实例并查询
-//! app-cli 业务就绪（rcoder-engine 侧装配，注入 app_manager）。
-//!
-//! 通道选择（Plan §5.3）：
-//! - 非 deploy-host（Compose/集群内）：容器/Pod IP 直连 `:3010`。
-//! - deploy-host Docker：优先 Published 端口映射（prod 从 `DeploymentStatus.ports`
-//!   读 3010 的 host 映射；dev 从发布注册表解析）；无映射/直连不可用形态走固定
-//!   只读命令通道（exec `app-cli readiness --json`）。
-//! - deploy-host K8s：固定 exec 命令通道（pods/exec）。
-//!
-//! 只读纪律：只用 `get_deployment_status`/`find_container`/`exec` 观察原语；
-//! 不 ensure/wake/adopt，不触碰 file-server 注册表（agent 自启 owner 可观察）；
-//! 观察后按物理身份（IP/容器 ID）复核，换代丢弃结果。
+//! 按 app + stage 定位实际实例，查询 app-cli 并复核物理身份。
+//! 容器内走管理 IP；宿主机 Docker 走实际发布端口或固定 exec；宿主机
+//! K8s 始终 exec 到捕获的 Pod/容器。全程只读，不唤醒、不登记、不申请租约。
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
+
+use container_runtime_api::{
+    UserAppDeploymentRuntime, UserAppReadinessInstance, UserAppReadinessTarget,
+    UserAppRuntimeReadiness,
+};
+use tokio::time::Instant;
 
 use crate::app_state::AppState;
 use shared_types::{
@@ -22,22 +18,9 @@ use shared_types::{
     UserAppReadinessStatus, UserappStage,
 };
 
-/// 直连单次 HTTP 上限（总预算内取小）。
 const DIRECT_FETCH_CAP: Duration = Duration::from_secs(4);
-/// exec 单次上限（进程 spawn + 容器内 HTTP）。
 const EXEC_FETCH_CAP: Duration = Duration::from_secs(6);
-/// app-cli 管理 API 端口（容器内恒绑 0.0.0.0）。
-const ADMIN_PORT: u16 = shared_types::APP_CLI_ADMIN_PORT;
-/// 固定只读查询命令（argv 逐字传递，不经 shell）。
-const READINESS_COMMAND: [&str; 5] = [
-    "app-cli",
-    "readiness",
-    "--json",
-    "--admin-addr",
-    "127.0.0.1:3010",
-];
 
-/// Weak 挂接 AppState（与 UserappDevLocator 同款防引用环）。
 pub struct UserAppReadinessReaderImpl {
     state: Weak<AppState>,
 }
@@ -54,12 +37,30 @@ impl UserAppReadinessReaderImpl {
     }
 }
 
-/// 单次通道尝试的分类结果。
+#[derive(Clone, Copy)]
+enum Access {
+    ContainerNetwork,
+    #[cfg_attr(not(feature = "deploy-host"), allow(dead_code))]
+    HostDirect,
+    HostPublished,
+}
+
+impl Access {
+    fn current() -> Self {
+        if !shared_types::is_deploy_host() {
+            return Self::ContainerNetwork;
+        }
+        #[cfg(feature = "deploy-host")]
+        if shared_types::deploy_host_reach::is_direct() {
+            return Self::HostDirect;
+        }
+        Self::HostPublished
+    }
+}
+
 enum FetchOutcome {
     Snapshot(UserAppBusinessReadiness),
-    /// 旧运行时：端点 404/405 或 CLI 退出码 3。
     Unsupported,
-    /// 传输失败（拒绝/超时/5xx/CLI 退出码 2 等）。
     Unreachable,
 }
 
@@ -72,264 +73,156 @@ impl shared_types::UserAppReadinessReader for UserAppReadinessReaderImpl {
         budget: Duration,
     ) -> Result<UserAppReadinessObservation, String> {
         let state = self.state()?;
-        match stage {
-            UserappStage::Prod => observe_prod(&state, app_id, budget).await,
-            UserappStage::Dev => observe_dev(&state, app_id, budget).await,
-        }
-    }
-}
-
-async fn observe_prod(
-    state: &Arc<AppState>,
-    app_id: &str,
-    budget: Duration,
-) -> Result<UserAppReadinessObservation, String> {
-    let deploy_host = shared_types::is_deploy_host();
-    let deadline = tokio::time::Instant::now() + budget;
-    // 观察轮次上限 2：定位 → 查询 → 复核 Pod IP 未换代；换代则**重新定位**
-    // 新实例再试一轮（不用旧 IP 重查），仍不稳返回 INSTANCE_CHANGED——
-    // 快速换代不会在预算内高频穿透 runtime API。
-    for _attempt in 0..2 {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        let status = state
-            .runtime()
-            .get_deployment_status(app_id)
-            .await
-            .map_err(|error| format!("read prod deployment status (app {app_id}): {error}"))?;
-        let Some(status) = status else {
-            return Ok(UserAppReadinessObservation::NoCompute {
-                detail: Some("deployment-missing".into()),
-            });
-        };
-        if status.replicas == 0 {
-            return Ok(UserAppReadinessObservation::NoCompute {
-                detail: Some("scaled-to-zero".into()),
-            });
-        }
-        let Some(pod_ip) = status.pod_ip.clone().filter(|ip| !ip.is_empty()) else {
-            // 副本期望 >0 但尚无 Pod IP（调度中）——不是停止，是启动窗口。
-            return Ok(UserAppReadinessObservation::NoCompute {
-                detail: Some("no-pod-ip".into()),
-            });
-        };
-        #[cfg(feature = "deploy-host")]
-        let published = if deploy_host {
-            status
-                .ports
-                .iter()
-                .find(|port| port.port == ADMIN_PORT)
-                .and_then(|port| port.external_port)
-        } else {
-            None
-        };
-        #[cfg(not(feature = "deploy-host"))]
-        let published: Option<u16> = None;
-
-        let (physical, outcome) =
-            fetch_once(state, app_id, &pod_ip, published, deploy_host, remaining).await?;
-        let recheck = state
-            .runtime()
-            .get_deployment_status(app_id)
-            .await
-            .map_err(|error| format!("re-verify prod deployment: {error}"))?;
-        let unchanged = recheck
-            .as_ref()
-            .and_then(|status| status.pod_ip.clone())
-            .is_some_and(|current| current == pod_ip);
-        if unchanged {
-            return Ok(classify_into_observation(physical, outcome));
-        }
-        tracing::debug!("[READINESS] prod instance changed during observation (app {app_id})");
-    }
-    Ok(UserAppReadinessObservation::InstanceChanged)
-}
-
-async fn observe_dev(
-    state: &Arc<AppState>,
-    app_id: &str,
-    budget: Duration,
-) -> Result<UserAppReadinessObservation, String> {
-    let deploy_host = shared_types::is_deploy_host();
-    let deadline = tokio::time::Instant::now() + budget;
-    // 与 prod 同款：最多两轮、每轮重新定位（换代后用新容器 ID/IP 重查）。
-    for _attempt in 0..2 {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        let found = state
-            .runtime()
-            .find_container(app_id, &shared_types::ServiceType::UserappBuilder)
-            .await
-            .map_err(|error| format!("find UserappBuilder (app {app_id}): {error}"))?;
-        let Some(info) = found else {
-            return Ok(UserAppReadinessObservation::NoCompute {
-                detail: Some("builder-missing".into()),
-            });
-        };
-        if info.status != container_runtime_api::ContainerRuntimeStatus::Running {
-            return Ok(UserAppReadinessObservation::NoCompute {
-                detail: Some("builder-not-running".into()),
-            });
-        }
-        let container_ip = info.container_ip.clone();
-        let container_id = info.container_id.clone();
-        #[cfg(feature = "deploy-host")]
-        let published = {
-            let container_name = info.container_name.clone();
-            if deploy_host {
-                shared_types::published::resolve_published_addr(&container_name, ADMIN_PORT)
-                    .ok()
-                    .map(|addr| addr.port())
-            } else {
-                None
-            }
-        };
-        #[cfg(not(feature = "deploy-host"))]
-        let published: Option<u16> = None;
-
-        let (physical, outcome) = fetch_once(
-            state,
+        observe_runtime(
+            state.runtime().as_ref(),
             app_id,
-            &container_ip,
-            published,
-            deploy_host,
-            remaining,
+            stage,
+            Access::current(),
+            budget,
         )
-        .await?;
-        let recheck = state
-            .runtime()
-            .find_container(app_id, &shared_types::ServiceType::UserappBuilder)
-            .await
-            .map_err(|error| format!("re-verify builder: {error}"))?;
-        let unchanged = recheck.is_some_and(|info| info.container_id == container_id);
-        if unchanged {
-            return Ok(classify_into_observation(physical, outcome));
-        }
-        tracing::debug!("[READINESS] dev builder changed during observation (app {app_id})");
-    }
-    Ok(UserAppReadinessObservation::InstanceChanged)
-}
-
-/// 单次查询结果 → 观察枚举。
-fn classify_into_observation(
-    physical: UserAppReadinessPhysical,
-    outcome: FetchOutcome,
-) -> UserAppReadinessObservation {
-    match outcome {
-        FetchOutcome::Snapshot(snapshot) => {
-            UserAppReadinessObservation::Snapshot { physical, snapshot }
-        }
-        FetchOutcome::Unsupported => UserAppReadinessObservation::UnsupportedRuntime { physical },
-        FetchOutcome::Unreachable => UserAppReadinessObservation::AdminUnreachable { physical },
+        .await
     }
 }
 
-/// 通道选择 + 单次查询（直连优先，exec 兜底——已确定的网络形态不随意回退）。
-async fn fetch_once(
-    state: &Arc<AppState>,
+async fn observe_runtime(
+    runtime: &dyn UserAppDeploymentRuntime,
     app_id: &str,
-    container_ip: &str,
-    published_port: Option<u16>,
-    deploy_host: bool,
-    remaining: Duration,
-) -> Result<(UserAppReadinessPhysical, FetchOutcome), String> {
-    // 1) Published 映射（deploy-host 注册/端口表命中）。
-    if let Some(host_port) = published_port {
-        let addr = format!("127.0.0.1:{host_port}");
-        let outcome = fetch_direct(&addr, remaining.min(DIRECT_FETCH_CAP)).await;
-        return Ok((
-            UserAppReadinessPhysical {
-                instance_id: Some(container_ip.to_string()),
-                address: Some(addr),
-                channel: UserAppReadinessChannel::Direct,
-            },
-            outcome,
-        ));
-    }
-    // 2) 容器/Pod IP 直连（非 deploy-host 恒走此处；deploy-host Direct 形态同）。
-    #[cfg(feature = "deploy-host")]
-    let direct_reachable = !deploy_host || shared_types::deploy_host_reach::is_direct();
-    #[cfg(not(feature = "deploy-host"))]
-    let direct_reachable = !deploy_host;
-    if direct_reachable {
-        let addr = format!("{container_ip}:{ADMIN_PORT}");
-        let outcome = fetch_direct(&addr, remaining.min(DIRECT_FETCH_CAP)).await;
-        return Ok((
-            UserAppReadinessPhysical {
-                instance_id: Some(container_ip.to_string()),
-                address: Some(addr),
-                channel: UserAppReadinessChannel::Direct,
-            },
-            outcome,
-        ));
-    }
-    // 3) 固定只读命令通道（exec；命令 argv 由平台固定，不透传任何用户数据）。
-    let command: Vec<String> = READINESS_COMMAND
-        .iter()
-        .map(|part| part.to_string())
-        .collect();
-    let exec = tokio::time::timeout(
-        remaining.min(EXEC_FETCH_CAP),
-        state.runtime().exec(app_id, command),
-    )
-    .await;
-    let physical = UserAppReadinessPhysical {
-        instance_id: Some(container_ip.to_string()),
-        address: None,
-        channel: UserAppReadinessChannel::Exec,
-    };
-    let exec = match exec {
-        Ok(result) => {
-            result.map_err(|error| format!("exec readiness command (app {app_id}): {error}"))?
+    stage: UserappStage,
+    access: Access,
+    budget: Duration,
+) -> Result<UserAppReadinessObservation, String> {
+    let deadline = Instant::now() + budget;
+    // The same deadline covers discovery, transport and all identity rechecks.
+    let observe = async {
+        for _ in 0..2 {
+            let current = runtime
+                .observe_userapp_readiness(app_id, stage)
+                .await
+                .map_err(|error| format!("Locate {stage:?} readiness (app {app_id}): {error}"))?;
+            let target = match current {
+                UserAppRuntimeReadiness::NotRunning(state) => {
+                    return Ok(UserAppReadinessObservation::NoCompute { state });
+                }
+                UserAppRuntimeReadiness::Running(target) => target,
+            };
+            let fetched = fetch_once(runtime, &target, access, deadline).await;
+            let recheck = runtime
+                .observe_userapp_readiness(app_id, stage)
+                .await
+                .map_err(|error| format!("Recheck {stage:?} readiness (app {app_id}): {error}"))?;
+            if recheck != UserAppRuntimeReadiness::Running(target) {
+                continue;
+            }
+            if let Some((physical, outcome)) = fetched? {
+                return Ok(match outcome {
+                    FetchOutcome::Snapshot(snapshot) => {
+                        UserAppReadinessObservation::Snapshot { physical, snapshot }
+                    }
+                    FetchOutcome::Unsupported => {
+                        UserAppReadinessObservation::UnsupportedRuntime { physical }
+                    }
+                    FetchOutcome::Unreachable => {
+                        UserAppReadinessObservation::AdminUnreachable { physical }
+                    }
+                });
+            }
         }
-        Err(_) => return Ok((physical, FetchOutcome::Unreachable)),
+        Ok(UserAppReadinessObservation::InstanceChanged)
     };
-    Ok((physical, classify_exec(&exec)))
+    tokio::time::timeout_at(deadline, observe)
+        .await
+        .unwrap_or(Ok(UserAppReadinessObservation::TimedOut))
 }
 
-/// 直连 GET `/v1/app/readiness` 并按响应分类。
+fn transport(
+    target: &UserAppReadinessTarget,
+    access: Access,
+) -> (UserAppReadinessChannel, Option<std::net::SocketAddr>) {
+    match (&target.instance, access) {
+        (_, Access::ContainerNetwork)
+        | (UserAppReadinessInstance::Docker { .. }, Access::HostDirect) => {
+            (UserAppReadinessChannel::Direct, target.address)
+        }
+        (UserAppReadinessInstance::Docker { .. }, Access::HostPublished)
+            if target.published_address.is_some() =>
+        {
+            (UserAppReadinessChannel::Direct, target.published_address)
+        }
+        _ => (UserAppReadinessChannel::Exec, None),
+    }
+}
+
+async fn fetch_once(
+    runtime: &dyn UserAppDeploymentRuntime,
+    target: &UserAppReadinessTarget,
+    access: Access,
+    deadline: Instant,
+) -> Result<Option<(UserAppReadinessPhysical, FetchOutcome)>, String> {
+    let (channel, address) = transport(target, access);
+    let physical = UserAppReadinessPhysical {
+        instance_id: Some(target.instance.physical_id().to_owned()),
+        address: address.map(|addr| addr.to_string()),
+        channel,
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let outcome = match channel {
+        UserAppReadinessChannel::Direct => match address {
+            Some(addr) => fetch_direct(&addr.to_string(), remaining.min(DIRECT_FETCH_CAP)).await,
+            None => FetchOutcome::Unreachable,
+        },
+        UserAppReadinessChannel::Exec => {
+            match tokio::time::timeout(
+                remaining.min(EXEC_FETCH_CAP),
+                runtime.exec_userapp_readiness(target),
+            )
+            .await
+            {
+                Ok(Ok(Some(exec))) => classify_exec(&exec),
+                Ok(Ok(None)) => return Ok(None),
+                Ok(Err(error)) => {
+                    return Err(format!(
+                        "Exec readiness for {}: {error}",
+                        target.instance.physical_id()
+                    ));
+                }
+                Err(_) => FetchOutcome::Unreachable,
+            }
+        }
+    };
+    Ok(Some((physical, outcome)))
+}
+
 async fn fetch_direct(addr: &str, budget: Duration) -> FetchOutcome {
-    let url = format!("http://{addr}/v1/app/readiness");
-    let request = async {
+    let query = async {
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(budget)
             .timeout(budget)
             .build()
-            .map_err(|error| format!("build client: {error}"))?;
-        client
-            .get(&url)
+            .map_err(|error| error.to_string())?;
+        let response = client
+            .get(format!("http://{addr}/v1/app/readiness"))
             .send()
             .await
-            .map_err(|error| format!("GET {url}: {error}"))
-    };
-    let Ok(response) = tokio::time::timeout(budget, request).await else {
-        return FetchOutcome::Unreachable;
-    };
-    let response = match response {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::debug!("[READINESS] direct fetch failed: {error}");
-            return FetchOutcome::Unreachable;
+            .map_err(|error| error.to_string())?;
+        match response.status().as_u16() {
+            404 | 405 => return Ok(FetchOutcome::Unsupported),
+            200..=299 => {}
+            _ => return Ok(FetchOutcome::Unreachable),
         }
+        let body = response.text().await.map_err(|error| error.to_string())?;
+        Ok::<_, String>(match parse_admin_envelope(&body) {
+            Ok(Some(snapshot)) => FetchOutcome::Snapshot(snapshot),
+            _ => protocol_invalid_snapshot(),
+        })
     };
-    let status = response.status().as_u16();
-    match status {
-        404 | 405 => return FetchOutcome::Unsupported,
-        200..=299 => {}
-        _ => return FetchOutcome::Unreachable,
-    }
-    let Ok(body) = response.text().await else {
-        return FetchOutcome::Unreachable;
-    };
-    match parse_admin_envelope(&body) {
-        Ok(Some(snapshot)) => FetchOutcome::Snapshot(snapshot),
-        // 200 但信封错误/缺字段：协议错误——不能当 ready，也不是不可达。
-        Ok(None) => protocol_invalid_snapshot(),
-        Err(_) => protocol_invalid_snapshot(),
+    match tokio::time::timeout(budget, query).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => {
+            tracing::debug!("[READINESS] direct fetch failed: {error}");
+            FetchOutcome::Unreachable
+        }
+        Err(_) => FetchOutcome::Unreachable,
     }
 }
 
@@ -397,4 +290,168 @@ fn protocol_invalid_snapshot() -> FetchOutcome {
         },
         services: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use container_runtime_api::{ContainerRuntimeResult, ExecResult};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct Runtime {
+        observations: Mutex<VecDeque<UserAppRuntimeReadiness>>,
+        commands: Mutex<Vec<UserAppReadinessTarget>>,
+        pending: bool,
+    }
+    #[async_trait::async_trait]
+    impl UserAppDeploymentRuntime for Runtime {
+        async fn observe_userapp_readiness(
+            &self,
+            app_id: &str,
+            stage: UserappStage,
+        ) -> ContainerRuntimeResult<UserAppRuntimeReadiness> {
+            if self.pending {
+                return std::future::pending().await;
+            }
+            let mut observations = self.observations.lock().unwrap();
+            let value = if observations.len() > 1 {
+                observations.pop_front().unwrap()
+            } else {
+                observations.front().unwrap().clone()
+            };
+            if let UserAppRuntimeReadiness::Running(target) = &value {
+                assert_eq!(target.app_id, app_id);
+                assert_eq!(target.stage, stage);
+            }
+            Ok(value)
+        }
+        async fn exec_userapp_readiness(
+            &self,
+            target: &UserAppReadinessTarget,
+        ) -> ContainerRuntimeResult<Option<ExecResult>> {
+            self.commands.lock().unwrap().push(target.clone());
+            let FetchOutcome::Snapshot(mut snapshot) = protocol_invalid_snapshot() else {
+                unreachable!()
+            };
+            snapshot.runtime_instance_id = Some(target.instance.physical_id().into());
+            Ok(Some(ExecResult {
+                exit_code: 0,
+                stdout: serde_json::to_string(&snapshot).unwrap(),
+                stderr: String::new(),
+            }))
+        }
+    }
+    fn docker_target(stage: UserappStage, id: &str) -> UserAppReadinessTarget {
+        UserAppReadinessTarget {
+            app_id: "194".into(),
+            stage,
+            instance: UserAppReadinessInstance::Docker {
+                container_id: id.into(),
+                started_at: Some("first-start".into()),
+            },
+            address: None,
+            published_address: None,
+        }
+    }
+    fn runtime(targets: Vec<UserAppReadinessTarget>) -> Runtime {
+        Runtime {
+            observations: Mutex::new(
+                targets
+                    .into_iter()
+                    .map(|target| UserAppRuntimeReadiness::Running(Box::new(target)))
+                    .collect(),
+            ),
+            commands: Mutex::default(),
+            pending: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn host_exec_preserves_dev_and_prod_targets_without_pod_ip() {
+        for stage in [UserappStage::Dev, UserappStage::Prod] {
+            let target = docker_target(stage, stage.as_str());
+            let runtime = runtime(vec![target.clone()]);
+            let observed = observe_runtime(
+                &runtime,
+                "194",
+                stage,
+                Access::HostPublished,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                observed,
+                UserAppReadinessObservation::Snapshot { .. }
+            ));
+            assert_eq!(*runtime.commands.lock().unwrap(), vec![target]);
+        }
+    }
+
+    #[tokio::test]
+    async fn rereads_instance_when_same_ip_is_reused_or_container_restarted() {
+        let old = docker_target(UserappStage::Dev, "same-container");
+        let mut new = old.clone();
+        if let UserAppReadinessInstance::Docker { started_at, .. } = &mut new.instance {
+            *started_at = Some("second-start".into());
+        }
+        let runtime = runtime(vec![old.clone(), new.clone(), new.clone()]);
+        let observed = observe_runtime(
+            &runtime,
+            "194",
+            UserappStage::Dev,
+            Access::HostPublished,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            observed,
+            UserAppReadinessObservation::Snapshot { .. }
+        ));
+        assert_eq!(*runtime.commands.lock().unwrap(), vec![old, new]);
+    }
+
+    #[test]
+    fn host_k8s_always_execs_exact_container_even_in_direct_mode() {
+        let mut target = docker_target(UserappStage::Dev, "unused");
+        target.instance = UserAppReadinessInstance::Kubernetes {
+            namespace: "test".into(),
+            pod_name: "builder-0".into(),
+            pod_uid: "uid".into(),
+            container_name: "agent".into(),
+            container_id: Some("runtime-id".into()),
+            owner_uid: "sts-uid".into(),
+        };
+        target.address = Some("10.0.0.3:3010".parse().unwrap());
+        target.published_address = Some("127.0.0.1:33010".parse().unwrap());
+        for access in [Access::HostDirect, Access::HostPublished] {
+            assert_eq!(
+                transport(&target, access),
+                (UserAppReadinessChannel::Exec, None)
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn total_deadline_includes_stalled_runtime_discovery() {
+        let runtime = Runtime {
+            pending: true,
+            ..runtime(vec![])
+        };
+        let started = Instant::now();
+        let observed = observe_runtime(
+            &runtime,
+            "194",
+            UserappStage::Dev,
+            Access::HostPublished,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(observed, UserAppReadinessObservation::TimedOut));
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert!(runtime.commands.lock().unwrap().is_empty());
+    }
 }

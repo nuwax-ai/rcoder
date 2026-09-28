@@ -632,6 +632,29 @@ pub trait WorkspaceRuntime: Send + Sync {
 /// Docker 由 `DockerRuntime` 做等价语义映射（容器 create/stop/start）。
 #[async_trait]
 pub trait UserAppDeploymentRuntime: Send + Sync {
+    /// Inspect the exact dev/prod compute instance without ensure, adoption,
+    /// cache registration or operation admission. Missing is a confirmed absence.
+    async fn observe_userapp_readiness(
+        &self,
+        _app_id: &str,
+        _stage: shared_types::UserappStage,
+    ) -> ContainerRuntimeResult<crate::UserAppRuntimeReadiness> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Read-only UserApp discovery is unsupported".into(),
+        ))
+    }
+
+    /// Run only the fixed readiness command in this captured physical instance.
+    /// None means the target disappeared/changed; callers may observe again.
+    async fn exec_userapp_readiness(
+        &self,
+        _target: &crate::UserAppReadinessTarget,
+    ) -> ContainerRuntimeResult<Option<ExecResult>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Read-only UserApp exec is unsupported".into(),
+        ))
+    }
+
     /// Remove only a successful restart's private archive. Caller must have
     /// committed its terminal result and released the original operation lease.
     async fn cleanup_builder_restart_archive(

@@ -42,6 +42,21 @@ fn merge_http_port_labels(ports: &mut Vec<AppPortStatus>, raw: &str) {
 
 #[async_trait]
 impl UserAppDeploymentRuntime for DockerRuntime {
+    async fn observe_userapp_readiness(
+        &self,
+        app_id: &str,
+        stage: shared_types::UserappStage,
+    ) -> ContainerRuntimeResult<container_runtime_api::UserAppRuntimeReadiness> {
+        self.inspect_readiness(app_id, stage).await
+    }
+
+    async fn exec_userapp_readiness(
+        &self,
+        target: &container_runtime_api::UserAppReadinessTarget,
+    ) -> ContainerRuntimeResult<Option<container_runtime_api::ExecResult>> {
+        self.exec_readiness(target).await
+    }
+
     async fn cleanup_builder_restart_archive(
         &self,
         template: &shared_types::BuilderRestartTemplate,
