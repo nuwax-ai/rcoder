@@ -309,6 +309,20 @@ impl BuildTask {
         self.cancelled.store(true, Ordering::Relaxed);
         self.cancellation.cancel();
     }
+
+    /// 任务的取消内核（soft cancel + emit `Cancelled` 终态）。
+    ///
+    /// 三个入口共用：cancel 端点、dev_stop/工作区重置的在途任务联动取消、
+    /// 构建自动接替（同 app 新构建请求取消更早的在途构建）。
+    /// 进程树清理由持有 ManagedChild 的 worker 负责；缓存的数字 pid 仅诊断，
+    /// 不能授权取消。主动 emit `Cancelled`：若 build 在循环间隙（非
+    /// build_generic 内），靠此置终态；若在 build_generic 内被 kill，错误
+    /// 分支的 is_cancelled 分支也会 emit（终态保护丢弃这里的重复）。
+    pub async fn request_cancel(&self) {
+        let _commit = self.commit_guard().await;
+        self.cancel();
+        self.emit(BuildProgressEvent::Cancelled).await;
+    }
 }
 
 fn is_terminal_status(status: BuildTaskStatus) -> bool {

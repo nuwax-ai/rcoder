@@ -188,7 +188,7 @@ pub(crate) async fn dev_stop(
                     app_id = %body.app_id, task_id = %task.id,
                     "[DEV_STOP] cancelling in-flight dev task (stop intent)"
                 );
-                super::userapp::cancel_build_task(&task).await;
+                task.request_cancel().await;
             }
         }
         // R05：managed 域停止不 ps 扫描——external 登记经运行 API 幂等停；

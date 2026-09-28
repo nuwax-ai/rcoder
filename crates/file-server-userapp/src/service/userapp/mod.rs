@@ -31,6 +31,7 @@ pub(crate) use manifest::discover_projects_async;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use file_server::error::{AppError, AppResult};
 use file_server::service::build_generic::{GenericBuildRequest, build_generic};
@@ -43,7 +44,14 @@ use manifest::{ReleaseMetadata, build_release_lock, read_workspace_manifest};
 use crate::models::{BuildTaskId, BuildTaskKind};
 use tasks::{BuildProgressEvent, BuildTask, BuildTaskStore};
 
-pub(crate) use tasks::BuildTask as UserappBuildTask;
+/// 同 app 构建锁的等待预算：持有方（dev 任务的编译阶段，或已被接替取消的
+/// 构建）一个完整构建周期的上界。持有方逐服务串行构建、每服务命令受
+/// `timeout_secs` 约束，故预算 = (服务数 + 1) × timeout_secs（+1 覆盖组包
+/// 收尾）。仍在自身超时包络内推进的持有方（持续产出构建日志）永远等得到；
+/// 预算到期只可能因持有方越过自身超时仍未返回（真卡死），此时 fail-fast。
+fn build_lock_wait_budget(enabled_services: usize, timeout_secs: u64) -> Duration {
+    Duration::from_secs(timeout_secs.saturating_mul(enabled_services.saturating_add(1) as u64))
+}
 
 /// 整体包产物文件名前缀（产物落 `{ws}/builds/` 子目录，见 [`WORKSPACE_BUILDS_DIR`]；
 /// `GET /api/v1/userapp/static/{app_id}` 按 app 直下取包——缺省最新，`?release_id=` 指定版本）。
@@ -252,7 +260,17 @@ pub async fn build_workspace_package(
     // 整个 workspace 构建周期持有 app_id 的 BuildGuard(项目互斥 + 1 个全局 permit):
     // 避免子项目构建间隙释放锁导致同 app_id 构建穿插、首个构建中途 409 失败(#13)。
     // guard 以引用传给每个子项目 build_generic,跨整个 for 循环不释放。
-    let _ws_guard = build_manager.try_start(app_id)?;
+    // 同 app 已有构建在途时等待而非失败(自动接替语义):Build 任务在受理期已被
+    // 更新的构建请求取消,dev 任务的编译阶段则等其自然完成(见 start_build_task)。
+    let _ws_guard = build_manager
+        .start_after_release(app_id, build_lock_wait_budget(enabled.len(), timeout_secs))
+        .await?;
+    // 等待窗口内被接替(更新请求已把本任务置 Cancelled)→ 不再进入构建。
+    if let Some(progress) = &progress
+        && progress.is_cancelled()
+    {
+        return Err(AppError::business("build cancelled by user"));
+    }
 
     let mut built: Vec<BuiltProject> = Vec::with_capacity(enabled.len());
     for proj in enabled {
@@ -528,9 +546,15 @@ async fn any_project_manifest(ws: &Path) -> bool {
 /// 异步发起 build 任务（不阻塞，立即返 task_id + 预生成的产物相对路径）。进度事件
 /// 经 task 流出（SSE/轮询）。
 ///
-/// 同 app_id 互斥由 `build_workspace_package` 最外层 `try_start(app_id)` 持有的
-/// `BuildGuard` 保证(覆盖整个构建周期,跨所有子项目)。重复构建立即返回 409 fail-fast
-/// (非排队);该 guard 同时占用 1 个全局并发 permit,以引用传给每个子项目 build_generic。
+/// 同 app_id 并发语义（自动接替，取代旧的 409 fail-fast）：
+/// - 受理新构建时，同 app **更早的在途 Build 任务**被立即取消（`request_cancel`：
+///   转 Cancelled 终态 + 取消信号终止其构建子进程），本任务随后经
+///   `build_workspace_package` 的 `start_after_release` 等待锁释放并开始——
+///   最新构建请求胜出，重复点击不再产生 failed 任务。
+/// - **DevStart/DevRestart 不被接替**：其编译阶段结束后还要拉起服务，中途取消
+///   会把用户刚触发的部署打成半途；新构建等待其编译阶段自然完成。
+/// - 该 guard 同时占用 1 个全局并发 permit，以引用传给每个子项目 build_generic。
+///
 /// 非循环路径的 Err（如 release lock env 缺失）由这里兜底 emit Failed。
 ///
 /// 返回 `(task_id, artifact_path)`——artifact_path 为预生成的确定性产物相对路径
@@ -549,6 +573,9 @@ pub async fn start_build_task(
         .create(app_id.clone(), BuildTaskKind::Build)
         .await
         .map_err(|e| AppError::business(e.to_string()))?;
+    // 自动接替:取消同 app 更早的在途构建(最新请求胜出)。在新任务入 store 之后
+    // 执行——旧任务的取消只依赖其自身状态,与新任务可见性无竞态。
+    supersede_older_build_tasks(store, &app_id, &task).await;
     // release_id 预生成并预置进快照：创建响应（BuildCreatedData.artifact_path）与
     // pending 期轮询即可见确定性产物路径；build_workspace_package 消费同一值,
     // Completed 事件携带一致路径覆盖（两处同源）。
@@ -606,6 +633,26 @@ pub async fn start_build_task(
         .map_err(AppError::system)?;
 
     Ok((task.id.clone(), artifact_path))
+}
+
+/// 自动接替：取消同 app **更早**的在途 Build 任务。
+///
+/// - 只接替 `Build`：DevStart/DevRestart 的编译阶段后还要拉起服务，中途取消
+///   会把部署打成半途（见 `start_build_task` 文档）。
+/// - "更早"以任务 id（UUIDv7，字典序即创建序）严格小于判定：排除自身，也使
+///   并发受理的两个新任务只有较新者接替较旧者，不会互相取消。
+async fn supersede_older_build_tasks(store: &BuildTaskStore, app_id: &str, newer: &Arc<BuildTask>) {
+    for older in store.active_tasks_for_app(app_id).await {
+        if older.kind == BuildTaskKind::Build && older.id < newer.id {
+            tracing::info!(
+                app_id,
+                superseded = %older.id,
+                by = %newer.id,
+                "superseding in-flight build with newer build request"
+            );
+            older.request_cancel().await;
+        }
+    }
 }
 
 /// 构建输出行回调（同步 send 进管道通道；Arc 式跨入 spawn task）。
@@ -1091,17 +1138,109 @@ mod stack_tests {
                 let store = BuildTaskStore::new();
                 let (id, path) = start_build_task(&store, &config, Arc::new(BuildManager::new(1)), ws.clone(), "stackapp".into(), 20).await.unwrap();
                 let task = store.get(&id).await.unwrap();
-                tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::time::timeout(Duration::from_secs(30), async {
                     loop {
                         if task.is_terminal().await { break; }
-                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                 }).await.unwrap();
                 let snapshot = task.snapshot().await;
                 assert_eq!(snapshot.status, crate::models::BuildTaskStatus::Completed, "{snapshot:?}");
                 let bytes = std::fs::read(ws.join(path)).unwrap();
                 assert!(!bytes.is_empty());
-                store.workers.drain(tokio::time::Instant::now() + std::time::Duration::from_secs(5)).await.unwrap();
+                store.workers.drain(tokio::time::Instant::now() + Duration::from_secs(5)).await.unwrap();
+            }).await.unwrap();
+        });
+    }
+
+    /// 自动接替回归：同 app 重复构建不再产生 "This project is being built"
+    /// 失败任务——旧任务被取消转 Cancelled，新任务等锁释放后重新构建完成。
+    /// 走真实链路：受理 → supersede → 取消信号终止子进程 → 锁释放 → 重构建 →
+    /// 组包 Completed。全局面容量取 1，证明新任务并非靠并发许可跑赢。
+    #[test]
+    fn rebuild_supersedes_in_flight_build_instead_of_failing() {
+        const CHILD: &str = "RCODER_BUILD_SUPERSEDE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "service::userapp::stack_tests::rebuild_supersedes_in_flight_build_instead_of_failing",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("RCODER_PINGAP_VERSION", "0.14.3")
+                .env("RCODER_PINGAP_COMMIT", "supersede-test")
+                .env("RCODER_RUNTIME_IMAGE_DIGEST", "local-dev")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child {}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::spawn(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let ws = tmp.path().join("supersede-app");
+                std::fs::create_dir_all(ws.join("web")).unwrap();
+                std::fs::write(ws.join("workspace.manifest.toml"), "schema_version = 1\n[workspace]\nname = 'supersede'\n").unwrap();
+                // 慢构建（3s）：保证第一个任务持锁在途时第二个请求到达。
+                std::fs::write(ws.join("web/project.manifest.toml"), "schema_version = 1\n[project]\nservice_id = 'web'\nname = 'web'\ntype = 'static'\n[build]\ncommand = ['sh', '-c', 'sleep 3; mkdir -p dist && echo supersede > dist/index.html']\nartifact = 'dist'\n[proxy]\npath = '/'\nstrip_prefix = false\n").unwrap();
+                let config = Arc::new(file_server::Config {
+                    userapp_workspace_dir: tmp.path().to_path_buf(),
+                    userapp_single_app_id: None,
+                    log_base_dir: tmp.path().join("logs"),
+                    ..Default::default()
+                });
+                let store = BuildTaskStore::new();
+                let manager = Arc::new(BuildManager::new(1));
+                let (first_id, _) = start_build_task(&store, &config, manager.clone(), ws.clone(), "supersede-app".into(), 30).await.unwrap();
+                let first = store.get(&first_id).await.unwrap();
+                // 等第一个任务进入 Running（已持锁、构建子进程已启动）再重复请求，
+                // 确保测的是"占用中被接替"而非"排队先后"。
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if matches!(first.status().await, crate::models::BuildTaskStatus::Running) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }).await.expect("first build reaches Running (lock held)");
+
+                let (second_id, second_path) = start_build_task(&store, &config, manager, ws.clone(), "supersede-app".into(), 30).await.unwrap();
+                let second = store.get(&second_id).await.unwrap();
+                // 接替即时生效：旧任务在受理返回前已转 Cancelled（非 Failed——
+                // 这正是旧行为 "This project is being built" 的位置）。
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if first.is_terminal().await { break; }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await.expect("first build cancelled promptly");
+                let first_snapshot = first.snapshot().await;
+                assert_eq!(first_snapshot.status, crate::models::BuildTaskStatus::Cancelled, "{first_snapshot:?}");
+
+                // 新任务等锁释放（旧子进程被取消信号终止）→ 重新构建 → 完成。
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        if second.is_terminal().await { break; }
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                }).await.expect("second build completes after supersede");
+                let second_snapshot = second.snapshot().await;
+                assert_eq!(second_snapshot.status, crate::models::BuildTaskStatus::Completed, "{second_snapshot:?}");
+                let bytes = std::fs::read(ws.join(&second_path)).unwrap();
+                assert!(!bytes.is_empty(), "superseding build produces artifact");
+                store.workers.drain(tokio::time::Instant::now() + Duration::from_secs(5)).await.unwrap();
             }).await.unwrap();
         });
     }

@@ -64,8 +64,16 @@ pub async fn run_dev_builds(
     shared_types::validate_workspace_startup(&workspace, &enabled)
         .map_err(|error| AppError::business(error.to_string()))?;
 
-    // 与发布编译同款互斥（同 app_id 的 /build、dev 任务并发防穿插）
-    let _ws_guard = build_manager.try_start(app_id)?;
+    // 与发布编译同款互斥（同 app_id 的 /build、dev 任务并发防穿插）。
+    // 同 app 已有构建在途时等待而非失败：Build 任务通常已被更新的构建请求
+    // 接替取消（收尾秒级）；被 dev 任务占用则等其编译阶段自然完成——预算
+    // 按持有方完整构建周期推导（见 build_lock_wait_budget）。
+    let _ws_guard = build_manager
+        .start_after_release(
+            app_id,
+            super::build_lock_wait_budget(enabled.len(), timeout_secs),
+        )
+        .await?;
 
     for proj in &enabled {
         // 软取消：服务间检查（硬 cancel 靠外部 kill 进程组，见 cancel handler）。

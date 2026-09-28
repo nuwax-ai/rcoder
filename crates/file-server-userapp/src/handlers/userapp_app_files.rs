@@ -458,7 +458,7 @@ async fn reset_workspace(
             .checked_add(1)
             .ok_or_else(|| AppError::system("Dev lifecycle generation exhausted"))?;
         for task in state.build_tasks.active_tasks_for_app(&app_id).await {
-            super::userapp::cancel_build_task(&task).await;
+            task.request_cancel().await;
         }
     }
     // Release lifecycle before awaiting workers: commit_start needs it in order

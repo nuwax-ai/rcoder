@@ -13,12 +13,10 @@
 //! 详见 `docs/application-management-service-v2-design.md` §5。
 
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::stream;
 
-use crate::service::userapp::UserappBuildTask;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -108,13 +106,14 @@ fn resolve_from_seq(last_event_id: Option<&str>, query_from_seq: u64) -> u64 {
 /// 发起 workspace 打包
 ///
 /// 异步任务：编译在后台 spawn 执行（`start_build_task`），受理即返 task_id；进度经 task 流出（轮询 `/tasks/{id}` +
-/// SSE `/tasks/{id}/logs/stream`）。同 app_id 排队由 `BuildManager` per-project 互斥保证。
+/// SSE `/tasks/{id}/logs/stream`）。同 app_id 已有在途构建时**自动接替**：旧任务立即转 cancelled，
+/// 本任务等构建锁释放后开始（见 `start_build_task` 文档）。
 #[utoipa::path(
     post,
     path = "/build",
     request_body = BuildUserAppBody,
     responses(
-        (status = 200, body = HttpResult<BuildCreatedData>, description = "构建任务已受理（异步执行）。data 立即返回 task_id（轮询/SSE 用）与 artifact_path（受理时即确定：builds/workspace-package-{release_id}.zip，release_id 预生成）+ status=pending。同 app_id 已有活跃任务时在队列排队（per-app 互斥）；全局任务容量满时 4xx 拒绝。后续状态：轮询 GET /tasks/{task_id} 或订阅 GET /tasks/{task_id}/logs/stream（SSE，构建日志行以 log 事件实时推送）。"),
+        (status = 200, body = HttpResult<BuildCreatedData>, description = "构建任务已受理（异步执行）。data 立即返回 task_id（轮询/SSE 用）与 artifact_path（受理时即确定：builds/workspace-package-{release_id}.zip，release_id 预生成）+ status=pending。同 app_id 已有在途构建任务时自动接替：旧构建任务立即转 cancelled（其 SSE 流收到 cancelled 终态事件），本任务等待构建锁释放后开始——最新构建请求胜出；构建锁被 dev 启动/重启任务的编译阶段占用时本任务等待其完成，不取消 dev 任务。全局任务容量满时 4xx 拒绝。后续状态：轮询 GET /tasks/{task_id} 或订阅 GET /tasks/{task_id}/logs/stream（SSE，构建日志行以 log 事件实时推送）。"),
     ),
     tag = "Userapp · dev · 构建任务"
 )]
@@ -347,7 +346,7 @@ pub(crate) async fn cancel_task(
                 already_terminal: Some(true),
             });
         }
-        cancel_build_task(&task).await;
+        task.request_cancel().await;
         Ok(CancelData {
             task_id,
             status: Some(BuildTaskStatus::Cancelled),
@@ -355,19 +354,6 @@ pub(crate) async fn cancel_task(
         })
     };
     reply(result.await)
-}
-
-/// 任务的取消内核（soft cancel + kill 编译进程组 + emit Cancelled 终态）。
-/// cancel_task handler 与 dev_stop 的在途任务联动取消共用。
-pub(crate) async fn cancel_build_task(task: &Arc<UserappBuildTask>) {
-    let _commit = task.commit_guard().await;
-    task.cancel();
-    // The worker that owns the ManagedChild performs tree cleanup; a cached
-    // numeric PID is diagnostic only and cannot authorize cancellation.
-    // 主动 emit Cancelled：若 build 在循环间隙（非 build_generic 内），靠此置终态；
-    // 若在 build_generic 内被 kill，错误分支的 is_cancelled 分支会 emit Cancelled
-    //（终态保护丢弃这里的重复）。
-    task.emit(BuildProgressEvent::Cancelled).await;
 }
 
 /// 检测项目类型
