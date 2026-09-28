@@ -242,16 +242,17 @@ impl Owner {
             resource: self.root.clone(),
         });
         let (mut old, rebuilt) = self.load_discovery(&binding)?;
-        // Capture recovery before detaching another container's control slot;
-        // that reset must not turn old one-shot deployment inputs into a fresh
-        // launch (for example APP_DEPLOY_URL retained in the Pod environment).
-        let recovery_launch = rebuilt
-            || old
-                .as_ref()
-                .is_some_and(|d| d.snapshot.phase != Phase::Stopped);
         if let Some(old) = &mut old {
             detach_previous_container_control(&self.root, old)?;
         }
+        let current = match crate::domain::PhysicalDomain::from_env() {
+            Ok(domain) => domain,
+            Err(error) => {
+                tracing::warn!(%error, "execution domain unreadable; first launch keeps recovery semantics");
+                None
+            }
+        };
+        let recovery_launch = initial_recovery_launch(&self.root, old.as_ref(), current.as_ref());
         // Resume an accepted control after parent death. Explicit launch after
         // a completed shutdown starts a new session; it cannot discard a Stop
         // still waiting for quiescence or for the worker's durable acknowledgement.
@@ -382,6 +383,24 @@ fn inactive_discovery(binding: control::Binding) -> Discovery {
             problem: None,
         },
         requests: Vec::new(),
+    }
+}
+
+/// First-launch recovery classification, container-scoped. Records that belong
+/// to a previous container were reset by [`detach_previous_container_control`]
+/// before this runs: those processes died with the container, so the first
+/// launch here is an explicit platform launch and one-shot deployment inputs
+/// redeclared in the environment are fresh intent, not a replay. Leftovers
+/// from THIS container (owner crash, in-place container restart) keep
+/// recovery semantics and never replay those inputs.
+fn initial_recovery_launch(
+    root: &Path,
+    old: Option<&Discovery>,
+    current: Option<&crate::domain::PhysicalDomain>,
+) -> bool {
+    match old {
+        Some(discovery) => discovery.snapshot.phase != Phase::Stopped,
+        None => record::current_container_work_exists_with(root, current),
     }
 }
 
@@ -924,5 +943,133 @@ mod tests {
             "I/O error is not corrupt JSON"
         );
         assert!(path.is_dir());
+    }
+
+    fn work_generation(scope: &Path, domain: Option<crate::domain::PhysicalDomain>) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let root = record::work_root(scope, &id).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        record::save(
+            &root.join("generation.json"),
+            &Generation {
+                version: 1,
+                id: id.clone(),
+                supervisor: "sup".into(),
+                token: "test".into(),
+                intent: Intent::Run,
+                phase: GenerationPhase::Running,
+                worker_pid: None,
+                exit_code: None,
+                error: None,
+                physical_domain: domain,
+                process_epoch: None,
+            },
+        )
+        .unwrap();
+        id
+    }
+
+    #[test]
+    fn same_container_leftovers_keep_recovery_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let binding = control::Binding {
+            component: "app-cli".into(),
+            resource: dir.path().to_path_buf(),
+        };
+        let mut discovery = inactive_discovery(binding);
+        discovery.snapshot.phase = Phase::Ready;
+        assert!(initial_recovery_launch(dir.path(), Some(&discovery), None));
+        discovery.snapshot.phase = Phase::Stopped;
+        assert!(!initial_recovery_launch(dir.path(), Some(&discovery), None));
+    }
+
+    /// belongs_to_previous_container 经 from_env 解析当前容器身份；测试用
+    /// env 守卫注入（nextest 每用例独立进程，无并发污染）。
+    struct DomainGuard;
+    impl DomainGuard {
+        #[allow(unsafe_code)]
+        fn new(instance: &str) -> Self {
+            unsafe {
+                std::env::set_var(
+                    crate::domain::DOMAIN_ENV,
+                    "{\"authority\":\"k8s\",\"volume\":\"workspace-pvc\",\"instance\":\"\",\
+                     \"instance_source_env\":\"RCODER_PHYSICAL_POD_UID\"}",
+                );
+                std::env::set_var("RCODER_PHYSICAL_POD_UID", instance);
+            }
+            Self
+        }
+    }
+    impl Drop for DomainGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var(crate::domain::DOMAIN_ENV);
+                std::env::remove_var("RCODER_PHYSICAL_POD_UID");
+            }
+        }
+    }
+
+    #[test]
+    fn replaced_container_leftovers_classify_as_explicit_launch() {
+        // 事故复现：上一容器死在 phase=Running，work 记录属于上一容器。
+        // detach 归零后首启是显式平台启动——不得剥离部署声明 env。
+        let _guard = DomainGuard::new("pod-new");
+        let dir = tempfile::tempdir().unwrap();
+        let previous = crate::domain::PhysicalDomain {
+            authority: "k8s".into(),
+            instance_source_env: None,
+            instance: "pod-old".into(),
+            volume: "workspace-pvc".into(),
+        };
+        let id = work_generation(dir.path(), Some(previous));
+        let binding = control::Binding {
+            component: "app-cli".into(),
+            resource: dir.path().to_path_buf(),
+        };
+        let mut discovery = inactive_discovery(binding);
+        discovery.snapshot.phase = Phase::Ready;
+        discovery.snapshot.generation = Some(id);
+        detach_previous_container_control(dir.path(), &mut discovery).unwrap();
+        assert_eq!(discovery.snapshot.phase, Phase::Stopped);
+        assert!(!initial_recovery_launch(
+            dir.path(),
+            Some(&discovery),
+            Some(&crate::domain::PhysicalDomain {
+                authority: "k8s".into(),
+                instance_source_env: None,
+                instance: "pod-new".into(),
+                volume: "workspace-pvc".into(),
+            })
+        ));
+    }
+
+    #[test]
+    fn same_pod_restart_keeps_recovery_launch() {
+        // 同 Pod 容器重启：domain instance 未变，detach 不归零，保持恢复语义
+        // （防一次性部署输入随 kubelet 重启重放）。
+        let _guard = DomainGuard::new("pod-same");
+        let dir = tempfile::tempdir().unwrap();
+        let same = crate::domain::PhysicalDomain {
+            authority: "k8s".into(),
+            instance_source_env: None,
+            instance: "pod-same".into(),
+            volume: "workspace-pvc".into(),
+        };
+        let id = work_generation(dir.path(), Some(same.clone()));
+        let binding = control::Binding {
+            component: "app-cli".into(),
+            resource: dir.path().to_path_buf(),
+        };
+        let mut discovery = inactive_discovery(binding);
+        discovery.snapshot.phase = Phase::Ready;
+        discovery.snapshot.generation = Some(id);
+        detach_previous_container_control(dir.path(), &mut discovery).unwrap();
+        assert_eq!(discovery.snapshot.phase, Phase::Ready);
+        assert!(initial_recovery_launch(
+            dir.path(),
+            Some(&discovery),
+            Some(&same)
+        ));
     }
 }

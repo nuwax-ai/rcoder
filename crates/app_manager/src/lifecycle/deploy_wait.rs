@@ -18,6 +18,11 @@ use crate::service::AppService;
 const DEPLOY_STAGE_BUDGET: Duration = Duration::from_secs(30 * 60);
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// The runtime's deploy status endpoint answering successfully while never
+/// naming the expected operation means the environment declaration was not
+/// consumed. The grace covers container boot and first acceptance; sustained
+/// absence beyond it is a deterministic mismatch, not slow progress.
+const RUNTIME_DECLARATION_GRACE: Duration = Duration::from_secs(180);
 /// app-cli 管理 API 端口（容器内恒绑 0.0.0.0）。
 const APP_CLI_ADMIN_PORT: u16 = shared_types::APP_CLI_ADMIN_PORT;
 
@@ -100,6 +105,28 @@ pub(crate) fn judge_stage(probe: &DeployStatusProbe, expected_operation_id: &str
     }
 }
 
+/// Tracks successful deploy-status responses that never name the expected
+/// operation. Absence is only accumulated on successful responses: transport
+/// failures leave the timer untouched and remain governed by the stage and
+/// absolute budgets.
+#[derive(Debug, Default)]
+struct DeclarationWatchdog {
+    absent_since: Option<tokio::time::Instant>,
+}
+
+impl DeclarationWatchdog {
+    /// Observe one successful response; returns `true` when the expected
+    /// operation has been persistently absent beyond the grace budget.
+    fn observe(&mut self, expected_present: bool, now: tokio::time::Instant) -> bool {
+        if expected_present {
+            self.absent_since = None;
+            return false;
+        }
+        let since = *self.absent_since.get_or_insert(now);
+        now.duration_since(since) >= RUNTIME_DECLARATION_GRACE
+    }
+}
+
 impl AppService {
     /// 冷部署同步等待：部署段完成（编排启动）即 Ok。超时/容器 Error 态/部署
     /// 期被删/容器侧 Failed 即 Err——错误信息面向 Java/前端排查直读。
@@ -140,6 +167,7 @@ impl AppService {
             oom_restart: budget.oom_restart_threshold,
         };
         let mut failure_tracker = FailureSignalTracker::default();
+        let mut declaration_watchdog = DeclarationWatchdog::default();
 
         // 高水位指纹跟踪
         let mut capability_fixed = false; // progress_v1 能力是否已固定
@@ -279,6 +307,22 @@ impl AppService {
                     && let Ok(body) = resp.json::<serde_json::Value>().await
                 {
                     let probe = parse_deploy_status(&body);
+                    // 部署声明未消费看门狗：端点成功应答但持续不出现本次操作。
+                    // 与 judge_stage 的 Pending 不同，这是"声明根本没被接受"的
+                    // 确定性失配——超宽限即快速失败，不再静默耗满阶段预算。
+                    let expected_present = probe
+                        .operation
+                        .as_ref()
+                        .is_some_and(|operation| operation.operation_id == operation_id);
+                    if declaration_watchdog.observe(expected_present, tokio::time::Instant::now()) {
+                        return Err(AppOperationError::Backend(format!(
+                            "runtime reported no deployment for operation {operation_id} on app \
+                             {app_id} within {}s (deployment declaration was not consumed); \
+                             verify the app-runtime image consumes environment deployments, \
+                             then retry",
+                            RUNTIME_DECLARATION_GRACE.as_secs()
+                        )));
+                    }
                     // 能力固定：首次通过 protocol 校验且携带 operation 的有效响应上固定，
                     // 之后不翻转（解析失败/字段缺失不重新协商）。
                     // operation_id 校验由 env snapshot 检查 + judge_stage 保证——
@@ -500,6 +544,43 @@ mod tests {
             &serde_json::json!({"phase":"running", "release_id":"op-new", "request_release_id":"op-new"}),
         );
         assert!(!matches!(judge_stage(&probe, "op-new"), StageVerdict::Done));
+    }
+
+    #[test]
+    fn declaration_watchdog_fires_only_after_sustained_absence() {
+        let start = tokio::time::Instant::now();
+        let mut watchdog = DeclarationWatchdog::default();
+        assert!(
+            !watchdog.observe(false, start),
+            "grace period must not fire immediately"
+        );
+        assert!(!watchdog.observe(
+            false,
+            start + RUNTIME_DECLARATION_GRACE - Duration::from_secs(1)
+        ));
+        assert!(watchdog.observe(false, start + RUNTIME_DECLARATION_GRACE));
+        // The expected operation appearing resets the window; a fresh absence
+        // restarts the clock from its first observation.
+        let resumed = start + RUNTIME_DECLARATION_GRACE + Duration::from_secs(1);
+        assert!(!watchdog.observe(true, resumed));
+        let absent_at = resumed + RUNTIME_DECLARATION_GRACE - Duration::from_secs(1);
+        assert!(!watchdog.observe(false, absent_at));
+        assert!(!watchdog.observe(
+            false,
+            absent_at + RUNTIME_DECLARATION_GRACE - Duration::from_secs(1)
+        ));
+        assert!(watchdog.observe(false, absent_at + RUNTIME_DECLARATION_GRACE));
+    }
+
+    #[test]
+    fn declaration_watchdog_counts_mismatched_operation_as_absent() {
+        // 与 judge_stage 的 op_id 不匹配语义一致：旧操作的终态不算"本次声明已接受"。
+        let probe = operation_probe("op-old", Stage::Succeeded, Phase::Running);
+        let present = probe
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.operation_id == "op-new");
+        assert!(!present);
     }
 
     #[test]

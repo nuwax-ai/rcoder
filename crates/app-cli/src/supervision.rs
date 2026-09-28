@@ -117,6 +117,7 @@ pub async fn supervise(args: &crate::RuntimeArgs, restart_on_exit: bool) -> Resu
         "APP_DEPLOY_URL",
         "APP_RELEASE_ID",
         "APP_DEPLOY_SHA256",
+        "APP_DEPLOY_OPERATION_ID",
         "APP_DEPLOY_GENERATION_ID",
     ]
     .into_iter()

@@ -157,6 +157,42 @@ fn previous_container(value: &Generation, current: Option<&crate::domain::Physic
             && old.instance != current.instance)
 }
 
+/// Whether any recorded worker generation ran in the current container.
+/// Only generations stamped by a previous container are excluded; a missing
+/// domain stamp or unreadable evidence counts as current, so uncertainty
+/// keeps recovery semantics instead of authorizing a fresh launch.
+pub(crate) fn current_container_work_exists_with(
+    scope: &Path,
+    current: Option<&crate::domain::PhysicalDomain>,
+) -> bool {
+    let entries = match std::fs::read_dir(scope.join("work")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(error) => {
+            tracing::warn!(%error, "work directory unreadable; assuming local work exists");
+            return true;
+        }
+    };
+    for entry in entries.flatten() {
+        let root = entry.path();
+        if !root.join("generation.json").try_exists().unwrap_or(false) {
+            continue; // legacy adapter owns legacy receipts
+        }
+        match generation(&root) {
+            Ok(value) => {
+                if !previous_container(&value, current) {
+                    return true;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "unreadable generation record; assuming local work exists");
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn verify_live(scope: &Path, supervisor: &str, id: &str) -> Result<()> {
     let root = work_root(scope, id)?;
     let generation = generation(&root)?;
@@ -329,6 +365,66 @@ mod tests {
         )
         .unwrap();
         (temp, id)
+    }
+
+    fn domain_fixture(instance: &str) -> crate::domain::PhysicalDomain {
+        crate::domain::PhysicalDomain {
+            authority: "k8s".into(),
+            instance_source_env: None,
+            instance: instance.into(),
+            volume: "workspace-pvc".into(),
+        }
+    }
+
+    #[test]
+    fn previous_container_records_do_not_count_as_local_work() {
+        let (temp, _id) = stuck_scope(Some(domain_fixture("pod-old")), None);
+        assert!(!current_container_work_exists_with(
+            temp.path(),
+            Some(&domain_fixture("pod-new"))
+        ));
+    }
+
+    #[test]
+    fn current_container_records_count_as_local_work() {
+        let (temp, _id) = stuck_scope(Some(domain_fixture("pod-same")), None);
+        assert!(current_container_work_exists_with(
+            temp.path(),
+            Some(&domain_fixture("pod-same"))
+        ));
+    }
+
+    #[test]
+    fn missing_domain_stamp_counts_as_local_work() {
+        // 无法盖章的环境保持保守：记录一律视为本容器工作，不得触发全新启动。
+        let (temp, _id) = stuck_scope(None, None);
+        assert!(current_container_work_exists_with(
+            temp.path(),
+            Some(&domain_fixture("pod-new"))
+        ));
+        assert!(current_container_work_exists_with(temp.path(), None));
+    }
+
+    #[test]
+    fn no_work_directory_is_not_local_work() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!current_container_work_exists_with(
+            temp.path(),
+            Some(&domain_fixture("pod-new"))
+        ));
+    }
+
+    #[test]
+    fn unreadable_generation_counts_as_local_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let root = work_root(temp.path(), &id).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("generation.json"), "{damaged").unwrap();
+        assert!(current_container_work_exists_with(
+            temp.path(),
+            Some(&domain_fixture("pod-new"))
+        ));
     }
 
     #[test]
