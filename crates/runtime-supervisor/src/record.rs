@@ -367,8 +367,10 @@ mod tests {
     }
     impl Drop for EpochGuard {
         fn drop(&mut self) {
-            self.0.take();
+            // 先清覆盖再放锁：放锁后下一个测试可立即设置自己的覆盖，
+            // 若此刻才清零会误清后者（nextest 并行测试竞态）。
             crate::epoch::set_epoch_for_tests(None);
+            self.0.take();
         }
     }
 
