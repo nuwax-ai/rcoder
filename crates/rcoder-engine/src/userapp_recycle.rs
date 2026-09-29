@@ -515,7 +515,9 @@ mod tests {
 
     fn cfg() -> UserAppRecycleRuntimeConfig {
         UserAppRecycleRuntimeConfig {
-            idle_timeout: Duration::from_secs(7_200), // 2h
+            idle_timeout: Duration::from_secs(
+                crate::config::UserAppRecycleConfig::default().idle_timeout_seconds,
+            ),
             scan_interval: Duration::from_secs(3600),
             protection: Duration::from_secs(300),
         }
@@ -529,8 +531,8 @@ mod tests {
         let d = decide_recycle(
             &RecycleEvalInput {
                 replicas: 1,
-                age: Some(Duration::from_secs(1000)),
-                idle: Some(Duration::from_secs(500_000)),
+                age: Some(Duration::from_secs(7200)),
+                idle: Some(Duration::from_secs(3600)),
                 ..Default::default()
             },
             &cfg(),
@@ -611,12 +613,12 @@ mod tests {
 
     #[test]
     fn decide_skips_below_threshold() {
-        // idle=100s < 全局阈值 7200s
+        // idle=3599s < 全局阈值 3600s
         let d = decide_recycle(
             &RecycleEvalInput {
                 replicas: 1,
-                age: Some(Duration::from_secs(1000)),
-                idle: Some(Duration::from_secs(100)),
+                age: Some(Duration::from_secs(7200)),
+                idle: Some(Duration::from_secs(3599)),
                 ..Default::default()
             },
             &cfg(),
@@ -626,7 +628,7 @@ mod tests {
 
     #[test]
     fn decide_per_app_threshold_overrides_global() {
-        // per-app 阈值=60s;idle=100s > 60 → Recycle(即便全局 7200 本会跳过)
+        // per-app 阈值=60s;idle=100s > 60 → Recycle(即便全局 3600 本会跳过)
         let d = decide_recycle(
             &RecycleEvalInput {
                 replicas: 1,
