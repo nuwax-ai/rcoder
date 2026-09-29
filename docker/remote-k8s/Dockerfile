@@ -26,20 +26,27 @@ RUN --mount=type=cache,id=rcoder-cargo-registry,target=/usr/local/cargo/registry
     cargo build --locked --jobs ${CARGO_JOBS} --profile dev --manifest-path crates/app-cli/Cargo.toml && \
     mkdir /out && cp /cache/target/debug/rcoder /cache/target/debug/agent_runner /cache/target/debug/app-cli /cache/target/debug/file-server-proxy /out/
 FROM ${RCODER_BASE} AS rcoder
+ENV TTYD_USER=root
 COPY --link --from=build /out/rcoder /out/agent_runner /app/bin/
 COPY --link --from=build /out/agent_runner /usr/local/bin/agent_runner
 COPY --link docker/rcoder-master/agent-runner-start.sh /app/agent-runner-start.sh
-RUN chmod +x /app/agent-runner-start.sh
+# ttyd 行为跟随源码快照，不能继承旧基础镜像中的普通用户默认值。
+COPY --link docker/rcoder-master/ttyd/start-ttyd.sh /usr/local/bin/start-ttyd.sh
+RUN chmod 0755 /app/agent-runner-start.sh /usr/local/bin/start-ttyd.sh
 FROM ${COMPUTER_BASE} AS computer
+ENV TTYD_USER=root
 # Credential identity and PG shutdown helpers belong to this source snapshot,
 # not the potentially older published base image.
 COPY --link --from=build /out/agent_runner /out/app-cli /usr/local/bin/
+COPY --link docker/rcoder-agent-runner/ttyd/start-ttyd.sh /usr/local/bin/start-ttyd.sh
+COPY --link docker/rcoder-agent-runner/supervisor/conf.d/ttyd.conf /etc/supervisor/conf.d/ttyd.conf
 COPY --link docker/rcoder-agent-runner/pg-admin-identity.sh docker/rcoder-agent-runner/pg-supervise.py docker/rcoder-agent-runner/pg-supervisor-entry.sh /usr/local/bin/
 # Snapshot transport can deliver these as 0600 (see the runtime stage note);
 # postgres runs the entry as a non-root user and needs world-read. 2026-09-27
 # personal-K8s finding: the missing bits made every fresh builder pod's
 # postgresql FATAL at pg-supervisor-entry.sh:22.
-RUN chmod 0755 /usr/local/bin/pg-supervisor-entry.sh /usr/local/bin/pg-admin-identity.sh /usr/local/bin/pg-supervise.py
+RUN chmod 0755 /usr/local/bin/pg-supervisor-entry.sh /usr/local/bin/pg-admin-identity.sh /usr/local/bin/pg-supervise.py /usr/local/bin/start-ttyd.sh && \
+    chmod 0644 /etc/supervisor/conf.d/ttyd.conf
 FROM ${RUNTIME_BASE} AS runtime
 COPY --link --from=build /out/app-cli /out/file-server-proxy /usr/local/bin/
 COPY --link docker/app-runtime-base/start-app.sh /usr/local/bin/start-app.sh

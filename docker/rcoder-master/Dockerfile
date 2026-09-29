@@ -122,6 +122,8 @@ RUN mkdir -p /root/.config/opencode && \
 # ============================================================================
 # 🖥️ ttyd Web 终端配置
 # ============================================================================
+# 默认 root 权限；终端工作目录仍由项目 --cwd 指定
+ENV TTYD_USER=root
 # 复制 ttyd 启动脚本和自定义前端页面
 COPY docker/rcoder-master/ttyd/start-ttyd.sh /usr/local/bin/start-ttyd.sh
 COPY docker/rcoder-master/ttyd/ttyd-index.html /usr/local/share/ttyd/index.html

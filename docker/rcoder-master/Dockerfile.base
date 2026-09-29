@@ -182,7 +182,7 @@ RUN rm -f /etc/nginx/sites-enabled/default && \
     rm -f /etc/nginx/conf.d/default.conf
 
 # ============================================================================
-# 🔧 创建非 root 用户（用于 ttyd 等服务降权运行）
+# 🔧 保留普通用户（供显式选择 TTYD_USER=user 或其他工具使用）
 # ============================================================================
 RUN useradd -ms /bin/bash user && \
     usermod -aG sudo user && \

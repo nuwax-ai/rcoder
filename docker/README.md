@@ -213,6 +213,14 @@ image: "master-rcoder:latest"
 | **日志目录** | `/app/logs` | `./docker/logs` | 容器日志输出 |
 | **规范目录** | `/app/specs` | - | 规范文件存放 |
 
+### Web 终端账户
+
+`rcoder-master` 和 `rcoder-agent-runner` 的 ttyd 默认以容器内 `root` 运行，无需先执行 `sudo su`。终端仍进入请求指定的项目目录；未指定 `--cwd` 时保持 `/home/user`。账户的 `HOME=/root` 与当前工作目录是两个不同概念。
+
+需要普通用户时，可在容器环境中显式设置 `TTYD_USER=user`。agent-runner 的 supervisor 继承该变量，不再覆盖为 `user`。
+
+修改脚本后须重建对应镜像并更新目标容器。`remote-k8s` 的 `rcoder`、`computer` 构建阶段会覆盖基础镜像中的 ttyd 脚本及相关配置，使终端行为跟随本次源码快照。
+
 ### 与生产环境对比
 
 | 配置项 | 本地测试 | 生产环境 |
