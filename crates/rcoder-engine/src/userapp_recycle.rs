@@ -32,14 +32,21 @@ pub(crate) struct UserAppRecycleRuntimeConfig {
 pub(crate) struct UserAppRecycleScanner {
     config: UserAppRecycleRuntimeConfig,
     state: Arc<AppState>,
+    /// 上一轮扫描即 NotReady 的 app（连续观察集合）。单次 NotReady 可能只是
+    /// 启动窗口，连续两轮（≥ scan_interval）才判定"长期不健康"。
+    not_ready_seen: std::collections::HashSet<String>,
 }
 
 impl UserAppRecycleScanner {
     pub(crate) fn new(config: UserAppRecycleRuntimeConfig, state: Arc<AppState>) -> Self {
-        Self { config, state }
+        Self {
+            config,
+            state,
+            not_ready_seen: Default::default(),
+        }
     }
 
-    pub async fn run(self, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
+    pub async fn run(mut self, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
         info!(
             "[USERAPP_RECYCLE] scanner started (interval={:?}, idle_timeout={:?}, protection={:?})",
             self.config.scan_interval, self.config.idle_timeout, self.config.protection
@@ -63,7 +70,7 @@ impl UserAppRecycleScanner {
     }
 
     /// 单轮扫描;返回本轮回收的 app 数。整轮失败向上传播(调用方 warn);单 app 失败隔离不影响其他。
-    async fn do_scan(&self) -> anyhow::Result<usize> {
+    async fn do_scan(&mut self) -> anyhow::Result<usize> {
         let apps = self
             .state
             .app_service
@@ -95,7 +102,7 @@ impl UserAppRecycleScanner {
         let now = Utc::now();
         let mut recycled = 0usize;
 
-        for app in apps {
+        for app in &apps {
             let Some(identity) = self
                 .state
                 .userapp_store
@@ -128,9 +135,13 @@ impl UserAppRecycleScanner {
                 };
             let idle =
                 last_accessed.map(|t| now.signed_duration_since(t).to_std().unwrap_or_default());
+            let unhealthy_now = app.replicas > 0 && app.ready_replicas == 0;
+            let sustained_unhealthy = unhealthy_now && self.not_ready_seen.contains(&app.app_id);
             let decision = decide_recycle(
                 &RecycleEvalInput {
                     replicas: app.replicas,
+                    ready_replicas: app.ready_replicas,
+                    sustained_unhealthy,
                     recycle_enabled: app.recycle_enabled,
                     is_waking: self.state.activity.is_waking(&app.app_id),
                     age,
@@ -170,7 +181,16 @@ impl UserAppRecycleScanner {
                     debug!("[USERAPP_RECYCLE] skip {app_id}: {reason}");
                 }
             }
+            // 连续 NotReady 观察集合：本轮观察到才保留，恢复就绪即清零。
+            if unhealthy_now {
+                self.not_ready_seen.insert(app_id.clone());
+            } else {
+                self.not_ready_seen.remove(app_id);
+            }
         }
+        // 已不存在的 app 不留观察残留
+        self.not_ready_seen
+            .retain(|id| apps.iter().any(|app| &app.app_id == id));
         Ok(recycled)
     }
 }
@@ -213,9 +233,13 @@ impl std::fmt::Display for SkipReason {
 }
 
 /// 单 app 的回收判定输入（扫描器从 `AppRuntimeInfo` + activity registry 装配）。
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct RecycleEvalInput {
     replicas: i32,
+    /// 就绪副本数：replicas>0 且 ready_replicas==0 = 僵尸运行中
+    ready_replicas: i32,
+    /// 连续两轮扫描均 NotReady（长期不健康；单轮不算，留出启动窗口）
+    sustained_unhealthy: bool,
     /// absent / Some(true) = 可回收；Some(false) = 付费永不回收
     recycle_enabled: Option<bool>,
     is_waking: bool,
@@ -245,6 +269,13 @@ fn decide_recycle(input: &RecycleEvalInput, cfg: &UserAppRecycleRuntimeConfig) -
         && age < cfg.protection
     {
         return RecycleDecision::Skip(SkipReason::WithinProtection);
+    }
+    // 长期不健康：副本在但零就绪持续跨扫描周期（≥ scan_interval）。从未就绪
+    // 的容器服务不了任何流量 → 永远等不到 idle 信号（含"从未访问"grace
+    // 分支），僵尸运行只占资源；按闲置同语义回收到 scale0，
+    // wake-on-traffic 负责后续拉起。
+    if input.sustained_unhealthy && input.replicas > 0 && input.ready_replicas == 0 {
+        return RecycleDecision::Recycle;
     }
     let idle = match input.idle {
         Some(d) => d,
@@ -427,6 +458,90 @@ mod tests {
             &cfg(),
         );
         assert_eq!(d, RecycleDecision::Recycle);
+    }
+
+    #[test]
+    fn decide_recycles_sustained_unhealthy_even_never_accessed() {
+        // 长期 NotReady（连续两轮）+ 从未被访问（idle=None 永久 grace）→ 回收。
+        // 僵尸容器永远等不到 idle 信号，grace 分支会把它变成永久漏回收。
+        let d = decide_recycle(
+            &RecycleEvalInput {
+                replicas: 1,
+                ready_replicas: 0,
+                sustained_unhealthy: true,
+                age: Some(Duration::from_secs(1000)),
+                idle: None,
+                ..Default::default()
+            },
+            &cfg(),
+        );
+        assert_eq!(d, RecycleDecision::Recycle);
+    }
+
+    #[test]
+    fn decide_unhealthy_single_observation_keeps_idle_rules() {
+        // 单轮 NotReady（可能只是启动窗口）不触发健康回收，走原闲置分支。
+        let d = decide_recycle(
+            &RecycleEvalInput {
+                replicas: 1,
+                ready_replicas: 0,
+                sustained_unhealthy: false,
+                age: Some(Duration::from_secs(1000)),
+                idle: None,
+                ..Default::default()
+            },
+            &cfg(),
+        );
+        assert_eq!(d, RecycleDecision::Skip(SkipReason::NeverAccessed));
+    }
+
+    #[test]
+    fn decide_unhealthy_respects_opt_out_and_wake() {
+        // 健康回收不越过 opt-out 与唤醒中：付费/唤醒优先级高于清理。
+        let base = RecycleEvalInput {
+            replicas: 1,
+            ready_replicas: 0,
+            sustained_unhealthy: true,
+            age: Some(Duration::from_secs(1000)),
+            idle: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_recycle(
+                &RecycleEvalInput {
+                    recycle_enabled: Some(false),
+                    ..base.clone()
+                },
+                &cfg()
+            ),
+            RecycleDecision::Skip(SkipReason::OptOut)
+        );
+        assert_eq!(
+            decide_recycle(
+                &RecycleEvalInput {
+                    is_waking: true,
+                    ..base
+                },
+                &cfg()
+            ),
+            RecycleDecision::Skip(SkipReason::WakeInFlight)
+        );
+    }
+
+    #[test]
+    fn decide_unhealthy_ignores_zero_replicas() {
+        // replicas=0 时 sustained 标志可能滞后（集合清理前的过渡轮），
+        // NotRunning 优先短路，不因脏集合误判。
+        let d = decide_recycle(
+            &RecycleEvalInput {
+                replicas: 0,
+                ready_replicas: 0,
+                sustained_unhealthy: true,
+                ..Default::default()
+            },
+            &cfg(),
+        );
+        assert_eq!(d, RecycleDecision::Skip(SkipReason::NotRunning));
     }
 
     #[test]

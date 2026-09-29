@@ -116,6 +116,15 @@ pub(super) async fn active_controls(
     }
     Ok(records)
 }
+
+/// 非终态操作的寿命上限（µs）。所有操作的观察/执行预算在代码层有界
+/// （traffic wake 分钟级、deploy 各阶段 30 分钟），超过该上限仍
+/// Pending/Running 的操作其执行器已随进程消亡（rcoder 重启后无人再推进
+/// 它），仅允许 Stop supersede——落点恒为 scale0，物理上安全。
+/// 事故锚点：nuwax-k8s-test app 83 的 Start 卡在 traffic_wake_observing
+/// 12h（waiter 随重启消亡），把闲置回收的 Stop 永久挡在 ERR_CONFLICT 上。
+const STALE_OPERATION_LIFETIME_US: i64 = 2 * 60 * 60 * 1_000_000;
+
 pub(super) async fn admit(
     tx: &mut dyn Executor,
     backend: Backend,
@@ -223,8 +232,17 @@ pub(super) async fn admit(
                 .ok_or_else(|| invalid("Compute intent target is missing"))?;
             interrupted.extend(old.interrupted_operations.clone());
             if !old.state.is_terminal() {
+                // 僵尸操作兜底：Pending/Running 超过寿命上限 = 执行器已消亡
+                // （无人在推进），Stop 可 supersede 接管；其余动作仍冲突。
+                // created_at 缺失的存量记录按 epoch 兜底，同样可被接管。
+                let zombie = matches!(
+                    old.state,
+                    ComputeControlState::Pending | ComputeControlState::Running
+                ) && now.saturating_sub(old.created_at.timestamp_micros())
+                    >= STALE_OPERATION_LIFETIME_US;
                 if !((request.action == ComputeControlAction::Stop
                     && old.action == ComputeControlAction::Restart)
+                    || zombie
                     || (!idle_only
                         && request.action == ComputeControlAction::Restart
                         && old.request_id.starts_with(AUTOMATIC_REPAIR_REQUEST_PREFIX)))
