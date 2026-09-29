@@ -434,135 +434,134 @@ async fn spawn_dev_task(
                     }));
                 })),
             };
-            let outcome = guard.scope(async {
-            result?;
-            if task_clone.is_cancelled() {
-                return Ok::<(), AppError>(());
-            }
-            // A registry entry only establishes ownership, not successful startup.
-            // External owners always follow the identity-bound control operation.
-            if matches!(action, DevTaskAction::Start)
-                && pg.is_none()
-                && state
-                    .fs
-                    .dev_server
-                    .confirmed_local_manifest_ready(&key, &ws)
-                    .await?
-            {
-                return Ok::<(), AppError>(());
-            }
-            // 编译成功但任务已被取消（cancel 落在编译完成后的打包/探活窗口
-            // ——pid 已清零只软取消）：不再执行启停，保持"取消=无副作用"
-            // 与终态 Cancelled 一致
-            if task_clone.is_cancelled() {
-                tracing::info!(%app_id, "dev task cancelled after build; skipping start/restart");
-                return Ok(());
-            }
-            // 启动 workspace 根（形态分派）：
-            // - 产物态（R03）：staging 只解压校验；**激活权归属 owner**——
-            //   匹配 owner 在 → Deploy(ArtifactId)（owner 侧身份/revision
-            //   核验后自行解压/激活/编排，拒绝不改变 active 目录）；
-            //   无 owner → 本地 activate + spawn（legacy 路径不变）。
-            // - 源码态：ensure 源码目录 release.lock（mtime 检测自动重锁），
-            //   app-cli 直接编排源码 workspace（devrun 优先、run 兜底）。
-            // 两种形态失败语义一致：旧运行态原样保留，任务 Failed。
-            if !dev_source_mode {
-                match state
-                    .fs
-                    .dev_server
-                    .route_artifact_restart(
-                        &key,
-                        &ws,
-                        &release_id,
-                        Some(hooks.clone()),
-                        pg.as_ref(),
-                        Some(&task_clone.id),
-                    )
-                    .await
-                {
-                    Ok(Some(started)) => {
-                        // owner 已受理并确认 Succeeded（含事件转发/终态排空/
-                        // external 登记，见 route_artifact_restart）——本地
-                        // .run 未被触碰，无需 commit_start 的本地激活段
-                        let _ = started;
-                        tracing::info!(%app_id, "artifact restart routed through runtime owner");
-                        return Ok(());
-                    }
-                    Ok(None) => { /* 无 owner：走下方本地激活 + spawn */ }
-                    Err(error) => return Err(error),
+            let startup = async {
+                result?;
+                if task_clone.is_cancelled() {
+                    return Ok::<(), AppError>(());
                 }
-            }
-            let prepared = if dev_source_mode {
-                None
-            } else {
-                Some(crate::service::userapp::run_dir::prepare_run_dir(&ws, &release_id).await?)
+                // A registry entry only establishes ownership, not successful startup.
+                // External owners always follow the identity-bound control operation.
+                if matches!(action, DevTaskAction::Start)
+                    && pg.is_none()
+                    && state
+                        .fs
+                        .dev_server
+                        .confirmed_local_manifest_ready(&key, &ws)
+                        .await?
+                {
+                    return Ok::<(), AppError>(());
+                }
+                // 编译成功但任务已被取消（cancel 落在编译完成后的打包/探活窗口
+                // ——pid 已清零只软取消）：不再执行启停，保持"取消=无副作用"
+                // 与终态 Cancelled 一致
+                if task_clone.is_cancelled() {
+                    tracing::info!(%app_id, "dev task cancelled after build; skipping start/restart");
+                    return Ok(());
+                }
+                // 启动 workspace 根（形态分派）：
+                // - 产物态（R03）：staging 只解压校验；**激活权归属 owner**——
+                //   匹配 owner 在 → Deploy(ArtifactId)（owner 侧身份/revision
+                //   核验后自行解压/激活/编排，拒绝不改变 active 目录）；
+                //   无 owner → 本地 activate + spawn（legacy 路径不变）。
+                // - 源码态：ensure 源码目录 release.lock（mtime 检测自动重锁），
+                //   app-cli 直接编排源码 workspace（devrun 优先、run 兜底）。
+                // 两种形态失败语义一致：旧运行态原样保留，任务 Failed。
+                if !dev_source_mode {
+                    match state
+                        .fs
+                        .dev_server
+                        .route_artifact_restart(
+                            &key,
+                            &ws,
+                            &release_id,
+                            Some(hooks.clone()),
+                            pg.as_ref(),
+                            Some(&task_clone.id),
+                        )
+                        .await
+                    {
+                        Ok(Some(_)) => {
+                            // owner 已受理并确认 Succeeded（含事件转发/终态排空/
+                            // external 登记，见 route_artifact_restart）——本地
+                            // .run 未被触碰，无需 commit_start 的本地激活段
+                            tracing::info!(%app_id, "artifact restart routed through runtime owner");
+                            return Ok(());
+                        }
+                        Ok(None) => { /* 无 owner：走下方本地激活 + spawn */ }
+                        Err(error) => return Err(error),
+                    }
+                }
+                let prepared = if dev_source_mode {
+                    None
+                } else {
+                    Some(crate::service::userapp::run_dir::prepare_run_dir(&ws, &release_id).await?)
+                };
+                if !task_clone
+                    .commit_start(&lifecycle, generation, async {
+                        let run_root = match prepared {
+                            Some(prepared) => prepared.activate()?,
+                            None => crate::service::userapp::dev_mode::ensure_dev_lock(&ws).await?,
+                        };
+                        match action {
+                            DevTaskAction::Start => {
+                                state
+                                    .fs
+                                    .dev_server
+                                    .start_dev(
+                                        &key,
+                                        &run_root,
+                                        base_path.as_deref(),
+                                        Some(hooks.clone()),
+                                        pg.as_ref(),
+                                        Some(&task_clone.id),
+                                    )
+                                    .await?;
+                            }
+                            DevTaskAction::Restart => {
+                                state
+                                    .fs
+                                    .dev_server
+                                    .restart_dev(
+                                        &key,
+                                        &run_root,
+                                        base_path.as_deref(),
+                                        Some(hooks.clone()),
+                                        pg.as_ref(),
+                                        Some(&task_clone.id),
+                                    )
+                                    .await?;
+                            }
+                        }
+                        Ok::<(), AppError>(())
+                    })
+                    .await?
+                {
+                    return Ok(());
+                }
+                if let Some(supervised) = state.fs.dev_server.supervised_child(&key) {
+                    let exit_tx = evt_tx.clone();
+                    let span = tracing::Span::current();
+                    tokio::spawn({
+                        let supervised = supervised.clone();
+                        async move {
+                            if let Some(exit) = supervised
+                                .wait_exit(std::time::Duration::from_secs(launch_budget_secs))
+                                .await
+                            {
+                                let _guard = span.enter();
+                                drop(exit_tx.send(EvtOutcome::ProducerExited {
+                                    exit: exit.describe(),
+                                }));
+                            }
+                        }
+                    });
+                }
+                drop(evt_tx);
+                event_pipe
+                    .finish(std::time::Duration::from_secs(launch_budget_secs))
+                    .await
             };
-            if !task_clone
-                .commit_start(&lifecycle, generation, async {
-                    let run_root = match prepared {
-                        Some(prepared) => prepared.activate()?,
-                        None => crate::service::userapp::dev_mode::ensure_dev_lock(&ws).await?,
-                    };
-                    match action {
-                        DevTaskAction::Start => {
-                            state
-                                .fs
-                                .dev_server
-                                .start_dev(
-                                    &key,
-                                    &run_root,
-                                    base_path.as_deref(),
-                                    Some(hooks.clone()),
-                                    pg.as_ref(),
-                                    Some(&task_clone.id),
-                                )
-                                .await?;
-                        }
-                        DevTaskAction::Restart => {
-                            state
-                                .fs
-                                .dev_server
-                                .restart_dev(
-                                    &key,
-                                    &run_root,
-                                    base_path.as_deref(),
-                                    Some(hooks.clone()),
-                                    pg.as_ref(),
-                                    Some(&task_clone.id),
-                                )
-                                .await?;
-                        }
-                    }
-                    Ok::<(), AppError>(())
-                })
-                .await?
-            {
-                return Ok(());
-            }
-            if let Some(supervised) = state.fs.dev_server.supervised_child(&key) {
-                let exit_tx = evt_tx.clone();
-                let span = tracing::Span::current();
-                tokio::spawn({
-                    let supervised = supervised.clone();
-                    async move {
-                        if let Some(exit) = supervised
-                            .wait_exit(std::time::Duration::from_secs(launch_budget_secs))
-                            .await
-                        {
-                            let _guard = span.enter();
-                            drop(exit_tx.send(EvtOutcome::ProducerExited {
-                                exit: exit.describe(),
-                            }));
-                        }
-                    }
-                });
-            }
-            drop(evt_tx);
-            event_pipe
-                .finish(std::time::Duration::from_secs(launch_budget_secs))
-                .await
-        })
-        .await;
+            let outcome = guard.scope(startup).await;
             // Release only after startup has consumed the freshly built workspace.
             drop(guard);
             match outcome {

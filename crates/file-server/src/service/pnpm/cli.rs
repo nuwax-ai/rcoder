@@ -31,21 +31,7 @@ pub(super) async fn install(
     logs: Option<&LogFiles>,
     timeout_secs: u64,
 ) -> Result<InstallOutcome, InstallError> {
-    install_with_heal(cwd, options, logs, timeout_secs, true).await
-}
-
-/// 单次执行 + 失败自愈判定（heal 门控防递归：自愈重试后不再触发）。
-async fn install_with_heal(
-    cwd: &Path,
-    options: &InstallOptions,
-    logs: Option<&LogFiles>,
-    timeout_secs: u64,
-    heal_allowed: bool,
-) -> Result<InstallOutcome, InstallError> {
     let result = install_once(cwd, options, logs, timeout_secs).await;
-    if !heal_allowed {
-        return result;
-    }
     // R11：只保留 typed code 通道（classify.rs 从原始输出边界提取 code——
     // "边界解析一次，内部用结构化结果"；message 文案不再参与触发）
     let is_ignored_builds = matches!(
@@ -89,8 +75,7 @@ async fn install_with_heal(
         "pnpm ignored-builds: approving blocked build scripts and retrying install once"
     );
     approve_builds(cwd, &packages, timeout_secs).await?;
-    // 自愈重试等价 install_once（heal_allowed=false 分支只透传单次结果，
-    // 不再触发自愈——直调避免 async 递归 boxing）。
+    // 直接执行一次重试，不递归进入自愈流程。
     install_once(cwd, options, logs, timeout_secs).await
 }
 

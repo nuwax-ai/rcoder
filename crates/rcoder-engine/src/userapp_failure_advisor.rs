@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rcoder_proxy::error_page::{UserAppProxyFailureAdvisor, UserAppProxyFailureHint};
-use shared_types::UserAppReadinessObservation;
+use shared_types::{UserAppReadinessObservation, UserappStage};
 
 use crate::app_state::AppState;
 
@@ -19,6 +19,7 @@ use crate::app_state::AppState;
 const HINT_TTL: Duration = Duration::from_secs(30);
 /// 单次观察预算上限（失败路径诊断绝不拖长代理等待）。
 const ADVISE_BUDGET_CAP: Duration = Duration::from_secs(2);
+const HINT_CACHE_CAPACITY: usize = 512;
 
 type HintKey = (String, &'static str);
 type Inflight = dashmap::DashMap<HintKey, Arc<tokio::sync::Mutex<()>>>;
@@ -40,7 +41,7 @@ impl Drop for ObservationFlight<'_> {
 
 struct CachedHint {
     at: Instant,
-    hint: Arc<Option<UserAppProxyFailureHint>>,
+    hint: Option<UserAppProxyFailureHint>,
 }
 
 pub struct UserAppProxyFailureAdvisorImpl {
@@ -68,8 +69,9 @@ impl UserAppProxyFailureAdvisor for UserAppProxyFailureAdvisorImpl {
         stage: &str,
         budget: Duration,
     ) -> Option<UserAppProxyFailureHint> {
+        let stage = UserappStage::parse(stage)?;
         let budget = budget.min(ADVISE_BUDGET_CAP);
-        let key = (app_id.to_string(), stage_leak(stage));
+        let key = (app_id.to_string(), stage.as_str());
         // Waiting for another observer is part of the same caller budget.
         tokio::time::timeout(
             budget,
@@ -81,7 +83,8 @@ impl UserAppProxyFailureAdvisor for UserAppProxyFailureAdvisorImpl {
 }
 
 impl UserAppProxyFailureAdvisorImpl {
-    async fn cached_hint(&self, key: &HintKey) -> Option<Arc<Option<UserAppProxyFailureHint>>> {
+    /// 外层 Option 表示缓存命中；Some(None) 缓存“没有诊断”，避免重复观察。
+    async fn cached_hint(&self, key: &HintKey) -> Option<Option<UserAppProxyFailureHint>> {
         self.cache
             .lock()
             .await
@@ -96,7 +99,7 @@ impl UserAppProxyFailureAdvisorImpl {
         observe: impl Future<Output = Option<UserAppProxyFailureHint>>,
     ) -> Option<UserAppProxyFailureHint> {
         if let Some(hint) = self.cached_hint(&key).await {
-            return (*hint).clone();
+            return hint;
         }
         let _flight = ObservationFlight {
             inflight: &self.inflight,
@@ -109,11 +112,11 @@ impl UserAppProxyFailureAdvisorImpl {
             .clone();
         let _guard = gate.lock().await;
         if let Some(hint) = self.cached_hint(&key).await {
-            return (*hint).clone();
+            return hint;
         }
         // The cache mutex only protects map access. Other apps may observe
         // while this app waits for its runtime, and cancellation releases flight.
-        let hint = Arc::new(observe.await);
+        let hint = observe.await;
         let mut cache = self.cache.lock().await;
         cache.insert(
             key,
@@ -122,22 +125,20 @@ impl UserAppProxyFailureAdvisorImpl {
                 hint: hint.clone(),
             },
         );
-        // 缓存有界：失败路径 app 集合有限，仍按容量防御（超出丢最旧——
-        // 无序 HashMap 直接 clear 极端场景，正常规模无感）。
-        if cache.len() > 512 {
+        // 超出容量后清空短时诊断缓存，后续请求重新观察。
+        if cache.len() > HINT_CACHE_CAPACITY {
             cache.clear();
         }
-        (*hint).clone()
+        hint
     }
 
     async fn observe(
         &self,
         app_id: &str,
-        stage: &str,
+        stage: UserappStage,
         budget: Duration,
     ) -> Option<UserAppProxyFailureHint> {
         let state = self.state.upgrade()?;
-        let stage = shared_types::UserappStage::parse(stage)?;
         let reader = state.app_service.readiness_reader()?;
         match reader.observe(app_id, stage, budget).await {
             Ok(UserAppReadinessObservation::Snapshot { snapshot, .. }) => {
@@ -161,18 +162,39 @@ impl UserAppProxyFailureAdvisorImpl {
     }
 }
 
-/// 失败路径的 stage 词表收口（代理侧传入 `prod`/`dev` 字面量）。
-fn stage_leak(stage: &str) -> &'static str {
-    match stage {
-        "prod" => "prod",
-        _ => "dev",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Weak;
+
+    #[tokio::test]
+    async fn failure_advisor_invalid_stage_cannot_reuse_dev_hint() {
+        let advisor = UserAppProxyFailureAdvisorImpl::new(Weak::new());
+        let hint = UserAppProxyFailureHint {
+            readiness_status: Some(shared_types::UserAppReadinessStatus::Failed),
+            error_origin_confirmed: true,
+        };
+        advisor
+            .cached_observation(("app123".into(), "dev"), async { Some(hint.clone()) })
+            .await;
+
+        for stage in ["", "staging", "DEV", "prod"] {
+            assert!(
+                advisor
+                    .advise("app123", stage, Duration::from_secs(1))
+                    .await
+                    .is_none(),
+                "stage {stage:?} must not reuse the dev hint"
+            );
+        }
+        assert_eq!(
+            advisor
+                .advise("app123", "dev", Duration::from_secs(1))
+                .await,
+            Some(hint)
+        );
+        assert!(advisor.inflight.is_empty());
+    }
 
     #[tokio::test]
     async fn failure_advisor_coalesces_waiters_without_blocking_other_apps() {
