@@ -3148,6 +3148,40 @@ fn git_scenarios() -> Result<Vec<GitScenario>> {
             )?,
             None,
         ),
+        // TS 02bec84 (v1.5.5): 目录在两个分支都是 VALIDATION 400（message/details
+        // 逐字对比），而非树清单文本（旧 git show）或 500。
+        git_scenario(
+            "git-file-content-directory-ref",
+            main,
+            {
+                let mut spec = git_json(
+                    main,
+                    Method::POST,
+                    "/api/git/file-content",
+                    json!({"filePath":"src","ref":"HEAD"}),
+                )?;
+                spec.expected_status = ExpectedStatus::ClientError4xx;
+                spec.normalized_paths = vec!["/error/requestId".into(), "/error/timestamp".into()];
+                spec
+            },
+            None,
+        ),
+        git_scenario(
+            "git-file-content-directory-worktree",
+            main,
+            {
+                let mut spec = git_json(
+                    main,
+                    Method::POST,
+                    "/api/git/file-content",
+                    json!({"filePath":"src","ref":"worktree"}),
+                )?;
+                spec.expected_status = ExpectedStatus::ClientError4xx;
+                spec.normalized_paths = vec!["/error/requestId".into(), "/error/timestamp".into()];
+                spec
+            },
+            None,
+        ),
     ];
 
     let branch_list = git_get(main, "branches");
@@ -5792,6 +5826,7 @@ fn compare_exchange(
         "location",
         "etag",
         "last-modified",
+        "x-file-size",
         "access-control-allow-origin",
         "access-control-allow-credentials",
         "access-control-expose-headers",

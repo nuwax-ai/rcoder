@@ -22,12 +22,12 @@ pub struct CorsConfig {
 
 pub const PAGE_CORS: CorsConfig = CorsConfig {
     allow_headers: "Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control, Fragment",
-    expose_headers: "Content-Type",
+    expose_headers: "Content-Type, X-File-Size",
 };
 
 pub const COMPUTER_CORS: CorsConfig = CorsConfig {
     allow_headers: "Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control, Range, If-Range",
-    expose_headers: "Content-Type, Content-Length, Content-Range, Accept-Ranges, ETag, Last-Modified",
+    expose_headers: "Content-Type, Content-Length, Content-Range, Accept-Ranges, ETag, Last-Modified, X-File-Size",
 };
 
 const ALLOW_METHODS: &str = "HEAD,GET,POST,PUT,DELETE,OPTIONS";
@@ -60,8 +60,11 @@ pub async fn serve_from_root(root: &Path, rest: &str, cors: &CorsConfig, req: Re
     // tokio::fs::metadata 而非阻塞的 Path::is_file()：本函数每次静态请求都会走到，
     // 阻塞调用会占住 tokio worker。NotFound 使用与 TS 一致的结构化资源错误；其他
     // I/O 错误按种类传播，不能把权限/设备故障伪装成文件缺失。
-    match tokio::fs::metadata(&full).await {
-        Ok(metadata) if metadata.is_file() => {}
+    // 对齐 TS 02bec84 (v1.5.5): 始终以 X-File-Size 返回完整文件大小（Range 请求
+    // 也是全量）—— 网关 gzip 会去掉 Content-Length（改 chunked），且 CORS 未暴露
+    // 的头前端读不到。
+    let file_size = match tokio::fs::metadata(&full).await {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
         Ok(_) => return cors_404(&req, cors),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return cors_resource_404(&request_path, origin.as_deref(), cors);
@@ -70,7 +73,7 @@ pub async fn serve_from_root(root: &Path, rest: &str, cors: &CorsConfig, req: Re
             let response = AppError::from(error).into_response();
             return add_cors_headers(response, origin.as_deref(), cors);
         }
-    }
+    };
     // ServeFile 处理 Range / ETag / Last-Modified / conditional GET
     let serve = ServeFile::new(full);
     match serve.oneshot(req).await {
@@ -80,6 +83,10 @@ pub async fn serve_from_root(root: &Path, rest: &str, cors: &CorsConfig, req: Re
         Ok(resp) => {
             let mut resp = resp.into_response();
             let headers = resp.headers_mut();
+            headers.insert(
+                HeaderName::from_static("x-file-size"),
+                HeaderValue::from(file_size),
+            );
             // 对齐 TS 静态服务 (send 模块) 的浏览器语义: 总是允许重新验证
             // (`public, max-age=0`, 避免用户内容被启发式缓存出陈旧副本), 并通告
             // ServeFile 已实现的 Range 能力; tower-http 默认不发送这两个头。
@@ -319,5 +326,74 @@ mod tests {
         assert_eq!(value["code"], "UNKNOWN_ERROR");
         assert_eq!(value["error"]["type"], "RESOURCE_ERROR");
         assert_eq!(value["error"]["message"], format!("Path not found: {path}"));
+    }
+
+    // ── TS 02bec84 (v1.5.5): X-File-Size 全量大小自定义头 ─────────────────────
+
+    #[tokio::test]
+    async fn success_responses_carry_full_x_file_size_header() {
+        // 对齐 TS: 网关 gzip 会去掉 Content-Length、CORS 未暴露的头前端读不到，
+        // 因此自定义头始终携带完整文件大小（Range 请求也是全量）。
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.txt"), b"0123456789").unwrap();
+        let response = serve_from_root(
+            root.path(),
+            "a.txt",
+            &PAGE_CORS,
+            Request::builder()
+                .uri("/")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("x-file-size").unwrap(), "10");
+        let expose = response
+            .headers()
+            .get("access-control-expose-headers")
+            .unwrap();
+        assert!(
+            expose
+                .to_str()
+                .unwrap()
+                .split(',')
+                .any(|token| token.trim() == "X-File-Size"),
+            "CORS 必须暴露 X-File-Size: {expose:?}"
+        );
+
+        // Range 请求: 206 携带的仍是全量大小（TS 同款语义）
+        let response = serve_from_root(
+            root.path(),
+            "a.txt",
+            &COMPUTER_CORS,
+            Request::builder()
+                .uri("/")
+                .header("range", "bytes=0-3")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers().get("x-file-size").unwrap(), "10");
+
+        // 目录与缺失: 404 不携带该头（TS 在 stat 失败时不设置，交由 404 流程）
+        std::fs::create_dir_all(root.path().join("sub")).unwrap();
+        for rest in ["sub", "missing.txt"] {
+            let response = serve_from_root(
+                root.path(),
+                rest,
+                &PAGE_CORS,
+                Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{rest}");
+            assert!(
+                response.headers().get("x-file-size").is_none(),
+                "{rest}: 404 不得携带 x-file-size"
+            );
+        }
     }
 }

@@ -167,7 +167,7 @@ pub(crate) async fn file_content(
             return Err(AppError::resource("workspace does not exist"));
         }
         if read_worktree {
-            return git::worktree_content(&path, &fp_c, max_bytes);
+            return git::worktree_content(&path, &fp_c, &ref_c, max_bytes);
         }
         let repo = git::ensure_repo(&path)?;
         git::ensure_gitignore(&path)?;

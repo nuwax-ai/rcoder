@@ -355,13 +355,24 @@ fn iso_from_secs(secs: i64) -> String {
 /// 缺文件 = 空串（TS `existsSync ? read : ""` 的空数据契约——Diff 右侧取
 /// 未存盘/已删文件时不得 500）；超限 = Validation；非 UTF-8 = lossy
 /// （与 ref 路径 [`file_content_at_ref`] 的 from_utf8_lossy 一致）。
+/// 对齐 TS 02bec84 (v1.5.5): lstat 语义 —— symlink 在 git 中是内容为目标路径的
+/// blob（返回链接文本），目录是入参错误；与 ref 路径 [`file_content_at_ref`]
+/// 读 blob 的结果保持一致（跟随链接读目标内容会造成两分支分叉）。
+/// 扫描竞态中的缺失（含 lstat 后链接被删）按空串归一。
 pub fn worktree_content(
     path: &std::path::Path,
     file_path: &str,
+    ref_spec: &str,
     max_bytes: u64,
 ) -> AppResult<String> {
+    fn not_a_file(ref_spec: &str, file_path: &str) -> AppError {
+        AppError::validation_with(
+            "filePath is a directory, file-content only supports files",
+            serde_json::json!({"ref": ref_spec, "filePath": file_path, "field": "filePath"}),
+        )
+    }
     let full = crate::path_safety::ensure_within(path, file_path)?;
-    let metadata = match std::fs::metadata(&full) {
+    let metadata = match std::fs::symlink_metadata(&full) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
         Err(error) => {
@@ -371,6 +382,28 @@ pub fn worktree_content(
             )));
         }
     };
+    if metadata.file_type().is_symlink() {
+        let target = match std::fs::read_link(&full) {
+            Ok(target) => target,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+            Err(error) => {
+                return Err(AppError::system(format!(
+                    "read link {}: {error}",
+                    full.display()
+                )));
+            }
+        };
+        let text = target.to_string_lossy().into_owned();
+        if text.len() as u64 > max_bytes {
+            return Err(AppError::validation(format!(
+                "git file content exceeds limit (max {max_bytes} bytes)"
+            )));
+        }
+        return Ok(text);
+    }
+    if metadata.is_dir() {
+        return Err(not_a_file(ref_spec, file_path));
+    }
     if metadata.len() > max_bytes {
         return Err(AppError::validation(format!(
             "git file content exceeds limit (max {max_bytes} bytes)"
@@ -379,6 +412,10 @@ pub fn worktree_content(
     let bytes = match std::fs::read(&full) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        // lstat 后类型被并发替换为目录的兜底（与 TS 同款防御）
+        Err(error) if error.kind() == std::io::ErrorKind::IsADirectory => {
+            return Err(not_a_file(ref_spec, file_path));
+        }
         Err(error) => {
             return Err(AppError::system(format!(
                 "read {}: {error}",
@@ -409,6 +446,19 @@ pub fn file_content_at_ref(
         .map_err(|e| map_git_err(e, "git lookup_entry_by_path"))?
     {
         Some(entry) => {
+            // 对齐 TS 02bec84 (v1.5.5): 目录(tree)/子模块在该 ref 中不是文件 ——
+            // 返回入参错误（git cat-file -t != blob），而不是把树清单当文件内容
+            // 或在 find_blob 上报 500。symlink 是内容为目标路径的 blob，放行。
+            if !entry.mode().is_blob_or_symlink() {
+                return Err(AppError::validation_with(
+                    "filePath is not a file in this ref (directory)",
+                    serde_json::json!({
+                        "ref": ref_spec,
+                        "filePath": file_path,
+                        "field": "filePath"
+                    }),
+                ));
+            }
             let size = repo
                 .find_header(entry.id())
                 .map_err(|e| map_git_err(e, "git find file-content header"))?
@@ -954,15 +1004,107 @@ mod tests {
         // 非 UTF-8 统一 lossy（与 ref 路径 from_utf8_lossy 一致）。
         let t = TestRepo::new();
         assert_eq!(
-            worktree_content(&t.0, "no/such/file.txt", 1024).expect("缺文件必须空串"),
+            worktree_content(&t.0, "no/such/file.txt", "worktree", 1024).expect("缺文件必须空串"),
             "",
             "缺文件必须走空串契约"
         );
         std::fs::write(t.0.join("bin.dat"), [0xff_u8, 0xfe, b'a']).expect("write non-utf8");
-        let s = worktree_content(&t.0, "bin.dat", 1024).expect("非 UTF-8 不得 500");
+        let s = worktree_content(&t.0, "bin.dat", "worktree", 1024).expect("非 UTF-8 不得 500");
         assert!(s.contains('a'), "lossy 内容应保留可解码部分: {s:?}");
         std::fs::write(t.0.join("big.txt"), "0123456789").expect("write big");
-        let err = worktree_content(&t.0, "big.txt", 5).expect_err("超限必须拒绝");
+        let err = worktree_content(&t.0, "big.txt", "worktree", 5).expect_err("超限必须拒绝");
         assert!(matches!(err, AppError::Validation(..)), "{err:?}");
+    }
+
+    // ── TS 02bec84 (v1.5.5): worktree file-content 目录/symlink 语义 ──────────
+
+    #[test]
+    fn worktree_content_directory_is_validation_with_ts_contract() {
+        // 对齐 TS: 目录（常为前端误传目录条目，带尾随 /）→ VALIDATION 而非
+        // EISDIR 500；message/details 与 TS 逐字一致（A/B 错误体全量对比）。
+        let t = TestRepo::new();
+        std::fs::create_dir_all(t.0.join("src")).expect("mkdir");
+        let err = worktree_content(&t.0, "src", "worktree", 1024)
+            .expect_err("目录必须是入参错误而非 500");
+        let AppError::Validation(message, details) = &err else {
+            panic!("必须是 Validation: {err:?}");
+        };
+        assert_eq!(
+            message,
+            "filePath is a directory, file-content only supports files"
+        );
+        assert_eq!(
+            details,
+            &Some(serde_json::json!({
+                "ref": "worktree",
+                "filePath": "src",
+                "field": "filePath"
+            }))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_content_symlink_returns_target_text() {
+        // git 语义: symlink 是内容为目标路径的 blob —— worktree 分支返回链接
+        // 文本而非跟随读目标内容（否则与 ref 分支 find_blob 结果分叉）。
+        // 指向目录的链接同样是链接文本。
+        let t = TestRepo::new();
+        std::fs::write(t.0.join("real.txt"), "target-body").expect("write target");
+        std::os::unix::fs::symlink("real.txt", t.0.join("link.txt")).expect("symlink");
+        std::fs::create_dir_all(t.0.join("sub")).expect("mkdir");
+        std::os::unix::fs::symlink("sub", t.0.join("dir-link")).expect("dir symlink");
+        assert_eq!(
+            worktree_content(&t.0, "link.txt", "worktree", 1024).expect("symlink 读文本"),
+            "real.txt",
+            "必须返回链接目标路径文本，而非目标文件内容"
+        );
+        assert_eq!(
+            worktree_content(&t.0, "dir-link", "worktree", 1024).expect("目录链接读文本"),
+            "sub"
+        );
+    }
+
+    #[test]
+    fn file_content_at_ref_directory_is_validation_with_ts_contract() {
+        // 对齐 TS native cat-file -t 门: 目录(tree)在该 ref 不是文件 → VALIDATION，
+        // 而非把树清单当内容（旧 git show 行为）或 find_blob 500。
+        let t = TestRepo::new();
+        std::fs::create_dir_all(t.0.join("src")).expect("建父目录");
+        commit_file(&t, "src/app.txt", "hello", "c1");
+        let repo = t.open();
+        let err =
+            file_content_at_ref(&repo, "HEAD", "src", 1024).expect_err("目录路径必须入参错误");
+        let AppError::Validation(message, details) = &err else {
+            panic!("必须是 Validation: {err:?}");
+        };
+        assert_eq!(message, "filePath is not a file in this ref (directory)");
+        assert_eq!(
+            details,
+            &Some(serde_json::json!({
+                "ref": "HEAD",
+                "filePath": "src",
+                "field": "filePath"
+            }))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_content_at_ref_symlink_blob_returns_target_text() {
+        // symlink 以 Link mode 提交（内容=目标路径 blob）→ blob 门放行，
+        // 返回链接文本 —— 与 worktree 分支结果一致。
+        let t = TestRepo::new();
+        std::fs::write(t.0.join("real.txt"), "target-body").expect("write target");
+        std::os::unix::fs::symlink("real.txt", t.0.join("link.txt")).expect("symlink");
+        let repo = t.open();
+        stage_path(&repo, "link.txt").expect("stage symlink");
+        commit_indexed(&repo, "add link", "Test", "test@example.com").expect("commit");
+        assert_eq!(
+            file_content_at_ref(&repo, "HEAD", "link.txt", 1024)
+                .expect("ref 读 symlink blob")
+                .as_deref(),
+            Some("real.txt")
+        );
     }
 }
