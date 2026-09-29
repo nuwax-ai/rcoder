@@ -23,6 +23,16 @@ pub(crate) struct MigrationJournal {
 }
 
 fn state_root(workspace: &Path) -> Result<PathBuf> {
+    // DEV-1 §3.2 迁移回执连续性：位置覆盖优先级 =
+    // ① APP_CLI_MIGRATION_RECEIPTS_DIR（file-server 侧发现旧物理目录后锁定
+    //    传入——环境切换到显式状态根后，已完成迁移不重跑、未确认迁移不被
+    //    路径切换隐藏）；② 显式状态根；③ workspace 父目录（历史缺省）。
+    // inspect/require/begin 全部经同一 resolver，三处行为一致。
+    if let Some(dir) =
+        std::env::var_os("APP_CLI_MIGRATION_RECEIPTS_DIR").filter(|value| !value.is_empty())
+    {
+        return Ok(PathBuf::from(dir));
+    }
     Ok(
         match std::env::var_os("APP_CLI_STATE_ROOT").filter(|value| !value.is_empty()) {
             Some(root) => PathBuf::from(root),

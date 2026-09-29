@@ -12,8 +12,10 @@
 //! - keep-alive 被动探活, 无空闲自动停止
 
 pub mod coordinated;
+mod discovery;
 pub mod error_classify;
 mod external_store;
+mod local_stop;
 pub mod log;
 mod owner_client;
 mod owner_recovery;
@@ -38,11 +40,20 @@ pub use types::{DevServerManager, StartedDev, StoppedDev};
 
 use crate::models::{DevProcess, ReadDevLogResult};
 
-use std::path::Path;
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::error::AppResult;
 use support::lock;
+
+/// start_dev 的启动参数包（restart_dev_staged 使用；字段与 start_dev 一致）。
+pub struct DevLaunch<'a> {
+    pub base_path: Option<&'a str>,
+    pub hooks: Option<DevEventHooks>,
+    pub pg: Option<&'a shared_types::StartPgCredential>,
+    pub request_context: Option<&'a str>,
+}
 
 impl DevServerManager {
     /// UserApp owner 用单一 Restart 操作完成停止和启动；本地子进程才 stop + start。
@@ -81,6 +92,50 @@ impl DevServerManager {
             hooks,
             pg,
             request_context,
+        )
+        .await
+    }
+
+    /// DEV-1 §3.5 分阶段重启：复用预检 → 确认旧执行停止 → **此时**切换运行
+    /// 目录（制品 activate）→ 启动。旧路径 activate 先于停止——活服务继续
+    /// 访问已被替换的目录。`stop_workspace` 用源码 workspace 的稳定 origin
+    ///（.run 目录切换不影响归属解析）；`activate` 产出实际启动根。
+    pub async fn restart_dev_staged<F>(
+        &self,
+        project_id: &str,
+        stop_workspace: &Path,
+        launch: DevLaunch<'_>,
+        activate: F,
+    ) -> AppResult<StartedDev>
+    where
+        F: Future<Output = AppResult<PathBuf>>,
+    {
+        if project_id.starts_with("userapp:") {
+            if let Some(started) = self
+                .reuse_or_refuse_owner(
+                    project_id,
+                    stop_workspace,
+                    launch.hooks.clone(),
+                    launch.pg,
+                    None,
+                    launch.request_context,
+                )
+                .await?
+            {
+                return Ok(started);
+            }
+            self.stop_userapp_dev(project_id, stop_workspace).await?;
+        } else {
+            self.stop_dev(project_id).await?;
+        }
+        let run_root = activate.await?;
+        self.start_dev(
+            project_id,
+            &run_root,
+            launch.base_path,
+            launch.hooks,
+            launch.pg,
+            launch.request_context,
         )
         .await
     }
@@ -328,7 +383,7 @@ mod tests {
                     started_at: 0,
                     instance_id: None,
                     base_path: None,
-                    log_dir: std::path::PathBuf::from("/tmp/nonexistent-fs-test"),
+                    log_dir: PathBuf::from("/tmp/nonexistent-fs-test"),
                     temp_log_name: "ghost.log".to_string(),
                     external_owner: None,
                 },

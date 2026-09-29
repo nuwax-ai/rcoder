@@ -41,8 +41,23 @@ impl DevServerManager {
             }
 
             // 无 runtime identity：区分"legacy app-cli 应答"与"无人监听"——
-            // /v1/deploy/status 是 app-cli 专属路由（foreign 服务 404）
+            // /v1/deploy/status 是 app-cli 专属路由（foreign 服务 404）。
+            // DEV-1 §3.4：Legacy 只说明"不支持 runtime API"，不说明"没有
+            // 进程"。可核验的本项目 run（发现阶段 binding 匹配且未 Stopped）
+            // 交给停止路径收束（restart 的 stop 阶段同请求停止）；无法归属的
+            // 外来监听保持拒绝（不猜杀）。
             if legacy_app_cli_responds(&owner_addr).await {
+                let local_run_alive =
+                    crate::service::dev_server::discovery::discover_targets(project_path)
+                        .iter()
+                        .any(|target| target.snapshot.phase != runtime_supervisor::Phase::Stopped);
+                if local_run_alive {
+                    tracing::info!(
+                        project_id,
+                        "verified local run orchestrator without runtime API; routing through supervised stop",
+                    );
+                    return Ok(None);
+                }
                 return Err(AppError::business(
                     "admin port 3010 is held by a legacy app-cli process without the \
                      runtime API; stop it before starting a managed instance",

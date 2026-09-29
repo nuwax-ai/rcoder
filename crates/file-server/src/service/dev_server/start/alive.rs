@@ -59,8 +59,14 @@ impl DevServerManager {
 }
 
 /// legacy app-cli 探测：/v1/deploy/status 是 app-cli 专属路由——200 且
-/// 响应含 protocol_version 即为 app-cli 管理面（legacy 或 serve 形态）；
-/// foreign 服务 404/异构 body → false。
+/// 响应 data 信封内含 protocol_version 即为 app-cli 管理面（legacy 或
+/// serve 形态）；foreign 服务 404/异构 body → false。
+///
+/// DEV-1 R2（app 211 事故根因之一）：真实 wire 是
+/// `{"success":..,"code":"0000","data":{"protocol_version":4,..}}`——
+/// protocol_version 嵌在 `data` 里；旧实现只查顶层导致活着的 run 被漏识别
+/// （复用返回 Ok(None)、Legacy 分类失效）。无历史依据表明顶层裸值曾是
+/// 真实契约，只支持已证实的 data 信封。
 pub(crate) async fn legacy_app_cli_responds(address: &str) -> bool {
     let url = format!("http://{address}/v1/deploy/status");
     let Ok(client) = reqwest::Client::builder()
@@ -79,5 +85,9 @@ pub(crate) async fn legacy_app_cli_responds(address: &str) -> bool {
     response
         .json::<serde_json::Value>()
         .await
-        .is_ok_and(|body| body.get("protocol_version").is_some())
+        .is_ok_and(|body| {
+            body.get("data")
+                .and_then(|data| data.get("protocol_version"))
+                .is_some()
+        })
 }

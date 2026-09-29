@@ -1,3 +1,4 @@
+use super::manifest::platform_launch_env;
 use super::*;
 
 // These two environment-injection tests execute a POSIX shell fixture.
@@ -49,6 +50,85 @@ mod cases {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("fake orchestrator env dump not written: {}", dump.display());
+    }
+
+    /// R1（DEV-1 Fix A 事故锚点 app 211）：平台身份指向本项目时
+    /// PROJECT_ID/APP_CLI_STATE_ROOT 必须透传编排子进程（原 env_clear 白名单
+    /// 缺这两键 → 子进程 standalone registry 段与父进程平台根分岔）。
+    /// 纯函数反例覆盖三种身份组合；接线用默认进程 env（无平台变量）验证
+    /// standalone 不注入。
+    #[test]
+    fn platform_launch_env_decides_passthrough_by_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("211");
+        std::fs::create_dir_all(&ws).unwrap();
+        let state_root = dir.path().join("state").join("211");
+
+        // 匹配：两键透传 + 根返回。
+        let mut extra = Vec::new();
+        let root = platform_launch_env(
+            Some(std::ffi::OsStr::new("211")),
+            Some(state_root.as_os_str()),
+            &ws,
+            &mut extra,
+        );
+        assert_eq!(root.as_deref(), Some(state_root.as_path()));
+        assert!(extra.contains(&("PROJECT_ID".into(), "211".into())));
+        assert!(extra.contains(&(
+            "APP_CLI_STATE_ROOT".into(),
+            state_root.display().to_string()
+        )));
+
+        // 不匹配：完全不注入（standalone 语义）。
+        let mut extra = Vec::new();
+        let root = platform_launch_env(
+            Some(std::ffi::OsStr::new("other-app")),
+            Some(state_root.as_os_str()),
+            &ws,
+            &mut extra,
+        );
+        assert!(root.is_none());
+        assert!(extra.is_empty(), "mismatched identity must forward nothing");
+
+        // 无平台变量：standalone。
+        let mut extra = Vec::new();
+        let root = platform_launch_env(None, None, &ws, &mut extra);
+        assert!(root.is_none());
+        assert!(extra.is_empty());
+
+        // 匹配但无显式根：仍透传 PROJECT_ID（identity 连续性），根为 None。
+        let mut extra = Vec::new();
+        let root = platform_launch_env(Some(std::ffi::OsStr::new("211")), None, &ws, &mut extra);
+        assert!(root.is_none());
+        assert!(extra.contains(&("PROJECT_ID".into(), "211".into())));
+    }
+
+    /// R1 接线（真实 spawn）：测试进程无平台变量（standalone）时编排子进程
+    /// env 不含 PROJECT_ID——与 platform_launch_env 决策一致的端到端锚点。
+    #[tokio::test]
+    async fn start_dev_manifest_standalone_env_has_no_platform_identity() {
+        if std::env::var_os("PROJECT_ID").is_some() {
+            // 宿主环境带平台变量时跳过（避免与决策函数的匹配分支耦合）。
+            return;
+        }
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+        std::fs::write(ws.path().join("workspace.manifest.toml"), "").expect("marker");
+        let dir = tempfile::tempdir().expect("harness tempdir");
+        let (dump, script) = fake_orchestrator(dir.path());
+        let manager = manager_with(&script, &dir.path().join("logs"));
+        manager
+            .start_dev("standalone-env-test", ws.path(), None, None, None, None)
+            .await
+            .expect("start manifest dev");
+        let env_txt = wait_dump(&dump).await;
+        assert!(
+            !env_txt.lines().any(|l| l.starts_with("PROJECT_ID=")),
+            "standalone spawn must not receive platform identity:\n{env_txt}"
+        );
+        manager
+            .stop_dev("standalone-env-test")
+            .await
+            .expect("stop dev");
     }
 
     /// pg 凭据注入：start_dev_manifest(Some) 必须把 POSTGRES_USER/PASSWORD
@@ -151,11 +231,21 @@ mod owner_reuse_tests {
             "no responder must fall through to spawn"
         );
 
-        // ② legacy app-cli 应答（仅 /v1/deploy/status）
+        // ② legacy app-cli 应答（仅 /v1/deploy/status，真实 wire 信封：
+        // HttpResult 外壳 + data 内嵌 protocol_version——R2 事故锚点：顶层
+        // 裸值曾被误当契约）
+        #[derive(serde::Serialize)]
+        struct LegacyDeployStatus {
+            protocol_version: u32,
+            phase: &'static str,
+        }
         let legacy = axum::Router::new().route(
             "/v1/deploy/status",
             axum::routing::get(|| async {
-                axum::Json(serde_json::json!({"protocol_version": 4, "phase": "running"}))
+                axum::Json(shared_types::HttpResult::success(LegacyDeployStatus {
+                    protocol_version: 4,
+                    phase: "running",
+                }))
             }),
         );
         let legacy_mock = serve_mock(legacy).await;

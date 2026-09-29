@@ -21,6 +21,9 @@ use crate::models::{
     UserappDevProcess, UserappDevStopped, UserappDevTaskCreated, UserappFrameworkDetection,
     UserappFrameworkInfo, UserappFrameworkInfoQuery, UserappServiceFrameworkInfo,
 };
+use std::future::Future;
+use std::path::PathBuf;
+
 use file_server::error::AppError;
 use file_server::models::DevProcess;
 use file_server::service::dev_server::StoppedDev;
@@ -498,12 +501,20 @@ async fn spawn_dev_task(
                 };
                 if !task_clone
                     .commit_start(&lifecycle, generation, async {
-                        let run_root = match prepared {
-                            Some(prepared) => prepared.activate()?,
-                            None => crate::service::userapp::dev_mode::ensure_dev_lock(&ws).await?,
-                        };
+                        // DEV-1 §3.5：确认旧执行停止 → 复核任务代次/取消
+                        //（commit_start 边界）→ **此时**切换运行目录 → 启动。
+                        // 制品态旧顺序是 activate 先于停止——活服务继续访问
+                        // 已被替换的目录。停止与归属解析用源码 workspace 的
+                        // 稳定 origin；Start 无旧执行，直接激活启动。
                         match action {
                             DevTaskAction::Start => {
+                                let run_root = match prepared {
+                                    Some(prepared) => prepared.activate()?,
+                                    None => {
+                                        crate::service::userapp::dev_mode::ensure_dev_lock(&ws)
+                                            .await?
+                                    }
+                                };
                                 state
                                     .fs
                                     .dev_server
@@ -518,16 +529,39 @@ async fn spawn_dev_task(
                                     .await?;
                             }
                             DevTaskAction::Restart => {
+                                // 激活夹在"确认旧执行停止"与"启动"之间（staged）。
+                                // prepared 按值捕获进盒装 future；源码态激活是
+                                // ensure_dev_lock（幂等重锁）。
+                                // 激活必须惰性：夹在"确认旧执行停止"与"启动"
+                                // 之间执行（restart_dev_staged 内 await）。
+                                let run_root: std::pin::Pin<
+                                    Box<
+                                        dyn Future<
+                                                Output = Result<PathBuf, AppError>,
+                                            > + Send
+                                            + '_,
+                                    >,
+                                > = match prepared {
+                                    Some(prepared) => {
+                                        Box::pin(async move { prepared.activate() })
+                                    }
+                                    None => Box::pin(
+                                        crate::service::userapp::dev_mode::ensure_dev_lock(&ws),
+                                    ),
+                                };
                                 state
                                     .fs
                                     .dev_server
-                                    .restart_dev(
+                                    .restart_dev_staged(
                                         &key,
-                                        &run_root,
-                                        base_path.as_deref(),
-                                        Some(hooks.clone()),
-                                        pg.as_ref(),
-                                        Some(&task_clone.id),
+                                        &ws,
+                                        file_server::service::dev_server::DevLaunch {
+                                            base_path: base_path.as_deref(),
+                                            hooks: Some(hooks.clone()),
+                                            pg: pg.as_ref(),
+                                            request_context: Some(&task_clone.id),
+                                        },
+                                        run_root,
                                     )
                                     .await?;
                             }

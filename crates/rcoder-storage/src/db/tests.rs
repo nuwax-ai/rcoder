@@ -330,27 +330,103 @@ async fn old_database_bytes_are_never_opened_by_downgraded_engine() {
     assert!(!path.with_extension("db.rcoder-format").exists());
 }
 
+/// DB-1 §4.3-1：panic 冻结期间已受理的 B/C 在恢复成功后**各执行一次**并
+/// 读回真实结果；panic 的 A 保持 OutcomeUnknown（不自动重放原事务）。
+/// 反例锚点：原实现排空检查用 try_recv——不消费探测做不到，每次冻结周期
+/// 直接丢弃一个已受理任务，其调用方无端收到 OutcomeUnknown。
 #[tokio::test]
-async fn task_panic_is_unknown_and_every_shutdown_reports_failure() {
-    let (owner, dropped) = owner().await;
-    let failed = owner
-        .execute::<(), _, _>(|_| async { panic!("injected task panic") })
-        .await;
+async fn panic_recovery_serves_admitted_backlog_once_and_panicked_stays_unknown() {
+    let (owner, dropped) = owner_with_inflight(1).await;
+
+    // A 占住唯一 inflight 槽，等爆炸信号（屏障控制时序，不靠 sleep）。
+    let (entered, started) = oneshot::channel();
+    let (boom, boomed) = oneshot::channel::<()>();
+    let a = tokio::spawn({
+        let owner = owner.clone();
+        async move {
+            owner
+                .execute::<(), _, _>(|_db| async move {
+                    entered.send(()).unwrap();
+                    boomed.await.unwrap();
+                    panic!("injected task panic");
+                })
+                .await
+        }
+    });
+    started.await.unwrap();
+
+    // A 在途期间受理 B/C（准入仍 Open——A 尚未 panic）。
+    let b = tokio::spawn({
+        let owner = owner.clone();
+        async move {
+            owner
+                .execute(|mut db| async move {
+                    Probe::create()
+                        .id(21)
+                        .revision(0)
+                        .value("B")
+                        .exec(&mut db)
+                        .await?;
+                    Ok(Probe::get_by_id(&mut db, 21).await?.value)
+                })
+                .await
+        }
+    });
+    let c = tokio::spawn({
+        let owner = owner.clone();
+        async move {
+            owner
+                .execute(|mut db| async move {
+                    Probe::create()
+                        .id(22)
+                        .revision(0)
+                        .value("C")
+                        .exec(&mut db)
+                        .await?;
+                    Ok(Probe::get_by_id(&mut db, 22).await?.value)
+                })
+                .await
+        }
+    });
+
+    boom.send(()).unwrap();
+    let a_error = a
+        .await
+        .unwrap()
+        .expect_err("panicking caller must receive an error");
     assert!(
-        failed
-            .unwrap_err()
-            .downcast_ref::<super::owner::OutcomeUnknown>()
-            .is_some()
+        a_error.to_string().contains("outcome is unknown"),
+        "panicked caller keeps OutcomeUnknown: {a_error:#}"
     );
-    assert!(
-        owner.execute(|_| async { Ok(()) }).await.is_err(),
-        "Panic must close admission before notifying the caller"
-    );
-    let (left, right) = tokio::join!(owner.shutdown(), owner.shutdown());
-    assert!(left.is_err() && right.is_err());
-    assert!(owner.shutdown().await.is_err());
+
+    // 恢复后 B/C 各执行一次；读回真实写入值。
+    assert_eq!(b.await.unwrap().unwrap(), "B");
+    assert_eq!(c.await.unwrap().unwrap(), "C");
+
+    owner.shutdown().await.unwrap();
     assert!(dropped.load(Ordering::SeqCst));
-    assert!(owner.execute(|_| async { Ok(()) }).await.is_err());
+}
+
+/// DB-1 §4.3-3：恢复中最后 owner drop 不泄漏——恢复循环观察到 channel
+/// 关闭（is_closed + is_empty，不消费元素）即排空退出、资源释放。
+#[tokio::test]
+async fn last_owner_drop_during_frozen_recovery_releases_resource() {
+    let (owner, dropped) = owner().await;
+    let panicked = owner
+        .execute::<(), _, _>(|_db| async move { panic!("boom during freeze") })
+        .await
+        .unwrap_err();
+    assert!(panicked.to_string().contains("outcome is unknown"));
+
+    drop(owner);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !dropped.load(Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "resource must be released after last owner drop during recovery"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]

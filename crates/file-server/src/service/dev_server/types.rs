@@ -81,6 +81,63 @@ pub(crate) struct ExternalStopRecord {
     pub submitted_at_ms: u64,
 }
 
+/// 本地 spawn 的启动身份（DEV-1 §3.1）：spawn 与停止/迟到清理共用同一
+/// launch_id，登记收束按捕获身份 compare-and-remove，不按 project_id 盲清。
+#[derive(Debug, Clone)]
+pub(crate) struct LocalLaunch {
+    pub launch_id: String,
+    /// 平台根透传时的确定根（stop 优先使用）；standalone spawn 为 None
+    ///（发现阶段经 registry 候选覆盖）。
+    pub state_root: Option<std::path::PathBuf>,
+}
+
+/// 可续查的本地监督停止（DEV-1 §3.3）：第一次 Stop 写入前固定请求身份，
+/// 超时/丢回复按同一请求续行；确认完成后按 attempt 身份收束。
+/// 不含 token/凭据/命令环境，可安全持久化。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LocalStopRecord {
+    pub state_root: String,
+    pub binding_component: String,
+    pub binding_resource: String,
+    pub request_id: String,
+    pub expected_generation: Option<String>,
+    pub captured_supervisor_id: Option<String>,
+    pub captured_generation: Option<String>,
+}
+
+impl LocalStopRecord {
+    /// 从可保留 attempt 构造（持久化形态）。
+    pub(crate) fn from_attempt(attempt: &runtime_supervisor::StopWorkAttempt) -> Self {
+        Self {
+            state_root: attempt.root.display().to_string(),
+            binding_component: attempt.binding.component.clone(),
+            binding_resource: attempt.binding.resource.display().to_string(),
+            request_id: attempt.request.request_id.clone(),
+            expected_generation: attempt.request.expected_generation.clone(),
+            captured_supervisor_id: attempt.captured_supervisor_id.clone(),
+            captured_generation: attempt.captured_generation.clone(),
+        }
+    }
+
+    /// 重建可续查 attempt（file-server 重启后按原请求身份续行）。
+    pub(crate) fn to_attempt(&self) -> anyhow::Result<runtime_supervisor::StopWorkAttempt> {
+        use runtime_supervisor::{Action, Request};
+        let mut request = Request::new(Action::StopWork);
+        request.request_id = self.request_id.clone();
+        request.expected_generation = self.expected_generation.clone();
+        Ok(runtime_supervisor::StopWorkAttempt {
+            root: std::path::PathBuf::from(&self.state_root),
+            binding: runtime_supervisor::Binding {
+                component: self.binding_component.clone(),
+                resource: std::path::PathBuf::from(&self.binding_resource),
+            },
+            captured_supervisor_id: self.captured_supervisor_id.clone(),
+            captured_generation: self.captured_generation.clone(),
+            request,
+        })
+    }
+}
+
 /// 构建前 owner 观察结果（R07 三态：捕获/确认无 owner/观察失败）。
 #[derive(Debug, Clone)]
 pub(crate) enum OwnerExpectation {
@@ -123,6 +180,11 @@ pub struct DevServerManager {
     /// 在途/最近的外部 owner 停止操作（R05）：确认 Succeeded 前保留——
     /// 重试按原 operation_id 查询（幂等），不重复提交。
     pub(super) external_stops: Mutex<HashMap<String, ExternalStopRecord>>,
+    /// 本地 spawn 启动身份（DEV-1 §3.1）：key=project_id。
+    pub(super) launches: Mutex<HashMap<String, LocalLaunch>>,
+    /// 在途的本地监督停止（DEV-1 §3.3）：key=`{project_id}|{state_root}`——
+    /// 同一目标只保留一个可续查 attempt，确认完成即移除。
+    pub(super) local_stops: Mutex<HashMap<String, runtime_supervisor::StopWorkAttempt>>,
     pub(super) port_pool: PortPool,
     pub(super) config: Arc<Config>,
 }
@@ -144,6 +206,8 @@ impl DevServerManager {
             cleanup_state: Arc::new(Mutex::new(HashMap::new())),
             owner_expectations: Mutex::new(HashMap::new()),
             external_stops: Mutex::new(HashMap::new()),
+            launches: Mutex::new(HashMap::new()),
+            local_stops: Mutex::new(HashMap::new()),
             port_pool: pool,
             config,
         };
@@ -190,6 +254,19 @@ impl DevServerManager {
         if let Ok(mut stops) = self.external_stops.lock() {
             for (key, record) in state.stops {
                 stops.insert(key, record);
+            }
+        }
+        // DEV-1 §3.3：恢复可续查的本地监督停止（同请求续行，不新建身份）。
+        if let Ok(mut local_stops) = self.local_stops.lock() {
+            for (key, record) in state.local_stops {
+                match record.to_attempt() {
+                    Ok(attempt) => {
+                        local_stops.insert(key, attempt);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%key, %error, "persisted local stop record unreadable")
+                    }
+                }
             }
         }
         tracing::info!("restored persisted external owner state");

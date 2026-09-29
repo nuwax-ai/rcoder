@@ -3,9 +3,11 @@
 //! A queued job is a complete business transaction, not an individual SQL statement.
 //! Cancelling its caller drops only the reply receiver. User shutdown rejects
 //! admission, drains every accepted job, drops the database and its runtime, then
-//! joins the owning thread before publishing a shared shutdown result. (When a
-//! panic has already frozen intake, the still-queued backlog cannot be served;
-//! it is dropped and those callers see OutcomeUnknown instead.)
+//! joins the owning thread before publishing a shared shutdown result. When a
+//! panic has frozen intake, already-admitted backlog jobs are **served exactly
+//! once** after a successful recovery probe (only the panicked job's own caller
+//! sees OutcomeUnknown — it is never replayed); if shutdown wins the recovery
+//! race, the backlog is dropped and those callers see OutcomeUnknown instead.
 //!
 //! A panicking task (for example toasty 0.10.0's connection-channel
 //! `unwrap` on a transient backend blip) reports `OutcomeUnknown` to its own
@@ -28,6 +30,9 @@ type Completion = Option<Result<(), String>>;
 
 /// Backoff between failed reopen probes while the database stays unreachable.
 const REOPEN_PROBE_BACKOFF: Duration = Duration::from_secs(1);
+/// 单次探活预算：悬挂连接（永不返回的 BEGIN/COMMIT）按次放弃退避重试，
+/// 不拖死整个恢复循环（DB-1 §4.2）。
+const SINGLE_PROBE_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub(crate) struct DatabaseOwner {
@@ -40,9 +45,72 @@ pub(crate) struct DatabaseOwner {
 /// 所有调用方 drop 后队列永不关闭，owner 永不退出（资源泄漏——契约
 /// `last_owner_drop_drains_accepted_job_and_releases_resource` 锁定的语义）。
 struct Shared {
-    closing: Mutex<bool>,
+    admission: Mutex<Admission>,
     stop: watch::Sender<bool>,
     completion: watch::Receiver<Completion>,
+}
+
+/// 准入状态机（DB-1）：`Open -> Recovering -> Open`；`Open/Recovering ->
+/// Closing`；`Closing` 不可被恢复探活改回（shutdown 与恢复提交共享同一
+/// 同步边界）。这是本进程数据库 worker 的内部同步，不是业务准入或多副本锁。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    Open,
+    Recovering,
+    Closing,
+}
+
+impl Shared {
+    /// Open→Recovering（panic 冻结）；已在 Closing 则不覆盖。
+    fn mark_recovering_if_open(&self) -> bool {
+        match self.admission.lock() {
+            Ok(mut admission) => {
+                if matches!(*admission, Admission::Open) {
+                    *admission = Admission::Recovering;
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(poisoned) => {
+                *poisoned.into_inner() = Admission::Closing;
+                false
+            }
+        }
+    }
+
+    /// 任意态→Closing（shutdown 不可撤销）。
+    fn begin_closing(&self) {
+        match self.admission.lock() {
+            Ok(mut admission) => *admission = Admission::Closing,
+            Err(poisoned) => *poisoned.into_inner() = Admission::Closing,
+        }
+    }
+
+    /// Recovering→Open（探活成功提交重开）；Closing 拒绝——shutdown 优先。
+    fn reopen_if_recovering(&self) -> bool {
+        match self.admission.lock() {
+            Ok(mut admission) => {
+                if matches!(*admission, Admission::Recovering) {
+                    *admission = Admission::Open;
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(poisoned) => {
+                *poisoned.into_inner() = Admission::Closing;
+                false
+            }
+        }
+    }
+
+    fn admission_open(&self) -> bool {
+        matches!(
+            self.admission.lock().map(|a| *a),
+            Ok(Admission::Open) | Err(_)
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -66,7 +134,7 @@ impl DatabaseOwner {
         Self {
             queue,
             inner: Arc::new(Shared {
-                closing: Mutex::new(true),
+                admission: Mutex::new(Admission::Closing),
                 stop,
                 completion,
             }),
@@ -93,7 +161,7 @@ impl DatabaseOwner {
         let (finished, completion) = watch::channel(None);
         let (ready, initialized) = oneshot::channel();
         let shared = Arc::new(Shared {
-            closing: Mutex::new(false),
+            admission: Mutex::new(Admission::Open),
             stop: stop.clone(),
             completion: completion.clone(),
         });
@@ -183,10 +251,9 @@ impl DatabaseOwner {
                     // owner observes this task's completion. Freezing is not
                     // terminal: the owner drains, probes the pool, and
                     // reopens if a fresh connection is available. User
-                    // shutdown remains the only permanent stop.
-                    if let Ok(mut closing) = shared.closing.lock() {
-                        *closing = true;
-                    }
+                    // shutdown remains the only permanent stop (Closing is
+                    // never reopened by a probe).
+                    shared.mark_recovering_if_open();
                 }
                 drop(reply.send(outcome.unwrap_or_else(|_| Err(OutcomeUnknown.into()))));
                 anyhow::ensure!(
@@ -197,12 +264,10 @@ impl DatabaseOwner {
             })
         });
         {
-            let closing = self
-                .inner
-                .closing
-                .lock()
-                .map_err(|_| anyhow::anyhow!("database admission lock poisoned"))?;
-            anyhow::ensure!(!*closing, "database is closing; job was not admitted");
+            anyhow::ensure!(
+                self.inner.admission_open(),
+                "database is closing; job was not admitted"
+            );
             self.queue.try_send(job).map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => {
                     anyhow::anyhow!("database queue is full; job was not admitted")
@@ -218,15 +283,9 @@ impl DatabaseOwner {
     }
 
     pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
-        {
-            let mut closing = self
-                .inner
-                .closing
-                .lock()
-                .map_err(|_| anyhow::anyhow!("database admission lock poisoned"))?;
-            *closing = true;
-            self.inner.stop.send_replace(true);
-        }
+        // Closing 不可撤销：与恢复提交共享同一准入锁，探活成功不能覆盖。
+        self.inner.begin_closing();
+        self.inner.stop.send_replace(true);
         wait_for_completion(self.inner.completion.clone()).await
     }
 }
@@ -295,22 +354,28 @@ async fn supervise(
         }
         // Drain complete after a failure: probe the pool for recovery.
         if intake_paused && tasks.is_empty() {
-            // 冻结中所有调用方已放弃（sender 全 drop）：恢复无人等待，
-            // 排空退出（未恢复的失败经 pending_failure 如实上报）。
-            if matches!(
-                queue.try_recv(),
-                Err(mpsc::error::TryRecvError::Disconnected)
-            ) {
+            // 不消费元素的排空检查（DB-1：try_recv 会把已受理任务直接丢弃
+            // ——每次冻结周期牺牲一个 job，其调用方无端 OutcomeUnknown）。
+            // is_closed = 全部 sender 已 drop（last-drop 语义）；is_empty
+            // 确认无已受理积压——两者缺一不可：关闭后可能仍有待执行 backlog。
+            if queue.is_closed() && queue.is_empty() {
                 queue_drained = true;
                 continue;
             }
             match reopen_probe(&db, &mut stop).await {
                 Reopen::Reopened => {
-                    if let Ok(mut closing) = shared.closing.lock() {
-                        *closing = false;
+                    // 状态机提交重开：Closing（shutdown 已受理）拒绝——停机
+                    // 优先，恢复探活不得覆盖关闭意图。
+                    if shared.reopen_if_recovering() {
+                        intake_paused = false;
+                        pending_failure = None;
+                    } else {
+                        // 已 Closing：与 UserStopped 同收束——积压丢弃
+                        //（调用方收 OutcomeUnknown），排空退出。
+                        queue.close();
+                        while queue.try_recv().is_ok() {}
+                        queue_drained = true;
                     }
-                    intake_paused = false;
-                    pending_failure = None;
                 }
                 Reopen::UserStopped => {
                     // User stop wins over recovery: the frozen owner must not
@@ -351,12 +416,47 @@ async fn reopen_probe(db: &toasty::Db, stop: &mut watch::Receiver<bool>) -> Reop
         // 走 Connection 提交路径，僵尸连接在此暴露。探活必须 spawn 隔离：
         // 官方 0.10.0 的 unwrap panic 若直接 await 会沿栈杀死 supervise
         // （owner 永久终局），JoinHandle 只暴露 JoinError。
+        //
+        // DB-1：单次探活有界（悬挂连接不拖死等待方）；等待探活时响应
+        // shutdown；取消探针后 await 收束其 task（不丢句柄让探针后台裸跑）。
+        // 只取消恢复探针，不中止已执行的业务事务——job 的取消语义不由此推导。
         let mut probe_db = db.clone();
-        let probe = tokio::spawn(async move {
+        let mut probe = tokio::spawn(async move {
             let tx = probe_db.transaction().await?;
             tx.commit().await
         });
-        match probe.await {
+        let outcome = tokio::select! {
+            biased;
+            _ = stop.changed() => {
+                probe.abort();
+                let joined = probe.await;
+                debug_assert!(joined.is_err(), "aborted probe must join cancelled");
+                if *stop.borrow() {
+                    return Reopen::UserStopped;
+                }
+                continue;
+            }
+            _ = tokio::time::sleep(SINGLE_PROBE_BUDGET) => {
+                probe.abort();
+                let joined = probe.await;
+                debug_assert!(joined.is_err(), "aborted probe must join cancelled");
+                tracing::warn!(
+                    "database reopen probe exceeded its budget; retrying with backoff"
+                );
+                tokio::select! {
+                    biased;
+                    _ = stop.changed() => {
+                        if *stop.borrow() {
+                            return Reopen::UserStopped;
+                        }
+                    }
+                    _ = tokio::time::sleep(REOPEN_PROBE_BACKOFF) => {}
+                }
+                continue;
+            }
+            probed = &mut probe => probed,
+        };
+        match outcome {
             Ok(Ok(())) => return Reopen::Reopened,
             Ok(Err(error)) => {
                 tracing::warn!(%error, "database reopen probe statement failed; retrying");
@@ -377,5 +477,50 @@ async fn reopen_probe(db: &toasty::Db, stop: &mut watch::Receiver<bool>) -> Reop
             }
             _ = tokio::time::sleep(REOPEN_PROBE_BACKOFF) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    fn shared() -> Shared {
+        let (stop, _) = watch::channel(false);
+        let (_, completion) = watch::channel(None);
+        Shared {
+            admission: Mutex::new(Admission::Open),
+            stop,
+            completion,
+        }
+    }
+
+    /// DB-1 §4.3-2：恢复探活成功提交重开时若 shutdown 已受理（Closing），
+    /// 重开必须被拒——关闭意图不可被覆盖。
+    #[test]
+    fn closing_wins_over_recovery_reopen() {
+        let state = shared();
+        assert!(state.mark_recovering_if_open(), "Open -> Recovering");
+        state.begin_closing();
+        assert!(!state.reopen_if_recovering(), "Closing must not reopen");
+        assert!(!state.admission_open());
+    }
+
+    /// panic 冻结不得覆盖已受理的 Closing。
+    #[test]
+    fn panic_during_closing_keeps_closing() {
+        let state = shared();
+        state.begin_closing();
+        assert!(!state.mark_recovering_if_open());
+        assert!(!state.admission_open());
+    }
+
+    /// 正常恢复周期：Open → Recovering → Open。
+    #[test]
+    fn normal_reopen_cycle() {
+        let state = shared();
+        assert!(state.mark_recovering_if_open());
+        assert!(!state.admission_open(), "frozen admission rejects");
+        assert!(state.reopen_if_recovering());
+        assert!(state.admission_open());
     }
 }

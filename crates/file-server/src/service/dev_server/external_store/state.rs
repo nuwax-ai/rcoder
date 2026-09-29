@@ -36,6 +36,9 @@ pub(crate) struct State {
     /// Retired transport registrations, not invented terminal operation results.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(super) retired: HashMap<String, serde_json::Value>,
+    /// DEV-1 §3.3：可续查的本地监督停止（加性字段；不含凭据）。
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) local_stops: HashMap<String, crate::service::dev_server::types::LocalStopRecord>,
 }
 
 impl State {

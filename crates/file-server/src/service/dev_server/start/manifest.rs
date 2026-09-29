@@ -1,4 +1,5 @@
 use super::*;
+use crate::service::dev_server::discovery;
 
 impl DevServerManager {
     /// Userapp workspace 的 dev 启动（app-cli 引擎）：spawn 常驻 `app-cli run
@@ -25,6 +26,17 @@ impl DevServerManager {
         {
             return Err(AppError::business(
                 "local orchestrator is already registered; readiness must be confirmed or an explicit restart requested",
+            ));
+        }
+        // DEV-1 §3.4：守卫扩展——除本地登记外，发现阶段的活监督目标同样阻止
+        // 全新 Start（Restart 经停止收束后到这里时登记与目标均已清净）。
+        // Legacy run 无 runtime API 可复用，越过守卫只会撞 3010 端口。
+        if discovery::discover_targets(project_path)
+            .iter()
+            .any(|target| target.snapshot.phase != runtime_supervisor::Phase::Stopped)
+        {
+            return Err(AppError::business(
+                "a local orchestrator for this project is still running; stop or restart it before starting a new one",
             ));
         }
         // P1-05：旧 supervised 停止后未确认清理（如进程组残留或 stdout 排空未完成）——
@@ -79,6 +91,17 @@ impl DevServerManager {
             env_extra.push(("POSTGRES_USER".to_string(), pg.username.clone()));
             env_extra.push(("POSTGRES_PASSWORD".to_string(), pg.password.clone()));
         }
+        // DEV-1 Fix A：平台身份/状态根透传——子编排器与父进程（file-server）
+        // 使用同一根与项目身份，消除 spawn 环境过滤造成的 standalone registry
+        // 段与平台根分岔（nuwax-k8s-test app 211 事故根因：stop 解析到平台根
+        // 的旧实例残留，活编排器在 registry 段根上毫发无损）。仅当平台身份
+        // 指向本项目时透传；桌面 standalone（无平台变量）保持原状。
+        let platform_state_root = platform_launch_env(
+            std::env::var_os("PROJECT_ID").as_deref(),
+            std::env::var_os("APP_CLI_STATE_ROOT").as_deref(),
+            project_path,
+            &mut env_extra,
+        );
         let (child, stdout, stderr) = process::spawn_dev(
             program,
             &[
@@ -122,19 +145,10 @@ impl DevServerManager {
             );
         }
 
-        // 早退检测 + 宽松就绪（pingap 按 [proxy] path 路由，根路径可能 404——
-        // HTTP 判不通但进程存活即通过）
-        self.poll_alive(
-            pid,
-            PINGAP_ENTRY_PORT,
-            None,
-            &stderr_ring,
-            &|port, _base, timeout_ms| {
-                Box::pin(process::is_project_alive(port, Some("/"), timeout_ms))
-            },
-        )
-        .await?;
-
+        // DEV-1 §3.1：spawn 已发生、探活未过的窗口先发表可捕获的 Starting
+        // 记录（launch 身份 + 进程登记）——并发 Stop 不得在此窗口看到"空
+        // 记录"而误判无目标；失败路径按同一身份自清，不补登记成运行成功。
+        let launch_id = uuid::Uuid::now_v7().simple().to_string();
         lock(&self.processes)?.insert(
             project_id.to_string(),
             DevProcess {
@@ -149,6 +163,36 @@ impl DevServerManager {
                 external_owner: None,
             },
         );
+        lock(&self.launches)?.insert(
+            project_id.to_string(),
+            super::super::types::LocalLaunch {
+                launch_id: launch_id.clone(),
+                state_root: platform_state_root,
+            },
+        );
+
+        // 早退检测 + 宽松就绪（pingap 按 [proxy] path 路由，根路径可能 404——
+        // HTTP 判不通但进程存活即通过）
+        if let Err(error) = self
+            .poll_alive(
+                pid,
+                PINGAP_ENTRY_PORT,
+                None,
+                &stderr_ring,
+                &|port, _base, timeout_ms| {
+                    Box::pin(process::is_project_alive(port, Some("/"), timeout_ms))
+                },
+            )
+            .await
+        {
+            // §3.1：探活失败清理自己刚创建的精确进程树与 Starting 登记
+            //（启动互斥锁在手，不存在更新的 launch 可被误伤）。
+            let _ = self.terminate_pid_group(pid).await;
+            lock(&self.processes)?.remove(project_id);
+            lock(&self.launches)?.remove(project_id);
+            return Err(error);
+        }
+
         lock(&self.supervised)?.insert(project_id.to_string(), supervised);
 
         Ok(StartedDev {
@@ -156,4 +200,47 @@ impl DevServerManager {
             port: PINGAP_ENTRY_PORT,
         })
     }
+}
+
+/// DEV-1 Fix A：平台身份 → 子进程 env 键的纯决策函数（无 env 读取，便于
+/// 反例测试）。身份匹配时透传 PROJECT_ID 与显式根（无根仍透传身份）；不
+/// 匹配/无平台变量返回 None（standalone 语义，registry 段继续生效）。
+pub(super) fn platform_launch_env(
+    project_id_env: Option<&std::ffi::OsStr>,
+    state_root_env: Option<&std::ffi::OsStr>,
+    project_path: &Path,
+    env_extra: &mut Vec<(String, String)>,
+) -> Option<std::path::PathBuf> {
+    let matches_project = project_id_env
+        .filter(|value| !value.is_empty())
+        .map(|project| {
+            runtime_state_layout::resolve_project_origin(project_path)
+                .ok()
+                .and_then(|origin| origin.file_name().map(|name| name == project))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if !matches_project {
+        return None;
+    }
+    let app_id = project_id_env
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    env_extra.push(("PROJECT_ID".to_string(), app_id));
+    let root = state_root_env
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string_lossy().to_string());
+    if let Some(root) = &root {
+        env_extra.push(("APP_CLI_STATE_ROOT".to_string(), root.clone()));
+    }
+    // 迁移回执连续性（§3.2 最小原则）：旧运行（无显式根）把回执放在
+    // workspace 父目录的共享目录；该目录存在时锁定旧物理位置，已完成
+    // 迁移不重跑、未确认迁移不被路径切换隐藏。不复制、不归属共享目录内容。
+    if root.is_some()
+        && let Some(old) = discovery::legacy_migration_receipts_dir(project_path)
+    {
+        env_extra.push(("APP_CLI_MIGRATION_RECEIPTS_DIR".to_string(), old));
+    }
+    root.map(std::path::PathBuf::from)
 }

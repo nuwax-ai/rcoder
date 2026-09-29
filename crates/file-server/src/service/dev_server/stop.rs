@@ -99,48 +99,33 @@ impl DevServerManager {
         })
     }
 
-    /// UserApp manifest 域的停止（R05）：**禁止 ps 扫描兜底**——managed 模式
-    /// 下登记缺失不授权 legacy 清理。
-    /// - 有 external 登记 → 经运行 API 停止（[`Self::stop_external_owner`]，
-    ///   幂等按原 operation_id 恢复）；
-    /// - 无登记但有 owner 应答 → 核验项目归属、读取控制凭据，持久化停止
-    ///   意图后通过 owner API 停止；身份不符则拒绝；
-    /// - 连接被拒绝或 identity 503（run 模式 app-cli 的
-    ///   ERR_PROTOCOL_UNSUPPORTED——无 runtime kernel，非 runtime owner）→
-    ///   无 owner，无登记时幂等成功；超时或其他协议错误不能当作已停止。
+    /// UserApp manifest 域的停止（R05 + DEV-1 §3.3/§3.4）：**禁止 ps 扫描兜底**
+    /// ——managed 模式下登记缺失不授权 legacy 清理。
+    /// - 有 external 登记 / owner 应答 → 经运行 API 停止（幂等按原
+    ///   operation_id 恢复）；
+    /// - 其余 → 本地目标收束：只读发现（平台根 + registry 段根）→ 同一
+    ///   请求停止（超时可续查，不再造第二个 Stop 自撞 Busy）→ 条件收束登记。
+    ///   503/拒连只说明"无 runtime owner 应答"，不说明"无进程"（app 211
+    ///   事故：Legacy run 活着却按"幂等成功"放行）。
     pub async fn stop_userapp_dev(
         &self,
         project_id: &str,
         project_path: &Path,
     ) -> AppResult<StoppedDev> {
-        let attempt = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            self.stop_userapp_dev_through_owner(project_id, project_path),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            Err(AppError::business(
-                "owner stop is still pending; using independent control",
-            ))
-        });
-        match attempt {
-            Ok(stopped) => Ok(stopped),
-            Err(original) => match self.stop_supervised_owner(project_id, project_path).await {
-                Ok(Some(stopped)) => Ok(stopped),
-                Ok(None) => Err(original),
-                Err(error) => Err(AppError::owner_error(
-                    &format!("owner stop failed: {original}; independent recovery"),
-                    error,
-                )),
-            },
+        if let Some(stopped) = self
+            .stop_userapp_dev_through_owner(project_id, project_path)
+            .await?
+        {
+            return Ok(stopped);
         }
+        self.stop_local_targets(project_id, project_path).await
     }
 
     async fn stop_userapp_dev_through_owner(
         &self,
         project_id: &str,
         project_path: &Path,
-    ) -> AppResult<StoppedDev> {
+    ) -> AppResult<Option<StoppedDev>> {
         self.check_external_store().map_err(|error| {
             AppError::business(format!("external owner recovery required: {error:#}"))
         })?;
@@ -185,7 +170,7 @@ impl DevServerManager {
                     }
                 }
             }
-            return self.stop_external_owner(project_id, &external).await;
+            return Ok(Some(self.stop_external_owner(project_id, &external).await?));
         }
         let owner_addr = recovered
             .map(|owner| owner.address)
@@ -210,32 +195,17 @@ impl DevServerManager {
             };
             // stop_external_owner persists registration AND the operation intent
             // before POST; unknown replies retain the same operation for recovery.
-            return self.stop_external_owner(project_id, &external).await;
+            return Ok(Some(self.stop_external_owner(project_id, &external).await?));
         }
-        // Legacy `run` has no runtime identity endpoint but may still own a
-        // supervised execution tree. Its absence is not a successful Stop.
-        if let Some(stopped) = self
-            .stop_supervised_owner(project_id, project_path)
-            .await
-            .map_err(|error| AppError::owner_error("independent owner stop", error))?
-        {
-            return Ok(stopped);
-        }
-        // 无 owner 应答：本地 spawn 登记（supervised）或无运行态都收束为无 external
-        // 停止；本地登记存在时仍走 stop_dev 的登记 pid 路径（ps 扫描跳过——
-        // managed 域不杀我们未 spawn 的进程）。
-        if snapshot.is_some() {
-            self.stop_registered_only(project_id).await
-        } else {
-            Ok(StoppedDev {
-                owner_stopped: false,
-                killed_pids: Vec::new(),
-            })
-        }
+        // 无 runtime owner 应答（含 run 模式的 ERR_PROTOCOL_UNSUPPORTED/拒连）：
+        // 只说明"无 owner API"，不说明"无进程"——Legacy run 可能仍活着
+        //（app 211 事故形态）。移交本地目标收束：只读发现候选根后逐个
+        // 同一请求停止，登记按捕获身份条件收束。
+        Ok(None)
     }
 
     /// 只停**登记的**本地 pid（managed 域：无 ps 扫描、无端口猜杀）。
-    async fn stop_registered_only(&self, project_id: &str) -> AppResult<StoppedDev> {
+    pub(super) async fn stop_registered_only(&self, project_id: &str) -> AppResult<StoppedDev> {
         let Some(proc) = lock(&self.processes)?.remove(project_id) else {
             return Ok(StoppedDev {
                 owner_stopped: false,
