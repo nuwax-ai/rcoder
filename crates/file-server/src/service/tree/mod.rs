@@ -859,8 +859,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(entries.len(), 1);
-        // 条目 name 相对 workspace 根 (非列表起点)
-        assert_eq!(entries[0].name, "sub/a.txt");
+        // 界内目录链接中段: 正常列出。条目 name 前缀是**字面**列表起点
+        // (relativePath=inside-dir → "inside-dir/a.txt", 与 TS 前缀回显一致,
+        // 不替换为解析后的真实路径 sub/)
+        assert_eq!(entries[0].name, "inside-dir/a.txt");
     }
 
     #[tokio::test]
