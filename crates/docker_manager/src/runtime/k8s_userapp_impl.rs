@@ -38,6 +38,13 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         self.exec_readiness(target).await
     }
 
+    async fn exec_userapp_dbx_readiness(
+        &self,
+        target: &container_runtime_api::UserAppReadinessTarget,
+    ) -> ContainerRuntimeResult<Option<container_runtime_api::ExecResult>> {
+        self.exec_dbx_readiness(target).await
+    }
+
     async fn cleanup_builder_restart_archive(
         &self,
         template: &shared_types::BuilderRestartTemplate,

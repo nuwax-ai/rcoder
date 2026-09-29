@@ -6,8 +6,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use bollard::models::{ContainerInspectResponse, ContainerStateStatusEnum as Status};
 use container_runtime_api::{
     ContainerRuntimeError as Error, ContainerRuntimeResult as Result, ExecResult,
-    USERAPP_READINESS_COMMAND, UserAppReadinessInstance, UserAppReadinessTarget,
-    UserAppRuntimeReadiness,
+    USERAPP_DBX_READINESS_COMMAND, USERAPP_READINESS_COMMAND, UserAppReadinessInstance,
+    UserAppReadinessTarget, UserAppRuntimeReadiness,
 };
 use shared_types::{ServiceType, UserAppNoComputeState as State, UserappStage};
 
@@ -53,6 +53,23 @@ impl DockerRuntime {
         &self,
         target: &UserAppReadinessTarget,
     ) -> Result<Option<ExecResult>> {
+        self.exec_readiness_command(target, &USERAPP_READINESS_COMMAND)
+            .await
+    }
+
+    pub(super) async fn exec_dbx_readiness(
+        &self,
+        target: &UserAppReadinessTarget,
+    ) -> Result<Option<ExecResult>> {
+        self.exec_readiness_command(target, &USERAPP_DBX_READINESS_COMMAND)
+            .await
+    }
+
+    async fn exec_readiness_command(
+        &self,
+        target: &UserAppReadinessTarget,
+        command: &[&str],
+    ) -> Result<Option<ExecResult>> {
         let UserAppReadinessInstance::Docker { container_id, .. } = &target.instance else {
             return Err(Error::ConfigurationError(
                 "Expected Docker readiness target".into(),
@@ -66,10 +83,7 @@ impl DockerRuntime {
         let result = super::docker_app_runtime::execute_container_command(
             self.inner.get_docker_client(),
             container_id,
-            USERAPP_READINESS_COMMAND
-                .iter()
-                .map(|arg| (*arg).to_owned())
-                .collect(),
+            command.iter().map(|arg| (*arg).to_owned()).collect(),
         )
         .await;
         // A concurrent stop/removal is an observation change, not a query-system
@@ -138,11 +152,24 @@ fn from_inspect(
         .ok()
         .filter(|ip| !ip.is_unspecified())
         .map(|ip| SocketAddr::new(ip, shared_types::APP_CLI_ADMIN_PORT));
-    let published_address = info
-        .network_settings
+    UserAppRuntimeReadiness::Running(Box::new(UserAppReadinessTarget {
+        app_id: app_id.into(),
+        stage,
+        instance: UserAppReadinessInstance::Docker {
+            container_id: id.clone(),
+            started_at: state.started_at.clone(),
+        },
+        address,
+        published_address: published_address(info, shared_types::APP_CLI_ADMIN_PORT),
+        dbx_published_address: published_address(info, shared_types::DBX_PORT),
+    }))
+}
+
+fn published_address(info: &ContainerInspectResponse, container_port: u16) -> Option<SocketAddr> {
+    info.network_settings
         .as_ref()
         .and_then(|network| network.ports.as_ref())
-        .and_then(|ports| ports.get(&format!("{}/tcp", shared_types::APP_CLI_ADMIN_PORT)))
+        .and_then(|ports| ports.get(&format!("{container_port}/tcp")))
         .and_then(Option::as_ref)
         .and_then(|bindings| {
             bindings.iter().find_map(|binding| {
@@ -164,17 +191,7 @@ fn from_inspect(
                 };
                 Some(SocketAddr::new(ip, port))
             })
-        });
-    UserAppRuntimeReadiness::Running(Box::new(UserAppReadinessTarget {
-        app_id: app_id.into(),
-        stage,
-        instance: UserAppReadinessInstance::Docker {
-            container_id: id.clone(),
-            started_at: state.started_at.clone(),
-        },
-        address,
-        published_address,
-    }))
+        })
 }
 
 #[cfg(test)]
@@ -188,7 +205,8 @@ mod tests {
             "State":{"Status":"exited","Running":false,"ExitCode":0},
             "HostConfig":{"NetworkMode":"app-network"},
             "NetworkSettings":{"Networks":{"app-network":{"IPAddress":"172.21.0.5"}},
-                "Ports":{"3010/tcp":[{"HostIp":"0.0.0.0","HostPort":"33010"}]}}
+                "Ports":{"3010/tcp":[{"HostIp":"0.0.0.0","HostPort":"33010"}],
+                    "4224/tcp":[{"HostIp":"::","HostPort":"34224"}]}}
         });
         // Use the actual service type wire name, not a duplicated test convention.
         object["Config"]["Labels"]["service-type"] = ServiceType::UserappBuilder.to_string().into();
@@ -218,6 +236,10 @@ mod tests {
         assert_eq!(
             target.published_address.unwrap().to_string(),
             "127.0.0.1:33010"
+        );
+        assert_eq!(
+            target.dbx_published_address.unwrap().to_string(),
+            "[::1]:34224"
         );
         assert_eq!(
             from_inspect("194", UserappStage::Prod, &info),

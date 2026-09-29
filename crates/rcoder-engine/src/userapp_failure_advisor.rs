@@ -1,11 +1,12 @@
 //! UserApp 代理失败诊断顾问（engine 实现：就绪 reader 的失败路径浓缩视图）。
 //!
 //! 失败出口不能每个请求都打 app-cli 管理面——这里做 30s TTL 的 per-app
-//! 短缓存 + 单飞行合并：错误风暴只穿透一次观察；缓存值附带观察时间，
-//! Stop/换代由 reader 的换代检测保证不沿用陈旧 ready（观察本身带
-//! observation_revision 复核）。缓存只在失败路径填充，无故障流量零开销。
+//! 短缓存 + 单飞行合并：错误风暴只穿透一次观察。reader 核验观察时的
+//! 实例身份；缓存提示最多延迟 30s，不作为当前运行态或控制操作的依据。
+//! 缓存只在失败路径填充，无故障流量零开销。
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,24 @@ const HINT_TTL: Duration = Duration::from_secs(30);
 /// 单次观察预算上限（失败路径诊断绝不拖长代理等待）。
 const ADVISE_BUDGET_CAP: Duration = Duration::from_secs(2);
 
+type HintKey = (String, &'static str);
+type Inflight = dashmap::DashMap<HintKey, Arc<tokio::sync::Mutex<()>>>;
+
+/// Declared before the local gate Arc so its Drop runs after that Arc is released,
+/// including cancellation and cache-hit exits. Entry acquisition and removal use
+/// the same DashMap shard lock; a map-only Arc has no active observer or waiter.
+struct ObservationFlight<'a> {
+    inflight: &'a Inflight,
+    key: HintKey,
+}
+
+impl Drop for ObservationFlight<'_> {
+    fn drop(&mut self) {
+        self.inflight
+            .remove_if(&self.key, |_, gate| Arc::strong_count(gate) == 1);
+    }
+}
+
 struct CachedHint {
     at: Instant,
     hint: Arc<Option<UserAppProxyFailureHint>>,
@@ -26,9 +45,9 @@ struct CachedHint {
 
 pub struct UserAppProxyFailureAdvisorImpl {
     state: std::sync::Weak<AppState>,
-    cache: tokio::sync::Mutex<HashMap<(String, &'static str), CachedHint>>,
+    cache: tokio::sync::Mutex<HashMap<HintKey, CachedHint>>,
     /// per-key 单飞行闸（错误风暴下不同 app 的观察互不排队）。
-    inflight: dashmap::DashMap<(String, &'static str), Arc<tokio::sync::Mutex<()>>>,
+    inflight: Inflight,
 }
 
 impl UserAppProxyFailureAdvisorImpl {
@@ -49,35 +68,55 @@ impl UserAppProxyFailureAdvisor for UserAppProxyFailureAdvisorImpl {
         stage: &str,
         budget: Duration,
     ) -> Option<UserAppProxyFailureHint> {
+        let budget = budget.min(ADVISE_BUDGET_CAP);
         let key = (app_id.to_string(), stage_leak(stage));
-        {
-            let cache = self.cache.lock().await;
-            if let Some(cached) = cache.get(&key)
-                && cached.at.elapsed() < HINT_TTL
-            {
-                return (*cached.hint).clone();
-            }
+        // Waiting for another observer is part of the same caller budget.
+        tokio::time::timeout(
+            budget,
+            self.cached_observation(key, self.observe(app_id, stage, budget)),
+        )
+        .await
+        .unwrap_or(None)
+    }
+}
+
+impl UserAppProxyFailureAdvisorImpl {
+    async fn cached_hint(&self, key: &HintKey) -> Option<Arc<Option<UserAppProxyFailureHint>>> {
+        self.cache
+            .lock()
+            .await
+            .get(key)
+            .filter(|cached| cached.at.elapsed() < HINT_TTL)
+            .map(|cached| cached.hint.clone())
+    }
+
+    async fn cached_observation(
+        &self,
+        key: HintKey,
+        observe: impl Future<Output = Option<UserAppProxyFailureHint>>,
+    ) -> Option<UserAppProxyFailureHint> {
+        if let Some(hint) = self.cached_hint(&key).await {
+            return (*hint).clone();
         }
-        // per-key 单飞行合并：同 app 并发失败只穿透一次观察；不同 app 各自
-        // 持钥互不排队（错误风暴下无跨应用队头阻塞；观察自身 ≤2s、只读）。
+        let _flight = ObservationFlight {
+            inflight: &self.inflight,
+            key: key.clone(),
+        };
         let gate = self
             .inflight
             .entry(key.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = gate.lock().await;
-        let mut cache = self.cache.lock().await;
-        if let Some(cached) = cache.get(&key)
-            && cached.at.elapsed() < HINT_TTL
-        {
-            return (*cached.hint).clone();
+        if let Some(hint) = self.cached_hint(&key).await {
+            return (*hint).clone();
         }
-        let hint = Arc::new(
-            self.observe(app_id, stage, budget.min(ADVISE_BUDGET_CAP))
-                .await,
-        );
+        // The cache mutex only protects map access. Other apps may observe
+        // while this app waits for its runtime, and cancellation releases flight.
+        let hint = Arc::new(observe.await);
+        let mut cache = self.cache.lock().await;
         cache.insert(
-            key.clone(),
+            key,
             CachedHint {
                 at: Instant::now(),
                 hint: hint.clone(),
@@ -88,18 +127,9 @@ impl UserAppProxyFailureAdvisor for UserAppProxyFailureAdvisorImpl {
         if cache.len() > 512 {
             cache.clear();
         }
-        // 单飞行闸回收：等待者各自持有 gate 的 Arc 克隆——仅当本 key 无
-        // 其他等待者（strong_count == 2 即 map 持有 + 当前持有者）时移除
-        // 条目，避免 inflight 随历史 (app, stage) 键慢泄漏；有等待者时保
-        // 留，由最后一个离开者回收。DashMap 分片锁把 entry 克隆与
-        // remove_if 串行化，计数判定不存在竞态窗口。
-        self.inflight
-            .remove_if(&key, |_, gate| Arc::strong_count(gate) == 2);
         (*hint).clone()
     }
-}
 
-impl UserAppProxyFailureAdvisorImpl {
     async fn observe(
         &self,
         app_id: &str,
@@ -136,5 +166,76 @@ fn stage_leak(stage: &str) -> &'static str {
     match stage {
         "prod" => "prod",
         _ => "dev",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Weak;
+
+    #[tokio::test]
+    async fn failure_advisor_coalesces_waiters_without_blocking_other_apps() {
+        let advisor = UserAppProxyFailureAdvisorImpl::new(Weak::new());
+        let key = ("slowapp".into(), "dev");
+        let release = tokio::sync::Notify::new();
+        let mut first = Box::pin(advisor.cached_observation(key.clone(), async {
+            release.notified().await;
+            None
+        }));
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        let mut waiter = Box::pin(advisor.cached_observation(key, async {
+            panic!("a waiter must reuse the cached observation, including None")
+        }));
+        assert!(futures::poll!(waiter.as_mut()).is_pending());
+
+        let other = tokio::time::timeout(
+            Duration::from_secs(1),
+            advisor.cached_observation(("fastapp".into(), "prod"), async { None }),
+        )
+        .await;
+        assert!(
+            other.is_ok(),
+            "a slow app must not hold the shared cache lock"
+        );
+        assert_eq!(advisor.inflight.len(), 1);
+
+        release.notify_one();
+        assert!(first.await.is_none());
+        assert!(waiter.await.is_none());
+        assert!(
+            advisor.inflight.is_empty(),
+            "cache-hit waiters must release the flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_advisor_cancellation_and_caller_budget_release_flights() {
+        let advisor = UserAppProxyFailureAdvisorImpl::new(Weak::new());
+        let key = ("cancelapp".into(), "dev");
+        let mut first = Box::pin(advisor.cached_observation(key, std::future::pending()));
+        assert!(futures::poll!(first.as_mut()).is_pending());
+
+        // Exercise the public caller budget while another request owns the gate.
+        assert!(
+            advisor
+                .advise("cancelapp", "dev", Duration::from_millis(10))
+                .await
+                .is_none()
+        );
+        assert_eq!(advisor.inflight.len(), 1);
+        drop(first);
+        assert!(advisor.inflight.is_empty());
+
+        assert!(
+            advisor
+                .advise("cancelapp", "dev", Duration::from_secs(1))
+                .await
+                .is_none()
+        );
+        assert!(
+            advisor.inflight.is_empty(),
+            "a cancelled observer must not strand the key"
+        );
     }
 }

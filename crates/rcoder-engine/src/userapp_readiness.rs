@@ -38,7 +38,7 @@ impl UserAppReadinessReaderImpl {
 }
 
 #[derive(Clone, Copy)]
-enum Access {
+pub(crate) enum Access {
     ContainerNetwork,
     #[cfg_attr(not(feature = "deploy-host"), allow(dead_code))]
     HostDirect,
@@ -46,7 +46,7 @@ enum Access {
 }
 
 impl Access {
-    fn current() -> Self {
+    pub(crate) fn current() -> Self {
         if !shared_types::is_deploy_host() {
             return Self::ContainerNetwork;
         }
@@ -138,15 +138,31 @@ fn transport(
     target: &UserAppReadinessTarget,
     access: Access,
 ) -> (UserAppReadinessChannel, Option<std::net::SocketAddr>) {
-    match (&target.instance, access) {
+    observation_transport(
+        &target.instance,
+        access,
+        target.address,
+        target.published_address,
+    )
+}
+
+/// Both business readiness and DBX select from addresses captured by the same
+/// runtime observation. Host Kubernetes never assumes Pod IP reachability.
+pub(crate) fn observation_transport(
+    instance: &UserAppReadinessInstance,
+    access: Access,
+    address: Option<std::net::SocketAddr>,
+    published_address: Option<std::net::SocketAddr>,
+) -> (UserAppReadinessChannel, Option<std::net::SocketAddr>) {
+    match (instance, access) {
         (_, Access::ContainerNetwork)
         | (UserAppReadinessInstance::Docker { .. }, Access::HostDirect) => {
-            (UserAppReadinessChannel::Direct, target.address)
+            (UserAppReadinessChannel::Direct, address)
         }
         (UserAppReadinessInstance::Docker { .. }, Access::HostPublished)
-            if target.published_address.is_some() =>
+            if published_address.is_some() =>
         {
-            (UserAppReadinessChannel::Direct, target.published_address)
+            (UserAppReadinessChannel::Direct, published_address)
         }
         _ => (UserAppReadinessChannel::Exec, None),
     }
@@ -350,6 +366,7 @@ mod tests {
             },
             address: None,
             published_address: None,
+            dbx_published_address: None,
         }
     }
     fn runtime(targets: Vec<UserAppReadinessTarget>) -> Runtime {

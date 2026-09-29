@@ -85,6 +85,36 @@ fn operation_summaries_are_ui_concise() {
     assert_summaries_ui_concise("file-server", &file_server_document());
 }
 
+#[test]
+fn userapp_readiness_documents_dbx_route_and_required_query() {
+    let document = serde_json::to_value(primary_document()).expect("OpenAPI document");
+    for path in [
+        "/api/v1/userapp/{app_id}/{app_stage}/readiness",
+        "/api/v1/userapp/{app_id}/{app_stage}/dbx/readiness",
+    ] {
+        let get = &document["paths"][path]["get"];
+        let parameters = get["parameters"].as_array().expect("GET query parameters");
+        assert!(
+            parameters.iter().any(|parameter| {
+                parameter["name"] == "user_id"
+                    && parameter["in"] == "query"
+                    && parameter["required"] == true
+            }),
+            "{path}: user_id is required by the HTTP extractor"
+        );
+        let schema = &get["responses"]["200"]["content"]["application/json"]["schema"];
+        assert!(!schema.is_null(), "{path}: missing response schema");
+    }
+    let schemas = &document["components"]["schemas"];
+    let properties = &schemas["DbxReadinessResponse"]["properties"];
+    for field in ["ready", "status", "reason_code", "message"] {
+        assert!(
+            !properties[field].is_null(),
+            "DBX response must document {field}"
+        );
+    }
+}
+
 fn sole_tag(
     doc_name: &str,
     document: &utoipa::openapi::OpenApi,

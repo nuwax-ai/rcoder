@@ -18,6 +18,63 @@ use crate::service::AppService;
 use crate::utils::validate_app_id;
 
 pub(crate) const READINESS_QUERY_BUDGET: Duration = Duration::from_secs(8);
+const DBX_READINESS_QUERY_BUDGET: Duration = Duration::from_secs(3);
+
+/// Poll the authoritative read inside the same deadline as the runtime query.
+/// Keeping the read as a future also permits a stalled-store regression without
+/// replacing the production lifecycle store or changing its mutation contract.
+async fn query_dbx_with_budget(
+    app_id: &str,
+    stage: UserappStage,
+    budget: Duration,
+    application: impl Future<
+        Output = Result<
+            Option<shared_types::UserAppLifecycleRecord>,
+            shared_types::UserAppStoreError,
+        >,
+    >,
+    prober: Option<Arc<dyn shared_types::DbxReadinessProber>>,
+) -> AppResult<shared_types::DbxReadinessResponse> {
+    use shared_types::{DbxReadinessObservation, DbxReadinessReason, DbxReadinessStatus};
+    let deadline = Instant::now() + budget;
+    let observe = async {
+        application
+            .await?
+            .filter(|record| record.state != UserAppLifecycleState::Deleted)
+            .ok_or_else(|| AppOperationError::NotFound(format!("app {app_id} not found")))?;
+        let prober = prober.ok_or_else(|| {
+            AppOperationError::Backend("dbx prober is not wired (host assembly missing)".into())
+        })?;
+        let observation = match prober
+            .probe(
+                app_id,
+                stage,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .await
+        {
+            Ok(observation) => observation,
+            Err(error) => {
+                tracing::warn!(app_id, %error, "DBX readiness observation failed");
+                DbxReadinessObservation::new(
+                    DbxReadinessStatus::Unknown,
+                    Some(DbxReadinessReason::ObservationFailed),
+                )
+                .with_message(error)
+            }
+        };
+        Ok(observation.into())
+    };
+    tokio::time::timeout_at(deadline, observe)
+        .await
+        .unwrap_or_else(|_| {
+            Ok(DbxReadinessObservation::new(
+                DbxReadinessStatus::Unknown,
+                Some(DbxReadinessReason::ObserveIncomplete),
+            )
+            .into())
+        })
+}
 
 impl AppService {
     pub fn set_readiness_reader(
@@ -59,31 +116,19 @@ impl AppService {
         app_id: &str,
     ) -> AppResult<shared_types::DbxReadinessResponse> {
         validate_app_id(app_id)?;
-        // 权威记录不存在或已删除 → 404 错误信封（对齐 readiness 族的失败形态）。
-        let _record = self
-            .metadata
-            .store
-            .get_application(app_id)
-            .await?
-            .filter(|record| record.state != UserAppLifecycleState::Deleted)
-            .ok_or_else(|| AppOperationError::NotFound(format!("app {app_id} not found")))?;
-        let Some(prober) = self.dbx_prober.read().ok().and_then(|slot| slot.clone()) else {
-            return Err(AppOperationError::Backend(
-                "dbx prober is not wired (host assembly missing)".into(),
-            ));
-        };
-        let (status, reason_code) = match prober.probe(app_id, app_stage).await {
-            Ok(status) => (status, None),
-            Err(reason) => {
-                tracing::warn!("[APP] dbx readiness probe failed: app {app_id}: {reason}");
-                (shared_types::DbxReadinessStatus::Unknown, Some(reason))
-            }
-        };
-        Ok(shared_types::DbxReadinessResponse {
-            ready: status == shared_types::DbxReadinessStatus::Ready,
-            status,
-            reason_code,
-        })
+        let prober = self
+            .dbx_prober
+            .read()
+            .map_err(|_| AppOperationError::Backend("dbx prober lock poisoned".into()))?
+            .clone();
+        query_dbx_with_budget(
+            app_id,
+            app_stage,
+            DBX_READINESS_QUERY_BUDGET,
+            self.metadata.store.get_application(app_id),
+            prober,
+        )
+        .await
     }
 
     pub async fn get_app_readiness(
@@ -732,10 +777,17 @@ mod tests {
                 &self,
                 _: &str,
                 _: UserappStage,
-            ) -> Result<shared_types::DbxReadinessStatus, String> {
+                _: Duration,
+            ) -> Result<shared_types::DbxReadinessObservation, String> {
                 match self.0.load(Ordering::SeqCst) {
-                    0 => Ok(shared_types::DbxReadinessStatus::Ready),
-                    1 => Ok(shared_types::DbxReadinessStatus::Stopped),
+                    0 => Ok(shared_types::DbxReadinessObservation::new(
+                        shared_types::DbxReadinessStatus::Ready,
+                        None,
+                    )),
+                    1 => Ok(shared_types::DbxReadinessObservation::new(
+                        shared_types::DbxReadinessStatus::Stopped,
+                        Some(shared_types::DbxReadinessReason::ComputeStopped),
+                    )),
                     _ => Err("probe transport blew up".into()),
                 }
             }
@@ -785,11 +837,52 @@ mod tests {
             .unwrap();
         assert!(!response.ready);
         assert_eq!(response.status, shared_types::DbxReadinessStatus::Unknown);
-        assert!(response.reason_code.is_some());
+        assert_eq!(
+            response.reason_code,
+            Some(shared_types::DbxReadinessReason::ObservationFailed)
+        );
+        assert_eq!(response.message.as_deref(), Some("probe transport blew up"));
 
         // 只读性：查询不产生任何 runtime 写调用（不唤醒、不建容器）。
         assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
         assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
         assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dbx_total_deadline_covers_a_stalled_store_before_probing() {
+        struct MustNotProbe;
+        #[async_trait::async_trait]
+        impl shared_types::DbxReadinessProber for MustNotProbe {
+            async fn probe(
+                &self,
+                _: &str,
+                _: UserappStage,
+                _: Duration,
+            ) -> Result<shared_types::DbxReadinessObservation, String> {
+                panic!("A stalled authoritative read must not reach the runtime");
+            }
+        }
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            query_dbx_with_budget(
+                "dbx1",
+                UserappStage::Prod,
+                Duration::from_millis(20),
+                std::future::pending(),
+                Some(Arc::new(MustNotProbe)),
+            ),
+        )
+        .await
+        .expect("the whole query must be bounded")
+        .unwrap();
+        assert!(!response.ready);
+        assert_eq!(response.status, shared_types::DbxReadinessStatus::Unknown);
+        assert_eq!(
+            response.reason_code,
+            Some(shared_types::DbxReadinessReason::ObserveIncomplete)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

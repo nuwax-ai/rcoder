@@ -48,12 +48,26 @@ dev 与 prod 各有独立的存储：删除 prod 运行容器默认保留数据�
 
 ### 业务就绪查询（只读）
 
-`GET /api/v1/userapp/{app_id}/{app_stage}/readiness` 回答"当前实例声明的服务集合 + Pingap 入口是否满足健康契约"——与容器探针（`/health`、`/ready`）分离。要点：
+`GET /api/v1/userapp/{app_id}/{app_stage}/readiness?user_id={user_id}` 回答"当前实例声明的服务集合 + Pingap 入口是否满足健康契约"——与容器探针（`/health`、`/ready`）分离。要点：
 
+- `user_id` 为当前接口必填的调用方参数；实例仍按 `app_id` 与 `app_stage` 定位，不按用户 ID 隔离或选择实例。调用方需显式传参。
 - 查询成功恒 200，**`data.ready` 才表示业务可用**；`status` 覆盖 `not_deployed/starting/stopping/stopped/ready/degraded/failed/unknown/unsupported`，`reason_code` 为结构化原因，`services[]` 为各服务明细、`proxy` 为入口与生效配置观察。
 - dev/prod 按当前实际容器或 Pod 分别观察，查询前后复核实例及控制意图；已停止返回 `stopped`，创建中返回 `starting`，真正缺少部署才返回 `not_deployed`。整个查询限时 8 秒，预算耗尽返回 `unknown/OBSERVE_INCOMPLETE`，可稍后重查。
 - **只读保证**：查询不启动/唤醒/停止任何服务、不刷新闲置计时、不阻塞 Stop/Restart；停止中的实例返回 `stopping`，旧运行时无新接口返回 `unsupported`。
 - 调用方（界面/Java）建议：显式启动后轮询（间隔 ≥2s、不重叠）；`starting` 显示等待、`ready` 打开预览、`failed` 给出日志入口；`ready=false` 不是接口调用失败；离开页面停止轮询（轮询不会取消实际部署）。完整字段以运行时 OpenAPI（`/api/docs`）为准。
+
+### DBX 界面就绪查询（只读）
+
+`GET /api/v1/userapp/{app_id}/{app_stage}/dbx/readiness?user_id={user_id}` 观察指定 dev/prod 实例中的 DBX HTTP 服务，独立于应用业务就绪和数据库连接健康：
+
+- `ready`：DBX HTTP 服务已响应；不代表数据库账号或业务 SQL 已通过验证。
+- `starting`：计算资源正在启动，或运行中的 DBX 尚未响应。
+- `stopped`：计算资源缺失或已停止。
+- `unknown`：无法确认，例如观察超时、实例换代、执行通道不可用或计算资源异常退出。`reason_code` 是稳定原因码，`message` 是可选诊断详情。
+
+总查询预算为 3 秒，包含存储查询、运行时定位和探测。Docker Published 使用 DBX 实际发布端口；宿主 K8s 使用绑定当前物理实例的只读 exec，不把管理端口的发布映射改成 4224。
+
+查询不启动容器、不刷新闲置计时，也不阻止用户启停；`unknown` 不应永久禁止用户直接访问。需要唤醒时沿用既有 DBX 访问入口。
 
 ### 访问失败的友好提示页
 

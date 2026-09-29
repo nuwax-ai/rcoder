@@ -655,6 +655,17 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         ))
     }
 
+    /// Run only USERAPP_DBX_READINESS_COMMAND in the captured instance, with
+    /// identity checked before and after. None means the target changed.
+    async fn exec_userapp_dbx_readiness(
+        &self,
+        _target: &crate::UserAppReadinessTarget,
+    ) -> ContainerRuntimeResult<Option<ExecResult>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Read-only DBX exec is unsupported".into(),
+        ))
+    }
+
     /// Remove only a successful restart's private archive. Caller must have
     /// committed its terminal result and released the original operation lease.
     async fn cleanup_builder_restart_archive(

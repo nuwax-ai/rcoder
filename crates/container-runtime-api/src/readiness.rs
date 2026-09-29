@@ -13,6 +13,24 @@ pub const USERAPP_READINESS_COMMAND: [&str; 5] = [
     "127.0.0.1:3010",
 ];
 
+/// Fixed, read-only loopback query. No shell, redirects, application start or
+/// caller-supplied URL. A successful command must also report a real HTTP code.
+pub const USERAPP_DBX_READINESS_COMMAND: [&str; 13] = [
+    "curl",
+    "--disable",
+    "--silent",
+    "--show-error",
+    "--output",
+    "/dev/null",
+    "--write-out",
+    "%{http_code}",
+    "--max-time",
+    "1.5",
+    "--noproxy",
+    "*",
+    "http://127.0.0.1:4224/",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserAppReadinessInstance {
     Docker {
@@ -47,6 +65,9 @@ pub struct UserAppReadinessTarget {
     pub instance: UserAppReadinessInstance,
     pub address: Option<SocketAddr>,
     pub published_address: Option<SocketAddr>,
+    /// Actual host binding for 4224/tcp from this same physical observation.
+    /// Never derive it from the app-cli management port's host binding.
+    pub dbx_published_address: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

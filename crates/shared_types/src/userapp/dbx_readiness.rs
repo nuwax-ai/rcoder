@@ -6,6 +6,7 @@
 
 use crate::UserappStage;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use utoipa::ToSchema;
 
 /// dbx 就绪四态（前端渲染口径）。
@@ -22,15 +23,76 @@ pub enum DbxReadinessStatus {
     Unknown,
 }
 
+/// 稳定的观察原因；诊断详情放在 message，调用方不解析底层错误文本。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DbxReadinessReason {
+    ComputeMissing,
+    ComputeStopped,
+    ComputeStarting,
+    ComputeStopping,
+    ComputeFailed,
+    ComputeUnknown,
+    DbxUnreachable,
+    ObserveIncomplete,
+    ObservationFailed,
+    InstanceChanged,
+    ProbeUnsupported,
+    ProbeProtocolInvalid,
+}
+
 /// `GET /api/v1/userapp/{app_id}/{app_stage}/dbx/readiness` 响应体。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DbxReadinessResponse {
     /// 前端直接消费的布尔（= `status == Ready`）。
     pub ready: bool,
+    /// 就绪状态：ready（HTTP 可达）、starting（启动中）、stopped（无运行实例）、unknown（无法确认）。
     pub status: DbxReadinessStatus,
-    /// 结构化原因码（starting/unknown 时提供排障线索）。
+    /// 结构化原因码：COMPUTE_MISSING（无实例）、COMPUTE_STOPPED（已停止）、
+    /// COMPUTE_STARTING（启动中）、COMPUTE_STOPPING（停止中）、COMPUTE_FAILED（实例失败）、
+    /// COMPUTE_UNKNOWN（实例状态未知）、DBX_UNREACHABLE（DBX 不可达）、
+    /// OBSERVE_INCOMPLETE（观察超时）、OBSERVATION_FAILED（观察失败）、
+    /// INSTANCE_CHANGED（实例换代）、PROBE_UNSUPPORTED（不支持探测）、
+    /// PROBE_PROTOCOL_INVALID（探测响应无效）。ready 时省略。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason_code: Option<String>,
+    pub reason_code: Option<DbxReadinessReason>,
+    /// 可选诊断详情；程序分支应使用 reason_code。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// 内部观察结果；输出 ready 时统一从 status 派生，避免两个字段矛盾。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbxReadinessObservation {
+    pub status: DbxReadinessStatus,
+    pub reason_code: Option<DbxReadinessReason>,
+    pub message: Option<String>,
+}
+
+impl DbxReadinessObservation {
+    pub fn new(status: DbxReadinessStatus, reason_code: Option<DbxReadinessReason>) -> Self {
+        Self {
+            status,
+            reason_code,
+            message: None,
+        }
+    }
+
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+}
+
+impl From<DbxReadinessObservation> for DbxReadinessResponse {
+    fn from(observation: DbxReadinessObservation) -> Self {
+        Self {
+            ready: observation.status == DbxReadinessStatus::Ready,
+            status: observation.status,
+            reason_code: observation.reason_code,
+            message: observation.message,
+        }
+    }
 }
 
 /// 宿主注入的 dbx 探测器（app_manager 经 `set_dbx_prober` 装配；实现由
@@ -38,5 +100,10 @@ pub struct DbxReadinessResponse {
 #[async_trait::async_trait]
 pub trait DbxReadinessProber: Send + Sync {
     /// 只读探测 dbx-web；实现不得唤醒、不得创建容器；预算内返回。
-    async fn probe(&self, app_id: &str, stage: UserappStage) -> Result<DbxReadinessStatus, String>;
+    async fn probe(
+        &self,
+        app_id: &str,
+        stage: UserappStage,
+        budget: Duration,
+    ) -> Result<DbxReadinessObservation, String>;
 }

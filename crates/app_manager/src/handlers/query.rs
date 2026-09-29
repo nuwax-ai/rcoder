@@ -107,7 +107,7 @@ pub async fn get_app_readiness(
         Ok(stage) => stage,
         Err(error) => return error.into_response(),
     };
-    // 标识符白名单校验（user_id 为调用方身份段，含 `/` 即逃逸）
+    // 校验调用方身份参数格式；实例定位仍只使用 app_id 与 app_stage。
     if let Err(error) = params
         .validate()
         .map_err(shared_types::garde_err_to_app_error)
@@ -133,11 +133,10 @@ pub async fn get_app_readiness(
     }
 }
 
-/// 获取 dbx-web（DBX 数据库 GUI，容器内恒起 :4224）就绪状态（只读探测）
+/// 获取 DBX 数据库界面的就绪状态
 ///
-/// 只读不唤醒：容器未运行 → `stopped`；运行中但 dbx 未应答 → `starting`；
-/// 4224 应答 → `ready`。前端据 `data.ready` 决定 DB 面板呈现，唤醒由
-/// dbx 代理路径的"有请求即唤醒"承担。
+/// 只读不唤醒：计算资源缺失/停止 → `stopped`；创建中或 DBX 未应答 →
+/// `starting`；DBX 应答 → `ready`；故障/无法确认 → `unknown`。
 #[utoipa::path(
     get,
     path = "/api/v1/userapp/{app_id}/{app_stage}/dbx/readiness",
@@ -146,6 +145,17 @@ pub async fn get_app_readiness(
         ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）；`prod`=运行容器（UserApp）"),
         ReadinessParams
     ),
+    description = r#"
+观察当前 dev/prod 实例的 DBX HTTP 服务，不启动/唤醒容器，也不刷新闲置计时。
+
+- `user_id` 必填，观察按 `app_id` 与 `app_stage` 定位；不使用用户 ID 改变实例归属。
+- `success=true` 表示查询完成；`data.ready` 才表示 DBX 可用。
+- `status` 为 `ready` / `starting` / `stopped` / `unknown`；`reason_code` 为稳定原因码，
+  `message` 为可选诊断信息。无法观察不等于服务停止。
+- 总预算为 3 秒，覆盖存储、运行时定位、HTTP/exec 探测及实例复核；耗尽返回 `unknown`。
+- 容器部署使用实例 IP；宿主机使用 DBX 的实际发布端口或捕获实例的只读 exec。
+- 查询本身不触发唤醒；需要打开 DBX 时沿用既有 DBX 访问入口。
+"#,
     responses(
         (status = 200, description = "观察完成（data.ready 才是 dbx 可用）", body = HttpResult<shared_types::DbxReadinessResponse>)
     ),

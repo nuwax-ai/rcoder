@@ -3,8 +3,8 @@
 
 use container_runtime_api::{
     ContainerRuntimeError as Error, ContainerRuntimeResult as Result, ExecResult,
-    USERAPP_READINESS_COMMAND, UserAppReadinessInstance, UserAppReadinessTarget,
-    UserAppRuntimeReadiness,
+    USERAPP_DBX_READINESS_COMMAND, USERAPP_READINESS_COMMAND, UserAppReadinessInstance,
+    UserAppReadinessTarget, UserAppRuntimeReadiness,
 };
 use k8s_openapi::api::{
     apps::v1::{Deployment, ReplicaSet, StatefulSet},
@@ -159,6 +159,23 @@ impl KubernetesRuntime {
         &self,
         target: &UserAppReadinessTarget,
     ) -> Result<Option<ExecResult>> {
+        self.exec_readiness_command(target, &USERAPP_READINESS_COMMAND)
+            .await
+    }
+
+    pub(super) async fn exec_dbx_readiness(
+        &self,
+        target: &UserAppReadinessTarget,
+    ) -> Result<Option<ExecResult>> {
+        self.exec_readiness_command(target, &USERAPP_DBX_READINESS_COMMAND)
+            .await
+    }
+
+    async fn exec_readiness_command(
+        &self,
+        target: &UserAppReadinessTarget,
+        command: &[&str],
+    ) -> Result<Option<ExecResult>> {
         let UserAppReadinessInstance::Kubernetes {
             namespace,
             pod_name,
@@ -184,10 +201,7 @@ impl KubernetesRuntime {
             .exec_pod_container(
                 pod_name,
                 container_name,
-                USERAPP_READINESS_COMMAND
-                    .iter()
-                    .map(|arg| (*arg).to_owned())
-                    .collect(),
+                command.iter().map(|arg| (*arg).to_owned()).collect(),
             )
             .await;
         // Kubernetes exec has no UID precondition. Discard a result if the Pod
@@ -266,6 +280,7 @@ fn from_pod(
             .filter(|ip| !ip.is_unspecified())
             .map(|ip| std::net::SocketAddr::new(ip, shared_types::APP_CLI_ADMIN_PORT)),
         published_address: None,
+        dbx_published_address: None,
     }))
 }
 

@@ -58,6 +58,7 @@ pub const PROBE_CONNECT_TIMEOUT_SECS: u64 = 2;
 ///   就绪信号）；dbx 探测任意状态码即 ready，同样不受影响。
 static PROBE_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(PROBE_CONNECT_TIMEOUT_SECS))
         .pool_idle_timeout(Duration::from_secs(3))

@@ -97,6 +97,7 @@ use crate::handler;
         app_manager::handlers::query_app_logs,
         app_manager::handlers::get_app_health,
         app_manager::handlers::get_app_readiness,
+        app_manager::handlers::get_app_dbx_readiness,
         crate::handler::error_page_admin::put_error_page,
         crate::handler::error_page_admin::get_error_page,
         crate::handler::error_page_admin::delete_error_page,

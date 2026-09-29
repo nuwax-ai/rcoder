@@ -43,7 +43,10 @@ pub use userapp::db_align::{
     align_pg_credentials_with_admin,
 };
 pub use userapp::db_password::*;
-pub use userapp::dbx_readiness::{DbxReadinessProber, DbxReadinessResponse, DbxReadinessStatus};
+pub use userapp::dbx_readiness::{
+    DbxReadinessObservation, DbxReadinessProber, DbxReadinessReason, DbxReadinessResponse,
+    DbxReadinessStatus,
+};
 pub use userapp::dev_cleanup::{
     BuilderDeletionSnapshot, BuilderRegistryIdentity, UserappDevCleanup, UserappDevDeletion,
     UserappDevDeletionReceipt,
