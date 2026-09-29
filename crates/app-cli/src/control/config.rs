@@ -7,8 +7,8 @@ use std::path::PathBuf;
 #[command(
     name = "app-cli",
     version,
-    about = "跨平台 UserApp 构建与服务管理器",
-    after_help = "常用流程：\n  app-cli build --workspace <工作区> --deploy-dir <部署目录>\n  app-cli serve --workspace <部署目录>\n\n参数放在子命令后；用 app-cli <子命令> --help 查看详细说明。"
+    about = "Cross-platform UserApp build and service manager",
+    after_help = "Typical workflow:\n  app-cli build --workspace <WORKSPACE> --deploy-dir <DEPLOY_DIR>\n  app-cli serve --workspace <DEPLOY_DIR>\n\nPlace options after the subcommand. Use app-cli <COMMAND> --help for details."
 )]
 pub struct CliArgs {
     #[command(subcommand)]
@@ -17,32 +17,35 @@ pub struct CliArgs {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
-    /// 启动常驻服务管理器，处理启动、停止、重启和部署。
+    /// Start a persistent service manager for start, stop, restart, and deployment operations.
     ///
-    /// 服务管理器持续运行并提供管理 API。仅恢复管理入口、不自动启动业务时，
-    /// 使用 --control-only。此命令不执行工作区构建。
+    /// The manager keeps running and exposes the management API. Use --control-only
+    /// to restore management access without automatically starting application services.
+    /// This command does not build the workspace.
     Serve(ServeArgs),
-    /// 前台运行工作区服务，持续监督到停止或退出。
+    /// Run workspace services in the foreground and supervise them until stopped or exited.
     ///
-    /// 不执行构建；按 release.lock.toml 启动服务。本地编排时进程持续运行，
-    /// 不会在服务启动后立即退出；已有所有者时通过所有者协调。
-    /// 设置 APP_CLI_RUN_PROFILE=dev 可优先使用 [devrun]，否则使用 [run]。
-    /// 需要常驻管理、反复启停和部署时，优先使用 serve。
+    /// Starts services from release.lock.toml without building. When managing services
+    /// locally, the process stays running after startup. If an owner already exists,
+    /// the request is coordinated through that owner. Set APP_CLI_RUN_PROFILE=dev
+    /// to prefer [devrun]; otherwise [run] is used. Prefer serve for persistent
+    /// management, repeated start/stop operations, and deployments.
     Run(RunArgs),
-    /// 构建工作区服务，可生成部署目录；不启动服务。
+    /// Build workspace services and optionally assemble a deployment directory without starting services.
     Build(BuildArgs),
-    /// 校验 manifest 并生成 release.lock.toml，不启动服务。
+    /// Validate manifests and generate release.lock.toml without starting services.
     GenLock(GenLockArgs),
-    /// 内部服务执行入口，由 supervisord 调用。
+    /// Run an individual service (internal entry point used by supervisord).
     RunService(RunServiceArgs),
-    /// 查询业务服务是否就绪，不启动或停止服务。
+    /// Query application service readiness without starting or stopping services.
     Readiness(ReadinessArgs),
-    /// 通过独立监督通道查询、恢复、停止业务或关闭 CLI。
+    /// Query status, recover, stop services, or shut down the CLI through the supervision channel.
     ///
-    /// 不依赖业务管理 API 是否可用。stop 停止业务并保留管理入口，
-    /// shutdown 关闭整个 CLI；recover 收束旧执行并恢复管理入口。
+    /// Works independently of the application management API. stop stops application
+    /// services while keeping management access; shutdown shuts down the entire CLI;
+    /// recover ends the previous execution and restores management access.
     Owner(OwnerArgs),
-    /// 处理部署日志的状态冲突（运维命令）。
+    /// Resolve deployment journal state conflicts (administrative command).
     Journal {
         #[command(subcommand)]
         command: JournalCommand,
@@ -51,43 +54,44 @@ pub enum Command {
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy)]
 pub enum OwnerAction {
-    /// 查询监督进程、业务进程代次与恢复状态。
+    /// Query the supervisor, application process generation, and recovery status.
     Status,
-    /// 收束旧执行，恢复管理入口。
+    /// End the previous execution and restore management access.
     Recover,
-    /// 停止业务，保留管理入口。
+    /// Stop application services while keeping management access.
     Stop,
-    /// 停止业务并关闭 CLI。
+    /// Stop application services and shut down the CLI.
     Shutdown,
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct OwnerArgs {
+    /// Action to perform through the supervision channel.
     #[arg(value_enum)]
     pub action: OwnerAction,
     #[command(flatten)]
     pub workspace: WorkspaceArgs,
-    /// 重试同一操作时沿用；不提供则生成新的请求 ID。
+    /// Reuse this ID when retrying the same operation; a new ID is generated if omitted.
     #[arg(long)]
     pub request_id: Option<String>,
-    /// 期望的业务进程代次；不匹配时拒绝操作，避免影响新代次。
+    /// Expected application process generation; a mismatch rejects the operation to protect a newer generation.
     #[arg(long)]
     pub generation: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct ReadinessArgs {
-    /// 管理 API 查询地址（exec 场景容器内固定 loopback）。
+    /// Management API address to query; defaults to loopback for queries executed inside a container.
     #[arg(long, default_value = "127.0.0.1:3010", env = "APP_CLI_ADMIN_ADDR")]
     pub admin_addr: String,
-    /// JSON 输出（查询结果恒以 JSON 写 stdout，flag 保留为显式契约）。
+    /// Request JSON output (results are always written to stdout as JSON).
     #[arg(long)]
     pub json: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum JournalCommand {
-    /// 裁决双权威域冲突：归档被取代的陈旧 legacy 记录（可审计、可回滚）。
+    /// Resolve conflicting state roots by archiving superseded legacy records (auditable and reversible).
     Adopt(JournalAdoptArgs),
 }
 
@@ -95,16 +99,17 @@ pub enum JournalCommand {
 pub struct JournalAdoptArgs {
     #[command(flatten)]
     pub workspace: WorkspaceArgs,
-    /// 跳过 settled/新旧判定归档陈旧 legacy 记录——操作者断言权威状态根为
-    /// 唯一真相。归档只改名（.superseded-<ts>）可回滚，不删除；任一侧锁被
-    /// 活持有者持有时仍拒绝。
+    /// Archive legacy records without checking whether they are settled or superseded.
+    /// The operator asserts that the authoritative state root is the sole source of truth.
+    /// Records are renamed with a .superseded-<ts> suffix, not deleted, so the action
+    /// can be reversed. The command still refuses to proceed if either lock is held.
     #[arg(long)]
     pub force: bool,
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct WorkspaceArgs {
-    /// 包含 workspace.manifest.toml 或 release.lock.toml 的工作区。
+    /// Workspace containing workspace.manifest.toml or release.lock.toml.
     #[arg(long, default_value = "/app/code", env = "APP_CLI_WORKSPACE")]
     pub workspace: PathBuf,
 }
@@ -113,20 +118,20 @@ pub struct WorkspaceArgs {
 pub struct GenLockArgs {
     #[command(flatten)]
     pub workspace: WorkspaceArgs,
-    /// 预览 devrun 对应的代理规则；锁文件同时保留 dev/prod 配置。
+    /// Preview proxy rules for devrun; the lock file retains both dev and prod settings.
     #[arg(long)]
     pub dev: bool,
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct RuntimeOptions {
-    /// 运行态及服务日志目录。
+    /// Directory for runtime and service logs.
     #[arg(long, default_value = "/app/logs", env = "APP_CLI_LOG_DIR")]
     pub log_dir: PathBuf,
-    /// 管理 API 监听地址。
+    /// Listen address for the management API.
     #[arg(long, default_value = "0.0.0.0:3010", env = "APP_CLI_ADMIN_ADDR")]
     pub admin_addr: String,
-    /// 匹配版本的 Pingap 可执行文件路径。
+    /// Path to a compatible Pingap executable.
     #[arg(
         long,
         default_value = "/usr/local/bin/pingap",
@@ -147,10 +152,10 @@ pub struct RunArgs {
 pub struct ServeArgs {
     #[command(flatten)]
     pub run: RunArgs,
-    /// 附着到身份匹配的所有者，等待接管。
+    /// Attach to an owner with a matching identity and wait to take over.
     #[arg(long, env = "APP_CLI_ATTACH")]
     pub attach: bool,
-    /// 仅恢复管理面，等待显式运行操作；不自动启动业务或执行环境变量部署。
+    /// Restore management access only and wait for explicit operations; do not automatically start services or deploy from environment variables.
     #[arg(long, conflicts_with = "attach")]
     pub control_only: bool,
 }
@@ -159,23 +164,26 @@ pub struct ServeArgs {
 pub struct BuildArgs {
     #[command(flatten)]
     pub workspace: WorkspaceArgs,
-    /// 按开发模式选择构建步骤（devbuild/devrun）。
+    /// Select development-mode build steps (devbuild/devrun).
     #[arg(long)]
     pub dev: bool,
-    /// 构建后组装产物部署目录。
+    /// Assemble build outputs into this deployment directory.
     #[arg(long, value_name = "DIR")]
     pub deploy_dir: Option<PathBuf>,
-    /// 只构建指定的已启用服务 ID（逗号分隔）。
+    /// Build only the specified enabled service IDs (comma-separated).
     #[arg(long, value_name = "IDS")]
     pub only: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct RunServiceArgs {
+    /// Release ID for the service specification.
     #[arg(value_name = "RELEASE_ID")]
     pub release_id: String,
+    /// Service ID to run from the release.
     #[arg(value_name = "SERVICE_ID")]
     pub service_id: String,
+    /// Directory for runtime and service logs.
     #[arg(long, default_value = "/app/logs", env = "APP_CLI_LOG_DIR")]
     pub log_dir: PathBuf,
 }

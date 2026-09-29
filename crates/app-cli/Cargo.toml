@@ -3,7 +3,7 @@ name = "app-cli"
 version = "0.3.10"
 edition = "2024"
 license = "Apache-2.0"
-description = "跨平台 UserApp 构建与服务管理器（服务编排、Pingap 路由及管理 API）"
+description = "Cross-platform UserApp build and service manager with orchestration, Pingap routing, and a management API"
 # app-cli 独立于 rcoder workspace（exclude）—— 避免 pingap-config 的 bollard/regex 传递依赖
 # 与 rcoder workspace 的锁冲突。app-cli 有自己的 Cargo.lock。
 
