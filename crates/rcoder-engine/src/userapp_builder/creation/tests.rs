@@ -114,6 +114,14 @@ mod cases {
         store: &Arc<dyn UserAppLifecycleStore>,
         app_id: &str,
     ) -> UserAppOperationRecord {
+        admitted_kind(store, app_id, UserAppOperationKind::EnsureBuilder).await
+    }
+
+    async fn admitted_kind(
+        store: &Arc<dyn UserAppLifecycleStore>,
+        app_id: &str,
+        kind: UserAppOperationKind,
+    ) -> UserAppOperationRecord {
         store.ensure_identity(app_id).await.expect("identity");
         match store
             .admit(&UserAppAdmission {
@@ -125,13 +133,113 @@ mod cases {
                 operation_id: uuid::Uuid::new_v4().to_string(),
                 request_id: None,
                 request_fingerprint: "a".repeat(64),
-                kind: UserAppOperationKind::EnsureBuilder,
+                kind,
             })
             .await
             .expect("admit")
         {
             UserAppAdmissionOutcome::Accepted(record) => record,
             _ => panic!("fresh application must admit once"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_creation_marker_requires_failed_dev_ensure_evidence() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store: Arc<dyn UserAppLifecycleStore> = Arc::new(
+            rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+                &directory.path().join("userapp.turso.db"),
+            )
+            .await
+            .expect("store"),
+        );
+        for (app_id, kind, state, flag, marked) in [
+            (
+                "cancelled",
+                UserAppOperationKind::EnsureBuilder,
+                UserAppOperationState::Failed,
+                serde_json::json!(true),
+                true,
+            ),
+            (
+                "otherfamily",
+                UserAppOperationKind::Start,
+                UserAppOperationState::Failed,
+                serde_json::json!(true),
+                false,
+            ),
+            (
+                "badflag",
+                UserAppOperationKind::EnsureBuilder,
+                UserAppOperationState::Failed,
+                serde_json::json!("true"),
+                false,
+            ),
+            (
+                "uncertain",
+                UserAppOperationKind::EnsureBuilder,
+                UserAppOperationState::RecoveryRequired,
+                serde_json::json!(true),
+                false,
+            ),
+        ] {
+            let accepted = admitted_kind(&store, app_id, kind).await;
+            let running = progress(
+                &store,
+                &accepted,
+                "worker",
+                UserAppOperationState::Running,
+                "claimed",
+                serde_json::Value::Null,
+                None,
+            )
+            .await
+            .expect("claim");
+            progress(
+                &store,
+                &running,
+                "worker",
+                state,
+                "creation_result",
+                serde_json::json!({"creation_cancelled": flag}),
+                Some("interrupted".into()),
+            )
+            .await
+            .expect("persist outcome");
+            let budget = if state == UserAppOperationState::RecoveryRequired {
+                Duration::from_millis(150)
+            } else {
+                Duration::from_secs(5)
+            };
+            let error = wait_record(&store, &accepted, Instant::now() + budget)
+                .await
+                .expect_err("creation not successful")
+                .context("forwarding lookup");
+            let marker = error.chain().find_map(|cause| {
+                cause.downcast_ref::<crate::userapp_builder::BuilderEnsureSuperseded>()
+            });
+            assert_eq!(marker.is_some(), marked, "{app_id}: {error:#}");
+            if let Some(marker) = marker {
+                assert_eq!(marker.operation_id, accepted.operation_id);
+            }
+            if state == UserAppOperationState::RecoveryRequired {
+                let timeout = error
+                    .downcast_ref::<shared_types::UserAppWaitTimeout>()
+                    .expect("observe the original operation until the caller's deadline");
+                assert_eq!(
+                    timeout.operation_id.as_deref(),
+                    Some(accepted.operation_id.as_str())
+                );
+                assert_eq!(
+                    store
+                        .get_operation(app_id, &accepted.operation_id)
+                        .await
+                        .expect("read")
+                        .expect("operation")
+                        .state,
+                    state
+                );
+            }
         }
     }
     #[tokio::test]

@@ -236,14 +236,18 @@ pub(crate) async fn wait_record(
                             .as_deref()
                             .unwrap_or("Operation result requires inspection")
                     );
-                    let cancelled = serde_json::json!(true);
                     return Err(
-                        if operation.checkpoint.pointer("/creation_cancelled") == Some(&cancelled) {
+                        if operation.kind == UserAppOperationKind::EnsureBuilder
+                            && operation.scope == shared_types::UserAppOperationScope::Dev
+                            && operation.checkpoint.get("creation_cancelled")
+                                == Some(&serde_json::Value::Bool(true))
+                        {
                             // 取消型失败的机器可读根因（chain 可 downcast）：
-                            // 所有已发写均有返回、取消方秒级收敛——转发层据此
-                            // 等待重试而非立即 502。
-                            anyhow::Error::new(crate::userapp_builder::BuilderEnsureSuperseded)
-                                .context(human)
+                            // 只说明本次创建已收束，控制操作仍需按持久状态等待。
+                            anyhow::Error::new(crate::userapp_builder::BuilderEnsureSuperseded {
+                                operation_id: operation.operation_id.clone(),
+                            })
+                            .context(human)
                         } else {
                             anyhow::Error::msg(human)
                         },

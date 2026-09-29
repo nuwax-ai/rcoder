@@ -532,12 +532,35 @@ mod tests {
         // 目标（c1）之后新增的文件 b.txt。
         std::fs::write(dir.path().join("b.txt"), "added later\n").expect("write b.txt");
         stage_path(&repo, "b.txt").expect("stage b.txt");
-        commit_indexed(&repo, "c3 add b.txt", "Test", "test@example.com").expect("commit c3");
+        let c3 =
+            commit_indexed(&repo, "c3 add b.txt", "Test", "test@example.com").expect("commit c3");
 
         let outcome = revert_to_commit(&repo, &c1, None, "Test", "test@example.com")
             .expect("revert across added files succeeds");
 
-        assert!(outcome.commit.is_some(), "revert commit created");
+        assert_eq!(outcome.previous_head, c3);
+        assert_eq!(outcome.target, c1);
+        let commit = outcome.commit.expect("revert commit created");
+        assert_eq!(repo.head_id().expect("HEAD").to_string(), commit);
+        let reverted = repo
+            .find_commit(ObjectId::from_hex(commit.as_bytes()).expect("revert id"))
+            .expect("revert commit");
+        assert_eq!(
+            reverted
+                .parent_ids()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>(),
+            [c3],
+            "revert must preserve history instead of resetting HEAD to the target"
+        );
+        let target = repo
+            .find_commit(ObjectId::from_hex(c1.as_bytes()).expect("target id"))
+            .expect("target commit");
+        assert_eq!(
+            reverted.tree().expect("revert tree").id(),
+            target.tree().expect("target tree").id(),
+            "the committed tree, including .gitignore, must match the target"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).expect("a.txt exists"),
             "v1\n",
@@ -549,7 +572,12 @@ mod tests {
         );
         let status = get_status(&repo).expect("status after revert");
         assert!(
-            status.staged.is_empty() && status.created.is_empty(),
+            status.staged.is_empty()
+                && status.created.is_empty()
+                && status.modified.is_empty()
+                && status.deleted.is_empty()
+                && status.untracked.is_empty()
+                && status.conflicted.is_empty(),
             "worktree must stay clean after revert, got {status:?}"
         );
     }

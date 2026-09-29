@@ -12,19 +12,21 @@ pub mod app_adoption;
 /// 转发层"可等待冲突"的机器可读标记：builder ensure 操作被在途 Dev 控制
 /// 操作取消（操作记录 checkpoint 携带 `creation_cancelled: true`，由
 /// creation/spawn.rs 写入）。取消语义是"所有已发出的写均已有返回"——
-/// 无悬空写入、不需要人工裁决；取消方（RestartBuilder 等）秒级收敛，
-/// 等待后重试幂等 ensure 即可成功。观察循环把它挂进 anyhow 链，
+/// 当前创建已收束，但不保证取消方已完成。观察循环把它挂进 anyhow 链，
 /// userapp_forward/upstream.rs 据此把该失败并入等待轮询而非立即 502
 /// （nuwax-k8s-test app 184：file-list 撞 builder 重启窗口 650ms 报错，
 /// 同窗口 git/status 走等待 8.1s 成功——两条路径行为统一）。
 #[derive(Debug)]
-pub(crate) struct BuilderEnsureSuperseded;
+pub(crate) struct BuilderEnsureSuperseded {
+    pub operation_id: String,
+}
 
 impl std::fmt::Display for BuilderEnsureSuperseded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "builder ensure superseded by an in-flight control operation"
+            "builder ensure {} superseded by an in-flight control operation",
+            self.operation_id
         )
     }
 }
@@ -336,6 +338,15 @@ pub fn control_error(error: &anyhow::Error) -> shared_types::AppError {
             control.message.clone(),
         )
         .with_operation_id(control.operation_id.clone());
+    }
+    if let Some(cancelled) = error.downcast_ref::<BuilderEnsureSuperseded>() {
+        // This is the cancelled ensure identity, not a fabricated identity for
+        // the control operation that interrupted it.
+        return shared_types::AppError::with_message(
+            shared_types::error_codes::ERR_CONFLICT,
+            "Builder ensure was interrupted by container control; retry after control completes",
+        )
+        .with_operation_id(cancelled.operation_id.clone());
     }
     if let Some(timeout) = error.downcast_ref::<shared_types::UserAppWaitTimeout>() {
         let response = shared_types::AppError::with_message(
