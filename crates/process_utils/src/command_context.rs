@@ -217,11 +217,20 @@ pub fn require_quiescent(root: &Path) -> std::io::Result<()> {
 
 /// Preserve the actual child/wrapper after an uncertain bounded stop. The
 /// command counter remains nonzero until both tree and durable receipt settle.
-pub fn retain_cleanup(
+pub fn retain_cleanup(child: Option<crate::guardian::OwnedChild>, record: Option<CommandRecord>) {
+    retain_cleanup_with_resource(child, record, ());
+}
+
+/// Keep the caller's resource lease until the actual child tree has stopped.
+/// Receipt persistence may continue afterwards; a diagnostic write failure does
+/// not keep a physically quiescent workspace unavailable.
+pub fn retain_cleanup_with_resource<T: Send + 'static>(
     mut child: Option<crate::guardian::OwnedChild>,
     record: Option<CommandRecord>,
+    resource: T,
 ) {
     tokio::spawn(async move {
+        let mut resource = Some(resource);
         // 观测性：首败与每 ~50 次重试（约 5 秒）各一条 warn 心跳；不改退出条件
         let mut retries: u32 = 0;
         loop {
@@ -241,6 +250,7 @@ pub fn retain_cleanup(
                 }
                 child.take();
             }
+            drop(resource.take());
             match record.as_ref() {
                 None => break,
                 Some(record) => match record.quiescent() {

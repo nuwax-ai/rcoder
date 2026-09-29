@@ -113,7 +113,7 @@ fn resolve_from_seq(last_event_id: Option<&str>, query_from_seq: u64) -> u64 {
     path = "/build",
     request_body = BuildUserAppBody,
     responses(
-        (status = 200, body = HttpResult<BuildCreatedData>, description = "构建任务已受理（异步执行）。data 立即返回 task_id（轮询/SSE 用）与 artifact_path（受理时即确定：builds/workspace-package-{release_id}.zip，release_id 预生成）+ status=pending。同 app_id 已有在途构建任务时自动接替：旧构建任务立即转 cancelled（其 SSE 流收到 cancelled 终态事件），本任务等待构建锁释放后开始——最新构建请求胜出；构建锁被 dev 启动/重启任务的编译阶段占用时本任务等待其完成，不取消 dev 任务。全局任务容量满时 4xx 拒绝。后续状态：轮询 GET /tasks/{task_id} 或订阅 GET /tasks/{task_id}/logs/stream（SSE，构建日志行以 log 事件实时推送）。"),
+        (status = 200, body = HttpResult<BuildCreatedData>, description = "构建任务已受理（异步执行）。data 立即返回 task_id（轮询/SSE 用）与 artifact_path（受理时即确定：builds/workspace-package-{release_id}.zip，release_id 预生成）+ status=pending。同 app_id 已有在途构建任务时自动接替：旧构建任务立即转 cancelled（其 SSE 流收到 cancelled 终态事件），本任务等待构建锁释放后开始——最新构建请求胜出；构建锁被 dev 启动/重启占用时，等待其编译与启动交接完成，不取消 dev 任务。执行容量暂满同样等待；等待可取消，独立预算由 USERAPP_BUILD_WAIT_TIMEOUT_SECS 配置（默认 3600 秒），不保证整个任务在此时间内完成。等待快照为 pending、stage=waiting_for_build_slot；调用方须分别处理排队和执行预算。任务表保留容量耗尽时 4xx 拒绝。后续状态：轮询 GET /tasks/{task_id} 或订阅 GET /tasks/{task_id}/logs/stream（SSE，构建日志行以 log 事件实时推送）。"),
     ),
     tag = "Userapp · dev · 构建任务"
 )]

@@ -168,6 +168,10 @@ impl Config {
         parse!(dev_stop_max_attempts, "DEV_STOP_MAX_ATTEMPTS");
         parse!(dev_command_timeout_secs, "DEV_COMMAND_TIMEOUT_SECS");
         parse!(max_build_concurrency, "MAX_BUILD_CONCURRENCY");
+        parse!(
+            userapp_build_wait_timeout_secs,
+            "USERAPP_BUILD_WAIT_TIMEOUT_SECS"
+        );
         self.app_cli_bin = env_opt_string("FILE_SERVER_APP_CLI_BIN")?;
         self.app_cli_admin_probe_addr = env_opt_string("FILE_SERVER_APP_CLI_ADMIN_PROBE_ADDR")?
             .unwrap_or_else(|| "127.0.0.1:3010".to_string());
@@ -282,6 +286,7 @@ impl Config {
             dev_stop_max_attempts: env_parse("DEV_STOP_MAX_ATTEMPTS", 50)?,
             dev_command_timeout_secs: env_parse("DEV_COMMAND_TIMEOUT_SECS", 600)?,
             max_build_concurrency: env_parse("MAX_BUILD_CONCURRENCY", 20)?,
+            userapp_build_wait_timeout_secs: env_parse("USERAPP_BUILD_WAIT_TIMEOUT_SECS", 3600)?,
             app_cli_bin: env_opt_string("FILE_SERVER_APP_CLI_BIN")?,
             app_cli_admin_probe_addr: env_opt_string("FILE_SERVER_APP_CLI_ADMIN_PROBE_ADDR")?
                 .unwrap_or_else(|| "127.0.0.1:3010".to_string()),
@@ -402,6 +407,10 @@ impl Config {
                 self.dev_stop_check_interval_ms,
             ),
             ("DEV_COMMAND_TIMEOUT_SECS", self.dev_command_timeout_secs),
+            (
+                "USERAPP_BUILD_WAIT_TIMEOUT_SECS",
+                self.userapp_build_wait_timeout_secs,
+            ),
             ("LOG_READ_MAX_BYTES", self.log_read_max_bytes),
         ] {
             if value == 0 {

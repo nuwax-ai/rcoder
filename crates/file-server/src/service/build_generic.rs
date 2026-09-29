@@ -41,15 +41,15 @@ pub struct GenericBuildRequest<'a> {
 /// 整个构建周期,避免子项目间隙释放锁导致同 app_id 构建穿插、首个构建中途 409 失败,#13),
 /// 也可作任意单项目构建(调用方自己 `try_start` 取一个 guard 传入)。
 ///
-/// `guard` 以引用传入:仅用于在类型层面证明调用方已持有并发 guard(其借用在本次调用期间
-/// 有效,阻止 guard 被提前释放),函数体内不直接使用。
+/// `guard` 以引用传入并进入命令执行作用域。子进程清理暂未确认时，清理任务会
+/// 保留同一租约，直到原进程树退出，避免新构建和遗留进程同时写工作区。
 ///
 /// # 工具链盲区
 /// agent-runner 镜像当前缺 **Go** 和 **Gradle**（`Dockerfile.base` 未装）。这两类项目
 /// 需先在镜像补装，或在 `cmd` 里自行 `curl` 拉取 —— 否则 build 会失败。
 pub async fn build_generic(
     req: &GenericBuildRequest<'_>,
-    _guard: &BuildGuard<'_>,
+    guard: &BuildGuard,
 ) -> AppResult<PathBuf> {
     let (program, args) = req
         .argv
@@ -63,19 +63,20 @@ pub async fn build_generic(
     let temp_log = req.log_dir.join(temp_log_name(now));
 
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_command_to_log(
-        program,
-        &args,
-        req.cwd,
-        &main_log,
-        &temp_log,
-        req.timeout_secs,
-        crate::service::dev_server::process::CommandObservers {
-            on_pid: req.on_pid,
-            on_line: req.on_line.clone(),
-        },
-    )
-    .await?;
+    guard
+        .scope(run_command_to_log(
+            program,
+            &args,
+            req.cwd,
+            &main_log,
+            &temp_log,
+            req.timeout_secs,
+            crate::service::dev_server::process::CommandObservers {
+                on_pid: req.on_pid,
+                on_line: req.on_line.clone(),
+            },
+        ))
+        .await?;
 
     // 校验产物
     let artifact = req.cwd.join(req.artifact_rel);

@@ -5,7 +5,7 @@
 //! 无新重依赖:broadcast(tokio)、VecDeque(std)。
 //!
 //! 任务生命周期:Pending(创建)→ Running(spawn 执行)→ Completed/Failed/Cancelled。
-//! cancel 通过 `cancel()` 置位 + 外部 kill 进程组(`kill_process_group`)。
+//! cancel 通过任务 CancellationToken 通知持有进程树的执行者收束。
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -166,6 +166,26 @@ impl BuildTask {
         Ok(true)
     }
 
+    /// Pending stays Pending while queued; expose the reason through the
+    /// existing snapshot stage and log event, without a new protocol variant.
+    pub async fn waiting_for_build_slot(&self, seconds: u64) {
+        {
+            let mut state = self.state.lock().await;
+            if is_terminal_status(state.status) {
+                return;
+            }
+            state.stage = Some("waiting_for_build_slot".to_owned());
+            state.updated_at = Utc::now().timestamp();
+        }
+        self.emit(BuildProgressEvent::Log {
+            service: "workspace".to_owned(),
+            line: format!(
+                "Waiting for a build slot (maximum {seconds}s); cancellation remains available"
+            ),
+        })
+        .await;
+    }
+
     /// 当前快照(查询用)。
     pub async fn snapshot(&self) -> BuildTaskSnapshot {
         let s = self.state.lock().await;
@@ -211,13 +231,22 @@ impl BuildTask {
         self.state.lock().await.workspace_root.clone()
     }
 
-    /// 发进度事件:取一次 state 锁 → `publish_mut` → 释放 → broadcast。
-    /// 已 Completed/Failed/Cancelled 的任务丢弃后续事件(终态)。
     /// 发进度事件:取一次 state 锁 → `publish_mut` → broadcast → 释放。
     /// 已 Completed/Failed/Cancelled 的任务丢弃后续事件(终态)。
     pub async fn emit(&self, event: BuildProgressEvent) {
         let terminal = {
             let mut s = self.state.lock().await;
+            // Supersede signals cancellation under the admission lock before
+            // awaiting event publication. Late success/failure cannot overtake it.
+            let event = if matches!(
+                event,
+                BuildProgressEvent::Completed { .. } | BuildProgressEvent::Failed { .. }
+            ) && self.is_cancelled()
+            {
+                BuildProgressEvent::Cancelled
+            } else {
+                event
+            };
             let Some((seq, event, terminal)) = publish_mut(&mut s, event) else {
                 return;
             };
@@ -362,6 +391,7 @@ fn apply_event(state: &mut TaskState, event: &BuildProgressEvent) {
             state.status = BuildTaskStatus::Running;
         }
         BuildProgressEvent::Building { service } => {
+            state.stage = Some("building".to_owned());
             state.current_service = Some(service.clone());
             state.status = BuildTaskStatus::Running;
         }
@@ -483,14 +513,26 @@ impl BuildTaskStore {
         app_id: String,
         kind: BuildTaskKind,
     ) -> Result<Arc<BuildTask>, BuildTaskStoreError> {
-        let task = BuildTask::with_cancellation(
-            app_id,
-            kind,
-            self.workers.cancellation(),
-            self.workers.cleanup_pending(),
-        );
-        let now = Utc::now().timestamp();
+        self.create_inner(app_id, kind, false).await
+    }
+
+    /// Registration is the ordering point, not UUID generation on another
+    /// thread. Select and signal older Builds under the same short map lock.
+    pub async fn create_superseding_build(
+        &self,
+        app_id: String,
+    ) -> Result<Arc<BuildTask>, BuildTaskStoreError> {
+        self.create_inner(app_id, BuildTaskKind::Build, true).await
+    }
+
+    async fn create_inner(
+        &self,
+        app_id: String,
+        kind: BuildTaskKind,
+        supersede: bool,
+    ) -> Result<Arc<BuildTask>, BuildTaskStoreError> {
         let mut map = self.map.lock().await;
+        let now = Utc::now().timestamp();
         map.retain(|_, existing| {
             let terminal_at = existing.terminal_at.load(Ordering::Acquire);
             terminal_at == 0 || now.saturating_sub(terminal_at) < TERMINAL_TASK_TTL_SECS
@@ -509,7 +551,32 @@ impl BuildTaskStore {
             };
             map.remove(&oldest_terminal_id);
         }
+        let task = BuildTask::with_cancellation(
+            app_id.clone(),
+            kind,
+            self.workers.cancellation(),
+            self.workers.cleanup_pending(),
+        );
+        let older: Vec<_> = if supersede {
+            map.values()
+                .filter(|existing| {
+                    existing.app_id == app_id
+                        && existing.kind == BuildTaskKind::Build
+                        && existing.terminal_at.load(Ordering::Acquire) == 0
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for existing in &older {
+            existing.cancel();
+        }
         map.insert(task.id.clone(), task.clone());
+        drop(map);
+        for existing in older {
+            existing.request_cancel().await;
+        }
         Ok(task)
     }
 
@@ -535,6 +602,82 @@ impl BuildTaskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_build_admission_supersedes_pending_builds_but_not_dev() {
+        let store = Arc::new(BuildTaskStore::new());
+        let dev = store
+            .create("application".into(), BuildTaskKind::DevStart)
+            .await
+            .unwrap();
+        let older = store
+            .create_superseding_build("application".into())
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            joins.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .create_superseding_build("application".into())
+                    .await
+                    .unwrap()
+            }));
+        }
+        barrier.wait().await;
+        let a = joins.remove(0).await.unwrap();
+        let b = joins.remove(0).await.unwrap();
+        let (earlier, latest) = if a.id < b.id { (a, b) } else { (b, a) };
+        assert!(older.is_cancelled());
+        assert!(earlier.is_cancelled());
+        assert!(!latest.is_cancelled());
+        assert!(!dev.is_cancelled());
+        assert_eq!(earlier.status().await, BuildTaskStatus::Cancelled);
+        // Late worker fallback and success cannot override cancellation or add a terminal.
+        earlier
+            .emit(BuildProgressEvent::Failed {
+                error: "cancelled command exited".into(),
+            })
+            .await;
+        earlier
+            .emit(BuildProgressEvent::Completed {
+                release_id: "unused".into(),
+                sha256: String::new(),
+                size_bytes: 0,
+                file_name: String::new(),
+                artifact_path: String::new(),
+            })
+            .await;
+        let (events, _) = earlier.subscribe(0).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(_, event)| matches!(
+                    event,
+                    BuildProgressEvent::Cancelled
+                        | BuildProgressEvent::Completed { .. }
+                        | BuildProgressEvent::Failed { .. }
+                ))
+                .count(),
+            1
+        );
+        // Signal/publication gap: a worker may finish before request_cancel
+        // obtains the state lock. Its fallback must still publish Cancelled.
+        latest.cancel();
+        latest
+            .emit(BuildProgressEvent::Failed {
+                error: "worker finished before cancel event publication".into(),
+            })
+            .await;
+        latest.request_cancel().await;
+        assert_eq!(latest.status().await, BuildTaskStatus::Cancelled);
+        let (events, _) = latest.subscribe(0).await;
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].1, BuildProgressEvent::Cancelled));
+    }
 
     #[tokio::test]
     async fn terminal_event_does_not_release_a_workers_workspace_lease() {

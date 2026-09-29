@@ -41,6 +41,8 @@ pub struct BuildTaskSnapshot {
     pub kind: BuildTaskKind,
     /// 任务状态（枚举：`pending` / `running` / `completed` / `failed` / `cancelled`）
     pub status: BuildTaskStatus,
+    /// 当前阶段，如 `waiting_for_build_slot`（等待执行名额）、`building`；
+    /// 展示字段，调用方应容忍新增阶段，终态以 status 为准。
     pub stage: Option<String>,
     /// 当前/失败中断的子项目 service_id（构建日志按 service_id 归档，
     /// 失败排查用 `tasks/{id}/logs?service=` 同键取日志）

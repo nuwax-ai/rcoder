@@ -41,17 +41,8 @@ use shared_types::ProjectType;
 use assemble::assemble_workspace_package;
 use manifest::{ReleaseMetadata, build_release_lock, read_workspace_manifest};
 
-use crate::models::{BuildTaskId, BuildTaskKind};
+use crate::models::BuildTaskId;
 use tasks::{BuildProgressEvent, BuildTask, BuildTaskStore};
-
-/// 同 app 构建锁的等待预算：持有方（dev 任务的编译阶段，或已被接替取消的
-/// 构建）一个完整构建周期的上界。持有方逐服务串行构建、每服务命令受
-/// `timeout_secs` 约束，故预算 = (服务数 + 1) × timeout_secs（+1 覆盖组包
-/// 收尾）。仍在自身超时包络内推进的持有方（持续产出构建日志）永远等得到；
-/// 预算到期只可能因持有方越过自身超时仍未返回（真卡死），此时 fail-fast。
-fn build_lock_wait_budget(enabled_services: usize, timeout_secs: u64) -> Duration {
-    Duration::from_secs(timeout_secs.saturating_mul(enabled_services.saturating_add(1) as u64))
-}
 
 /// 整体包产物文件名前缀（产物落 `{ws}/builds/` 子目录，见 [`WORKSPACE_BUILDS_DIR`]；
 /// `GET /api/v1/userapp/static/{app_id}` 按 app 直下取包——缺省最新，`?release_id=` 指定版本）。
@@ -92,7 +83,7 @@ pub(super) fn is_pnpm_no_lockfile_failure(error: &AppError) -> bool {
 /// `dev_mode::devbuild_with_no_lockfile_heal`（公告/安装/终错三段共用）。
 async fn build_service_with_no_lockfile_heal(
     request: &GenericBuildRequest<'_>,
-    guard: &BuildGuard<'_>,
+    guard: &BuildGuard,
     progress: &Option<Arc<BuildTask>>,
     service_id: &str,
 ) -> AppResult<PathBuf> {
@@ -102,7 +93,8 @@ async fn build_service_with_no_lockfile_heal(
         Err(error) => return Err(error),
     };
     emit_no_lockfile_heal_log(progress, service_id, &first).await;
-    let install_error = heal_pnpm_install(request.cwd, request.log_dir, request.timeout_secs).await;
+    let install_error =
+        heal_pnpm_install(request.cwd, request.log_dir, request.timeout_secs).await?;
     match build_generic(request, guard).await {
         Ok(artifact) => Ok(artifact),
         Err(retry) => Err(self_heal_retry_error(retry, install_error)),
@@ -132,7 +124,11 @@ async fn emit_no_lockfile_heal_log(
 /// 同轴 logs/<service_id>：main + 新 dev-temp）；安装失败不放弃重试（pnpm
 /// 先写 lockfile 再跑 postinstall，部分安装后 lockfile 已可用）。返回安装
 /// 错误文本（None=安装成功）。
-async fn heal_pnpm_install(cwd: &Path, log_dir: &Path, timeout_secs: u64) -> Option<String> {
+async fn heal_pnpm_install(
+    cwd: &Path,
+    log_dir: &Path,
+    timeout_secs: u64,
+) -> AppResult<Option<String>> {
     let install_logs = file_server::service::pnpm::LogFiles::new(
         log_dir.join(file_server::service::dev_server::log::main_log_name()),
         log_dir.join(file_server::service::dev_server::log::temp_log_name(
@@ -147,8 +143,12 @@ async fn heal_pnpm_install(cwd: &Path, log_dir: &Path, timeout_secs: u64) -> Opt
     )
     .await
     {
-        Ok(_) => None,
-        Err(error) => Some(error.to_string()),
+        Ok(_) => Ok(None),
+        Err(
+            error @ (file_server::service::pnpm::InstallError::Cancelled
+            | file_server::service::pnpm::InstallError::CleanupUnconfirmed { .. }),
+        ) => Err(AppError::process(error.to_string())),
+        Err(error) => Ok(Some(error.to_string())),
     }
 }
 
@@ -222,6 +222,38 @@ pub async fn build_workspace_package(
     timeout_secs: u64,
     progress: Option<Arc<BuildTask>>,
 ) -> AppResult<WorkspaceBuildArtifact> {
+    let guard = build_manager
+        .start_after_release(
+            app_id,
+            Duration::from_secs(config.userapp_build_wait_timeout_secs),
+        )
+        .await?;
+    guard
+        .scope(build_workspace_package_with_guard(
+            config,
+            &guard,
+            app_id,
+            release_id,
+            timeout_secs,
+            progress,
+        ))
+        .await
+}
+
+/// The caller may retain this lease through dev startup, not just compilation.
+pub async fn build_workspace_package_with_guard(
+    config: &file_server::Config,
+    guard: &BuildGuard,
+    app_id: &str,
+    release_id: &str,
+    timeout_secs: u64,
+    progress: Option<Arc<BuildTask>>,
+) -> AppResult<WorkspaceBuildArtifact> {
+    if guard.project_id() != app_id {
+        return Err(AppError::system(
+            "build guard belongs to a different project",
+        ));
+    }
     // 1. workspace 根（Userapp 开发卷, 容器无关）
     let ws = file_server::workspace::resolve_userapp_dev(app_id, None, config)?;
     if !tokio::fs::metadata(&ws)
@@ -257,14 +289,6 @@ pub async fn build_workspace_package(
         .filter(|project| project.manifest.project.enabled)
         .collect();
 
-    // 整个 workspace 构建周期持有 app_id 的 BuildGuard(项目互斥 + 1 个全局 permit):
-    // 避免子项目构建间隙释放锁导致同 app_id 构建穿插、首个构建中途 409 失败(#13)。
-    // guard 以引用传给每个子项目 build_generic,跨整个 for 循环不释放。
-    // 同 app 已有构建在途时等待而非失败(自动接替语义):Build 任务在受理期已被
-    // 更新的构建请求取消,dev 任务的编译阶段则等其自然完成(见 start_build_task)。
-    let _ws_guard = build_manager
-        .start_after_release(app_id, build_lock_wait_budget(enabled.len(), timeout_secs))
-        .await?;
     // 等待窗口内被接替(更新请求已把本任务置 Cancelled)→ 不再进入构建。
     if let Some(progress) = &progress
         && progress.is_cancelled()
@@ -274,7 +298,7 @@ pub async fn build_workspace_package(
 
     let mut built: Vec<BuiltProject> = Vec::with_capacity(enabled.len());
     for proj in enabled {
-        // 软取消：服务间检查（硬 cancel 靠外部 kill 进程组，见 cancel handler）。
+        // 服务间检查取消；执行中的命令由同一任务 token 通知进程树清理。
         // 不在此 emit 终态（Cancelled 由 cancel handler / 顶层 task 统一 emit）。
         if let Some(p) = &progress {
             if p.is_cancelled() {
@@ -323,7 +347,7 @@ pub async fn build_workspace_package(
                 on_pid: pid_ref,
                 on_line: Some(line_cb.clone()),
             },
-            &_ws_guard,
+            guard,
             &progress,
             proj.service_id(),
         )
@@ -549,10 +573,10 @@ async fn any_project_manifest(ws: &Path) -> bool {
 /// 同 app_id 并发语义（自动接替，取代旧的 409 fail-fast）：
 /// - 受理新构建时，同 app **更早的在途 Build 任务**被立即取消（`request_cancel`：
 ///   转 Cancelled 终态 + 取消信号终止其构建子进程），本任务随后经
-///   `build_workspace_package` 的 `start_after_release` 等待锁释放并开始——
+///   可取消的 `start_after_release` 等待同项目及全局容量释放并开始——
 ///   最新构建请求胜出，重复点击不再产生 failed 任务。
 /// - **DevStart/DevRestart 不被接替**：其编译阶段结束后还要拉起服务，中途取消
-///   会把用户刚触发的部署打成半途；新构建等待其编译阶段自然完成。
+///   会把用户刚触发的部署打成半途；新构建等待其编译和启动交接完成。
 /// - 该 guard 同时占用 1 个全局并发 permit，以引用传给每个子项目 build_generic。
 ///
 /// 非循环路径的 Err（如 release lock env 缺失）由这里兜底 emit Failed。
@@ -570,12 +594,9 @@ pub async fn start_build_task(
     let workspace_activity = store.workspace_activity(&app_id).await.read_owned().await;
     // 容量耗尽(全活跃任务达上限)→ 立即拒绝,不再越过上限插入(#12)。
     let task = store
-        .create(app_id.clone(), BuildTaskKind::Build)
+        .create_superseding_build(app_id.clone())
         .await
         .map_err(|e| AppError::business(e.to_string()))?;
-    // 自动接替:取消同 app 更早的在途构建(最新请求胜出)。在新任务入 store 之后
-    // 执行——旧任务的取消只依赖其自身状态,与新任务可见性无竞态。
-    supersede_older_build_tasks(store, &app_id, &task).await;
     // release_id 预生成并预置进快照：创建响应（BuildCreatedData.artifact_path）与
     // pending 期轮询即可见确定性产物路径；build_workspace_package 消费同一值,
     // Completed 事件携带一致路径覆盖（两处同源）。
@@ -589,70 +610,70 @@ pub async fn start_build_task(
     let task_spawn = task.clone();
     let config = Arc::clone(config);
     let context = task.command_context();
-    store
-        .workers
-        .spawn_identified(
-            context.identity.clone(),
-            context.scope(async move {
-                let _workspace_activity = workspace_activity;
-                let result = build_workspace_package(
-                    &config,
-                    build_manager.as_ref(),
-                    &app_id,
-                    &release_id,
-                    timeout_secs,
-                    Some(task_spawn.clone()),
-                )
-                .await;
-                // 终态统一由此 emit：build_workspace_package 只发非终态进度（Building/BuildOk/BuildFail）。
-                // Ok → Completed；Err 且非 cancel → Failed（cancel 的 Cancelled 已由 cancel handler emit）。
-                match result {
-                    Ok(artifact) => {
+    let spawned = store.workers.spawn_identified(
+        context.identity.clone(),
+        context.scope(async move {
+            let activity = Arc::new(workspace_activity);
+            let result = async {
+                task_spawn
+                    .waiting_for_build_slot(config.userapp_build_wait_timeout_secs)
+                    .await;
+                let guard = build_manager
+                    .start_after_release(
+                        &app_id,
+                        Duration::from_secs(config.userapp_build_wait_timeout_secs),
+                    )
+                    .await?
+                    .keep_alive(activity.clone());
+                guard
+                    .scope(build_workspace_package_with_guard(
+                        &config,
+                        &guard,
+                        &app_id,
+                        &release_id,
+                        timeout_secs,
+                        Some(task_spawn.clone()),
+                    ))
+                    .await
+            }
+            .await;
+            // 终态统一由此 emit：build_workspace_package 只发非终态进度（Building/BuildOk/BuildFail）。
+            // Ok → Completed；Err 且非 cancel → Failed（cancel 的 Cancelled 已由 cancel handler emit）。
+            match result {
+                Ok(artifact) => {
+                    task_spawn
+                        .emit(BuildProgressEvent::Completed {
+                            release_id: artifact.release_id.clone(),
+                            sha256: artifact.sha256.clone(),
+                            size_bytes: artifact.size_bytes,
+                            file_name: artifact.file_name.clone(),
+                            artifact_path: artifact.rel_path.clone(),
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    if task_spawn.is_cancelled() {
+                        task_spawn.emit(BuildProgressEvent::Cancelled).await;
+                    } else if !task_spawn.is_terminal().await {
                         task_spawn
-                            .emit(BuildProgressEvent::Completed {
-                                release_id: artifact.release_id.clone(),
-                                sha256: artifact.sha256.clone(),
-                                size_bytes: artifact.size_bytes,
-                                file_name: artifact.file_name.clone(),
-                                artifact_path: artifact.rel_path.clone(),
+                            .emit(BuildProgressEvent::Failed {
+                                error: e.to_string(),
                             })
                             .await;
                     }
-                    Err(e) => {
-                        if !task_spawn.is_cancelled() && !task_spawn.is_terminal().await {
-                            task_spawn
-                                .emit(BuildProgressEvent::Failed {
-                                    error: e.to_string(),
-                                })
-                                .await;
-                        }
-                    }
                 }
-            }),
-        )
-        .map_err(AppError::system)?;
+            }
+        }),
+    );
+    if let Err(error) = spawned {
+        task.emit(BuildProgressEvent::Failed {
+            error: error.clone(),
+        })
+        .await;
+        return Err(AppError::system(error));
+    }
 
     Ok((task.id.clone(), artifact_path))
-}
-
-/// 自动接替：取消同 app **更早**的在途 Build 任务。
-///
-/// - 只接替 `Build`：DevStart/DevRestart 的编译阶段后还要拉起服务，中途取消
-///   会把部署打成半途（见 `start_build_task` 文档）。
-/// - "更早"以任务 id（UUIDv7，字典序即创建序）严格小于判定：排除自身，也使
-///   并发受理的两个新任务只有较新者接替较旧者，不会互相取消。
-async fn supersede_older_build_tasks(store: &BuildTaskStore, app_id: &str, newer: &Arc<BuildTask>) {
-    for older in store.active_tasks_for_app(app_id).await {
-        if older.kind == BuildTaskKind::Build && older.id < newer.id {
-            tracing::info!(
-                app_id,
-                superseded = %older.id,
-                by = %newer.id,
-                "superseding in-flight build with newer build request"
-            );
-            older.request_cancel().await;
-        }
-    }
 }
 
 /// 构建输出行回调（同步 send 进管道通道；Arc 式跨入 spawn task）。
@@ -1161,25 +1182,42 @@ mod stack_tests {
     fn rebuild_supersedes_in_flight_build_instead_of_failing() {
         const CHILD: &str = "RCODER_BUILD_SUPERSEDE_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "service::userapp::stack_tests::rebuild_supersedes_in_flight_build_instead_of_failing",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .env("RCODER_PINGAP_VERSION", "0.14.3")
-                .env("RCODER_PINGAP_COMMIT", "supersede-test")
-                .env("RCODER_RUNTIME_IMAGE_DIGEST", "local-dev")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "child {}\n{}\n{}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            use std::os::unix::fs::PermissionsExt;
+            let bin = tempfile::tempdir().unwrap();
+            let pnpm = bin.path().join("pnpm");
+            std::fs::write(
+                &pnpm,
+                "#!/bin/sh\necho $$ > first.started\nsleep 30\ntouch obsolete-write\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&pnpm, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut paths = vec![bin.path().to_path_buf()];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            let path = std::env::join_paths(paths).unwrap();
+            for mode in ["manifest", "pnpm-heal"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "service::userapp::stack_tests::rebuild_supersedes_in_flight_build_instead_of_failing",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, mode)
+                    .env("PATH", &path)
+                    .env("RCODER_PINGAP_VERSION", "0.14.3")
+                    .env("RCODER_PINGAP_COMMIT", "supersede-test")
+                    .env("RCODER_RUNTIME_IMAGE_DIGEST", "local-dev")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{mode}: child {}\n{}\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
             return;
         }
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1193,8 +1231,14 @@ mod stack_tests {
                 let ws = tmp.path().join("supersede-app");
                 std::fs::create_dir_all(ws.join("web")).unwrap();
                 std::fs::write(ws.join("workspace.manifest.toml"), "schema_version = 1\n[workspace]\nname = 'supersede'\n").unwrap();
-                // 慢构建（3s）：保证第一个任务持锁在途时第二个请求到达。
-                std::fs::write(ws.join("web/project.manifest.toml"), "schema_version = 1\n[project]\nservice_id = 'web'\nname = 'web'\ntype = 'static'\n[build]\ncommand = ['sh', '-c', 'sleep 3; mkdir -p dist && echo supersede > dist/index.html']\nartifact = 'dist'\n[proxy]\npath = '/'\nstrip_prefix = false\n").unwrap();
+                // The first command would write after 30s if cancellation is
+                // ignored. The replacement is fast; both must settle within 8s.
+                let first_command = if std::env::var(CHILD).unwrap() == "pnpm-heal" {
+                    "echo ERR_PNPM_NO_LOCKFILE; exit 1"
+                } else {
+                    "echo $$ > first.started; sleep 30; touch obsolete-write"
+                };
+                std::fs::write(ws.join("web/project.manifest.toml"), format!("schema_version = 1\n[project]\nservice_id = 'web'\nname = 'web'\ntype = 'static'\n[build]\ncommand = ['sh', '-c', 'if test ! -e first.started; then {first_command}; fi; mkdir -p dist && echo supersede > dist/index.html']\nartifact = 'dist'\n[proxy]\npath = '/'\nstrip_prefix = false\n")).unwrap();
                 let config = Arc::new(file_server::Config {
                     userapp_workspace_dir: tmp.path().to_path_buf(),
                     userapp_single_app_id: None,
@@ -1205,16 +1249,19 @@ mod stack_tests {
                 let manager = Arc::new(BuildManager::new(1));
                 let (first_id, _) = start_build_task(&store, &config, manager.clone(), ws.clone(), "supersede-app".into(), 30).await.unwrap();
                 let first = store.get(&first_id).await.unwrap();
-                // 等第一个任务进入 Running（已持锁、构建子进程已启动）再重复请求，
-                // 确保测的是"占用中被接替"而非"排队先后"。
-                tokio::time::timeout(Duration::from_secs(10), async {
+                // Observe a marker written by the actual manifest/pnpm process,
+                // not a Running event emitted before spawn.
+                let first_pid = tokio::time::timeout(Duration::from_secs(10), async {
                     loop {
-                        if matches!(first.status().await, crate::models::BuildTaskStatus::Running) {
-                            break;
+                        if let Ok(marker) = tokio::fs::read_to_string(ws.join("web/first.started")).await
+                            && let Ok(pid) = marker.trim().parse::<u32>()
+                            && pid > 1
+                        {
+                            break pid;
                         }
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
-                }).await.expect("first build reaches Running (lock held)");
+                }).await.expect("first child really starts");
 
                 let (second_id, second_path) = start_build_task(&store, &config, manager, ws.clone(), "supersede-app".into(), 30).await.unwrap();
                 let second = store.get(&second_id).await.unwrap();
@@ -1230,7 +1277,7 @@ mod stack_tests {
                 assert_eq!(first_snapshot.status, crate::models::BuildTaskStatus::Cancelled, "{first_snapshot:?}");
 
                 // 新任务等锁释放（旧子进程被取消信号终止）→ 重新构建 → 完成。
-                tokio::time::timeout(Duration::from_secs(30), async {
+                tokio::time::timeout(Duration::from_secs(8), async {
                     loop {
                         if second.is_terminal().await { break; }
                         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1238,6 +1285,13 @@ mod stack_tests {
                 }).await.expect("second build completes after supersede");
                 let second_snapshot = second.snapshot().await;
                 assert_eq!(second_snapshot.status, crate::models::BuildTaskStatus::Completed, "{second_snapshot:?}");
+                assert!(!ws.join("web/obsolete-write").exists(), "cancelled command must not continue writing");
+                assert!(!process_utils::process_group_exists(first_pid).unwrap(),
+                    "the old process group must be gone before the replacement completes");
+                let (events, _) = first.subscribe(0).await;
+                assert_eq!(events.iter().filter(|(_, event)| matches!(event,
+                    BuildProgressEvent::Cancelled | BuildProgressEvent::Failed { .. } | BuildProgressEvent::Completed { .. }
+                )).count(), 1, "worker completion must not publish a second terminal");
                 let bytes = std::fs::read(ws.join(&second_path)).unwrap();
                 assert!(!bytes.is_empty(), "superseding build produces artifact");
                 store.workers.drain(tokio::time::Instant::now() + Duration::from_secs(5)).await.unwrap();

@@ -283,6 +283,13 @@ pub async fn run_command_to_log(
     if cancellation.is_cancelled() {
         return Err(AppError::business("command cancelled before spawn"));
     }
+    if crate::service::build_manager::BuildGuard::current()
+        .is_some_and(|guard| guard.cleanup_pending())
+    {
+        return Err(AppError::process(
+            "previous command process-tree cleanup is still pending",
+        ));
+    }
     let record = process_utils::command_context::CommandRecord::prepare()
         .map_err(|e| AppError::system(format!("persist command intent: {e}")))?;
     let mut child = match process_utils::guardian::spawn_owned(cmd, record.as_ref()).await {
@@ -302,7 +309,7 @@ pub async fn run_command_to_log(
     if let Some(receipt) = &record
         && let Err(error) = receipt.running(child.id())
     {
-        process_utils::command_context::retain_cleanup(Some(child), record);
+        crate::service::build_manager::BuildGuard::retain_command_cleanup(child, record);
         return Err(AppError::system(format!("persist owned child: {error}")));
     }
     // PID is diagnostic only; cancellation reaches the retained child owner.
@@ -345,7 +352,7 @@ pub async fn run_command_to_log(
         cleanup,
         process_utils::managed_tree::StopOutcome::Unconfirmed
     ) {
-        process_utils::command_context::retain_cleanup(Some(child), record);
+        crate::service::build_manager::BuildGuard::retain_command_cleanup(child, record);
         Err(AppError::system(
             "owned command process-tree cleanup unconfirmed",
         ))
@@ -421,16 +428,20 @@ async fn append_run_log_tail(err: AppError, temp_log: &Path) -> AppError {
 }
 
 /// 等待 stdout/stderr 日志管道 task 结束,确保 child 退出后尾部日志写完(#17)。
-/// 每个 handle 给 2s drain 窗口;超时/panic 仅告警,不影响构建结果。
+/// 两个 handle 共用 2s drain 窗口；超时/panic 仅告警，不影响构建结果。
 async fn drain_log_pipes(stdout: Option<JoinHandle<()>>, stderr: Option<JoinHandle<()>>) {
-    const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
-    for handle in stdout.into_iter().chain(stderr) {
-        match tokio::time::timeout(DRAIN_TIMEOUT, handle).await {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    for mut handle in stdout.into_iter().chain(stderr) {
+        match tokio::time::timeout_at(deadline, &mut handle).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!(error = %e, "log pipe task ended with error"),
-            Err(_) => tracing::warn!(
-                "log pipe drain timed out after {DRAIN_TIMEOUT:?}; tail logs may be incomplete"
-            ),
+            Err(_) => {
+                handle.abort();
+                // Drop its log callback as well, so the caller can close its
+                // progress channel instead of waiting forever on an orphan.
+                drop(handle.await);
+                tracing::warn!("log pipe drain timed out; tail logs may be incomplete");
+            }
         }
     }
 }

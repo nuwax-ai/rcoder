@@ -51,6 +51,10 @@ pub enum InstallError {
         #[source]
         source: std::io::Error,
     },
+    #[error("pnpm operation cancelled")]
+    Cancelled,
+    #[error("pnpm process-tree cleanup remains unconfirmed: {reason}")]
+    CleanupUnconfirmed { reason: String },
     #[error("pnpm install timed out after {timeout_secs}s")]
     TimedOut { timeout_secs: u64 },
     #[error("pnpm install failed (exit {exit_code}, {kind}{code_suffix}): {message}")]

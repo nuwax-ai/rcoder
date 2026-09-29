@@ -12,7 +12,9 @@ use super::classify::classify_failure;
 use super::error::InstallError;
 use super::protocol::{ObservedLine, observe_event};
 use super::types::{InstallOptions, InstallOutcome, InstallSummary, LogFiles};
-use crate::service::dev_server::{log, process};
+use crate::service::build_manager::BuildGuard;
+use crate::service::dev_server::log;
+use process_utils::command_context::{CommandContext, CommandRecord, retain_cleanup};
 
 const CAPTURE_LIMIT: usize = 1024 * 1024;
 
@@ -86,7 +88,7 @@ async fn install_with_heal(
         packages = ?packages,
         "pnpm ignored-builds: approving blocked build scripts and retrying install once"
     );
-    approve_builds(cwd, &packages, timeout_secs).await;
+    approve_builds(cwd, &packages, timeout_secs).await?;
     // 自愈重试等价 install_once（heal_allowed=false 分支只透传单次结果，
     // 不再触发自愈——直调避免 async 递归 boxing）。
     install_once(cwd, options, logs, timeout_secs).await
@@ -138,45 +140,33 @@ fn extract_ignored_build_packages(message: &str) -> Vec<String> {
 
 /// 显式放行被阻断的构建脚本（非交互 `pnpm approve-builds <pkgs>`；best-effort，
 /// 失败仅告警——随后重试的 install 会给出真实失败原因）。
-async fn approve_builds(cwd: &Path, packages: &[String], timeout_secs: u64) {
+async fn approve_builds(
+    cwd: &Path,
+    packages: &[String],
+    timeout_secs: u64,
+) -> Result<(), InstallError> {
     let mut command = Command::new("pnpm");
     command
         .arg("approve-builds")
         .args(packages)
         .current_dir(cwd);
-    if let Ok(path) = std::env::var("PATH") {
-        command.env("PATH", path);
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        command.env("HOME", home);
-    }
     command.env_remove("CI");
     command.stdin(Stdio::null());
-    command.stdout(Stdio::null());
+    command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    #[cfg(unix)]
-    command.process_group(0);
-    let child = command.spawn();
-    let mut child = match child {
-        Ok(child) => child,
-        Err(source) => {
-            tracing::warn!(%source, "pnpm approve-builds spawn failed");
-            return;
+    match run_owned_command(command, None, timeout_secs).await {
+        Ok((status, _, _)) if status.success() => Ok(()),
+        Err(error @ (InstallError::Cancelled | InstallError::CleanupUnconfirmed { .. })) => {
+            Err(error)
         }
-    };
-    match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-        Ok(Ok(status)) if status.success() => {}
-        Ok(Ok(status)) => {
+        result => {
+            // Ordinary approve failures remain best-effort; the next install
+            // provides the diagnostic. Cancellation must never start a retry.
             tracing::warn!(
-                exit_code = status.code().unwrap_or(-1),
-                "pnpm approve-builds non-success (retry install will surface real error)"
+                ?result,
+                "pnpm approve-builds failed; retry install will surface error"
             );
-        }
-        Ok(Err(source)) => tracing::warn!(%source, "pnpm approve-builds wait failed"),
-        Err(_) => {
-            tracing::warn!("pnpm approve-builds timed out");
-            drop(child.start_kill());
-            drop(child.wait().await);
+            Ok(())
         }
     }
 }
@@ -203,62 +193,9 @@ async fn install_once(
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    #[cfg(unix)]
-    command.process_group(0);
-
     let started = Instant::now();
-    let mut child = command
-        .spawn()
-        .map_err(|source| InstallError::Spawn { source })?;
-    let child_pid = child.id();
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let stdout_logs = logs.cloned();
-    let stderr_logs = logs.cloned();
-
-    let stdout_task = tokio::spawn(async move {
-        match stdout {
-            Some(stream) => read_stream(stream, stdout_logs.as_ref()).await,
-            None => StreamResult::default(),
-        }
-    });
-    let stderr_task = tokio::spawn(async move {
-        match stderr {
-            Some(stream) => read_stream(stream, stderr_logs.as_ref()).await,
-            None => StreamResult::default(),
-        }
-    });
-
-    let status = match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(source)) => {
-            terminate_and_reap(&mut child, child_pid).await;
-            if let Err(e) = stdout_task.await {
-                tracing::warn!(error = %e, "stdout reader task join failed during wait-error path (skipping)");
-            }
-            if let Err(e) = stderr_task.await {
-                tracing::warn!(error = %e, "stderr reader task join failed during wait-error path (skipping)");
-            }
-            return Err(InstallError::Wait { source });
-        }
-        Err(_) => {
-            terminate_and_reap(&mut child, child_pid).await;
-            if let Err(e) = stdout_task.await {
-                tracing::warn!(error = %e, "stdout reader task join failed during timeout path (skipping)");
-            }
-            if let Err(e) = stderr_task.await {
-                tracing::warn!(error = %e, "stderr reader task join failed during timeout path (skipping)");
-            }
-            return Err(InstallError::TimedOut { timeout_secs });
-        }
-    };
-
-    let stdout_result = stdout_task.await.map_err(|error| InstallError::Wait {
-        source: std::io::Error::other(format!("pnpm stdout reader task failed: {error}")),
-    })?;
-    let stderr_result = stderr_task.await.map_err(|error| InstallError::Wait {
-        source: std::io::Error::other(format!("pnpm stderr reader task failed: {error}")),
-    })?;
+    let (status, stdout_result, stderr_result) =
+        run_owned_command(command, logs, timeout_secs).await?;
     let stream_errors: Vec<String> = [stdout_result.error.clone(), stderr_result.error.clone()]
         .into_iter()
         .flatten()
@@ -339,21 +276,116 @@ fn install_args(options: &InstallOptions) -> Vec<String> {
     args
 }
 
-async fn terminate_and_reap(child: &mut tokio::process::Child, pid: Option<u32>) {
-    if let Some(pid) = pid {
-        process::kill_process_group_force(pid);
-    } else {
-        if let Err(e) = child.start_kill() {
-            tracing::warn!(error = %e, "start_kill failed (child may already be dead)");
-        }
+/// All pnpm phases share command cancellation and process-tree ownership with
+/// manifest builds, including the lockfile/ignored-builds recovery branches.
+async fn run_owned_command(
+    command: Command,
+    logs: Option<&LogFiles>,
+    timeout_secs: u64,
+) -> Result<(std::process::ExitStatus, StreamResult, StreamResult), InstallError> {
+    let cancellation = CommandContext::current()
+        .map(|context| context.cancellation)
+        .unwrap_or_default();
+    if cancellation.is_cancelled() {
+        return Err(InstallError::Cancelled);
     }
-    // 回收子进程，让 stdout/stderr reader 收到 EOF，避免留下 zombie 和后台 task。
-    if let Err(e) = child.wait().await {
-        tracing::warn!(error = %e, "wait to reap child failed (skipping)");
+    if BuildGuard::current().is_some_and(|guard| guard.cleanup_pending()) {
+        return Err(InstallError::CleanupUnconfirmed {
+            reason: "the previous command in this build is still being stopped".into(),
+        });
+    }
+    let record = CommandRecord::prepare().map_err(|source| InstallError::Wait { source })?;
+    let mut child = match process_utils::guardian::spawn_owned(command, record.as_ref()).await {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(record) = record
+                && record.quiescent().is_err()
+            {
+                retain_cleanup(None, Some(record));
+            }
+            return Err(InstallError::Spawn {
+                source: std::io::Error::other(error),
+            });
+        }
+    };
+    if let Some(receipt) = &record
+        && let Err(source) = receipt.running(child.id())
+    {
+        BuildGuard::retain_command_cleanup(child, record);
+        return Err(InstallError::CleanupUnconfirmed {
+            reason: format!("persist running receipt failed: {source}; cleanup continues"),
+        });
+    }
+    let stdout = child.take_stdout();
+    let stderr = child.take_stderr();
+    let stdout_logs = logs.cloned();
+    let stderr_logs = logs.cloned();
+    let stdout_task = tokio::spawn(async move {
+        match stdout {
+            Some(stream) => read_stream(stream, stdout_logs.as_ref()).await,
+            None => StreamResult::default(),
+        }
+    });
+    let stderr_task = tokio::spawn(async move {
+        match stderr {
+            Some(stream) => read_stream(stream, stderr_logs.as_ref()).await,
+            None => StreamResult::default(),
+        }
+    });
+    let result = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(InstallError::Cancelled),
+        waited = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_root()) => {
+            match waited {
+                Ok(result) => result.map_err(|source| InstallError::Wait { source }),
+                Err(_) => Err(InstallError::TimedOut { timeout_secs }),
+            }
+        }
+    };
+    let result = if matches!(
+        child.stop(Duration::from_secs(1)).await,
+        process_utils::managed_tree::StopOutcome::Unconfirmed
+    ) {
+        BuildGuard::retain_command_cleanup(child, record);
+        Err(InstallError::CleanupUnconfirmed {
+            reason: "bounded process-tree stop did not finish; cleanup continues".into(),
+        })
+    } else if let Some(record) = record {
+        match record.quiescent() {
+            Ok(()) => result,
+            Err(source) => {
+                retain_cleanup(None, Some(record));
+                Err(InstallError::Wait { source })
+            }
+        }
+    } else {
+        result
+    };
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let stdout = finish_stream(stdout_task, drain_deadline).await;
+    let stderr = finish_stream(stderr_task, drain_deadline).await;
+    result.map(|status| (status, stdout, stderr))
+}
+
+async fn finish_stream(
+    mut task: tokio::task::JoinHandle<StreamResult>,
+    deadline: tokio::time::Instant,
+) -> StreamResult {
+    match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(Ok(result)) => result,
+        result => {
+            task.abort();
+            let error = format!("pnpm output drain incomplete: {result:?}");
+            tracing::warn!(%error);
+            StreamResult {
+                error: Some(error),
+                ..StreamResult::default()
+            }
+        }
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct StreamResult {
     summary: InstallSummary,
     tail: String,

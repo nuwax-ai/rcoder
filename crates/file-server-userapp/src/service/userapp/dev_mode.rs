@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use file_server::error::{AppError, AppResult};
-use file_server::service::build_manager::BuildManager;
+use file_server::service::build_manager::BuildGuard;
 use file_server::service::dev_server::log::{main_log_name, temp_log_name};
 use file_server::service::dev_server::process::{CommandObservers, now_ms, run_command_to_log};
 use shared_types::{BuildProgressEvent, DiscoveredProject};
@@ -49,7 +49,7 @@ pub async fn dev_mode_enabled(ws: &Path) -> AppResult<bool> {
 /// 检查命令如 type-check，不产 artifact.zip）、不组 workspace 包。失败上抛
 /// （dev 任务终态 Failed、不启动——与产物态同语义）。
 pub async fn run_dev_builds(
-    build_manager: &BuildManager,
+    guard: &BuildGuard,
     app_id: &str,
     ws: &Path,
     timeout_secs: u64,
@@ -64,16 +64,11 @@ pub async fn run_dev_builds(
     shared_types::validate_workspace_startup(&workspace, &enabled)
         .map_err(|error| AppError::business(error.to_string()))?;
 
-    // 与发布编译同款互斥（同 app_id 的 /build、dev 任务并发防穿插）。
-    // 同 app 已有构建在途时等待而非失败：Build 任务通常已被更新的构建请求
-    // 接替取消（收尾秒级）；被 dev 任务占用则等其编译阶段自然完成——预算
-    // 按持有方完整构建周期推导（见 build_lock_wait_budget）。
-    let _ws_guard = build_manager
-        .start_after_release(
-            app_id,
-            super::build_lock_wait_budget(enabled.len(), timeout_secs),
-        )
-        .await?;
+    if guard.project_id() != app_id {
+        return Err(AppError::system(
+            "build guard belongs to a different project",
+        ));
+    }
 
     for proj in &enabled {
         // 软取消：服务间检查（硬 cancel 靠外部 kill 进程组，见 cancel handler）。
@@ -232,7 +227,7 @@ async fn devbuild_with_no_lockfile_heal(
         Err(error) => return Err(error),
     };
     super::emit_no_lockfile_heal_log(progress, service_id, &first).await;
-    let install_error = super::heal_pnpm_install(proj_dir, log_dir, timeout_secs).await;
+    let install_error = super::heal_pnpm_install(proj_dir, log_dir, timeout_secs).await?;
     match run_devbuild_once(argv, proj_dir, log_dir, timeout_secs, progress, service_id).await {
         Ok(()) => Ok(()),
         Err(retry) => Err(super::self_heal_retry_error(retry, install_error)),
@@ -332,6 +327,7 @@ async fn discover_ws_projects(ws: &Path) -> AppResult<Vec<DiscoveredProject>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use file_server::service::build_manager::BuildManager;
     use std::fs;
 
     fn temp_ws() -> PathBuf {
@@ -488,7 +484,10 @@ mod tests {
 
     async fn run_dev_builds_on(ws: &Path, app_id: &str) -> AppResult<()> {
         let manager = BuildManager::new(1);
-        run_dev_builds(&manager, app_id, ws, 300, None).await
+        let guard = manager.try_start(app_id)?;
+        guard
+            .scope(run_dev_builds(&guard, app_id, ws, 300, None))
+            .await
     }
 
     fn devbuild_log_text(ws: &Path) -> String {
