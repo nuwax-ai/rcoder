@@ -519,4 +519,38 @@ mod tests {
             .expect_err("缺 target 必须显式报错");
         assert!(matches!(err, AppError::System(..)), "{err:?}");
     }
+
+    /// 事故锚点（TS 版 nativeRevertToTree，nuwax-k8s-test cId=1695139）：回退
+    /// 目标之后**新增**的文件让 `git rm -- ':(literal)x'` 在 index 里无匹配
+    /// → fatal pathspec did not match → revert 500 且留下半完成脏状态。
+    /// Rust 树级实现（apply_tree_to_worktree 删除 target 之外的旧文件）必须
+    /// 覆盖该场景：新增文件被移除、工作区干净、revert 提交完整落地。
+    /// 未来若对齐 TS 的 CLI 组合实现，此测试守住该语义不回归。
+    #[test]
+    fn revert_removes_files_added_after_target_and_stays_clean() {
+        let (dir, repo, c1, _c2) = fixture();
+        // 目标（c1）之后新增的文件 b.txt。
+        std::fs::write(dir.path().join("b.txt"), "added later\n").expect("write b.txt");
+        stage_path(&repo, "b.txt").expect("stage b.txt");
+        commit_indexed(&repo, "c3 add b.txt", "Test", "test@example.com").expect("commit c3");
+
+        let outcome = revert_to_commit(&repo, &c1, None, "Test", "test@example.com")
+            .expect("revert across added files succeeds");
+
+        assert!(outcome.commit.is_some(), "revert commit created");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).expect("a.txt exists"),
+            "v1\n",
+            "content restored to target"
+        );
+        assert!(
+            !dir.path().join("b.txt").exists(),
+            "file added after target must be removed from worktree"
+        );
+        let status = get_status(&repo).expect("status after revert");
+        assert!(
+            status.staged.is_empty() && status.created.is_empty(),
+            "worktree must stay clean after revert, got {status:?}"
+        );
+    }
 }
