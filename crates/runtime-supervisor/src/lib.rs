@@ -17,7 +17,10 @@ pub use control::{
 };
 pub use monitor::{Options, Owner, Policy};
 pub use record::{Intent, Quiescence, verify_live, verify_local_quiescent, verify_quiescent};
-pub use recovery::{StopWorkAttempt, continue_stop_work, prepare_stop_work, stop_work};
+pub use recovery::{
+    StopMode, StopRefused, StopWorkAttempt, continue_stop_work, continue_stop_work_with_checkpoint,
+    is_stop_refused, prepare_stop_work, stop_work,
+};
 pub use worker::{Worker, WorkerControl};
 
 pub const WORKER_ENV: &str = "RCODER_SUPERVISOR_WORKER";

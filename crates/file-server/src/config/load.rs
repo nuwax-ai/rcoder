@@ -166,6 +166,10 @@ impl Config {
         parse!(dev_alive_poll_interval_ms, "DEV_ALIVE_POLL_INTERVAL_MS");
         parse!(dev_stop_check_interval_ms, "DEV_STOP_CHECK_INTERVAL_MS");
         parse!(dev_stop_max_attempts, "DEV_STOP_MAX_ATTEMPTS");
+        parse!(
+            dev_supervision_stop_budget_secs,
+            "DEV_SUPERVISION_STOP_BUDGET_SECS"
+        );
         parse!(dev_command_timeout_secs, "DEV_COMMAND_TIMEOUT_SECS");
         parse!(max_build_concurrency, "MAX_BUILD_CONCURRENCY");
         parse!(
@@ -284,6 +288,7 @@ impl Config {
             dev_alive_poll_interval_ms: env_parse("DEV_ALIVE_POLL_INTERVAL_MS", 300)?,
             dev_stop_check_interval_ms: env_parse("DEV_STOP_CHECK_INTERVAL_MS", 100)?,
             dev_stop_max_attempts: env_parse("DEV_STOP_MAX_ATTEMPTS", 50)?,
+            dev_supervision_stop_budget_secs: env_parse("DEV_SUPERVISION_STOP_BUDGET_SECS", 90)?,
             dev_command_timeout_secs: env_parse("DEV_COMMAND_TIMEOUT_SECS", 600)?,
             max_build_concurrency: env_parse("MAX_BUILD_CONCURRENCY", 20)?,
             userapp_build_wait_timeout_secs: env_parse("USERAPP_BUILD_WAIT_TIMEOUT_SECS", 3600)?,

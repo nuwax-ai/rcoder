@@ -508,6 +508,15 @@ async fn spawn_dev_task(
                         // 稳定 origin；Start 无旧执行，直接激活启动。
                         match action {
                             DevTaskAction::Start => {
+                                // DEV-R6：Start 拒绝前不得改运行目录——激活前
+                                // 先核验/收束本地旧执行（活 run 拒绝、死记录
+                                // 就地收束、在途停止续行）。此时若拒绝，任务
+                                // Failed 而 `.run` 保持原样。
+                                state
+                                    .fs
+                                    .dev_server
+                                    .ensure_no_local_execution(&key, &ws)
+                                    .await?;
                                 let run_root = match prepared {
                                     Some(prepared) => prepared.activate()?,
                                     None => {
@@ -521,10 +530,19 @@ async fn spawn_dev_task(
                                     .start_dev(
                                         &key,
                                         &run_root,
-                                        base_path.as_deref(),
-                                        Some(hooks.clone()),
-                                        pg.as_ref(),
-                                        Some(&task_clone.id),
+                                        file_server::service::dev_server::DevLaunch {
+                                            base_path: base_path.as_deref(),
+                                            hooks: Some(hooks.clone()),
+                                            pg: pg.as_ref(),
+                                            request_context: Some(&task_clone.id),
+                                            // DEV-R6：制品身份贯穿——窗口内出现的
+                                            // serve 复用提交 Deploy(ArtifactId)。
+                                            artifact_release_id: if dev_source_mode {
+                                                None
+                                            } else {
+                                                Some(release_id.as_str())
+                                            },
+                                        },
                                     )
                                     .await?;
                             }
@@ -560,6 +578,14 @@ async fn spawn_dev_task(
                                             hooks: Some(hooks.clone()),
                                             pg: pg.as_ref(),
                                             request_context: Some(&task_clone.id),
+                                            // DEV-R6：制品身份贯穿——staged 复用
+                                            // 预检遇 serve 时提交 Deploy(ArtifactId)，
+                                            // 不退化为 Source Restart。
+                                            artifact_release_id: if dev_source_mode {
+                                                None
+                                            } else {
+                                                Some(release_id.as_str())
+                                            },
                                         },
                                         run_root,
                                     )

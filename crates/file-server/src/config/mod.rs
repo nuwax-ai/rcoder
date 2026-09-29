@@ -207,6 +207,10 @@ pub struct Config {
     pub dev_stop_check_interval_ms: u64,
     /// stop 后最大轮询次数 (对齐 nuwax 50, 合计 5s)。
     pub dev_stop_max_attempts: u32,
+    /// 本地监督停止（同请求续行）的单目标预算秒数（默认 90：覆盖守护树
+    /// 排空与离线收据；超时 attempt 保留续行，不放大不截断合法慢收束。
+    /// 测试注入小值确定性覆盖续查路径）。
+    pub dev_supervision_stop_budget_secs: u64,
     /// build/install 命令超时秒 (对齐 nuwax 10min)。
     pub dev_command_timeout_secs: u64,
     /// build 全局并发上限 (对齐 nuwax MAX_BUILD_CONCURRENCY, 默认 20)。
@@ -287,6 +291,7 @@ impl Default for Config {
             dev_alive_poll_interval_ms: 300,
             dev_stop_check_interval_ms: 100,
             dev_stop_max_attempts: 50,
+            dev_supervision_stop_budget_secs: 90,
             dev_command_timeout_secs: 600,
             max_build_concurrency: 20,
             userapp_build_wait_timeout_secs: 3600,

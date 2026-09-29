@@ -47,10 +47,7 @@ impl DevServerManager {
         &self,
         project_id: &str,
         project_path: &Path,
-        base_path: Option<&str>,
-        hooks: Option<crate::service::dev_server::supervise::DevEventHooks>,
-        pg: Option<&shared_types::StartPgCredential>,
-        request_context: Option<&str>,
+        launch: super::super::DevLaunch<'_>,
     ) -> AppResult<StartedDev> {
         // 启动锁
         {
@@ -66,25 +63,14 @@ impl DevServerManager {
             starting: &self.starting,
             project_id: project_id.to_string(),
         };
-        self.start_dev_inner(
-            project_id,
-            project_path,
-            base_path,
-            hooks,
-            pg,
-            request_context,
-        )
-        .await
+        self.start_dev_inner(project_id, project_path, launch).await
     }
 
     pub(super) async fn start_dev_inner(
         &self,
         project_id: &str,
         project_path: &Path,
-        base_path: Option<&str>,
-        hooks: Option<crate::service::dev_server::supervise::DevEventHooks>,
-        pg: Option<&shared_types::StartPgCredential>,
-        request_context: Option<&str>,
+        launch: super::super::DevLaunch<'_>,
     ) -> AppResult<StartedDev> {
         // Userapp workspace 分流：workspace.manifest.toml 存在 → app-cli 引擎。
         // manifest 多服务（Java/Go 等）的正确运行态 = app-cli 按 run.command
@@ -95,7 +81,7 @@ impl DevServerManager {
         let manifest = project_path.join("workspace.manifest.toml");
         if tokio::fs::try_exists(&manifest).await.unwrap_or(false) {
             return self
-                .start_dev_manifest(project_id, project_path, hooks, pg, request_context)
+                .start_dev_manifest(project_id, project_path, launch)
                 .await;
         }
         // 幂等: 已运行则返回现有 pid/port
@@ -114,7 +100,14 @@ impl DevServerManager {
         };
 
         let started = self
-            .spawn_and_register(project_id, project_id, project_path, port, base_path, None)
+            .spawn_and_register(
+                project_id,
+                project_id,
+                project_path,
+                port,
+                launch.base_path,
+                None,
+            )
             .await?;
         port_alloc.disarm(); // 分配成功且就绪, 不再归还端口 (Drop 变 no-op)
         Ok(started)

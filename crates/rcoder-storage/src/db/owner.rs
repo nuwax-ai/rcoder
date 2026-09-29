@@ -34,6 +34,20 @@ const REOPEN_PROBE_BACKOFF: Duration = Duration::from_secs(1);
 /// 不拖死整个恢复循环（DB-1 §4.2）。
 const SINGLE_PROBE_BUDGET: Duration = Duration::from_secs(5);
 
+/// 一次恢复探活的执行体（默认实现 = 真实 BEGIN/COMMIT；测试注入可控探针
+/// 以确定性屏障覆盖 probe/shutdown/last-drop 竞态）。
+type ProbeFn = Arc<
+    dyn Fn(toasty::Db) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync,
+>;
+
+fn real_probe(mut db: toasty::Db) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
+    Box::pin(async move {
+        let tx = db.transaction().await?;
+        tx.commit().await?;
+        anyhow::Ok(())
+    })
+}
+
 #[derive(Clone)]
 pub(crate) struct DatabaseOwner {
     /// 每个调用方克隆各持一份 sender；**绝不与 worker 共享**——最后一份
@@ -105,11 +119,17 @@ impl Shared {
         }
     }
 
-    fn admission_open(&self) -> bool {
-        matches!(
-            self.admission.lock().map(|a| *a),
-            Ok(Admission::Open) | Err(_)
-        )
+    /// Hold this guard through try_send so shutdown/panic cannot close admission
+    /// between the check and enqueue. No asynchronous work runs under this lock.
+    fn open_admission(&self) -> anyhow::Result<std::sync::MutexGuard<'_, Admission>> {
+        let admission = self.admission.lock().map_err(|_| {
+            anyhow::anyhow!("database admission lock poisoned; job was not admitted")
+        })?;
+        anyhow::ensure!(
+            matches!(*admission, Admission::Open),
+            "database is closing; job was not admitted"
+        );
+        Ok(admission)
     }
 }
 
@@ -146,6 +166,29 @@ impl DatabaseOwner {
         max_inflight: usize,
         resource: Resource,
         initialize: I,
+    ) -> anyhow::Result<Self>
+    where
+        I: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = anyhow::Result<toasty::Db>> + Send + 'static,
+        Resource: Send + 'static,
+    {
+        Self::open_with_probe(
+            queue_capacity,
+            max_inflight,
+            resource,
+            initialize,
+            Arc::new(real_probe),
+        )
+        .await
+    }
+
+    /// 测试可注入探针体（确定性时序）；生产行为与 [`Self::open`] 一致。
+    pub(crate) async fn open_with_probe<I, Fut, Resource>(
+        queue_capacity: usize,
+        max_inflight: usize,
+        resource: Resource,
+        initialize: I,
+        probe: ProbeFn,
     ) -> anyhow::Result<Self>
     where
         I: FnOnce() -> Fut + Send + 'static,
@@ -189,7 +232,7 @@ impl DatabaseOwner {
                             drop(db);
                             return Ok(());
                         }
-                        supervise(db, receiver, closing, worker_shared, max_inflight).await
+                        supervise(db, receiver, closing, worker_shared, max_inflight, probe).await
                     });
                     drop(runtime);
                     result
@@ -264,10 +307,7 @@ impl DatabaseOwner {
             })
         });
         {
-            anyhow::ensure!(
-                self.inner.admission_open(),
-                "database is closing; job was not admitted"
-            );
+            let _admission = self.inner.open_admission()?;
             self.queue.try_send(job).map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => {
                     anyhow::anyhow!("database queue is full; job was not admitted")
@@ -314,6 +354,7 @@ async fn supervise(
     mut stop: watch::Receiver<bool>,
     shared: Arc<Shared>,
     max_inflight: usize,
+    probe: ProbeFn,
 ) -> anyhow::Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     let mut stop_seen = false;
@@ -362,7 +403,7 @@ async fn supervise(
                 queue_drained = true;
                 continue;
             }
-            match reopen_probe(&db, &mut stop).await {
+            match reopen_probe(&db, &mut queue, &mut stop, &probe).await {
                 Reopen::Reopened => {
                     // 状态机提交重开：Closing（shutdown 已受理）拒绝——停机
                     // 优先，恢复探活不得覆盖关闭意图。
@@ -386,6 +427,11 @@ async fn supervise(
                     while queue.try_recv().is_ok() {}
                     queue_drained = true;
                 }
+                // DB-R4：探活期间所有调用方已消失且无已受理积压——有界退出
+                // 释放资源（线程/DB/目录独占），不因探活持续失败无限保留。
+                Reopen::LastDropped => {
+                    queue_drained = true;
+                }
             }
         }
     }
@@ -399,16 +445,28 @@ async fn supervise(
 enum Reopen {
     Reopened,
     UserStopped,
+    /// DB-R4：探活/退避循环观察到 last-drop（队列关闭且空）——owner 应有界退出。
+    LastDropped,
 }
 
-/// Probe with backoff until the pool yields a fresh connection or the user
-/// stops the owner. `Db::connection` acquires from the pool — the same
-/// recycle path production uses after a blip — so success means the
-/// transport (and a live worker) is back.
-async fn reopen_probe(db: &toasty::Db, stop: &mut watch::Receiver<bool>) -> Reopen {
+/// Probe with backoff until the pool yields a fresh connection, the user stops
+/// the owner, or every caller disappears (DB-R4: last-drop during a failing
+/// recovery must still release the owner's resources within a bounded window).
+async fn reopen_probe(
+    db: &toasty::Db,
+    queue: &mut mpsc::Receiver<Job>,
+    stop: &mut watch::Receiver<bool>,
+    probe: &ProbeFn,
+) -> Reopen {
     loop {
         if *stop.borrow() {
             return Reopen::UserStopped;
+        }
+        // 不消费元素的排空检查（closed = 全部 sender 已 drop；empty = 无已
+        // 受理积压）。closed+empty 一旦成立即稳定（无 sender 可再入队），
+        // 是安全的退出决策；已受理 backlog 存在时继续探活服务。
+        if queue.is_closed() && queue.is_empty() {
+            return Reopen::LastDropped;
         }
         // 真实语句探活，而非池 checkout：toasty 0.10.0 的 worker-gone 缺陷
         // 里连接对象完好、只有内部 worker 已退出——checkout 恒"成功"，
@@ -420,26 +478,26 @@ async fn reopen_probe(db: &toasty::Db, stop: &mut watch::Receiver<bool>) -> Reop
         // DB-1：单次探活有界（悬挂连接不拖死等待方）；等待探活时响应
         // shutdown；取消探针后 await 收束其 task（不丢句柄让探针后台裸跑）。
         // 只取消恢复探针，不中止已执行的业务事务——job 的取消语义不由此推导。
-        let mut probe_db = db.clone();
-        let mut probe = tokio::spawn(async move {
-            let tx = probe_db.transaction().await?;
-            tx.commit().await
-        });
+        let mut probe_task = tokio::spawn(probe(db.clone()));
         let outcome = tokio::select! {
             biased;
             _ = stop.changed() => {
-                probe.abort();
-                let joined = probe.await;
-                debug_assert!(joined.is_err(), "aborted probe must join cancelled");
+                probe_task.abort();
+                // Completion may have won the race with abort. Joining either
+                // result is valid; shutdown still wins this select branch.
+                if let Err(error) = probe_task.await && !error.is_cancelled() {
+                    tracing::warn!(%error, "database reopen probe failed while stopping");
+                }
                 if *stop.borrow() {
                     return Reopen::UserStopped;
                 }
                 continue;
             }
             _ = tokio::time::sleep(SINGLE_PROBE_BUDGET) => {
-                probe.abort();
-                let joined = probe.await;
-                debug_assert!(joined.is_err(), "aborted probe must join cancelled");
+                probe_task.abort();
+                if let Err(error) = probe_task.await && !error.is_cancelled() {
+                    tracing::warn!(%error, "database reopen probe failed after its budget expired");
+                }
                 tracing::warn!(
                     "database reopen probe exceeded its budget; retrying with backoff"
                 );
@@ -454,7 +512,7 @@ async fn reopen_probe(db: &toasty::Db, stop: &mut watch::Receiver<bool>) -> Reop
                 }
                 continue;
             }
-            probed = &mut probe => probed,
+            probed = &mut probe_task => probed,
         };
         match outcome {
             Ok(Ok(())) => return Reopen::Reopened,
@@ -468,6 +526,8 @@ async fn reopen_probe(db: &toasty::Db, stop: &mut watch::Receiver<bool>) -> Reop
                 );
             }
         }
+        // 探活失败的退避窗口同样观察 last-drop（DB-R4）：退避期间调用方全部
+        // 消失且无积压 → 有界退出，不空转下一轮探活。
         tokio::select! {
             biased;
             _ = stop.changed() => {
@@ -476,6 +536,9 @@ async fn reopen_probe(db: &toasty::Db, stop: &mut watch::Receiver<bool>) -> Reop
                 }
             }
             _ = tokio::time::sleep(REOPEN_PROBE_BACKOFF) => {}
+        }
+        if queue.is_closed() && queue.is_empty() {
+            return Reopen::LastDropped;
         }
     }
 }
@@ -494,6 +557,35 @@ mod admission_tests {
         }
     }
 
+    #[tokio::test]
+    async fn poisoned_admission_does_not_enqueue_a_job() {
+        let shared = Arc::new(shared());
+        let poisoned = shared.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned.admission.lock().unwrap();
+                panic!("injected admission lock poison");
+            })
+            .join()
+            .is_err()
+        );
+        let (queue, mut receiver) = mpsc::channel(1);
+        let owner = DatabaseOwner {
+            queue,
+            inner: shared,
+        };
+        let result = owner.execute(|_| async { Ok(()) });
+        tokio::pin!(result);
+        assert!(matches!(
+            futures::poll!(&mut result),
+            std::task::Poll::Ready(Err(_))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
     /// DB-1 §4.3-2：恢复探活成功提交重开时若 shutdown 已受理（Closing），
     /// 重开必须被拒——关闭意图不可被覆盖。
     #[test]
@@ -502,7 +594,7 @@ mod admission_tests {
         assert!(state.mark_recovering_if_open(), "Open -> Recovering");
         state.begin_closing();
         assert!(!state.reopen_if_recovering(), "Closing must not reopen");
-        assert!(!state.admission_open());
+        assert!(state.open_admission().is_err());
     }
 
     /// panic 冻结不得覆盖已受理的 Closing。
@@ -511,7 +603,7 @@ mod admission_tests {
         let state = shared();
         state.begin_closing();
         assert!(!state.mark_recovering_if_open());
-        assert!(!state.admission_open());
+        assert!(state.open_admission().is_err());
     }
 
     /// 正常恢复周期：Open → Recovering → Open。
@@ -519,8 +611,8 @@ mod admission_tests {
     fn normal_reopen_cycle() {
         let state = shared();
         assert!(state.mark_recovering_if_open());
-        assert!(!state.admission_open(), "frozen admission rejects");
+        assert!(state.open_admission().is_err(), "frozen admission rejects");
         assert!(state.reopen_if_recovering());
-        assert!(state.admission_open());
+        assert!(state.open_admission().is_ok());
     }
 }

@@ -99,26 +99,51 @@ impl DevServerManager {
         })
     }
 
-    /// UserApp manifest 域的停止（R05 + DEV-1 §3.3/§3.4）：**禁止 ps 扫描兜底**
-    /// ——managed 模式下登记缺失不授权 legacy 清理。
+    /// UserApp manifest 域的停止（R05 + DEV-1 §3.3/§3.4 + 复核 DEV-R1）：
+    /// **禁止 ps 扫描兜底**——managed 模式下登记缺失不授权 legacy 清理。
+    /// - 只读发现先行（先于 owner bootstrap 副作用）：本地目标的证据不
+    ///   依赖 HTTP 链路成功；
     /// - 有 external 登记 / owner 应答 → 经运行 API 停止（幂等按原
-    ///   operation_id 恢复）；
-    /// - 其余 → 本地目标收束：只读发现（平台根 + registry 段根）→ 同一
-    ///   请求停止（超时可续查，不再造第二个 Stop 自撞 Busy）→ 条件收束登记。
-    ///   503/拒连只说明"无 runtime owner 应答"，不说明"无进程"（app 211
-    ///   事故：Legacy run 活着却按"幂等成功"放行）。
+    ///   operation_id 恢复）——该链路错误如实上抛（外部 owner 是权威）；
+    /// - 无登记时 owner 链路（探测/恢复）失败**不挡住**已核验的本地目标：
+    ///   移交本地监督收束；连本地痕迹都没有时才上抛 owner 链路错误；
+    /// - 其余 → 本地目标收束：只读发现（捕获根 + 持久停止根 + 平台/registry
+    ///   根）→ 同一请求停止（超时可续查，不再造第二个 Stop 自撞 Busy）→
+    ///   退出确认后条件退休登记。503/拒连只说明"无 runtime owner 应答"，
+    ///   不说明"无进程"（app 211 事故：Legacy run 活着却按"幂等成功"放行）。
     pub async fn stop_userapp_dev(
         &self,
         project_id: &str,
         project_path: &Path,
     ) -> AppResult<StoppedDev> {
-        if let Some(stopped) = self
+        // DEV-R1：磁盘 phase / TCP 端口都不能单独决定"是否有执行"；发现
+        //（只读、含观察失败分类）先于 through_owner 可能的 bootstrap。
+        let report = super::discovery::discover_targets(project_path);
+        let has_local_presence = report.has_local_presence()
+            || lock(&self.launches)?.contains_key(project_id)
+            || lock(&self.processes)?.contains_key(project_id);
+        match self
             .stop_userapp_dev_through_owner(project_id, project_path)
-            .await?
+            .await
         {
-            return Ok(stopped);
+            Ok(Some(stopped)) => Ok(stopped),
+            Ok(None) => self.stop_local_targets(project_id, project_path).await,
+            Err(owner_error) => {
+                let has_registration = lock(&self.processes)?
+                    .get(project_id)
+                    .is_some_and(|p| p.external_owner.is_some());
+                if !has_registration && has_local_presence {
+                    tracing::warn!(
+                        project_id,
+                        error = %owner_error,
+                        "owner path failed; proceeding with independently verified local targets"
+                    );
+                    self.stop_local_targets(project_id, project_path).await
+                } else {
+                    Err(owner_error)
+                }
+            }
         }
-        self.stop_local_targets(project_id, project_path).await
     }
 
     async fn stop_userapp_dev_through_owner(
@@ -206,37 +231,12 @@ impl DevServerManager {
 
     /// 只停**登记的**本地 pid（managed 域：无 ps 扫描、无端口猜杀）。
     pub(super) async fn stop_registered_only(&self, project_id: &str) -> AppResult<StoppedDev> {
-        let Some(proc) = lock(&self.processes)?.remove(project_id) else {
-            return Ok(StoppedDev {
-                owner_stopped: false,
-                killed_pids: Vec::new(),
-            });
-        };
-        let supervised = lock(&self.supervised)?.remove(project_id);
-        let mut killed = Vec::new();
-        if proc.pid > 0 {
-            let ok = self.terminate_pid_group(proc.pid).await;
-            killed.push(KilledPid {
-                pid: proc.pid,
-                killed: ok,
-            });
-        }
-        self.port_pool.release(project_id)?;
-        log::cleanup_temp_logs(&proc.log_dir).await;
-        if let Some(supervised) = supervised {
-            let drain_timeout = std::time::Duration::from_secs(
-                self.config.dev_stop_max_attempts as u64 * self.config.dev_stop_check_interval_ms
-                    / 1000,
-            );
-            supervised.drain_stdout(drain_timeout).await;
-            if supervised.wait_exit(drain_timeout).await.is_none() {
-                // 本地编排进程未确认退出：登记保留保护（R05——不假成功）
-                lock(&self.processes)?.insert(project_id.to_string(), proc);
-                return Err(AppError::business(
-                    "local orchestrator exit not confirmed; registration kept, retry stop",
-                ));
-            }
-        }
+        let captured = lock(&self.launches)?
+            .get(project_id)
+            .map(|launch| launch.launch_id.clone());
+        let killed = self
+            .close_local_registration(project_id, captured.as_deref())
+            .await?;
         Ok(StoppedDev {
             owner_stopped: false,
             killed_pids: killed,

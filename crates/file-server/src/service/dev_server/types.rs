@@ -91,9 +91,9 @@ pub(crate) struct LocalLaunch {
     pub state_root: Option<std::path::PathBuf>,
 }
 
-/// 可续查的本地监督停止（DEV-1 §3.3）：第一次 Stop 写入前固定请求身份，
-/// 超时/丢回复按同一请求续行；确认完成后按 attempt 身份收束。
-/// 不含 token/凭据/命令环境，可安全持久化。
+/// 可续查的本地监督停止（DEV-1 §3.3 / 复核 DEV-R4）：第一次 Stop 写入前
+/// 固定请求身份与目标，超时/丢回复按同一请求续行；确认完成后按 attempt
+/// 身份收束。不含 token/凭据/命令环境，可安全持久化。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LocalStopRecord {
     pub state_root: String,
@@ -101,7 +101,13 @@ pub(crate) struct LocalStopRecord {
     pub binding_resource: String,
     pub request_id: String,
     pub expected_generation: Option<String>,
-    pub captured_supervisor_id: Option<String>,
+    /// 目标模式（DEV-R4）：`unresolved` / `online:<supervisor_id>` /
+    /// `offline`——在线/离线选择跨进程保持，不因 None 混用而重绑目标。
+    #[serde(default)]
+    pub mode: String,
+    /// Read pre-mode online records and persist the captured offline target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    captured_supervisor_id: Option<String>,
     pub captured_generation: Option<String>,
 }
 
@@ -114,27 +120,113 @@ impl LocalStopRecord {
             binding_resource: attempt.binding.resource.display().to_string(),
             request_id: attempt.request.request_id.clone(),
             expected_generation: attempt.request.expected_generation.clone(),
-            captured_supervisor_id: attempt.captured_supervisor_id.clone(),
+            mode: match &attempt.mode {
+                runtime_supervisor::StopMode::Unresolved => "unresolved".to_string(),
+                runtime_supervisor::StopMode::Online { supervisor_id } => {
+                    format!("online:{supervisor_id}")
+                }
+                runtime_supervisor::StopMode::OfflineChosen { .. } => "offline".to_string(),
+            },
+            captured_supervisor_id: match &attempt.mode {
+                runtime_supervisor::StopMode::Online { supervisor_id }
+                | runtime_supervisor::StopMode::OfflineChosen { supervisor_id } => {
+                    Some(supervisor_id.clone())
+                }
+                runtime_supervisor::StopMode::Unresolved => None,
+            },
             captured_generation: attempt.captured_generation.clone(),
         }
     }
 
     /// 重建可续查 attempt（file-server 重启后按原请求身份续行）。
     pub(crate) fn to_attempt(&self) -> anyhow::Result<runtime_supervisor::StopWorkAttempt> {
-        use runtime_supervisor::{Action, Request};
+        use runtime_supervisor::{Action, Request, StopMode};
         let mut request = Request::new(Action::StopWork);
         request.request_id = self.request_id.clone();
         request.expected_generation = self.expected_generation.clone();
+        let mode = match self.mode.as_str() {
+            "" => match &self.captured_supervisor_id {
+                Some(id) if !id.is_empty() => StopMode::Online {
+                    supervisor_id: id.clone(),
+                },
+                None => StopMode::Unresolved,
+                Some(_) => anyhow::bail!("persisted local stop has an empty supervisor identity"),
+            },
+            "unresolved" => StopMode::Unresolved,
+            "offline" => StopMode::OfflineChosen {
+                supervisor_id: self.captured_supervisor_id.clone().filter(|id| !id.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("legacy offline stop has no captured supervisor identity; retry stop to capture the current target"))?,
+            },
+            mode => {
+                let id = mode
+                    .strip_prefix("online:")
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("invalid persisted local stop mode: {mode}"))?;
+                StopMode::Online {
+                    supervisor_id: id.to_string(),
+                }
+            }
+        };
         Ok(runtime_supervisor::StopWorkAttempt {
             root: std::path::PathBuf::from(&self.state_root),
             binding: runtime_supervisor::Binding {
                 component: self.binding_component.clone(),
                 resource: std::path::PathBuf::from(&self.binding_resource),
             },
-            captured_supervisor_id: self.captured_supervisor_id.clone(),
+            mode,
             captured_generation: self.captured_generation.clone(),
             request,
         })
+    }
+}
+
+#[cfg(test)]
+mod local_stop_record_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_stop_record_keeps_the_captured_owner_after_reload() {
+        let record: LocalStopRecord = serde_json::from_value(serde_json::json!({
+            "state_root": "/tmp/owner",
+            "binding_component": "app-cli",
+            "binding_resource": "/tmp/workspace",
+            "request_id": "original-stop",
+            "expected_generation": "generation-a",
+            "captured_supervisor_id": "owner-a",
+            "captured_generation": "generation-a"
+        }))
+        .unwrap();
+        let attempt = record.to_attempt().unwrap();
+        assert_eq!(attempt.request.request_id, "original-stop");
+        assert_eq!(
+            attempt.mode,
+            runtime_supervisor::StopMode::Online {
+                supervisor_id: "owner-a".into()
+            }
+        );
+        assert_eq!(
+            attempt.request.expected_generation,
+            attempt.captured_generation
+        );
+        let encoded = serde_json::to_vec(&LocalStopRecord::from_attempt(&attempt)).unwrap();
+        let reloaded: LocalStopRecord = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(reloaded.to_attempt().unwrap().mode, attempt.mode);
+    }
+
+    #[test]
+    fn malformed_stop_mode_cannot_be_rebound_as_a_new_request() {
+        let attempt = runtime_supervisor::StopWorkAttempt::allocate(
+            std::path::Path::new("/tmp/owner"),
+            &runtime_supervisor::Binding {
+                component: "app-cli".into(),
+                resource: "/tmp/workspace".into(),
+            },
+        );
+        for mode in ["unknown", "online:"] {
+            let mut record = LocalStopRecord::from_attempt(&attempt);
+            record.mode = mode.into();
+            assert!(record.to_attempt().is_err(), "accepted invalid mode {mode}");
+        }
     }
 }
 

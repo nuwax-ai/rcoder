@@ -117,7 +117,17 @@ mod cases {
         let (dump, script) = fake_orchestrator(dir.path());
         let manager = manager_with(&script, &dir.path().join("logs"));
         manager
-            .start_dev("standalone-env-test", ws.path(), None, None, None, None)
+            .start_dev(
+                "standalone-env-test",
+                ws.path(),
+                crate::service::dev_server::DevLaunch {
+                    base_path: None,
+                    hooks: None,
+                    pg: None,
+                    request_context: None,
+                    artifact_release_id: None,
+                },
+            )
             .await
             .expect("start manifest dev");
         let env_txt = wait_dump(&dump).await;
@@ -150,7 +160,17 @@ mod cases {
             password: "s3cret".into(),
         };
         let started = manager
-            .start_dev("pg-inject-test", ws.path(), None, None, Some(&pg), None)
+            .start_dev(
+                "pg-inject-test",
+                ws.path(),
+                crate::service::dev_server::DevLaunch {
+                    base_path: None,
+                    hooks: None,
+                    pg: Some(&pg),
+                    request_context: None,
+                    artifact_release_id: None,
+                },
+            )
             .await
             .expect("start manifest dev");
         assert_eq!(started.port, shared_types::APP_ENTRY_PORT);
@@ -170,7 +190,17 @@ mod cases {
         // None：不注入——期望值 = 父进程 env 透传结果（无则不出现）
         std::fs::remove_file(&dump).expect("reset dump");
         let started = manager
-            .start_dev("pg-inject-none-test", ws.path(), None, None, None, None)
+            .start_dev(
+                "pg-inject-none-test",
+                ws.path(),
+                crate::service::dev_server::DevLaunch {
+                    base_path: None,
+                    hooks: None,
+                    pg: None,
+                    request_context: None,
+                    artifact_release_id: None,
+                },
+            )
             .await
             .expect("start manifest dev (no pg)");
         assert_eq!(started.port, shared_types::APP_ENTRY_PORT);
@@ -436,6 +466,121 @@ mod owner_reuse_tests {
                 .is_err()
         );
         assert_eq!(requests.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
+    /// DEV-R1（正常 serve 复用不被磁盘 phase 挡住）：同项目 serve owner 存活
+    ///（identity/status/operations 全 wire），磁盘监督记录 phase=ready——
+    /// 复用分支先于本地 run 分类执行：start_dev 返回复用结果（提交
+    /// Restart），不以"still running"拒绝（旧序在此 phase 直接拒绝 Start）。
+    #[tokio::test]
+    async fn ready_serve_owner_is_reused_despite_ready_supervision_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("ws-serve-reuse");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("workspace.manifest.toml"), "# t\n").unwrap();
+        // registry 登记 + phase=ready 的监督记录（发现侧会将其视为活 run 目标）。
+        let state_root = dir.path().join(".app-cli-state").join("unknown-app");
+        std::fs::create_dir_all(&state_root).unwrap();
+        std::fs::write(state_root.join("token"), "test-token").unwrap();
+        let canonical = std::fs::canonicalize(&workspace).unwrap();
+        let registry = std::collections::BTreeMap::from([(
+            canonical.to_string_lossy().into_owned(),
+            "unknown-app".to_string(),
+        )]);
+        std::fs::write(
+            dir.path().join(".app-cli-state/registry.json"),
+            serde_json::to_string(&registry).unwrap(),
+        )
+        .unwrap();
+        let discovery = crate::service::dev_server::supervision_tests::WireDiscoveryFile {
+            version: 2,
+            instance: "serve-supervisor".into(),
+            address: "127.0.0.1:1".into(),
+            token: "fixture-token".into(),
+            snapshot: runtime_supervisor::Snapshot {
+                version: 1,
+                binding: runtime_supervisor::Binding {
+                    component: "app-cli".into(),
+                    resource: canonical,
+                },
+                supervisor_id: "serve-supervisor".into(),
+                generation: None,
+                phase: runtime_supervisor::Phase::Ready,
+                intent: runtime_supervisor::Intent::Run,
+                operation_id: None,
+                error: None,
+                problem: None,
+            },
+            requests: Vec::new(),
+        };
+        std::fs::write(
+            state_root.join("supervisor.json"),
+            serde_json::to_vec(&discovery).unwrap(),
+        )
+        .unwrap();
+
+        let requests = Arc::new(Mutex::new(
+            Vec::<shared_types::RuntimeOperationRequest>::new(),
+        ));
+        let captured = requests.clone();
+        let router = mock_owner_router("hashed-workspace", &workspace)
+            .with_state(Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let captured = captured.clone();
+                    async move {
+                        if request.method() == axum::http::Method::POST {
+                            let (parts, body) = request.into_parts();
+                            let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                            captured
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::from_slice(&bytes).unwrap());
+                            next.run(axum::extract::Request::from_parts(
+                                parts,
+                                axum::body::Body::from(bytes),
+                            ))
+                            .await
+                        } else {
+                            next.run(request).await
+                        }
+                    }
+                },
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::from_env().unwrap();
+        config.log_base_dir = dir.path().join("logs");
+        config.app_cli_admin_probe_addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let manager = DevServerManager::new(Arc::new(config));
+
+        let started = manager
+            .start_dev(
+                "userapp:serve-reuse",
+                &workspace,
+                crate::service::dev_server::DevLaunch {
+                    base_path: None,
+                    hooks: None,
+                    pg: None,
+                    request_context: None,
+                    artifact_release_id: None,
+                },
+            )
+            .await
+            .expect("a ready serve owner must be reused, not refused by the disk phase");
+        // 复用结果形态（owner 进程保留，pid 0 + 固定入口端口）。
+        assert_eq!(started.pid, 0);
+        assert_eq!(started.port, shared_types::APP_ENTRY_PORT);
+        let posted = requests.lock().unwrap();
+        assert_eq!(
+            posted.len(),
+            1,
+            "exactly the reuse Restart submission: {posted:?}"
+        );
+        assert_eq!(posted[0].kind, shared_types::RuntimeOperationKind::Restart);
         server.abort();
     }
 

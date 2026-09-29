@@ -364,3 +364,136 @@ mod tests {
         );
     }
 }
+
+/// DEV-R6（本次制品实际生效）：restart_dev_staged 的 activate 夹在"确认旧
+/// 执行停止"与"启动"之间——`.run` 被**本次**制品内容替换（旧版本移入
+/// `.previous` 留档），编排器在**新**目录上启动并产出新内容。
+#[cfg(all(test, unix))]
+mod artifact_restart_tests {
+    use super::*;
+    use crate::service::userapp::WORKSPACE_BUILDS_DIR;
+    use std::io::Write;
+
+    /// 造带内容标记的最小合法制品 zip。
+    fn make_package_with_marker(dir: &Path, release_id: &str, marker: &str) {
+        let builds = dir.join(WORKSPACE_BUILDS_DIR);
+        std::fs::create_dir_all(&builds).expect("builds dir");
+        let zip_path = builds.join(format!("workspace-package-{release_id}.zip"));
+        let file = std::fs::File::create(&zip_path).expect("zip file");
+        let mut writer = ::zip::ZipWriter::new(file);
+        let options = ::zip::write::SimpleFileOptions::default()
+            .compression_method(::zip::CompressionMethod::Stored);
+        writer
+            .start_file("workspace.manifest.toml", options)
+            .expect("start manifest");
+        writer.write_all(b"schema_version = 1\n").expect("manifest");
+        writer
+            .start_file("release.lock.toml", options)
+            .expect("start lock");
+        writer.write_all(b"release_id = \"x\"\n").expect("lock");
+        writer.start_file("marker.txt", options).expect("marker");
+        writer.write_all(marker.as_bytes()).expect("marker content");
+        // 编排器：把 cwd 的 marker.txt 内容落到 served.txt（内容生效的可观测面）
+        writer.start_file("orchestrator.sh", options).expect("sh");
+        writer
+            .write_all(b"#!/bin/sh\ncp marker.txt served.txt 2>/dev/null || true\nexec sleep 120\n")
+            .expect("sh content");
+        writer.finish().expect("finish zip");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&zip_path, std::fs::Permissions::from_mode(0o644))
+                .expect("zip mode");
+        }
+    }
+
+    #[tokio::test]
+    async fn staged_restart_runs_on_this_release_content() {
+        let harness = tempfile::tempdir().expect("harness");
+        let ws = harness.path().join("ws-art");
+        std::fs::create_dir_all(&ws).expect("ws");
+        // 旧版本 .run（内容 A）：activate 必须替换而不是叠加。
+        std::fs::create_dir_all(ws.join(".run")).expect("old run");
+        std::fs::write(ws.join(".run/marker.txt"), "A").expect("old marker");
+        // 本次制品（内容 B）。
+        let release_id = "rel-art-1";
+        make_package_with_marker(&ws, release_id, "B");
+
+        // 受控编排器 = 制品内的 orchestrator.sh（cwd=.run）。
+        let bin = harness.path().join("run-orchestrator.sh");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\ncp \"$(pwd)/marker.txt\" \"$(pwd)/served.txt\"\nexec sleep 120\n",
+        )
+        .expect("write orchestrator");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod orchestrator");
+        }
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let probe_addr = unused.local_addr().unwrap().to_string();
+        drop(unused);
+        let mut config = file_server::Config::from_env().expect("test config");
+        config.app_cli_bin = Some(bin.display().to_string());
+        config.app_cli_admin_probe_addr = probe_addr;
+        config.log_base_dir = harness.path().join("logs");
+        std::fs::create_dir_all(&config.log_base_dir).expect("logs");
+        config.dev_alive_max_wait_ms = 1200;
+        config.dev_alive_poll_interval_ms = 100;
+        config.dev_alive_check_timeout_ms = 300;
+        let manager = std::sync::Arc::new(file_server::service::dev_server::DevServerManager::new(
+            std::sync::Arc::new(config),
+        ));
+
+        let key = "userapp:artifact-effective";
+        let ws_for_stop = ws.clone();
+        let prepared = prepare_run_dir(&ws, release_id)
+            .await
+            .expect("prepare staging");
+        let started = manager
+            .restart_dev_staged(
+                key,
+                &ws_for_stop,
+                file_server::service::dev_server::DevLaunch {
+                    base_path: None,
+                    hooks: None,
+                    pg: None,
+                    request_context: Some("artifact-test"),
+                    artifact_release_id: Some(release_id),
+                },
+                async move { prepared.activate() },
+            )
+            .await
+            .expect("staged restart");
+        assert!(started.pid > 0);
+        // 本次制品实际生效：.run 内容 == B（旧 A 归档进 .previous）。
+        assert_eq!(
+            std::fs::read_to_string(ws.join(".run/marker.txt")).expect("new marker"),
+            "B",
+            "active run dir must be THIS release's content"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join(".previous/marker.txt")).expect("archived marker"),
+            "A",
+            "the replaced release must be archived, not merged"
+        );
+        // 编排器在新目录上运行并产出新内容。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            if let Ok(content) = std::fs::read_to_string(ws.join(".run/served.txt"))
+                && content.trim() == "B"
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "orchestrator never produced this release's content"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        manager
+            .stop_userapp_dev(key, &ws)
+            .await
+            .expect("cleanup stop");
+    }
+}

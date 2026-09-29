@@ -41,6 +41,32 @@ async fn owner() -> (DatabaseOwner, Arc<AtomicBool>) {
     owner_with_inflight(1).await
 }
 
+type TestProbe = Arc<
+    dyn Fn(toasty::Db) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync,
+>;
+
+async fn owner_with_custom_probe(probe: TestProbe) -> (DatabaseOwner, Arc<AtomicBool>) {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let db = DatabaseOwner::open_with_probe(
+        8,
+        1,
+        Resource(dropped.clone()),
+        || async {
+            let db = toasty::Db::builder()
+                .models(toasty::models!(Probe))
+                .max_pool_size(1)
+                .connect("turso::memory:")
+                .await?;
+            db.push_schema().await?;
+            Ok(db)
+        },
+        probe,
+    )
+    .await
+    .unwrap();
+    (db, dropped)
+}
+
 #[tokio::test]
 async fn cancelled_caller_does_not_cancel_admitted_transaction() {
     let (owner, dropped) = owner().await;
@@ -356,38 +382,29 @@ async fn panic_recovery_serves_admitted_backlog_once_and_panicked_stays_unknown(
     started.await.unwrap();
 
     // A 在途期间受理 B/C（准入仍 Open——A 尚未 panic）。
-    let b = tokio::spawn({
-        let owner = owner.clone();
-        async move {
-            owner
-                .execute(|mut db| async move {
-                    Probe::create()
-                        .id(21)
-                        .revision(0)
-                        .value("B")
-                        .exec(&mut db)
-                        .await?;
-                    Ok(Probe::get_by_id(&mut db, 21).await?.value)
-                })
-                .await
-        }
+    let b = owner.execute(|mut db| async move {
+        Probe::create()
+            .id(21)
+            .revision(0)
+            .value("B")
+            .exec(&mut db)
+            .await?;
+        Ok(Probe::get_by_id(&mut db, 21).await?.value)
     });
-    let c = tokio::spawn({
-        let owner = owner.clone();
-        async move {
-            owner
-                .execute(|mut db| async move {
-                    Probe::create()
-                        .id(22)
-                        .revision(0)
-                        .value("C")
-                        .exec(&mut db)
-                        .await?;
-                    Ok(Probe::get_by_id(&mut db, 22).await?.value)
-                })
-                .await
-        }
+    let c = owner.execute(|mut db| async move {
+        Probe::create()
+            .id(22)
+            .revision(0)
+            .value("C")
+            .exec(&mut db)
+            .await?;
+        Ok(Probe::get_by_id(&mut db, 22).await?.value)
     });
+    tokio::pin!(b, c);
+    // Poll through execute's synchronous enqueue before releasing A. Merely
+    // spawning B/C allows A to freeze admission before either task is scheduled.
+    assert!(futures::poll!(&mut b).is_pending());
+    assert!(futures::poll!(&mut c).is_pending());
 
     boom.send(()).unwrap();
     let a_error = a
@@ -400,8 +417,8 @@ async fn panic_recovery_serves_admitted_backlog_once_and_panicked_stays_unknown(
     );
 
     // 恢复后 B/C 各执行一次；读回真实写入值。
-    assert_eq!(b.await.unwrap().unwrap(), "B");
-    assert_eq!(c.await.unwrap().unwrap(), "C");
+    assert_eq!(b.await.unwrap(), "B");
+    assert_eq!(c.await.unwrap(), "C");
 
     owner.shutdown().await.unwrap();
     assert!(dropped.load(Ordering::SeqCst));
@@ -427,6 +444,125 @@ async fn last_owner_drop_during_frozen_recovery_releases_resource() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// DB-R4：探活**持续失败**时（探针恒败），最后调用方 drop 且无已受理积压
+/// → owner 有界退出释放资源——探活/退避循环观察队列关闭（last-drop），
+/// 不再只在探活成功或显式 shutdown 时才收束。
+#[tokio::test]
+async fn probe_keeps_failing_last_owner_drop_releases_resource_bounded() {
+    let (entered_tx, mut entered_rx) = tokio::sync::watch::channel(false);
+    let (fail_tx, fail_rx) = tokio::sync::watch::channel(false);
+    let probe: TestProbe = Arc::new(move |_db| {
+        let entered_tx = entered_tx.clone();
+        let mut fail_rx = fail_rx.clone();
+        Box::pin(async move {
+            let _ = entered_tx.send(true);
+            fail_rx.wait_for(|fail| *fail).await?;
+            anyhow::bail!("injected persistent probe failure")
+        })
+    });
+    let (owner, dropped) = owner_with_custom_probe(probe).await;
+    let panicked = owner
+        .execute::<(), _, _>(|_db| async move { panic!("boom during failing recovery") })
+        .await
+        .unwrap_err();
+    assert!(panicked.to_string().contains("outcome is unknown"));
+
+    // Last-drop must happen inside the probe loop, not before the supervisor
+    // joins the failed task and can short-circuit on an already closed queue.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        entered_rx.wait_for(|entered| *entered),
+    )
+    .await
+    .expect("recovery probe must have started")
+    .unwrap();
+    drop(owner);
+    fail_tx.send(true).unwrap();
+    // 预算：探针立即失败 + 退避 1s + 关闭检查 → 秒级；上限 15s 排除调度抖动。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !dropped.load(Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "owner must exit within a bounded window after last drop while probing keeps failing"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// DB-R4 + DB-R2：探针**在途悬挂**（屏障：entered 信号 + 永不触发的释放）
+/// 时收到 shutdown——关闭优先（biased select），悬挂探针被取消收束；
+/// 已受理积压不误吃（调用方收 OutcomeUnknown），shutdown 观察到未恢复
+/// 失败，资源释放。
+#[tokio::test]
+async fn shutdown_during_hanging_probe_wins_backlog_dropped_and_resource_released() {
+    let (entered_tx, mut entered_rx) = tokio::sync::watch::channel(false);
+    let (_hang_tx, hang_rx) = tokio::sync::watch::channel(false);
+    let probe: TestProbe = Arc::new(move |_db| {
+        let entered_tx = entered_tx.clone();
+        let mut hang_rx = hang_rx.clone();
+        Box::pin(async move {
+            let _ = entered_tx.send(true);
+            // 悬挂探活：等待永不到来的信号——shutdown 的 abort 取消本 task。
+            hang_rx.changed().await?;
+            anyhow::Ok(())
+        })
+    });
+    let (owner, dropped) = owner_with_custom_probe(probe).await;
+    // A 占唯一执行槽；B 在 A 在途期间完成同步入队（准入仍 Open）。
+    let (a_entered, a_started) = oneshot::channel();
+    let (boom, boomed) = oneshot::channel::<()>();
+    let a = tokio::spawn({
+        let owner = owner.clone();
+        async move {
+            owner
+                .execute::<(), _, _>(|_db| async move {
+                    a_entered.send(()).unwrap();
+                    boomed.await.unwrap();
+                    panic!("injected task panic");
+                })
+                .await
+        }
+    });
+    a_started.await.unwrap();
+    let b = owner.execute(|mut db| async move {
+        Probe::create()
+            .id(31)
+            .revision(0)
+            .value("B")
+            .exec(&mut db)
+            .await?;
+        Ok(Probe::get_by_id(&mut db, 31).await?.value)
+    });
+    tokio::pin!(b);
+    assert!(
+        futures::poll!(&mut b).is_pending(),
+        "B must be admitted while A is in flight"
+    );
+    boom.send(()).unwrap();
+    let a_error = a.await.unwrap().unwrap_err();
+    assert!(a_error.to_string().contains("outcome is unknown"));
+    // 屏障：确认探针已进入（A 已排空、恢复循环启动）。
+    tokio::time::timeout(Duration::from_secs(5), entered_rx.changed())
+        .await
+        .expect("probe must start after the panicked task drains")
+        .unwrap();
+    // 探针悬挂中 shutdown：关闭优先。
+    let shutdown = tokio::time::timeout(Duration::from_secs(10), owner.shutdown())
+        .await
+        .expect("shutdown must complete while the probe hangs")
+        .unwrap_err();
+    assert!(
+        shutdown.to_string().contains("did not recover"),
+        "unrecovered failure expected: {shutdown:#}"
+    );
+    let b_error = b.await.unwrap_err();
+    assert!(
+        b_error.to_string().contains("outcome is unknown"),
+        "dropped backlog caller keeps OutcomeUnknown: {b_error:#}"
+    );
+    assert!(dropped.load(Ordering::SeqCst));
 }
 
 #[tokio::test]

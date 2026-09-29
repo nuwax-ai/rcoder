@@ -205,22 +205,71 @@ pub async fn control(root: &Path, request: Request) -> Result<Snapshot> {
         .into());
     }
     record::is_locked(&root.join("owner.lock"))?;
-    let mut stream = connect(&discovery.address)
+    dispatch(
+        &discovery.address,
+        &discovery.instance,
+        &discovery.token,
+        request,
+    )
+    .await
+}
+
+/// DEV-R4：发送停止类请求前核验 discovery.instance 仍是捕获的那一代——
+/// 请求组包与发送使用**这份已核验的 discovery**，不重读。捕获后 owner 换代
+///（同根、同 binding、generation 恰好一致或均为 None）时，请求不会再先
+/// 作用于新 owner 再由客户端事后报身份变化；服务端 envelope.instance
+/// 校验继续防住读取与连接之间的残余窗口。
+pub(crate) async fn control_verified(
+    root: &Path,
+    request: Request,
+    expected_instance: &str,
+) -> Result<Snapshot> {
+    let discovery: Discovery = record::read(&root.join("supervisor.json"))?;
+    if discovery.version != CONTROL_VERSION {
+        return Err(Problem {
+            code: FailureCode::ProtocolMismatch,
+            message: "unsupported supervisor control protocol; restart with matching CLI".into(),
+        }
+        .into());
+    }
+    if discovery.instance != expected_instance {
+        anyhow::bail!(
+            "supervisor changed before stop was sent: captured {expected_instance}, discovery has {}",
+            discovery.instance
+        );
+    }
+    record::is_locked(&root.join("owner.lock"))?;
+    dispatch(
+        &discovery.address,
+        &discovery.instance,
+        &discovery.token,
+        request,
+    )
+    .await
+}
+
+async fn dispatch(
+    address: &str,
+    instance: &str,
+    token: &str,
+    request: Request,
+) -> Result<Snapshot> {
+    let mut stream = connect(address)
         .await
         .context("connect independent supervisor")?;
     send(
         &mut stream,
         &Envelope {
             version: CONTROL_VERSION,
-            instance: discovery.instance.clone(),
-            token: discovery.token,
+            instance: instance.to_string(),
+            token: token.to_string(),
             request,
         },
     )
     .await?;
     let reply: Reply = receive(&mut stream).await?;
     ensure!(
-        reply.instance == discovery.instance,
+        reply.instance == instance,
         "supervisor reply identity mismatch"
     );
     if let Some(error) = reply.error {

@@ -77,6 +77,23 @@ pub struct Owner {
     root: PathBuf,
 }
 impl Owner {
+    /// Resolve an offline target while holding its owner lock. If discovery was
+    /// lost or damaged, publish a nonterminal identity before a caller persists
+    /// its Stop intent; this does not claim that execution has been cleaned up.
+    pub(crate) fn capture_offline_target(&self, binding: &control::Binding) -> Result<Snapshot> {
+        let (old, _) = self.load_discovery(binding)?;
+        if let Some(discovery) = old {
+            ensure!(
+                discovery.instance == discovery.snapshot.supervisor_id,
+                "supervisor discovery identity is inconsistent"
+            );
+            return Ok(discovery.snapshot);
+        }
+        let discovery = inactive_discovery(binding.clone());
+        record::save(&self.root.join("supervisor.json"), &discovery)?;
+        Ok(discovery.snapshot)
+    }
+
     /// Explicit shutdown after a supervisor crash, while holding its owner lock.
     /// Evidence must cover every local generation before publishing completion.
     pub async fn stop_offline(
@@ -84,12 +101,31 @@ impl Owner {
         binding: &control::Binding,
         request: &control::Request,
     ) -> Result<Snapshot> {
+        self.stop_offline_inner(binding, request, None).await
+    }
+
+    pub(crate) async fn stop_offline_verified(
+        self,
+        binding: &control::Binding,
+        request: &control::Request,
+        supervisor_id: &str,
+    ) -> Result<Snapshot> {
+        self.stop_offline_inner(binding, request, Some(supervisor_id))
+            .await
+    }
+
+    async fn stop_offline_inner(
+        self,
+        binding: &control::Binding,
+        request: &control::Request,
+        supervisor_id: Option<&str>,
+    ) -> Result<Snapshot> {
         // Parent death closes pipes first; guardians still need a bounded drain
         // window. Wait only for a retained OS lock, never reinterpret corruption
         // or missing cleanup evidence as success.
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            match self.try_stop_offline(binding, request) {
+            match self.try_stop_offline(binding, request, supervisor_id) {
                 Err(error)
                     if error
                         .downcast_ref::<std::fs::TryLockError>()
@@ -106,6 +142,7 @@ impl Owner {
         &self,
         binding: &control::Binding,
         request: &control::Request,
+        supervisor_id: Option<&str>,
     ) -> Result<Snapshot> {
         ensure!(
             !request.request_id.is_empty() && request.request_id.len() <= 128,
@@ -115,7 +152,24 @@ impl Owner {
             matches!(request.action, Action::Shutdown | Action::StopWork),
             "offline action must stop execution"
         );
-        let (old, _) = self.load_discovery(binding)?;
+        let old = if let Some(expected) = supervisor_id {
+            // A retained request may not repair or overwrite a replacement's
+            // discovery before checking its identity, even if generation=None.
+            let discovery: Discovery = record::read(&self.root.join("supervisor.json"))?;
+            if discovery.instance != expected
+                || discovery.snapshot.supervisor_id != expected
+                || &discovery.snapshot.binding != binding
+            {
+                return Err(Problem {
+                    code: FailureCode::IdentityChanged,
+                    message: "offline stop target has been replaced".into(),
+                }
+                .into());
+            }
+            Some(discovery)
+        } else {
+            self.load_discovery(binding)?.0
+        };
         let mut discovery = old.unwrap_or_else(|| inactive_discovery(binding.clone()));
         if let Some((original, snapshot)) = discovery
             .requests

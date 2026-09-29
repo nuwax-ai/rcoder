@@ -15,10 +15,14 @@ impl DevServerManager {
         &self,
         project_id: &str,
         project_path: &Path,
-        hooks: Option<crate::service::dev_server::supervise::DevEventHooks>,
-        pg: Option<&shared_types::StartPgCredential>,
-        request_context: Option<&str>,
+        launch: super::super::DevLaunch<'_>,
     ) -> AppResult<StartedDev> {
+        let (hooks, pg, request_context, artifact_release_id) = (
+            launch.hooks.clone(),
+            launch.pg,
+            launch.request_context,
+            launch.artifact_release_id,
+        );
         // 单一来源 shared_types::APP_ENTRY_PORT（release 流程、Pingora 免端口代理同值）
         const PINGAP_ENTRY_PORT: u16 = shared_types::APP_ENTRY_PORT;
         if let Some(process) = lock(&self.processes)?.get(project_id).cloned()
@@ -26,17 +30,6 @@ impl DevServerManager {
         {
             return Err(AppError::business(
                 "local orchestrator is already registered; readiness must be confirmed or an explicit restart requested",
-            ));
-        }
-        // DEV-1 §3.4：守卫扩展——除本地登记外，发现阶段的活监督目标同样阻止
-        // 全新 Start（Restart 经停止收束后到这里时登记与目标均已清净）。
-        // Legacy run 无 runtime API 可复用，越过守卫只会撞 3010 端口。
-        if discovery::discover_targets(project_path)
-            .iter()
-            .any(|target| target.snapshot.phase != runtime_supervisor::Phase::Stopped)
-        {
-            return Err(AppError::business(
-                "a local orchestrator for this project is still running; stop or restart it before starting a new one",
             ));
         }
         // P1-05：旧 supervised 停止后未确认清理（如进程组残留或 stdout 排空未完成）——
@@ -50,19 +43,27 @@ impl DevServerManager {
         // P3-02：owner 感知——spawn 前探测 3010。匹配本 workspace 的 serve
         // owner 经运行 API 复用（消除平台/agent 双启动的 3010 冲突）；legacy
         // app-cli / foreign 应答明确拒绝（XP04：不杀对方、不盲 spawn）。
+        // DEV-R1：serve 复用先于磁盘 phase 门禁——监督 phase=Ready 的 serve
+        // 不能被"非 Stopped 就拒绝"挡在复用之前。DEV-R6：复用提交携带本次
+        // 制品身份（artifact_release_id）——制品态不得退化为 Source Restart。
         if let Some(started) = self
             .reuse_or_refuse_owner(
                 project_id,
                 project_path,
                 hooks.clone(),
                 pg,
-                None,
+                artifact_release_id,
                 request_context,
             )
             .await?
         {
             return Ok(started);
         }
+        // DEV-R1：serve 未复用后分类本地 run 目标——磁盘 phase 单独不是门禁：
+        // 活 run 拒绝（短预算探测，非 Stopped 即活）；死记录（进程已退、
+        // owner.lock 可取）就地离线收束后放行，用户无需删除状态文件。
+        self.ensure_no_local_execution(project_id, project_path)
+            .await?;
 
         let ldir = log::log_dir(&self.config, project_id);
         tokio::fs::create_dir_all(ldir.join("app-cli"))
@@ -102,6 +103,15 @@ impl DevServerManager {
             project_path,
             &mut env_extra,
         );
+        // 迁移回执位置绑定（DEV-R5）：由 apply_migration_receipts_binding 证据
+        // 决策（显式根/旧目录两侧的 pending/completed + 持久位置记录）后注入，
+        // 不再按"旧目录存在"猜测——pending 不被路径切换掩盖、已完成不重跑。
+        self.apply_migration_receipts_binding(
+            project_id,
+            project_path,
+            platform_state_root.as_deref(),
+            &mut env_extra,
+        )?;
         let (child, stdout, stderr) = process::spawn_dev(
             program,
             &[
@@ -145,31 +155,39 @@ impl DevServerManager {
             );
         }
 
-        // DEV-1 §3.1：spawn 已发生、探活未过的窗口先发表可捕获的 Starting
-        // 记录（launch 身份 + 进程登记）——并发 Stop 不得在此窗口看到"空
-        // 记录"而误判无目标；失败路径按同一身份自清，不补登记成运行成功。
+        // DEV-1 §3.1 / 复核 DEV-R2：spawn 已发生、探活未过的窗口先发表可捕获
+        // 的 Starting 记录——launch 身份 + 进程 + **监督句柄**三张表在单一
+        // 同步临界区（固定锁序 launches→processes→supervised，不持锁跨
+        // await）原子发表；并发 Stop 不得在此窗口看到"有 launch 无
+        // supervised"的半登记。失败路径按同一身份自清，不补登记成运行成功。
         let launch_id = uuid::Uuid::now_v7().simple().to_string();
-        lock(&self.processes)?.insert(
-            project_id.to_string(),
-            DevProcess {
-                pid,
-                port: PINGAP_ENTRY_PORT,
-                project_id: project_id.to_string(),
-                instance_id: None,
-                base_path: None,
-                started_at: now,
-                log_dir: ldir.clone(),
-                temp_log_name: log::temp_log_name(now),
-                external_owner: None,
-            },
-        );
-        lock(&self.launches)?.insert(
-            project_id.to_string(),
-            super::super::types::LocalLaunch {
-                launch_id: launch_id.clone(),
-                state_root: platform_state_root,
-            },
-        );
+        {
+            let mut launches = lock(&self.launches)?;
+            let mut processes = lock(&self.processes)?;
+            let mut supervised_map = lock(&self.supervised)?;
+            processes.insert(
+                project_id.to_string(),
+                DevProcess {
+                    pid,
+                    port: PINGAP_ENTRY_PORT,
+                    project_id: project_id.to_string(),
+                    instance_id: None,
+                    base_path: None,
+                    started_at: now,
+                    log_dir: ldir.clone(),
+                    temp_log_name: log::temp_log_name(now),
+                    external_owner: None,
+                },
+            );
+            launches.insert(
+                project_id.to_string(),
+                super::super::types::LocalLaunch {
+                    launch_id: launch_id.clone(),
+                    state_root: platform_state_root,
+                },
+            );
+            supervised_map.insert(project_id.to_string(), supervised.clone());
+        }
 
         // 早退检测 + 宽松就绪（pingap 按 [proxy] path 路由，根路径可能 404——
         // HTTP 判不通但进程存活即通过）
@@ -188,23 +206,150 @@ impl DevServerManager {
             // §3.1：探活失败清理自己刚创建的精确进程树与 Starting 登记
             //（启动互斥锁在手，不存在更新的 launch 可被误伤）。
             let _ = self.terminate_pid_group(pid).await;
-            lock(&self.processes)?.remove(project_id);
-            lock(&self.launches)?.remove(project_id);
+            {
+                let mut launches = lock(&self.launches)?;
+                let mut processes = lock(&self.processes)?;
+                let mut supervised_map = lock(&self.supervised)?;
+                launches.remove(project_id);
+                processes.remove(project_id);
+                supervised_map.remove(project_id);
+            }
             return Err(error);
         }
-
-        lock(&self.supervised)?.insert(project_id.to_string(), supervised);
 
         Ok(StartedDev {
             pid,
             port: PINGAP_ENTRY_PORT,
         })
     }
+
+    /// DEV-R1：分类并清场本地执行目标（Start 在激活运行目录之前调用，
+    /// 保证"拒绝前不改运行目录"——复核 DEV-R6）。磁盘 phase 单独不是门禁：
+    /// - 活 run（短预算 Status 探测有应答）→ 拒绝，用户须显式 stop/restart；
+    /// - 死记录（探测无应答且 owner.lock 可取）→ 就地离线收束（同请求
+    ///   幂等回执），用户无需删除状态文件；
+    /// - 在途/持久停止 → 按原请求续行至收束（不新造身份）；
+    /// - 锁被持有但通道无应答 → 活而通道损坏，明确拒绝；
+    /// - 仅观察失败（记录不可读）→ 如实上报，不假装没有目标。
+    pub async fn ensure_no_local_execution(
+        &self,
+        project_id: &str,
+        workspace: &Path,
+    ) -> AppResult<()> {
+        /// 短预算在线探测（control 自身 connect 2s；总预算收紧避免拖慢受理）。
+        const ALIVE_PROBE_BUDGET: Duration = Duration::from_secs(3);
+        let pending = self.pending_local_stops(project_id)?;
+        let mut roots: Vec<_> = pending
+            .iter()
+            .map(|(_, attempt)| attempt.root.clone())
+            .collect();
+        if let Some(root) = lock(&self.launches)?
+            .get(project_id)
+            .and_then(|launch| launch.state_root.clone())
+        {
+            roots.push(root);
+        }
+        // Continue retained requests even if their latest snapshot is Stopped
+        // or their root is absent from the current registry/layout.
+        for (key, attempt) in pending {
+            self.stop_seated_target(
+                &key,
+                &attempt.root,
+                &attempt.binding,
+                Duration::from_secs(self.config.dev_supervision_stop_budget_secs.max(1)),
+            )
+            .await?;
+        }
+        let report = discovery::discover_targets_with(workspace, &roots);
+        for target in &report.targets {
+            if target.snapshot.phase == runtime_supervisor::Phase::Stopped {
+                continue;
+            }
+            let probe = runtime_supervisor::control(
+                &target.state_root,
+                runtime_supervisor::Request::new(runtime_supervisor::Action::Status),
+            );
+            match tokio::time::timeout(ALIVE_PROBE_BUDGET, probe).await {
+                Ok(Ok(_snapshot)) => {
+                    return Err(AppError::business(format!(
+                        "a local orchestrator for this project is still running ({}); stop or restart it before starting a new one",
+                        target.snapshot.diagnostic()
+                    )));
+                }
+                Ok(Err(error))
+                    if error
+                        .downcast_ref::<runtime_supervisor::Problem>()
+                        .is_some() =>
+                {
+                    return Err(AppError::business(format!(
+                        "local orchestrator control is incompatible ({}); stop it before starting a new one",
+                        error
+                    )));
+                }
+                // 无应答（探测超时/连接失败，含"execution owner has exited"）：
+                // 死记录或通道损坏——以 owner.lock 为准。
+                Ok(Err(_)) | Err(_) => {
+                    match runtime_supervisor::Owner::try_acquire(&target.state_root) {
+                        Ok(Some(owner)) => {
+                            let request = runtime_supervisor::Request::new(
+                                runtime_supervisor::Action::StopWork,
+                            );
+                            let result = owner
+                                .stop_offline(target.binding(), &request)
+                                .await
+                                .map_err(|error| {
+                                    AppError::owner_error(
+                                        "collect stale local orchestrator record",
+                                        error,
+                                    )
+                                })?;
+                            if result.phase != runtime_supervisor::Phase::Stopped {
+                                return Err(AppError::owner_error(
+                                    "collect stale local orchestrator record",
+                                    result.recovery_error(),
+                                ));
+                            }
+                            tracing::info!(
+                                project_id,
+                                root = %target.state_root.display(),
+                                "collected stale local orchestrator record before start"
+                            );
+                        }
+                        Ok(None) => {
+                            return Err(AppError::business(format!(
+                                "an orchestrator for this project is alive but its control channel is unavailable ({}); retry stop first",
+                                target.snapshot.diagnostic()
+                            )));
+                        }
+                        Err(error) => {
+                            return Err(AppError::owner_error(
+                                "inspect local orchestrator ownership",
+                                error,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if report.targets.is_empty() && !report.unreadable.is_empty() {
+            let unreadable = report
+                .unreadable
+                .iter()
+                .map(|(root, error)| format!("{}: {error}", root.display()))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(AppError::business(format!(
+                "local supervision state is unreadable; cannot confirm no execution ({unreadable})"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// DEV-1 Fix A：平台身份 → 子进程 env 键的纯决策函数（无 env 读取，便于
 /// 反例测试）。身份匹配时透传 PROJECT_ID 与显式根（无根仍透传身份）；不
 /// 匹配/无平台变量返回 None（standalone 语义，registry 段继续生效）。
+/// 迁移回执目录注入不在此处（DEV-R5：见 apply_migration_receipts_binding）。
 pub(super) fn platform_launch_env(
     project_id_env: Option<&std::ffi::OsStr>,
     state_root_env: Option<&std::ffi::OsStr>,
@@ -233,14 +378,6 @@ pub(super) fn platform_launch_env(
         .map(|value| value.to_string_lossy().to_string());
     if let Some(root) = &root {
         env_extra.push(("APP_CLI_STATE_ROOT".to_string(), root.clone()));
-    }
-    // 迁移回执连续性（§3.2 最小原则）：旧运行（无显式根）把回执放在
-    // workspace 父目录的共享目录；该目录存在时锁定旧物理位置，已完成
-    // 迁移不重跑、未确认迁移不被路径切换隐藏。不复制、不归属共享目录内容。
-    if root.is_some()
-        && let Some(old) = discovery::legacy_migration_receipts_dir(project_path)
-    {
-        env_extra.push(("APP_CLI_MIGRATION_RECEIPTS_DIR".to_string(), old));
     }
     root.map(std::path::PathBuf::from)
 }

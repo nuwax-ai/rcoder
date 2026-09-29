@@ -25,6 +25,14 @@ pub(crate) struct OwnerIdentity {
     pub address: String,
     pub runtime_instance_id: String,
 }
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct MigrationLocationRecord {
+    pub version: u8,
+    /// 归一 workspace origin（记录与当前项目不一致时不使用，防止跨项目误绑）。
+    pub origin: String,
+    pub receipts_dir: String,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct State {
     pub owners: HashMap<String, OwnerRecord>,
@@ -35,10 +43,14 @@ pub(crate) struct State {
     pub(super) completed: HashMap<String, Intent>,
     /// Retired transport registrations, not invented terminal operation results.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub(super) retired: HashMap<String, serde_json::Value>,
+    pub(crate) retired: HashMap<String, serde_json::Value>,
     /// DEV-1 §3.3：可续查的本地监督停止（加性字段；不含凭据）。
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(crate) local_stops: HashMap<String, crate::service::dev_server::types::LocalStopRecord>,
+    /// DEV-R5：迁移回执位置的项目绑定（加性字段；只绑定位置，不伪造
+    /// completed——回执本身的成功/未知语义由 app-cli 回执承载）。
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) migration_locations: HashMap<String, MigrationLocationRecord>,
 }
 
 impl State {

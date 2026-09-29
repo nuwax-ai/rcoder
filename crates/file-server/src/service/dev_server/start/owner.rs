@@ -49,8 +49,9 @@ impl DevServerManager {
             if legacy_app_cli_responds(&owner_addr).await {
                 let local_run_alive =
                     crate::service::dev_server::discovery::discover_targets(project_path)
-                        .iter()
-                        .any(|target| target.snapshot.phase != runtime_supervisor::Phase::Stopped);
+                        .live_targets()
+                        .next()
+                        .is_some();
                 if local_run_alive {
                     tracing::info!(
                         project_id,

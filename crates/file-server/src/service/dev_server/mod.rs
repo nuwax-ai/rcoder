@@ -17,6 +17,7 @@ pub mod error_classify;
 mod external_store;
 mod local_stop;
 pub mod log;
+mod migration_receipts;
 mod owner_client;
 mod owner_recovery;
 mod owner_supervision;
@@ -26,6 +27,9 @@ mod start;
 mod startup_contract;
 mod stop;
 pub mod supervise;
+// The real-process fixture uses POSIX flock, signals and executable scripts.
+#[cfg(all(test, unix))]
+mod supervision_tests;
 mod support;
 mod types;
 
@@ -48,11 +52,14 @@ use crate::error::AppResult;
 use support::lock;
 
 /// start_dev 的启动参数包（restart_dev_staged 使用；字段与 start_dev 一致）。
+/// DEV-R6：artifact_release_id 携带本次制品身份——staged 路径若复遇 serve
+/// owner，复用提交 Deploy(ArtifactId)，不得退化为 Source Restart。
 pub struct DevLaunch<'a> {
     pub base_path: Option<&'a str>,
     pub hooks: Option<DevEventHooks>,
     pub pg: Option<&'a shared_types::StartPgCredential>,
     pub request_context: Option<&'a str>,
+    pub artifact_release_id: Option<&'a str>,
 }
 
 impl DevServerManager {
@@ -88,10 +95,13 @@ impl DevServerManager {
         self.start_dev(
             project_id,
             project_path,
-            base_path,
-            hooks,
-            pg,
-            request_context,
+            DevLaunch {
+                base_path,
+                hooks,
+                pg,
+                request_context,
+                artifact_release_id: None,
+            },
         )
         .await
     }
@@ -100,6 +110,8 @@ impl DevServerManager {
     /// 目录（制品 activate）→ 启动。旧路径 activate 先于停止——活服务继续
     /// 访问已被替换的目录。`stop_workspace` 用源码 workspace 的稳定 origin
     ///（.run 目录切换不影响归属解析）；`activate` 产出实际启动根。
+    /// DEV-R6：复用预检携带本次制品身份——route 无 owner 后窗口内出现的
+    /// serve 收到 Deploy(ArtifactId)，不退化为 Source Restart。
     pub async fn restart_dev_staged<F>(
         &self,
         project_id: &str,
@@ -117,7 +129,7 @@ impl DevServerManager {
                     stop_workspace,
                     launch.hooks.clone(),
                     launch.pg,
-                    None,
+                    launch.artifact_release_id,
                     launch.request_context,
                 )
                 .await?
@@ -129,15 +141,7 @@ impl DevServerManager {
             self.stop_dev(project_id).await?;
         }
         let run_root = activate.await?;
-        self.start_dev(
-            project_id,
-            &run_root,
-            launch.base_path,
-            launch.hooks,
-            launch.pg,
-            launch.request_context,
-        )
-        .await
+        self.start_dev(project_id, &run_root, launch).await
     }
 
     /// 取 UserApp manifest 编排进程的监督句柄（P1-03/P1-04：调用方经此
@@ -274,7 +278,17 @@ impl DevServerManager {
         // （无凭据来源——容器 env 透传行为，见 start_dev 的 pg 参数注释）
         self.stop_dev(project_id).await?;
         let started = self
-            .start_dev(project_id, project_path, base_path, None, None, None)
+            .start_dev(
+                project_id,
+                project_path,
+                DevLaunch {
+                    base_path,
+                    hooks: None,
+                    pg: None,
+                    request_context: None,
+                    artifact_release_id: None,
+                },
+            )
             .await?;
         Ok(KeepAliveResult {
             alive: true,
