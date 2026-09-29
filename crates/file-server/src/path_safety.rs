@@ -90,6 +90,22 @@ pub async fn ensure_resolved_within(base: &Path, relative: &str) -> AppResult<Pa
     Ok(target)
 }
 
+/// realpath 级根边界 (对齐 TS e822516 escapesRoot): `target` 是调用方字面解析后的
+/// 绝对路径 (如 `resolve_subdir` 的产物), 与 `base` 一起沿存在祖先链解析符号链接
+/// (含目录链接中段、链式链接) 后必须满足前缀包含。缺失后缀保留——不存在的
+/// 路径不在此层报错, 由调用方常规缺失流程处理; 与 [`ensure_resolved_within`]
+/// 同水位, 区别是入口已是绝对路径而非待解析的相对字符串。
+pub async fn ensure_resolved_target_within(base: &Path, target: &Path) -> AppResult<()> {
+    let resolved_base = resolve_existing_ancestor(base).await?;
+    let resolved_target = resolve_existing_ancestor(target).await?;
+    if !resolved_target.starts_with(&resolved_base) {
+        return Err(AppError::validation(
+            "File path resolves outside the workspace directory",
+        ));
+    }
+    Ok(())
+}
+
 async fn resolve_existing_ancestor(path: &Path) -> AppResult<PathBuf> {
     let mut probe = std::path::absolute(path)
         .map_err(|error| AppError::validation(format!("Resolve file path: {error}")))?
@@ -189,5 +205,47 @@ mod tests {
             safe_zip_entry(&ex, "skills/foo/SKILL.md").unwrap(),
             PathBuf::from("/tmp/extract/skills/foo/SKILL.md")
         );
+    }
+
+    // ── TS e822516 escapesRoot 对齐: realpath 级根边界 (绝对路径入口) ────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_resolved_target_within_three_states() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("session");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("a.txt"), "x").unwrap();
+        std::os::unix::fs::symlink("sub", root.join("inside-dir")).unwrap();
+        std::os::unix::fs::symlink("..", root.join("outside-dir")).unwrap();
+
+        // 界内: 字面子目录 / 界内目录链接中段 / 缺失后缀 (不在此层报错)
+        ensure_resolved_target_within(&root, &root.join("sub"))
+            .await
+            .unwrap();
+        ensure_resolved_target_within(&root, &root.join("inside-dir").join("a.txt"))
+            .await
+            .unwrap();
+        ensure_resolved_target_within(&root, &root.join("sub").join("missing.txt"))
+            .await
+            .unwrap();
+
+        // 界外: relativePath 指进越界目录链接 (realpath 后落在根之外)
+        let err = ensure_resolved_target_within(&root, &root.join("outside-dir"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(..)), "{err:?}");
+        let err =
+            ensure_resolved_target_within(&root, &root.join("outside-dir").join("secret.txt"))
+                .await
+                .unwrap_err();
+        assert!(matches!(err, AppError::Validation(..)), "{err:?}");
+        // 越界目录链接自身指向的文件 (链接条目在界内, 目标在界外)
+        std::fs::write(outer.path().join("secret.txt"), "x").unwrap();
+        std::os::unix::fs::symlink("../secret.txt", root.join("outside-file.txt")).unwrap();
+        let err = ensure_resolved_target_within(&root, &root.join("outside-file.txt"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(..)), "{err:?}");
     }
 }

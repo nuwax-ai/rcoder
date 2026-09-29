@@ -179,6 +179,11 @@ pub async fn list_files_meta_filtered(
     options: MetaListOptions,
 ) -> AppResult<Vec<FileEntry>> {
     let list_dir = resolve_subdir(root, relative_path)?;
+    // realpath 级根边界 (对齐 TS e822516 escapesRoot): relativePath 指进目录符号链接
+    // (如 link -> /etc 后 relativePath=link) 时列表起点实际位于目标根之外, 按非法
+    // 路径拒绝——与字面 `..` 穿越同一报错口径; 缺失路径不在此层报错 (先于存在性检查,
+    // 与 TS 顺序一致)。
+    ensure_resolved_list_dir(root, &list_dir, relative_path).await?;
     if !crate::service::fs_util::path_exists(&list_dir).await? {
         // 目录不存在 → 空数组 (handler 层也会先判存在, 这里是防御)
         return Ok(Vec::new());
@@ -254,14 +259,46 @@ pub(crate) fn resolve_subdir(root: &Path, relative_path: Option<&str>) -> AppRes
         .components()
         .any(|c| matches!(c, Component::ParentDir))
     {
-        return Err(AppError::validation(
-            "relativePath is not safe, cannot exceed target directory",
-        ));
+        return Err(illegal_relative_path(relative_path));
     }
 
     // normalized 是相对路径 (已剥前导斜杠 + 无 ..), join 不会替换 base;
     // ensure_within_path 做最终 starts_with 兜底, 双重保险。
     path_safety::ensure_within_path(&root.clean(), normalized)
+}
+
+/// `relativePath` 越界的 details 结构 (JSON 键对齐 TS 契约): 字段集编译期锁定。
+#[derive(serde::Serialize)]
+struct RelativePathErrorDetails<'a> {
+    field: &'static str,
+    #[serde(rename = "relativePath")]
+    relative_path: &'a str,
+}
+
+/// `relativePath` 越界的 ValidationError: 字面 `..` 穿越 (resolve_subdir) 与
+/// realpath 级越界目录链接 (ensure_resolved_list_dir, TS e822516) 共用同一
+/// 报错口径 (message 英文; details.field/relativePath 对齐 TS 键名)。
+pub(crate) fn illegal_relative_path(relative_path: Option<&str>) -> AppError {
+    AppError::validation_with_details(
+        "relativePath is not safe, cannot exceed target directory",
+        RelativePathErrorDetails {
+            field: "relativePath",
+            relative_path: relative_path.unwrap_or(""),
+        },
+    )
+}
+
+/// realpath 级列表/搜索起点边界 (对齐 TS e822516 escapesRoot): `resolved` 是
+/// `resolve_subdir` 字面解析后的绝对路径, 经符号链接 (含目录链接中段) 解析后
+/// 越出 `root` → 与字面 `..` 穿越同款 400。缺失路径不在此层报错。
+pub(crate) async fn ensure_resolved_list_dir(
+    root: &Path,
+    resolved: &Path,
+    relative_path: Option<&str>,
+) -> AppResult<()> {
+    path_safety::ensure_resolved_target_within(root, resolved)
+        .await
+        .map_err(|_| illegal_relative_path(relative_path))
 }
 
 /// 读取目录条目并按 nuwax 规则过滤 + 排序 (隐藏文件除 .gitignore / traverse_exclude_dirs /
@@ -768,6 +805,62 @@ mod tests {
         .await
         .unwrap();
         assert!(none.is_empty());
+    }
+
+    // ── TS e822516 escapesRoot 对齐: relativePath 指进越界目录链接 ────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_files_meta_relative_path_into_outside_dir_link_is_rejected() {
+        // relativePath 指进目录符号链接 (link -> 根外目录) → 与字面 `..` 穿越
+        // 同款 400 (message 英文, details.field/relativePath 键名对齐 TS);
+        // 界内目录链接中段不受影响。
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("session");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("a.txt"), "a").unwrap();
+        std::fs::write(outer.path().join("secret.txt"), "outside").unwrap();
+        std::os::unix::fs::symlink("sub", root.join("inside-dir")).unwrap();
+        std::os::unix::fs::symlink("..", root.join("outside-dir")).unwrap();
+        let cfg = default_test_config();
+        let options = MetaListOptions {
+            recursive: true,
+            levels_left: 1,
+            file_type: MetaListType::All,
+            limit: None,
+        };
+
+        // 越界目录链接 → 400, 不泄露界外条目
+        let Err(err) =
+            list_files_meta_filtered(&root, &cfg, None, Some("outside-dir"), options).await
+        else {
+            panic!("越界目录链接作为列表起点必须 400");
+        };
+        let AppError::Validation(message, details) = &err else {
+            panic!("必须是 Validation: {err:?}");
+        };
+        assert_eq!(
+            message,
+            "relativePath is not safe, cannot exceed target directory"
+        );
+        let details = details.as_ref().expect("details 必带字段回显");
+        assert_eq!(details["field"], "relativePath");
+        assert_eq!(details["relativePath"], "outside-dir");
+
+        // 字面 `..` 穿越: 同一报错口径 (details 回显原始输入)
+        let Err(err) = list_files_meta_filtered(&root, &cfg, None, Some("../outer"), options).await
+        else {
+            panic!("字面 .. 穿越必须 400");
+        };
+        assert!(matches!(err, AppError::Validation(..)), "{err:?}");
+
+        // 界内目录链接中段: 正常列出
+        let entries = list_files_meta_filtered(&root, &cfg, None, Some("inside-dir"), options)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        // 条目 name 相对 workspace 根 (非列表起点)
+        assert_eq!(entries[0].name, "sub/a.txt");
     }
 
     #[tokio::test]

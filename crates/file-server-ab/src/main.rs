@@ -2031,6 +2031,54 @@ fn core_scenarios(fixtures: &Path) -> Result<Vec<(&'static str, RequestSpec)>> {
                 encode_query("outside-link.txt")
             )),
         ),
+        // ── TS e822516 (1.5.7) escapesRoot: 越界目录链接的中段逃逸 ──────────────────
+        // relativePath 指进 outside-dir (→ 会话根之外的工作区根) 双侧 400;
+        // message 文案 TS 中文 / Rust 英文 (默认英文错误提示), 归一化对比类型与 details。
+        (
+            "computer-file-list-relative-path-outside-dir-link",
+            {
+                let mut spec = get_client_error(format!(
+                    "/api/computer/get-file-list?userId={user}&cId={cid}&relativePath=outside-dir"
+                ));
+                spec.normalized_paths.push("/error/message".into());
+                spec
+            },
+        ),
+        (
+            "computer-search-relative-path-outside-dir-link",
+            {
+                let mut spec = get_client_error(format!(
+                    "/api/computer/search-files?userId={user}&cId={cid}&kw=hello&relativePath=outside-dir"
+                ));
+                spec.normalized_paths.push("/error/message".into());
+                spec
+            },
+        ),
+        // 静态直读经越界目录链接 → 双侧 404 纯文本 "Not Found" (不泄露内容与大小);
+        // 框架默认 content-type 不同 (express text/html vs axum text/plain), 归一化。
+        (
+            "computer-static-dir-link-outside-root",
+            {
+                let mut spec = get_client_error(format!(
+                    "/api/computer/static/{user}/{cid}/outside-dir/file-server-ab-outside-secret.txt"
+                ));
+                spec.normalized_headers.push("content-type".into());
+                spec
+            },
+        ),
+        // get-file-meta 经越界目录链接 → 双侧 200 + 单条 error:"illegal path"
+        (
+            "computer-get-file-meta-outside-dir-link",
+            json_request(
+                Method::POST,
+                "/api/computer/get-file-meta".to_string(),
+                json!({
+                    "userId": user,
+                    "cId": cid,
+                    "filePaths": ["outside-dir/file-server-ab-outside-secret.txt", "sub/nested/hello.txt"]
+                }),
+            )?,
+        ),
         (
             "computer-resolve-file-path-traversal",
             get(format!(
@@ -6662,6 +6710,9 @@ fn prepare_computer_fixture(root: &Path) -> Result<()> {
             "../../file-server-ab-outside-secret.txt",
             dir.join("outside-link.txt"),
         )?;
+        // 目录链接 → 会话根之外的工作区根 (TS e822516 escapesRoot 对照:
+        // relativePath 指进/静态读取经此链接必须被拒)
+        symlink("../..", dir.join("outside-dir"))?;
     }
     Ok(())
 }

@@ -71,6 +71,18 @@ impl AppError {
     pub fn validation_with(msg: impl Into<String>, details: Value) -> Self {
         AppError::Validation(msg.into(), Some(details))
     }
+    /// 结构体 details 的校验错误: 字段集在编译期锁定 (裸 `json!` 宏改名字段
+    /// 不会有任何编译感知)。序列化失败降级为无 details 的校验错误并 warn,
+    /// 不 panic、不向调用方传染 `Result`。
+    pub fn validation_with_details(msg: impl Into<String>, details: impl serde::Serialize) -> Self {
+        match serde_json::to_value(details) {
+            Ok(value) => AppError::Validation(msg.into(), Some(value)),
+            Err(error) => {
+                tracing::warn!(%error, "serialize validation error details failed");
+                AppError::Validation(msg.into(), None)
+            }
+        }
+    }
     /// 带 i18n key 的校验错误: `fallback` 为英文兜底消息 (支持 String 动态拼接),
     /// `key` 为 i18n 翻译 key。`into_response` 时优先按请求 locale 翻译 key, 未命中则用 fallback。
     pub fn validation_i18n(fallback: impl Into<String>, key: &'static str) -> Self {

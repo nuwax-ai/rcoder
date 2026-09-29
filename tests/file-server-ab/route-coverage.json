@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "typescript_revision": "cd0f075602c8dec48088cb51e7d612bae1569274",
+  "typescript_revision": "e822516a31e4a856f34b8a65884af2c585057b7c",
   "route_sources": [
     "src/routes/*.js",
     "src/server.js"
@@ -308,7 +308,8 @@
         "computer-file-list-invalid-type",
         "computer-file-list-invalid-limit",
         "computer-file-list-depth-decimal-rejected",
-        "computer-file-list-limit-whitespace-rejected"
+        "computer-file-list-limit-whitespace-rejected",
+        "computer-file-list-relative-path-outside-dir-link"
       ]
     },
     {
@@ -320,7 +321,8 @@
       "suite": "core",
       "cases": [
         "computer-file-meta",
-        "computer-file-meta-boundary"
+        "computer-file-meta-boundary",
+        "computer-get-file-meta-outside-dir-link"
       ]
     },
     {
@@ -412,7 +414,8 @@
       "status": "covered",
       "suite": "core",
       "cases": [
-        "computer-search-files"
+        "computer-search-files",
+        "computer-search-relative-path-outside-dir-link"
       ]
     },
     {
@@ -427,7 +430,8 @@
         "computer-read-uploaded-single-binary",
         "computer-read-uploaded-batch-binary",
         "computer-read-generated-file-utf8",
-        "computer-read-imported-project-file"
+        "computer-read-imported-project-file",
+        "computer-static-dir-link-outside-root"
       ]
     },
     {
@@ -935,6 +939,7 @@
     "Revision 9f636bf vs 0cffa11 touched only src/utils (search exclusion + git quoting); route inventory re-verified unchanged (no src/routes or server.js deltas).",
     "Revision 55ac510 (1.5.4) adds get-file-list depth and search-files type params over 104d285/9f636bf; route paths unchanged, new-param cases registered per entry.",
     "Revision 02bec84 (1.5.5) adds X-File-Size static header (compared as protocol header) and git file-content directory/symlink semantics; new directory cases registered, revert --ignore-unmatch is TS-shell-specific (Rust gix tree-apply immune, covered by unit test).",
-    "Revision cd0f075 (1.5.6) tightens limit/depth to strict decimal /^\\d+$/ (no trim) and adds .tmp to search noise; Rust mirrored both plus contract 1.5.6. TS also converged to Rust on outside-root symlink invisibility, status --untracked-files=all, path no-trim, platform-aware leading-separator, rename lstat — corresponding approved rules should retire after the next A/B run confirms."
+    "Revision cd0f075 (1.5.6) tightens limit/depth to strict decimal /^\\d+$/ (no trim) and adds .tmp to search noise; Rust mirrored both plus contract 1.5.6. TS also converged to Rust on outside-root symlink invisibility, status --untracked-files=all, path no-trim, platform-aware leading-separator, rename lstat — corresponding approved rules should retire after the next A/B run confirms.",
+    "Revision e822516 (1.5.7) upgrades boundary guard to realpath-level escapesRoot (static mounts, file-list/resolve-file/get-file-meta entries, relativePath for list/search); Rust mirrored via ensure_resolved_target_within at the three literal-parse sites. New outside-dir-link cases registered; error message texts intentionally differ (TS Chinese vs Rust English default) and are normalized in-case."
   ]
 }

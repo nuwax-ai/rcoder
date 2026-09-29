@@ -195,6 +195,45 @@ mod file_list_options_tests {
     }
 }
 
+#[cfg(test)]
+mod file_meta_boundary_tests {
+    use super::query_file_meta_entry;
+    use crate::config::Config;
+
+    // ── TS e822516 escapesRoot 对齐: 越界链接的 meta 按非法路径处理 ─────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_meta_outside_link_is_illegal_path_entry() {
+        // 路径经符号链接 (含目录链接中段) 解析后越出目标根 → error:"illegal path"
+        // 条目, 不泄露界外文件的 meta (isLink/linkTarget/size)。
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("session");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(outer.path().join("secret.txt"), "outside").unwrap();
+        std::os::unix::fs::symlink("..", root.join("outside-dir")).unwrap();
+        std::os::unix::fs::symlink("../secret.txt", root.join("outside-file.txt")).unwrap();
+        std::os::unix::fs::symlink("sub", root.join("inside-dir")).unwrap();
+        let config = Config::default();
+
+        for input in ["outside-dir/secret.txt", "outside-file.txt", "outside-dir"] {
+            let entry = query_file_meta_entry(&root, input, &config).await;
+            assert_eq!(entry.path, input, "{input}: 回显原始输入");
+            assert_eq!(
+                entry.error.as_deref(),
+                Some("illegal path"),
+                "{input}: error 必须为 illegal path"
+            );
+        }
+
+        // 界内路径不受影响 (目录链接中段在界内)
+        let entry = query_file_meta_entry(&root, "inside-dir", &config).await;
+        assert!(entry.error.is_none(), "界内目录链接不得误伤");
+        // lstat 对链接条目本身: is_link=true (不跟随)
+        assert_eq!(entry.is_link, Some(true));
+    }
+}
+
 /// get-file-list 的 workspace 无关核心 (computer / userapp 域共用;
 /// 定位由各域壳层完成, 此处只收目标根路径 + 业务参数; 类型化返回,
 /// customTargetDir URL 后缀等展示逻辑归各域拼装层)。
@@ -573,6 +612,14 @@ async fn query_file_meta_entry(
         Ok(resolved) => resolved,
         Err(_) => return FileMetaEntry::errored(input.to_string(), "illegal path".into()),
     };
+    // realpath 级根边界 (对齐 TS e822516 escapesRoot): 路径经符号链接 (含目录
+    // 链接中段) 解析后越出目标根 → illegal path 条目 (不泄露界外 meta)。
+    if tree::ensure_resolved_list_dir(target_dir, &resolved, Some(input))
+        .await
+        .is_err()
+    {
+        return FileMetaEntry::errored(input.to_string(), "illegal path".into());
+    }
     let meta = match tokio::fs::symlink_metadata(&resolved).await {
         Ok(meta) => meta,
         Err(e) => return FileMetaEntry::errored(input.to_string(), e.to_string()),

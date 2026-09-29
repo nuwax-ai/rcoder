@@ -30,7 +30,7 @@ pub async fn root() -> Html<&'static str> {
 /// `AGENT_STORE_MIN_VERSION = 1.4.0` 比较, 决定是否走 v2 agent-store API。本实现
 /// 已覆盖该契约面 (create-workspace-v2/agent-store), 因此报告所实现的 TS 契约线
 /// 版本; crate 版本只是构建编号, 不参与能力判断。升级功能面时同步提升此常量。
-pub const API_CONTRACT_VERSION: &str = "1.5.6";
+pub const API_CONTRACT_VERSION: &str = "1.5.7";
 
 /// 健康检查
 #[utoipa::path(

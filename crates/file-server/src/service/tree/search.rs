@@ -149,6 +149,9 @@ pub async fn search_files(params: SearchParams<'_>) -> AppResult<SearchResult> {
     let timeout = Duration::from_millis(timeout_ms);
 
     let search_root_abs = resolve_subdir(root, relative_path)?;
+    // realpath 级搜索起点边界 (对齐 TS e822516 escapesRoot): relativePath 指进越界
+    // 目录链接 → 400 (先于存在性检查, 与 TS 顺序一致); 缺失路径不在此层报错。
+    super::ensure_resolved_list_dir(root, &search_root_abs, relative_path).await?;
     if !crate::service::fs_util::path_exists(&search_root_abs).await? {
         return Ok(SearchResult {
             files: Vec::new(),
@@ -645,6 +648,62 @@ mod tests {
                 "kw={kw} 应命中 {expected}, 实际: {names:?}"
             );
         }
+    }
+
+    // ── TS e822516 escapesRoot 对齐: 搜索起点指进越界目录链接 ─────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_files_relative_path_into_outside_dir_link_is_rejected() {
+        // 搜索起点 relativePath 指进越界目录链接 → 与列表同款 400, 不扫描界外子树。
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("session");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("kw-hit.txt"), "x").unwrap();
+        std::fs::write(outer.path().join("kw-secret.txt"), "outside").unwrap();
+        std::os::unix::fs::symlink("..", root.join("outside-dir")).unwrap();
+
+        let Err(err) = search_files(SearchParams {
+            root: &root,
+            config: &default_test_config(),
+            proxy_path: None,
+            kw: "kw",
+            relative_path: Some("outside-dir"),
+            limit: 100,
+            max_visit: 1000,
+            timeout_ms: 5000,
+            kind_filter: None,
+        })
+        .await
+        else {
+            panic!("越界目录链接作为搜索起点必须 400")
+        };
+        let AppError::Validation(message, details) = &err else {
+            panic!("必须是 Validation: {err:?}");
+        };
+        assert_eq!(
+            message,
+            "relativePath is not safe, cannot exceed target directory"
+        );
+        assert_eq!(details.as_ref().unwrap()["relativePath"], "outside-dir");
+
+        // 界内子目录起点不受影响
+        let r = search_files(SearchParams {
+            root: &root,
+            config: &default_test_config(),
+            proxy_path: None,
+            kw: "kw",
+            relative_path: Some("sub"),
+            limit: 100,
+            max_visit: 1000,
+            timeout_ms: 5000,
+            kind_filter: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(r.files.len(), 1);
+        // 条目 name 相对 workspace 根 (非搜索起点)
+        assert_eq!(r.files[0].name, "sub/kw-hit.txt");
     }
 
     #[tokio::test]
