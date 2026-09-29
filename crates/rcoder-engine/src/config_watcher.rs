@@ -7,20 +7,40 @@
 //!
 //! 三层互补，覆盖两类编辑方式与容器单文件 bind 场景：
 //!
-//! 1. **文件 inode watch**：同 inode 原地写（`echo >>` / `tee` / 程序直写）。
-//!    inotify 语义下目录 watch **收不到**子文件的内容修改事件，必须 watch
-//!    文件本身；单文件 bind mount 两侧共享同一 inode，宿主侧原地写的事件
-//!    会投递到容器内对该 inode 的 watch。
+//! 1. **文件 watch**：单文件 bind mount 两侧共享同一 inode，宿主侧对 bind
+//!    源文件的原地写（`echo >>` / `tee` / 程序直写）会投递到容器内对该
+//!    inode 的监听。容器部署实测：只监听父目录时此类写法零事件——宿主
+//!    修改走的是宿主侧目录路径，而非容器内被监听的目录项（inotify(7)：
+//!    目录监听不覆盖通过该目录之外的其他路径进行的操作）。
 //! 2. **父目录 watch**：编辑器原子保存（write-to-temp + rename）产生的
-//!    目录项变化（IN_MOVED_TO / Create）。
+//!    目录项变化（IN_MOVED_TO → Create/Modify(Name)）。
 //! 3. **低频轮询兜底**（默认 3s，`RCODER_CONFIG_POLL_SECS` 可调，0 禁用）：
-//!    内容 hash 快照比对（mtime 在跨虚拟化文件系统下可能被属性缓存拖后，
-//!    内容读取没有该问题）。事件通路在异构挂载/传播特性下仍可能丢事件，
-//!    轮询保证修改后有界生效。
+//!    内容快照比对。事件通路在异构挂载/传播特性差异下仍可能丢事件，
+//!    轮询在新内容对容器可见后持续重试；实测跨虚拟化
+//!    文件系统的内容可见性延迟远小于 mtime 属性缓存的抖动，故用内容
+//!    而非 mtime+size 做指纹。
 //!
-//! 已知边界（bind mount 固有，非 watcher 可解）：宿主以 rename 语义编辑
-//!（`sed -i` / vim 原子保存）时，容器内单文件 bind 仍指向旧 inode——内容
-//! 都不会更新，事件与轮询均不触发，需原地写方式或重启容器重新绑定。
+//! # 一致性规则
+//!
+//! - **单一重载执行者**：事件与轮询只负责触发，读取、解析、提交在同一个
+//!   串行任务中按序执行——不存在并发提交导致的旧值倒序覆盖；
+//! - **同一份字节用于指纹与解析**；
+//! - **成功提交后才更新已应用指纹**：重载失败（文件半成品/暂时不可读）
+//!   保留旧指纹，下一次触发自动重试；
+//! - **启动对账**：构造后立即按当前文件内容对账一次——启动读取配置与
+//!   watcher 创建之间发生的修改不会因被当作基线而永久遗漏；
+//! - **半成品不改变运行配置**：`api_key_auth` 段缺失/非法时保留旧配置
+//!   并报错（关闭鉴权必须显式 `enabled: false`）；
+//! - 环境变量覆盖（`RCODER_API_KEY_ENABLED`/`RCODER_API_KEY`）与启动
+//!   加载共用同一规则（见 `config::apply_api_key_env_overrides`），热修改
+//!   不会静默覆盖环境变量指定的鉴权状态。
+//!
+//! # 已知边界（bind mount 固有）
+//!
+//! 宿主以 rename 语义编辑（`sed -i` / vim 原子保存）时，容器内单文件
+//! bind 仍指向旧 inode——**新内容尚未进入容器的挂载视图**，watcher 与
+//! 轮询读到的都是旧内容，热加载无从生效；需原地写方式或重启容器重新
+//! 绑定。旧 inode 自身的属性事件仍可能触发一次重载，结果与旧内容一致。
 //!
 //! # 其他特性
 //!
@@ -28,10 +48,12 @@
 //! - 线程安全更新（ArcSwap 原子换）
 //! - 相对路径（容器形态默认 `config.yml` / `RCODER_CONFIG_FILE`）注册前
 //!   归一为绝对路径，消除空 parent 目录与 cwd 依赖漂移
+//! - watch 注册失败不放弃热加载：轮询兜底在则降级继续（warn 记录原因）
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use parking_lot::Mutex;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -40,18 +62,31 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::config::{ApiKeyAuthConfig, load_api_key_config_from_file};
+use crate::config::{ApiKeyAuthConfig, parse_api_key_config};
 
 /// 轮询兜底默认间隔（秒）；`RCODER_CONFIG_POLL_SECS` 可覆盖（0 = 禁用）。
+/// 本地正常 I/O 下，新内容可读后通常在一个周期内被检测；挂载传播、
+/// 读取失败或调度延迟不属于固定的时间保证。
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 3;
 
-/// 配置文件监控器
+/// 配置文件监控器。
 ///
-/// 内部持有 `RecommendedWatcher` 以保持文件监控活跃。
-/// 一旦 ConfigWatcher 被 drop,文件监控将停止。
+/// 持有 native watcher（可能为 `None`：降级纯轮询）与重载任务句柄；
+/// drop 撤销发布权限并取消任务。已经开始的同步读取可能稍后才返回，
+/// 但其结果不得再提交；不会等待磁盘 I/O 完成才允许关停。
 pub struct ConfigWatcher {
-    /// 文件系统监控器(必须保持存活)
-    _watcher: RecommendedWatcher,
+    _watcher: Option<RecommendedWatcher>,
+    _reloader: tokio::task::JoinHandle<()>,
+    updates_enabled: Arc<Mutex<bool>>,
+}
+
+impl Drop for ConfigWatcher {
+    fn drop(&mut self) {
+        // abort is cooperative. Revoke publication under the same short lock
+        // used by ArcSwap commits before cancelling an in-flight read/parse.
+        *self.updates_enabled.lock() = false;
+        self._reloader.abort();
+    }
 }
 
 /// 相对路径 → 绝对路径（相对当前工作目录拼接）。注册 watch、读取与事件
@@ -90,182 +125,309 @@ impl ConfigWatcher {
         api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
         poll_interval: Duration,
     ) -> Result<Self> {
+        Self::build(config_path, api_key_config, poll_interval, true)
+    }
+
+    /// 仅轮询（无 native watcher）。既用于 watcher 构造失败时的降级，
+    /// 也供测试确定性覆盖纯轮询路径。
+    pub fn poll_only(
+        config_path: PathBuf,
+        api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
+        poll_interval: Duration,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            !poll_interval.is_zero(),
+            "poll-only watcher requires a non-zero poll interval"
+        );
+        Self::build(config_path, api_key_config, poll_interval, false)
+    }
+
+    fn build(
+        config_path: PathBuf,
+        api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
+        poll_interval: Duration,
+        use_native_watcher: bool,
+    ) -> Result<Self> {
         let config_path = normalize_config_path(&config_path)?;
-        let (tx, mut rx) = mpsc::channel(100);
-
-        let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-            if let Ok(event) = res
-                && let Err(e) = tx.blocking_send(event)
-            {
-                warn!("config watcher event send failed (consumer gone): {e}");
+        let mut event_rx = None;
+        let watcher = if use_native_watcher {
+            match Self::spawn_watches(&config_path) {
+                Ok((watcher, rx)) => {
+                    event_rx = Some(rx);
+                    Some(watcher)
+                }
+                Err(error) => {
+                    // 注册失败不放弃热加载：轮询兜底在则降级继续；轮询也
+                    // 禁用时如实报错（上层 warn 降级，与既有装配语义一致）。
+                    if poll_interval.is_zero() {
+                        return Err(error.context("config file watcher unavailable"));
+                    }
+                    warn!(
+                        "📁 [CONFIG_WATCHER] native watcher unavailable, degrading to poll-only: {error:#}"
+                    );
+                    None
+                }
             }
-        })?;
-
-        // 双 watch：
-        // - 文件本身（同 inode 原地写的内容修改事件只在文件 inode watch 上
-        //   投递，目录 watch 收不到——这是原实现热加载失效的直接根因）；
-        // - 父目录（原子保存 write-to-temp + rename 的目录项事件）。
-        watcher.watch(&config_path, RecursiveMode::NonRecursive)?;
-        if let Some(parent) = config_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            watcher.watch(parent, RecursiveMode::NonRecursive)?;
-        }
+        } else {
+            None
+        };
         info!(
-            "📁 [CONFIG_WATCHER] Watching config file: {:?} (file + parent dir) with {:?} poll fallback",
-            config_path, poll_interval
+            "📁 [CONFIG_WATCHER] Watching config file: {:?} ({}, poll fallback {:?})",
+            config_path,
+            if watcher.is_some() {
+                "file + parent dir"
+            } else {
+                "poll-only"
+            },
+            poll_interval
         );
 
-        let file_name = config_path.file_name().map(|n| n.to_os_string());
-        let event_config_path = config_path.clone();
-        let event_api_key_config = Arc::clone(&api_key_config);
-        // 事件通路：过滤目标文件事件（文件 watch 的事件 path 即目标文件；
-        // 目录 watch 的事件按 file_name 过滤出目标），交公共重载入口。
-        tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                if let Some(ref name) = file_name {
-                    let event_matches = event.paths.iter().any(|p| {
-                        p.file_name()
-                            .map(|n| n == name.as_os_str())
-                            .unwrap_or(false)
-                    });
-                    if !event_matches {
-                        continue;
-                    }
-                }
-                // EventKind::Any：macOS fsevent 默认 imprecise 模式把所有
-                // 变化都报告为 Any（无细粒度 kind）；目标文件已按路径过滤，
-                // Any 也必须触发重载。
-                if matches!(
-                    event.kind,
-                    EventKind::Modify(_) | EventKind::Create(_) | EventKind::Any
-                ) {
-                    reload_with_retry(&event_config_path, Arc::clone(&event_api_key_config)).await;
-                }
-            }
-        });
+        let updates_enabled = Arc::new(Mutex::new(true));
+        let reloader = tokio::spawn(reload_loop(
+            config_path,
+            event_rx,
+            poll_interval,
+            api_key_config,
+            Arc::clone(&updates_enabled),
+        ));
 
-        // 轮询兜底通路：内容 hash 快照比对（事件丢失/异构挂载传播特性差异
-        // 时保证有界生效；mtime 在跨虚拟化文件系统下可能被属性缓存拖后）。
-        // 文件暂时不可读（读取失败）保持快照不变，待恢复后按变化处理；文件
-        // 被 rename 替换（bind 滞留旧 inode）时内容不变，轮询正确地不触发。
-        if !poll_interval.is_zero() {
-            let poll_config_path = config_path.clone();
-            let poll_api_key_config = Arc::clone(&api_key_config);
-            // 基线快照在构造同步段捕获（而非任务首次调度时）——构造与
-            // 首个 tick 之间发生的修改必须被检测，不能被误当作基线。
-            let mut snapshot = file_fingerprint(&config_path);
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(poll_interval).await;
-                    let current = file_fingerprint(&poll_config_path);
-                    if current != snapshot {
-                        info!(
-                            "[CONFIG_WATCHER] poll detected config change: {:?} -> {:?}",
-                            snapshot, current
-                        );
-                        snapshot = current;
-                        reload_with_retry(&poll_config_path, Arc::clone(&poll_api_key_config))
-                            .await;
-                    }
-                }
-            });
-        }
-
-        Ok(Self { _watcher: watcher })
+        Ok(Self {
+            _watcher: watcher,
+            _reloader: reloader,
+            updates_enabled,
+        })
     }
 
-    /// 重新加载配置（使用 ArcSwap 无锁更新）。
-    /// 校验失败（enabled 且空 key / 解析失败）时不写入 ArcSwap——调用方与
-    /// 调用方旧配置保持生效，不 panic、不放行。
-    async fn reload_config(
-        config_path: &Path,
-        api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
-    ) -> Result<()> {
-        match load_api_key_config_from_file(config_path) {
-            Ok(new_config) => {
-                // 验证配置有效性
-                if new_config.enabled && new_config.api_key.trim().is_empty() {
-                    error!("[CONFIG_WATCHER] API Key is empty");
-                    return Err(anyhow::anyhow!("API Key cannot be empty string"));
+    /// 文件 + 父目录双监听。单侧失败降级为另一侧（warn）——文件监听覆盖
+    /// 同 inode 原地写，目录监听覆盖原子保存 rename；任一侧注册成功即保留
+    /// native 通路（事件接收端一并返回），双侧失败向上返回错误由调用方
+    /// 决定降级。通知只表示需要重读当前文件，合并连续事件而不阻塞
+    /// native 回调；监听错误和重扫请求同样触发对账。
+    fn spawn_watches(config_path: &Path) -> Result<(RecommendedWatcher, mpsc::Receiver<()>)> {
+        let (tx, rx) = mpsc::channel(1);
+        let file_name = config_path.file_name().map(|name| name.to_os_string());
+        let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+            let reload = match res {
+                Ok(event) => event_targets(&event, file_name.as_deref()),
+                Err(error) => {
+                    warn!("[CONFIG_WATCHER] watcher error event: {error}");
+                    true
                 }
-
-                // 🚀 使用 ArcSwap 原子更新配置（无锁，不阻塞读取）
-                let old_config = api_key_config.load();
-                let old_enabled = old_config.enabled;
-                let key_changed = old_config.api_key != new_config.api_key;
-
-                // 提前保存新配置状态（用于日志）
-                let new_enabled = new_config.enabled;
-
-                // 原子替换配置（移动所有权，避免 clone）
-                api_key_config.store(Arc::new(new_config));
-
-                // 记录配置变更
-                if old_enabled != new_enabled {
-                    info!(
-                        "🔄 [CONFIG_WATCHER] API Key auth status updated: {} -> {}",
-                        old_enabled, new_enabled
-                    );
+            };
+            if reload {
+                match tx.try_send(()) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {
+                        // A queued signal already covers the latest contents.
+                    }
+                    Err(mpsc::error::TrySendError::Closed(())) => {
+                        // The reloader has stopped; no further work is owned.
+                    }
                 }
-
-                if key_changed {
-                    info!("[CONFIG_WATCHER] API Key updated");
-                }
-
-                if !old_enabled && !new_enabled && !key_changed {
-                    // 配置未实际变化，不记录日志
-                    return Ok(());
-                }
-
-                info!("[CONFIG_WATCHER] Config update succeeded");
-                Ok(())
             }
-            Err(e) => {
-                error!("[CONFIG_WATCHER] Config file reload failed: {}", e);
-                Err(e)
+        })?;
+        let mut registered = false;
+        match watcher.watch(config_path, RecursiveMode::NonRecursive) {
+            Ok(()) => registered = true,
+            Err(error) => warn!(
+                "[CONFIG_WATCHER] file watch unavailable ({}): {error}",
+                config_path.display()
+            ),
+        }
+        if let Some(parent) = config_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            match watcher.watch(parent, RecursiveMode::NonRecursive) {
+                Ok(()) => registered = true,
+                Err(error) => warn!(
+                    "[CONFIG_WATCHER] parent dir watch unavailable ({}): {error}",
+                    parent.display()
+                ),
             }
+        }
+        anyhow::ensure!(registered, "neither file nor parent dir watch registered");
+        Ok((watcher, rx))
+    }
+}
+
+/// 单一重载执行者：事件与轮询只是触发源，读取、解析、提交全部在此串行
+/// 执行（见模块「一致性规则」）。
+async fn reload_loop(
+    config_path: PathBuf,
+    mut event_rx: Option<mpsc::Receiver<()>>,
+    poll_interval: Duration,
+    api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>,
+    updates_enabled: Arc<Mutex<bool>>,
+) {
+    let mut applied: Option<Vec<u8>> = None;
+    // 启动对账：构造与启动配置读取之间发生的修改在此补齐（applied 为空，
+    // 首次必然按当前文件内容对账；与启动值一致时静默无日志）。
+    reload_with_retry(
+        &config_path,
+        &mut applied,
+        &api_key_config,
+        &updates_enabled,
+    )
+    .await;
+
+    let poll_enabled = !poll_interval.is_zero();
+    let mut ticker = tokio::time::interval(poll_interval.max(Duration::from_millis(1)));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        // 触发源：已过滤、合并的通知或轮询 tick。事件源枯竭后自然
+        // 退化为纯轮询，所有读取与提交仍由此任务串行执行。
+        let triggered = match event_rx.as_mut() {
+            Some(rx) => {
+                tokio::select! {
+                    maybe = rx.recv() => match maybe {
+                        Some(()) => true,
+                        None => {
+                            // 通道关闭：watcher 已 drop，停用事件源。
+                            event_rx = None;
+                            false
+                        }
+                    },
+                    _ = ticker.tick(), if poll_enabled => true,
+                }
+            }
+            None => {
+                if !poll_enabled {
+                    // 无事件源且轮询禁用：构造期已拒绝该组合，防御退出。
+                    break;
+                }
+                ticker.tick().await;
+                true
+            }
+        };
+        if triggered {
+            reload_with_retry(
+                &config_path,
+                &mut applied,
+                &api_key_config,
+                &updates_enabled,
+            )
+            .await;
         }
     }
 }
 
-/// 文件指纹（内容 hash）：原地写必然变化；读不到时返回 None（与任何
-/// Some 互不相等——文件短暂消失再出现会按变化处理一次，幂等重载无害）。
-/// 用内容而非 mtime/size：跨虚拟化文件系统（virtiofs 等）与异构 bind
-/// 传播下，容器内看到的 mtime 可能被属性缓存拖后，内容读取没有该问题。
-fn file_fingerprint(path: &Path) -> Option<u64> {
-    let content = std::fs::read(path).ok()?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash_slice(&content, &mut hasher);
-    Some(std::hash::Hasher::finish(&hasher))
+/// 事件是否指向目标配置文件且属于修改/创建类。`EventKind::Any`：个别
+/// 后端/事件形态不提供细粒度分类（无 kind 信息），目标已按路径过滤，
+/// 一并接受。
+fn event_targets(event: &Event, file_name: Option<&std::ffi::OsStr>) -> bool {
+    if event.need_rescan() {
+        return true;
+    }
+    if let Some(name) = file_name {
+        let matches_name = event
+            .paths
+            .iter()
+            .any(|p| p.file_name().is_some_and(|n| n == name));
+        if !matches_name {
+            return false;
+        }
+    }
+    matches!(
+        event.kind,
+        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Any
+    )
 }
 
-/// 带重试的重载入口（事件与轮询共用）：编辑器/写入方可能尚未写完整，
-/// 小间隔重试后再放弃（失败保留旧配置）。
-async fn reload_with_retry(config_path: &Path, api_key_config: Arc<ArcSwap<ApiKeyAuthConfig>>) {
+/// 一次重载尝试（带小间隔重试覆盖写一半窗口）：读文件字节 → 与已应用
+/// 指纹比对（相同即静默跳过）→ 解析（缺段/非法保留旧值）→ 提交 →
+/// **成功后**才更新已应用指纹。
+async fn reload_with_retry(
+    config_path: &Path,
+    applied: &mut Option<Vec<u8>>,
+    api_key_config: &Arc<ArcSwap<ApiKeyAuthConfig>>,
+    updates_enabled: &Mutex<bool>,
+) {
     let max_retries = 3;
     let mut retry_delay = Duration::from_millis(100);
     for attempt in 1..=max_retries {
         tokio::time::sleep(retry_delay).await;
-        match ConfigWatcher::reload_config(config_path, Arc::clone(&api_key_config)).await {
-            Ok(_) => break,
-            Err(e) => {
+        if !*updates_enabled.lock() {
+            return;
+        }
+        let bytes = match std::fs::read(config_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                // 文件暂时不可读（写入方正在替换等）：不更新已应用指纹，
+                // 下一次触发重试。
                 if attempt == max_retries {
                     warn!(
-                        "[CONFIG_WATCHER] config reload failed after {} attempts: {}",
-                        max_retries, e
+                        "[CONFIG_WATCHER] config file unreadable ({}): {error}",
+                        config_path.display()
+                    );
+                }
+                retry_delay *= 2;
+                continue;
+            }
+        };
+        if applied.as_deref() == Some(bytes.as_slice()) {
+            return; // 内容与已应用值一致（含启动对账一致）
+        }
+        match apply_config(&bytes, api_key_config, updates_enabled) {
+            Ok(true) => {
+                *applied = Some(bytes);
+                return;
+            }
+            Ok(false) => return,
+            Err(error) => {
+                if attempt == max_retries {
+                    warn!(
+                        "[CONFIG_WATCHER] config reload failed after {} attempts (keeping previous config): {error:#}",
+                        max_retries
                     );
                 } else {
-                    warn!(
-                        "[CONFIG_WATCHER] config reload attempt {}/{} failed: {}, retrying in {}ms",
-                        attempt,
-                        max_retries,
-                        e,
-                        retry_delay.as_millis()
-                    );
-                    retry_delay *= 2; // 指数退避
+                    retry_delay *= 2;
                 }
             }
         }
     }
+}
+
+/// 解析并提交（ArcSwap 原子换）。校验失败（缺段/空 key/解析错误）返回 Err，
+/// 不写入 ArcSwap——运行配置保持旧值。返回 false 表示 watcher 已退出。
+fn apply_config(
+    bytes: &[u8],
+    api_key_config: &Arc<ArcSwap<ApiKeyAuthConfig>>,
+    updates_enabled: &Mutex<bool>,
+) -> Result<bool> {
+    let content = std::str::from_utf8(bytes).context("decode config file as utf-8")?;
+    let new_config = parse_api_key_config(content).map_err(|error| {
+        error!("[CONFIG_WATCHER] config rejected (keeping previous): {error:#}");
+        error
+    })?;
+    if new_config.enabled && new_config.api_key.trim().is_empty() {
+        error!("[CONFIG_WATCHER] API Key is empty");
+        anyhow::bail!("API Key cannot be empty string");
+    }
+
+    let new_config = Arc::new(new_config);
+    let old_config = {
+        let enabled = updates_enabled.lock();
+        if !*enabled {
+            return Ok(false);
+        }
+        // No parsing, filesystem I/O or logging while holding this guard.
+        api_key_config.swap(Arc::clone(&new_config))
+    };
+    let old_enabled = old_config.enabled;
+    let key_changed = old_config.api_key != new_config.api_key;
+    let new_enabled = new_config.enabled;
+
+    if old_enabled != new_enabled {
+        info!(
+            "🔄 [CONFIG_WATCHER] API Key auth status updated: {} -> {}",
+            old_enabled, new_enabled
+        );
+    }
+    if key_changed {
+        info!("[CONFIG_WATCHER] API Key updated");
+    }
+    if old_enabled == new_enabled && !key_changed {
+        return Ok(true); // 配置未实际变化，不记录成功日志
+    }
+    info!("[CONFIG_WATCHER] Config update succeeded");
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -274,20 +436,28 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    fn write_config(path: &Path, enabled: bool, key: &str) {
-        fs::write(
-            path,
-            format!("\napi_key_auth:\n  enabled: {enabled}\n  api_key: \"{key}\"\n"),
-        )
-        .unwrap();
+    fn config_text(enabled: bool, key: &str) -> String {
+        format!("\napi_key_auth:\n  enabled: {enabled}\n  api_key: \"{key}\"\n")
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        fs::write(path, content).unwrap();
+    }
+
+    fn shared_config(enabled: bool, key: &str) -> Arc<ArcSwap<ApiKeyAuthConfig>> {
+        Arc::new(ArcSwap::from_pointee(ApiKeyAuthConfig {
+            enabled,
+            api_key: key.to_string(),
+        }))
     }
 
     async fn wait_until(
         api_key_config: &Arc<ArcSwap<ApiKeyAuthConfig>>,
         expect_enabled: bool,
         expect_key: &str,
+        budget: Duration,
     ) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + budget;
         loop {
             let current = api_key_config.load();
             if current.enabled == expect_enabled && current.api_key == expect_key {
@@ -307,103 +477,233 @@ mod tests {
     async fn test_config_watcher_creation() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.yml");
-        write_config(&config_path, false, "sk-test123");
-
-        let api_key_config = Arc::new(ArcSwap::from_pointee(ApiKeyAuthConfig {
-            enabled: false,
-            api_key: "sk-test123".to_string(),
-        }));
-
-        let watcher =
-            ConfigWatcher::with_poll_interval(config_path, api_key_config, Duration::ZERO);
+        write_file(&config_path, &config_text(false, "sk-test123"));
+        let watcher = ConfigWatcher::with_poll_interval(
+            config_path,
+            shared_config(false, "sk-test123"),
+            Duration::ZERO,
+        );
         assert!(watcher.is_ok());
     }
 
-    /// 反例（修复锚点）：同 inode 原地写（fs::write truncate+write，等价
-    /// `echo >`）必须触发热加载——旧实现只 watch 父目录，而 inotify 目录
-    /// watch 收不到子文件的内容修改事件，此用例在修复前超时失败。
-    /// 生产形态事件+轮询双通路常开（Linux inotify 事件先到；本地 macOS
-    /// fsevent 高负载下由轮询保底送达），断言的验收行为不变。
+    /// 半成品与非法配置必须拒绝，且不得推进已应用快照。直接等待真实
+    /// 重载流程完成，避免仅因后台任务尚未运行而把旧值不变误判为通过。
+    #[tokio::test(start_paused = true)]
+    async fn invalid_configs_keep_auth_and_snapshot_then_allow_explicit_disable() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.yml");
+        let valid = config_text(true, "sk-valid");
+        write_file(&config_path, &valid);
+        let api_key_config = shared_config(true, "sk-valid");
+        let updates_enabled = Mutex::new(true);
+        let mut applied = None;
+        reload_with_retry(
+            &config_path,
+            &mut applied,
+            &api_key_config,
+            &updates_enabled,
+        )
+        .await;
+        for invalid in [
+            "port: 8080\n",
+            "api_key_auth: null\n",
+            "api_key_auth:\n  api_key: sk-partial\n",
+            "api_key_auth: [\n",
+            "api_key_auth:\n  enabled: true\n  api_key: '  '\n",
+        ] {
+            write_file(&config_path, invalid);
+            reload_with_retry(
+                &config_path,
+                &mut applied,
+                &api_key_config,
+                &updates_enabled,
+            )
+            .await;
+            let current = api_key_config.load();
+            assert!(current.enabled && current.api_key == "sk-valid");
+            assert_eq!(applied.as_deref(), Some(valid.as_bytes()));
+        }
+        // 显式关闭才生效；其他配置段的类型变化不影响 API Key 热加载。
+        let disabled = format!(
+            "port: [unrelated-schema]\n{}",
+            config_text(false, "sk-valid")
+        );
+        write_file(&config_path, &disabled);
+        reload_with_retry(
+            &config_path,
+            &mut applied,
+            &api_key_config,
+            &updates_enabled,
+        )
+        .await;
+        let current = api_key_config.load();
+        assert!(!current.enabled && current.api_key == "sk-valid");
+        assert_eq!(applied.as_deref(), Some(disabled.as_bytes()));
+    }
+
+    /// 启动对账：构造时文件内容与共享配置初值不同（启动读取与 watcher
+    /// 创建之间被改过）——构造后立即对账应用，不把构造时刻内容当基线遗漏。
+    #[tokio::test]
+    async fn poll_only_reconciles_at_startup_and_tracks_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.yml");
+        write_file(&config_path, &config_text(true, "sk-changed-before-watch"));
+        let api_key_config = shared_config(false, "sk-old");
+        let _watcher = ConfigWatcher::poll_only(
+            config_path.clone(),
+            api_key_config.clone(),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        // 构造后立即对账（无需任何文件修改）
+        wait_until(
+            &api_key_config,
+            true,
+            "sk-changed-before-watch",
+            Duration::from_secs(3),
+        )
+        .await;
+        // 后续变更正常跟踪
+        write_file(&config_path, &config_text(true, "sk-later"));
+        wait_until(&api_key_config, true, "sk-later", Duration::from_secs(3)).await;
+        // 文件暂时不可读（删除）：保持已应用配置；恢复后按内容处理
+        fs::remove_file(&config_path).unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        write_file(&config_path, &config_text(true, "sk-recovered"));
+        wait_until(
+            &api_key_config,
+            true,
+            "sk-recovered",
+            Duration::from_secs(3),
+        )
+        .await;
+    }
+
+    /// 行为回归：原地写热加载生效（事件与轮询双通路形态，与生产一致）。
     #[tokio::test]
     async fn in_place_overwrite_triggers_hot_reload() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.yml");
-        write_config(&config_path, false, "sk-old");
-
-        let api_key_config = Arc::new(ArcSwap::from_pointee(ApiKeyAuthConfig {
-            enabled: false,
-            api_key: "sk-old".to_string(),
-        }));
+        write_file(&config_path, &config_text(false, "sk-old"));
+        let api_key_config = shared_config(false, "sk-before-watch");
         let _watcher = ConfigWatcher::with_poll_interval(
             config_path.clone(),
             api_key_config.clone(),
             Duration::from_millis(150),
         )
         .unwrap();
-
-        // 同 inode 原地覆盖（不 rename、不换 inode）
-        write_config(&config_path, true, "sk-new");
-        wait_until(&api_key_config, true, "sk-new").await;
+        wait_until(&api_key_config, false, "sk-old", Duration::from_secs(3)).await;
+        write_file(&config_path, &config_text(true, "sk-new"));
+        wait_until(&api_key_config, true, "sk-new", Duration::from_secs(5)).await;
     }
 
-    /// 轮询兜底通路：内容变化后一个轮询周期内生效（事件通路不可用
-    /// 或丢事件时的保底）。
+    /// 原子替换（write-to-temp + rename）触发目录监听路径——仅 Linux
+    /// inotify 确定性覆盖（macOS fsevent 本机高负载下事件延迟不可复现判
+    /// 定，行为级覆盖由轮询兜底测试承担）。
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn poll_fallback_reloads_after_interval() {
+    async fn rename_replacement_triggers_hot_reload() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.yml");
-        write_config(&config_path, false, "sk-old");
-
-        let api_key_config = Arc::new(ArcSwap::from_pointee(ApiKeyAuthConfig {
-            enabled: false,
-            api_key: "sk-old".to_string(),
-        }));
+        write_file(&config_path, &config_text(false, "sk-old"));
+        let api_key_config = shared_config(false, "sk-before-watch");
         let _watcher = ConfigWatcher::with_poll_interval(
             config_path.clone(),
             api_key_config.clone(),
-            Duration::from_millis(150),
+            Duration::ZERO,
         )
         .unwrap();
-
-        // 等首个轮询周期建立基线快照后再改文件
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        write_config(&config_path, true, "sk-poll");
-        wait_until(&api_key_config, true, "sk-poll").await;
+        // 先完成启动对账，后续更新必须由纯事件通路触发。
+        wait_until(&api_key_config, false, "sk-old", Duration::from_secs(3)).await;
+        let staging = temp_dir.path().join(".config.yml.new");
+        write_file(&staging, &config_text(true, "sk-renamed"));
+        fs::rename(&staging, &config_path).unwrap();
+        wait_until(&api_key_config, true, "sk-renamed", Duration::from_secs(5)).await;
     }
 
-    /// 非法配置（enabled 且空 key）：打错误、沿用旧配置（不 panic、不放行
-    /// ——验收标准 2）。随后恢复合法配置仍可继续热加载。
+    /// 连续两次修改快速连写：单一串行重载执行者保证最终收敛到最新值，
+    /// 不出现旧值倒序覆盖。
     #[tokio::test]
-    async fn invalid_config_keeps_old_and_recovers() {
+    async fn rapid_double_write_converges_to_latest() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.yml");
-        write_config(&config_path, true, "sk-valid");
-
-        let api_key_config = Arc::new(ArcSwap::from_pointee(ApiKeyAuthConfig {
-            enabled: true,
-            api_key: "sk-valid".to_string(),
-        }));
+        write_file(&config_path, &config_text(false, "sk-old"));
+        let api_key_config = shared_config(false, "sk-before-watch");
         let _watcher = ConfigWatcher::with_poll_interval(
             config_path.clone(),
             api_key_config.clone(),
-            Duration::from_millis(150),
+            Duration::from_millis(100),
         )
         .unwrap();
+        wait_until(&api_key_config, false, "sk-old", Duration::from_secs(3)).await;
+        write_file(&config_path, &config_text(true, "sk-a"));
+        write_file(&config_path, &config_text(true, "sk-b"));
+        wait_until(&api_key_config, true, "sk-b", Duration::from_secs(5)).await;
+    }
 
-        // 非法：enabled + 空 key
-        write_config(&config_path, true, "");
-        tokio::time::sleep(Duration::from_millis(800)).await;
+    /// 生命周期：`ConfigWatcher` drop 后不再有任何任务更新配置。
+    #[tokio::test]
+    async fn drop_stops_reloading() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.yml");
+        write_file(&config_path, &config_text(false, "sk-old"));
+        let api_key_config = shared_config(false, "sk-before-watch");
+        let watcher = ConfigWatcher::with_poll_interval(
+            config_path.clone(),
+            api_key_config.clone(),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        wait_until(&api_key_config, false, "sk-old", Duration::from_secs(3)).await;
+        // 模拟已经开始的同步读取：保留发布入口，Drop 后返回读取结果。
+        // 单靠 JoinHandle::abort 无法撤销同步段，因此必须拒绝迟到提交。
+        let updates_enabled = Arc::clone(&watcher.updates_enabled);
+        drop(watcher);
+        assert!(
+            !apply_config(
+                config_text(true, "sk-in-flight").as_bytes(),
+                &api_key_config,
+                &updates_enabled,
+            )
+            .unwrap()
+        );
+        write_file(&config_path, &config_text(true, "sk-after-drop"));
+        tokio::time::sleep(Duration::from_millis(600)).await;
         let current = api_key_config.load();
         assert!(
-            current.enabled && current.api_key == "sk-valid",
-            "invalid config must keep the old one: enabled={} key={}",
+            !current.enabled && current.api_key == "sk-old",
+            "dropped watcher must not reload: enabled={} key={}",
             current.enabled,
             current.api_key
         );
+    }
 
-        // 恢复合法配置：热加载继续
-        write_config(&config_path, true, "sk-rotated");
-        wait_until(&api_key_config, true, "sk-rotated").await;
+    /// 文件和父目录在创建 watcher 时都不存在：注册失败仍保留轮询，
+    /// 路径恢复后自动加载，不依赖再次启动 RCoder。
+    #[tokio::test]
+    async fn unavailable_native_watches_recover_when_config_appears() {
+        let temp_dir = TempDir::new().unwrap();
+        let parent = temp_dir.path().join("not-created-yet");
+        let config_path = parent.join("config.yml");
+        let api_key_config = shared_config(true, "sk-old");
+        let _watcher = ConfigWatcher::with_poll_interval(
+            config_path.clone(),
+            api_key_config.clone(),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        // 先让启动对账经历一次失败，文件出现后必须靠后续重试恢复。
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(api_key_config.load().api_key, "sk-old");
+        fs::create_dir(&parent).unwrap();
+        write_file(&config_path, &config_text(true, "sk-recovered"));
+        wait_until(
+            &api_key_config,
+            true,
+            "sk-recovered",
+            Duration::from_secs(3),
+        )
+        .await;
     }
 
     /// 相对路径（容器形态默认 `config.yml` / `RCODER_CONFIG_FILE` 相对形态）
@@ -413,7 +713,6 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let relative = normalize_config_path(Path::new("config.yml")).unwrap();
         assert_eq!(relative, cwd.join("config.yml"));
-
         let absolute = normalize_config_path(Path::new("/app/config.yml")).unwrap();
         assert_eq!(absolute, Path::new("/app/config.yml"));
     }

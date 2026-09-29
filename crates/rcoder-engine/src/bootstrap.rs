@@ -14,7 +14,6 @@ pub struct BootstrapResult {
     pub api_key_config: Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>,
     pub telemetry: Arc<TelemetryGuard>,
     pub config_file_path: std::path::PathBuf,
-    pub config_watcher_enabled: bool,
 }
 
 pub async fn bootstrap() -> anyhow::Result<BootstrapResult> {
@@ -131,15 +130,11 @@ pub async fn bootstrap() -> anyhow::Result<BootstrapResult> {
     info!("Projects directory: {:?}", config.projects_dir);
 
     let config_file_path = crate::config::config_file_path();
-    let config_watcher_enabled = tokio::fs::try_exists(&config_file_path)
-        .await
-        .unwrap_or(false);
 
     Ok(BootstrapResult {
         config,
         api_key_config,
         telemetry,
         config_file_path,
-        config_watcher_enabled,
     })
 }

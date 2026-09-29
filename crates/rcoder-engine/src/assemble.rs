@@ -151,25 +151,26 @@ pub async fn assemble(
     // Retain signals during asynchronous AppState/background initialization.
     let shutdown_rx = shutdown_tx.subscribe();
 
-    let _config_watcher = if bootstrap_result.config_watcher_enabled {
-        match config_watcher::ConfigWatcher::new(
-            bootstrap_result.config_file_path.clone(),
-            Arc::clone(&bootstrap_result.api_key_config),
-        ) {
-            Ok(watcher) => {
-                info!(
-                    "📁 Config file watcher started: {:?}",
-                    bootstrap_result.config_file_path
-                );
-                Some(watcher)
-            }
-            Err(e) => {
-                warn!("config file watcher start failed: {}, API Key updated", e);
-                None
-            }
+    // A temporary gap while replacing the file must not permanently disable
+    // hot reload. The watcher itself handles unavailable files/native watches
+    // and keeps polling until the configured path becomes readable again.
+    let _config_watcher = match config_watcher::ConfigWatcher::new(
+        bootstrap_result.config_file_path.clone(),
+        Arc::clone(&bootstrap_result.api_key_config),
+    ) {
+        Ok(watcher) => {
+            info!(
+                "📁 Config file watcher started: {:?}",
+                bootstrap_result.config_file_path
+            );
+            Some(watcher)
         }
-    } else {
-        None
+        Err(e) => {
+            warn!(
+                "config file watcher start failed; hot reload disabled, keeping current API Key config: {e:#}"
+            );
+            None
+        }
     };
 
     let (container_prefix_rcoder, container_prefix_computer) =

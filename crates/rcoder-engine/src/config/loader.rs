@@ -73,20 +73,8 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
         docker_config.apply_env_overrides()?;
     }
 
-    // 应用 API Key 配置的环境变量覆盖
-    if let Ok(val) = std::env::var("RCODER_API_KEY_ENABLED") {
-        if let Ok(enabled) = val.parse::<bool>() {
-            config.api_key_auth.enabled = enabled;
-            info!(" RCODER_API_KEY_ENABLED: {}", enabled);
-        } else {
-            warn!(" parse RCODER_API_KEY_ENABLED failed: {}", val);
-        }
-    }
-
-    if let Ok(val) = std::env::var("RCODER_API_KEY") {
-        config.api_key_auth.api_key = val.clone();
-        info!(" RCODER_API_KEY configured");
-    }
+    // 应用 API Key 配置的环境变量覆盖（与热加载共用同一规则）
+    apply_api_key_env_overrides(&mut config.api_key_auth);
 
     // 应用 Userapp 自动回收配置的环境变量覆盖
     env_override_bool(
@@ -240,28 +228,59 @@ fn load_config_from_file() -> anyhow::Result<AppConfig> {
     Ok(config)
 }
 
+/// 应用 API Key 配置的环境变量覆盖（`RCODER_API_KEY_ENABLED` /
+/// `RCODER_API_KEY`）。启动加载与热加载共用——热加载若只读文件，任何一次
+/// 无关配置的修改都会静默覆盖环境变量显式指定的鉴权状态。
+pub fn apply_api_key_env_overrides(config: &mut ApiKeyAuthConfig) {
+    if let Ok(val) = std::env::var("RCODER_API_KEY_ENABLED") {
+        if let Ok(enabled) = val.parse::<bool>() {
+            config.enabled = enabled;
+            info!(" RCODER_API_KEY_ENABLED: {}", enabled);
+        } else {
+            warn!(" parse RCODER_API_KEY_ENABLED failed: {}", val);
+        }
+    }
+
+    if let Ok(val) = std::env::var("RCODER_API_KEY") {
+        config.api_key = val;
+        info!(" RCODER_API_KEY configured");
+    }
+}
+
+/// 从配置内容（YAML 文本）中仅加载 API Key 配置（热更新用）。
+///
+/// 语义约束：
+/// - 只解析 `api_key_auth` 段——其余段字段增删/类型演进不使 api_key 热加载
+///   整体失效（其余段的 **YAML 语法损坏** 仍会解析失败，由调用方保留旧配置）；
+/// - **`api_key_auth` 段缺失视为错误**（可能是写到一半的半成品文件）——
+///   热加载不得据此隐式关闭鉴权；关闭鉴权必须在文件中显式写
+///   `enabled: false`；
+/// - 解析结果应用与启动一致的环境变量覆盖（见
+///   [`apply_api_key_env_overrides`]）。
+pub fn parse_api_key_config(content: &str) -> anyhow::Result<ApiKeyAuthConfig> {
+    #[derive(serde::Deserialize)]
+    struct ApiKeySectionOnly {
+        api_key_auth: Option<ApiKeyAuthConfig>,
+    }
+    let section: ApiKeySectionOnly = serde_yaml::from_str(content)
+        .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
+    let mut config = section
+        .api_key_auth
+        .ok_or_else(|| anyhow::anyhow!("api_key_auth section missing"))?;
+    apply_api_key_env_overrides(&mut config);
+    Ok(config)
+}
+
 /// 从配置文件中仅加载 API Key 配置（用于热更新）
 ///
 /// 此函数由 config_watcher 模块调用,用于配置热重载。
-/// 编译器可能误报为未使用,因为是跨模块调用。
 #[allow(dead_code)]
 pub fn load_api_key_config_from_file(
     config_path: &std::path::Path,
 ) -> anyhow::Result<ApiKeyAuthConfig> {
     let config_content = fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
-
-    // 热加载只关心 api_key_auth 段，不反序列化整个 AppConfig——其余段
-    // 字段增删/形态演进不应使 api_key 热加载整体失效，缺省字段取默认。
-    #[derive(serde::Deserialize)]
-    struct ApiKeySectionOnly {
-        #[serde(default)]
-        api_key_auth: ApiKeyAuthConfig,
-    }
-    let config: ApiKeySectionOnly = serde_yaml::from_str(&config_content)
-        .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
-
-    Ok(config.api_key_auth)
+    parse_api_key_config(&config_content)
 }
 
 /// 创建默认配置文件
