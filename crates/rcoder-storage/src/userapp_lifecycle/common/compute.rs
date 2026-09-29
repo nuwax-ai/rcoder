@@ -117,14 +117,6 @@ pub(super) async fn active_controls(
     Ok(records)
 }
 
-/// 非终态操作的寿命上限（µs）。所有操作的观察/执行预算在代码层有界
-/// （traffic wake 分钟级、deploy 各阶段 30 分钟），超过该上限仍
-/// Pending/Running 的操作其执行器已随进程消亡（rcoder 重启后无人再推进
-/// 它），仅允许 Stop supersede——落点恒为 scale0，物理上安全。
-/// 事故锚点：nuwax-k8s-test app 83 的 Start 卡在 traffic_wake_observing
-/// 12h（waiter 随重启消亡），把闲置回收的 Stop 永久挡在 ERR_CONFLICT 上。
-const STALE_OPERATION_LIFETIME_US: i64 = 2 * 60 * 60 * 1_000_000;
-
 pub(super) async fn admit(
     tx: &mut dyn Executor,
     backend: Backend,
@@ -232,17 +224,11 @@ pub(super) async fn admit(
                 .ok_or_else(|| invalid("Compute intent target is missing"))?;
             interrupted.extend(old.interrupted_operations.clone());
             if !old.state.is_terminal() {
-                // 僵尸操作兜底：Pending/Running 超过寿命上限 = 执行器已消亡
-                // （无人在推进），Stop 可 supersede 接管；其余动作仍冲突。
-                // created_at 缺失的存量记录按 epoch 兜底，同样可被接管。
-                let zombie = matches!(
-                    old.state,
-                    ComputeControlState::Pending | ComputeControlState::Running
-                ) && now.saturating_sub(old.created_at.timestamp_micros())
-                    >= STALE_OPERATION_LIFETIME_US;
+                // Business work uses a separate ledger. Age is not proof of a
+                // drained executor, and superseded claimed Stops have no automatic
+                // drain path. Preserve the existing physical-control priorities.
                 if !((request.action == ComputeControlAction::Stop
                     && old.action == ComputeControlAction::Restart)
-                    || zombie
                     || (!idle_only
                         && request.action == ComputeControlAction::Restart
                         && old.request_id.starts_with(AUTOMATIC_REPAIR_REQUEST_PREFIX)))
@@ -378,17 +364,17 @@ pub(super) async fn claim(
     if changed != 1 {
         return Err(Error::VersionConflict);
     }
-    cancel_unclaimed_business(tx, backend, &record).await?;
+    cancel_interruptible_business(tx, backend, &record).await?;
     get(tx, &identity.app_id, &identity.operation_id)
         .await?
         .ok_or(Error::NotFound)
 }
 
-/// Pending revision 1 has never granted execution authority. Retire only that
-/// exact state while holding the same short application CAS transaction as the
-/// compute claim. Running/WaitingRetry/uncertain operations require runtime
-/// reconciliation and must not be inferred drained from elapsed time.
-async fn cancel_unclaimed_business(
+/// Pending revision 1 never granted execution authority. An acknowledged wake
+/// has already returned from all runtime writes and only observes business Ready.
+/// Explicit compute Stop/Restart may end either under the same root CAS, while
+/// keeping any physical lease for the execution coordinator to release.
+async fn cancel_interruptible_business(
     tx: &mut dyn Executor,
     backend: Backend,
     control: &ComputeControlRecord,
@@ -403,6 +389,57 @@ async fn cancel_unclaimed_business(
         };
         if old.lifecycle_id != control.lifecycle_id {
             return Err(Error::LifecycleConflict);
+        }
+        let confirmed_wake = old.kind == UserAppOperationKind::Start
+            && matches!(
+                old.state,
+                UserAppOperationState::Running | UserAppOperationState::RecoveryRequired
+            )
+            && old.step == "traffic_wake_observing"
+            && old.checkpoint.get("start_write_acknowledged")
+                == Some(&serde_json::Value::Bool(true))
+            && old
+                .checkpoint
+                .get("target")
+                .and_then(|value| {
+                    serde_json::from_value::<UserAppMutationTarget>(value.clone()).ok()
+                })
+                .is_some_and(|target| {
+                    target.context.app_id == old.app_id
+                        && target.context.lifecycle_id == old.lifecycle_id
+                        && target.context.operation_id == old.operation_id
+                        && Some(&target.context.executor_id) == old.executor_id.as_ref()
+                        && target.context.request_fingerprint == old.request_fingerprint
+                });
+        if confirmed_wake {
+            super::configuration::validate_terminal(tx, &old, UserAppOperationState::Failed)
+                .await?;
+            let before = old.clone();
+            let executor_id = old.executor_id.clone().ok_or(Error::VersionConflict)?;
+            let mut checkpoint = old.checkpoint.clone();
+            checkpoint["compute_operation_id"] = control.operation_id.clone().into();
+            // Internal transition only; it never grants another runtime write.
+            old.state = UserAppOperationState::Running;
+            let progress = UserAppOperationProgress {
+                app_id: old.app_id.clone(),
+                lifecycle_id: old.lifecycle_id.clone(),
+                operation_id: old.operation_id.clone(),
+                expected_revision: old.revision,
+                executor_id,
+                state: UserAppOperationState::Failed,
+                step: "traffic_wake_observation_failed".into(),
+                checkpoint,
+                error_code: Some("ERR_OPERATION_CANCELLED".into()),
+                error_message: Some(
+                    "Read-only wake observation interrupted by explicit compute control".into(),
+                ),
+            };
+            domain::advance(&mut app, &mut old, &progress)?;
+            repo::save_operation(tx, backend, &old, &before).await?;
+            models::OperationInput::delete_by_operation_id(tx, id)
+                .await
+                .map_err(storage)?;
+            continue;
         }
         if old.state != UserAppOperationState::Pending {
             continue;
@@ -764,4 +801,350 @@ async fn restore_unprovisioned_root(
         .await
         .map_err(storage)?;
     Ok(app)
+}
+
+#[cfg(test)]
+mod stale_control_tests {
+    use super::*;
+    use crate::userapp_lifecycle::common::ToastyUserAppStore;
+
+    fn request(
+        app: &UserAppLifecycleRecord,
+        id: &str,
+        action: ComputeControlAction,
+    ) -> ComputeControlRequest {
+        ComputeControlRequest {
+            app_id: app.app_id.clone(),
+            lifecycle_id: app.lifecycle_id.clone(),
+            scope: UserAppOperationScope::Prod,
+            operation_id: id.into(),
+            request_id: id.into(),
+            request_fingerprint: "a".repeat(64),
+            action,
+            restart_image_roll: false,
+        }
+    }
+
+    async fn running_control(
+        store: &ToastyUserAppStore,
+        action: ComputeControlAction,
+    ) -> (UserAppLifecycleRecord, ComputeControlRecord) {
+        let app = store
+            .ensure_identity(&format!("stale{}", uuid::Uuid::new_v4().simple()))
+            .await
+            .unwrap();
+        let old = store
+            .admit_compute_control(&request(
+                &app,
+                &uuid::Uuid::new_v4().simple().to_string(),
+                action,
+            ))
+            .await
+            .unwrap();
+        let old = store
+            .claim_compute_control(
+                &ComputeExecutorIdentity {
+                    app_id: app.app_id.clone(),
+                    lifecycle_id: app.lifecycle_id.clone(),
+                    scope: old.scope,
+                    operation_id: old.operation_id,
+                    generation: old.generation,
+                    executor_id: "originalworker".into(),
+                },
+                old.revision,
+            )
+            .await
+            .unwrap();
+        (app, old)
+    }
+
+    async fn age_stop(store: &ToastyUserAppStore, id: &str) {
+        let id = id.to_owned();
+        store
+            .run(false, move |tx, backend| {
+                Box::pin(async move {
+                    toasty::sql::statement(repo::sql(backend,
+                "UPDATE userapp_compute_controls SET created_at_us=$2 WHERE operation_id=$1"))
+                .bind(&id).bind(chrono::Utc::now().timestamp_micros() - 3 * 60 * 60 * 1_000_000)
+                .exec(tx).await.map_err(storage)?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn stale_stop_contract(store: &ToastyUserAppStore) {
+        let (app, old) = running_control(store, ComputeControlAction::Stop).await;
+        let successor = request(
+            &app,
+            &uuid::Uuid::new_v4().simple().to_string(),
+            ComputeControlAction::Stop,
+        );
+        assert!(matches!(
+            store.admit_compute_control(&successor).await,
+            Err(Error::OperationInProgress(_))
+        ));
+        age_stop(store, &old.operation_id).await;
+        let restart = request(
+            &app,
+            &uuid::Uuid::new_v4().simple().to_string(),
+            ComputeControlAction::Restart,
+        );
+        assert!(
+            matches!(
+                store.admit_compute_control(&restart).await,
+                Err(Error::OperationInProgress(_))
+            ),
+            "age alone must not let Restart replace an unfinished Stop"
+        );
+        assert!(
+            store
+                .get_compute_control(&app.app_id, &restart.operation_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            matches!(
+                store.admit_compute_control(&successor).await,
+                Err(Error::OperationInProgress(_))
+            ),
+            "a superseded claimed Stop has no drain path; recover its original identity instead"
+        );
+        // Stop may preempt Restart, without relying on elapsed time. Its old
+        // execution remains interrupted until the runtime proves cleanup.
+        let (app, old) = running_control(store, ComputeControlAction::Restart).await;
+        age_stop(store, &old.operation_id).await;
+        let successor = request(
+            &app,
+            &uuid::Uuid::new_v4().simple().to_string(),
+            ComputeControlAction::Stop,
+        );
+        let new = store.admit_compute_control(&successor).await.unwrap();
+        assert_eq!(new.state, ComputeControlState::Pending);
+        assert_eq!(new.generation, old.generation + 1);
+        assert!(new.interrupted_operations.contains(&old.operation_id));
+        let retired = store
+            .get_compute_control(&app.app_id, &old.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retired.state, ComputeControlState::Superseded);
+        assert_eq!(retired.executor_id, old.executor_id);
+        assert_eq!(store.admit_compute_control(&successor).await.unwrap(), new);
+        let original = ComputeExecutorIdentity {
+            app_id: app.app_id.clone(),
+            lifecycle_id: app.lifecycle_id.clone(),
+            scope: old.scope,
+            operation_id: old.operation_id,
+            generation: old.generation,
+            executor_id: "originalworker".into(),
+        };
+        assert!(matches!(
+            store.check_compute_executor(&original).await,
+            Err(Error::VersionConflict)
+        ));
+    }
+
+    async fn confirmed_wake_control_contract(store: &ToastyUserAppStore) {
+        for action in [ComputeControlAction::Stop, ComputeControlAction::Restart] {
+            for acknowledged in [true, false] {
+                let app = store
+                    .ensure_identity(&format!("wake{}", uuid::Uuid::new_v4().simple()))
+                    .await
+                    .unwrap();
+                let admission = UserAppAdmission {
+                    app_id: app.app_id.clone(),
+                    lifecycle_id: Some(app.lifecycle_id.clone()),
+                    operation_id: uuid::Uuid::new_v4().simple().to_string(),
+                    request_id: Some(uuid::Uuid::new_v4().simple().to_string()),
+                    request_fingerprint: "b".repeat(64),
+                    kind: UserAppOperationKind::Start,
+                    command: Some(UserAppControlCommand::Start { traffic: true }),
+                    metadata: None,
+                    runtime_policy_on_success: None,
+                };
+                let UserAppAdmissionOutcome::Accepted(pending) =
+                    store.admit(&admission).await.unwrap()
+                else {
+                    panic!("new wake")
+                };
+                let context = UserAppExecutionContext {
+                    app_id: app.app_id.clone(),
+                    lifecycle_id: app.lifecycle_id.clone(),
+                    operation_id: pending.operation_id.clone(),
+                    executor_id: "wakeworker".into(),
+                    request_fingerprint: pending.request_fingerprint.clone(),
+                };
+                let target = UserAppMutationTarget {
+                    context: context.clone(),
+                    resource: AppResourceIdentity {
+                        kind: AppResourceKind::Deployment,
+                        name: "originaldeployment".into(),
+                        uid: "originaluid".into(),
+                        resource_version: Some("1".into()),
+                    },
+                };
+                let running = store.advance(&UserAppOperationProgress {
+                    app_id: app.app_id.clone(), lifecycle_id: app.lifecycle_id.clone(), operation_id: pending.operation_id,
+                    expected_revision: pending.revision, executor_id: context.executor_id.clone(), state: UserAppOperationState::Running,
+                    step: "traffic_wake_observing".into(), checkpoint: serde_json::json!({"target":target,"start_write_acknowledged":acknowledged}),
+                    error_code: None, error_message: None,
+                }).await.unwrap();
+                let receipt = UserAppOperationLeaseReceipt::Kubernetes {
+                    service_type: ServiceType::Userapp,
+                    namespace: "review".into(),
+                    name: "originallease".into(),
+                    uid: "leaseuid".into(),
+                    resource_version: "1".into(),
+                    token: context.operation_id.clone(),
+                };
+                store
+                    .bind_operation_lease(&context, &receipt)
+                    .await
+                    .unwrap();
+                let running = if action == ComputeControlAction::Restart {
+                    store
+                        .advance(&UserAppOperationProgress {
+                            app_id: app.app_id.clone(),
+                            lifecycle_id: app.lifecycle_id.clone(),
+                            operation_id: running.operation_id.clone(),
+                            expected_revision: running.revision,
+                            executor_id: context.executor_id.clone(),
+                            state: UserAppOperationState::RecoveryRequired,
+                            step: running.step.clone(),
+                            checkpoint: running.checkpoint.clone(),
+                            error_code: Some("ERR_BACKEND_ERROR".into()),
+                            error_message: Some("observer lost".into()),
+                        })
+                        .await
+                        .unwrap()
+                } else {
+                    running
+                };
+                let control = store
+                    .admit_compute_control(&request(
+                        &app,
+                        &uuid::Uuid::new_v4().simple().to_string(),
+                        action,
+                    ))
+                    .await
+                    .unwrap();
+                let control = store
+                    .claim_compute_control(
+                        &ComputeExecutorIdentity {
+                            app_id: app.app_id.clone(),
+                            lifecycle_id: app.lifecycle_id.clone(),
+                            scope: control.scope,
+                            operation_id: control.operation_id,
+                            generation: control.generation,
+                            executor_id: "controlworker".into(),
+                        },
+                        control.revision,
+                    )
+                    .await
+                    .unwrap();
+                let old = store
+                    .get_operation(&app.app_id, &running.operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if acknowledged {
+                    assert_eq!(old.state, UserAppOperationState::Failed);
+                    assert_eq!(old.step, "traffic_wake_observation_failed");
+                    assert_eq!(old.checkpoint["target"], running.checkpoint["target"]);
+                    assert_eq!(old.checkpoint["compute_operation_id"], control.operation_id);
+                    assert!(
+                        store
+                            .get_application(&app.app_id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .active_operations
+                            .prod
+                            .is_none()
+                    );
+                } else {
+                    assert_eq!(old, running, "unknown write cannot be declared drained");
+                }
+                assert_eq!(control.state, ComputeControlState::Running);
+                assert!(control.interrupted_operations.contains(&old.operation_id));
+                assert_eq!(
+                    store
+                        .get_operation_lease(&app.app_id, &old.operation_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .receipt,
+                    receipt,
+                    "admission never releases physical leases"
+                );
+                assert!(
+                    matches!(
+                        store.admit(&admission).await.unwrap(),
+                        UserAppAdmissionOutcome::Existing(_)
+                    ),
+                    "original request history is retained"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "userapp-turso")]
+    #[tokio::test]
+    async fn turso_stale_stop_retains_priority_and_requires_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ToastyUserAppStore::open_exclusive(&dir.path().join("controls.db"))
+            .await
+            .unwrap();
+        stale_stop_contract(&store).await;
+        confirmed_wake_control_contract(&store).await;
+        store.shutdown().await.unwrap();
+    }
+
+    #[cfg(feature = "pg")]
+    #[tokio::test]
+    #[ignore = "requires RCODER_USERAPP_PG_TEST_DSN for an isolated PostgreSQL database"]
+    async fn pg_stale_stop_is_single_winner_across_connections() {
+        let config = crate::config::PostgresConfig {
+            url: Some(std::env::var("RCODER_USERAPP_PG_TEST_DSN").expect("isolated PG required")),
+            max_connections: Some(1),
+            min_connections: Some(1),
+            ..Default::default()
+        };
+        let first = ToastyUserAppStore::connect(&config).await.unwrap();
+        let second = ToastyUserAppStore::connect(&config).await.unwrap();
+        stale_stop_contract(&first).await;
+        confirmed_wake_control_contract(&first).await;
+        let (app, old) = running_control(&first, ComputeControlAction::Restart).await;
+        age_stop(&first, &old.operation_id).await;
+        let a = request(
+            &app,
+            &uuid::Uuid::new_v4().simple().to_string(),
+            ComputeControlAction::Stop,
+        );
+        let b = request(
+            &app,
+            &uuid::Uuid::new_v4().simple().to_string(),
+            ComputeControlAction::Stop,
+        );
+        let (a, b) = tokio::join!(
+            first.admit_compute_control(&a),
+            second.admit_compute_control(&b)
+        );
+        let (winner, loser) = match (a, b) {
+            (Ok(winner), Err(Error::OperationInProgress(loser)))
+            | (Err(Error::OperationInProgress(loser)), Ok(winner)) => (winner, loser),
+            other => panic!("exactly one Stop must win: {other:?}"),
+        };
+        assert_eq!(loser.operation_id, winner.operation_id);
+        assert_eq!(winner.generation, old.generation + 1);
+        assert_eq!(
+            first.active_compute_controls(&app.app_id).await.unwrap(),
+            vec![winner]
+        );
+        first.shutdown().await.unwrap();
+        second.shutdown().await.unwrap();
+    }
 }
