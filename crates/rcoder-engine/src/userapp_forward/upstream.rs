@@ -102,9 +102,26 @@ pub(super) fn missing_app_id_response() -> Response {
 /// 探活失败**不直接判死**：先经 `crate::userapp_builder::remediate_stale_registry`
 /// 以容器运行时真实状态裁决——Running 保容器（高负载超时/启动窗口抖动），
 /// 真死才清注册重建。
-async fn resolve_dev_addr(state: &AppState, app_id: &str) -> Result<String, Box<Response>> {
-    let deadline = tokio::time::Instant::now()
-        + std::time::Duration::from_secs(state.config.userapp_storage.ensure_timeout_seconds);
+/// 交互转发的 ensure 等待分档（2026-09-29 拍板）：builder 控制窗口通常
+/// ~7s，交互请求（file-list/git status/tasks 等）等 10s 仍未就绪即返回
+/// 明确冲突错误——快失败优于长悬挂，前端可重试；部署制品拉取
+/// （`/api/v1/userapp/static/*`）失败会打断 prod 部署，必须收敛，
+/// 保留完整 `ensure_timeout_seconds`（默认 90s，config 硬上限 3600s）。
+const INTERACTIVE_ENSURE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn resolve_dev_addr(
+    state: &AppState,
+    app_id: &str,
+    converging: bool,
+) -> Result<String, Box<Response>> {
+    let configured =
+        std::time::Duration::from_secs(state.config.userapp_storage.ensure_timeout_seconds);
+    let budget = if converging {
+        configured
+    } else {
+        configured.min(INTERACTIVE_ENSURE_WAIT)
+    };
+    let deadline = tokio::time::Instant::now() + budget;
     tokio::time::timeout_at(deadline, resolve_dev_addr_inner(state, app_id, deadline))
         .await
         .unwrap_or_else(|_| {
@@ -114,30 +131,48 @@ async fn resolve_dev_addr(state: &AppState, app_id: &str) -> Result<String, Box<
         })
 }
 
+/// 转发层"可等待"的 builder 冲突判定。两种形态是同一个 builder 控制窗口
+/// 的两个观测面，等待（有界于调用方 deadline）+ 幂等重试即可收敛：
+/// 1. 准入被在途 Dev 控制操作拒绝（`OperationInProgress`）；
+/// 2. 本请求的 ensure 操作已被在途控制操作取消
+///    （[`BuilderEnsureSuperseded`]：所有已发写均有返回，取消方秒级收敛）。
+///
+/// 只把"取消/被接管"子集纳入等待；其余失败（镜像拉取失败等）维持快速
+/// 失败，deadline 同时是等待的兜底熔断。
+fn waitable_builder_conflict(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<shared_types::UserAppStoreError>())
+        .any(|store_error| {
+            matches!(
+                store_error,
+                shared_types::UserAppStoreError::OperationInProgress(blocker)
+                    if blocker.scope == shared_types::UserAppOperationScope::Dev
+            )
+        })
+        || error.chain().any(|cause| {
+            cause
+                .downcast_ref::<crate::userapp_builder::BuilderEnsureSuperseded>()
+                .is_some()
+        })
+}
+
 async fn resolve_dev_addr_inner(
     state: &AppState,
     app_id: &str,
     deadline: tokio::time::Instant,
 ) -> Result<String, Box<Response>> {
     // A dev-scope control operation (Stop/Restart) fences new business ensure
-    // attempts by admission design. Business reads routed here — notably the
-    // prod deploy's artifact fetch through /static — must converge, not fail:
-    // the control op finishes (a Restart recreates the builder), so wait it
-    // out within the caller's deadline instead of surfacing an immediate 502.
+    // attempts by admission design, and may also cancel an already-admitted
+    // ensure mid-flight. Business reads routed here — notably the prod deploy's
+    // artifact fetch through /static — must converge, not fail: the control op
+    // finishes (a Restart recreates the builder), so wait out both conflict
+    // forms within the caller's deadline instead of surfacing an immediate 502.
     let mut info = loop {
         match ensure_userapp_builder_until(state, app_id, deadline).await {
             Ok(info) => break info,
             Err(error) => {
-                let blocked = error
-                    .chain()
-                    .filter_map(|cause| cause.downcast_ref::<shared_types::UserAppStoreError>())
-                    .any(|store_error| {
-                        matches!(
-                            store_error,
-                            shared_types::UserAppStoreError::OperationInProgress(blocker)
-                                if blocker.scope == shared_types::UserAppOperationScope::Dev
-                        )
-                    });
+                let blocked = waitable_builder_conflict(&error);
                 if !blocked || tokio::time::Instant::now() >= deadline {
                     warn!(
                         "[USERAPP_FORWARD] ensure dev container failed: app_id={app_id}: {error:#}"
@@ -338,7 +373,9 @@ pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request)
             Err(error) => super::error_body::reject(req, error.into_response()).await,
         };
     }
-    let addr = match resolve_dev_addr(state, app_id).await {
+    // 制品拉取（/static）必须收敛；其余交互转发走短预算快失败。
+    let converging = req.uri().path().starts_with("/api/v1/userapp/static/");
+    let addr = match resolve_dev_addr(state, app_id, converging).await {
         Ok(addr) => addr,
         Err(resp) => return super::error_body::reject(req, *resp).await,
     };
@@ -581,5 +618,55 @@ mod control_response_tests {
             assert_eq!(envelope["operation_id"], operation_id);
             assert_eq!(envelope["success"], false);
         }
+    }
+}
+
+#[cfg(test)]
+mod waitable_conflict_tests {
+    use super::*;
+
+    fn blocker(scope: shared_types::UserAppOperationScope) -> shared_types::UserAppStoreError {
+        shared_types::UserAppStoreError::OperationInProgress(
+            shared_types::UserAppOperationBlocker {
+                scope,
+                operation_id: "op-1".into(),
+                kind: shared_types::UserAppOperationKind::RestartBuilder,
+                state: shared_types::UserAppOperationState::Running,
+                step: "draining_previous".into(),
+            },
+        )
+    }
+
+    /// 准入冲突（Dev scope）→ 可等待（既有行为回归锁）。
+    #[test]
+    fn dev_scope_admission_conflict_is_waitable() {
+        let error = anyhow::Error::new(blocker(shared_types::UserAppOperationScope::Dev));
+        assert!(waitable_builder_conflict(&error));
+    }
+
+    /// Prod scope 冲突不属于 builder 控制窗口 → 快速失败。
+    #[test]
+    fn prod_scope_conflict_is_not_waitable() {
+        let error = anyhow::Error::new(blocker(shared_types::UserAppOperationScope::Prod));
+        assert!(!waitable_builder_conflict(&error));
+    }
+
+    /// ensure 被在途控制操作取消（观察循环挂 BuilderEnsureSuperseded）→ 可等待。
+    /// 事故锚点：nuwax-k8s-test app 184 file-list 650ms 502，同窗口
+    /// git/status 走等待 8.1s 成功——两条路径在此合一。
+    #[test]
+    fn superseded_ensure_is_waitable() {
+        let error = anyhow::Error::new(crate::userapp_builder::BuilderEnsureSuperseded).context(
+            "Builder operation f1637d74 ended as Failed: ensure UserappBuilder failed: \
+                 Builder creation cancelled after acknowledged writes",
+        );
+        assert!(waitable_builder_conflict(&error));
+    }
+
+    /// 其它失败（如镜像拉取失败）→ 维持快速失败，等待不扩大到真错误。
+    #[test]
+    fn ordinary_failure_is_not_waitable() {
+        let error = anyhow::anyhow!("ensure UserappBuilder failed: image pull backoff");
+        assert!(!waitable_builder_conflict(&error));
     }
 }
