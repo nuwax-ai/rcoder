@@ -251,7 +251,14 @@ pub fn load_api_key_config_from_file(
     let config_content = fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
 
-    let config: AppConfig = serde_yaml::from_str(&config_content)
+    // 热加载只关心 api_key_auth 段，不反序列化整个 AppConfig——其余段
+    // 字段增删/形态演进不应使 api_key 热加载整体失效，缺省字段取默认。
+    #[derive(serde::Deserialize)]
+    struct ApiKeySectionOnly {
+        #[serde(default)]
+        api_key_auth: ApiKeyAuthConfig,
+    }
+    let config: ApiKeySectionOnly = serde_yaml::from_str(&config_content)
         .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
 
     Ok(config.api_key_auth)
