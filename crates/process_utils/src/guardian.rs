@@ -348,20 +348,24 @@ pub async fn spawn_owned_with_output(
         },
     }
 }
-pub async fn spawn_guarded(
+struct RegisteredCommand {
+    root: PathBuf,
+    frame: Vec<u8>,
+    managed: bool,
+}
+
+async fn register_guardian(
     command: tokio::process::Command,
     work_root: &Path,
     command_record: Option<&Path>,
-    capture: bool,
-) -> Result<OwnedChild> {
-    let admission = if crate::command_authority::is_managed(work_root)
-        .with_context(|| format!("read command authority at {}", work_root.display()))?
-    {
-        let gate = crate::command_authority::Gate::acquire(work_root)
+    declared_root: Option<&Path>,
+) -> Result<RegisteredCommand> {
+    let managed = crate::command_authority::managed_scope(work_root, declared_root)
+        .with_context(|| format!("read command authority at {}", work_root.display()))?;
+    let admission = if managed {
+        let gate = crate::command_authority::Gate::observe_open(work_root)
             .await
             .with_context(|| format!("acquire command authority at {}", work_root.display()))?;
-        gate.require_open()
-            .context("check command admission before guardian registration")?;
         Some(gate)
     } else {
         None
@@ -386,6 +390,7 @@ pub async fn spawn_guarded(
         .join(uuid::Uuid::new_v4().to_string());
     crate::command_context::create_durable_directory(&root)
         .with_context(|| format!("create command guardian directory {}", root.display()))?;
+    let mut frame = serde_json::to_vec(&spec)?;
     let receipt = Receipt {
         version: 2,
         root_status: None,
@@ -398,7 +403,7 @@ pub async fn spawn_guarded(
         instance_id,
         phase: "Pending".into(),
         command_record: command_record.map(Path::to_path_buf),
-        command_digest: Sha256::digest(serde_json::to_vec(&spec)?)
+        command_digest: Sha256::digest(&frame)
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>(),
@@ -407,6 +412,26 @@ pub async fn spawn_guarded(
         .with_context(|| format!("register command guardian at {}", root.display()))?;
     // Registered before closure; a late guardian must consume under the same gate.
     drop(admission);
+    frame.push(b'\n');
+    Ok(RegisteredCommand {
+        root,
+        frame,
+        managed,
+    })
+}
+
+pub async fn spawn_guarded(
+    command: tokio::process::Command,
+    work_root: &Path,
+    command_record: Option<&Path>,
+    capture: bool,
+) -> Result<OwnedChild> {
+    let declared_root = crate::command_authority::current_root();
+    let RegisteredCommand {
+        root,
+        frame,
+        managed,
+    } = register_guardian(command, work_root, command_record, declared_root.as_deref()).await?;
     let mut guardian = tokio::process::Command::new(
         std::env::current_exe().context("resolve command guardian executable")?,
     );
@@ -424,18 +449,22 @@ pub async fn spawn_guarded(
         } else {
             Stdio::inherit()
         });
+    if managed {
+        // Pin the protocol selected at registration, including older callers
+        // discovered through positive receipt evidence. A transient read in the
+        // new process must not switch this command to legacy owner authorization.
+        guardian.env(crate::command_authority::WORK_ROOT_ENV, work_root);
+    }
     #[cfg(unix)]
     guardian.process_group(0);
     #[cfg(windows)]
     guardian.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP; no kill-on-drop Job.
     let mut child = guardian.spawn().context("spawn command guardian")?;
     let mut lease = child.stdin.take().context("guardian lease pipe missing")?;
-    let mut bytes = serde_json::to_vec(&spec)?;
-    bytes.push(b'\n');
     // If this future is cancelled, lease EOF still directs the guardian to
     // cleanup; Pending remains fenced until recover proves its exact receipt.
     lease
-        .write_all(&bytes)
+        .write_all(&frame)
         .await
         .context("send guardian command")?;
     // Spawn means the actual command has started, not merely its guardian.
@@ -471,6 +500,20 @@ pub async fn spawn_guarded(
 /// Private binary entry: hold the authorization lock before checking owner and
 /// before spawning any business command. EOF on the exact parent pipe cancels.
 pub async fn run(root: &Path) -> Result<i32> {
+    let declared_root = crate::command_authority::current_root();
+    run_with_input(
+        root,
+        tokio::io::BufReader::new(tokio::io::stdin()),
+        declared_root.as_deref(),
+    )
+    .await
+}
+
+async fn run_with_input(
+    root: &Path,
+    input: impl tokio::io::AsyncBufRead + Unpin,
+    declared_root: Option<&Path>,
+) -> Result<i32> {
     // 启动首读纳入有界观察（收据可见性，2026-09-28）：父进程刚写收据即 spawn
     // 本 guardian，共享挂载上 lock/receipt 可能短暂不可见。每轮重新取锁（轮间
     // 释放）；phase 已消费/撤销是身份拒绝，不在观察内。
@@ -488,7 +531,7 @@ pub async fn run(root: &Path) -> Result<i32> {
         receipt.phase == "Pending",
         "guardian authorization already consumed/revoked"
     );
-    let result = execute_unconsumed(root, &mut receipt).await;
+    let result = execute_unconsumed(root, &mut receipt, input, declared_root).await;
     if result.is_err() && receipt.phase == "Pending" {
         // Holding the original authorization lock and not having entered the
         // pre-spawn Running boundary proves no business child was started.
@@ -499,7 +542,12 @@ pub async fn run(root: &Path) -> Result<i32> {
     result
 }
 
-async fn execute_unconsumed(root: &Path, receipt: &mut Receipt) -> Result<i32> {
+async fn execute_unconsumed(
+    root: &Path,
+    receipt: &mut Receipt,
+    mut input: impl tokio::io::AsyncBufRead + Unpin,
+    declared_root: Option<&Path>,
+) -> Result<i32> {
     if let Some(path) = &receipt.command_record {
         let work = root
             .parent()
@@ -516,7 +564,8 @@ async fn execute_unconsumed(root: &Path, receipt: &mut Receipt) -> Result<i32> {
         .context("guardian work root missing")?;
     // Older proxy receipts keep their existing authority contract. New managed
     // generations use the shared gate below, never proxy-specific owner.json.
-    if !crate::command_authority::is_managed(work)? {
+    let managed = crate::command_authority::managed_scope(work, declared_root)?;
+    if !managed {
         let scope = root
             .parent()
             .and_then(Path::parent)
@@ -540,7 +589,6 @@ async fn execute_unconsumed(root: &Path, receipt: &mut Receipt) -> Result<i32> {
             Err(error) => bail!("cannot verify original owner lock: {error}"),
         }
     }
-    let mut input = tokio::io::BufReader::new(tokio::io::stdin());
     let mut bytes = Vec::new();
     (&mut input)
         .take(1024 * 1024 + 1)
@@ -559,26 +607,16 @@ async fn execute_unconsumed(root: &Path, receipt: &mut Receipt) -> Result<i32> {
             == receipt.command_digest,
         "guardian command differs from original authorized specification"
     );
-    let work = root
-        .parent()
-        .and_then(Path::parent)
-        .context("guardian work root missing")?;
-    let admission = if crate::command_authority::is_managed(work)? {
-        // 准入读取纳入有界观察（收据可见性）：command-admission 记录可能短暂
-        // 不可见/锁短暂忙碌；"no longer accepts work" 是拒绝，不在观察内。
-        // try_acquire 无内建等待，避免预算叠加。
-        let work = work.to_path_buf();
-        let gate =
-            crate::observe::observe("command admission", Duration::from_secs(3), move || {
-                let work = work.clone();
-                async move {
-                    let gate = crate::command_authority::Gate::try_acquire(&work)?;
-                    gate.require_open()?;
-                    Ok(Some(gate))
-                }
-            })
-            .await?;
-        Some(gate)
+    let mut lease_byte = [0u8; 1];
+    let admission = if managed {
+        tokio::select! {
+            biased;
+            ended = input.read(&mut lease_byte) => {
+                ended.context("observe guardian parent lease before command admission")?;
+                bail!("guardian parent lease ended before command admission");
+            }
+            gate = crate::command_authority::Gate::observe_open(work) => Some(gate?),
+        }
     } else {
         None
     };
@@ -620,7 +658,6 @@ async fn execute_unconsumed(root: &Path, receipt: &mut Receipt) -> Result<i32> {
         eprintln!("record owned root start: {error:#}");
     }
     drop(admission);
-    let mut lease_byte = [0u8; 1];
     let exit = tokio::select! { result = child.wait_root() => result.ok(), _ = input.read(&mut lease_byte) => None };
     receipt.root_status = exit.map(encode_status);
     if let Err(error) = save(root, receipt) {
@@ -778,6 +815,141 @@ pub fn confirm_physical_domain_exit(work_root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn managed_work(root: &Path) -> PathBuf {
+        let instance = uuid::Uuid::new_v4().to_string();
+        let work = root.join("work").join(&instance);
+        crate::command_context::create_durable_directory(&work).unwrap();
+        std::fs::write(
+            work.join("generation.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1, "id": instance, "supervisor": "test-supervisor",
+                "token": "test-token", "intent": "run", "phase": "Running",
+                "worker_pid": std::process::id(), "exit_code": null, "error": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        work
+    }
+
+    #[cfg(unix)]
+    async fn assert_pending(future: std::pin::Pin<&mut impl Future>) {
+        let mut future = future;
+        std::future::poll_fn(|cx| {
+            assert!(future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_admission_gap_preserves_pending_and_honors_revocation() {
+        for (outcome, generation_missing) in [
+            ("open", false),
+            ("open", true),
+            ("closed", false),
+            ("cancelled", true),
+        ] {
+            let scope = tempfile::tempdir().unwrap();
+            let work = managed_work(scope.path());
+            crate::command_authority::Gate::try_acquire(&work)
+                .unwrap()
+                .initialize()
+                .unwrap();
+            let authority_path = work.join("command-admission.json");
+            let authority = std::fs::read(&authority_path).unwrap();
+            std::fs::remove_file(&authority_path).unwrap();
+            if generation_missing {
+                std::fs::remove_file(work.join("generation.json")).unwrap();
+            }
+
+            let marker = scope.path().join("started");
+            let mut command = tokio::process::Command::new("sh");
+            command.args(["-c", "printf 'started\\n' >> \"$1\"", "fixture"]);
+            command.arg(&marker);
+            let mut registration = Box::pin(register_guardian(command, &work, None, Some(&work)));
+            // One explicit poll must observe the missing receipt and yield.
+            // This is the synchronization point, not a sleep hoping to hit it.
+            assert_pending(registration.as_mut()).await;
+            assert!(!work.join("guardians").exists());
+            drop(crate::command_authority::Gate::try_acquire(&work).unwrap());
+            std::fs::write(&authority_path, &authority).unwrap();
+            let registered = registration.await.unwrap();
+            assert!(registered.managed);
+            assert_eq!(read(&registered.root).unwrap().phase, "Pending");
+
+            // Reproduce the same gap in the independently consumed launch.
+            std::fs::remove_file(&authority_path).unwrap();
+            let (mut lease, input) = tokio::io::duplex(8192);
+            lease.write_all(&registered.frame).await.unwrap();
+            let mut lease = Some(lease);
+            let mut execution = Box::pin(run_with_input(
+                &registered.root,
+                tokio::io::BufReader::new(input),
+                Some(&work),
+            ));
+            assert_pending(execution.as_mut()).await;
+            assert_eq!(read(&registered.root).unwrap().phase, "Pending");
+            assert!(!marker.exists());
+            // The generation gate is available while observation sleeps.
+            let gate = crate::command_authority::Gate::try_acquire(&work).unwrap();
+            match outcome {
+                "closed" => gate.close().unwrap(),
+                "cancelled" => drop(lease.take()),
+                _ => std::fs::write(&authority_path, &authority).unwrap(),
+            }
+            drop(gate);
+            let result = tokio::time::timeout(
+                if outcome == "open" {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_secs(1)
+                },
+                execution,
+            )
+            .await
+            .unwrap();
+            drop(lease);
+            if outcome != "open" {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(error.contains(if outcome == "closed" {
+                    "no longer accepts work"
+                } else {
+                    "parent lease ended"
+                }));
+                assert_eq!(read(&registered.root).unwrap().phase, "Revoked");
+                assert!(!marker.exists(), "revocation must prevent business spawn");
+            } else {
+                assert_eq!(result.unwrap(), 0);
+                assert_eq!(std::fs::read_to_string(marker).unwrap(), "started\n");
+                assert_eq!(read(&registered.root).unwrap().phase, "Quiescent");
+            }
+            confirmed(&registered.root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_registration_missing_admission_expires_without_registering() {
+        let scope = tempfile::tempdir().unwrap();
+        let work = managed_work(scope.path());
+        let command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        let result = tokio::time::timeout(
+            Duration::from_secs(4),
+            register_guardian(command, &work, None, None),
+        )
+        .await
+        .expect("one admission budget must bound the whole registration");
+        let error = match result {
+            Ok(_) => panic!("persistent receipt absence must reject registration"),
+            Err(error) => error,
+        };
+        assert!(crate::observe::is_not_found(&error));
+        assert!(format!("{error:#}").contains("not visible within"));
+        assert!(!work.join("guardians").exists());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn receipt_visibility_gap_retains_child_but_missing_or_corrupt_receipt_is_not_success() {

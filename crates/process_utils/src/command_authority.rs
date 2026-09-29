@@ -59,6 +59,22 @@ impl Gate {
         }
     }
 
+    /// Registration and consumption both require the same live generation gate.
+    /// Each failed observation drops its lock before waiting; a closed or invalid
+    /// authority is a rejection, while a briefly missing receipt remains pending.
+    pub(crate) async fn observe_open(root: &Path) -> Result<Self> {
+        crate::observe::observe(
+            "command admission",
+            std::time::Duration::from_secs(3),
+            || async {
+                let gate = Self::try_acquire(root)?;
+                gate.require_open()?;
+                Ok(Some(gate))
+            },
+        )
+        .await
+    }
+
     pub fn initialize(&self) -> Result<()> {
         ensure!(
             !self.root.join("command-admission.json").try_exists()?,
@@ -126,12 +142,29 @@ pub fn current_root() -> Option<PathBuf> {
 }
 
 pub fn is_managed(root: &Path) -> Result<bool> {
-    let authority = root.join("command-admission.json").try_exists()?;
-    ensure!(
-        authority || !root.join("generation.json").try_exists()?,
-        "supervised command admission record is missing"
-    );
-    Ok(authority)
+    managed_scope(root, current_root().as_deref())
+}
+
+pub(crate) fn managed_scope(root: &Path, declared_root: Option<&Path>) -> Result<bool> {
+    if let Some(declared) = declared_root {
+        // The supervisor already passes this generation root to its worker.
+        // Keep that protocol selection even when both receipts are temporarily
+        // invisible. This selects the gate; it never replaces gate authorization.
+        ensure!(
+            declared == root
+                || std::fs::canonicalize(declared)
+                    .context("resolve declared command generation")?
+                    == std::fs::canonicalize(root).context("resolve command generation")?,
+            "command work root differs from the supervised generation"
+        );
+        return Ok(true);
+    }
+    // Older/manual entry points have no inherited declaration. Positive evidence
+    // of either managed record still requires the gate, even if its peer is missing.
+    // The caller retains this choice for the entire launch and validates the
+    // existing owner receipt/lock before executing any legacy command.
+    Ok(root.join("command-admission.json").try_exists()?
+        || root.join("generation.json").try_exists()?)
 }
 
 /// An independently owned CLI must not inherit its launcher's worker identity.
@@ -144,5 +177,24 @@ pub fn detach_command(command: &mut tokio::process::Command) {
         "FILE_SERVER_PROXY_LAUNCH_ID",
     ] {
         command.env_remove(name);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn declared_generation_never_falls_back_when_both_receipts_are_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("generation");
+        let other = directory.path().join("other");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        assert!(managed_scope(&root, Some(&root)).unwrap());
+        assert!(managed_scope(&root, Some(&other)).is_err());
+        assert!(!managed_scope(&root, None).unwrap());
+        std::fs::write(root.join("generation.json"), "{}").unwrap();
+        assert!(managed_scope(&root, None).unwrap());
     }
 }
