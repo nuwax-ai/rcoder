@@ -4,7 +4,7 @@
 # Phony targets
 .PHONY: help \
 	build install install-agent uninstall \
-	dev-build dev-up dev-restart dev-down dev-logs \
+	dev-build dev-up dev-restart dev-down dev-logs dev-clean \
 	dev-build-k8s dev-up-k8s dev-restart-k8s dev-down-k8s dev-logs-k8s \
 	dev-build-k8s-local dev-up-k8s-local dev-restart-k8s-local dev-down-k8s-local dev-logs-k8s-local dev-local-k8s \
 	devspace-init devspace-dev devspace-build devspace-down devspace-purge devspace-logs devspace-enter devspace-help \
@@ -104,6 +104,7 @@ help:
 	@echo "  make dev-restart    - 重启开发模式容器（重新构建镜像并启动）"
 	@echo "  make dev-down       - 停止开发模式容器"
 	@echo "  make dev-logs       - 查看开发模式容器日志"
+	@echo "  make dev-clean      - 清理历史日志（保留最新一份）+ 已迁 volume 的旧目录"
 	@echo ""
 	@echo "🚀 DevSpace 开发模式（推荐）："
 	@echo "  make devspace-init    - 初始化 DevSpace（首次使用）"

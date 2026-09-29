@@ -92,3 +92,37 @@ dial9-view:
 dev-logs:
 	@echo "📋 开发模式容器日志（Ctrl+C 退出）:"
 	@$(RCODER_COMPOSE) logs -f
+
+## 清理本地 dev compose 的历史大文件（可重复执行）：
+## 1) docker/logs/rcoder.<日期> 按天日志，保留最新一份（活跃文件在被追加，
+##    删除也不释放空间且影响滚动）；
+## 2) 已迁入 named volume 的一次性旧目录：docker/data/rcoder、docker/computer-cache。
+##    若 rcoder 容器正以 bind 形态挂载它们（未叠加 turso-volume overlay 的
+##    base compose 直跑形态）则拒绝执行，防止误删活跃数据。
+dev-clean:
+	@echo "🧹 [1/2] 清理 docker/logs 按天历史日志（保留最新一份）..."
+	@if [ -d docker/logs ]; then \
+		files=$$(ls -t docker/logs/rcoder.20* 2>/dev/null | tail -n +2); \
+		if [ -n "$$files" ]; then \
+			echo "$$files" | xargs rm -v; \
+		else \
+			echo "  无历史日志可清理"; \
+		fi; \
+	else \
+		echo "  docker/logs 不存在，跳过"; \
+	fi
+	@echo "🧹 [2/2] 清理已迁入 volume 的旧目录（docker/data/rcoder、docker/computer-cache）..."
+	@if docker inspect rcoder-rcoder-1 >/dev/null 2>&1 && \
+		docker inspect rcoder-rcoder-1 --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' 2>/dev/null \
+			| grep -q -e 'docker/data/rcoder' -e 'docker/computer-cache'; then \
+		echo "❌ rcoder 容器正以 bind 挂载待清理目录（未叠加 turso-volume overlay），拒绝清理"; \
+		exit 1; \
+	fi; \
+	for d in docker/data/rcoder docker/computer-cache; do \
+		if [ -e "$$d" ]; then \
+			du -sh "$$d"; rm -rf "$$d"; \
+		else \
+			echo "  $$d 不存在，跳过"; \
+		fi; \
+	done; \
+	echo "✅ 清理完成"
