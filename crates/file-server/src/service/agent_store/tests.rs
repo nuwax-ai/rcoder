@@ -714,35 +714,105 @@ mod cases {
     }
 
     #[tokio::test]
-    async fn view_lock_takeover_and_late_release_never_delete_successor_lock() {
-        // Q07：A 持锁（伪造超龄 mtime）→ B 接管（token 轮换）→ A 的迟到
-        // Drop 不得删掉 B 的锁（C 不得凭空进入）；B 正常释放有效
+    async fn view_lock_reuses_legacy_file_and_never_steals_an_aged_live_lock() {
+        use std::time::Duration;
+
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("proj-store");
         fs::create_dir_all(&root).await.unwrap();
         let lock = root.join(VIEW_LOCK_NAME);
-        // A 持锁
-        let a = ViewGuard::acquire(&root).await.expect("A acquires");
-        // 伪造超龄：直接回写 mtime（文件锁内容为 A token）
-        let old =
-            std::time::SystemTime::now() - std::time::Duration::from_secs(VIEW_LOCK_STALE_MS + 60);
+        fs::write(&lock, "legacy-owner-token")
+            .await
+            .expect("legacy file");
+        // 旧 token 文件无需删文件或等待超龄即可恢复。
+        let a = tokio::time::timeout(Duration::from_secs(1), ViewGuard::acquire(&root))
+            .await
+            .expect("legacy file recovers immediately")
+            .expect("A acquires");
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
         let f = std::fs::File::options().write(true).open(&lock).unwrap();
         f.set_modified(old).unwrap();
         drop(f);
-        // B 接管（stale 检测 → token 轮换 rename）
-        let b = ViewGuard::acquire(&root).await.expect("B takes over");
-        assert_ne!(a.token, b.token, "接管必须轮换所有权 token");
-        // A 迟到 Drop：锁内容是 B 的 token——不得删除
-        drop(a);
-        assert!(lock.exists(), "迟到 Drop 不得删除接管者的锁（Q07）");
-        assert_eq!(
-            fs::read_to_string(&lock).await.unwrap(),
-            b.token,
-            "锁内容必须仍是 B 的所有权 token"
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), ViewGuard::acquire(&root))
+                .await
+                .is_err(),
+            "mtime age cannot authorize taking a live OS lock"
         );
-        // B 正常释放有效
+        drop(a);
+        let b = tokio::time::timeout(Duration::from_secs(1), ViewGuard::acquire(&root))
+            .await
+            .expect("release permits next owner")
+            .expect("B acquires");
         drop(b);
-        assert!(!lock.exists(), "持有者自身释放必须生效");
+        assert_eq!(
+            fs::read_to_string(&lock)
+                .await
+                .expect("stable lock remains"),
+            "legacy-owner-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_view_lock_contenders_enter_one_at_a_time() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+        use tokio::sync::{Barrier, Semaphore, mpsc};
+
+        let directory = tempfile::tempdir().expect("lock directory");
+        let barrier = Arc::new(Barrier::new(3));
+        let permits = Arc::new(Semaphore::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let mut contenders = Vec::new();
+        for _ in 0..2 {
+            let root = directory.path().to_path_buf();
+            let barrier = barrier.clone();
+            let permits = permits.clone();
+            let active = active.clone();
+            let entered = entered_tx.clone();
+            contenders.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let guard = ViewGuard::acquire(&root).await.expect("acquire view lock");
+                assert_eq!(
+                    active.fetch_add(1, Ordering::SeqCst),
+                    0,
+                    "exclusive critical section"
+                );
+                entered.send(()).expect("notify owner");
+                permits.acquire().await.expect("release permit").forget();
+                assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
+                drop(guard);
+            }));
+        }
+        barrier.wait().await;
+        tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
+            .await
+            .expect("first contender enters")
+            .expect("entry notification");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), entered_rx.recv())
+                .await
+                .is_err(),
+            "second contender waits"
+        );
+        permits.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
+            .await
+            .expect("next contender enters after release")
+            .expect("entry notification");
+        permits.add_permits(1);
+        for contender in contenders {
+            contender.await.expect("contender task");
+        }
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(
+            directory.path().join(VIEW_LOCK_NAME).exists(),
+            "lock inode remains after both owners"
+        );
     }
 
     #[tokio::test]

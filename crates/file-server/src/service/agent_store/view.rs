@@ -15,7 +15,6 @@ use super::*;
 
 pub(super) const MANIFEST_FILE: &str = "manifest.json";
 pub(super) const VIEW_LOCK_NAME: &str = ".view.lock";
-pub(super) const VIEW_LOCK_STALE_MS: u64 = 5 * 60 * 1000;
 const VIEW_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 const VIEW_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(200);
 
@@ -150,106 +149,43 @@ fn reverse_refs(
     refs
 }
 
-/// 视图锁（项目级，O_EXCL 创建 + 过期自愈 + **所有权保护**）。
-///
-/// Q07 三项修复：
-/// 1. 锁文件内容 = 持有者 token——Drop 只在内容仍是**自己的** token 时删除：
-///    A（被 B 判定过期接管后）的迟到 Drop 不再删掉 B 的锁放 C 进来；
-/// 2. stale 判定只认 mtime 超龄——metadata **读取错误不当 stale**（IO 抖动
-///    不是"无主"证明，按忙等重试）；
-/// 3. 接管 = 校验 token 未变后 write-temp + **rename** 原子替换（同 inode
-///    域内原子；B 接管与 A 迟到释放竞争时，rename 后 A 的 remove 命中的
-///    token 校验必然失败——不再有"删掉别人锁"窗口）。
+/// 项目级 OS 排他锁。锁文件保留原 inode，永不 rename/remove；关闭句柄
+/// 即释放，崩溃后由 OS 自动释放。遗留 token/空锁文件可以直接复用，文件
+/// 内容及 mtime 不再授予接管权，也不会因旧文件残留等待五分钟。
 pub(super) struct ViewGuard {
-    pub(super) path: PathBuf,
-    pub(super) token: String,
-}
-
-/// 读视图锁 token：NotFound（锁已被释放/尚未写入）按空串参与后续校验；
-/// 其他读错误返回 None——IO 抖动不构成接管依据（保守跳过本轮接管，
-/// 与 acquire 内 metadata 读错误不当 stale 的姿态一致）。
-async fn read_lock_token(lock: &Path) -> Option<String> {
-    match fs::read_to_string(lock).await {
-        Ok(content) => Some(content),
-        Err(e) if e.kind() == ErrorKind::NotFound => Some(String::new()),
-        Err(_) => None,
-    }
+    _file: std::fs::File,
 }
 
 impl ViewGuard {
     pub(super) async fn acquire(project_store_root: &Path) -> AppResult<Self> {
         let lock = project_store_root.join(VIEW_LOCK_NAME);
-        let token = uuid::Uuid::new_v4().to_string();
         let deadline = std::time::Instant::now() + VIEW_LOCK_WAIT;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock)
+            .await
+            .map_err(|error| {
+                crate::error::AppError::system(format!(
+                    "open agent skill view lock {}: {error}",
+                    lock.display()
+                ))
+            })?
+            .into_std()
+            .await;
         loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock)
-                .await
-            {
-                Ok(mut file) => {
-                    use tokio::io::AsyncWriteExt as _;
-                    file.write_all(token.as_bytes()).await?;
-                    // 锁内容必须在持有者返回前可靠落盘：显式 sync 消除
-                    // 写入延迟可见（接管方读到空 token 的窗口）
-                    file.sync_all().await?;
-                    return Ok(ViewGuard { path: lock, token });
+            // try_lock 不阻塞 executor；仅正常竞争异步退避，其他错误直接返回。
+            match file.try_lock() {
+                Ok(()) => return Ok(ViewGuard { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(crate::error::AppError::system(format!(
+                        "lock agent skill view {}: {error}",
+                        lock.display()
+                    )));
                 }
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                    // 过期自愈（5 分钟）。Q07：metadata 读取失败 ≠ stale——
-                    // 元数据不可读时按"仍被持有"处理（保守等待），只有明确的
-                    // mtime 超龄才构成接管依据。
-                    let stale = match fs::metadata(&lock).await {
-                        Ok(meta) => meta
-                            .modified()
-                            .ok()
-                            .and_then(|at| at.elapsed().ok())
-                            .is_some_and(|age| age.as_millis() as u64 > VIEW_LOCK_STALE_MS),
-                        Err(e) if e.kind() == ErrorKind::NotFound => true,
-                        Err(_) => false,
-                    };
-                    if stale {
-                        // 接管：读旧 token → 写临时文件（自己的 token）→
-                        // 校验旧 token 未变 → rename 原子替换。校验失败说明
-                        // 别人刚接管/释放，回锁竞争循环。
-                        // 锁内容读失败（非 NotFound）不构成接管依据：跳过本轮
-                        // 接管、按仍被持有保守等待（走下方 deadline/sleep 重试）。
-                        match read_lock_token(&lock).await {
-                            Some(observed) => {
-                                let candidate = lock.with_extension(format!("takeover-{token}"));
-                                fs::write(&candidate, &token).await?;
-                                // 二次读失败 → "token 未变"校验依据缺失，放弃本轮接管
-                                let unchanged = read_lock_token(&lock)
-                                    .await
-                                    .is_some_and(|current| current == observed);
-                                if unchanged {
-                                    match fs::rename(&candidate, &lock).await {
-                                        Ok(()) => return Ok(ViewGuard { path: lock, token }),
-                                        Err(e) if e.kind() == ErrorKind::NotFound => {
-                                            // 锁在接管窗口被持有人正常释放——重试创建
-                                            fs::remove_file(&candidate).await.ok();
-                                        }
-                                        Err(e) => {
-                                            fs::remove_file(&candidate).await.ok();
-                                            return Err(e.into());
-                                        }
-                                    }
-                                } else {
-                                    fs::remove_file(&candidate).await.ok();
-                                }
-                                continue;
-                            }
-                            None => {
-                                tracing::debug!(
-                                    lock = %lock.display(),
-                                    "read view lock for takeover failed; deferring takeover"
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(e) => return Err(e.into()),
             }
             if std::time::Instant::now() >= deadline {
                 return Err(crate::error::AppError::system(
@@ -257,20 +193,6 @@ impl ViewGuard {
                 ));
             }
             tokio::time::sleep(VIEW_LOCK_RETRY).await;
-        }
-    }
-}
-
-impl Drop for ViewGuard {
-    fn drop(&mut self) {
-        // Q07：只释放**自己的**锁——内容仍是本持有者 token 才删除；否则
-        // 锁已被接管（或他人持有），迟到 Drop 不得误删
-        let path = &self.path;
-        let token = self.token.clone();
-        if let Ok(content) = std::fs::read_to_string(path)
-            && content == token
-        {
-            std::fs::remove_file(path).ok();
         }
     }
 }

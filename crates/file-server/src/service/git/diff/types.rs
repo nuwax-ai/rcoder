@@ -78,6 +78,7 @@ pub struct DiffResult {
 pub(super) struct Side {
     pub(super) bytes: Option<Vec<u8>>,
     pub(super) mode: Option<EntryMode>,
+    pub(super) object_id: Option<gix::ObjectId>,
     /// 超出单文件上限被降级的一侧（内容未加载，按 binary 标记渲染）。
     /// 语义对齐 TS git CLI：超限/二进制文件不报错、不出内容，仅出
     /// "Binary files ... differ" 标记（降级时在 content 层打 warn 日志）。
@@ -89,6 +90,7 @@ impl Side {
         Self {
             bytes: None,
             mode: None,
+            object_id: None,
             oversized: false,
         }
     }
@@ -97,16 +99,44 @@ impl Side {
         Self {
             bytes: Some(bytes),
             mode: Some(mode),
+            object_id: None,
             oversized: false,
         }
     }
 
-    /// 超限降级侧：mode 在场（参与文件头/路径判定），内容缺席。
-    pub(super) fn present_oversized(mode: EntryMode) -> Self {
+    /// 已加载的 Git 对象保留原 ID，避免渲染时重复计算。
+    pub(super) fn present_blob(bytes: Vec<u8>, mode: EntryMode, id: gix::ObjectId) -> Self {
+        Self {
+            object_id: Some(id),
+            ..Self::present(bytes, mode)
+        }
+    }
+
+    /// 超限侧不保留内容，但对象 ID 和 mode 仍用于相等判断及文件头。
+    pub(super) fn present_oversized(mode: EntryMode, id: gix::ObjectId) -> Self {
         Self {
             bytes: None,
             mode: Some(mode),
+            object_id: Some(id),
             oversized: true,
+        }
+    }
+
+    pub(super) fn content_id(
+        &self,
+        hash_kind: gix::hash::Kind,
+    ) -> AppResult<Option<gix::ObjectId>> {
+        if let Some(id) = self.object_id {
+            return Ok(Some(id));
+        }
+        match &self.bytes {
+            Some(bytes) => gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, bytes)
+                .map(Some)
+                .map_err(|error| AppError::system(format!("git compute blob hash: {error}"))),
+            None if !self.is_present() => Ok(None),
+            None => Err(AppError::system(
+                "git diff present side has no content identity",
+            )),
         }
     }
 

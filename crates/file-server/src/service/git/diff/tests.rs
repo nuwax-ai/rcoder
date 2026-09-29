@@ -137,6 +137,98 @@ fn oversized_committed_blob_degrades_to_binary_marker_instead_of_error() {
     assert!(result.files[0].binary);
     assert_eq!(result.insertions, 0);
     assert_eq!(result.deletions, 0);
+    assert!(
+        !result.diff.contains("index 0000000.."),
+        "oversized blobs retain their object IDs"
+    );
+}
+
+#[test]
+fn oversized_worktree_restored_to_head_has_no_diff_despite_staged_change() {
+    let directory = tempfile::tempdir().expect("test repository");
+    let root = directory.path();
+    init_repo(root, "Test", "test@example.com").expect("init");
+    let repo = open(root).expect("open");
+    let original = vec![b'a'; 128];
+    std::fs::write(root.join("large.txt"), &original).expect("head content");
+    stage_path(&repo, "large.txt").expect("stage head");
+    commit_indexed(&repo, "head", "Test", "test@example.com").expect("commit");
+    std::fs::write(root.join("large.txt"), vec![b'b'; 128]).expect("changed content");
+    stage_path(&repo, "large.txt").expect("stage changed content");
+    std::fs::write(root.join("large.txt"), original).expect("restore only worktree");
+    let index_before = std::fs::read(repo.index_path()).expect("staged index");
+    let mut params = DiffParams {
+        source: DiffSource::Worktree,
+        from: None,
+        to: None,
+        paths: vec![],
+        max_file_size_bytes: 32,
+        max_total_bytes: 1024,
+        max_output_bytes: 1024,
+    };
+
+    let worktree = compute_diff(&repo, &params).expect("HEAD versus restored worktree");
+    assert!(worktree.files.is_empty());
+    assert!(worktree.diff.is_empty());
+    params.source = DiffSource::Staged;
+    let staged = compute_diff(&repo, &params).expect("HEAD versus changed index");
+    assert_eq!(staged.files.len(), 1);
+    assert!(staged.files[0].binary);
+    assert!(
+        staged
+            .diff
+            .contains("Binary files a/large.txt and b/large.txt differ")
+    );
+    assert_eq!(
+        std::fs::read(repo.index_path()).expect("index after diff"),
+        index_before
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mode_only_changes_do_not_report_binary_content_changes_at_any_size() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().expect("test repository");
+    let root = directory.path();
+    init_repo(root, "Test", "test@example.com").expect("init");
+    let repo = open(root).expect("open");
+    let path = root.join("large.sh");
+    std::fs::write(&path, vec![0; 128]).expect("binary file");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("initial mode");
+    stage_path(&repo, "large.sh").expect("stage");
+    commit_indexed(&repo, "head", "Test", "test@example.com").expect("commit");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("executable mode");
+    stage_path(&repo, "large.sh").expect("stage mode change");
+    for (source, max_file_size_bytes) in [
+        (DiffSource::Worktree, 32),
+        (DiffSource::Staged, 32),
+        (DiffSource::Worktree, 256),
+        (DiffSource::Staged, 256),
+    ] {
+        let result = compute_diff(
+            &repo,
+            &DiffParams {
+                source,
+                from: None,
+                to: None,
+                paths: vec![],
+                max_file_size_bytes,
+                max_total_bytes: 1024,
+                max_output_bytes: 1024,
+            },
+        )
+        .expect("mode-only diff");
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].changes, 0);
+        assert!(!result.files[0].binary);
+        assert_eq!(
+            result.diff,
+            "diff --git a/large.sh b/large.sh\nold mode 100644\nnew mode 100755\n"
+        );
+    }
 }
 
 #[test]
@@ -246,7 +338,8 @@ fn worktree_symlink_reads_link_target_without_following_it() {
     std::fs::create_dir(&worktree).expect("create worktree fixture");
     symlink(&outside, worktree.join("link")).expect("create symlink fixture");
 
-    let side = read_worktree_file(&worktree, "link", 4096).expect("read symlink side");
+    let side = read_worktree_file(&worktree, "link", 4096, gix::hash::Kind::Sha1)
+        .expect("read symlink side");
     assert_eq!(
         side.bytes.expect("symlink bytes"),
         outside.as_os_str().as_bytes()

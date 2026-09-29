@@ -62,6 +62,14 @@ fn collect_stage_paths(workdir: &Path, dir: &Path, out: &mut Vec<String>) -> App
 }
 
 fn stage_file(repo: &Repository, worktree_path: &str) -> AppResult<()> {
+    stage_file_with_metadata(repo, worktree_path, |path| std::fs::symlink_metadata(path))
+}
+
+fn stage_file_with_metadata(
+    repo: &Repository,
+    worktree_path: &str,
+    metadata: impl FnOnce(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> AppResult<()> {
     let mut index = repo
         .open_index()
         .map_err(|e| map_git_err(e, "git open_index"))?;
@@ -74,7 +82,7 @@ fn stage_file(repo: &Repository, worktree_path: &str) -> AppResult<()> {
     // NotFound = 文件确已删除 → 从 index 移除（对齐 git add 删档语义）；
     // 其他 IO 错误（EACCES/ESTALE——CephFS 瞬时 stat 失败是现实场景）必须传播：
     // 静默按删除写入 index 会让存在的文件被后续 commit 从历史里删掉。
-    let metadata = match std::fs::symlink_metadata(&abs) {
+    let metadata = match metadata(&abs) {
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
@@ -469,41 +477,37 @@ mod tests {
     /// 反例（审查 H-1）：stat 的非 NotFound IO 错误（EACCES/ESTALE——CephFS
     /// 现实场景）曾被 `.ok()` 当作"文件已删除"写入 index 并持久化，存在的
     /// 文件会被后续 commit 从历史里删掉。修复后必须传播错误、index 不动。
-    #[cfg(unix)]
     #[test]
     fn stage_file_propagates_stat_io_error_instead_of_treating_as_deleted() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = std::env::temp_dir().join(format!(
-            "file-server-git-stat-err-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let directory = tempfile::tempdir().expect("test repository");
+        let dir = directory.path();
         std::fs::create_dir_all(dir.join("protected")).expect("建目录");
-        init_repo(&dir, "Test", "test@example.com").expect("init");
+        init_repo(dir, "Test", "test@example.com").expect("init");
         std::fs::write(dir.join("protected/a.txt"), "alive").expect("写文件");
-        let repo = open(&dir).expect("open");
+        let repo = open(dir).expect("open");
         stage_file(&repo, "protected/a.txt").expect("正常 stage");
         commit_indexed(&repo, "c1", "Test", "test@example.com").expect("commit");
 
-        // 父目录去 x 位 → 子文件 stat 以 EACCES 失败（非 NotFound）
-        let original = std::fs::metadata(dir.join("protected"))
-            .expect("stat dir")
-            .permissions();
-        let mut denied = original.clone();
-        denied.set_mode(0o000);
-        std::fs::set_permissions(dir.join("protected"), denied).expect("锁目录");
-        let result = stage_file(&repo, "protected/a.txt");
-        std::fs::set_permissions(dir.join("protected"), original).expect("恢复目录权限");
-
-        let error = result.expect_err("stat IO 错误必须传播而非按删除处理");
-        assert!(
-            matches!(error, AppError::System(_)),
-            "应为系统错误: {error:?}"
-        );
+        let before = std::fs::read(repo.index_path()).expect("index bytes");
+        // 受控 stat 故障走完整 stage 分支，不依赖 chmod 对 root/Windows 的行为。
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            let error = stage_file_with_metadata(&repo, "protected/a.txt", |path| {
+                assert_eq!(path, dir.join("protected/a.txt"));
+                Err(std::io::Error::new(kind, "injected stat failure"))
+            })
+            .expect_err("stat IO 错误必须传播而非按删除处理");
+            assert!(
+                matches!(error, AppError::System(_)),
+                "应为系统错误: {error:?}"
+            );
+            assert_eq!(
+                std::fs::read(repo.index_path()).expect("unchanged index"),
+                before
+            );
+        }
         // index 未被写入删除态：文件仍在 index 中。
         let index = repo.open_index().expect("reopen index");
         assert!(
@@ -515,9 +519,6 @@ mod tests {
                 .is_some(),
             "存在的文件不得因 stat 失败被移出 index"
         );
-
-        drop(repo);
-        drop(std::fs::remove_dir_all(dir));
     }
 
     struct TestRepo(std::path::PathBuf);

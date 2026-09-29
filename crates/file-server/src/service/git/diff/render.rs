@@ -6,7 +6,7 @@ use gix::diff::blob::{Algorithm, InternedInput, UnifiedDiff, diff_with_slider_he
 use crate::error::{AppError, AppResult};
 
 use super::types::{DiffResult, FileChange, FileSummary, Side};
-use super::{ensure_output_size, is_binary, short_hash};
+use super::{ensure_output_size, is_binary};
 
 /// 渲染所有变更 → 完整 unified diff 文本 + summary。
 pub(super) fn render_changes(
@@ -21,9 +21,11 @@ pub(super) fn render_changes(
     for ch in changes {
         let old_bytes = ch.old.bytes.as_deref();
         let new_bytes = ch.new.bytes.as_deref();
-        // 任一侧超限降级（内容未加载）→ 无法比较内容，视为已变更并按 binary 渲染。
+        // 超限只控制内容加载/渲染；对象身份仍用于精确判断内容是否改变。
         let oversized = ch.old.oversized || ch.new.oversized;
-        let content_changed = oversized || old_bytes != new_bytes;
+        let old_id = ch.old.content_id(repo.object_hash())?;
+        let new_id = ch.new.content_id(repo.object_hash())?;
+        let content_changed = old_id != new_id;
         let mode_changed = ch.old.mode != ch.new.mode;
         if !content_changed && !mode_changed {
             continue;
@@ -35,17 +37,17 @@ pub(super) fn render_changes(
                 hunks: String::new(),
                 insertions: 0,
                 deletions: 0,
-                binary: true,
+                binary: content_changed,
             }
         } else {
             render_blob_diff(old_bytes, new_bytes)?
         };
-        let old_hash = match old_bytes {
-            Some(bytes) => short_hash(repo, bytes)?,
+        let old_hash = match old_id {
+            Some(id) => id.to_hex().to_string().chars().take(7).collect(),
             None => "0000000".to_string(),
         };
-        let new_hash = match new_bytes {
-            Some(bytes) => short_hash(repo, bytes)?,
+        let new_hash = match new_id {
+            Some(id) => id.to_hex().to_string().chars().take(7).collect(),
             None => "0000000".to_string(),
         };
         let header = assemble_header(
@@ -106,20 +108,20 @@ pub(super) struct Rendered {
 pub(super) fn render_blob_diff(old: Option<&[u8]>, new: Option<&[u8]>) -> AppResult<Rendered> {
     let ob = old.unwrap_or(&[]);
     let nb = new.unwrap_or(&[]);
-    if is_binary(ob) || is_binary(nb) {
-        return Ok(Rendered {
-            hunks: String::new(),
-            insertions: 0,
-            deletions: 0,
-            binary: true,
-        });
-    }
     if ob == nb {
         return Ok(Rendered {
             hunks: String::new(),
             insertions: 0,
             deletions: 0,
             binary: false,
+        });
+    }
+    if is_binary(ob) || is_binary(nb) {
+        return Ok(Rendered {
+            hunks: String::new(),
+            insertions: 0,
+            deletions: 0,
+            binary: true,
         });
     }
     let a = sources::byte_lines(ob);

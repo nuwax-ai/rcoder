@@ -218,7 +218,7 @@ fn collect_worktree_changes(
             continue;
         }
         let old = read_head_blob(repo, &head_tree, f, max_bytes)?;
-        let new = read_worktree_file(workdir, f, max_bytes)?;
+        let new = read_worktree_file(workdir, f, max_bytes, repo.object_hash())?;
         let change = FileChange {
             path: f.clone(),
             old,
@@ -301,15 +301,6 @@ fn ensure_output_size(output: &str, max_bytes: u64) -> AppResult<()> {
 
 fn includes_path(paths: &[String], path: &str) -> bool {
     paths.is_empty() || paths.iter().any(|candidate| candidate == path)
-}
-
-/// blob 7 字符短 hash (对齐 nuwax gitBlobHash[..7])。
-/// 纯计算对象 ID，不修改对象数据库。
-fn short_hash(repo: &Repository, bytes: &[u8]) -> AppResult<String> {
-    let id = gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, bytes)
-        .map_err(|error| AppError::system(format!("git compute blob hash: {error}")))?;
-    let hex = id.to_hex().to_string();
-    Ok(hex.chars().take(7).collect())
 }
 
 #[cfg(test)]

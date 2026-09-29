@@ -148,7 +148,7 @@ pub fn ensure_repo(path: &Path) -> AppResult<Repository> {
         let repo = init(path).map_err(|e| AppError::system(format!("git init failed: {e}")))?;
         // nuwax 显式 defaultBranch=main；覆盖宿主机/镜像中的 init.defaultBranch 配置。
         set_unborn_head_to_main(&repo)?;
-        write_initial_index(&repo)?;
+        ensure_index_file(&repo)?;
         Ok(repo)
     }
 }
@@ -159,14 +159,37 @@ pub fn ensure_repo(path: &Path) -> AppResult<Repository> {
 /// git 操作的必经收口自愈一次：unborn HEAD → 空 index；有提交 → 从 HEAD tree
 /// 重建 (git reset 语义，未提交改动按 modified/untracked 正常呈现)。
 fn ensure_index_file(repo: &Repository) -> AppResult<()> {
-    if repo.index_path().exists() {
-        return Ok(());
-    }
-    write_initial_index(repo)
+    ensure_index_file_with_probe(repo, |path| std::fs::symlink_metadata(path))
 }
 
-/// 从 HEAD tree 写出 index (无 .git/index 文件时补齐; 否则首次 stage 的 open_index 失败)。
-fn write_initial_index(repo: &Repository) -> AppResult<()> {
+fn ensure_index_file_with_probe(
+    repo: &Repository,
+    mut probe: impl FnMut(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> AppResult<()> {
+    let index_path = repo.index_path();
+    let exists = |result: std::io::Result<std::fs::Metadata>| match result {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(AppError::system(format!(
+            "git stat index {}: {error}",
+            index_path.display()
+        ))),
+    };
+    if exists(probe(&index_path))? {
+        return Ok(());
+    }
+
+    // 与 git add / gix index.write 使用同一个 index.lock。初次探测之后可能
+    // 已有请求补齐并暂存了文件，必须持锁复核，不能再覆盖成 HEAD tree。
+    let lock = gix::lock::File::acquire_to_update_resource(
+        &index_path,
+        gix::lock::acquire::Fail::Immediately,
+        None,
+    )
+    .map_err(|error| map_git_err(error, "git lock initial index"))?;
+    if exists(probe(&index_path))? {
+        return Ok(());
+    }
     let tree_id = repo
         .head_tree_id_or_empty()
         .map_err(|e| AppError::system(format!("git head_tree: {e}")))?
@@ -175,8 +198,15 @@ fn write_initial_index(repo: &Repository) -> AppResult<()> {
         .index_from_tree(&tree_id)
         .map_err(|e| AppError::system(format!("git index_from_tree: {e}")))?;
     idx.remove_tree();
-    idx.write(IndexWriteOptions::default())
-        .map_err(|e| AppError::system(format!("git index write: {e}")))?;
+    // 锁已由本函数持有，write_to 不会像 idx.write 那样再次申请锁。
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, lock);
+    idx.write_to(&mut writer, IndexWriteOptions::default())
+        .map_err(|error| map_git_err(error, "git write initial index"))?;
+    let lock = writer
+        .into_inner()
+        .map_err(|error| map_git_err(error, "git flush initial index"))?;
+    lock.commit()
+        .map_err(|error| map_git_err(error, "git commit initial index"))?;
     Ok(())
 }
 
@@ -301,5 +331,90 @@ mod tests {
         assert_eq!(status.untracked, vec!["new.txt".to_string()]);
         assert!(status.staged.is_empty());
         assert!(status.deleted.is_empty());
+    }
+
+    #[test]
+    fn missing_index_recheck_preserves_concurrent_stage() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().expect("test repository");
+        let root = directory.path();
+        let repo = ensure_repo(root).expect("init");
+        std::fs::write(root.join("app.txt"), "head").expect("head content");
+        stage_path(&repo, "app.txt").expect("stage head");
+        commit_indexed(&repo, "head", "Test", "test@example.com").expect("commit");
+        std::fs::remove_file(repo.index_path()).expect("remove index");
+
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let late_root = root.to_path_buf();
+        let late_reader = std::thread::spawn(move || {
+            let repo = open(late_root).expect("open late reader");
+            let mut first = true;
+            ensure_index_file_with_probe(&repo, |path| {
+                let observed = std::fs::symlink_metadata(path);
+                if first {
+                    first = false;
+                    assert_eq!(
+                        observed.as_ref().expect_err("missing index").kind(),
+                        std::io::ErrorKind::NotFound
+                    );
+                    observed_tx.send(()).expect("report missing index");
+                    resume_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("resume late reader");
+                } else {
+                    assert!(
+                        path.with_extension("lock").exists(),
+                        "second probe holds the Git index lock"
+                    );
+                }
+                observed
+            })
+        });
+
+        observed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader observed missing index");
+        let writer = ensure_repo(root).expect("other request repairs index");
+        std::fs::write(root.join("app.txt"), "staged").expect("staged content");
+        stage_path(&writer, "app.txt").expect("other request stages");
+        let staged_index = std::fs::read(writer.index_path()).expect("saved staged index");
+        std::fs::write(root.join("app.txt"), "later worktree edit").expect("unstaged edit");
+        resume_tx.send(()).expect("resume original request");
+        late_reader
+            .join()
+            .expect("reader thread")
+            .expect("reader reuses existing index");
+
+        assert_eq!(
+            std::fs::read(writer.index_path()).expect("index after repair"),
+            staged_index
+        );
+        assert!(
+            !root.join(".git/index.lock").exists(),
+            "repair releases its lock"
+        );
+    }
+
+    #[test]
+    fn index_stat_error_preserves_staged_bytes_without_attempting_repair() {
+        let directory = tempfile::tempdir().expect("test repository");
+        let repo = ensure_repo(directory.path()).expect("init");
+        std::fs::write(directory.path().join("app.txt"), "staged").expect("file");
+        stage_path(&repo, "app.txt").expect("stage");
+        let before = std::fs::read(repo.index_path()).expect("index bytes");
+
+        let error = ensure_index_file_with_probe(&repo, |_| {
+            Err(std::io::Error::other("injected stat I/O failure"))
+        })
+        .expect_err("stat error must not authorize repair");
+        assert!(matches!(error, AppError::System(_)));
+        assert_eq!(
+            std::fs::read(repo.index_path()).expect("unchanged index"),
+            before
+        );
+        assert!(!directory.path().join(".git/index.lock").exists());
     }
 }
