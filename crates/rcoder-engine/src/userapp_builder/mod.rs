@@ -34,6 +34,7 @@ impl std::fmt::Display for BuilderEnsureSuperseded {
 impl std::error::Error for BuilderEnsureSuperseded {}
 pub(crate) mod auto_repair;
 pub mod compute_control;
+mod compute_drain_recovery;
 pub mod control;
 mod creation;
 mod dev_cleanup;

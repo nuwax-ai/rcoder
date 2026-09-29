@@ -146,6 +146,17 @@ fn takeover_patch_rewrites_identity_and_bumps_transitions() {
     let body = takeover_patch(&desired, "7", 3).expect("patch");
     assert_eq!(body["metadata"]["resourceVersion"], "7");
     assert_eq!(body["spec"]["holderIdentity"], "executor-one:operation-one");
+    assert!(
+        body["metadata"]["annotations"]["rcoder.io/lease-token"].is_null(),
+        "ordinary takeover must remove an old compute token"
+    );
+    assert!(
+        body["metadata"]["annotations"]
+            .as_object()
+            .unwrap()
+            .contains_key("rcoder.io/lease-token"),
+        "merge patch must explicitly clear the old key"
+    );
     assert_eq!(body["spec"]["leaseTransitions"], 4);
     assert_eq!(body["spec"]["leaseDurationSeconds"], LEASE_TTL_SECONDS);
 }

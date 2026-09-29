@@ -377,6 +377,24 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             .await
     }
 
+    async fn prepare_compute_operation(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        scope: shared_types::UserAppOperationScope,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::PreparedComputeLease>> {
+        self.prepare_compute_k8s_lease(context, scope).await
+    }
+
+    async fn inspect_compute_drain_lease(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        scope: shared_types::UserAppOperationScope,
+        receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+    ) -> ContainerRuntimeResult<shared_types::ComputeLeaseInspection> {
+        self.inspect_compute_k8s_lease(context, scope, receipt)
+            .await
+    }
+
     async fn acquire_app_operation(
         &self,
         app_id: &str,

@@ -40,12 +40,12 @@ pub struct ComputeRecoveryRequest {
     pub expected_revision: i64,
 }
 
-/// 恢复计算控制操作（续排空或终局确认，不重放）
+/// 恢复原计算控制操作；早期阶段核验租约后更换执行者，已写入阶段只按原证据收束
 #[utoipa::path(post, path = "/computer/pod/operations/{app_id}/{operation_id}/recover",
     params(("app_id" = String, Path, description = "Application ID"),
            ("operation_id" = String, Path, description = "Original compute operation ID")),
     request_body = ComputeRecoveryRequest,
-    responses((status = 202, description = "Resume original draining or finalize confirmed compute effects without replay",
+    responses((status = 202, description = "Inspect and continue the original operation with a new executor before container writes, or reconcile captured effects; query state/stage/error_code/error_message for progress. Unknown lease ownership remains recoverable",
         body = HttpResult<crate::userapp_builder::compute_control::ComputeOperationView>),
         (status = 409, description = "Stale revision or another control owns the scope"),
         (status = 400, description = "Captured runtime writes require reconciliation before retry")),

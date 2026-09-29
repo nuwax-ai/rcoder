@@ -1196,6 +1196,31 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         Ok(None)
     }
 
+    /// Prepare an attempt-specific mutex without an unregistered Docker marker.
+    /// The caller binds its receipt durably before activation or compute writes.
+    async fn prepare_compute_operation(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _scope: shared_types::UserAppOperationScope,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::PreparedComputeLease>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Prepared compute leases are unsupported".into(),
+        ))
+    }
+
+    /// Inspect only an executor already revoked by an early-stage store CAS.
+    /// No fallback from an observation error to an absent or released lease.
+    async fn inspect_compute_drain_lease(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _scope: shared_types::UserAppOperationScope,
+        _receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+    ) -> ContainerRuntimeResult<shared_types::ComputeLeaseInspection> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Compute lease inspection is unsupported".into(),
+        ))
+    }
+
     /// Builder-family runtime mutex for dev-scope operations. Durable receipts
     /// must carry the UserappBuilder service family. Named distinctly from
     /// AgentContainerRuntime::acquire_builder_operation so `dyn ContainerRuntime`

@@ -19,15 +19,28 @@ pub(super) struct OperationLease {
     pub(super) receipt: shared_types::UserAppOperationLeaseReceipt,
 }
 
-/// Holder identity of a lease: the durable operation id when present, else the
-/// legacy token. Reads exactly what acquisition writes, in the same priority.
+/// Holder identity: compute attempt token, ordinary operation id, then legacy
+/// token. Reads exactly what acquisition writes, in the same priority.
 pub(super) fn holder_token(object: &Lease) -> Option<String> {
     let annotations = object.metadata.annotations.as_ref()?;
     annotations
-        .get("rcoder.io/operation-id")
+        .get("rcoder.io/lease-token")
+        .or_else(|| annotations.get("rcoder.io/operation-id"))
         .or_else(|| annotations.get("rcoder.io/legacy-operation-id"))
         .filter(|token| !token.is_empty())
         .cloned()
+}
+
+/// Diagnostics report the operation, while ownership uses the per-attempt token.
+fn reported_operation(object: &Lease) -> Option<String> {
+    object
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|values| values.get("rcoder.io/operation-id"))
+        .filter(|id| !id.is_empty())
+        .cloned()
+        .or_else(|| holder_token(object))
 }
 
 pub(super) fn lease_now() -> k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime {
@@ -106,9 +119,30 @@ pub(super) fn takeover_patch(
             ..Default::default()
         }),
     };
-    serde_json::to_value(patch).map_err(|error| {
+    let mut patch = serde_json::to_value(patch).map_err(|error| {
         ContainerRuntimeError::K8sError(format!("serialize lease takeover patch: {error}"))
-    })
+    })?;
+    // JSON merge preserves unspecified map keys. Explicitly retire the previous
+    // holder's identity fields when switching between compute/business/legacy.
+    for key in [
+        "rcoder.io/lease-token",
+        "rcoder.io/compute-lease",
+        "rcoder.io/operation-id",
+        "rcoder.io/legacy-operation-id",
+        "rcoder.io/executor-id",
+        "rcoder.io/lifecycle-id",
+        "rcoder.io/request-fingerprint",
+    ] {
+        if !desired
+            .metadata
+            .annotations
+            .as_ref()
+            .is_some_and(|values| values.contains_key(key))
+        {
+            patch["metadata"]["annotations"][key] = serde_json::Value::Null;
+        }
+    }
+    Ok(patch)
 }
 
 enum RenewOutcome {
@@ -332,7 +366,7 @@ pub(super) async fn take_over_expired(
         // conflict shape; the caller's next attempt recreates the lease.
         return Ok(TakeOver::InProgress(None));
     };
-    let holder = holder_token(&current);
+    let holder = reported_operation(&current);
     if !lease_expired_at(k8s_openapi::jiff::Timestamp::now(), &current) {
         return Ok(TakeOver::InProgress(holder));
     }
@@ -360,7 +394,7 @@ pub(super) async fn take_over_expired(
             // once so the reported holder is the actual winner, not the dead
             // holder we just read; an unreadable object reports no identity.
             let winner = match api.get_opt(name).await {
-                Ok(Some(current)) => holder_token(&current),
+                Ok(Some(current)) => reported_operation(&current),
                 _ => None,
             };
             Ok(TakeOver::InProgress(winner))

@@ -895,7 +895,7 @@ async fn compute_drain_recovery_accepts_only_initial_policy_checkpoint() {
         failure.error_code = Some("ERR_BACKEND_ERROR".into());
         failure.error_message = Some("Drain interrupted".into());
         let uncertain = store.advance_compute_control(&failure).await.unwrap();
-        let resumed = store.resume_compute_drain(&uncertain).await;
+        let resumed = store.resume_released_compute_drain(&uncertain, None).await;
         if extra_evidence {
             assert!(resumed.is_err(), "runtime evidence needs inspection");
         } else {
@@ -1202,4 +1202,236 @@ async fn stopped_restart_replacement_uid_requires_witness_and_single_cas_winner(
         }
     }
     store.shutdown().await.unwrap();
+}
+
+/// Runs the same CAS protocol on Turso and two independent PG connections.
+async fn early_handoff_contract(
+    first: &dyn UserAppLifecycleStore,
+    second: &dyn UserAppLifecycleStore,
+) {
+    for (scope, bound) in [
+        (UserAppOperationScope::Dev, false),
+        (UserAppOperationScope::Prod, true),
+    ] {
+        let app = first
+            .ensure_identity(&format!("handoff{}", uuid::Uuid::new_v4().simple()))
+            .await
+            .unwrap();
+        let mut input = request(
+            &app,
+            &format!("stop{}", uuid::Uuid::new_v4().simple()),
+            ComputeControlAction::Stop,
+        );
+        input.scope = scope;
+        input.restart_image_roll = true;
+        let pending = first.admit_compute_control(&input).await.unwrap();
+        let mut sibling_request = request(
+            &app,
+            &format!("sibling{}", uuid::Uuid::new_v4().simple()),
+            ComputeControlAction::Stop,
+        );
+        sibling_request.scope = if scope == UserAppOperationScope::Dev {
+            UserAppOperationScope::Prod
+        } else {
+            UserAppOperationScope::Dev
+        };
+        let sibling = first.admit_compute_control(&sibling_request).await.unwrap();
+        let old = compute_identity(&pending);
+        let mut snapshot = first
+            .claim_compute_control(&old, pending.revision)
+            .await
+            .unwrap();
+        let receipt = UserAppOperationLeaseReceipt::Docker {
+            service_type: compute_lease_family(scope).unwrap(),
+            device: 1,
+            inode: 42,
+            token: old.executor_id.clone(),
+        };
+        if bound {
+            snapshot = first.bind_compute_lease(&old, &receipt).await.unwrap();
+        }
+        let (a, b) = tokio::join!(
+            first.reserve_compute_drain_recovery(&snapshot),
+            second.reserve_compute_drain_recovery(&snapshot)
+        );
+        let reserved = match (a, b) {
+            (Ok(record), Err(UserAppStoreError::VersionConflict))
+            | (Err(UserAppStoreError::VersionConflict), Ok(record)) => record,
+            pair => panic!("exactly one recovery wins: {pair:?}"),
+        };
+        assert!(first.bind_compute_lease(&old, &receipt).await.is_err());
+        assert!(
+            first
+                .advance_compute_control(&compute_progress(
+                    &snapshot,
+                    ComputeControlStage::Stopping
+                ))
+                .await
+                .is_err()
+        );
+        assert!(first.check_compute_executor(&old).await.is_err());
+        // Captured after a lost acquisition response, or previously bound.
+        let captured = if bound {
+            reserved
+        } else {
+            first
+                .capture_compute_drain_lease(
+                    &reserved,
+                    &receipt,
+                    &reserved.execution_context().unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+        assert!(
+            first
+                .resume_released_compute_drain(&captured, None)
+                .await
+                .is_err()
+        );
+        let resumed = first
+            .resume_released_compute_drain(&captured, Some(&receipt))
+            .await
+            .unwrap();
+        assert_eq!(resumed.operation_id, pending.operation_id);
+        assert_eq!(resumed.generation, pending.generation);
+        assert_eq!(resumed.lifecycle_id, pending.lifecycle_id);
+        assert_eq!(resumed.checkpoint, pending.checkpoint);
+        assert_eq!(resumed.request_id, pending.request_id);
+        assert_eq!(resumed.request_fingerprint, pending.request_fingerprint);
+        assert!(resumed.executor_id.is_none() && resumed.lease.is_none());
+        assert!(
+            second
+                .resume_released_compute_drain(&captured, Some(&receipt))
+                .await
+                .is_err()
+        );
+        let mut next = old.clone();
+        next.executor_id = "newexecutor".into();
+        let mut competing = next.clone();
+        competing.executor_id = "competingexecutor".into();
+        let (a, b) = tokio::join!(
+            first.claim_compute_control(&next, resumed.revision),
+            second.claim_compute_control(&competing, resumed.revision)
+        );
+        let mut record = match (a, b) {
+            (Ok(record), Err(UserAppStoreError::VersionConflict)) => record,
+            (Err(UserAppStoreError::VersionConflict), Ok(record)) => {
+                next = competing;
+                record
+            }
+            pair => panic!("exactly one executor wins: {pair:?}"),
+        };
+        assert_eq!(
+            record.executor_id.as_deref(),
+            Some(next.executor_id.as_str())
+        );
+        assert!(first.bind_compute_lease(&old, &receipt).await.is_err());
+        let mut replacement = receipt.clone();
+        if let UserAppOperationLeaseReceipt::Docker { token, .. } = &mut replacement {
+            token.clone_from(&next.executor_id);
+        }
+        record = first.bind_compute_lease(&next, &replacement).await.unwrap();
+        assert!(first.forget_compute_lease(&old, &receipt).await.is_err());
+        for stage in [
+            ComputeControlStage::Stopping,
+            ComputeControlStage::Stopped,
+            ComputeControlStage::Completed,
+        ] {
+            let mut progress = compute_progress(&record, stage);
+            progress.identity = next.clone();
+            if stage == ComputeControlStage::Completed {
+                progress.state = ComputeControlState::Succeeded;
+            }
+            record = first.advance_compute_control(&progress).await.unwrap();
+        }
+        assert_eq!(record.state, ComputeControlState::Succeeded);
+        first
+            .forget_compute_lease(&next, &replacement)
+            .await
+            .unwrap();
+        first
+            .check_compute_access(&app.app_id, scope, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .get_compute_control(&app.app_id, &sibling.operation_id)
+                .await
+                .unwrap(),
+            Some(sibling),
+            "other scope remains unchanged"
+        );
+        let mut again = request(
+            &app,
+            &format!("restart{}", uuid::Uuid::new_v4().simple()),
+            ComputeControlAction::Restart,
+        );
+        again.scope = scope;
+        first
+            .admit_compute_control(&again)
+            .await
+            .expect("explicit restart after Stop recovers");
+    }
+}
+
+#[tokio::test]
+async fn early_compute_handoff_fences_old_executor_and_preserves_operation() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ToastyUserAppStore::open_exclusive(&dir.path().join("handoff.db"))
+        .await
+        .unwrap();
+    early_handoff_contract(&store, &store).await;
+    // A writer reaching Stopping wins over early recovery, which must not rewind.
+    let app = store.ensure_identity("stagewinner").await.unwrap();
+    let pending = store
+        .admit_compute_control(&request(&app, "stagecontrol", ComputeControlAction::Stop))
+        .await
+        .unwrap();
+    let identity = compute_identity(&pending);
+    store
+        .claim_compute_control(&identity, pending.revision)
+        .await
+        .unwrap();
+    let before = store
+        .bind_compute_lease(&identity, &compute_receipt())
+        .await
+        .unwrap();
+    let stopping = store
+        .advance_compute_control(&compute_progress(&before, ComputeControlStage::Stopping))
+        .await
+        .unwrap();
+    assert!(store.reserve_compute_drain_recovery(&before).await.is_err());
+    assert!(
+        store
+            .reserve_compute_drain_recovery(&stopping)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .get_compute_control(&app.app_id, &stopping.operation_id)
+            .await
+            .unwrap(),
+        Some(stopping)
+    );
+    store.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "pg")]
+#[tokio::test]
+#[ignore = "requires explicit disposable PostgreSQL database"]
+async fn early_compute_handoff_pg_independent_connections() {
+    let config = crate::config::PostgresConfig {
+        url: Some(std::env::var("RCODER_USERAPP_PG_TEST_DSN").expect("disposable PG required")),
+        max_connections: Some(1),
+        min_connections: Some(1),
+        statement_timeout_secs: Some(5),
+        ..Default::default()
+    };
+    let first = ToastyUserAppStore::connect(&config).await.unwrap();
+    let second = ToastyUserAppStore::connect(&config).await.unwrap();
+    early_handoff_contract(&first, &second).await;
+    first.shutdown().await.unwrap();
+    second.shutdown().await.unwrap();
 }

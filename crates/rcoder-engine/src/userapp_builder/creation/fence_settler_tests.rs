@@ -59,6 +59,11 @@ impl TerminalSeed {
 /// 物理租约 validate 判定 + 可选死亡探针覆写。
 #[derive(Default)]
 pub(crate) struct FenceRuntime {
+    pub(crate) compute_release_succeeds: std::sync::atomic::AtomicBool,
+    pub(crate) compute_stall: std::sync::atomic::AtomicBool,
+    pub(crate) compute_inspection: Mutex<Option<shared_types::ComputeLeaseInspection>>,
+    pub(crate) compute_prepares: std::sync::atomic::AtomicUsize,
+    pub(crate) compute_releases: std::sync::atomic::AtomicUsize,
     status: Mutex<Option<Option<DeploymentStatus>>>,
     generation: Mutex<Option<String>>,
     pub(crate) builder_workload: Mutex<Option<String>>,
@@ -74,6 +79,11 @@ impl FenceRuntime {
         generation: Option<&str>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            compute_release_succeeds: Default::default(),
+            compute_stall: Default::default(),
+            compute_inspection: Default::default(),
+            compute_prepares: Default::default(),
+            compute_releases: Default::default(),
             status: Mutex::new(Some(status)),
             generation: Mutex::new(generation.map(str::to_string)),
             builder_workload: Mutex::new(None),
@@ -182,6 +192,65 @@ impl WorkspaceRuntime for FenceRuntime {}
 
 #[async_trait::async_trait]
 impl UserAppDeploymentRuntime for FenceRuntime {
+    async fn prepare_compute_operation(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        scope: shared_types::UserAppOperationScope,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::PreparedComputeLease>> {
+        self.compute_prepares
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::new(PreparedComputeFixture(
+            shared_types::UserAppOperationLeaseReceipt::Docker {
+                service_type: shared_types::compute_lease_family(scope).unwrap(),
+                device: 1,
+                inode: 1,
+                token: context.executor_id.clone(),
+            },
+        )))
+    }
+    async fn inspect_compute_drain_lease(
+        &self,
+        _: &shared_types::UserAppExecutionContext,
+        _: shared_types::UserAppOperationScope,
+        receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+    ) -> ContainerRuntimeResult<shared_types::ComputeLeaseInspection> {
+        if self.compute_stall.load(std::sync::atomic::Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        if *self.receipt_verdict.lock().unwrap() == ReceiptVerdict::Transport {
+            return Err(ContainerRuntimeError::K8sError(
+                "injected observation failure".into(),
+            ));
+        }
+        Ok(self
+            .compute_inspection
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| {
+                receipt.map_or(shared_types::ComputeLeaseInspection::Absent, |r| {
+                    shared_types::ComputeLeaseInspection::Releasable(r.clone())
+                })
+            }))
+    }
+    async fn release_app_operation_receipt(
+        &self,
+        _: &shared_types::UserAppExecutionContext,
+        _: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<()> {
+        self.compute_releases
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .compute_release_succeeds
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            Ok(())
+        } else {
+            Err(ContainerRuntimeError::K8sError(
+                "injected lease release failure".into(),
+            ))
+        }
+    }
     async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
         Ok(vec![])
     }
@@ -387,63 +456,7 @@ async fn fence_state_on_store(
     Arc<AppState>,
     Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore>,
 ) {
-    let (adapter, _cleanup_rx) =
-        crate::storage::ProjectAdapter::new("test-ns".to_string(), "cluster.local".to_string());
-    let activity = Arc::new(app_manager::AppActivityRegistry::new(Duration::from_secs(
-        300,
-    )));
-    let manager_config = app_manager::config::AppManagerConfig {
-        access_mode: app_manager::config::AppAccessMode::Docker,
-        ..app_manager::config::AppManagerConfig::default()
-    };
-    let app_service: Arc<dyn app_manager::AppServiceTrait> = Arc::new(
-        app_manager::service::AppService::new(
-            manager_config,
-            runtime.clone(),
-            activity.clone(),
-            None,
-            store.clone(),
-        )
-        .await
-        .expect("AppService"),
-    );
-    let download_dir = tempfile::tempdir().expect("download directory");
-    let (pod_created_tx, _) = tokio::sync::broadcast::channel(8);
-    let state = Arc::new(AppState {
-        userapp_store: store.clone(),
-        userapp_store_control: store.clone(),
-        userapp_op_flight: Arc::new(
-            crate::userapp_builder::shutdown_gate::OperationFlightGate::default(),
-        ),
-        userapp_recovery_handle: Arc::new(Mutex::new(None)),
-        config: crate::config::AppConfig {
-            fence_settle_grace_secs,
-            ..Default::default()
-        },
-        projects: Arc::new(crate::storage::ProjectStoreBackend::Memory(Arc::new(
-            adapter,
-        ))),
-        pingora_service: None,
-        userapp_error_page: None,
-        grpc_pool: Arc::new(crate::grpc::GrpcChannelPool::new()),
-        session_stream_registry: Arc::new(crate::grpc::SessionStreamRegistry::new()),
-        api_key_config: Arc::new(ArcSwap::from_pointee(
-            crate::config::ApiKeyAuthConfig::default(),
-        )),
-        pod_creating: Arc::new(DashMap::new()),
-        pod_created_tx: Arc::new(pod_created_tx),
-        container_prefix_rcoder: "dev-rcoder".to_string(),
-        container_prefix_computer: "computer-agent-runner".to_string(),
-        runtime,
-        cleanup_rx: Arc::new(Mutex::new(None)),
-        agent_download_manager: Arc::new(
-            agent_provisioning::AgentDownloadManager::new(download_dir.path())
-                .expect("download manager"),
-        ),
-        app_service,
-        activity,
-        cluster_domain: "cluster.local".to_string(),
-    });
+    let state = runtime_state(runtime, store.clone(), fence_settle_grace_secs).await;
     // 构造围栏记录：admit(Pending) → advance(Running, executor) →
     // advance(RecoveryRequired, step=runtime_updated)。
     let lifecycle = store.ensure_identity("fenced").await.expect("identity");
@@ -1263,4 +1276,86 @@ async fn real_terminal_failure_still_fails_fast() {
         "real terminal must fail fast: {:?}",
         started.elapsed()
     );
+}
+
+/// Shared real-store AppState fixture for lifecycle recovery protocols.
+pub(crate) async fn runtime_state(
+    runtime: Arc<dyn container_runtime_api::ContainerRuntime>,
+    store: Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore>,
+    fence_settle_grace_secs: Option<u64>,
+) -> Arc<AppState> {
+    let (adapter, _cleanup_rx) =
+        crate::storage::ProjectAdapter::new("test-ns".to_string(), "cluster.local".to_string());
+    let activity = Arc::new(app_manager::AppActivityRegistry::new(Duration::from_secs(
+        300,
+    )));
+    let manager_config = app_manager::config::AppManagerConfig {
+        access_mode: app_manager::config::AppAccessMode::Docker,
+        ..app_manager::config::AppManagerConfig::default()
+    };
+    let app_service: Arc<dyn app_manager::AppServiceTrait> = Arc::new(
+        app_manager::service::AppService::new(
+            manager_config,
+            runtime.clone(),
+            activity.clone(),
+            None,
+            store.clone(),
+        )
+        .await
+        .expect("AppService"),
+    );
+    let download_dir = tempfile::tempdir().expect("download directory");
+    let (pod_created_tx, _) = tokio::sync::broadcast::channel(8);
+    Arc::new(AppState {
+        userapp_store: store.clone(),
+        userapp_store_control: store.clone(),
+        userapp_op_flight: Arc::new(
+            crate::userapp_builder::shutdown_gate::OperationFlightGate::default(),
+        ),
+        userapp_recovery_handle: Arc::new(Mutex::new(None)),
+        config: crate::config::AppConfig {
+            fence_settle_grace_secs,
+            ..Default::default()
+        },
+        projects: Arc::new(crate::storage::ProjectStoreBackend::Memory(Arc::new(
+            adapter,
+        ))),
+        pingora_service: None,
+        userapp_error_page: None,
+        grpc_pool: Arc::new(crate::grpc::GrpcChannelPool::new()),
+        session_stream_registry: Arc::new(crate::grpc::SessionStreamRegistry::new()),
+        api_key_config: Arc::new(ArcSwap::from_pointee(
+            crate::config::ApiKeyAuthConfig::default(),
+        )),
+        pod_creating: Arc::new(DashMap::new()),
+        pod_created_tx: Arc::new(pod_created_tx),
+        container_prefix_rcoder: "dev-rcoder".to_string(),
+        container_prefix_computer: "computer-agent-runner".to_string(),
+        runtime,
+        cleanup_rx: Arc::new(Mutex::new(None)),
+        agent_download_manager: Arc::new(
+            agent_provisioning::AgentDownloadManager::new(download_dir.path())
+                .expect("download manager"),
+        ),
+        app_service,
+        activity,
+        cluster_domain: "cluster.local".to_string(),
+    })
+}
+
+struct PreparedComputeFixture(shared_types::UserAppOperationLeaseReceipt);
+#[async_trait::async_trait]
+impl shared_types::AppOperationLease for PreparedComputeFixture {
+    fn receipt(&self) -> Option<shared_types::UserAppOperationLeaseReceipt> {
+        Some(self.0.clone())
+    }
+    async fn release(self: Box<Self>) -> Result<(), String> {
+        Ok(())
+    }
+}
+#[async_trait::async_trait]
+impl shared_types::PreparedComputeLease for PreparedComputeFixture {
+    async fn activate(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }

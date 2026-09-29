@@ -10,6 +10,19 @@ pub(super) fn lock_builder_file_with_marker(
     name: &str,
     marker: shared_types::AppFileMutationMarker,
 ) -> Result<BuilderFileLease> {
+    let lease = prepare_builder_file(root, name, marker)?;
+    lease
+        .marker
+        .begin(&lease.file)
+        .map_err(|e| Error::DockerError(format!("persist builder operation marker: {e}")))?;
+    Ok(lease)
+}
+
+pub(super) fn prepare_builder_file(
+    root: &std::path::Path,
+    name: &str,
+    marker: shared_types::AppFileMutationMarker,
+) -> Result<BuilderFileLease> {
     std::fs::create_dir_all(root)
         .map_err(|e| Error::DockerError(format!("builder operation lock directory: {e}")))?;
     let file = std::fs::OpenOptions::new()
@@ -23,15 +36,21 @@ pub(super) fn lock_builder_file_with_marker(
         .map_err(|e| Error::Conflict(format!("builder operation lease unavailable: {e}")))?;
     shared_types::AppFileMutationMarker::check_clean(&file)
         .map_err(|e| Error::Conflict(format!("builder operation requires recovery: {e}")))?;
-    marker
-        .begin(&file)
-        .map_err(|e| Error::DockerError(format!("persist builder operation marker: {e}")))?;
     Ok(BuilderFileLease {
         file,
         marker,
         unlocked: false,
         service_type: ServiceType::UserappBuilder,
     })
+}
+
+#[async_trait::async_trait]
+impl shared_types::PreparedComputeLease for BuilderFileLease {
+    async fn activate(&mut self) -> std::result::Result<(), String> {
+        self.marker
+            .begin(&self.file)
+            .map_err(|error| format!("Activate compute lease: {error}"))
+    }
 }
 
 #[cfg(unix)]

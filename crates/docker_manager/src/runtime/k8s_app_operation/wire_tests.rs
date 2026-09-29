@@ -402,3 +402,122 @@ async fn captured_release_treats_taken_over_lease_as_released_without_deleting()
     .await
     .expect("taken-over release within budget");
 }
+
+#[tokio::test]
+async fn compute_lease_lost_create_reply_is_discoverable_and_late_release_spares_successor() {
+    use container_runtime_api::UserAppDeploymentRuntime as _;
+    use shared_types::{ComputeLeaseInspection, UserAppExecutionContext, UserAppOperationScope};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let observed_deletes = deletes.clone();
+        let expire = Arc::new(AtomicBool::new(false));
+        let server_expire = expire.clone();
+        let server = tokio::spawn(async move {
+            let mut stored: Option<serde_json::Value> = None;
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (head, body) = read_request(&mut stream).await;
+                if head.starts_with("POST ") {
+                    if stored.is_some() {
+                        write_reply(&mut stream, 409, &status(409, "lease exists")).await;
+                        continue;
+                    }
+                    let mut object: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    object["metadata"]["uid"] = "same-lease-uid".into();
+                    object["metadata"]["resourceVersion"] = "1".into();
+                    assert_eq!(object["metadata"]["annotations"]["rcoder.io/compute-lease"], "true");
+                    stored = Some(object);
+                    // The first create commits, but the client never gets its reply.
+                } else if head.starts_with("GET ") {
+                    match &mut stored {
+                        Some(object) => {
+                            if server_expire.load(Ordering::SeqCst) {
+                                object["spec"]["renewTime"] = "2000-01-01T00:00:00.000000Z".into();
+                            }
+                            write_reply(&mut stream, 200, object).await;
+                        }
+                        None => write_reply(&mut stream, 404, &status(404, "absent")).await,
+                    }
+                } else if head.starts_with("PATCH ") {
+                    let patch: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let object = stored.as_mut().unwrap();
+                    assert_eq!(patch["metadata"]["resourceVersion"], object["metadata"]["resourceVersion"]);
+                    let annotations = object["metadata"]["annotations"].as_object_mut().unwrap();
+                    for (key, value) in patch["metadata"]["annotations"].as_object().unwrap() {
+                        if value.is_null() {
+                            annotations.remove(key);
+                        } else {
+                            annotations.insert(key.clone(), value.clone());
+                        }
+                    }
+                    object["metadata"]["labels"] = patch["metadata"]["labels"].clone();
+                    object["metadata"]["resourceVersion"] = "2".into();
+                    object["spec"] = patch["spec"].clone();
+                    write_reply(&mut stream, 200, object).await;
+                } else if head.starts_with("DELETE ") {
+                    let params: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let object = stored.take().unwrap();
+                    assert_eq!(params["preconditions"]["uid"], object["metadata"]["uid"]);
+                    assert_eq!(params["preconditions"]["resourceVersion"], object["metadata"]["resourceVersion"]);
+                    observed_deletes.fetch_add(1, Ordering::SeqCst);
+                    write_reply(&mut stream, 200, &object).await;
+                } else {
+                    panic!("unexpected request: {head}");
+                }
+            }
+        });
+        let runtime = runtime_for(client_for(address).await);
+        let context = UserAppExecutionContext {
+            app_id: "computelease".into(),
+            lifecycle_id: "life".into(),
+            operation_id: "sameoperation".into(),
+            executor_id: "firstattempt".into(),
+            request_fingerprint: "a".repeat(64),
+        };
+        assert!(runtime.prepare_compute_operation(&context, UserAppOperationScope::Prod).await.is_err());
+        let ComputeLeaseInspection::Discovered { receipt: original, attempt } = runtime
+            .inspect_compute_drain_lease(&context, UserAppOperationScope::Prod, None)
+            .await.unwrap()
+        else { panic!("lost reply receipt must be recovered"); };
+        assert_eq!(attempt, context);
+        let mut next_context = context.clone();
+        next_context.executor_id = "secondattempt".into();
+        assert!(matches!(
+            runtime.inspect_compute_drain_lease(&next_context, UserAppOperationScope::Prod, None).await.unwrap(),
+            ComputeLeaseInspection::Discovered { attempt, .. } if attempt == context
+        ));
+        let mut foreign = context.clone();
+        foreign.request_fingerprint = "b".repeat(64);
+        assert!(matches!(
+            runtime.inspect_compute_drain_lease(&foreign, UserAppOperationScope::Prod, None).await.unwrap(),
+            ComputeLeaseInspection::IdentityChanged(_)
+        ));
+        // A competing acquisition can take over the very same Lease object.
+        // UID alone must not authorize a late release from the previous attempt.
+        expire.store(true, Ordering::SeqCst);
+        let next = runtime.prepare_compute_operation(&next_context, UserAppOperationScope::Prod).await.unwrap();
+        expire.store(false, Ordering::SeqCst);
+        let receipt = next.receipt().unwrap();
+        match (&original, &receipt) {
+            (shared_types::UserAppOperationLeaseReceipt::Kubernetes { uid: old_uid, token: old_token, .. },
+             shared_types::UserAppOperationLeaseReceipt::Kubernetes { uid, token, .. }) => {
+                assert_eq!(uid, old_uid);
+                assert_ne!(token, old_token);
+                assert_eq!(token, &next_context.executor_id);
+            }
+            _ => panic!("Kubernetes receipts required"),
+        }
+        assert!(matches!(
+            runtime.inspect_compute_drain_lease(&context, UserAppOperationScope::Prod, Some(&original)).await.unwrap(),
+            ComputeLeaseInspection::IdentityChanged(_)
+        ));
+        runtime.release_app_operation_receipt(&context, &original).await.unwrap();
+        assert_eq!(deletes.load(Ordering::SeqCst), 0);
+        next.release().await.unwrap();
+        assert_eq!(deletes.load(Ordering::SeqCst), 1);
+        server.abort();
+    }).await.expect("bounded compute lease protocol test");
+}

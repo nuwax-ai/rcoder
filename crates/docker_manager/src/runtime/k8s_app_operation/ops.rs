@@ -295,6 +295,17 @@ impl KubernetesRuntime {
         service_type: &ServiceType,
         context: Option<&shared_types::UserAppExecutionContext>,
     ) -> ContainerRuntimeResult<Box<dyn AppOperationLease>> {
+        self.acquire_operation_lease(app_id, service_type, context, false)
+            .await
+    }
+
+    pub(super) async fn acquire_operation_lease(
+        &self,
+        app_id: &str,
+        service_type: &ServiceType,
+        context: Option<&shared_types::UserAppExecutionContext>,
+        compute: bool,
+    ) -> ContainerRuntimeResult<Box<dyn AppOperationLease>> {
         if !matches!(
             service_type,
             ServiceType::Userapp | ServiceType::UserappBuilder
@@ -330,8 +341,18 @@ impl KubernetesRuntime {
             annotations.insert("rcoder.io/legacy-operation-id".into(), legacy_id.clone());
             holder_identity = format!("legacy:{legacy_id}");
         }
+        if compute {
+            let context = context.ok_or_else(|| {
+                ContainerRuntimeError::ConfigurationError(
+                    "Compute lease requires execution identity".into(),
+                )
+            })?;
+            annotations.insert("rcoder.io/lease-token".into(), context.executor_id.clone());
+            annotations.insert("rcoder.io/compute-lease".into(), "true".into());
+        }
         let token = annotations
-            .get("rcoder.io/operation-id")
+            .get("rcoder.io/lease-token")
+            .or_else(|| annotations.get("rcoder.io/operation-id"))
             .or_else(|| annotations.get("rcoder.io/legacy-operation-id"))
             .cloned()
             .ok_or_else(|| {

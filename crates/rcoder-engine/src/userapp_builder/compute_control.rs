@@ -1,6 +1,5 @@
 //! Detached compute coordination. Admission never waits for a business slot.
 //! Runtime calls retain their physical receipt until their outcome is confirmed.
-use super::dev_cleanup::BuilderOperation;
 use crate::app_state::AppState;
 use anyhow::{Context, Result, anyhow, ensure};
 use futures::FutureExt as _;
@@ -156,7 +155,10 @@ async fn submit_with_image_policy(
         Ok(record) => record,
         Err(UserAppStoreError::OperationInProgress(blocker))
             if blocker.scope == scope
-                && blocker.state == UserAppOperationState::RecoveryRequired =>
+                && matches!(
+                    blocker.state,
+                    UserAppOperationState::Running | UserAppOperationState::RecoveryRequired
+                ) =>
         {
             // A retry of the same physical intent must continue the original
             // operation. A new operation would discard its unknown remote write
@@ -170,7 +172,8 @@ async fn submit_with_image_policy(
                 || previous.scope != scope
                 || previous.action != action
                 || previous.request_fingerprint != fingerprint
-                || previous.state != ComputeControlState::RecoveryRequired
+                || !(previous.state == ComputeControlState::RecoveryRequired
+                    || previous.can_recover_compute_drain())
                 || explicit_request_id
                     .as_ref()
                     .is_some_and(|id| id != &previous.request_id)
@@ -181,7 +184,7 @@ async fn submit_with_image_policy(
         }
         Err(error) => return Err(error.into()),
     };
-    if record.state == ComputeControlState::RecoveryRequired {
+    if record.state == ComputeControlState::RecoveryRequired || record.can_recover_compute_drain() {
         let state = state.clone();
         let retry = record.clone();
         tokio::spawn(async move {
@@ -250,16 +253,23 @@ pub async fn recover(
         drop(flight);
         return Ok(completed.into());
     }
-    let pending = state.userapp_store.resume_compute_drain(&current).await?;
-    let worker = pending.clone();
+    if !current.can_recover_compute_drain() {
+        return Err(UserAppStoreError::InvalidOperation(
+            "Compute stage requires physical result inspection".into(),
+        )
+        .into());
+    }
+    let worker = current.clone();
     let state = state.clone();
     tokio::spawn(async move {
         let _flight = flight;
-        if let Err(error) = execute_pending(&state, worker).await {
-            tracing::error!(%error, "Compute recovery requires further inspection");
+        if let Err(error) =
+            super::compute_drain_recovery::recover_and_execute(&state, &worker).await
+        {
+            tracing::warn!(%error, "Compute early recovery requires further inspection");
         }
     });
-    Ok(pending.into())
+    Ok(current.into())
 }
 
 /// Recover a durable completion boundary or an exact atomic remote stop receipt.
@@ -634,6 +644,129 @@ pub(crate) async fn execute_pending(state: &AppState, pending: ComputeControlRec
     Ok(())
 }
 
+pub(super) async fn drain_previous_once(
+    state: &AppState,
+    record: &ComputeControlRecord,
+    identity: &ComputeExecutorIdentity,
+) -> Result<bool> {
+    let mut drained = true;
+    for id in &record.interrupted_operations {
+        if let Some(mut old) = state
+            .userapp_store
+            .get_operation(&record.app_id, id)
+            .await?
+        {
+            ensure!(
+                old.lifecycle_id == record.lifecycle_id,
+                "Interrupted business lifecycle differs from compute control"
+            );
+            if !old.state.is_terminal()
+                && userapp_operation_has_drain_evidence(&old)
+                && !old.kind.ends_lifecycle()
+            {
+                match state
+                    .userapp_store
+                    .finalize_compute_interrupted_operation(identity, &old)
+                    .await
+                {
+                    Ok(finalized) => old = finalized,
+                    Err(UserAppStoreError::VersionConflict) => {
+                        drained = false;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            // Do not depend on another scanner slot to release terminal
+            // leases: all recovery slots may themselves be draining controls.
+            if old.state.is_terminal()
+                && let Some(binding) = state
+                    .userapp_store
+                    .get_operation_lease(&record.app_id, id)
+                    .await?
+            {
+                state
+                    .runtime()
+                    .release_app_operation_receipt(&binding.context, &binding.receipt)
+                    .await?;
+                state.userapp_store.forget_operation_lease(&binding).await?;
+            }
+            drained &= old.state.is_terminal()
+                && state
+                    .userapp_store
+                    .get_operation_lease(&record.app_id, id)
+                    .await?
+                    .is_none();
+        } else if let Some(mut old) = state
+            .userapp_store
+            .get_compute_control(&record.app_id, id)
+            .await?
+        {
+            ensure!(
+                old.lifecycle_id == record.lifecycle_id,
+                "Interrupted compute lifecycle differs from current control"
+            );
+            if old.state == ComputeControlState::Superseded
+                && old.action == ComputeControlAction::Restart
+                && (matches!(old.stage.as_str(), "stopped" | "verifying")
+                    || (matches!(old.stage.as_str(), "starting" | "stopping")
+                        && (old.has_conditional_compute_write()
+                            || old.has_docker_compute_target())))
+                && old.lease.is_some()
+            {
+                match reconcile_superseded(state, &old).await {
+                    Ok(closed) => old = closed,
+                    Err(error)
+                        if matches!(
+                            error.downcast_ref::<UserAppStoreError>(),
+                            Some(UserAppStoreError::VersionConflict)
+                        ) =>
+                    {
+                        drained = false;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if matches!(
+                old.state,
+                ComputeControlState::Succeeded | ComputeControlState::Failed
+            ) && let Some(receipt) = old.lease.as_ref()
+            {
+                let context = old.execution_context().map_err(anyhow::Error::msg)?;
+                state
+                    .runtime()
+                    .release_app_operation_receipt(&context, receipt)
+                    .await?;
+                state
+                    .userapp_store
+                    .forget_compute_lease(
+                        &ComputeExecutorIdentity {
+                            app_id: old.app_id.clone(),
+                            lifecycle_id: old.lifecycle_id.clone(),
+                            scope: old.scope,
+                            operation_id: old.operation_id.clone(),
+                            generation: old.generation,
+                            executor_id: context.executor_id,
+                        },
+                        receipt,
+                    )
+                    .await?;
+                old.lease = None;
+            }
+            drained &= (matches!(
+                old.state,
+                ComputeControlState::Succeeded | ComputeControlState::Failed
+            ) || (old.state == ComputeControlState::Superseded
+                && old.executor_id.is_none()))
+                && old.lease.is_none();
+        } else {
+            return Err(anyhow!("Interrupted operation evidence is missing: {id}"));
+        }
+    }
+    Ok(drained)
+}
+
 async fn execute_claimed(
     state: &AppState,
     record: &mut ComputeControlRecord,
@@ -646,113 +779,7 @@ async fn execute_claimed(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
         state.userapp_store.check_compute_executor(identity).await?;
-        let mut drained = true;
-        for id in &record.interrupted_operations {
-            if let Some(mut old) = state
-                .userapp_store
-                .get_operation(&record.app_id, id)
-                .await?
-            {
-                if !old.state.is_terminal()
-                    && userapp_operation_has_drain_evidence(&old)
-                    && !old.kind.ends_lifecycle()
-                {
-                    match state
-                        .userapp_store
-                        .finalize_compute_interrupted_operation(identity, &old)
-                        .await
-                    {
-                        Ok(finalized) => old = finalized,
-                        Err(UserAppStoreError::VersionConflict) => {
-                            drained = false;
-                            continue;
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-                // Do not depend on another scanner slot to release terminal
-                // leases: all recovery slots may themselves be draining controls.
-                if old.state.is_terminal()
-                    && let Some(binding) = state
-                        .userapp_store
-                        .get_operation_lease(&record.app_id, id)
-                        .await?
-                {
-                    state
-                        .runtime()
-                        .release_app_operation_receipt(&binding.context, &binding.receipt)
-                        .await?;
-                    state.userapp_store.forget_operation_lease(&binding).await?;
-                }
-                drained &= old.state.is_terminal()
-                    && state
-                        .userapp_store
-                        .get_operation_lease(&record.app_id, id)
-                        .await?
-                        .is_none();
-            } else if let Some(mut old) = state
-                .userapp_store
-                .get_compute_control(&record.app_id, id)
-                .await?
-            {
-                if old.state == ComputeControlState::Superseded
-                    && old.action == ComputeControlAction::Restart
-                    && (matches!(old.stage.as_str(), "stopped" | "verifying")
-                        || (matches!(old.stage.as_str(), "starting" | "stopping")
-                            && (old.has_conditional_compute_write()
-                                || old.has_docker_compute_target())))
-                    && old.lease.is_some()
-                {
-                    match reconcile_superseded(state, &old).await {
-                        Ok(closed) => old = closed,
-                        Err(error)
-                            if matches!(
-                                error.downcast_ref::<UserAppStoreError>(),
-                                Some(UserAppStoreError::VersionConflict)
-                            ) =>
-                        {
-                            drained = false;
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                if matches!(
-                    old.state,
-                    ComputeControlState::Succeeded | ComputeControlState::Failed
-                ) && let Some(receipt) = old.lease.as_ref()
-                {
-                    let context = old.execution_context().map_err(anyhow::Error::msg)?;
-                    state
-                        .runtime()
-                        .release_app_operation_receipt(&context, receipt)
-                        .await?;
-                    state
-                        .userapp_store
-                        .forget_compute_lease(
-                            &ComputeExecutorIdentity {
-                                app_id: old.app_id.clone(),
-                                lifecycle_id: old.lifecycle_id.clone(),
-                                scope: old.scope,
-                                operation_id: old.operation_id.clone(),
-                                generation: old.generation,
-                                executor_id: context.executor_id,
-                            },
-                            receipt,
-                        )
-                        .await?;
-                    old.lease = None;
-                }
-                drained &= (matches!(
-                    old.state,
-                    ComputeControlState::Succeeded | ComputeControlState::Failed
-                ) || (old.state == ComputeControlState::Superseded
-                    && old.executor_id.is_none()))
-                    && old.lease.is_none();
-            } else {
-                return Err(anyhow!("Interrupted operation evidence is missing: {id}"));
-            }
-        }
+        let drained = drain_previous_once(state, record, identity).await?;
         if drained {
             break;
         }
@@ -762,38 +789,9 @@ async fn execute_claimed(
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    let lease = match identity.scope {
-        UserAppOperationScope::Dev => {
-            state
-                .runtime()
-                .acquire_builder_operation(&record.app_id)
-                .await?
-        }
-        UserAppOperationScope::Prod => state
-            .runtime()
-            .acquire_app_operation(&record.app_id)
-            .await?
-            .ok_or_else(|| anyhow!("Runtime did not return a physical operation lease"))?,
-        UserAppOperationScope::Application => {
-            return Err(anyhow!("Compute control requires dev or prod scope"));
-        }
-    };
-    let mut lease = BuilderOperation::new(lease);
-    // Validate after acquiring the physical lease: waiting for another writer
-    // must not turn an earlier storage observation into permission to restart.
-    // Stop deliberately has no storage prerequisite.
-    if record.action == ComputeControlAction::Restart {
-        state
-            .app_service
-            .verify_recovered_storage(&record.app_id, identity.scope)
-            .await?;
-        state.userapp_store.check_compute_executor(identity).await?;
-    }
+    let mut lease =
+        super::compute_drain_recovery::prepare_and_bind(state, record, identity).await?;
     let receipt = lease.receipt().map_err(anyhow::Error::msg)?;
-    *record = state
-        .userapp_store
-        .bind_compute_lease(identity, &receipt)
-        .await?;
     lease
         .begin_external_mutation()
         .map_err(anyhow::Error::msg)?;

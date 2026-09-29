@@ -40,5 +40,6 @@ pub mod runtime_control;
 pub mod builder_recovery;
 
 pub mod compute_control;
+pub mod compute_recovery;
 
 pub mod discovery;

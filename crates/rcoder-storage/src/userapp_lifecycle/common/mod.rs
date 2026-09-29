@@ -8,6 +8,7 @@ mod admission_cancellation_tests;
 mod codec;
 mod compute;
 mod compute_execution;
+mod compute_recovery;
 #[cfg(all(test, feature = "userapp-turso"))]
 mod compute_tests;
 #[cfg(test)]
@@ -234,13 +235,63 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         .await
     }
 
-    async fn resume_compute_drain(
+    async fn reserve_compute_drain_recovery(
         &self,
         snapshot: &ComputeControlRecord,
     ) -> Result<ComputeControlRecord, UserAppStoreError> {
         let snapshot = snapshot.clone();
+
         self.run(false, move |tx, backend| {
-            Box::pin(async move { compute_execution::resume_drain(tx, backend, &snapshot).await })
+            Box::pin(async move { compute_recovery::reserve(tx, backend, &snapshot).await })
+        })
+        .await
+    }
+
+    async fn capture_compute_drain_lease(
+        &self,
+        snapshot: &ComputeControlRecord,
+        receipt: &UserAppOperationLeaseReceipt,
+        attempt: &UserAppExecutionContext,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let receipt = receipt.clone();
+        let attempt = attempt.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_recovery::capture(tx, backend, &snapshot, &receipt, &attempt).await
+            })
+        })
+        .await
+    }
+
+    async fn resume_released_compute_drain(
+        &self,
+        snapshot: &ComputeControlRecord,
+        released: Option<&UserAppOperationLeaseReceipt>,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let released = released.cloned();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_recovery::resume(tx, backend, &snapshot, released.as_ref()).await
+            })
+        })
+        .await
+    }
+
+    async fn record_compute_drain_problem(
+        &self,
+        snapshot: &ComputeControlRecord,
+        code: &str,
+        message: &str,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let code = code.to_owned();
+        let message = message.to_owned();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_recovery::problem(tx, backend, &snapshot, &code, &message).await
+            })
         })
         .await
     }

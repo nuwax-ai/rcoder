@@ -34,6 +34,7 @@ use shared_types::{AppOperationLease, ServiceType};
 // 身份校验与命名自由函数。lease/helpers 经 pub(super) + 私有 glob 供子模块
 // （含测试）互见；ops 方法 pub(crate) 供 runtime 兄弟模块经类型调用。
 
+mod compute;
 mod helpers;
 mod lease;
 mod ops;

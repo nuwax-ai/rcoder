@@ -227,18 +227,17 @@ pub(super) async fn discover_pending(
             );
             continue;
         }
-        if record.state == shared_types::ComputeControlState::RecoveryRequired
-            && record.stage == "draining_previous"
-            && record.lease.is_none()
-            && record.checkpoint.is_null()
-        {
+        if record.can_recover_compute_drain() {
             let flight = state.userapp_op_flight.guard()?;
             let state = state.clone();
             tasks.push(
                 format!("compute-drain:{}", record.operation_id),
                 async move {
                     let _flight = flight;
-                    resume_after_drain(&state, &record).await
+                    crate::userapp_builder::compute_drain_recovery::recover_and_execute(
+                        &state, &record,
+                    )
+                    .await
                 },
             );
             continue;
@@ -317,69 +316,5 @@ pub(super) async fn discover_pending(
     Ok(())
 }
 
-/// This preliminary read only avoids repeatedly occupying a worker for the
-/// entire drain deadline. Resume still CASes the full original snapshot; the
-/// executor and storage recheck drain/authority before any compute mutation.
-async fn resume_after_drain(
-    state: &std::sync::Arc<AppState>,
-    record: &shared_types::ComputeControlRecord,
-) -> anyhow::Result<()> {
-    use shared_types::{ComputeControlState, UserAppStoreError};
-    for id in &record.interrupted_operations {
-        if let Some(old) = state
-            .userapp_store
-            .get_operation(&record.app_id, id)
-            .await?
-        {
-            anyhow::ensure!(
-                old.lifecycle_id == record.lifecycle_id,
-                "Interrupted business lifecycle differs from compute control"
-            );
-            if !old.state.is_terminal() {
-                // A late receipt can arrive after the original drain budget.
-                // Resume the same control so its elected executor finalizes
-                // the interrupted operation and releases the original lease.
-                if old.kind.ends_lifecycle()
-                    || !shared_types::userapp_operation_has_drain_evidence(&old)
-                {
-                    return Ok(());
-                }
-            } else if state
-                .userapp_store
-                .get_operation_lease(&record.app_id, id)
-                .await?
-                .is_some()
-            {
-                return Ok(());
-            }
-        } else if let Some(old) = state
-            .userapp_store
-            .get_compute_control(&record.app_id, id)
-            .await?
-        {
-            anyhow::ensure!(
-                old.lifecycle_id == record.lifecycle_id,
-                "Interrupted compute lifecycle differs from current control"
-            );
-            let unclaimed = old.state == ComputeControlState::Superseded
-                && old.executor_id.is_none()
-                && old.stage == "accepted";
-            if !(matches!(
-                old.state,
-                ComputeControlState::Succeeded | ComputeControlState::Failed
-            ) || unclaimed)
-                || old.lease.is_some()
-            {
-                return Ok(());
-            }
-        } else {
-            anyhow::bail!("Interrupted operation evidence missing: {id}");
-        }
-    }
-    let pending = match state.userapp_store.resume_compute_drain(record).await {
-        Ok(pending) => pending,
-        Err(UserAppStoreError::VersionConflict) => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    crate::userapp_builder::compute_control::execute_pending(state, pending).await
-}
+#[cfg(all(test, feature = "userapp-turso"))]
+mod tests;

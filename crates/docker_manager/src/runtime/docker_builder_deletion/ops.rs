@@ -1,6 +1,6 @@
 use super::*;
 
-async fn application_lease_root() -> Result<std::path::PathBuf> {
+pub(super) async fn application_lease_root() -> Result<std::path::PathBuf> {
     #[cfg(feature = "deploy-host")]
     if shared_types::is_deploy_host() {
         if let Ok(root) = std::env::var("RCODER_OPERATION_LOCK_ROOT")
@@ -207,7 +207,8 @@ impl DockerRuntime {
                 ));
             }
         };
-        let path = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT)
+        let path = application_lease_root()
+            .await?
             .join(".app-operation-locks")
             .join(format!("{prefix}-{}.lock", context.app_id));
         let receipt = receipt.clone();

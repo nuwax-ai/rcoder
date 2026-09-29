@@ -897,12 +897,50 @@ pub trait UserAppLifecycleStore: Send + Sync {
         snapshot: &UserAppOperationRecord,
     ) -> Result<UserAppOperationRecord, UserAppStoreError>;
 
-    /// Resume the same control only before it obtained a physical lease or issued
-    /// compute writes. Other recovery stages require runtime-specific evidence.
-    async fn resume_compute_drain(
+    /// Revoke an early executor by exact snapshot CAS, preserving its receipt.
+    async fn reserve_compute_drain_recovery(
         &self,
-        snapshot: &crate::ComputeControlRecord,
-    ) -> Result<crate::ComputeControlRecord, UserAppStoreError>;
+        _snapshot: &crate::ComputeControlRecord,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Early compute recovery is unsupported".into(),
+        ))
+    }
+
+    /// Attach an exactly identified, previously unbound attempt receipt.
+    async fn capture_compute_drain_lease(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _receipt: &crate::UserAppOperationLeaseReceipt,
+        _attempt: &UserAppExecutionContext,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Compute recovery capture is unsupported".into(),
+        ))
+    }
+
+    /// Runtime inspection/release has completed. This CAS must match the original
+    /// snapshot and receipt, and all interrupted operations must be drained.
+    async fn resume_released_compute_drain(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _released: Option<&crate::UserAppOperationLeaseReceipt>,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Compute recovery completion is unsupported".into(),
+        ))
+    }
+
+    async fn record_compute_drain_problem(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _code: &str,
+        _message: &str,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Compute recovery diagnostics are unsupported".into(),
+        ))
+    }
 
     /// Finalize a compute control whose durable stage proves that all physical
     /// writes have returned. The caller verifies any outstanding readiness read;

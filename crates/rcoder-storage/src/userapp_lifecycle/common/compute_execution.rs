@@ -63,7 +63,10 @@ pub(super) async fn bind(
 
 /// Drain proof includes durable old-operation completion AND lease release.
 /// Ordinary checkpoint observation alone cannot authorize the next physical write.
-async fn drained(tx: &mut dyn Executor, record: &ComputeControlRecord) -> Result<(), Error> {
+pub(super) async fn drained(
+    tx: &mut dyn Executor,
+    record: &ComputeControlRecord,
+) -> Result<(), Error> {
     for id in &record.interrupted_operations {
         if let Some(old) = repo::operation(tx, &record.app_id, id).await? {
             if old.lifecycle_id != record.lifecycle_id || !old.state.is_terminal() {
@@ -351,8 +354,14 @@ pub(super) async fn finalize_interrupted(
     snapshot: &UserAppOperationRecord,
 ) -> Result<UserAppOperationRecord, Error> {
     repo::claim_app(tx, backend, &identity.app_id).await?;
-    compute::check(tx, identity).await?;
     let control = compute::current(tx, identity).await?;
+    if !owns(&control, identity)
+        || !(control.state == ComputeControlState::Running
+            || (control.state == ComputeControlState::RecoveryRequired
+                && control.can_recover_compute_drain()))
+    {
+        return Err(Error::VersionConflict);
+    }
     let mut current = repo::operation(tx, &identity.app_id, &snapshot.operation_id)
         .await?
         .ok_or(Error::NotFound)?;
@@ -402,59 +411,6 @@ pub(super) async fn finalize_interrupted(
         },
     )
     .await
-}
-
-pub(super) async fn resume_drain(
-    tx: &mut dyn Executor,
-    backend: Backend,
-    snapshot: &ComputeControlRecord,
-) -> Result<ComputeControlRecord, Error> {
-    repo::claim_app(tx, backend, &snapshot.app_id).await?;
-    let identity = ComputeExecutorIdentity {
-        app_id: snapshot.app_id.clone(),
-        lifecycle_id: snapshot.lifecycle_id.clone(),
-        scope: snapshot.scope,
-        operation_id: snapshot.operation_id.clone(),
-        generation: snapshot.generation,
-        executor_id: snapshot.executor_id.clone().ok_or(Error::VersionConflict)?,
-    };
-    let current = compute::current(tx, &identity).await?;
-    if current != *snapshot
-        || current.state != ComputeControlState::RecoveryRequired
-        || current.stage != "draining_previous"
-        || current.lease.is_some()
-        || !unstarted_checkpoint(&current.checkpoint)
-    {
-        return Err(invalid(
-            "Recovery requires inspection of the captured runtime write; only unstarted compute can resume draining",
-        ));
-    }
-    let changed = toasty::sql::statement(repo::sql(backend,
-        "UPDATE userapp_compute_controls SET state='pending',executor_id=NULL,stage='accepted',error_code=NULL,error_message=NULL,revision=revision+1,updated_at_us=$3 WHERE operation_id=$1 AND revision=$2 AND state='recovery_required' AND lease_json IS NULL"))
-        .bind(&snapshot.operation_id).bind(snapshot.revision)
-        .bind(chrono::Utc::now().timestamp_micros()).exec(tx).await.map_err(storage)?;
-    if changed != 1 {
-        return Err(Error::VersionConflict);
-    }
-    compute::get(tx, &snapshot.app_id, &snapshot.operation_id)
-        .await?
-        .ok_or(Error::NotFound)
-}
-
-/// Admission now persists the restart image policy before an executor runs.
-/// That one field is not a runtime write receipt; any other checkpoint data
-/// still requires physical inspection before resuming the original operation.
-fn unstarted_checkpoint(checkpoint: &serde_json::Value) -> bool {
-    match checkpoint {
-        serde_json::Value::Null => true,
-        serde_json::Value::Object(fields) => {
-            fields.len() == 1
-                && fields
-                    .get("restart_image_roll")
-                    .is_some_and(serde_json::Value::is_boolean)
-        }
-        _ => false,
-    }
 }
 
 /// Stopped/Verifying are written only after the physical operation returned.

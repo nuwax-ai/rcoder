@@ -333,6 +333,7 @@ mod operation_flight;
 pub use operation_flight::{FlightAdmissionClosed, FlightGuard, OperationFlightGate};
 
 pub use userapp::compute_control::*;
+pub use userapp::compute_recovery::*;
 
 pub use userapp::discovery::UserAppDiscoveredIdentity;
 

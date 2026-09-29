@@ -1,6 +1,154 @@
 use super::*;
 use shared_types::AppOperationLease;
 
+#[cfg(all(unix, feature = "deploy-host"))]
+#[tokio::test]
+async fn captured_release_uses_host_root_and_allows_reacquisition() {
+    // A child process keeps environment changes out of concurrent async tests.
+    if std::env::var_os("RCODER_LEASE_ROOT_TEST_CHILD").is_none() {
+        let root = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "runtime::docker_builder_deletion::tests::captured_release_uses_host_root_and_allows_reacquisition", "--nocapture"])
+            .env("RCODER_LEASE_ROOT_TEST_CHILD", "1")
+            .env("RCODER_OPERATION_LOCK_ROOT", root.path())
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let runtime = lease_test_runtime();
+    let context = shared_types::UserAppExecutionContext {
+        app_id: format!("lease{}", uuid::Uuid::new_v4().simple()),
+        lifecycle_id: "life".into(),
+        operation_id: "operation".into(),
+        executor_id: "executor".into(),
+        request_fingerprint: "a".repeat(64),
+    };
+    for (family, prefix) in [
+        (ServiceType::UserappBuilder, "builder"),
+        (ServiceType::Userapp, "prod"),
+    ] {
+        let lease = runtime
+            .acquire_application_file_lease(&context.app_id, &family)
+            .await
+            .unwrap();
+        let receipt = lease.receipt().unwrap();
+        let path =
+            std::path::PathBuf::from(std::env::var_os("RCODER_OPERATION_LOCK_ROOT").unwrap())
+                .join(".app-operation-locks")
+                .join(format!("{prefix}-{}.lock", context.app_id));
+        drop(lease); // death releases the flock, not the durable marker
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+        assert!(
+            runtime
+                .acquire_application_file_lease(&context.app_id, &family)
+                .await
+                .is_err()
+        );
+        runtime
+            .release_captured_file_lease(&context, &receipt)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        runtime
+            .acquire_application_file_lease(&context.app_id, &family)
+            .await
+            .unwrap()
+            .release()
+            .await
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prepared_compute_file_lease_survives_both_crash_windows() {
+    use shared_types::{ComputeLeaseInspection, PreparedComputeLease as _};
+    let dir = tempfile::tempdir().unwrap();
+    let name = "builder-prepared.lock";
+    let path = dir.path().join(name);
+    let prepared = prepare_builder_file(
+        dir.path(),
+        name,
+        shared_types::AppFileMutationMarker::for_operation("attemptone").unwrap(),
+    )
+    .unwrap();
+    let receipt = prepared.receipt().unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    assert_eq!(
+        compute_lease::inspect(&path, ServiceType::UserappBuilder, "attemptone", None).unwrap(),
+        ComputeLeaseInspection::Held
+    );
+    drop(prepared); // acquired, not bound: no dirty marker
+    assert_eq!(
+        compute_lease::inspect(&path, ServiceType::UserappBuilder, "attemptone", None).unwrap(),
+        ComputeLeaseInspection::Absent
+    );
+    let mut prepared = prepare_builder_file(
+        dir.path(),
+        name,
+        shared_types::AppFileMutationMarker::for_operation("attemptone").unwrap(),
+    )
+    .unwrap();
+    prepared.activate().await.unwrap(); // DB bind precedes this call in coordinator
+    drop(prepared); // bound + activated, before Stopping
+    assert_eq!(
+        compute_lease::inspect(
+            &path,
+            ServiceType::UserappBuilder,
+            "attemptone",
+            Some(&receipt)
+        )
+        .unwrap(),
+        ComputeLeaseInspection::Releasable(receipt.clone())
+    );
+    release_file_receipt(&path, &receipt).unwrap();
+    let mut next = prepare_builder_file(
+        dir.path(),
+        name,
+        shared_types::AppFileMutationMarker::for_operation("attempttwo").unwrap(),
+    )
+    .unwrap();
+    next.activate().await.unwrap();
+    drop(next);
+    assert!(matches!(
+        compute_lease::inspect(
+            &path,
+            ServiceType::UserappBuilder,
+            "attemptone",
+            Some(&receipt)
+        )
+        .unwrap(),
+        ComputeLeaseInspection::IdentityChanged(_)
+    ));
+    assert!(release_file_receipt(&path, &receipt).is_err());
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "attempttwo");
+}
+
+#[cfg(all(unix, feature = "deploy-host"))]
+fn lease_test_runtime() -> DockerRuntime {
+    use std::sync::Arc;
+    let (actor, containers) = crate::container_state_actor::ContainerStateActor::new();
+    tokio::spawn(actor.run());
+    DockerRuntime::new(Arc::new(crate::DockerManager {
+        docker: bollard::Docker::connect_with_http(
+            "http://127.0.0.1:9",
+            1,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap(),
+        config: crate::DockerManagerConfig::default(),
+        containers,
+        main_network_name: Arc::new(tokio::sync::RwLock::new("test".into())),
+        api_cache: Arc::new(crate::api_cache::DockerApiCache::new(600, 600, 100)),
+    }))
+}
+
 #[cfg(unix)]
 #[test]
 fn captured_file_release_requires_inactive_original_inode_and_owner() {

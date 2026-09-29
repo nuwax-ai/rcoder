@@ -41,6 +41,7 @@ pub(super) fn builder_identity(
 // docker_builder_control 经 `docker_builder_deletion::builder_identity` 路径
 // 引用，pub(super) 可见性与路径均不变。
 
+mod compute_lease;
 mod endpoint;
 mod file_lease;
 mod ops;
