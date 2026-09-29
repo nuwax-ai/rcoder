@@ -200,8 +200,8 @@ jobs:
           set -euo pipefail
           REV=$(grep -o 'rev = "[0-9a-f]\{40\}"' crates/app-cli/Cargo.toml | head -1 | cut -d'"' -f2)
           [ -n "$REV" ] || { echo "✗ 未在 crates/app-cli/Cargo.toml 找到 pingap-config rev"; exit 1; }
-          VER=$(grep -o 'DEFAULT_PINGAP_VERSION: &str = "[0-9.]*"' crates/app-cli/src/devtool.rs | head -1 | cut -d'"' -f2)
-          [ -n "$VER" ] || { echo "✗ 未在 devtool.rs 找到 DEFAULT_PINGAP_VERSION"; exit 1; }
+          VER=$(grep -rh -o 'DEFAULT_PINGAP_VERSION: &str = "[0-9.]*"' crates/app-cli/src/ | head -1 | cut -d'"' -f2)
+          [ -n "$VER" ] || { echo "✗ 未在 crates/app-cli/src 找到 DEFAULT_PINGAP_VERSION"; exit 1; }
           echo "PINGAP_REV=$REV" >> "$GITHUB_ENV"
           echo "PINGAP_VERSION_EXPECTED=$VER" >> "$GITHUB_ENV"
           echo "pingap rev = $REV, expect version = $VER"
@@ -274,8 +274,8 @@ jobs:
           set -euo pipefail
           REV=$(grep -o 'rev = "[0-9a-f]\{40\}"' crates/app-cli/Cargo.toml | head -1 | cut -d'"' -f2)
           [ -n "$REV" ] || { echo "✗ 未在 crates/app-cli/Cargo.toml 找到 pingap-config rev"; exit 1; }
-          VER=$(grep -o 'DEFAULT_PINGAP_VERSION: &str = "[0-9.]*"' crates/app-cli/src/devtool.rs | head -1 | cut -d'"' -f2)
-          [ -n "$VER" ] || { echo "✗ 未在 devtool.rs 找到 DEFAULT_PINGAP_VERSION"; exit 1; }
+          VER=$(grep -rh -o 'DEFAULT_PINGAP_VERSION: &str = "[0-9.]*"' crates/app-cli/src/ | head -1 | cut -d'"' -f2)
+          [ -n "$VER" ] || { echo "✗ 未在 crates/app-cli/src 找到 DEFAULT_PINGAP_VERSION"; exit 1; }
           echo "PINGAP_REV=$REV" >> "$GITHUB_ENV"
           echo "PINGAP_VERSION_EXPECTED=$VER" >> "$GITHUB_ENV"
 
