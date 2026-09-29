@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "typescript_revision": "02bec84f6e749b523936c5a11bb4e6630b4bde49",
+  "typescript_revision": "cd0f075602c8dec48088cb51e7d612bae1569274",
   "route_sources": [
     "src/routes/*.js",
     "src/server.js"
@@ -306,7 +306,9 @@
         "computer-file-list-empty-directories",
         "computer-file-list-subdirectory",
         "computer-file-list-invalid-type",
-        "computer-file-list-invalid-limit"
+        "computer-file-list-invalid-limit",
+        "computer-file-list-depth-decimal-rejected",
+        "computer-file-list-limit-whitespace-rejected"
       ]
     },
     {
@@ -932,6 +934,7 @@
     "A route is covered only when at least one listed A/B case executes it; all others remain pending.",
     "Revision 9f636bf vs 0cffa11 touched only src/utils (search exclusion + git quoting); route inventory re-verified unchanged (no src/routes or server.js deltas).",
     "Revision 55ac510 (1.5.4) adds get-file-list depth and search-files type params over 104d285/9f636bf; route paths unchanged, new-param cases registered per entry.",
-    "Revision 02bec84 (1.5.5) adds X-File-Size static header (compared as protocol header) and git file-content directory/symlink semantics; new directory cases registered, revert --ignore-unmatch is TS-shell-specific (Rust gix tree-apply immune, covered by unit test)."
+    "Revision 02bec84 (1.5.5) adds X-File-Size static header (compared as protocol header) and git file-content directory/symlink semantics; new directory cases registered, revert --ignore-unmatch is TS-shell-specific (Rust gix tree-apply immune, covered by unit test).",
+    "Revision cd0f075 (1.5.6) tightens limit/depth to strict decimal /^\\d+$/ (no trim) and adds .tmp to search noise; Rust mirrored both plus contract 1.5.6. TS also converged to Rust on outside-root symlink invisibility, status --untracked-files=all, path no-trim, platform-aware leading-separator, rename lstat — corresponding approved rules should retire after the next A/B run confirms."
   ]
 }

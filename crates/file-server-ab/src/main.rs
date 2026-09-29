@@ -2142,6 +2142,20 @@ fn core_scenarios(fixtures: &Path) -> Result<Vec<(&'static str, RequestSpec)>> {
                 "/api/computer/get-file-list?userId={user}&cId={cid}&recursive=false&depth=11"
             )),
         ),
+        // TS cd0f075 (1.5.6) 收紧为 /^\d+$/ 严格十进制: 小数形式与带空白的
+        // 输入两侧都是 400（Rust 曾按旧 Number 语义接受 "3.0"/" 3 "，此为回归锚点）
+        (
+            "computer-file-list-depth-decimal-rejected",
+            get_client_error(format!(
+                "/api/computer/get-file-list?userId={user}&cId={cid}&recursive=false&depth=3.0"
+            )),
+        ),
+        (
+            "computer-file-list-limit-whitespace-rejected",
+            get_client_error(format!(
+                "/api/computer/get-file-list?userId={user}&cId={cid}&limit=%20%203%20"
+            )),
+        ),
         (
             "computer-file-list-depth-ignored-in-recursive",
             get(format!(

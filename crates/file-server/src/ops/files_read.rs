@@ -55,47 +55,59 @@ fn parse_file_list_type(raw: Option<&str>) -> Result<tree::MetaListType, AppErro
     })
 }
 
-fn parse_file_list_limit(raw: Option<&str>) -> Result<Option<usize>, AppError> {
-    match raw {
-        None | Some("") => Ok(None),
-        // TS Number("  ") 为 0；空串本身仍表示未指定。
-        Some(value) if value.trim().is_empty() => Ok(Some(0)),
-        Some(value) => value.trim().parse::<usize>().map(Some).map_err(|_| {
-            AppError::validation_with(
-                "limit 必须为非负整数",
-                json!({ "field": "limit", "value": value }),
-            )
-        }),
-    }
+/// 纯 ASCII 数字串（对齐 TS cd0f075 `/^\d+$/` 严格十进制）：不 trim、不带
+/// 符号、不接受 "3.0"/"0x3"/"1e1"/空白。TS v1.5.4 曾用 `Number()` 宽松解析，
+/// v1.5.6 收紧为本口径。
+fn is_decimal_digit_str(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// depth 归一 (对齐 TS 1.5.4 `Number(depth)` 契约): 仅单层模式 (`!recursive`)
-/// 下解析——`None`/空串 = 不展开 (None)；trim 后十进制数值且整数值域 [1,10] →
-/// 生效；其余 (非数值/小数/越界/纯空白, TS Number 空白=0<1 同样报错) → 400。
-/// 已知刻意分歧: TS `Number` 还接受 "0x3"/"1e1" 这类形式, 我方按十进制拒绝。
-/// 递归模式由调用方跳过本函数 (不校验不生效, 回显 null)。
+/// limit 归一 (对齐 TS cd0f075 `/^\d+$/` 严格十进制): `None`/空串 = 不限；
+/// 仅接受纯数字串 (值域 ≥ 0)；纯空白/带符号/小数形式 → 400 (TS v1.5.4 的
+/// `Number("  ")=0` 宽松行为已在 v1.5.6 移除)。超出 usize 表示范围的超长
+/// 数字串 → 400 (TS parseInt 走 float 不溢出；已知微分歧, 无实际影响)。
+fn parse_file_list_limit(raw: Option<&str>) -> Result<Option<usize>, AppError> {
+    let Some(value) = raw.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let invalid = || {
+        AppError::validation_with(
+            "limit 必须为非负整数",
+            json!({ "field": "limit", "value": value }),
+        )
+    };
+    if !is_decimal_digit_str(value) {
+        return Err(invalid());
+    }
+    value.parse::<usize>().map(Some).map_err(|_| invalid())
+}
+
+/// depth 归一 (对齐 TS cd0f075 `/^\d+$/` 严格十进制): 仅单层模式 (`!recursive`)
+/// 下解析——`None`/空串 = 不展开 (None)；纯数字串且值域 [1,10] → 生效；其余
+/// (trim 后可解析的 " 3 "/"3.0"/"+3"、非数值、纯空白、越界) → 400。
+/// 递归模式跳过校验不生效 (回显 null)。
 fn parse_file_list_depth(recursive: bool, raw: Option<&str>) -> Result<Option<usize>, AppError> {
     if recursive {
         return Ok(None);
     }
-    let Some(value) = raw else {
+    let Some(value) = raw.filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
-    if value.is_empty() {
-        return Ok(None);
-    }
-    let trimmed = value.trim();
     let invalid = || {
         AppError::validation_with(
             "depth 需为 1-10 的整数",
             json!({ "field": "depth", "value": value }),
         )
     };
-    let parsed = trimmed.parse::<f64>().map_err(|_| invalid())?;
-    if parsed.fract() != 0.0 || !(1.0..=10.0).contains(&parsed) {
+    if !is_decimal_digit_str(value) {
         return Err(invalid());
     }
-    Ok(Some(parsed as usize))
+    let parsed = value.parse::<usize>().map_err(|_| invalid())?;
+    if (1..=10).contains(&parsed) {
+        Ok(Some(parsed))
+    } else {
+        Err(invalid())
+    }
 }
 
 #[cfg(test)]
@@ -105,17 +117,18 @@ mod file_list_options_tests {
     use crate::service::tree::MetaListType;
 
     #[test]
-    fn depth_parses_boundaries_and_rejects_invalid_like_ts_number() {
+    fn depth_strict_decimal_contract_aligns_ts_cd0f075() {
         // 缺省/空串 → 不展开
         assert_eq!(parse_file_list_depth(false, None).unwrap(), None);
         assert_eq!(parse_file_list_depth(false, Some("")).unwrap(), None);
-        // 边界 1/10 生效; trim/整数值小数形式 ("3.0") 对齐 TS Number
+        // 边界 1/10 生效
         assert_eq!(parse_file_list_depth(false, Some("1")).unwrap(), Some(1));
         assert_eq!(parse_file_list_depth(false, Some("10")).unwrap(), Some(10));
-        assert_eq!(parse_file_list_depth(false, Some(" 3 ")).unwrap(), Some(3));
-        assert_eq!(parse_file_list_depth(false, Some("3.0")).unwrap(), Some(3));
-        // 越界/非整数/非数值/纯空白 (TS Number("  ")=0<1) 均 400
-        for bad in ["0", "11", "3.5", "abc", "  ", "-1"] {
+        assert_eq!(parse_file_list_depth(false, Some("3")).unwrap(), Some(3));
+        // 严格十进制 (TS cd0f075 /^\d+$/): 不 trim、不带符号、不接受小数/科学/十六进制
+        for bad in [
+            "0", "11", "3.5", "abc", "  ", "-1", " 3 ", "3.0", "+3", "0x3", "1e1",
+        ] {
             let err = parse_file_list_depth(false, Some(bad)).unwrap_err();
             assert!(matches!(err, AppError::Validation(..)), "{bad}: {err:?}");
         }
@@ -145,13 +158,17 @@ mod file_list_options_tests {
         );
         assert!(parse_file_list_type(Some("other")).is_err());
         assert_eq!(parse_file_list_limit(None).unwrap(), None);
+        assert_eq!(parse_file_list_limit(Some("")).unwrap(), None);
         assert_eq!(parse_file_list_limit(Some("0")).unwrap(), Some(0));
         assert_eq!(
             parse_file_list_limit(Some(&usize::MAX.to_string())).unwrap(),
             Some(usize::MAX)
         );
-        assert!(parse_file_list_limit(Some("-1")).is_err());
-        assert!(parse_file_list_limit(Some("1.5")).is_err());
+        // 严格十进制 (TS cd0f075): 纯空白不再是 Number("  ")=0, 与带符号/小数同样 400
+        for bad in ["-1", "1.5", "  ", " 3 ", "+3"] {
+            let err = parse_file_list_limit(Some(bad)).unwrap_err();
+            assert!(matches!(err, AppError::Validation(..)), "{bad}: {err:?}");
+        }
     }
 
     #[test]

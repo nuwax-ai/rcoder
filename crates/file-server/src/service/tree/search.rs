@@ -27,7 +27,7 @@ const MAX_SEARCH_THREADS: usize = 8;
 /// 其下的技能 (SKILL.md) 与配置文件正是搜索要找的目标; 与浏览列表的隐藏口径
 /// (listDirectoryLevel 对点开头条目的整体隐藏) 解耦, 各管各的。
 /// 与 env TRAVERSE_EXCLUDE_DIRS 合并生效: 配置可追加排除项, 不可放行内置噪音项。
-/// (对齐 TS SEARCH_NOISE_DIR_NAMES, nuwax commit 9f636bf)
+/// (对齐 TS SEARCH_NOISE_DIR_NAMES, nuwax commit 9f636bf; ".tmp" 补于 cd0f075)
 const SEARCH_NOISE_DIR_NAMES: &[&str] = &[
     ".git",
     ".svn",
@@ -41,6 +41,7 @@ const SEARCH_NOISE_DIR_NAMES: &[&str] = &[
     ".pytest_cache",
     ".ruff_cache",
     ".cache",
+    ".tmp",
 ];
 
 /// 搜索遍历的文件黑名单: 系统生成的噪音文件 (点开头条目不再整体排除)。
@@ -651,11 +652,12 @@ mod tests {
         // TS 9f636bf: 噪音黑名单 —— .DS_Store 等噪音文件、.venv/__pycache__/.git 等
         // 噪音目录 (含整个子树) 即便关键字命中也不可见。.venv/__pycache__/.cache
         // 不在默认 traverse_exclude_dirs, 只有噪音表能挡住 —— 本测试即锁定该表。
+        // (.tmp 补于 TS cd0f075)
         let tmp = tempfile::tempdir().unwrap();
         tokio::fs::write(tmp.path().join(".DS_Store"), "junk")
             .await
             .unwrap();
-        for noise_dir in [".venv", "__pycache__", ".git"] {
+        for noise_dir in [".venv", "__pycache__", ".git", ".tmp"] {
             tokio::fs::create_dir_all(tmp.path().join(noise_dir))
                 .await
                 .unwrap();
@@ -690,7 +692,8 @@ mod tests {
             !names.iter().any(|n| n.contains(".DS_Store")
                 || n.starts_with(".venv")
                 || n.starts_with("__pycache__")
-                || n.starts_with(".git")),
+                || n.starts_with(".git")
+                || n.starts_with(".tmp")),
             "噪音条目不应出现: {names:?}"
         );
         // kw=store: 唯一含 "store" 的条目是噪音文件 .DS_Store → 结果必须为空
