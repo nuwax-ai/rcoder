@@ -244,8 +244,10 @@ pub(crate) fn core_scenarios(fixtures: &Path) -> Result<Vec<(&'static str, Reque
         (
             "computer-search-relative-path-outside-dir-link",
             {
+                // limit/maxVisit/timeoutMs 为必填 query —— 首跑漏传导致两侧各自
+                // 报 limit 参数错误, 边界检查根本没被打到
                 let mut spec = get_client_error(format!(
-                    "/api/computer/search-files?userId={user}&cId={cid}&kw=hello&relativePath=outside-dir"
+                    "/api/computer/search-files?userId={user}&cId={cid}&kw=hello&limit=10&maxVisit=100&timeoutMs=1000&relativePath=outside-dir"
                 ));
                 spec.normalized_paths.push("/error/message".into());
                 spec
@@ -266,15 +268,22 @@ pub(crate) fn core_scenarios(fixtures: &Path) -> Result<Vec<(&'static str, Reque
         // get-file-meta 经越界目录链接 → 双侧 200 + 单条 error:"illegal path"
         (
             "computer-get-file-meta-outside-dir-link",
-            json_request(
-                Method::POST,
-                "/api/computer/get-file-meta".to_string(),
-                json!({
-                    "userId": user,
-                    "cId": cid,
-                    "filePaths": ["outside-dir/file-server-ab-outside-secret.txt", "sub/nested/hello.txt"]
-                }),
-            )?,
+            {
+                // 两侧容器各自的 fixture 副本创建时间不同, metas[1] 的 mtimeMs
+                // 归一化 (与既有 computer-file-meta 用例同款); 只校验存在性与
+                // 稳定字段, 原始值保留在 bodies 证据里。
+                let mut spec = json_request(
+                    Method::POST,
+                    "/api/computer/get-file-meta".to_string(),
+                    json!({
+                        "userId": user,
+                        "cId": cid,
+                        "filePaths": ["outside-dir/file-server-ab-outside-secret.txt", "sub/nested/hello.txt"]
+                    }),
+                )?;
+                spec.normalized_paths.push("/metas/1/mtimeMs".into());
+                spec
+            },
         ),
         (
             "computer-resolve-file-path-traversal",

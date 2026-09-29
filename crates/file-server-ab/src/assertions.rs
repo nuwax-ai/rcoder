@@ -628,31 +628,26 @@ pub(crate) fn validate_boundary_meta_response(body: &[u8], side: &str) -> Result
             ));
         }
     }
-    // metas[1] 是带首尾空格的文件名；两侧按已批准语义分歧行为不同：
-    // Rust 精确寻址返回完整元数据；TS trim 后报 ENOENT（TS 已知缺陷）。
+    // metas[1] 是带首尾空格的文件名。TS v1.5.6 起路径原样使用不再 trim,
+    // 两侧契约统一为: 精确寻址返回完整元数据 (回显原名、error 缺席、字节 24)。
+    // （旧断言曾接受 TS trim+ENOENT 的"已知缺陷"形态, 已随 TS 修复移除。）
     let spaced = &metas[1];
-    if side == "rust" {
-        let full = spaced
-            .get("path")
-            .and_then(Value::as_str)
-            .is_some_and(|path| path == "  中文文件 .txt  ");
-        let complete = spaced.get("error").is_none()
-            && spaced.get("isDir").and_then(Value::as_bool) == Some(false)
-            && spaced.get("isLink").and_then(Value::as_bool) == Some(false)
-            && spaced.get("size").and_then(Value::as_u64) == Some(24)
-            && spaced
-                .get("mtimeMs")
-                .and_then(Value::as_f64)
-                .is_some_and(|mtime| mtime > 0.0);
-        if !full || !complete {
-            return Err("Rust must resolve the exact spaced file name with full metadata".into());
-        }
-    } else if spaced.get("path").and_then(Value::as_str) != Some("中文文件 .txt")
-        || spaced.get("error").and_then(Value::as_str) != Some("ENOENT")
-    {
-        return Err(
-            "TypeScript is expected to trim the name and report ENOENT (known defect)".into(),
-        );
+    let full = spaced
+        .get("path")
+        .and_then(Value::as_str)
+        .is_some_and(|path| path == "  中文文件 .txt  ");
+    let complete = spaced.get("error").is_none()
+        && spaced.get("isDir").and_then(Value::as_bool) == Some(false)
+        && spaced.get("isLink").and_then(Value::as_bool) == Some(false)
+        && spaced.get("size").and_then(Value::as_u64) == Some(24)
+        && spaced
+            .get("mtimeMs")
+            .and_then(Value::as_f64)
+            .is_some_and(|mtime| mtime > 0.0);
+    if !full || !complete {
+        return Err(format!(
+            "{side} must resolve the exact spaced file name with full metadata"
+        ));
     }
     Ok(())
 }

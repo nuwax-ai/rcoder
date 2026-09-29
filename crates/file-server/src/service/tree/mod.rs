@@ -521,11 +521,21 @@ async fn traverse(
 }
 
 /// 列表可展示根目录内的链接，但不暴露指向所选根之外的链接目标。
+/// 列表条目的链接安全判定 (对齐 TS e822516 escapesRoot): 链接目标 realpath 解析
+/// 后必须落在根内; **悬空链接 (目标不存在, realpath 失败) 按未越界处理照常列出**
+/// —— A/B 实测: 中途删除目标后 TS 列出悬空条目而本实现隐藏, 属语义分歧。
+/// canonicalize 失败的其他形态同样不在边界层隐藏, 交由常规条目流程。
 async fn is_safe_list_link(root: &Path, relative: &str, is_link: bool) -> bool {
-    !is_link
-        || path_safety::ensure_resolved_within(root, relative)
-            .await
-            .is_ok()
+    if !is_link {
+        return true;
+    }
+    match fs::canonicalize(root).await {
+        Ok(resolved_root) => match fs::canonicalize(root.join(relative)).await {
+            Ok(resolved) => resolved.starts_with(&resolved_root),
+            Err(_) => true,
+        },
+        Err(_) => true,
+    }
 }
 
 async fn build_file_entry(
@@ -808,6 +818,40 @@ mod tests {
     }
 
     // ── TS e822516 escapesRoot 对齐: relativePath 指进越界目录链接 ────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_keeps_dangling_in_root_link_visible() {
+        // A/B 实测回归 (2026-09-29): 目标被中途删除后, 悬空的界内链接照常列出
+        // (对齐 TS e822516 escapesRoot 的 realpath 失败=未越界语义), 不因解析
+        // 失败被边界层隐藏。单层/受限展开/递归三种模式一致。
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("real.txt"), "x").unwrap();
+        std::os::unix::fs::symlink("real.txt", tmp.path().join("dangling.txt")).unwrap();
+        std::fs::remove_file(tmp.path().join("real.txt")).unwrap();
+        let cfg = default_test_config();
+        for (recursive, levels) in [(false, 1usize), (false, 2), (true, 1)] {
+            let entries = list_files_meta_filtered(
+                tmp.path(),
+                &cfg,
+                None,
+                None,
+                MetaListOptions {
+                    recursive,
+                    levels_left: levels,
+                    file_type: MetaListType::All,
+                    limit: None,
+                },
+            )
+            .await
+            .unwrap();
+            let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+            assert!(
+                names.iter().any(|n| n == "dangling.txt"),
+                "recursive={recursive} levels={levels}: 悬空链接必须列出: {names:?}"
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]
