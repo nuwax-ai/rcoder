@@ -154,12 +154,13 @@ pub(crate) fn belongs_to_previous_container(scope: &Path, id: &str) -> Result<bo
 /// epoch fallback (see [`previous_container_for_launch`]): monitor's
 /// first-launch classification uses it so unstamped legacy records from a
 /// replaced container stop forcing recovery semantics.
-pub(crate) fn belongs_to_previous_container_for_launch(scope: &Path, id: &str) -> Result<bool> {
+pub(crate) fn belongs_to_previous_container_for_launch(
+    scope: &Path,
+    id: &str,
+    current: Option<&crate::domain::PhysicalDomain>,
+) -> Result<bool> {
     let value = generation(&work_root(scope, id)?)?;
-    Ok(previous_container_for_launch(
-        &value,
-        crate::domain::PhysicalDomain::from_env()?.as_ref(),
-    ))
+    Ok(previous_container_for_launch(&value, current))
 }
 
 fn previous_container(value: &Generation, current: Option<&crate::domain::PhysicalDomain>) -> bool {
@@ -170,10 +171,12 @@ fn previous_container(value: &Generation, current: Option<&crate::domain::Physic
 }
 
 /// 启动期跨容器分类（monitor 首启判定专用）：在 [`previous_container`] 的
-/// 域印章判定之上，对无印章记录以进程纪元兜底——K8s 上早于
+/// 域印章判定之上，对无印章记录或同一物理域以进程纪元兜底——K8s 上早于
 /// RCODER_EXECUTION_DOMAIN 注入的存量 Deployment 写下的记录都带 pid1 纪元，
 /// 纪元不同即证明记录属于另一容器的进程空间。缺此兜底时无印章记录一律
 /// 保守判为本容器残留 → 恢复语义剥掉一次性部署声明 → K8s 冷部署稳态卡死。
+/// 同一 Pod UID 下重启容器也会更换 pid1 纪元；不同 authority/volume 的印章
+/// 则不能被本地纪元覆盖。
 ///
 /// 退役路径（reconcile/verify_local_quiescent）必须继续用纯印章的
 /// [`previous_container`]：无印章即 native 场景，epoch 本身就是身份、允许
@@ -184,6 +187,11 @@ fn previous_container_for_launch(
 ) -> bool {
     if previous_container(value, current) {
         return true;
+    }
+    // An epoch is local process-space evidence, never authority over another
+    // stamped volume/cluster. It also covers a restart inside the SAME Pod UID.
+    if !process_space_ended_with(value, current) {
+        return false;
     }
     let (Some(recorded), Some(now)) = (value.process_epoch.as_deref(), crate::epoch::current())
     else {
@@ -201,32 +209,62 @@ pub(crate) fn current_container_work_exists_with(
     scope: &Path,
     current: Option<&crate::domain::PhysicalDomain>,
 ) -> bool {
+    work_history_for_launch(scope, current) == LaunchHistory::CurrentOrUnknown
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchHistory {
+    Empty,
+    PreviousContainerOnly,
+    CurrentOrUnknown,
+}
+
+/// Inspect all receipts: discovery can lag generation creation after a crash.
+/// Empty history is not proof that a pending control belongs to an old container.
+pub(crate) fn work_history_for_launch(
+    scope: &Path,
+    current: Option<&crate::domain::PhysicalDomain>,
+) -> LaunchHistory {
     let entries = match std::fs::read_dir(scope.join("work")) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return LaunchHistory::Empty,
         Err(error) => {
             tracing::warn!(%error, "work directory unreadable; assuming local work exists");
-            return true;
+            return LaunchHistory::CurrentOrUnknown;
         }
     };
-    for entry in entries.flatten() {
+    let mut history = LaunchHistory::Empty;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, "work entry unreadable; assuming local work exists");
+                return LaunchHistory::CurrentOrUnknown;
+            }
+        };
         let root = entry.path();
-        if !root.join("generation.json").try_exists().unwrap_or(false) {
-            continue; // legacy adapter owns legacy receipts
+        match root.join("generation.json").try_exists() {
+            Ok(false) => continue, // legacy adapter owns legacy receipts
+            Ok(true) => {}
+            Err(error) => {
+                tracing::warn!(%error, "generation path unreadable; assuming local work exists");
+                return LaunchHistory::CurrentOrUnknown;
+            }
         }
         match generation(&root) {
             Ok(value) => {
                 if !previous_container_for_launch(&value, current) {
-                    return true;
+                    return LaunchHistory::CurrentOrUnknown;
                 }
+                history = LaunchHistory::PreviousContainerOnly;
             }
             Err(error) => {
                 tracing::warn!(%error, "unreadable generation record; assuming local work exists");
-                return true;
+                return LaunchHistory::CurrentOrUnknown;
             }
         }
     }
-    false
+    history
 }
 
 pub fn verify_live(scope: &Path, supervisor: &str, id: &str) -> Result<()> {
@@ -350,29 +388,7 @@ fn process_space_ended_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 进程级 epoch 覆盖的互斥锁：覆盖是全局的，持锁期间其他依赖
-    /// `epoch::current()` 判定的测试不得并发运行（测试进程内 nextest 并行）。
-    static EPOCH_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct EpochGuard(Option<std::sync::MutexGuard<'static, ()>>);
-    impl EpochGuard {
-        fn new(value: Option<String>) -> Self {
-            let lock = EPOCH_OVERRIDE_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            crate::epoch::set_epoch_for_tests(value);
-            Self(Some(lock))
-        }
-    }
-    impl Drop for EpochGuard {
-        fn drop(&mut self) {
-            // 先清覆盖再放锁：放锁后下一个测试可立即设置自己的覆盖，
-            // 若此刻才清零会误清后者（nextest 并行测试竞态）。
-            crate::epoch::set_epoch_for_tests(None);
-            self.0.take();
-        }
-    }
+    use crate::epoch::EpochGuard;
 
     /// Minimal stuck-generation scope: Running, no cleanup receipts, a live
     /// command record and an initialized admission gate.
@@ -487,6 +503,42 @@ mod tests {
     }
 
     #[test]
+    fn launch_epoch_does_not_override_conflicting_domain() {
+        let _guard = EpochGuard::new(Some(
+            "pid1:11111111-1111-4111-8111-111111111111:9000".into(),
+        ));
+        let (temp, _) = stuck_scope(
+            Some(domain_fixture("pod-same")),
+            Some("pid1:11111111-1111-4111-8111-111111111111:100".into()),
+        );
+        for current in [
+            None,
+            Some(crate::domain::PhysicalDomain {
+                authority: "another-cluster".into(),
+                ..domain_fixture("pod-same")
+            }),
+            Some(crate::domain::PhysicalDomain {
+                volume: "another-volume".into(),
+                ..domain_fixture("pod-same")
+            }),
+        ] {
+            assert!(
+                current_container_work_exists_with(temp.path(), current.as_ref()),
+                "an unrelated local epoch cannot override a stamped domain: {current:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn epoch_guard_restores_platform_reader() {
+        {
+            let _guard = EpochGuard::new(None);
+            assert!(crate::epoch::current().is_none());
+        }
+        assert!(crate::epoch::current().is_some());
+    }
+
+    #[test]
     fn no_work_directory_is_not_local_work() {
         let temp = tempfile::tempdir().unwrap();
         assert!(!current_container_work_exists_with(
@@ -531,7 +583,7 @@ mod tests {
 
     #[test]
     fn process_epoch_change_retires_only_local_generations_and_preserves_outcomes() {
-        // One sequential test: the epoch override is process-global.
+        // Each guard overrides only this synchronous test thread.
         // (a) native scope, epoch changed → retired, business record untouched.
         let (_temp, id) = stuck_scope(
             None,

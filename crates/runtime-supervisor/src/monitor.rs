@@ -136,7 +136,11 @@ impl Owner {
             "execution generation changed"
         );
         record::reconcile(&self.root)?;
-        detach_previous_container_control(&self.root, &mut discovery)?;
+        detach_previous_container_control(
+            &self.root,
+            &mut discovery,
+            crate::domain::PhysicalDomain::from_env()?.as_ref(),
+        )?;
         if let Some(id) = &discovery.snapshot.operation_id {
             for (original, snapshot) in &mut discovery.requests {
                 if &original.request_id == id {
@@ -242,16 +246,11 @@ impl Owner {
             resource: self.root.clone(),
         });
         let (mut old, rebuilt) = self.load_discovery(&binding)?;
+        let current = crate::domain::PhysicalDomain::from_env()
+            .context("read execution domain before supervisor launch")?;
         if let Some(old) = &mut old {
-            detach_previous_container_control(&self.root, old)?;
+            detach_previous_container_control(&self.root, old, current.as_ref())?;
         }
-        let current = match crate::domain::PhysicalDomain::from_env() {
-            Ok(domain) => domain,
-            Err(error) => {
-                tracing::warn!(%error, "execution domain unreadable; first launch keeps recovery semantics");
-                None
-            }
-        };
         let recovery_launch = initial_recovery_launch(&self.root, old.as_ref(), current.as_ref());
         // Resume an accepted control after parent death. Explicit launch after
         // a completed shutdown starts a new session; it cannot discard a Stop
@@ -388,11 +387,11 @@ fn inactive_discovery(binding: control::Binding) -> Discovery {
 
 /// First-launch recovery classification, container-scoped. Records that belong
 /// to a previous container were reset by [`detach_previous_container_control`]
-/// before this runs: those processes died with the container, so the first
-/// launch here is an explicit platform launch and one-shot deployment inputs
-/// redeclared in the environment are fresh intent, not a replay. Leftovers
-/// from THIS container (owner crash, in-place container restart) keep
-/// recovery semantics and never replay those inputs.
+/// before this runs. The first launch in the replacement domain uses the fresh
+/// platform deployment inputs; classifying history is not a receipt that the
+/// other domain exited. Local process-space leftovers
+/// from THIS process space (owner crash with unchanged PID 1) keep recovery
+/// semantics. A container restart with a new PID 1 is a fresh platform launch.
 fn initial_recovery_launch(
     root: &Path,
     old: Option<&Discovery>,
@@ -407,14 +406,24 @@ fn initial_recovery_launch(
 /// A control request targets one container's captured process tree. Preserve
 /// its unknown result as history, but never replay an old Shutdown or let its
 /// pending operation occupy the replacement container's management slot.
-fn detach_previous_container_control(root: &Path, discovery: &mut Discovery) -> Result<()> {
-    let Some(id) = discovery.snapshot.generation.as_deref() else {
-        return Ok(());
-    };
+fn detach_previous_container_control(
+    root: &Path,
+    discovery: &mut Discovery,
+    current: Option<&crate::domain::PhysicalDomain>,
+) -> Result<()> {
     // Launch-time classification (epoch fallback included): only the boot
     // decision treats unstamped legacy records from a replaced container as
     // previous-container history; retirement keeps the stamp-only predicate.
-    if !record::belongs_to_previous_container_for_launch(root, id)? {
+    if let Some(id) = discovery.snapshot.generation.as_deref()
+        && !record::belongs_to_previous_container_for_launch(root, id, current)?
+    {
+        return Ok(());
+    }
+    // The supervisor can die before persisting its generation ID, or after
+    // creating another receipt. Only detach when ALL recorded work is old.
+    if record::work_history_for_launch(root, current)
+        != record::LaunchHistory::PreviousContainerOnly
+    {
         return Ok(());
     }
     for (_, snapshot) in &mut discovery.requests {
@@ -999,30 +1008,12 @@ mod tests {
         assert!(!initial_recovery_launch(dir.path(), Some(&discovery), None));
     }
 
-    /// belongs_to_previous_container 经 from_env 解析当前容器身份；测试用
-    /// env 守卫注入（nextest 每用例独立进程，无并发污染）。
-    struct DomainGuard;
-    impl DomainGuard {
-        #[allow(unsafe_code)]
-        fn new(instance: &str) -> Self {
-            unsafe {
-                std::env::set_var(
-                    crate::domain::DOMAIN_ENV,
-                    "{\"authority\":\"k8s\",\"volume\":\"workspace-pvc\",\"instance\":\"\",\
-                     \"instance_source_env\":\"RCODER_PHYSICAL_POD_UID\"}",
-                );
-                std::env::set_var("RCODER_PHYSICAL_POD_UID", instance);
-            }
-            Self
-        }
-    }
-    impl Drop for DomainGuard {
-        #[allow(unsafe_code)]
-        fn drop(&mut self) {
-            unsafe {
-                std::env::remove_var(crate::domain::DOMAIN_ENV);
-                std::env::remove_var("RCODER_PHYSICAL_POD_UID");
-            }
+    fn domain(instance: &str) -> crate::domain::PhysicalDomain {
+        crate::domain::PhysicalDomain {
+            authority: "k8s".into(),
+            instance_source_env: Some("RCODER_PHYSICAL_POD_UID".into()),
+            instance: instance.into(),
+            volume: "workspace-pvc".into(),
         }
     }
 
@@ -1030,7 +1021,7 @@ mod tests {
     fn replaced_container_leftovers_classify_as_explicit_launch() {
         // 事故复现：上一容器死在 phase=Running，work 记录属于上一容器。
         // detach 归零后首启是显式平台启动——不得剥离部署声明 env。
-        let _guard = DomainGuard::new("pod-new");
+        let current = domain("pod-new");
         let dir = tempfile::tempdir().unwrap();
         let previous = crate::domain::PhysicalDomain {
             authority: "k8s".into(),
@@ -1046,7 +1037,7 @@ mod tests {
         let mut discovery = inactive_discovery(binding);
         discovery.snapshot.phase = Phase::Ready;
         discovery.snapshot.generation = Some(id);
-        detach_previous_container_control(dir.path(), &mut discovery).unwrap();
+        detach_previous_container_control(dir.path(), &mut discovery, Some(&current)).unwrap();
         assert_eq!(discovery.snapshot.phase, Phase::Stopped);
         assert!(!initial_recovery_launch(
             dir.path(),
@@ -1061,10 +1052,9 @@ mod tests {
     }
 
     #[test]
-    fn same_pod_restart_keeps_recovery_launch() {
-        // 同 Pod 容器重启：domain instance 未变，detach 不归零，保持恢复语义
-        // （防一次性部署输入随 kubelet 重启重放）。
-        let _guard = DomainGuard::new("pod-same");
+    fn same_pod_without_epoch_keeps_recovery_launch() {
+        // Same Pod UID alone cannot distinguish owner restart from container
+        // restart. Missing epoch evidence must not authorize a fresh launch.
         let dir = tempfile::tempdir().unwrap();
         let same = crate::domain::PhysicalDomain {
             authority: "k8s".into(),
@@ -1080,12 +1070,113 @@ mod tests {
         let mut discovery = inactive_discovery(binding);
         discovery.snapshot.phase = Phase::Ready;
         discovery.snapshot.generation = Some(id);
-        detach_previous_container_control(dir.path(), &mut discovery).unwrap();
+        detach_previous_container_control(dir.path(), &mut discovery, Some(&same)).unwrap();
         assert_eq!(discovery.snapshot.phase, Phase::Ready);
         assert!(initial_recovery_launch(
             dir.path(),
             Some(&discovery),
             Some(&same)
         ));
+    }
+
+    #[test]
+    fn discovery_without_generation_uses_remaining_launch_evidence() {
+        let current = domain("pod-new");
+        let dir = tempfile::tempdir().unwrap();
+        let previous = crate::domain::PhysicalDomain {
+            authority: "k8s".into(),
+            instance_source_env: Some("RCODER_PHYSICAL_POD_UID".into()),
+            instance: "pod-old".into(),
+            volume: "workspace-pvc".into(),
+        };
+        work_generation(dir.path(), Some(previous));
+        for phase in [Phase::Reconciling, Phase::RecoveryRequired] {
+            let mut discovery = inactive_discovery(control::Binding {
+                component: "app-cli".into(),
+                resource: dir.path().to_owned(),
+            });
+            discovery.snapshot.phase = phase;
+            discovery.snapshot.intent = Intent::Shutdown;
+            discovery.snapshot.operation_id = Some("interrupted-control".into());
+            detach_previous_container_control(dir.path(), &mut discovery, Some(&current)).unwrap();
+            assert!(!initial_recovery_launch(dir.path(), Some(&discovery), None));
+            assert_eq!(discovery.snapshot.operation_id, None);
+            assert_eq!(discovery.snapshot.intent, Intent::Run);
+        }
+    }
+
+    #[test]
+    fn previous_discovery_must_not_hide_a_current_orphan_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = domain("pod-new");
+        let previous = crate::domain::PhysicalDomain {
+            instance: "pod-old".into(),
+            ..current.clone()
+        };
+        let id = work_generation(dir.path(), Some(previous));
+        work_generation(dir.path(), Some(current.clone()));
+        let mut discovery = inactive_discovery(control::Binding {
+            component: "app-cli".into(),
+            resource: dir.path().to_owned(),
+        });
+        discovery.snapshot.phase = Phase::RecoveryRequired;
+        discovery.snapshot.generation = Some(id);
+        detach_previous_container_control(dir.path(), &mut discovery, Some(&current)).unwrap();
+        assert!(initial_recovery_launch(
+            dir.path(),
+            Some(&discovery),
+            Some(&current)
+        ));
+    }
+
+    #[test]
+    fn boot_classification_matches_record_evidence() {
+        let now = "pid1:11111111-1111-4111-8111-111111111111:9000";
+        let before = "pid1:11111111-1111-4111-8111-111111111111:100";
+        let _guard = crate::epoch::EpochGuard::new(Some(now.into()));
+        let current = domain("pod-same");
+        for (previous, epoch, recovery) in [
+            (None, Some(before), false), // legacy app Deployment, replaced PID 1
+            (None, Some(now), true),     // owner restarted, same PID 1
+            (None, Some("legacy:100"), true),
+            (None, None, true),
+            (Some(current.clone()), Some(before), false), // same Pod, new container
+            (Some(current.clone()), Some(now), true),
+            (Some(domain("pod-old")), Some(now), false), // stamp wins over equal epoch
+            (Some(domain("pod-old")), None, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let owner = Owner::try_acquire(dir.path()).unwrap().unwrap();
+            let id = work_generation(dir.path(), previous);
+            let work = record::work_root(dir.path(), &id).unwrap();
+            let mut generation = record::generation(&work).unwrap();
+            generation.process_epoch = epoch.map(str::to_owned);
+            record::save(&work.join("generation.json"), &generation).unwrap();
+            let binding = control::Binding {
+                component: "app-cli".into(),
+                resource: owner.root.clone(),
+            };
+            let mut discovery = inactive_discovery(binding.clone());
+            discovery.snapshot.phase = Phase::RecoveryRequired;
+            discovery.snapshot.intent = Intent::Run;
+            discovery.snapshot.generation = Some(id);
+            record::save(&dir.path().join("supervisor.json"), &discovery).unwrap();
+            let (loaded, rebuilt) = owner.load_discovery(&binding).unwrap();
+            assert!(!rebuilt);
+            let mut loaded = loaded.unwrap();
+            detach_previous_container_control(dir.path(), &mut loaded, Some(&current)).unwrap();
+            assert_eq!(
+                initial_recovery_launch(dir.path(), Some(&loaded), Some(&current)),
+                recovery
+            );
+            assert_eq!(
+                initial_recovery_launch(dir.path(), None, Some(&current)),
+                recovery
+            );
+            // A completed user Stop keeps its business intent even after replacement.
+            discovery.snapshot.intent = Intent::Stopped;
+            detach_previous_container_control(dir.path(), &mut discovery, Some(&current)).unwrap();
+            assert_eq!(discovery.snapshot.intent, Intent::Stopped);
+        }
     }
 }

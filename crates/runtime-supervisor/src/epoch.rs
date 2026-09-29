@@ -5,9 +5,6 @@
 //! the whole PID namespace. It never proves anything about processes in
 //! OTHER containers or pods — callers must scope it accordingly.
 
-#[cfg(any(test, feature = "test-support"))]
-use std::sync::OnceLock;
-
 /// Process-space identity, or `None` when no reliable evidence is available.
 /// Wall-clock time is deliberately excluded: clock corrections do not kill
 /// processes and therefore cannot authorize retirement.
@@ -113,40 +110,47 @@ fn platform_epoch() -> Option<String> {
     None
 }
 
-#[cfg(any(test, feature = "test-support"))]
-type TestOverride = OnceLock<std::sync::Mutex<Option<(u32, Option<String>)>>>;
-
-#[cfg(any(test, feature = "test-support"))]
-static TEST_OVERRIDE: TestOverride = OnceLock::new();
-
-/// Test seam: force the epoch observed by `current()`. Only affects the
-/// calling process, so cross-process contract tests still exercise the real
-/// platform reading.
-#[cfg(any(test, feature = "test-support"))]
-#[cfg_attr(not(test), allow(dead_code))] // seam referenced only from tests/binaries
-pub(crate) fn set_epoch_for_tests(value: Option<String>) {
-    let slot = TEST_OVERRIDE.get_or_init(|| std::sync::Mutex::new(None));
-    let mut guard = slot
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = Some((std::process::id(), value));
+#[cfg(test)]
+thread_local! {
+    // Synchronous unit tests must not override another test's platform reads.
+    // Outer None = real platform; inner None = simulated unavailable evidence.
+    static TEST_OVERRIDE: std::cell::RefCell<Option<(u32, Option<String>)>> = const {
+        std::cell::RefCell::new(None)
+    };
 }
 
-#[cfg(any(test, feature = "test-support"))]
-fn test_override() -> Option<Option<String>> {
-    let slot = TEST_OVERRIDE.get_or_init(|| std::sync::Mutex::new(None));
-    let guard = slot
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match guard.as_ref() {
-        // nextest runs tests in separate processes; the pid pin keeps an
-        // override from leaking across a forked child in other harnesses.
-        Some((pid, value)) if *pid == std::process::id() => Some(value.clone()),
-        _ => None,
+/// Scoped to the calling test thread, including nested overrides. Not Send:
+/// dropping on a different thread would fail to restore the original reader.
+#[cfg(test)]
+pub(crate) struct EpochGuard {
+    previous: Option<(u32, Option<String>)>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+#[cfg(test)]
+impl EpochGuard {
+    pub(crate) fn new(value: Option<String>) -> Self {
+        Self {
+            previous: TEST_OVERRIDE.replace(Some((std::process::id(), value))),
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+}
+#[cfg(test)]
+impl Drop for EpochGuard {
+    fn drop(&mut self) {
+        TEST_OVERRIDE.set(self.previous.take());
     }
 }
 
-#[cfg(not(any(test, feature = "test-support")))]
+#[cfg(test)]
+fn test_override() -> Option<Option<String>> {
+    TEST_OVERRIDE.with_borrow(|slot| match slot {
+        Some((pid, value)) if *pid == std::process::id() => Some(value.clone()),
+        _ => None,
+    })
+}
+
+#[cfg(not(test))]
 fn test_override() -> Option<Option<String>> {
     None
 }
@@ -154,6 +158,23 @@ fn test_override() -> Option<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epoch_override_is_nested_and_thread_local() {
+        assert!(test_override().is_none());
+        {
+            let _outer = EpochGuard::new(Some("test-epoch".into()));
+            {
+                let _inner = EpochGuard::new(None);
+                assert!(current().is_none());
+            }
+            assert_eq!(current().as_deref(), Some("test-epoch"));
+            std::thread::spawn(|| assert!(test_override().is_none()))
+                .join()
+                .unwrap();
+        }
+        assert!(test_override().is_none());
+    }
 
     #[test]
     fn only_valid_process_space_evidence_authorizes_retirement() {

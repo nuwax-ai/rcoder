@@ -115,6 +115,107 @@ mod conditional_tests {
     }
 
     #[tokio::test]
+    async fn app_execution_domain_matches_rendered_pvc_and_mounts() {
+        use runtime_supervisor::domain::{DOMAIN_ENV, PhysicalDomain};
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let config = kube::Config::new("http://127.0.0.1:1".parse().unwrap());
+        let runtime = runtime(kube::Client::try_from(config).unwrap());
+        let mut params = ContainerCreateParams::builder()
+            .project_id("197")
+            .service_type(ServiceType::Userapp)
+            .build();
+        params.image_override = Some("test-runtime:first".into());
+        params.env = Some(std::collections::HashMap::from([
+            (DOMAIN_ENV.into(), "must-not-override-platform".into()),
+            (
+                "RCODER_PHYSICAL_POD_UID".into(),
+                "must-not-override-downward-api".into(),
+            ),
+        ]));
+        let deployment = runtime.build_app_deployment("197", &params).unwrap();
+        let spec = deployment.spec.unwrap();
+        assert_eq!(spec.strategy.unwrap().type_.as_deref(), Some("Recreate"));
+        let pod = spec.template.spec.unwrap();
+        let app = &pod.containers[0];
+        let env = app.env.as_ref().unwrap();
+        assert_eq!(env.iter().filter(|v| v.name == DOMAIN_ENV).count(), 1);
+        assert_eq!(
+            env.iter()
+                .filter(|v| v.name == "RCODER_PHYSICAL_POD_UID")
+                .count(),
+            1
+        );
+        let encoded = env
+            .iter()
+            .find(|v| v.name == DOMAIN_ENV)
+            .unwrap()
+            .value
+            .as_ref()
+            .unwrap();
+        let domain: PhysicalDomain = serde_json::from_str(encoded).unwrap();
+        assert_eq!(domain.authority, runtime.config.execution_authority);
+        assert!(domain.instance.is_empty());
+        assert_eq!(
+            domain.instance_source_env.as_deref(),
+            Some("RCODER_PHYSICAL_POD_UID")
+        );
+        let uid = env
+            .iter()
+            .find(|v| v.name == "RCODER_PHYSICAL_POD_UID")
+            .unwrap();
+        assert_eq!(
+            uid.value_from
+                .as_ref()
+                .unwrap()
+                .field_ref
+                .as_ref()
+                .unwrap()
+                .field_path,
+            "metadata.uid"
+        );
+        let mounts = app.volume_mounts.as_ref().unwrap();
+        assert_eq!(mounts.len(), 4);
+        let pvc = pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| mounts.iter().all(|m| m.name == v.name))
+            .unwrap()
+            .persistent_volume_claim
+            .as_ref()
+            .unwrap();
+        let views = mounts
+            .iter()
+            .map(|m| (m.sub_path.clone().unwrap(), m.mount_path.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            *encoded,
+            super::super::super::k8s_native_domain::app_domain_env(
+                &runtime.config.execution_authority,
+                &pvc.claim_name,
+                &views
+            )
+        );
+        // Changing deployment inputs must not change the stable physical-volume domain.
+        params.image_override = Some("test-runtime:second".into());
+        params.env = None;
+        let next = runtime.build_app_deployment("197", &params).unwrap();
+        let next_env = &next.spec.unwrap().template.spec.unwrap().containers[0].env;
+        assert_eq!(
+            next_env
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|v| v.name == DOMAIN_ENV)
+                .unwrap()
+                .value
+                .as_ref(),
+            Some(encoded)
+        );
+    }
+
+    #[tokio::test]
     async fn owned_pvc_create_echoes_identity_and_validates_competing_winner() {
         use crate::runtime::k8s_pvc::K8sPvcOps as _;
         tokio::time::timeout(std::time::Duration::from_secs(12), async {

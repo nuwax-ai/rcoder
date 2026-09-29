@@ -47,7 +47,7 @@ pub(crate) fn builder_domain_env(authority: &str, pvc: &str, mounts: &[VolumeMou
 
 /// The app-runtime execution-domain env value. Same identity rules as
 /// [`builder_domain_env`] on the app Deployment's flat four-subPath mounts
-/// (`app_flat_volume_mounts`); SSA re-apply converges existing Deployments.
+/// (`app_flat_volume_mounts`); conditional replacement updates existing Deployments.
 pub(crate) fn app_domain_env(authority: &str, pvc: &str, views: &[(String, String)]) -> String {
     let mut sorted: Vec<(&str, &str)> = views
         .iter()

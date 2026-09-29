@@ -83,7 +83,7 @@ impl KubernetesRuntime {
             // 执行域身份（builder 同款）：instance 由上方 fieldRef 在 Pod 内解析，
             // volume 绑定 per-app 工作区 PVC 与压平挂载视图。缺此声明时 app-cli
             // 无法把 PVC 上的跨容器监督状态判为"前容器残留"→ 误判恢复式启动 →
-            // 冷部署声明被剥（K8s 冷部署卡死的根因）。SSA re-apply 收敛存量。
+            // 冷部署声明被剥（K8s 冷部署卡死的根因）。条件 replace 收敛存量。
             EnvVar {
                 name: runtime_supervisor::domain::DOMAIN_ENV.to_string(),
                 value: Some(super::super::k8s_native_domain::app_domain_env(

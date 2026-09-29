@@ -7,18 +7,19 @@ async fn status(root: &Path) -> Result<Snapshot> {
     control(root, Request::new(Action::Status)).await
 }
 async fn until(root: &Path, predicate: impl Fn(&Snapshot) -> bool) -> Result<Snapshot> {
+    let mut last = String::from("no observation");
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if let Ok(value) = status(root).await
-                && predicate(&value)
-            {
-                return value;
+            match status(root).await {
+                Ok(value) if predicate(&value) => return value,
+                Ok(value) => last = format!("{value:?}"),
+                Err(error) => last = format!("{error:#}"),
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .context("supervisor did not reach expected state")
+    .with_context(|| format!("supervisor did not reach expected state; last observation: {last}"))
 }
 fn start(root: &Path) -> Result<tokio::process::Child> {
     Ok(
@@ -101,7 +102,7 @@ async fn replacement_container_does_not_replay_stale_shutdown_or_block_new_stop(
     current.instance = "replacement-container".into();
     let mut owner = tokio::process::Command::new(env!("CARGO_BIN_EXE_supervision-fixture"))
         .arg(&root)
-        .env("SUPERVISION_FIXTURE_ONE_SHOT", "old-deployment")
+        .env("SUPERVISION_FIXTURE_ONE_SHOT", "fresh-platform-deployment")
         .env(
             runtime_supervisor::domain::DOMAIN_ENV,
             serde_json::to_string(&current).unwrap(),
@@ -112,8 +113,8 @@ async fn replacement_container_does_not_replay_stale_shutdown_or_block_new_stop(
         let ready = until(&root, |s| s.phase == Phase::Ready).await?;
         let address = leaf(&root).await?;
         ensure!(
-            std::fs::read_to_string(root.join("one-shot-env-present"))? == "false",
-            "replacement replayed one-shot deployment input"
+            std::fs::read_to_string(root.join("one-shot-env-present"))? == "true",
+            "replacement stripped the fresh platform deployment input"
         );
         ensure!(
             ready.operation_id.is_none(),
@@ -146,6 +147,78 @@ async fn replacement_container_does_not_replay_stale_shutdown_or_block_new_stop(
     }
     .await;
     shutdown(&root, &mut owner).await;
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn pod_uid_stamp_is_persisted_and_used_by_the_next_launch() {
+    use runtime_supervisor::{Phase, domain::DOMAIN_ENV};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let domain = serde_json::json!({
+        "authority":"test-runtime", "volume":"workspace-volume", "instance":"",
+        "instance_source_env":"RCODER_PHYSICAL_POD_UID"
+    })
+    .to_string();
+    let spawn = |uid: &str| {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_supervision-fixture"))
+            .arg(root)
+            .env(DOMAIN_ENV, &domain)
+            .env("RCODER_PHYSICAL_POD_UID", uid)
+            .env("SUPERVISION_FIXTURE_ONE_SHOT", "fresh-deployment")
+            .spawn()
+            .unwrap()
+    };
+    let mut first = spawn("pod-first");
+    let result = async {
+        let ready = until(root, |s| s.phase == Phase::Ready).await?;
+        let receipt: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            root.join("work")
+                .join(ready.generation.context("generation missing")?)
+                .join("generation.json"),
+        )?)?;
+        ensure!(
+            receipt["physical_domain"]["instance"] == "pod-first",
+            "stamp not resolved"
+        );
+        ensure!(
+            receipt["physical_domain"]["instance_source_env"] == "RCODER_PHYSICAL_POD_UID",
+            "source lost"
+        );
+        ensure!(receipt["process_epoch"].is_string(), "epoch not persisted");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    shutdown(root, &mut first).await;
+    result.unwrap();
+    // Simulate interrupted discovery, using a real persisted worker receipt.
+    // Both launches run on this host with the same epoch: only the Pod stamp
+    // can classify the previous generation as belonging to another container.
+    let path = root.join("supervisor.json");
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    saved["snapshot"]["phase"] = serde_json::json!(Phase::RecoveryRequired);
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let mut second = spawn("pod-second");
+    let result = async {
+        let ready = until(root, |s| s.phase == Phase::Ready).await?;
+        ensure!(
+            std::fs::read_to_string(root.join("one-shot-env-present"))? == "true",
+            "next Pod lost its fresh deployment declaration"
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            root.join("work")
+                .join(ready.generation.context("generation missing")?)
+                .join("generation.json"),
+        )?)?;
+        ensure!(
+            receipt["physical_domain"]["instance"] == "pod-second",
+            "stale Pod stamp"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    shutdown(root, &mut second).await;
     result.unwrap();
 }
 
