@@ -150,6 +150,18 @@ pub(crate) fn belongs_to_previous_container(scope: &Path, id: &str) -> Result<bo
     ))
 }
 
+/// Launch-time variant of [`belongs_to_previous_container`] with the process
+/// epoch fallback (see [`previous_container_for_launch`]): monitor's
+/// first-launch classification uses it so unstamped legacy records from a
+/// replaced container stop forcing recovery semantics.
+pub(crate) fn belongs_to_previous_container_for_launch(scope: &Path, id: &str) -> Result<bool> {
+    let value = generation(&work_root(scope, id)?)?;
+    Ok(previous_container_for_launch(
+        &value,
+        crate::domain::PhysicalDomain::from_env()?.as_ref(),
+    ))
+}
+
 fn previous_container(value: &Generation, current: Option<&crate::domain::PhysicalDomain>) -> bool {
     matches!((value.physical_domain.as_ref(), current), (Some(old), Some(current))
         if old.authority == current.authority
@@ -157,10 +169,34 @@ fn previous_container(value: &Generation, current: Option<&crate::domain::Physic
             && old.instance != current.instance)
 }
 
+/// 启动期跨容器分类（monitor 首启判定专用）：在 [`previous_container`] 的
+/// 域印章判定之上，对无印章记录以进程纪元兜底——K8s 上早于
+/// RCODER_EXECUTION_DOMAIN 注入的存量 Deployment 写下的记录都带 pid1 纪元，
+/// 纪元不同即证明记录属于另一容器的进程空间。缺此兜底时无印章记录一律
+/// 保守判为本容器残留 → 恢复语义剥掉一次性部署声明 → K8s 冷部署稳态卡死。
+///
+/// 退役路径（reconcile/verify_local_quiescent）必须继续用纯印章的
+/// [`previous_container`]：无印章即 native 场景，epoch 本身就是身份、允许
+/// 本地退役；盖章的外容器历史归平台退役，本地 epoch 永远不得染指。
+fn previous_container_for_launch(
+    value: &Generation,
+    current: Option<&crate::domain::PhysicalDomain>,
+) -> bool {
+    if previous_container(value, current) {
+        return true;
+    }
+    let (Some(recorded), Some(now)) = (value.process_epoch.as_deref(), crate::epoch::current())
+    else {
+        return false;
+    };
+    crate::epoch::proves_replacement(recorded, &now)
+}
+
 /// Whether any recorded worker generation ran in the current container.
-/// Only generations stamped by a previous container are excluded; a missing
-/// domain stamp or unreadable evidence counts as current, so uncertainty
-/// keeps recovery semantics instead of authorizing a fresh launch.
+/// Generations stamped by a previous container are excluded by domain stamp
+/// or, for unstamped legacy records, by process epoch; a record with neither
+/// evidence (or unreadable evidence) counts as current, so uncertainty keeps
+/// recovery semantics instead of authorizing a fresh launch.
 pub(crate) fn current_container_work_exists_with(
     scope: &Path,
     current: Option<&crate::domain::PhysicalDomain>,
@@ -180,7 +216,7 @@ pub(crate) fn current_container_work_exists_with(
         }
         match generation(&root) {
             Ok(value) => {
-                if !previous_container(&value, current) {
+                if !previous_container_for_launch(&value, current) {
                     return true;
                 }
             }
@@ -315,15 +351,23 @@ fn process_space_ended_with(
 mod tests {
     use super::*;
 
-    struct EpochGuard;
+    /// 进程级 epoch 覆盖的互斥锁：覆盖是全局的，持锁期间其他依赖
+    /// `epoch::current()` 判定的测试不得并发运行（测试进程内 nextest 并行）。
+    static EPOCH_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EpochGuard(Option<std::sync::MutexGuard<'static, ()>>);
     impl EpochGuard {
         fn new(value: Option<String>) -> Self {
+            let lock = EPOCH_OVERRIDE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             crate::epoch::set_epoch_for_tests(value);
-            Self
+            Self(Some(lock))
         }
     }
     impl Drop for EpochGuard {
         fn drop(&mut self) {
+            self.0.take();
             crate::epoch::set_epoch_for_tests(None);
         }
     }
@@ -403,6 +447,41 @@ mod tests {
             Some(&domain_fixture("pod-new"))
         ));
         assert!(current_container_work_exists_with(temp.path(), None));
+    }
+
+    /// 存量无印章记录（旧 app Deployment 未注入执行域 env 写下的）以进程
+    /// 纪元兜底：记录的 pid1 与当前纪元不同 → 前容器残留 → 不再被恢复
+    /// 语义吞掉一次性部署声明（K8s 冷部署稳态卡死的根因回归锁）。
+    #[test]
+    fn unstamped_record_with_foreign_epoch_is_previous_container() {
+        let (temp, _id) = stuck_scope(
+            None,
+            Some("pid1:11111111-1111-4111-8111-111111111111:100".into()),
+        );
+        let _guard = EpochGuard::new(Some(
+            "pid1:11111111-1111-4111-8111-111111111111:9000".into(),
+        ));
+        assert!(!current_container_work_exists_with(temp.path(), None));
+        assert!(!current_container_work_exists_with(
+            temp.path(),
+            Some(&domain_fixture("pod-new"))
+        ));
+    }
+
+    /// 同容器残留（owner 崩溃重启、pid1 未变）：纪元相同不构成跨容器证据，
+    /// 恢复语义保持——不重放一次性部署输入。
+    #[test]
+    fn unstamped_record_with_current_epoch_stays_local_work() {
+        let (temp, _id) = stuck_scope(
+            None,
+            Some("pid1:22222222-2222-4222-8222-222222222222:100".into()),
+        );
+        let _guard = EpochGuard::new(Some("pid1:22222222-2222-4222-8222-222222222222:100".into()));
+        assert!(current_container_work_exists_with(temp.path(), None));
+        assert!(current_container_work_exists_with(
+            temp.path(),
+            Some(&domain_fixture("pod-new"))
+        ));
     }
 
     #[test]

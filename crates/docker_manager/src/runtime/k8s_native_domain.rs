@@ -42,9 +42,29 @@ pub(crate) fn builder_domain_env(authority: &str, pvc: &str, mounts: &[VolumeMou
         })
         .collect();
     views.sort_unstable();
+    execution_domain_env(authority, pvc, &views)
+}
+
+/// The app-runtime execution-domain env value. Same identity rules as
+/// [`builder_domain_env`] on the app Deployment's flat four-subPath mounts
+/// (`app_flat_volume_mounts`); SSA re-apply converges existing Deployments.
+pub(crate) fn app_domain_env(authority: &str, pvc: &str, views: &[(String, String)]) -> String {
+    let mut sorted: Vec<(&str, &str)> = views
+        .iter()
+        .map(|(sub, path)| (sub.as_str(), path.as_str()))
+        .collect();
+    sorted.sort_unstable();
+    execution_domain_env(authority, pvc, &sorted)
+}
+
+fn execution_domain_env(authority: &str, pvc: &str, sorted_views: &[(&str, &str)]) -> String {
     let mut digest = Sha256::new();
     digest.update(pvc.as_bytes());
-    digest.update(serde_json::to_string(&views).unwrap_or_default().as_bytes());
+    digest.update(
+        serde_json::to_string(sorted_views)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     serde_json::json!({
         "authority": authority,
         "instance": "",
@@ -381,6 +401,25 @@ mod tests {
         let mut changed = mounts.clone();
         changed[0].sub_path = Some("renamed".into());
         assert_ne!(builder_domain_env("k8s:aa", "pvc-app-1", &changed), first);
+    }
+
+    #[test]
+    fn app_domain_env_is_stable_and_view_order_free() {
+        let views = [
+            ("197".to_string(), "/home/user/197".to_string()),
+            ("data".to_string(), "/home/user/data".to_string()),
+        ];
+        let first = app_domain_env("k8s:aa", "pvc-app-197", &views);
+        assert_eq!(first, app_domain_env("k8s:aa", "pvc-app-197", &views));
+        // 视图序不影响身份（指纹内排序）；PVC/authority 变化则不匹配。
+        let mut shuffled = views.clone();
+        shuffled.reverse();
+        assert_eq!(app_domain_env("k8s:aa", "pvc-app-197", &shuffled), first);
+        assert_ne!(app_domain_env("k8s:aa", "pvc-app-198", &views), first);
+        assert_ne!(app_domain_env("k8s:bb", "pvc-app-197", &views), first);
+        let value: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(value["instance"], "");
+        assert_eq!(value["instance_source_env"], "RCODER_PHYSICAL_POD_UID");
     }
 
     #[test]

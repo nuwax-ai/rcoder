@@ -411,7 +411,10 @@ fn detach_previous_container_control(root: &Path, discovery: &mut Discovery) -> 
     let Some(id) = discovery.snapshot.generation.as_deref() else {
         return Ok(());
     };
-    if !record::belongs_to_previous_container(root, id)? {
+    // Launch-time classification (epoch fallback included): only the boot
+    // decision treats unstamped legacy records from a replaced container as
+    // previous-container history; retirement keeps the stamp-only predicate.
+    if !record::belongs_to_previous_container_for_launch(root, id)? {
         return Ok(());
     }
     for (_, snapshot) in &mut discovery.requests {
