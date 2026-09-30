@@ -73,6 +73,9 @@ pub(crate) struct Journal {
     pub receipt: Option<Receipt>,
     pub(super) deploy_replays: super::deploy_replay::History,
     pub process_scope: Option<String>,
+    /// 本协调者关联的原生执行代次（统一 owner 进程内会话显式附加；
+    /// 旧 worker 路径派生自 guardian 注入的 env）。
+    worker_generation: Option<String>,
     previous_owner: Option<CoordinatorOwner>,
     // Retain the old lock domain for the entire owner lifetime: an old binary
     // must not start against now-empty legacy record paths during migration.
@@ -131,6 +134,12 @@ impl Journal {
     /// records: migration waits until the management listener has bound.
     pub fn open_with_root(workspace: &Path, root: PathBuf) -> Result<Self> {
         Self::open_recovering(workspace, root, false)
+    }
+
+    /// 统一 owner 进程内会话：显式附加本会话的原生执行代次——没有 guardian
+    /// env 可派生，协调者登记与后续会话的「上一代清理已核验」判定都以此为准。
+    pub fn attach_worker_generation(&mut self, generation: String) {
+        self.worker_generation = Some(generation);
     }
 
     /// The independent supervisor has retired preceding managed executions.
@@ -270,6 +279,7 @@ impl Journal {
             receipt,
             deploy_replays,
             process_scope: process_scope(),
+            worker_generation: current_worker_generation(),
             previous_owner,
             legacy_leases: Vec::new(),
             legacy_root: None,
@@ -460,7 +470,7 @@ impl Journal {
         let owner = CoordinatorOwner {
             state: OwnerState::Active,
             process_scope: self.process_scope.clone(),
-            worker_generation: current_worker_generation(),
+            worker_generation: self.worker_generation.clone(),
         };
         self.previous_owner = Some(self.write_verified(".deploy-coordinator.json", &owner)?);
         Ok(())
@@ -473,13 +483,13 @@ impl Journal {
         anyhow::ensure!(
             previous.state == OwnerState::Active
                 && previous.process_scope == self.process_scope
-                && previous.worker_generation == current_worker_generation(),
+                && previous.worker_generation == self.worker_generation,
             "coordinator ownership changed before shutdown"
         );
         let owner = CoordinatorOwner {
             state: OwnerState::Quiescent,
             process_scope: self.process_scope.clone(),
-            worker_generation: current_worker_generation(),
+            worker_generation: self.worker_generation.clone(),
         };
         self.previous_owner = Some(self.write_verified(".deploy-coordinator.json", &owner)?);
         Ok(())

@@ -51,7 +51,13 @@ fn start_with_env(
         .env("APP_CLI_REQUIRE_PG", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(
+            std::fs::File::create(format!(
+                "/tmp/serve-restart-debug-{}.err",
+                std::process::id()
+            ))
+            .unwrap(),
+        );
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -89,6 +95,16 @@ async fn expect_phase(server: &mut OwnedServer, base: &str, phase: &str) {
             "server exited before status became available"
         );
         if let Ok(response) = client.get(format!("{base}/v1/deploy/status")).send().await {
+            // 恢复窗口（T1b）合法应答 503 ERR_INITIALIZING：管理面已绑定但
+            // 启动恢复/围栏未完成——继续等待，不当失败也不当 idle。
+            if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                assert!(
+                    Instant::now() < deadline,
+                    "server never left initialization"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
             assert!(response.status().is_success());
             let body: serde_json::Value = response.json().await.unwrap();
             if body["data"]["phase"] == phase {
@@ -228,6 +244,15 @@ async fn replaced_container_consumes_deploy_declaration_env() {
             .send()
             .await
         {
+            // 同 expect_phase：恢复窗口的 503 ERR_INITIALIZING 是合法中间态。
+            if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                assert!(
+                    Instant::now() < deadline,
+                    "replacement never left initialization"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
             assert!(response.status().is_success());
             let body: serde_json::Value = response.json().await.unwrap();
             latest = body.clone();

@@ -32,10 +32,12 @@ impl ServerState {
             preparations: Arc::new(preparation::Preparations::default()),
             journal: std::sync::Mutex::new(None),
             volatile_deploy_replays: std::sync::Mutex::new(Default::default()),
-            generation: std::env::var(shared_types::APP_DEPLOY_GENERATION_ID)
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            generation: RwLock::new(
+                std::env::var(shared_types::APP_DEPLOY_GENERATION_ID)
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            ),
             phase: RwLock::new(ServerPhase::Idle),
             release: RwLock::new(None),
             ready,
@@ -51,8 +53,10 @@ impl ServerState {
             }),
             deploy_tx,
             deploy_rx: tokio::sync::Mutex::new(deploy_rx),
-            cancel: CancellationToken::new(),
+            cancel: RwLock::new(CancellationToken::new()),
             log_layout: RwLock::new(LogLayout::Builtin),
+            deploy_inputs_eligible: std::sync::atomic::AtomicBool::new(true),
+            business_relaunch: std::sync::OnceLock::new(),
         }
     }
 
@@ -209,7 +213,7 @@ impl ServerState {
             Boundary::Active | Boundary::RestoredActive | Boundary::StartupFailed
         ) || (receipt.boundary == Boundary::Preparing
             && receipt.operation.phase == AppCliDeployPhase::Failed);
-        if receipt.generation != self.generation || !confirmed_boundary {
+        if receipt.generation != self.generation_value() || !confirmed_boundary {
             return Ok(false);
         }
         let active = receipt
@@ -270,7 +274,7 @@ impl ServerState {
             .to_owned()
         });
         let migrations = receipt
-            .filter(|receipt| receipt.generation == self.generation)
+            .filter(|receipt| receipt.generation == self.generation_value())
             .and_then(|receipt| receipt.active.as_ref())
             .and_then(|active| active.request.as_ref())
             .and_then(|request| request.execution_target)
@@ -288,13 +292,14 @@ impl ServerState {
             .unwrap_or_default();
         Ok(shared_types::RuntimeRecoveryView {
             runtime_instance_id: status.runtime_instance_id,
-            deployment_generation_id: self.generation.clone(),
+            deployment_generation_id: self.generation_value(),
             revision: status.revision,
             kernel_protected: status.recovery_protection,
             owner_protected: self.runtime_recovery_hold_active(),
             operation_id: receipt.map(|receipt| receipt.operation.operation_id.clone()),
             boundary,
-            generation_matches: receipt.map(|receipt| receipt.generation == self.generation),
+            generation_matches: receipt
+                .map(|receipt| receipt.generation == self.generation_value()),
             credentials_required: receipt
                 .and_then(|receipt| receipt.active.as_ref())
                 .and_then(|active| active.request.as_ref())
@@ -448,12 +453,83 @@ impl ServerState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.accepting
             .store(false, std::sync::atomic::Ordering::Release);
-        self.cancel.cancel();
+        self.trigger_cancel();
+    }
+
+    /// 统一 owner：注入业务重启通知（运行操作受理后触发会话重建）。
+    pub(crate) fn set_business_relaunch(
+        &self,
+        notify: impl Fn() + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.business_relaunch
+            .set(Box::new(notify))
+            .map_err(|_| anyhow::anyhow!("business relaunch hook already installed"))
     }
 
     /// 启动恢复是否仍在进行（P1-01：API bind 先于恢复，写端点/ready 门控依据）。
     pub fn initializing(&self) -> bool {
         self.initializing.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// 统一 owner（recovery v2）：进入新的业务会话。重置会话级运行面（代次、
+    /// 取消令牌、部署受理、journal 槽位、相位与部署进度），保留跨会话事实
+    /// （owner token、运行内核、recovery hold、凭据恢复标记）。
+    /// `fresh=false` 的恢复式会话不消费一次性部署声明 env（等效进程模式在
+    /// 派生时剥除 APP_DEPLOY_* 的语义）。
+    pub(crate) fn begin_business_session(&self, generation: String, fresh: bool) {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.renew_cancel_locked();
+        self.initializing
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.accepting
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.shutdown_unconfirmed
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.supervision_driver_started
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.deploy_inputs_eligible
+            .store(fresh, std::sync::atomic::Ordering::Release);
+        *self
+            .generation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = generation;
+        *self
+            .journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .current_runtime_operation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .pending_dev_profile
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .pending_run_config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .release
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .deploy_status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = DeployStatus {
+            phase: AppCliDeployPhase::Idle,
+            protocol_version: DEPLOY_PROTOCOL,
+            capabilities: vec![
+                "progress_v1".into(),
+                "deployment_run_pg".into(),
+                shared_types::BUSINESS_READINESS_CAPABILITY.into(),
+            ],
+            ..Default::default()
+        };
+        self.set_phase_locked(ServerPhase::Idle);
     }
 
     pub(crate) fn begin_auxiliary_write(&self) -> Result<AuxiliaryWriter<'_>> {
@@ -805,7 +881,7 @@ impl ServerState {
         let previous = self.deploy_status();
         let operation = shared_types::AppDeploymentOperation {
             operation_id,
-            deployment_generation_id: self.generation.clone(),
+            deployment_generation_id: self.generation_value(),
             deploy_stage: AppDeploymentStage::Pending,
             persisted: false,
             request_release_id: req.release_id.clone(),
@@ -837,14 +913,14 @@ impl ServerState {
             journal
                 .write_with_history(
                     Receipt {
-                        generation: self.generation.clone(),
+                        generation: self.generation_value(),
 
                         operation: operation.clone(),
                         request: req.clone(),
                         boundary: Boundary::Preparing,
                         active: old_receipt
                             .as_ref()
-                            .filter(|r| r.generation == self.generation)
+                            .filter(|r| r.generation == self.generation_value())
                             .and_then(|r| r.active.clone())
                             .or_else(|| {
                                 (phase == ServerPhase::Running)
@@ -988,7 +1064,7 @@ impl ServerState {
         let active = journal
             .receipt
             .as_ref()
-            .filter(|receipt| receipt.generation == self.generation)
+            .filter(|receipt| receipt.generation == self.generation_value())
             .and_then(|receipt| receipt.active.clone())
             .or_else(|| {
                 self.release().map(|release| ActiveVersion {
@@ -998,7 +1074,7 @@ impl ServerState {
             });
         let operation = shared_types::AppDeploymentOperation {
             operation_id: operation_id.clone(),
-            deployment_generation_id: self.generation.clone(),
+            deployment_generation_id: self.generation_value(),
             deploy_stage: AppDeploymentStage::Pending,
             persisted: false,
             request_release_id: request.release_id.clone(),
@@ -1008,7 +1084,7 @@ impl ServerState {
             error: None,
         };
         journal.write(Receipt {
-            generation: self.generation.clone(),
+            generation: self.generation_value(),
 
             operation: operation.clone(),
             request: request.clone(),
@@ -1036,7 +1112,7 @@ impl ServerState {
     }
 
     pub(crate) fn matches_generation(&self, generation: &str) -> bool {
-        generation == self.generation
+        generation == self.generation_value()
     }
 
     pub(super) fn persist_boundary(&self, boundary: Boundary) -> Result<()> {
@@ -1056,8 +1132,8 @@ impl ServerState {
             return Ok(());
         };
         anyhow::ensure!(
-            receipt.generation == self.generation
-                && operation.deployment_generation_id == self.generation
+            receipt.generation == self.generation_value()
+                && operation.deployment_generation_id == self.generation_value()
                 && receipt.operation.operation_id == operation.operation_id,
             "deployment receipt does not belong to the current operation"
         );
@@ -1127,8 +1203,8 @@ impl ServerState {
             && let Some(operation) = snapshot.operation.as_ref()
         {
             anyhow::ensure!(
-                receipt.generation == self.generation
-                    && operation.deployment_generation_id == self.generation
+                receipt.generation == self.generation_value()
+                    && operation.deployment_generation_id == self.generation_value()
                     && receipt.operation.operation_id == operation.operation_id,
                 "failure receipt does not belong to the current operation"
             );

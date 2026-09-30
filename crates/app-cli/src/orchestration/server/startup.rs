@@ -1,13 +1,15 @@
 use super::*;
 
-/// serve 核心逻辑：所有权 → API bind → journal 恢复 → 状态机主循环。
+/// serve 核心逻辑：所有权分类 → 统一 owner 承载 / 旧版 worker 兼容 / 分派。
+///
+/// recovery v2（plan §5）：本进程成为统一 owner 时，公共管理监听（3010）
+/// 先于一切业务副作用绑定，原生控制会话与业务编排同进程运行——围栏、
+/// Stopped、journal 故障期间管理 API 保持可用。
 pub(super) async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
     anyhow::ensure!(
         !args.control_only || !crate::deploy::deploy_requested(),
         "control-only startup cannot execute an environment deployment"
     );
-    // OwnerGuard：跨进程排他锁（cross-platform.md §3）——在 API bind 前获取，
-    // 确保同一项目最多一个 owner。锁文件位于部署替换范围外的稳定状态根。
     let application_id = std::env::var("PROJECT_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -15,74 +17,59 @@ pub(super) async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
     let state_root =
         crate::runtime_kernel::RuntimeStore::resolve_root(&args.workspace, &application_id)?;
     let supervised_worker = runtime_supervisor::Worker::from_env(&state_root).await?;
-    let stop_intent = supervised_worker
-        .as_ref()
-        .is_some_and(|worker| worker.intent() == runtime_supervisor::Intent::Stopped);
-    let _owner_guard = if supervised_worker.is_some() {
-        None
-    } else {
-        match crate::platform::owner_guard::OwnerGuard::try_acquire(&state_root)? {
-            Some(guard) => Some(guard),
-            None => {
-                // A bootstrap race must never turn into a Start request to the winner.
-                anyhow::ensure!(
-                    !args.control_only,
-                    "runtime owner is already starting or running"
-                );
-                anyhow::ensure!(
-                    !crate::deploy::deploy_requested(),
-                    "workspace already has an owner; submit artifact deployment through its deployment API"
-                );
-                return match crate::owner_dispatch::dispatch_to_owner(
-                    &args.admin_addr,
-                    &args.workspace,
-                    &state_root,
-                    &application_id,
-                )
-                .await?
-                {
-                    crate::owner_dispatch::OwnerDispatch::Terminal(view) => {
-                        crate::owner_dispatch::describe_terminal(&view)
-                    }
-                    crate::owner_dispatch::OwnerDispatch::NoOwner => {
-                        anyhow::bail!(
-                            "owner disappeared during dispatch; no operation was submitted"
-                        )
-                    }
-                };
+    if let Some(worker) = supervised_worker {
+        // 旧版 owner（进程模式二进制）派生的 worker 子进程：保持旧结构直接
+        // 服务业务（升级窗口兼容；新 owner 不再派生 worker）。
+        return serve_supervised_worker(args, state_root, worker).await;
+    }
+    match crate::supervision::supervise(args, true).await? {
+        crate::supervision::SupervisionOutcome::Owner(session) => {
+            owner_serve(args, state_root, application_id, session, false).await
+        }
+        crate::supervision::SupervisionOutcome::Dispatch => {
+            // 锁被活 owner 持有：分派到其管理 API（R02）。
+            match crate::owner_dispatch::dispatch_to_owner(
+                &args.admin_addr,
+                &args.workspace,
+                &state_root,
+                &application_id,
+            )
+            .await?
+            {
+                crate::owner_dispatch::OwnerDispatch::Terminal(view) => {
+                    crate::owner_dispatch::describe_terminal(&view)
+                }
+                crate::owner_dispatch::OwnerDispatch::NoOwner => {
+                    anyhow::bail!("owner disappeared during dispatch; no operation was submitted")
+                }
             }
         }
-    };
-
-    // Hold the real public listener before legacy journal archival/migration.
-    let api_listener = crate::api::bind_listener(&args.admin_addr).await?;
-    let journal = if supervised_worker.is_some() {
-        Journal::open_recovering(&args.workspace, state_root.clone(), true)?
-    } else {
-        Journal::open_with_root(&args.workspace, state_root.clone())?
-    };
-    let ready = RuntimeStatusService::default();
-    let mut initial_state = ServerState::new(ready.clone());
-    initial_state.initialize_owner_token()?;
-    // A failed serve startup is a recovery failure, never legacy run mode.
-    initial_state.mark_kernel_required();
-    if std::env::var(shared_types::APP_DEPLOY_GENERATION_ID).is_err()
-        && let Some(receipt) = journal.receipt.as_ref()
-    {
-        initial_state.generation = receipt.generation.clone();
+        crate::supervision::SupervisionOutcome::Legacy => {
+            // serve() 已先行处理 attach；此处 Legacy 仅在 worker env 下可达，
+            // 而该分支已在上方消费。
+            anyhow::bail!("unclassified serve entry; refusing to start a second orchestrator")
+        }
     }
-    let state = Arc::new(initial_state);
-    *state
-        .journal
-        .lock()
-        .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))? = Some(journal);
+}
 
-    // 管理 API 预绑定（P1-01）：bind 成功才继续部署清理/启动恢复/业务停启——
-    // 端口冲突在一切运行态副作用之前 fail-fast（未 commit_coordinator、未
-    // stop_all；journal 随 Drop 释放锁，不写 Quiescent）。恢复完成前写端点由
-    // initializing 门控拒绝、/ready 以 initializing 摘流（探针早有人应答的价值
-    // 保留——/health 恒 200 覆盖 kubelet liveness）。serve future 运行期故障 →
-    // cancel 主循环受控收束，不留"无管理面的运行态"。
+/// 统一 owner 服务形态：管理面（API + 原生控制）与业务会话同进程。
+///
+/// 顺序（plan §5.1）：锁 → 公共监听 bind（端口冲突 fail-fast 于业务副作用
+/// 之前）→ 早期身份/端点发布 → 会话循环（围栏清障后逐代次运行业务）。
+/// 业务会话失败按会话重启策略收敛；管理 API 与 Stop/Status 全程在线。
+pub async fn owner_serve(
+    args: &RuntimeArgs,
+    state_root: std::path::PathBuf,
+    application_id: String,
+    session: std::sync::Arc<runtime_supervisor::OwnerSession>,
+    run_mode: bool,
+) -> Result<()> {
+    let _ = application_id;
+    let api_listener = crate::api::bind_listener(&args.admin_addr).await?;
+    let ready = RuntimeStatusService::default();
+    let state = Arc::new(ServerState::new(ready));
+    state.initialize_owner_token()?;
+    state.mark_kernel_required();
     let api_state = state.clone();
     let api_workspace = args.workspace.clone();
     let api_log_dir = args.log_dir.clone();
@@ -104,14 +91,129 @@ pub(super) async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
             if let Ok(mut slot) = api_monitor_failure.lock() {
                 *slot = Some(format!("{error:#}"));
             }
-            api_monitor_state.cancel.cancel();
+            api_monitor_state.trigger_cancel();
         }
     });
-    let _worker_control = match supervised_worker {
-        Some(worker) => Some(worker.serve(state.clone()).await?),
-        None => None,
-    };
 
+    // 早期运行内核装配（plan §5.1 step 3）：发布身份/能力与端点记录；业务
+    // 恢复尚未发生。装配失败=管理降级（B05 语义）：API 保持在线，业务启动
+    // 压制，具体原因可从身份/恢复端点与日志观察到。
+    match assemble_runtime_kernel(&state, args).await {
+        Ok(kernel) => {
+            let credential_result = state
+                .control_token()
+                .context("owner control token missing")
+                .and_then(|token| kernel.store().store_token(&token))
+                .context("publish owner control credential");
+            match credential_result {
+                Ok(()) => {
+                    state.set_runtime_kernel(kernel.clone());
+                    let endpoint = crate::runtime_kernel::EndpointRecord {
+                        protocol_version: kernel.identity().protocol_version,
+                        application_id: kernel.identity().application_id.clone(),
+                        workspace_id: kernel.identity().workspace_id.clone(),
+                        runtime_instance_id: kernel.identity().runtime_instance_id.clone(),
+                        address: bound_api_addr.clone(),
+                    };
+                    if let Err(endpoint_error) = kernel.store().store_endpoint(&endpoint) {
+                        tracing::warn!(
+                            "endpoint discovery record publish failed: {endpoint_error:#}"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "owner credential publication failed; business startup suppressed"
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                "runtime kernel unavailable ({error:#}); automatic business startup suppressed"
+            );
+        }
+    }
+    state.set_business_relaunch({
+        let session = session.clone();
+        move || session.request_relaunch()
+    })?;
+
+    let factory_args = args.clone();
+    let factory_state = state.clone();
+    let factory_state_root = state_root.clone();
+    let factory_session = session.clone();
+    let session_exit = session
+        .run(Box::new(
+            move |launch: runtime_supervisor::BusinessLaunch| {
+                let args = factory_args.clone();
+                let state = factory_state.clone();
+                let state_root = factory_state_root.clone();
+                let session = factory_session.clone();
+                let end = tokio::spawn(async move {
+                    if run_mode {
+                        run_business_session(args, state_root, state, session, launch).await
+                    } else {
+                        business_session(args, state_root, state, session, launch)
+                            .await
+                            .map(|_| None::<i32>)
+                    }
+                });
+                let control = factory_state.clone();
+                Ok(runtime_supervisor::BusinessRun {
+                    control,
+                    end: Box::pin(async move {
+                        end.await
+                            .map_err(|error| {
+                                anyhow::anyhow!("business session task failed: {error}")
+                            })
+                            .and_then(|result| result)
+                    }),
+                })
+            },
+        ))
+        .await;
+
+    api_handle.abort();
+    if let Ok(slot) = api_failure.lock()
+        && let Some(api_error) = slot.as_ref()
+    {
+        anyhow::bail!("app-cli management API terminated: {api_error}");
+    }
+    let exit = session_exit?;
+    if exit != 0 {
+        anyhow::bail!("unified owner exited with code {exit}");
+    }
+    Ok(())
+}
+
+/// 统一 owner 的一个业务会话：会话状态 re-arm → journal → 启动恢复序列 →
+/// 编排主循环，直到取消（Stop/Shutdown/信号）或自身失败。
+///
+/// 返回 Err 时由会话重启策略收敛（预算耗尽转 RecoveryRequired，管理面
+/// 保留）；成功返回即本次会话干净收束。
+async fn business_session(
+    args: RuntimeArgs,
+    state_root: std::path::PathBuf,
+    state: Arc<ServerState>,
+    session: std::sync::Arc<runtime_supervisor::OwnerSession>,
+    launch: runtime_supervisor::BusinessLaunch,
+) -> Result<()> {
+    let ready_guard = session.ready_guard(&launch.generation);
+    state.begin_business_session(launch.generation.clone(), launch.fresh);
+    let stop_intent = session.snapshot().intent == runtime_supervisor::Intent::Stopped;
+    let mut journal = Journal::open_with_root(&args.workspace, state_root.clone())?;
+    journal.attach_worker_generation(launch.generation.clone());
+    if std::env::var(shared_types::APP_DEPLOY_GENERATION_ID).is_err()
+        && let Some(receipt) = journal.receipt.as_ref()
+    {
+        state.set_generation(receipt.generation.clone());
+    }
+    *state
+        .journal
+        .lock()
+        .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))? = Some(journal);
     let migrate = state
         .journal
         .lock()
@@ -119,10 +221,7 @@ pub(super) async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
         .as_mut()
         .context("deployment journal missing")?
         .migrate_after_bind();
-    if let Err(error) = migrate {
-        api_handle.abort();
-        return Err(error).context("migrate deployment journal after management bind");
-    }
+    migrate.context("migrate deployment journal after management bind")?;
     crate::deploy::cleanup_startup(&args.workspace).await?;
 
     let signal_state = state.clone();
@@ -153,15 +252,12 @@ pub(super) async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
         .err();
     }
     let ownership_claimed = startup_error.is_none();
-    // B05：内核装配**先于**启动决策——恢复裁决（损坏记录/未终态操作/desired
-    // 读取）必须先于 initialize_startup，否则 Existing 自动启动在保护生效前
-    // 已进入 first_request。
+    // B05：内核装配先于启动决策。统一 owner 已在会话外完成装配——这里消费
+    // 装配结果；未装配（状态根不可用）时写入口 fail-closed。
     let mut kernel_recovery_hold = false;
     if ownership_claimed {
-        // R05：尝试装配即标记——失败（kernel=None）时写入口 fail-closed
-        state.mark_kernel_required();
-        match assemble_runtime_kernel(&state, args).await {
-            Ok(kernel) => {
+        match state.runtime_kernel() {
+            Some(kernel) => {
                 let recovered = kernel
                     .recover()
                     .await
@@ -181,7 +277,7 @@ pub(super) async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
                 {
                     let reconciled = (|| -> Result<Receipt> {
                         anyhow::ensure!(
-                            receipt.generation == state.generation,
+                            receipt.generation == state.generation_value(),
                             "switch generation mismatch"
                         );
                         let expected = receipt
@@ -272,7 +368,7 @@ pub(super) async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
                                         operation.state == shared_types::RuntimeOperationState::RecoveryRequired),
                                     None => true,
                                 };
-                                if eligible && receipt.generation == state.generation {
+                                if eligible && receipt.generation == state.generation_value() {
                                     let normalized = state
                                         .journal
                                         .lock()
@@ -329,59 +425,11 @@ pub(super) async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
                         "runtime state requires storage-level recovery; automatic business startup suppressed"
                     );
                 }
-                let credential_result = state
-                    .control_token()
-                    .context("owner control token missing")
-                    .and_then(|token| kernel.store().store_token(&token))
-                    .context("publish owner control credential");
-                if let Err(error) = credential_result {
-                    state.close_admission();
-                    api_handle.abort();
-                    signal_task.abort();
-                    return Err(error);
-                }
-                state.set_runtime_kernel(kernel.clone());
-                // R06 事件桥：编排 EVT 同步进入活跃操作的运行事件 journal
-                //（复用 owner 的平台侧经运行 API 读事件流，读不到本进程
-                // stdout）。stdout 通道不变（本地 spawn 路径消费）。
-                {
-                    let kernel = kernel.clone();
-                    crate::orchestration_events::install_bridge(Box::new(move |json| {
-                        if let Some(record) = bridge_event_fields(&json) {
-                            kernel.append_orchestration_event(
-                                &record.stage,
-                                record.service,
-                                &record.event_name,
-                                record.payload,
-                            );
-                        }
-                    }));
-                }
-                // endpoint 发现记录（cross-platform.md §3）：API 已绑定 +
-                // 身份就绪后原子发布——多项目按状态根天然隔离。
-                // 发布失败仅告警（发现能力缺失，不影响已建立的 owner）。
-                if let Err(endpoint_error) =
-                    kernel
-                        .store()
-                        .store_endpoint(&crate::runtime_kernel::EndpointRecord {
-                            protocol_version: kernel.identity().protocol_version,
-                            application_id: kernel.identity().application_id.clone(),
-                            workspace_id: kernel.identity().workspace_id.clone(),
-                            runtime_instance_id: kernel.identity().runtime_instance_id.clone(),
-                            address: bound_api_addr.clone(),
-                        })
-                {
-                    tracing::warn!("endpoint discovery record publish failed: {endpoint_error:#}");
-                }
             }
-            Err(error) => {
-                // B05：状态根不可用 = 运行态可信状态不可读——不再仅关闭新 API
-                // 放行旧链。fail-closed：压住自动启动；旧部署受理也会因
-                // desired/记录不可读而不可信（deploy admission 检查
-                // runtime_kernel 为 None 时见下述显式阻断）。
+            None => {
                 kernel_recovery_hold = true;
                 tracing::error!(
-                    "runtime kernel unavailable ({error:#}); automatic business startup suppressed"
+                    "runtime kernel unavailable; automatic business startup suppressed"
                 );
             }
         }
@@ -417,7 +465,7 @@ pub(super) async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
         state.set_phase(ServerPhase::Idle);
         None
     } else {
-        match initialize_startup(args, &state).await {
+        match initialize_startup(&args, &state).await {
             Ok(action) => action,
             Err(error) => {
                 tracing::error!(%error, "Deployment startup reconciliation failed");
@@ -441,10 +489,7 @@ pub(super) async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
             }
         }
     };
-    // R03/B05：desired 读取先于启动决策；**读取失败同样压制自动启动**
-    //（损坏 desired 等价于不可信状态——不允许"读错当 Running 继续起"）。
-    // R05：读错时必须清除已生成的 first_request——否则自动恢复（journal
-    // resume/卷上 release.lock 的 Existing 路径）仍会在不可信状态上启动。
+    // R03/B05：desired 读取先于启动决策；读取失败同样压制自动启动。
     if ownership_claimed && !kernel_recovery_hold {
         let mut desired_unreadable = false;
         let desired = match state
@@ -471,9 +516,6 @@ pub(super) async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
         if desired == Some(shared_types::DesiredState::Stopped)
             && matches!(first_request, Some(InitialAction::Existing))
         {
-            // 用户 stop（spec §5）压制**自动恢复**（journal resume/卷上
-            // release.lock 的 Existing 路径），保持 Idle；显式 env 部署
-            //（Deploy 路径）是新的部署意图，不受 Stopped 压制。
             first_request = None;
             tracing::info!(
                 "desired state is Stopped; automatic business recovery suppressed (staying Idle)"
@@ -482,14 +524,13 @@ pub(super) async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
         }
     }
 
-    // 启动恢复完成（含 Failed 相位——可再次部署修复的合法可查状态）：开放
-    // 写端点受理与 /ready 判定。quiescence 失败路径不开放（进程保护现场至退出）。
+    // 启动恢复完成（含 Failed 相位）：开放写端点受理与 /ready 判定，并发布
+    // 本会话的管理就绪（原生快照 phase=ready——管理就绪，非业务就绪）。
     if ownership_claimed {
         state.mark_initialized();
+        ready_guard.mark_ready()?;
     }
 
-    // 服务托管引擎探测：supervisord socket 可用（容器形态）→ 动态 program 托管
-    //（per-service 隔离重启）；否则 builtin（裸跑/dev，与 legacy 同引擎）。
     state.set_log_layout(if host.is_some() {
         LogLayout::Supervisord
     } else {
@@ -497,12 +538,13 @@ pub(super) async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
     });
 
     let result = if let Some(error) = startup_error {
-        state.cancel.cancelled().await;
+        state.cancel_token().cancelled().await;
+        tracing::error!(%error, "startup ownership was not claimed; business session ends");
         Err(error).context("startup ownership was not claimed")
     } else {
         let supervised = host.is_some();
-        let driver_args = args.clone();
         let driver_state = state.clone();
+        let driver_args = args.clone();
         let mut driver = tokio::spawn(async move {
             driver_state
                 .supervision_driver_started
@@ -521,13 +563,526 @@ pub(super) async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
             }
         });
         let mut joined = false;
+        let cancel = state.cancel_token();
         let (driver_result, shutdown_deadline) = tokio::select! {
             result = &mut driver => {
                 joined = true;
                 state.close_admission();
                 (result.context("server driver panicked").and_then(|result| result), tokio::time::Instant::now().checked_add(state.shutdown_budget(supervised)).context("shutdown budget exceeds clock range")?)
             },
-            () = state.cancel.cancelled() => {
+            () = cancel.cancelled() => {
+                let deadline = tokio::time::Instant::now().checked_add(state.shutdown_budget(supervised)).context("shutdown budget exceeds clock range")?;
+                let result = match tokio::time::timeout_at(deadline, &mut driver).await {
+                    Ok(result) => { joined = true; result.context("server driver panicked").and_then(|result| result) },
+                    Err(error) => Err(error).context("server shutdown confirmation timed out"),
+                };
+                (result, deadline)
+            },
+        };
+        if !joined {
+            driver.abort();
+        }
+        match driver_result {
+            Ok(()) => match tokio::time::timeout_at(
+                shutdown_deadline,
+                finish_clean_shutdown(&args, &state, ownership_claimed),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(error).context("remaining shutdown writers did not stop"),
+            },
+            Err(error) => Err(error),
+        }
+    };
+    state.close_admission();
+    signal_task.abort();
+    result
+}
+
+/// run 命令的业务会话（recovery v2 T2 前的过渡形态）：前台一次性编排——
+/// 与旧 run 主体同语义（env 部署段 + 前台 supervisor 循环，失败即非零
+/// 退出），差异仅在：API/管理面由 owner 进程承载（先绑定），取消经会话
+/// 协作停止。空工作区（无部署声明且无 release.lock）沿用 serve 的管理
+/// 空转语义。
+async fn run_business_session(
+    args: RuntimeArgs,
+    state_root: std::path::PathBuf,
+    state: Arc<ServerState>,
+    session: std::sync::Arc<runtime_supervisor::OwnerSession>,
+    launch: runtime_supervisor::BusinessLaunch,
+) -> Result<Option<i32>> {
+    let ready_guard = session.ready_guard(&launch.generation);
+    state.begin_business_session(launch.generation.clone(), launch.fresh);
+    let idle_workspace = !(state.deploy_inputs_eligible() && crate::deploy::deploy_requested())
+        && !tokio::fs::try_exists(args.workspace.join("release.lock.toml"))
+            .await
+            .unwrap_or(false);
+    if idle_workspace {
+        // 无业务可编排：保持管理会话（serve 业务序列的 idle 语义），前台
+        // 等待会话取消。
+        return business_session(args, state_root, state, session, launch)
+            .await
+            .map(|_| None);
+    }
+    // 部署段（仅 fresh 会话消费一次性部署声明 env）：失败即前台失败退出。
+    if state.deploy_inputs_eligible()
+        && crate::deploy::deploy_requested()
+        && let Err(error) = crate::deploy::run_from_env(&args.workspace).await
+    {
+        tracing::error!("❌ deploy stage failed: {error:#}");
+        anyhow::bail!("deploy stage failed");
+    }
+    if let Ok(release) = crate::manifest::read_release_lock(&args.workspace) {
+        state.set_release(release);
+        state.set_phase(ServerPhase::Running);
+    }
+    state.mark_initialized();
+    ready_guard.mark_ready()?;
+    let runtime_status = state.ready.clone();
+    let cancel = state.cancel_token();
+    let result = crate::supervisor::run_with_cancel(
+        args.clone(),
+        runtime_status,
+        cancel,
+        None,
+        crate::supervisor::legacy_run_profile(),
+    )
+    .await;
+    match &result {
+        Ok(()) => tracing::info!("app-cli supervisor exited normally"),
+        Err(e) => tracing::error!("app-cli supervisor error: {e:#}"),
+    }
+    result.map(|_| Some(0))
+}
+
+/// 旧版进程模式 owner 派生的 worker 子进程路径（升级窗口兼容）：保持既有
+/// 二进制结构——本进程绑定 3010 并承载全部业务编排，父 owner 负责监督。
+async fn serve_supervised_worker(
+    args: &RuntimeArgs,
+    state_root: std::path::PathBuf,
+    supervised_worker: runtime_supervisor::Worker,
+) -> Result<()> {
+    let stop_intent = supervised_worker.intent() == runtime_supervisor::Intent::Stopped;
+    // Hold the real public listener before legacy journal archival/migration.
+    let api_listener = crate::api::bind_listener(&args.admin_addr).await?;
+    let bound_api_addr = api_listener
+        .local_addr()
+        .context("read bound app-cli management address")?
+        .to_string();
+    let journal = Journal::open_recovering(&args.workspace, state_root.clone(), true)?;
+    let ready = RuntimeStatusService::default();
+    let initial_state = ServerState::new(ready.clone());
+    initial_state.initialize_owner_token()?;
+    // A failed serve startup is a recovery failure, never legacy run mode.
+    initial_state.mark_kernel_required();
+    if std::env::var(shared_types::APP_DEPLOY_GENERATION_ID).is_err()
+        && let Some(receipt) = journal.receipt.as_ref()
+    {
+        initial_state.set_generation(receipt.generation.clone());
+    }
+    let state = Arc::new(initial_state);
+    *state
+        .journal
+        .lock()
+        .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))? = Some(journal);
+
+    let api_state = state.clone();
+    let api_workspace = args.workspace.clone();
+    let api_log_dir = args.log_dir.clone();
+    let api_pingap_bin = args.pingap_bin.clone();
+    let api_app = crate::api::bound_router(api_workspace, api_log_dir, api_pingap_bin, api_state);
+    let api_failure = Arc::new(std::sync::Mutex::new(None::<String>));
+    let api_monitor_failure = api_failure.clone();
+    let api_monitor_state = state.clone();
+    let api_handle = tokio::spawn(async move {
+        let result = axum::serve(api_listener, api_app)
+            .await
+            .context("serve app-cli management API");
+        if let Err(error) = result {
+            tracing::error!("app-cli management API failed: {error:#}");
+            if let Ok(mut slot) = api_monitor_failure.lock() {
+                *slot = Some(format!("{error:#}"));
+            }
+            api_monitor_state.trigger_cancel();
+        }
+    });
+    let _worker_control = Some(supervised_worker.serve(state.clone()).await?);
+
+    let migrate = state
+        .journal
+        .lock()
+        .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
+        .as_mut()
+        .context("deployment journal missing")?
+        .migrate_after_bind();
+    if let Err(error) = migrate {
+        api_handle.abort();
+        return Err(error).context("migrate deployment journal after management bind");
+    }
+    crate::deploy::cleanup_startup(&args.workspace).await?;
+
+    let signal_state = state.clone();
+    let signal_task = tokio::spawn(async move {
+        tokio::select! {
+            () = crate::supervisor::sigterm_watch() => {},
+            _ = tokio::signal::ctrl_c() => {},
+        }
+        let closer = signal_state.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || closer.close_admission()).await {
+            signal_state.begin_failure(format!("shutdown admission task failed: {error}"), true);
+            signal_state.close_admission();
+        }
+    });
+    let (host, mut startup_error) = match SupervisordHost::detect().await {
+        Ok(host) => (host, None),
+        Err(error) => (None, Some(error)),
+    };
+    if startup_error.is_none() {
+        startup_error = establish_startup_quiescence(&state, host.is_some(), async {
+            if let Some(host) = host.as_ref() {
+                host.stop_all().await?;
+            }
+            crate::static_hosting::reconcile(&[], &args.workspace, false).await
+        })
+        .await
+        .err();
+    }
+    let ownership_claimed = startup_error.is_none();
+    let mut kernel_recovery_hold = false;
+    if ownership_claimed {
+        state.mark_kernel_required();
+        match assemble_runtime_kernel(&state, args).await {
+            Ok(kernel) => {
+                let recovered = kernel
+                    .recover()
+                    .await
+                    .context("recover runtime operation state")?;
+                if !recovered.is_empty() {
+                    tracing::warn!("runtime operations held for recovery: {:?}", recovered);
+                }
+                let mut saved = state
+                    .journal
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
+                    .as_ref()
+                    .and_then(|journal| journal.receipt.clone());
+                if let Some(receipt) = saved
+                    .as_ref()
+                    .filter(|receipt| receipt.boundary == Boundary::Switching)
+                {
+                    let reconciled = (|| -> Result<Receipt> {
+                        anyhow::ensure!(
+                            receipt.generation == state.generation_value(),
+                            "switch generation mismatch"
+                        );
+                        let expected = receipt
+                            .operation
+                            .artifact_release_id
+                            .as_deref()
+                            .context("switch intent has no target artifact identity")?;
+                        let workspace = resolved_execution_workspace(
+                            &args.workspace,
+                            receipt.request.execution_target,
+                            &state,
+                        )?;
+                        if !workspace.try_exists()? {
+                            let active = receipt
+                                .active
+                                .as_ref()
+                                .context("previous active version missing")?;
+                            anyhow::ensure!(
+                                receipt.operation.recovery.is_none()
+                                    && active
+                                        .request
+                                        .as_ref()
+                                        .is_some_and(|request| request.execution_target
+                                            == receipt.request.execution_target),
+                                "previous execution binding is not confirmed for restoration"
+                            );
+                            crate::deploy::restore_previous_generation(
+                                &workspace,
+                                &active.artifact_release_id,
+                            )?;
+                        }
+                        let release = crate::manifest::read_release_lock(&workspace)?;
+                        crate::migration_journal::require_confirmed_migrations(&workspace)?;
+                        let mut journal = state
+                            .journal
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?;
+                        let journal = journal.as_mut().context("switch journal missing")?;
+                        if release.release_id == expected {
+                            journal.confirm_switched_artifact(receipt, expected)
+                        } else {
+                            journal.confirm_preserved_active(receipt, &release.release_id)
+                        }
+                    })();
+                    match reconciled {
+                        Ok(receipt) => saved = Some(receipt),
+                        Err(error) => {
+                            state.begin_runtime_recovery_hold();
+                            tracing::error!(%error, "Switch outcome remains unconfirmed");
+                        }
+                    }
+                }
+                if let Some(mut receipt) = saved
+                    && matches!(
+                        receipt.boundary,
+                        Boundary::StartupFailed
+                            | Boundary::Active
+                            | Boundary::Preparing
+                            | Boundary::Activated
+                    )
+                {
+                    let evidence = (|| -> Result<()> {
+                        if receipt.boundary == Boundary::Preparing && receipt.active.is_none() {
+                            return Ok(());
+                        }
+                        let active = receipt.active.as_ref().context("active artifact missing")?;
+                        let target = active
+                            .request
+                            .as_ref()
+                            .and_then(|request| request.execution_target);
+                        let workspace =
+                            resolved_execution_workspace(&args.workspace, target, &state)?;
+                        crate::migration_journal::require_confirmed_migrations(&workspace)?;
+                        let release = crate::manifest::read_release_lock(&workspace)?;
+                        anyhow::ensure!(
+                            release.release_id == active.artifact_release_id,
+                            "startup recovery artifact changed"
+                        );
+                        Ok(())
+                    })();
+                    match evidence {
+                        Ok(()) => {
+                            if receipt.boundary == Boundary::Activated {
+                                let eligible = match receipt.request.runtime_operation_id.as_ref() {
+                                    Some(id) => kernel.get(id).await?.is_some_and(|operation|
+                                        operation.state == shared_types::RuntimeOperationState::RecoveryRequired),
+                                    None => true,
+                                };
+                                if eligible && receipt.generation == state.generation_value() {
+                                    let normalized = state
+                                        .journal
+                                        .lock()
+                                        .map_err(|_| {
+                                            anyhow::anyhow!("deployment journal lock poisoned")
+                                        })?
+                                        .as_mut()
+                                        .context("activation journal missing")?
+                                        .confirm_interrupted_activation(&receipt);
+                                    match normalized {
+                                        Ok(updated) => receipt = updated,
+                                        Err(error) => {
+                                            state.begin_runtime_recovery_hold();
+                                            tracing::error!(%error, "Activation reconciliation could not be persisted");
+                                        }
+                                    }
+                                }
+                            }
+                            if let Err(error) = kernel.reconcile_quiesced_operation(&receipt).await
+                            {
+                                tracing::error!(%error, "Quiesced operation reconciliation remains blocked");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "Quiesced operation evidence is incomplete")
+                        }
+                    }
+                }
+                if let Err(error) = kernel.reconcile_quiesced_stop().await {
+                    tracing::error!(%error, "Persisted stop reconciliation remains blocked");
+                }
+                match kernel.settle_unresolved_recoveries().await {
+                    Ok(settled) if !settled.is_empty() => {
+                        tracing::warn!(
+                            count = settled.len(),
+                            "startup settled interrupted operations; automatic business startup proceeds"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "Interrupted operations could not be settled automatically");
+                    }
+                }
+                if kernel.recovery_protection_active() {
+                    kernel_recovery_hold = true;
+                    tracing::error!(
+                        "runtime state requires storage-level recovery; automatic business startup suppressed"
+                    );
+                }
+                let credential_result = state
+                    .control_token()
+                    .context("owner control token missing")
+                    .and_then(|token| kernel.store().store_token(&token))
+                    .context("publish owner control credential");
+                if let Err(error) = credential_result {
+                    state.close_admission();
+                    api_handle.abort();
+                    signal_task.abort();
+                    return Err(error);
+                }
+                state.set_runtime_kernel(kernel.clone());
+                {
+                    let kernel = kernel.clone();
+                    crate::orchestration_events::install_bridge(Box::new(move |json| {
+                        if let Some(record) = bridge_event_fields(&json) {
+                            kernel.append_orchestration_event(
+                                &record.stage,
+                                record.service,
+                                &record.event_name,
+                                record.payload,
+                            );
+                        }
+                    }));
+                }
+                if let Err(endpoint_error) =
+                    kernel
+                        .store()
+                        .store_endpoint(&crate::runtime_kernel::EndpointRecord {
+                            protocol_version: kernel.identity().protocol_version,
+                            application_id: kernel.identity().application_id.clone(),
+                            workspace_id: kernel.identity().workspace_id.clone(),
+                            runtime_instance_id: kernel.identity().runtime_instance_id.clone(),
+                            address: bound_api_addr,
+                        })
+                {
+                    tracing::warn!("endpoint discovery record publish failed: {endpoint_error:#}");
+                }
+            }
+            Err(error) => {
+                kernel_recovery_hold = true;
+                tracing::error!(
+                    "runtime kernel unavailable ({error:#}); automatic business startup suppressed"
+                );
+            }
+        }
+    }
+    if stop_intent || args.control_only {
+        state
+            .runtime_recovery_hold
+            .fetch_and(1, std::sync::atomic::Ordering::AcqRel);
+    }
+    if stop_intent {
+        let store = crate::runtime_kernel::RuntimeStore::open_with_root(
+            state_root.clone(),
+            &args.workspace,
+        )?;
+        let (_, revision) = store.load_desired()?;
+        store.store_desired(
+            shared_types::DesiredState::Stopped,
+            revision
+                .checked_add(1)
+                .context("desired revision overflow")?,
+        )?;
+    }
+    let mut first_request = if stop_intent {
+        None
+    } else if let Some(error) = startup_error.as_ref() {
+        state.begin_failure(format!("startup shutdown unconfirmed: {error:#}"), true);
+        None
+    } else if kernel_recovery_hold {
+        state.set_phase(ServerPhase::Idle);
+        None
+    } else {
+        match initialize_startup(args, &state).await {
+            Ok(action) => action,
+            Err(error) => {
+                tracing::error!(%error, "Deployment startup reconciliation failed");
+                state.ready.set_ready(false);
+                if state.runtime_recovery_hold_active() {
+                    state.begin_failure(
+                        format!("startup recovery required: {error:#}"),
+                        !state.credentials_only_hold(),
+                    );
+                } else if let Err(persist_error) =
+                    state.fail_operation(format!("deployment startup: {error:#}"), Boundary::Failed)
+                {
+                    state.begin_failure(
+                        format!("deployment startup: {error:#}; persist: {persist_error:#}"),
+                        true,
+                    );
+                }
+                None
+            }
+        }
+    };
+    if ownership_claimed && !kernel_recovery_hold {
+        let mut desired_unreadable = false;
+        let desired = match state
+            .runtime_kernel()
+            .map(|kernel| kernel.store().load_desired())
+        {
+            Some(Ok((desired, _))) => Some(desired),
+            Some(Err(error)) => {
+                tracing::error!(
+                    "desired state unreadable ({error:#}); automatic business recovery suppressed"
+                );
+                desired_unreadable = true;
+                state.set_phase(ServerPhase::Idle);
+                None
+            }
+            None => None,
+        };
+        if desired_unreadable && first_request.is_some() {
+            first_request = None;
+            tracing::error!(
+                "pre-generated startup action discarded: desired state unreadable (R05)"
+            );
+        }
+        if desired == Some(shared_types::DesiredState::Stopped)
+            && matches!(first_request, Some(InitialAction::Existing))
+        {
+            first_request = None;
+            tracing::info!(
+                "desired state is Stopped; automatic business recovery suppressed (staying Idle)"
+            );
+            state.set_phase(ServerPhase::Idle);
+        }
+    }
+
+    if ownership_claimed {
+        state.mark_initialized();
+    }
+
+    state.set_log_layout(if host.is_some() {
+        LogLayout::Supervisord
+    } else {
+        LogLayout::Builtin
+    });
+
+    let result = if let Some(error) = startup_error {
+        state.cancel_token().cancelled().await;
+        tracing::error!(%error, "startup ownership was not claimed; business session ends");
+        Err(error).context("startup ownership was not claimed")
+    } else {
+        let supervised = host.is_some();
+        let driver_args = args.clone();
+        let driver_state = state.clone();
+        let mut driver = tokio::spawn(async move {
+            driver_state
+                .supervision_driver_started
+                .store(true, std::sync::atomic::Ordering::Release);
+            let mut probes = driver_state.supervision_probe_rx.lock().await;
+            let driver = server_loop(&driver_args, &driver_state, host, first_request);
+            tokio::pin!(driver);
+            loop {
+                tokio::select! {
+                    result = &mut driver => break result,
+                    Some(reply) = probes.recv() => { let _sent = reply.send(()); }
+                }
+            }
+        });
+        let mut joined = false;
+        let cancel = state.cancel_token();
+        let (driver_result, shutdown_deadline) = tokio::select! {
+            result = &mut driver => {
+                joined = true;
+                state.close_admission();
+                (result.context("server driver panicked").and_then(|result| result), tokio::time::Instant::now().checked_add(state.shutdown_budget(supervised)).context("shutdown budget exceeds clock range")?)
+            },
+            () = cancel.cancelled() => {
                 let deadline = tokio::time::Instant::now().checked_add(state.shutdown_budget(supervised)).context("shutdown budget exceeds clock range")?;
                 let result = match tokio::time::timeout_at(deadline, &mut driver).await {
                     Ok(result) => { joined = true; result.context("server driver panicked").and_then(|result| result) },
@@ -555,9 +1110,6 @@ pub(super) async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
     state.close_admission();
     api_handle.abort();
     signal_task.abort();
-    // API 运行期故障（监控记录）：即使主循环已正常收尾也按失败退出——
-    // 无管理面的实例不可宣称成功（P1-01）。正常关停路径 api task 被
-    // abort，不会写入故障记录。
     if let Ok(slot) = api_failure.lock()
         && let Some(api_error) = slot.as_ref()
     {
@@ -656,7 +1208,7 @@ pub(super) async fn assemble_runtime_kernel(
         "userapp-dev".to_string(),
         workspace_id,
         source_root,
-        state.generation.clone(),
+        state.generation_value(),
     )?;
     let dispatch_state = state.clone();
     let dispatch_workspace = runtime_state_layout::resolve_project_origin(&args.workspace)
@@ -819,6 +1371,10 @@ pub(super) async fn assemble_runtime_kernel(
                 };
                 if dispatch_state.deploy_tx.send(request).is_err() {
                     tracing::error!("runtime dispatch: deploy channel closed ({operation_id})");
+                } else {
+                    // 统一 owner：受理后若业务会话未在跑（Stopped 后的显式
+                    // 部署/启动），触发会话重建消费该受理。
+                    dispatch_state.request_business_relaunch();
                 }
             }
             DispatchAction::DeployArtifact {
@@ -856,6 +1412,10 @@ pub(super) async fn assemble_runtime_kernel(
                 };
                 if dispatch_state.deploy_tx.send(request).is_err() {
                     tracing::error!("runtime dispatch: deploy channel closed ({operation_id})");
+                } else {
+                    // 统一 owner：受理后若业务会话未在跑（Stopped 后的显式
+                    // 部署/启动），触发会话重建消费该受理。
+                    dispatch_state.request_business_relaunch();
                 }
             }
             DispatchAction::OrchestrateSource {
@@ -890,20 +1450,22 @@ pub(super) async fn assemble_runtime_kernel(
                     if state.settle_cancelled_before_execution(&operation_id).await {
                         return;
                     }
-                    if state
-                        .control_tx
-                        .send(ControlSignal::OrchestrateSource {
-                            operation_id: operation_id.clone(),
-                            dev_profile,
-                            pg,
-                        })
-                        .is_err()
-                    {
-                        hold_unconfirmed(
-                            &state,
-                            format!("runtime control channel closed ({operation_id})"),
-                        )
-                        .await;
+                    match state.control_tx.send(ControlSignal::OrchestrateSource {
+                        operation_id: operation_id.clone(),
+                        dev_profile,
+                        pg,
+                    }) {
+                        Err(_) => {
+                            hold_unconfirmed(
+                                &state,
+                                format!("runtime control channel closed ({operation_id})"),
+                            )
+                            .await;
+                        }
+                        Ok(()) => {
+                            // 统一 owner：同上——受理后确保业务会话在跑。
+                            state.request_business_relaunch();
+                        }
                     }
                 });
             }
@@ -1012,7 +1574,7 @@ pub(super) fn recover_legacy_execution_target(
     let Some(mut receipt) = journal.receipt.clone() else {
         return Ok(());
     };
-    if receipt.generation != state.generation
+    if receipt.generation != state.generation_value()
         || !matches!(
             receipt.boundary,
             Boundary::Active
@@ -1092,8 +1654,8 @@ pub(super) fn restored_runtime_args_inner(
         .and_then(|journal| journal.receipt.clone());
     let mut restored = args.clone();
     if let Some(receipt) = receipt {
-        if receipt.generation != state.generation {
-            if !crate::deploy::deploy_requested() {
+        if receipt.generation != state.generation_value() {
+            if !env_deploy_requested(state) {
                 state.begin_runtime_recovery_hold();
                 anyhow::bail!(
                     "deployment journal generation does not match this owner; explicit deployment required"
@@ -1113,7 +1675,7 @@ pub(super) fn restored_runtime_args_inner(
                     .run_pg
                     .as_ref()
                     .is_some_and(|pg| pg.password.is_empty())
-                && !crate::deploy::deploy_requested()
+                && !env_deploy_requested(state)
             {
                 state.begin_credentials_hold();
                 anyhow::bail!(
@@ -1138,6 +1700,13 @@ pub(super) fn restored_runtime_args_inner(
     Ok(restored)
 }
 
+/// 统一 owner 会话的一次性部署声明门禁：非 fresh 会话（恢复式重启）不消费
+/// APP_DEPLOY_*（等效进程模式在派生 worker 时剥除该组 env 的语义）。
+/// legacy worker/直跑路径的 deploy_inputs_eligible 恒为 true，行为不变。
+fn env_deploy_requested(state: &ServerState) -> bool {
+    state.deploy_inputs_eligible() && crate::deploy::deploy_requested()
+}
+
 pub(super) async fn initialize_startup(
     args: &RuntimeArgs,
     state: &ServerState,
@@ -1149,7 +1718,7 @@ pub(super) async fn initialize_startup(
     let stopped_args = restored_runtime_args_inner(args, state, false)?;
     // Decide automatic recovery before generating Switching. Stopped must not
     // leave a false interrupted-switch journal when no business was started.
-    if !crate::deploy::deploy_requested()
+    if !env_deploy_requested(state)
         && state
             .runtime_kernel()
             .map(|kernel| kernel.store().load_desired())
@@ -1165,7 +1734,7 @@ pub(super) async fn initialize_startup(
         state.begin_runtime_recovery_hold();
         return Err(error).context("database migration requires reconciliation");
     }
-    if crate::deploy::deploy_requested() {
+    if env_deploy_requested(state) {
         let generation = std::env::var(shared_types::APP_DEPLOY_GENERATION_ID)
             .context("APP_DEPLOY_GENERATION_ID is required")?;
         anyhow::ensure!(
@@ -1181,7 +1750,7 @@ pub(super) async fn initialize_startup(
         .context("deployment journal missing")?
         .receipt
         .clone()
-        .filter(|receipt| receipt.generation == state.generation);
+        .filter(|receipt| receipt.generation == state.generation_value());
     if let Some(receipt) = saved.as_ref() {
         let mut status = state
             .deploy_status
@@ -1197,7 +1766,7 @@ pub(super) async fn initialize_startup(
         .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
         .as_ref()
         .context("deployment journal missing")?
-        .resume(&state.generation)
+        .resume(&state.generation_value())
         .inspect_err(|_| state.begin_runtime_recovery_hold())?;
     if let Some(receipt) = resume {
         let release = crate::manifest::read_release_lock(&args.workspace)?;
@@ -1257,7 +1826,7 @@ pub(super) async fn initialize_startup(
         state.set_phase(ServerPhase::Orchestrating);
         return Ok(Some(InitialAction::Existing));
     }
-    if crate::deploy::deploy_requested() {
+    if env_deploy_requested(state) {
         let request = crate::deploy::request_from_env()?;
         let operation_id = std::env::var(shared_types::APP_DEPLOY_OPERATION_ID)
             .context("APP_DEPLOY_OPERATION_ID is required")?;

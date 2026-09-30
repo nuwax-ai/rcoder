@@ -471,6 +471,17 @@ async fn deploy_status(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<DeployStatusQuery>,
 ) -> Response {
+    // Initializing gate (recovery v2 T1b): during startup recovery/fencing, the
+    // deployment state machine has not been reconstructed yet — answering
+    // "idle" would misreport recovery as complete. Management identity, health
+    // and control stay available; callers retry like the cold-start window.
+    if state.server.initializing() {
+        return envelope::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ERR_INITIALIZING",
+            "runtime owner is initializing",
+        );
+    }
     if let Some(id) = query.operation_id {
         let current = state.server.deploy_status();
         if current
@@ -838,6 +849,16 @@ mod tests {
         assert_eq!(body["data"]["reason_code"], "SERVICE_STARTING");
     }
 
+    /// T1b 反例锁：启动恢复/围栏窗口内 deploy/status 不得谎报 idle——
+    /// 200+idle 会把"围栏未清"误判为"恢复完成"（serve_restart 语义）。
+    #[tokio::test]
+    async fn deploy_status_gated_while_initializing() {
+        let state = test_state();
+        let (status, body) = call(&state, "GET", "/v1/deploy/status", "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "ERR_INITIALIZING");
+    }
+
     /// sources/query 端点信封：idle 态编排器内置源（app-cli/orchestrator）可见
     /// ——空容器排障正是该源的核心场景。
     #[tokio::test]
@@ -960,6 +981,7 @@ mod tests {
     #[tokio::test]
     async fn deploy_status_envelope() {
         let state = test_state();
+        state.server.mark_initialized();
         let (status, body) = call(&state, "GET", "/v1/deploy/status", "").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["code"], "0000");
@@ -973,6 +995,7 @@ mod tests {
     #[tokio::test]
     async fn deploy_status_phase_wire_matrix() {
         let state = test_state();
+        state.server.mark_initialized();
         state
             .server
             .set_phase(crate::server::ServerPhase::Deploying);
@@ -998,6 +1021,7 @@ mod tests {
     #[tokio::test]
     async fn deploy_status_request_release_id_wire() {
         let state = test_state();
+        state.server.mark_initialized();
         // 无请求方：字段不出现在 wire
         let (status, body) = call(&state, "GET", "/v1/deploy/status", "").await;
         assert_eq!(status, StatusCode::OK);

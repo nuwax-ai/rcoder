@@ -522,8 +522,8 @@ format = "jsonl"
             toml::to_string(&artifact).unwrap(),
         )
         .unwrap();
-        let mut first = state();
-        first.generation = "generation-a".into();
+        let first = state();
+        first.set_generation("generation-a".to_string());
         *first.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
         first
             .try_accept_deploy_with_id(request(), "hot-b".into())
@@ -532,8 +532,8 @@ format = "jsonl"
         first.complete_stage().unwrap();
         first.complete_running().unwrap();
         drop(first);
-        let mut restarted = state();
-        restarted.generation = "generation-a".into();
+        let restarted = state();
+        restarted.set_generation("generation-a".to_string());
         *restarted.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
         let args = RuntimeArgs {
             workspace,
@@ -561,8 +561,8 @@ format = "jsonl"
             toml::to_string(&release("unattached-a")).unwrap(),
         )
         .unwrap();
-        let mut first = state();
-        first.generation = "cold-generation".into();
+        let first = state();
+        first.set_generation("cold-generation".to_string());
         *first.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
         first
             .try_accept_deploy_with_id(request(), "failed-cold".into())
@@ -571,8 +571,8 @@ format = "jsonl"
             .fail_operation("download failed".into(), Boundary::Preparing)
             .unwrap();
         drop(first);
-        let mut restarted = state();
-        restarted.generation = "cold-generation".into();
+        let restarted = state();
+        restarted.set_generation("cold-generation".to_string());
         *restarted.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
         let args = RuntimeArgs {
             workspace,
@@ -598,8 +598,8 @@ format = "jsonl"
             toml::to_string(&artifact).unwrap(),
         )
         .unwrap();
-        let mut first = state();
-        first.generation = "existing-generation".into();
+        let first = state();
+        first.set_generation("existing-generation".to_string());
         *first.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
         let args = RuntimeArgs {
             workspace: workspace.clone(),
@@ -619,8 +619,8 @@ format = "jsonl"
             .fail_operation("invalid B".into(), Boundary::Preparing)
             .unwrap();
         drop(first);
-        let mut restarted = state();
-        restarted.generation = "existing-generation".into();
+        let restarted = state();
+        restarted.set_generation("existing-generation".to_string());
         *restarted.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
         assert!(matches!(
             initialize_startup(&args, &restarted).await.unwrap(),
@@ -645,8 +645,8 @@ format = "jsonl"
         assert_eq!(receipt.active.unwrap().artifact_release_id, "existing-a");
         assert_eq!(receipt.operation.phase, AppCliDeployPhase::Failed);
         drop(restarted);
-        let mut second_restart = state();
-        second_restart.generation = "existing-generation".into();
+        let second_restart = state();
+        second_restart.set_generation("existing-generation".to_string());
         *second_restart.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
         assert!(matches!(
             initialize_startup(&args, &second_restart).await.unwrap(),
@@ -670,8 +670,8 @@ format = "jsonl"
             toml::to_string(&artifact).unwrap(),
         )
         .unwrap();
-        let mut first = state();
-        first.generation = "old-generation".into();
+        let first = state();
+        first.set_generation("old-generation".to_string());
         *first.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
         first
             .try_accept_deploy_with_id(request(), "foreign-failed-b".into())
@@ -681,8 +681,8 @@ format = "jsonl"
             .unwrap();
         drop(first);
         let before = std::fs::read(dir.path().join(".deploy-operation.json")).unwrap();
-        let mut restarted = state();
-        restarted.generation = "new-generation".into();
+        let restarted = state();
+        restarted.set_generation("new-generation".to_string());
         *restarted.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
         let args = RuntimeArgs {
             workspace,
@@ -703,16 +703,16 @@ format = "jsonl"
     async fn startup_interrupted_switch_retains_operation_for_error_reporting() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("code");
-        let mut first = state();
-        first.generation = "generation-a".into();
+        let first = state();
+        first.set_generation("generation-a".to_string());
         *first.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
         first
             .try_accept_deploy_with_id(request(), "switch-b".into())
             .unwrap();
         first.persist_boundary(Boundary::Switching).unwrap();
         drop(first);
-        let mut restarted = state();
-        restarted.generation = "generation-a".into();
+        let restarted = state();
+        restarted.set_generation("generation-a".to_string());
         *restarted.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
         let args = RuntimeArgs {
             workspace,
@@ -1045,7 +1045,7 @@ format = "jsonl"
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .resume(&state.generation)
+                .resume(&state.generation_value())
                 .is_err()
         );
     }

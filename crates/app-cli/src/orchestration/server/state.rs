@@ -21,7 +21,9 @@ pub struct ServerState {
     pub(super) journal: std::sync::Mutex<Option<Journal>>,
     /// Legacy run/tests have no durable journal; preserve same-process replays.
     pub(super) volatile_deploy_replays: std::sync::Mutex<super::deploy_replay::History>,
-    pub(super) generation: String,
+    /// 统一 owner（recovery v2）：业务会话代次 id。跨会话可重置（RwLock），
+    /// 读取方经 [`ServerState::generation_value`]。
+    pub(super) generation: RwLock<String>,
     pub(super) phase: RwLock<ServerPhase>,
     pub(super) release: RwLock<Option<ReleaseLock>>,
     pub(super) ready: RuntimeStatusService,
@@ -30,7 +32,9 @@ pub struct ServerState {
     /// 热部署受理通道（api 端点 → 主循环）。
     pub(super) deploy_tx: tokio::sync::mpsc::UnboundedSender<DeployRequest>,
     pub(super) deploy_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<DeployRequest>>,
-    pub(super) cancel: CancellationToken,
+    /// 统一 owner：跨业务会话可续期（会话结束即换新），避免一次取消永久
+    /// 卡死后续会话。访问经 [`ServerState::cancel_token`] 系列方法。
+    pub(super) cancel: RwLock<CancellationToken>,
     /// 日志布局（跟随服务托管引擎；serve 探测后设置，legacy 默认 Builtin）。
     pub(super) log_layout: RwLock<LogLayout>,
     /// 运行操作内核槽位（阶段二：serve 在 ownership 认领后注入；legacy 形态
@@ -64,6 +68,13 @@ pub struct ServerState {
         tokio::sync::Mutex<tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<()>>>,
     /// 当前执行中的运行操作 ID（dispatch 写入，主循环边界收束）。
     pub(super) current_runtime_operation: RwLock<Option<String>>,
+    /// 统一 owner（recovery v2）：本业务会话是否允许消费一次性部署声明
+    /// env（APP_DEPLOY_*）。恢复式重启必须为 false——进程内无法像进程模式
+    /// 那样在派生时剥除 env，以该标志等效门禁。
+    pub(super) deploy_inputs_eligible: std::sync::atomic::AtomicBool,
+    /// 统一 owner：业务重启通知（运行操作受理后，若当前无业务会话在跑，
+    /// 经此触发会话重建）。由 owner 装配时注入。
+    pub(super) business_relaunch: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 pub(crate) struct AuxiliaryWriter<'a> {
@@ -149,8 +160,9 @@ impl runtime_supervisor::WorkerControl for ServerState {
     }
     async fn shutdown(&self) -> Result<()> {
         // Physical shutdown cannot wait forever for a business admission lock.
-        // The parent retains the real execution handle if this path is stuck.
-        self.cancel.cancel();
+        // The retained driver handle or an external supervisor owns the
+        // precise termination path if this hangs.
+        self.trigger_cancel();
         let _guard = self
             .admission
             .try_lock()
@@ -173,6 +185,68 @@ pub enum ServerPhase {
     Running,
     /// 最近一次部署/编排失败（现场保留，可再次部署）。
     Failed(String),
+}
+
+impl ServerState {
+    /// 当前业务会话代次（快照读取）。
+    pub(crate) fn generation_value(&self) -> String {
+        self.generation
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// 覆写会话代次（journal 回执延续；统一 owner 会话以启动代次为准）。
+    pub(crate) fn set_generation(&self, generation: String) {
+        *self
+            .generation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = generation;
+    }
+
+    /// 当前取消令牌（克隆共享同一来源；跨 await 持有请先 clone）。
+    pub(crate) fn cancel_token(&self) -> CancellationToken {
+        self.cancel
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn cancel_child_token(&self) -> CancellationToken {
+        self.cancel_token().child_token()
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel_token().is_cancelled()
+    }
+
+    pub(crate) fn trigger_cancel(&self) {
+        self.cancel
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancel();
+    }
+
+    /// 换新取消令牌（业务会话 re-arm 专用；须在 admission 锁内调用）。
+    pub(super) fn renew_cancel_locked(&self) {
+        *self
+            .cancel
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = CancellationToken::new();
+    }
+
+    /// 统一 owner：本会话是否允许消费一次性部署声明 env。
+    pub(crate) fn deploy_inputs_eligible(&self) -> bool {
+        self.deploy_inputs_eligible
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// 统一 owner：通知 owner 会话重建业务（运行操作已受理但无会话在跑）。
+    pub(crate) fn request_business_relaunch(&self) {
+        if let Some(notify) = self.business_relaunch.get() {
+            notify();
+        }
+    }
 }
 
 impl ServerPhase {

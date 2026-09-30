@@ -10,6 +10,7 @@ mod guardian;
 mod monitor;
 mod record;
 mod recovery;
+mod session;
 mod worker;
 
 pub use cleanup::CleanupCommand;
@@ -23,6 +24,9 @@ pub use recovery::{
     StopMode, StopRefused, StopWorkAttempt, continue_stop_work, continue_stop_work_with_checkpoint,
     continue_stop_work_with_cleanup, is_stop_refused, prepare_stop_work, stop_work,
     stop_work_with_cleanup,
+};
+pub use session::{
+    BusinessFactory, BusinessLaunch, BusinessRun, FenceState, OwnerSession, SessionOptions,
 };
 pub use worker::{Worker, WorkerControl};
 

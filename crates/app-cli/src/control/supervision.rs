@@ -1,7 +1,7 @@
 //! app-cli adapter for the common local supervisor. Business journals remain
 //! owned by the worker; the parent only records process-control intent.
 use anyhow::Result;
-use runtime_supervisor::{Action, Options, Owner, Request, Worker};
+use runtime_supervisor::{Action, Owner, Request, Worker};
 use std::path::{Path, PathBuf};
 
 /// Interactive service shutdown grace, shared by both execution engines.
@@ -102,48 +102,64 @@ pub fn scope(workspace: &Path) -> Result<PathBuf> {
         .unwrap_or_else(|| "unknown-app".into());
     crate::runtime_kernel::RuntimeStore::resolve_root(workspace, &app)
 }
-/// None means authenticated worker or an existing owner handled by dispatch.
-pub async fn supervise(args: &crate::RuntimeArgs, restart_on_exit: bool) -> Result<Option<i32>> {
+/// serve/run 进入统一 owner 监督的分类结果（recovery v2 T1b）。
+pub enum SupervisionOutcome {
+    /// 旧版 owner 派生的 worker 子进程或 attach 回退：调用方直接运行业务
+    /// 主体，不再获取锁。
+    Legacy,
+    /// 锁被活进程持有：调用方分派到既有 owner 的管理 API。
+    Dispatch,
+    /// 本进程成为统一 owner：管理 API 与业务编排同进程承载。
+    Owner(std::sync::Arc<runtime_supervisor::OwnerSession>),
+}
+
+/// 统一 owner 获取（recovery v2 plan §5.2）：持锁进程直接承载原生控制
+/// 会话、发现登记、代次回执与业务编排——不再派生 guardian+worker 子进程
+/// 对承载管理 API。围栏/Stopped/恢复期间管理面保持可用。
+///
+/// None 语义由 [`SupervisionOutcome`] 表达；进程信号（TERM/Ctrl-C）续接到
+/// 会话的 shutdown 令牌。
+pub async fn supervise(
+    args: &crate::RuntimeArgs,
+    restart_on_exit: bool,
+) -> Result<SupervisionOutcome> {
     if args.attach {
-        return Ok(None);
+        return Ok(SupervisionOutcome::Legacy);
     }
     let root = scope(&args.workspace)?;
     if Worker::from_env(&root).await?.is_some() {
-        return Ok(None);
+        return Ok(SupervisionOutcome::Legacy);
     }
     let Some(owner) = Owner::try_acquire(&root)? else {
-        return Ok(None);
+        return Ok(SupervisionOutcome::Dispatch);
     };
-    let mut options = Options::new(std::env::args_os().skip(1).collect());
-    options.binding = Some(runtime_supervisor::Binding {
-        component: "app-cli".into(),
-        resource: runtime_state_layout::resolve_project_origin(&args.workspace)?,
-    });
-    options.restart_on_exit = restart_on_exit;
-    options.external_cleanup_args = Some(vec!["--app-cli-cleanup-engine".into()]);
-    options.recovery_remove_env = [
-        "APP_DEPLOY_URL",
-        "APP_RELEASE_ID",
-        "APP_DEPLOY_SHA256",
-        "APP_DEPLOY_OPERATION_ID",
-        "APP_DEPLOY_GENERATION_ID",
-    ]
-    .into_iter()
-    .map(Into::into)
-    .collect();
     // Interactive controls must not inherit long per-service shutdown budgets.
-    // After 3s the guardian terminates the captured worker; owned command
-    // guardians then stop their trees and publish cleanup receipts.
-    options.policy.graceful_stop = std::time::Duration::from_secs(STOP_GRACE_SECONDS);
-    options.policy.negotiate_shutdown_grace = false;
-    let cancel = options.shutdown.clone();
-    let signals = tokio::spawn(async move {
+    // After 3s the cooperative stop records its bounded problem instead of
+    // manufacturing success.
+    let policy = runtime_supervisor::Policy {
+        graceful_stop: std::time::Duration::from_secs(STOP_GRACE_SECONDS),
+        negotiate_shutdown_grace: false,
+        ..Default::default()
+    };
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let cancel = shutdown.clone();
+    tokio::spawn(async move {
         tokio::select! { () = crate::supervisor::sigterm_watch() => {}, _ = tokio::signal::ctrl_c() => {} }
         cancel.cancel();
     });
-    let result = owner.run(options).await;
-    signals.abort();
-    result.map(Some)
+    let options = runtime_supervisor::SessionOptions {
+        binding: runtime_supervisor::Binding {
+            component: "app-cli".into(),
+            resource: runtime_state_layout::resolve_project_origin(&args.workspace)?,
+        },
+        policy,
+        cleanup_adapter: Some(cleanup_command()?),
+        restart_on_exit,
+        shutdown,
+    };
+    let session =
+        std::sync::Arc::new(runtime_supervisor::OwnerSession::start(owner, options).await?);
+    Ok(SupervisionOutcome::Owner(session))
 }
 pub async fn control(args: &crate::config::OwnerArgs) -> Result<()> {
     let action = match args.action {

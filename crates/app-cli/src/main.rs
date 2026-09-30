@@ -57,9 +57,9 @@ async fn run() -> anyhow::Result<()> {
         }
         app_cli::config::Command::Serve(args) => {
             let runtime = app_cli::RuntimeArgs::from(args);
-            if let Some(code) = app_cli::supervision::supervise(&runtime, true).await? {
-                std::process::exit(code);
-            }
+            // tracing 先于监督（recovery v2 plan §9）：owner 進入恢复围栏时仍
+            // 要有 stderr/文件日志——围栏判定发生在监督内部，事后初始化的
+            // 日志链什么都看不到（app 11 零日志排障代价的教训）。
             let _guard = init_tracing(&runtime.log_dir);
             return app_cli::server::serve(&runtime).await;
         }
@@ -97,10 +97,17 @@ async fn run() -> anyhow::Result<()> {
         }
         app_cli::config::Command::Run(args) => app_cli::RuntimeArgs::from(args),
     };
-    if let Some(code) = app_cli::supervision::supervise(&args, false).await? {
-        std::process::exit(code);
-    }
+    // tracing 先于监督（同 Serve 分支注释）：run 的 owner 围栏/清理阶段
+    // 同样需要早期日志。
     let _guard = init_tracing(&args.log_dir);
+    // 统一 owner（recovery v2）：run 的 owner 路径与 serve 同构——持锁进程
+    // 承载管理面 + 业务会话（restart_on_exit=false：前台退出码语义）。
+    // Dispatch = 锁被持有，走下方既有分派块；Legacy = 旧版 owner 派生的
+    // worker 子进程，直接进入本地业务主体。
+    let owner_session = match app_cli::supervision::supervise(&args, false).await? {
+        app_cli::supervision::SupervisionOutcome::Owner(session) => Some(session),
+        _ => None,
+    };
 
     // ── run 前台服务会话：持续编排与监督，直到停止或退出 ──
     let runtime_status = app_cli::runtime_status::RuntimeStatusService::default();
@@ -117,6 +124,18 @@ async fn run() -> anyhow::Result<()> {
     // 已有 serve owner（锁被活进程持有）→ 转交唯一 owner（运行 API 提交
     // Start 并等终态）；身份不符/协议不兼容/凭据缺失 → 明确拒绝；无人持锁
     // → 本地 legacy 编排（持锁运行，后续 CLI 同样被分派或拒绝）。
+    // 统一 owner 路径（recovery v2）在上方提前返回：run_owner_serve 与
+    // serve 同构承载管理面与业务会话。
+    if let Some(session) = owner_session {
+        let application_id = std::env::var("PROJECT_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "unknown-app".to_string());
+        let state_root =
+            app_cli::runtime_kernel::RuntimeStore::resolve_root(&args.workspace, &application_id)?;
+        return app_cli::server::run_owner_serve(&args, state_root, application_id, session, true)
+            .await;
+    }
     let _owner_guard = {
         let application_id = std::env::var("PROJECT_ID")
             .ok()

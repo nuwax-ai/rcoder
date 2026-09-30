@@ -113,6 +113,19 @@ const DB_CREDENTIAL_ENV_KEYS: [&str; 9] = [
     "DATABASE_URL",
 ];
 
+/// 容器执行域族透传白名单：app-cli 编排器的容器身份判定所需（跨容器
+/// 前代次分类、Pod UID 域章解析、pingap 版本门禁）。这些变量是容器级
+/// 事实（子进程与父进程同容器），不存在按项目身份取舍的问题——缺
+/// `RCODER_EXECUTION_DOMAIN` 时子编排器把带域章的旧 Running 代次误判为
+/// 本容器残留，落入 cleanup_unconfirmed 围栏（app 11 事故根因，recovery
+/// v2 plan §6.1 过渡桥）。
+const EXECUTION_DOMAIN_ENV_KEYS: [&str; 4] = [
+    "RCODER_EXECUTION_DOMAIN",
+    "RCODER_PHYSICAL_POD_UID",
+    "RCODER_PINGAP_VERSION",
+    "RCODER_PINGAP_COMMIT",
+];
+
 /// 最小化 env (对齐 nuwax: PATH + NODE_ENV=development + extra; 补 HOME 供 pnpm cache;
 /// 透传数据库凭据族——dev 形态与生产形态的取数行为对齐)。
 ///
@@ -147,6 +160,11 @@ fn minimal_env_with_source(
         push_override(&mut env, "HOME", h);
     }
     for key in DB_CREDENTIAL_ENV_KEYS {
+        if let Some(v) = passthrough(key) {
+            push_override(&mut env, key, v);
+        }
+    }
+    for key in EXECUTION_DOMAIN_ENV_KEYS {
         if let Some(v) = passthrough(key) {
             push_override(&mut env, key, v);
         }
@@ -601,6 +619,40 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "APP_CLI_RUN_PROFILE" && v == "dev")
         );
+    }
+
+    /// 反例锁（app 11 事故根因）：容器执行域变量在父 env 存在时必须透传给
+    /// 编排器子进程——修复前白名单缺这组键，`env_clear` 后子 app-cli 的
+    /// `PhysicalDomain::from_env()` 返回 None，带域章的旧 Running 代次不被
+    /// 识别为前容器历史，owner 落入 cleanup_unconfirmed 围栏且零日志。
+    #[test]
+    fn minimal_env_passes_through_execution_domain_identity() {
+        use super::minimal_env_with_source;
+
+        const DOMAIN_JSON: &str = r#"{"authority":"k8s:b48f","instance":"","instance_source_env":"RCODER_PHYSICAL_POD_UID","volume":"pvc:ws"}"#;
+        let passthrough = |k: &str| match k {
+            "RCODER_EXECUTION_DOMAIN" => Some(DOMAIN_JSON.to_string()),
+            "RCODER_PHYSICAL_POD_UID" => Some("340e6388-e747-443d-8019-e029b3d9cc55".to_string()),
+            _ => None,
+        };
+        let env = minimal_env_with_source(&[], passthrough);
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "RCODER_EXECUTION_DOMAIN" && v == DOMAIN_JSON),
+            "执行域必须透传: {env:?}"
+        );
+        assert!(
+            env.iter().any(|(k, v)| k == "RCODER_PHYSICAL_POD_UID"
+                && v == "340e6388-e747-443d-8019-e029b3d9cc55"),
+            "Pod UID 必须透传: {env:?}"
+        );
+
+        // 父 env 不含域变量（standalone/宿主机）：不注入空值、不改变结构。
+        let absent = minimal_env_with_source(&[], |k| match k {
+            "PATH" => Some("/usr/bin".to_string()),
+            _ => None,
+        });
+        assert!(absent.iter().all(|(k, _)| !k.starts_with("RCODER_")));
     }
 
     /// extra 覆盖白名单透传值（last-wins 契约）：save-db-credential 改密后

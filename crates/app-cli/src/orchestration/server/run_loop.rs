@@ -296,7 +296,7 @@ pub(super) async fn hold_unconfirmed(state: &ServerState, error: String) {
     state.ready.set_ready(false);
     state.begin_failure(error.clone(), true);
     tracing::error!(%error, "Deployment remains pending until process shutdown is confirmed; operator recovery required");
-    state.cancel.cancelled().await;
+    state.cancel_token().cancelled().await;
 }
 
 pub(super) async fn fail_activation(
@@ -525,7 +525,7 @@ pub(super) async fn server_loop(
     };
     let args = &mut active_args;
     loop {
-        if state.cancel.is_cancelled() {
+        if state.is_cancelled() {
             return Ok(());
         }
         // 取下一个动作：有待处理的直接用，否则挂 Idle 等受理/信号
@@ -563,11 +563,11 @@ pub(super) async fn server_loop(
                                     Some(req) => Some(InitialAction::Deploy(req)),
                                     None => return Ok(()),
                                 },
-                                () = state.cancel.cancelled() => return Ok(()),
+                                () = async { state.cancel_token().cancelled().await } => return Ok(()),
                             }
                         }
                     },
-                    () = state.cancel.cancelled() => return Ok(()),
+                    () = async { state.cancel_token().cancelled().await } => return Ok(()),
                 };
                 // control/防御分支产出 Option；展开为统一 InitialAction
                 match action {
@@ -728,7 +728,7 @@ pub(super) async fn server_loop(
             }
             InitialAction::Existing => None,
         };
-        if state.cancel.is_cancelled() {
+        if state.is_cancelled() {
             return Ok(());
         }
         if state.current_operation_cancelled() {
@@ -794,7 +794,7 @@ pub(super) async fn server_loop(
 
         // ── 引擎分派：supervisord 托管（编排完成即返回，服务由 supervisord
         // per-service 重启）与 builtin（编排+supervise 阻塞在同一 task）──
-        if state.cancel.is_cancelled() {
+        if state.is_cancelled() {
             return Ok(());
         }
         // R08：本次操作的 dev profile（Source 形态编排显式传递；未指定 =
@@ -815,7 +815,7 @@ pub(super) async fn server_loop(
                 ));
                 continue;
             };
-            let orchestration_cancel = state.cancel.child_token();
+            let orchestration_cancel = state.cancel_child_token();
             let orchestration = host.orchestrate(
                 args,
                 &release,
@@ -837,7 +837,7 @@ pub(super) async fn server_loop(
                     orchestration_cancel.cancel();
                     (&mut orchestration).await
                 }
-                () = state.cancel.cancelled() => {
+                () = async { state.cancel_token().cancelled().await } => {
                     orchestration_cancel.cancel();
                     (&mut orchestration).await
                 }
@@ -871,7 +871,7 @@ pub(super) async fn server_loop(
                 pending = Some(settle_stopped_startup(args, state, signal, reason).await);
                 continue;
             }
-            if state.cancel.is_cancelled() {
+            if state.is_cancelled() {
                 host.stop_all().await?;
                 if let Err(error) = outcome
                     && error
@@ -985,7 +985,7 @@ pub(super) async fn server_loop(
                     }
                     None => Next::Wait,
                 },
-                () = state.cancel.cancelled() => Next::Exit,
+                () = async { state.cancel_token().cancelled().await } => Next::Exit,
             };
             drop(control_rx);
             match next {
@@ -1012,7 +1012,7 @@ pub(super) async fn server_loop(
 
         // builtin：编排 supervise（可被下一次部署请求打断：cancel → 停服 → 回
         // Deploying）；编排完成进 supervise 时经 on_running 通知 → 相位切 Running。
-        let cancel = state.cancel.child_token();
+        let cancel = state.cancel_child_token();
         let runtime_status = state.runtime_status();
         let (running_tx, mut running_rx) = tokio::sync::oneshot::channel::<()>();
         let mut sup = tokio::spawn(supervisor::run_with_cancel(
@@ -1160,7 +1160,7 @@ pub(super) async fn server_loop(
                 }
                 None => Next::Wait,
             },
-                    () = state.cancel.cancelled() => {
+                    () = async { state.cancel_token().cancelled().await } => {
                         cancel.cancel();
                         join_supervisor(&mut sup, &mut sup_joined).await?;
                         Next::Exit
@@ -1194,7 +1194,7 @@ pub(super) async fn server_loop(
                     None => Next::Exit,
                 }
             },
-            () = state.cancel.cancelled() => {
+            () = async { state.cancel_token().cancelled().await } => {
                 cancel.cancel();
                 join_supervisor(&mut sup, &mut sup_joined).await?;
                 Next::Exit

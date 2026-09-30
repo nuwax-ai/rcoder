@@ -59,5 +59,7 @@ mod tests;
 // 私有 glob 仅供 mod.rs 作用域（子模块经 `use super::*` 互见）。
 use run_loop::*;
 pub use serve::*;
+/// run 命令的统一 owner 入口（recovery v2）：与 serve 同构，供 main 分流。
+pub use startup::owner_serve as run_owner_serve;
 use startup::*;
 pub use state::*;

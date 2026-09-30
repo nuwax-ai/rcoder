@@ -138,13 +138,9 @@ pub(super) async fn recovery(
 pub(super) async fn identity(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if state.server.initializing() {
-        return Err(reject(
-            "ERR_INITIALIZING",
-            "runtime owner is initializing",
-            StatusCode::SERVICE_UNAVAILABLE,
-        ));
-    }
+    // Management identity answers as soon as the runtime kernel is assembled
+    // (recovery v2 T1b: identity availability must not depend on business
+    // recovery). A degraded owner without a kernel still reports its reason.
     let kernel = kernel_of(&state)?;
     let identity = kernel.identity().clone();
     Ok(Json(

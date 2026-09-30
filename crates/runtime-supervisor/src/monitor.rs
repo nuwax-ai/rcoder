@@ -78,6 +78,10 @@ pub struct Owner {
     root: PathBuf,
 }
 impl Owner {
+    /// Canonical scope root this owner lock protects.
+    pub(crate) fn scope_root(&self) -> &Path {
+        &self.root
+    }
     /// Resolve an offline target while holding its owner lock. If discovery was
     /// lost or damaged, publish a nonterminal identity before a caller persists
     /// its Stop intent; this does not claim that execution has been cleaned up.
@@ -264,7 +268,10 @@ impl Owner {
 
     /// Discovery locates the management endpoint; generation receipts prove
     /// process cleanup. Only the owner-lock holder may rebuild discovery.
-    fn load_discovery(&self, binding: &control::Binding) -> Result<(Option<Discovery>, bool)> {
+    pub(crate) fn load_discovery(
+        &self,
+        binding: &control::Binding,
+    ) -> Result<(Option<Discovery>, bool)> {
         let path = self.root.join("supervisor.json");
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
@@ -317,6 +324,12 @@ impl Owner {
     pub async fn run(self, options: Options) -> Result<i32> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let instance = uuid::Uuid::new_v4().to_string();
+        tracing::info!(
+            root = %self.root.display(),
+            supervisor = %instance,
+            control = %listener.local_addr()?,
+            "supervisor owner starting"
+        );
         let binding = options.binding.clone().unwrap_or(control::Binding {
             component: "runtime".into(),
             resource: self.root.clone(),
@@ -436,7 +449,7 @@ impl Owner {
     }
 }
 
-fn preserve_discovery(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn preserve_discovery(path: &Path, bytes: &[u8]) -> Result<()> {
     let backup = path.with_extension(format!("corrupt-{}.json", uuid::Uuid::new_v4().simple()));
     let parent = path.parent().context("discovery parent missing")?;
     // Keep discovery readable until persist atomically replaces it. Moving it
@@ -483,7 +496,7 @@ fn inactive_discovery(binding: control::Binding) -> Discovery {
 /// other domain exited. Local process-space leftovers
 /// from THIS process space (owner crash with unchanged PID 1) keep recovery
 /// semantics. A container restart with a new PID 1 is a fresh platform launch.
-fn initial_recovery_launch(
+pub(crate) fn initial_recovery_launch(
     root: &Path,
     old: Option<&Discovery>,
     current: Option<&crate::domain::PhysicalDomain>,
@@ -497,7 +510,7 @@ fn initial_recovery_launch(
 /// A control request targets one container's captured process tree. Preserve
 /// its unknown result as history, but never replay an old Shutdown or let its
 /// pending operation occupy the replacement container's management slot.
-fn detach_previous_container_control(
+pub(crate) fn detach_previous_container_control(
     root: &Path,
     discovery: &mut Discovery,
     current: Option<&crate::domain::PhysicalDomain>,
@@ -750,6 +763,16 @@ impl State {
             } else {
                 Phase::RecoveryRequired
             };
+            // 围栏转换必须落日志（recovery v2 plan §9）：调用方已把 tracing
+            // 初始化提前到监督之前，这里不再有零日志围栏。
+            tracing::error!(
+                root = %self.root.display(),
+                supervisor = %self.discovery.instance,
+                phase = ?self.discovery.snapshot.phase,
+                generation = ?self.discovery.snapshot.generation,
+                "supervisor reconciliation fence: {}",
+                problem.message
+            );
             self.discovery.snapshot.error = Some(problem.message.clone());
             self.discovery.snapshot.problem = Some(problem);
             self.persist()?;
