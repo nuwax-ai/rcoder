@@ -42,12 +42,15 @@ def main():
                 'exec /usr/lib/postgresql/16/bin/postgres -D /tmp/probedata -p 5549 -k /tmp',
             ], check=True, stdout=subprocess.DEVNULL)
             created = True
-            for _ in range(100):
+            # 真实 PG16 镜像内 initdb 含 fsync 全量落盘：实测可达 60-80s
+            # （2026-09-30 本机 cold cache），20s 硬窗会误杀正常夹具。
+            deadline = time.monotonic() + int(os.environ.get('RCODER_PG_FIXTURE_TIMEOUT', '300'))
+            while time.monotonic() < deadline:
                 ready = subprocess.run(['docker', 'exec', name, 'psql', '-h', '/tmp', '-p', '5549',
                                         '-U', 'fixture', '-d', 'postgres', '-Atc', 'SELECT 1'], capture_output=True)
                 if ready.returncode == 0:
                     break
-                time.sleep(.2)
+                time.sleep(.5)
             else:
                 raise RuntimeError('PostgreSQL fixture did not start')
             # Native helper invokes real psql in the isolated container. Forward
