@@ -7,10 +7,18 @@ use std::path::{Path, PathBuf};
 /// Interactive service shutdown grace, shared by both execution engines.
 pub(crate) const STOP_GRACE_SECONDS: u64 = 3;
 
+pub(crate) fn cleanup_command() -> Result<runtime_supervisor::CleanupCommand> {
+    Ok(runtime_supervisor::CleanupCommand {
+        program: std::env::current_exe()?,
+        args: vec!["--app-cli-cleanup-engine".into()],
+        cwd: std::env::current_dir()?,
+    })
+}
+
 /// Called by the retained guardian, including after a stuck worker is killed.
 pub async fn cleanup_external_engine() -> Result<()> {
     use anyhow::Context;
-    runtime_supervisor::verify_cleanup_callback()?;
+    let _cleanup = runtime_supervisor::verify_cleanup_callback()?;
     let root = std::env::var_os("RCODER_SUPERVISOR_CLEANUP_ROOT")
         .context("cleanup callback root missing")?;
     crate::supervisord_host::SupervisordHost::cleanup_generation(Path::new(&root)).await
@@ -156,7 +164,7 @@ pub async fn control(args: &crate::config::OwnerArgs) -> Result<()> {
             match Owner::try_acquire(&root)? {
                 Some(owner) => {
                     owner
-                        .stop_offline(
+                        .stop_offline_with_cleanup(
                             &runtime_supervisor::Binding {
                                 component: "app-cli".into(),
                                 resource: runtime_state_layout::resolve_project_origin(
@@ -164,6 +172,7 @@ pub async fn control(args: &crate::config::OwnerArgs) -> Result<()> {
                                 )?,
                             },
                             &request,
+                            &cleanup_command()?,
                         )
                         .await?
                 }

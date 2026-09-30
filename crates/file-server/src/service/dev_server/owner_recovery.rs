@@ -204,6 +204,7 @@ impl DevServerManager {
         let origin = runtime_state_layout::resolve_project_origin(workspace)?;
         let mut diagnostic = None;
         let mut resumed_shutdown = false;
+        let mut recovery_request: Option<(String, runtime_supervisor::Request)> = None;
         let result = tokio::time::timeout(Duration::from_secs(45), async {
             loop {
                 // Check the winner first: another managed supervisor can win the
@@ -236,7 +237,37 @@ impl DevServerManager {
                     );
                     diagnostic = Some(snapshot.diagnostic());
                     if snapshot.phase == runtime_supervisor::Phase::RecoveryRequired {
-                        return Err(snapshot.recovery_error());
+                        // A persisted failure describes the previous attempt.
+                        // Ask this exact supervisor/generation to reassess once;
+                        // it owns the worker-exit and cleanup proof. Lost replies
+                        // reuse the same request, never restart a replacement.
+                        if snapshot.problem.as_ref().is_none_or(|problem| {
+                            problem.code != runtime_supervisor::FailureCode::CleanupUnconfirmed
+                        }) || recovery_request.as_ref().is_some_and(|(_, request)| {
+                            snapshot.operation_id.as_deref() == Some(&request.request_id)
+                        }) {
+                            return Err(snapshot.recovery_error());
+                        }
+                        let (instance, request) = recovery_request.get_or_insert_with(|| {
+                            let mut request = runtime_supervisor::Request::new(
+                                runtime_supervisor::Action::Recover,
+                            );
+                            request.expected_generation = snapshot.generation.clone();
+                            (snapshot.supervisor_id.clone(), request)
+                        });
+                        if let Err(error) =
+                            runtime_supervisor::control_verified(root, request.clone(), instance)
+                                .await
+                        {
+                            if let Some(problem) =
+                                error.downcast_ref::<runtime_supervisor::Problem>()
+                                && problem.code != runtime_supervisor::FailureCode::Busy
+                            {
+                                return Err(error);
+                            }
+                            diagnostic =
+                                Some(format!("recovery request awaiting confirmation: {error:#}"));
+                        }
                     }
                 }
                 let exited = lock(&self.owner_children)
@@ -334,5 +365,127 @@ impl DevServerManager {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use runtime_supervisor::{Action, FailureCode, Intent, Phase, Problem, Request, Snapshot};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn historical_cleanup_failure_is_reassessed_once_before_continuing_request() {
+        for cleanup_succeeds in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(temp.path()).unwrap();
+            let ready = Arc::new(AtomicBool::new(false));
+            let identity = RuntimeIdentityView {
+                application_id: "210".into(),
+                service_family: "userapp-dev".into(),
+                workspace_id: "210".into(),
+                source_root: root.to_string_lossy().into_owned(),
+                runtime_instance_id: "new-worker".into(),
+                deployment_generation_id: "new-generation".into(),
+                protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+                capabilities: Vec::new(),
+            };
+            let http_ready = ready.clone();
+            let http = axum::Router::new().route(
+                "/v1/runtime/identity",
+                axum::routing::get(move || {
+                    let ready = http_ready.clone();
+                    let identity = identity.clone();
+                    async move {
+                        if ready.load(Ordering::SeqCst) {
+                            (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!({"data": identity})),
+                            )
+                        } else {
+                            (
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                axum::Json(serde_json::json!({"code": "ERR_INITIALIZING"})),
+                            )
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let http_task = tokio::spawn(async move { axum::serve(listener, http).await.unwrap() });
+            let control = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let owner_lock = std::fs::File::create(root.join("owner.lock")).unwrap();
+            owner_lock.try_lock().unwrap();
+            let mut snapshot = Snapshot {
+                version: 1,
+                binding: runtime_supervisor::Binding {
+                    component: "app-cli".into(),
+                    resource: root.clone(),
+                },
+                supervisor_id: "retained-supervisor".into(),
+                generation: Some("old-generation".into()),
+                phase: Phase::RecoveryRequired,
+                intent: Intent::Stopped,
+                operation_id: Some("old-failed-stop".into()),
+                error: Some("historical cleanup failure".into()),
+                problem: Some(Problem {
+                    code: FailureCode::CleanupUnconfirmed,
+                    message: "cleanup incomplete".into(),
+                }),
+            };
+            std::fs::write(root.join("supervisor.json"), serde_json::to_vec(&serde_json::json!({
+                "version": 2, "instance": snapshot.supervisor_id, "token": "fixture-token",
+                "address": control.local_addr().unwrap().to_string(), "snapshot": snapshot, "requests": []
+            })).unwrap()).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let recover_calls = calls.clone();
+            let control_task = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = control.accept().await.unwrap();
+                    let mut frame = String::new();
+                    BufReader::new(&mut stream)
+                        .read_line(&mut frame)
+                        .await
+                        .unwrap();
+                    let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                    assert_eq!(frame["version"], 2);
+                    assert_eq!(frame["instance"], snapshot.supervisor_id);
+                    assert_eq!(frame["token"], "fixture-token");
+                    let request: Request =
+                        serde_json::from_value(frame["request"].clone()).unwrap();
+                    if request.action == Action::Recover {
+                        recover_calls.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(request.expected_generation, snapshot.generation);
+                        snapshot.operation_id = Some(request.request_id);
+                        if cleanup_succeeds {
+                            snapshot.phase = Phase::CleanupPending;
+                            ready.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    let reply = serde_json::json!({"instance": snapshot.supervisor_id, "snapshot": snapshot, "error": null});
+                    stream
+                        .write_all(format!("{reply}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            });
+            let manager = DevServerManager::new(Arc::new(crate::Config::from_env().unwrap()));
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(4),
+                manager.wait_for_recovery_owner("210", &root, &address, &root),
+            )
+            .await;
+            http_task.abort();
+            control_task.abort();
+            let outcome = outcome.expect("recovery must stay within the current request");
+            assert_eq!(outcome.is_ok(), cleanup_succeeds);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "do not loop over new recovery identities"
+            );
+        }
     }
 }

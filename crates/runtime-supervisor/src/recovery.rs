@@ -115,18 +115,36 @@ pub async fn continue_stop_work(
 pub async fn continue_stop_work_with_checkpoint<F>(
     attempt: &mut StopWorkAttempt,
     budget: Duration,
+    checkpoint: F,
+) -> Result<Snapshot>
+where
+    F: FnMut(&StopWorkAttempt) -> Result<()> + Send,
+{
+    continue_stop_work_with_cleanup(attempt, budget, None, checkpoint).await
+}
+
+/// Continue the same captured stop, supplying the owning CLI's external-engine
+/// cleanup adapter if the supervisor died before completing cleanup.
+pub async fn continue_stop_work_with_cleanup<F>(
+    attempt: &mut StopWorkAttempt,
+    budget: Duration,
+    cleanup: Option<&crate::CleanupCommand>,
     mut checkpoint: F,
 ) -> Result<Snapshot>
 where
     F: FnMut(&StopWorkAttempt) -> Result<()> + Send,
 {
-    tokio::time::timeout(budget, continue_stop_work_inner(attempt, &mut checkpoint))
-        .await
-        .context("stop work and restore management timed out")?
+    tokio::time::timeout(
+        budget,
+        continue_stop_work_inner(attempt, cleanup, &mut checkpoint),
+    )
+    .await
+    .context("stop work and restore management timed out")?
 }
 
 async fn continue_stop_work_inner<F>(
     attempt: &mut StopWorkAttempt,
+    cleanup: Option<&crate::CleanupCommand>,
     checkpoint: &mut F,
 ) -> Result<Snapshot>
 where
@@ -169,8 +187,14 @@ where
                     supervisor_id: target.supervisor_id.clone(),
                 };
                 checkpoint(attempt)?;
-                return offline_stop(owner, &binding, &attempt.request, &target.supervisor_id)
-                    .await;
+                return offline_stop(
+                    owner,
+                    &binding,
+                    &attempt.request,
+                    &target.supervisor_id,
+                    cleanup,
+                )
+                .await;
             }
         }
     }
@@ -183,7 +207,7 @@ where
             let owner = Owner::try_acquire(&root)?.with_context(
                 || "independent supervisor unavailable: offline stop is not continuable",
             )?;
-            return offline_stop(owner, &binding, &attempt.request, supervisor_id).await;
+            return offline_stop(owner, &binding, &attempt.request, supervisor_id, cleanup).await;
         }
         anyhow::bail!("stop attempt mode resolved inconsistently");
     };
@@ -229,6 +253,7 @@ where
                             &binding,
                             &attempt.request,
                             &captured_supervisor_id,
+                            cleanup,
                         )
                         .await;
                     }
@@ -274,9 +299,10 @@ async fn offline_stop(
     binding: &Binding,
     request: &Request,
     supervisor_id: &str,
+    cleanup: Option<&crate::CleanupCommand>,
 ) -> Result<Snapshot> {
     let result = owner
-        .stop_offline_verified(binding, request, supervisor_id)
+        .stop_offline_verified(binding, request, supervisor_id, cleanup)
         .await
         .map_err(|error| {
             if error.downcast_ref::<crate::Problem>().is_some() {
@@ -299,6 +325,17 @@ async fn offline_stop(
 pub async fn stop_work(root: &Path, binding: &Binding, budget: Duration) -> Result<Snapshot> {
     let mut attempt = prepare_stop_work(root, binding).await?;
     continue_stop_work(&mut attempt, budget).await
+}
+
+/// Stop with the trusted CLI adapter needed to finish abandoned external work.
+pub async fn stop_work_with_cleanup(
+    root: &Path,
+    binding: &Binding,
+    budget: Duration,
+    cleanup: &crate::CleanupCommand,
+) -> Result<Snapshot> {
+    let mut attempt = prepare_stop_work(root, binding).await?;
+    continue_stop_work_with_cleanup(&mut attempt, budget, Some(cleanup), |_| Ok(())).await
 }
 
 #[cfg(test)]

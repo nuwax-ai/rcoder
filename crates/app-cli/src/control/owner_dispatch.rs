@@ -302,13 +302,14 @@ async fn dispatch_to_owner_inner(
         if status.recovery_protection
             || (recovery.owner_protected && !recovery.credentials_required)
         {
-            runtime_supervisor::stop_work(
+            runtime_supervisor::stop_work_with_cleanup(
                 state_root,
                 &runtime_supervisor::Binding {
                     component: "app-cli".into(),
                     resource: runtime_state_layout::resolve_project_origin(workspace)?,
                 },
                 std::time::Duration::from_secs(90),
+                &crate::supervision::cleanup_command()?,
             )
             .await
             .context("restore owner before explicit start")?;

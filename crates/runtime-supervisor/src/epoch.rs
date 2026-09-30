@@ -33,6 +33,16 @@ enum Epoch {
     WindowsUptime(u64),
 }
 
+/// Equality must describe a known PID namespace/boot, not two opaque strings.
+/// Windows uptime is not a stable namespace identity for PID-only inspection.
+pub(crate) fn same_process_space(recorded: &str, current: &str) -> bool {
+    match (parse(recorded), parse(current)) {
+        (Some(Epoch::Pid1(a, x)), Some(Epoch::Pid1(b, y))) => a == b && x == y,
+        (Some(Epoch::MacBoot(a)), Some(Epoch::MacBoot(b))) => a == b,
+        _ => false,
+    }
+}
+
 fn parse(value: &str) -> Option<Epoch> {
     let (kind, payload) = value.split_once(':')?;
     match kind {

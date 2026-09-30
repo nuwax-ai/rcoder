@@ -295,7 +295,11 @@ impl DevServerManager {
                                 runtime_supervisor::Action::StopWork,
                             );
                             let result = owner
-                                .stop_offline(target.binding(), &request)
+                                .stop_offline_with_cleanup(
+                                    target.binding(),
+                                    &request,
+                                    &self.owner_cleanup_command(workspace),
+                                )
                                 .await
                                 .map_err(|error| {
                                     AppError::owner_error(

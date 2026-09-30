@@ -24,6 +24,7 @@ pub(crate) struct Launch {
     pub remove_env: Vec<OsString>,
     #[serde(default)]
     pub external_cleanup_args: Option<Vec<OsString>>,
+    pub graceful_stop: Duration,
 }
 pub(crate) struct Child {
     pub process: tokio::process::Child,
@@ -90,6 +91,9 @@ pub(crate) async fn run(root: &Path) -> Result<i32> {
         "invalid worker launch frame"
     );
     let launch: Launch = serde_json::from_slice(&bytes)?;
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("install worker guardian TERM handler")?;
     // 准入读取纳入有界观察（收据可见性）：command-admission 由 monitor 在
     // spawn 本进程前初始化，共享挂载上可能短暂不可见/锁短暂忙碌；拒绝
     // （no longer accepts work）不在观察内。try_acquire 无内建等待。
@@ -135,6 +139,35 @@ pub(crate) async fn run(root: &Path) -> Result<i32> {
     }
     let mut result = tokio::select! {
         exit = child.wait() => exit,
+        _ = async {
+            #[cfg(unix)]
+            { terminate.recv().await; }
+            #[cfg(not(unix))]
+            std::future::pending::<()>().await;
+        } => {
+            // TERM must not abandon the retained Child. Give its management
+            // endpoint the same bounded grace as the monitor, then use this
+            // exact handle to stop it. Never signal a PID read from disk.
+            if let Err(error) = process_utils::command_authority::Gate::try_acquire(root)
+                .and_then(|gate| gate.close()) {
+                generation.error = Some(format!("close command admission: {error:#}"));
+            }
+            let deadline = tokio::time::Instant::now() + launch.graceful_stop;
+            let graceful = async {
+                // Failure to reach the worker does not extend its grace.
+                drop(crate::worker::challenge(root, true).await);
+                child.wait().await
+            };
+            match tokio::time::timeout_at(deadline, graceful).await {
+                Ok(exit) => exit,
+                Err(_) => {
+                    if let Err(error) = child.start_kill() {
+                        generation.error = Some(format!("stop execution process after TERM: {error}"));
+                    }
+                    child.wait().await
+                }
+            }
+        }
         _ = input.read(&mut byte) => {
             // EOF (parent death or accepted stop) is tied to this exact Child.
             // Keep retrying with the handle if the OS has not finished stopping.
@@ -164,78 +197,19 @@ pub(crate) async fn run(root: &Path) -> Result<i32> {
 }
 
 async fn finish(root: &Path, generation: &mut record::Generation, launch: &Launch) {
-    generation.phase = GenerationPhase::Draining;
+    let adapter = launch
+        .external_cleanup_args
+        .as_ref()
+        .map(|args| crate::CleanupCommand {
+            program: launch.program.clone(),
+            args: args.clone(),
+            cwd: launch.cwd.clone(),
+        });
     loop {
-        let cleanup = async {
-            process_utils::command_authority::Gate::try_acquire(root)?.close()?;
-            process_utils::guardian::recover(root)?;
-            // After root exit and every guardian's cleanup, SpawnPending local
-            // receipts can only be registrations interrupted before spawn.
-            settle_unspawned(root)?;
-            process_utils::command_context::require_quiescent(&root.join("commands"))?;
-            if let Some(args) = &launch.external_cleanup_args {
-                record::save(&root.join("generation.json"), generation)?;
-                let mut command = tokio::process::Command::new(&launch.program);
-                command
-                    .args(args)
-                    .current_dir(&launch.cwd)
-                    .stdin(Stdio::null());
-                process_utils::command_authority::detach_command(&mut command);
-                command
-                    .env("RCODER_SUPERVISOR_CLEANUP_ROOT", root)
-                    .env("RCODER_SUPERVISOR_CLEANUP_TOKEN", &generation.token);
-                command.kill_on_drop(true);
-                let output = tokio::time::timeout(Duration::from_secs(30), command.output())
-                    .await
-                    .context("external engine cleanup timed out")??;
-                ensure!(
-                    output.status.success(),
-                    "external engine cleanup failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            Ok(())
-        }
-        .await;
-        match cleanup {
-            Ok(()) => {
-                generation.phase = GenerationPhase::Quiescent;
-                match record::save(&root.join("generation.json"), generation) {
-                    Ok(()) => return,
-                    Err(error) => {
-                        tracing::warn!(%error, "could not persist quiescent generation record");
-                        generation.phase = GenerationPhase::Draining;
-                    }
-                }
-            }
-            Err(error) => {
-                let message = format!("command cleanup pending: {error:#}");
-                if generation.error.as_deref() != Some(&message) {
-                    generation.error = Some(message);
-                    if let Err(save_error) = record::save(&root.join("generation.json"), generation)
-                    {
-                        tracing::warn!(%save_error, "could not persist cleanup pending state");
-                    }
-                }
-            }
+        match crate::cleanup::once(root, generation, adapter.as_ref()).await {
+            Ok(()) => return,
+            Err(error) => crate::cleanup::record_failure(root, generation, &error),
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-}
-fn settle_unspawned(root: &Path) -> Result<()> {
-    let commands = root.join("commands");
-    if !commands.try_exists()? {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(commands)? {
-        let path = entry?.path();
-        let mut value: serde_json::Value = record::read(&path)?;
-        ensure!(value["version"] == 1, "unknown command record version");
-        if value["phase"] == "SpawnPending" {
-            value["phase"] = "Quiescent".into();
-            value["termination"] = "OwnerExitedBeforeSpawn".into();
-            record::save(&path, &value)?;
-        }
-    }
-    Ok(())
 }

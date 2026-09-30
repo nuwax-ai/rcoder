@@ -213,9 +213,11 @@ impl DevServerManager {
             )
         })?;
         let mut attempt = self.seat_stop_attempt(key, root, binding)?;
-        let outcome = runtime_supervisor::continue_stop_work_with_checkpoint(
+        let cleanup = self.owner_cleanup_command(&binding.resource);
+        let outcome = runtime_supervisor::continue_stop_work_with_cleanup(
             &mut attempt,
             budget,
+            Some(&cleanup),
             |captured| self.persist_captured_stop(key, captured),
         )
         .await;

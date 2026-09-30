@@ -25,7 +25,8 @@ pub(crate) struct Generation {
     pub token: String,
     pub intent: Intent,
     pub phase: GenerationPhase,
-    /// Launch handshake and diagnostics only. Signals use the retained Child.
+    /// Launch handshake and read-only exit inspection in the verified process
+    /// space. Signals always use the retained Child, never this recorded PID.
     #[serde(default)]
     pub worker_pid: Option<u32>,
     pub exit_code: Option<i32>,
@@ -50,8 +51,11 @@ pub(crate) enum GenerationPhase {
 pub(crate) fn save<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path.parent().context("receipt parent missing")?;
     process_utils::command_context::create_durable_directory(parent)?;
+    // Serialize before file I/O: to_writer on an unbuffered File issues a write
+    // for every JSON fragment, delaying the control loop as replay history grows.
+    let bytes = serde_json::to_vec(value)?;
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer(&mut file, value)?;
+    file.write_all(&bytes)?;
     file.flush()?;
     file.as_file().sync_all()?;
     process_utils::atomic_file::persist(file, path)
@@ -281,15 +285,27 @@ pub fn verify_live(scope: &Path, supervisor: &str, id: &str) -> Result<()> {
 
 /// Run only with the stable owner lock held. A late root guardian must obtain
 /// this same generation lock and cannot consume revoked authorization.
-pub(crate) fn reconcile(scope: &Path) -> Result<()> {
+#[derive(Debug)]
+pub(crate) struct AbandonedGeneration {
+    pub root: PathBuf,
+    pub value: Generation,
+    // Retained through asynchronous cleanup: no late guardian can spawn work.
+    pub _lock: File,
+}
+
+pub(crate) fn reconcile(scope: &Path) -> Result<Option<AbandonedGeneration>> {
     reconcile_local(scope, crate::domain::PhysicalDomain::from_env()?.as_ref())
 }
 
-fn reconcile_local(scope: &Path, current: Option<&crate::domain::PhysicalDomain>) -> Result<()> {
+fn reconcile_local(
+    scope: &Path,
+    current: Option<&crate::domain::PhysicalDomain>,
+) -> Result<Option<AbandonedGeneration>> {
     let dir = scope.join("work");
     if !dir.try_exists()? {
-        return Ok(());
+        return Ok(None);
     }
+    let mut abandoned = None;
     for entry in std::fs::read_dir(dir)? {
         let root = entry?.path();
         if !root.join("generation.json").try_exists()? {
@@ -304,7 +320,7 @@ fn reconcile_local(scope: &Path, current: Option<&crate::domain::PhysicalDomain>
                 "previous container execution retained as history; recovering local management");
             continue;
         }
-        let _lock = lock(&root.join("generation.lock"))?;
+        let generation_lock = lock(&root.join("generation.lock"))?;
         let mut value = generation(&root)?;
         let retirable = matches!(
             value.phase,
@@ -326,6 +342,25 @@ fn reconcile_local(scope: &Path, current: Option<&crate::domain::PhysicalDomain>
             value.phase = GenerationPhase::Revoked;
             save(&root.join("generation.json"), &value)?;
         }
+        if matches!(
+            value.phase,
+            GenerationPhase::Running | GenerationPhase::Draining
+        ) {
+            verify_abandoned_worker(&value, current)?;
+            // The caller must perform full command/engine cleanup before it
+            // may publish a terminal receipt or launch a successor.
+            if abandoned.is_none() {
+                abandoned = Some(AbandonedGeneration {
+                    root,
+                    value,
+                    _lock: generation_lock,
+                });
+            }
+            // Inspect all local generations before any external engine write.
+            // A newer live worker must not be stopped by an older receipt's
+            // cleanup, regardless of read_dir ordering.
+            continue;
+        }
         ensure!(
             matches!(
                 value.phase,
@@ -340,7 +375,46 @@ fn reconcile_local(scope: &Path, current: Option<&crate::domain::PhysicalDomain>
             process_utils::command_context::require_quiescent(&root.join("commands"))?;
         }
     }
-    Ok(())
+    Ok(abandoned)
+}
+
+fn verify_abandoned_worker(
+    value: &Generation,
+    current: Option<&crate::domain::PhysicalDomain>,
+) -> Result<()> {
+    ensure!(
+        process_space_ended_with(value, current),
+        "generation {} belongs to another physical domain",
+        value.id
+    );
+    let recorded = value
+        .process_epoch
+        .as_deref()
+        .context("abandoned worker process epoch missing")?;
+    let now = crate::epoch::current().context("current process epoch unavailable")?;
+    ensure!(
+        crate::epoch::same_process_space(recorded, &now),
+        "generation {} process space cannot be confirmed",
+        value.id
+    );
+    let pid = value
+        .worker_pid
+        .context("abandoned worker PID missing; cleanup cannot be confirmed")?;
+    #[cfg(unix)]
+    {
+        ensure!(
+            !process_utils::process_exists(pid).context("inspect original worker process")?,
+            "generation {} worker {pid} still exists; cleanup is unconfirmed",
+            value.id
+        );
+        ensure!(
+            crate::epoch::current().as_deref() == Some(now.as_str()),
+            "process space changed during worker inspection"
+        );
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    anyhow::bail!("local worker {pid} exit inspection is unsupported on this platform")
 }
 
 /// Terminal retirement of one generation. No exit code is invented and no
@@ -436,6 +510,50 @@ mod tests {
             instance: instance.into(),
             volume: "workspace-pvc".into(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abandoned_worker_requires_dead_pid_in_same_known_process_space() {
+        let epoch = "pid1:11111111-1111-4111-8111-111111111111:100".to_string();
+        let _guard = EpochGuard::new(Some(epoch.clone()));
+        let (temp, id) = stuck_scope(None, Some(epoch));
+        let root = work_root(temp.path(), &id).unwrap();
+        let mut value = generation(&root).unwrap();
+        value.worker_pid = None;
+        assert!(verify_abandoned_worker(&value, None).is_err());
+        value.worker_pid = Some(std::process::id());
+        assert!(verify_abandoned_worker(&value, None).is_err());
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        value.worker_pid = Some(child.id());
+        child.wait().unwrap();
+        for phase in [GenerationPhase::Running, GenerationPhase::Draining] {
+            value.phase = phase;
+            save(&root.join("generation.json"), &value).unwrap();
+            let permit = reconcile_local(temp.path(), None).unwrap().unwrap();
+            assert_eq!(permit.value.id, id);
+            assert!(lock(&root.join("generation.lock")).is_err());
+            // Discovering a candidate is not cleanup or business success.
+            assert_eq!(generation(&root).unwrap().phase, phase);
+            drop(permit);
+        }
+        value.process_epoch = Some("unknown".into());
+        assert!(verify_abandoned_worker(&value, None).is_err());
+        value.process_epoch = Some("pid1:11111111-1111-4111-8111-111111111111:100".into());
+        value.physical_domain = Some(domain_fixture("pod-original"));
+        assert!(verify_abandoned_worker(&value, Some(&domain_fixture("pod-new"))).is_err());
+        assert!(verify_abandoned_worker(&value, Some(&domain_fixture("pod-original"))).is_ok());
+        let mut live = value.clone();
+        live.id = uuid::Uuid::new_v4().to_string();
+        live.physical_domain = None;
+        live.worker_pid = Some(std::process::id());
+        let live_root = work_root(temp.path(), &live.id).unwrap();
+        std::fs::create_dir_all(&live_root).unwrap();
+        save(&live_root.join("generation.json"), &live).unwrap();
+        assert!(
+            reconcile_local(temp.path(), None).is_err(),
+            "old cleanup must not affect a newer live generation"
+        );
     }
 
     #[test]
@@ -614,13 +732,38 @@ mod tests {
         drop(_guard);
 
         // (b) native scope, same epoch → still unconfirmed (hard kill only).
-        let (_temp, _id) = stuck_scope(
+        let (_temp, id) = stuck_scope(
             None,
             Some("pid1:11111111-1111-4111-8111-111111111111:100".into()),
         );
         let _guard = EpochGuard::new(Some("pid1:11111111-1111-4111-8111-111111111111:100".into()));
-        let error = reconcile(_temp.path()).unwrap_err().to_string();
-        assert!(error.contains("cleanup is unconfirmed"), "{error}");
+        #[cfg(unix)]
+        {
+            let root = work_root(_temp.path(), &id).unwrap();
+            let mut value = generation(&root).unwrap();
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            value.worker_pid = Some(child.id());
+            child.wait().unwrap();
+            save(&root.join("generation.json"), &value).unwrap();
+        }
+        // A dead worker is now eligible for cleanup, but its unknown command
+        // outcome still prevents publishing quiescence or launching new work.
+        #[cfg(unix)]
+        {
+            let candidate = reconcile(_temp.path()).unwrap().unwrap();
+            assert!(
+                process_utils::command_context::require_quiescent(&candidate.root.join("commands"))
+                    .is_err()
+            );
+            assert_eq!(
+                generation(&candidate.root).unwrap().phase,
+                GenerationPhase::Running
+            );
+            drop(candidate);
+        }
+        #[cfg(not(unix))]
+        assert!(reconcile(_temp.path()).is_err());
+        assert!(verify_quiescent(_temp.path(), &id).is_err());
         drop(_guard);
 
         // (c) legacy record without epoch → conservative.

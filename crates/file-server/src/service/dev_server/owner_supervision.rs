@@ -6,6 +6,22 @@ use anyhow::Result;
 use std::{path::Path, time::Duration};
 
 impl DevServerManager {
+    pub(super) fn owner_cleanup_command(
+        &self,
+        workspace: &Path,
+    ) -> runtime_supervisor::CleanupCommand {
+        runtime_supervisor::CleanupCommand {
+            program: self
+                .config
+                .app_cli_bin
+                .as_deref()
+                .unwrap_or("app-cli")
+                .into(),
+            args: vec!["--app-cli-cleanup-engine".into()],
+            cwd: workspace.to_path_buf(),
+        }
+    }
+
     pub(super) async fn stop_supervised_owner(
         &self,
         project: &str,
@@ -23,13 +39,14 @@ impl DevServerManager {
         if !root.join("supervisor.json").try_exists()? {
             return Ok(None);
         }
-        let completed = runtime_supervisor::stop_work(
+        let completed = runtime_supervisor::stop_work_with_cleanup(
             &root,
             &runtime_supervisor::Binding {
                 component: "app-cli".into(),
                 resource: origin,
             },
             Duration::from_secs(90),
+            &self.owner_cleanup_command(workspace),
         )
         .await?;
         // The successor acknowledged only after startup quiescence (including

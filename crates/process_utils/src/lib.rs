@@ -28,6 +28,32 @@ use nix::unistd::Pid;
 #[cfg(unix)]
 pub use nix::sys::signal::Signal as KillSignal;
 
+/// Observe one PID without sending a signal. Only ESRCH proves absence;
+/// access denial is presence and other OS errors remain observation failures.
+/// This is never authority to signal a PID recovered from disk.
+#[cfg(unix)]
+pub fn process_exists(pid: u32) -> std::io::Result<bool> {
+    let pid = i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid worker process identifier",
+            )
+        })?;
+    process_observation(kill(Pid::from_raw(pid), None))
+}
+
+#[cfg(unix)]
+fn process_observation(result: Result<(), nix::errno::Errno>) -> std::io::Result<bool> {
+    match result {
+        Ok(()) | Err(nix::errno::Errno::EPERM) => Ok(true),
+        Err(nix::errno::Errno::ESRCH) => Ok(false),
+        Err(error) => Err(std::io::Error::from_raw_os_error(error as i32)),
+    }
+}
+
 /// Probe a process group without sending a signal. Only ESRCH proves absence.
 #[cfg(unix)]
 pub fn process_group_exists(pid: u32) -> std::io::Result<bool> {
@@ -107,6 +133,24 @@ mod tests {
     use super::*;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn process_absence_requires_esrch() {
+        use nix::errno::Errno;
+        assert!(process_observation(Ok(())).unwrap());
+        assert!(process_observation(Err(Errno::EPERM)).unwrap());
+        assert!(!process_observation(Err(Errno::ESRCH)).unwrap());
+        assert!(process_observation(Err(Errno::EIO)).is_err());
+        for pid in [0, 1, u32::MAX] {
+            assert!(process_exists(pid).is_err());
+        }
+        let mut child = spawn_sleeper();
+        let pid = child.id();
+        assert!(process_exists(pid).unwrap());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!process_exists(pid).unwrap());
+    }
 
     /// spawn 一个 sleep 子进程作为进程组组长, 返回其 pid。
     fn spawn_sleeper() -> std::process::Child {

@@ -41,6 +41,27 @@ fn main() -> Result<()> {
 }
 async fn run() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|a| a == "--cleanup") {
+        let _cleanup = runtime_supervisor::verify_cleanup_callback()?;
+        let scope = PathBuf::from(args.get(1).context("cleanup scope missing")?);
+        #[cfg(unix)]
+        if scope.join("pause-cleanup").exists() {
+            let parent = tokio::process::Command::new("ps")
+                .args(["-o", "ppid=", "-p", &std::process::id().to_string()])
+                .output()
+                .await?;
+            anyhow::ensure!(parent.status.success(), "read cleanup parent PID");
+            std::fs::write(scope.join("cleanup-parent"), parent.stdout)?;
+            while scope.join("pause-cleanup").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        anyhow::ensure!(
+            !scope.join("fail-cleanup").exists(),
+            "fixture cleanup failed"
+        );
+        return Ok(());
+    }
     if args.first().is_some_and(|a| a == "--leaf") {
         let path = PathBuf::from(args.get(1).context("leaf address path missing")?);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -80,6 +101,11 @@ async fn run() -> Result<()> {
     }
     let owner = Owner::try_acquire(&scope)?.context("owner already active")?;
     let mut options = Options::new(args);
+    options.restart_on_exit = !scope.join("one-shot-owner").exists();
+    if scope.join("external-cleanup-enabled").exists() {
+        options.external_cleanup_args =
+            Some(vec!["--cleanup".into(), scope.clone().into_os_string()]);
+    }
     options.recovery_remove_env = vec!["SUPERVISION_FIXTURE_ONE_SHOT".into()];
     options.policy.probe_interval = Duration::from_millis(100);
     options.policy.probe_timeout = Duration::from_millis(150);

@@ -219,7 +219,7 @@ pub async fn control(root: &Path, request: Request) -> Result<Snapshot> {
 ///（同根、同 binding、generation 恰好一致或均为 None）时，请求不会再先
 /// 作用于新 owner 再由客户端事后报身份变化；服务端 envelope.instance
 /// 校验继续防住读取与连接之间的残余窗口。
-pub(crate) async fn control_verified(
+pub async fn control_verified(
     root: &Path,
     request: Request,
     expected_instance: &str,
@@ -233,10 +233,13 @@ pub(crate) async fn control_verified(
         .into());
     }
     if discovery.instance != expected_instance {
-        anyhow::bail!(
-            "supervisor changed before stop was sent: captured {expected_instance}, discovery has {}",
-            discovery.instance
-        );
+        return Err(Problem {
+            code: FailureCode::IdentityChanged,
+            message: format!(
+                "supervisor changed before control was sent: captured {expected_instance}, discovery has {}",
+                discovery.instance
+            ),
+        }.into());
     }
     record::is_locked(&root.join("owner.lock"))?;
     dispatch(

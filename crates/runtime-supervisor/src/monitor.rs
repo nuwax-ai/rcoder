@@ -73,7 +73,7 @@ impl Options {
     }
 }
 pub struct Owner {
-    _lock: File,
+    _lock: Arc<File>,
     root: PathBuf,
 }
 impl Owner {
@@ -101,7 +101,19 @@ impl Owner {
         binding: &control::Binding,
         request: &control::Request,
     ) -> Result<Snapshot> {
-        self.stop_offline_inner(binding, request, None).await
+        self.stop_offline_inner(binding, request, None, None).await
+    }
+
+    /// The owning CLI supplies its cleanup adapter; executable paths are never
+    /// trusted from stale process records.
+    pub async fn stop_offline_with_cleanup(
+        self,
+        binding: &control::Binding,
+        request: &control::Request,
+        cleanup: &crate::CleanupCommand,
+    ) -> Result<Snapshot> {
+        self.stop_offline_inner(binding, request, None, Some(cleanup))
+            .await
     }
 
     pub(crate) async fn stop_offline_verified(
@@ -109,8 +121,9 @@ impl Owner {
         binding: &control::Binding,
         request: &control::Request,
         supervisor_id: &str,
+        cleanup: Option<&crate::CleanupCommand>,
     ) -> Result<Snapshot> {
-        self.stop_offline_inner(binding, request, Some(supervisor_id))
+        self.stop_offline_inner(binding, request, Some(supervisor_id), cleanup)
             .await
     }
 
@@ -119,13 +132,17 @@ impl Owner {
         binding: &control::Binding,
         request: &control::Request,
         supervisor_id: Option<&str>,
+        cleanup: Option<&crate::CleanupCommand>,
     ) -> Result<Snapshot> {
         // Parent death closes pipes first; guardians still need a bounded drain
         // window. Wait only for a retained OS lock, never reinterpret corruption
         // or missing cleanup evidence as success.
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            match self.try_stop_offline(binding, request, supervisor_id) {
+            match self
+                .try_stop_offline(binding, request, supervisor_id, cleanup)
+                .await
+            {
                 Err(error)
                     if error
                         .downcast_ref::<std::fs::TryLockError>()
@@ -138,11 +155,12 @@ impl Owner {
             }
         }
     }
-    fn try_stop_offline(
+    async fn try_stop_offline(
         &self,
         binding: &control::Binding,
         request: &control::Request,
         supervisor_id: Option<&str>,
+        cleanup: Option<&crate::CleanupCommand>,
     ) -> Result<Snapshot> {
         ensure!(
             !request.request_id.is_empty() && request.request_id.len() <= 128,
@@ -189,7 +207,11 @@ impl Owner {
                 || request.expected_generation == discovery.snapshot.generation,
             "execution generation changed"
         );
-        record::reconcile(&self.root)?;
+        while let Some(target) = record::reconcile(&self.root)? {
+            let cleanup =
+                cleanup.context("abandoned execution needs the owning CLI cleanup adapter")?;
+            crate::cleanup::abandoned(target, Some(cleanup)).await?;
+        }
         detach_previous_container_control(
             &self.root,
             &mut discovery,
@@ -231,7 +253,7 @@ impl Owner {
             .open(root.join("owner.lock"))?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Self {
-                _lock: file,
+                _lock: Arc::new(file),
                 root: std::fs::canonicalize(root).context("canonicalize supervisor scope")?,
             })),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
@@ -354,6 +376,9 @@ impl Owner {
             },
             recovery_launch,
             child: None,
+            exited: None,
+            cleanup: None,
+            next_cleanup: Instant::now(),
             stopping: None,
             probe: None,
             stop_ack: None,
@@ -378,6 +403,7 @@ impl Owner {
             cwd: std::env::current_dir()?,
             remove_env: Vec::new(),
             external_cleanup_args: options.external_cleanup_args,
+            graceful_stop: state.policy.graceful_stop,
         };
         let mut tick = tokio::time::interval(Duration::from_millis(200));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -391,7 +417,7 @@ impl Owner {
                         .err().unwrap_or_else(|| anyhow::anyhow!("supervisor listener exited")));
                 }
                 _ = tick.tick() => {
-                    if let Some(code) = state.tick(&launch, options.restart_on_exit, &options.recovery_remove_env).await? { return Ok(code); }
+                    if let Some(code) = state.tick(&launch, options.restart_on_exit, &options.recovery_remove_env, &self._lock).await? { return Ok(code); }
                 }
                 Some(incoming) = rx.recv() => {
                     let outcome = state.request(&incoming.request);
@@ -543,6 +569,10 @@ struct State {
     discovery: Discovery,
     recovery_launch: bool,
     child: Option<guardian::Child>,
+    // Preserve exit policy while asynchronous aggregate cleanup is pending.
+    exited: Option<i32>,
+    cleanup: Option<AbortOnDrop<Result<()>>>,
+    next_cleanup: Instant,
     stopping: Option<Instant>,
     probe: Option<tokio::task::JoinHandle<Result<worker::Observation>>>,
     stop_ack: Option<tokio::task::JoinHandle<Result<worker::Observation>>>,
@@ -661,6 +691,7 @@ impl State {
             return Err(error);
         }
         self.restarts.clear();
+        self.next_cleanup = Instant::now();
         self.restart_allowed = true;
         self.begin_stop(intent)?;
         Ok(self.discovery.snapshot.clone())
@@ -719,6 +750,7 @@ impl State {
         launch: &guardian::Launch,
         restart_on_exit: bool,
         recovery_remove_env: &[OsString],
+        owner_lock: &Arc<File>,
     ) -> Result<Option<i32>> {
         let now = Instant::now();
         if now.duration_since(self.last_tick) > self.policy.probe_interval * 4 {
@@ -802,6 +834,7 @@ impl State {
             if let Some(status) = child.process.try_wait()? {
                 let exit = status.code().unwrap_or(1);
                 self.child.take();
+                self.exited = Some(exit);
                 if let Some(task) = self.probe.take() {
                     task.abort();
                 }
@@ -815,9 +848,15 @@ impl State {
                     .clone()
                     .context("exited generation missing")?;
                 if let Err(error) = record::verify_quiescent(&self.root, &id) {
-                    self.record_cleanup_problem(&error)?;
-                    return Ok(None);
+                    tracing::debug!(%error, "guardian exited before aggregate cleanup; inspecting abandoned work");
                 }
+            }
+        }
+        if self.child.is_none() {
+            if !self.reconcile(launch, owner_lock).await? {
+                return Ok(None);
+            }
+            if let Some(exit) = self.exited.take() {
                 if self.discovery.snapshot.intent == Intent::Shutdown
                     || !restart_on_exit
                     || self.initial_launch
@@ -833,12 +872,6 @@ impl State {
                     self.discovery.snapshot.error =
                         Some(format!("execution process exited ({exit})"));
                 }
-            }
-        }
-        if self.child.is_none() {
-            if let Err(error) = record::reconcile(&self.root) {
-                self.record_cleanup_problem(&error)?;
-                return Ok(None);
             }
             self.discovery.snapshot.problem = None;
             if self.discovery.snapshot.intent == Intent::Shutdown {
@@ -894,6 +927,7 @@ impl State {
                     launch.remove_env.clone()
                 },
                 external_cleanup_args: launch.external_cleanup_args.clone(),
+                graceful_stop: launch.graceful_stop,
             };
             self.child = Some(guardian::spawn(&work, &recovery_launch).await?);
             self.recovery_launch = true;
@@ -959,6 +993,73 @@ impl State {
             self.next_probe = now + self.policy.probe_interval;
         }
         Ok(None)
+    }
+
+    /// One task owns the original generation lock throughout cleanup. Keeping
+    /// an Arc to the owner FD prevents a cancelled task from writing after a
+    /// replacement owner acquires the scope.
+    async fn reconcile(
+        &mut self,
+        launch: &guardian::Launch,
+        owner_lock: &Arc<File>,
+    ) -> Result<bool> {
+        if let Some(task) = &self.cleanup {
+            if !task.0.is_finished() {
+                return Ok(false);
+            }
+            if let Some(mut task) = self.cleanup.take() {
+                match (&mut task.0)
+                    .await
+                    .context("abandoned cleanup task failed")
+                    .and_then(|r| r)
+                {
+                    Ok(()) => {}
+                    Err(error) => {
+                        self.record_cleanup_problem(&error)?;
+                        self.next_cleanup = Instant::now() + Duration::from_secs(2);
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        if Instant::now() < self.next_cleanup {
+            return Ok(false);
+        }
+        match record::reconcile(&self.root) {
+            Ok(None) => Ok(true),
+            Ok(Some(target)) => {
+                self.discovery.snapshot.phase = Phase::CleanupPending;
+                self.discovery.snapshot.problem = Some(Problem {
+                    code: FailureCode::CleanupInProgress,
+                    message: format!(
+                        "verifying abandoned generation {} command and engine cleanup",
+                        target.value.id
+                    ),
+                });
+                self.discovery.snapshot.error = None;
+                self.persist()?;
+                let adapter =
+                    launch
+                        .external_cleanup_args
+                        .as_ref()
+                        .map(|args| crate::CleanupCommand {
+                            program: launch.program.clone(),
+                            args: args.clone(),
+                            cwd: launch.cwd.clone(),
+                        });
+                let owner_lock = Arc::clone(owner_lock);
+                self.cleanup = Some(AbortOnDrop(tokio::spawn(async move {
+                    let _owner_lock = owner_lock;
+                    crate::cleanup::abandoned(target, adapter.as_ref()).await
+                })));
+                Ok(false)
+            }
+            Err(error) => {
+                self.record_cleanup_problem(&error)?;
+                self.next_cleanup = Instant::now() + Duration::from_secs(2);
+                Ok(false)
+            }
+        }
     }
 
     fn repair_discovery(&mut self) -> Result<()> {

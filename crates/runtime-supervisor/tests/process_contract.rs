@@ -52,6 +52,40 @@ async fn leaf(root: &Path) -> Result<String> {
     .context("owned command did not listen")
 }
 
+#[cfg(unix)]
+async fn paused_cleanup_guardian(root: &Path) -> Result<u32> {
+    let pid = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(root.join("cleanup-parent"))
+                && let Ok(pid) = pid.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "cleanup barrier was not reached: {:?}",
+            runtime_supervisor::last_snapshot(root)
+        )
+    })?;
+    ensure!(pid > 1, "invalid captured fixture guardian PID");
+    Ok(pid)
+}
+
+#[cfg(unix)]
+async fn signal_fixture(pid: u32, signal: &str) -> Result<()> {
+    ensure!(pid > 1, "invalid fixture PID");
+    let status = tokio::process::Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status()
+        .await?;
+    ensure!(status.success(), "fixture signal failed");
+    Ok(())
+}
+
 #[tokio::test]
 async fn replacement_container_does_not_replay_stale_shutdown_or_block_new_stop() {
     use runtime_supervisor::{Binding, Intent, Phase, domain::PhysicalDomain};
@@ -401,6 +435,256 @@ async fn parent_death_drains_hung_worker_and_allows_verified_successor() {
     result.unwrap();
 }
 
+/// Real worker exit followed by loss of the guardian before its aggregate
+/// receipt. The OS/container epoch does NOT change during this recovery.
+#[cfg(unix)]
+#[tokio::test]
+async fn dead_guardian_after_worker_exit_recovers_in_same_process_space() {
+    use runtime_supervisor::{Intent, Phase};
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    std::fs::write(root.join("external-cleanup-enabled"), "enabled").unwrap();
+    let mut owner = start(&root).unwrap();
+    let result = async {
+        let before = until(&root, |s| s.phase == Phase::Ready).await?;
+        let address = leaf(&root).await?;
+        std::fs::write(root.join("pause-cleanup"), "barrier")?;
+        let mut stop = Request::new(Action::StopWork);
+        stop.expected_generation = before.generation.clone();
+        control(&root, stop.clone()).await?;
+        signal_fixture(paused_cleanup_guardian(&root).await?, "-KILL").await?;
+        // An old callback retains its guard even after the guardian dies.
+        // Recovery remains queryable and cannot start a successor yet.
+        until(&root, |s| s.phase == Phase::CleanupPending).await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        ensure!(
+            status(&root).await?.generation == before.generation,
+            "cleanup was bypassed"
+        );
+        std::fs::remove_file(root.join("pause-cleanup"))?;
+        until(&root, |s| {
+            s.phase == Phase::Ready && s.generation != before.generation
+        })
+        .await?;
+        runtime_supervisor::verify_quiescent(
+            &root,
+            before.generation.as_deref().context("generation missing")?,
+        )?;
+        ensure!(
+            tokio::net::TcpStream::connect(&address).await.is_err(),
+            "old business survived"
+        );
+        let stopped = control(&root, stop.clone()).await?;
+        ensure!(
+            stopped.phase == Phase::Ready && stopped.intent == Intent::Stopped,
+            "original stop did not finish"
+        );
+        // A fresh explicit start can run after recovery. A late old stop remains a replay.
+        shutdown(&root, &mut owner).await;
+        owner = start(&root)?;
+        until(&root, |s| s.phase == Phase::Ready).await?;
+        let next = leaf(&root).await?;
+        control(&root, stop).await?;
+        ensure!(
+            tokio::net::TcpStream::connect(&next).await.is_ok(),
+            "late stop hit successor"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    drop(std::fs::remove_file(root.join("pause-cleanup")));
+    shutdown(&root, &mut owner).await;
+    result.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn abandoned_cleanup_preserves_one_shot_exit_policy() {
+    use runtime_supervisor::Phase;
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    std::fs::write(root.join("external-cleanup-enabled"), "enabled").unwrap();
+    std::fs::write(root.join("one-shot-owner"), "enabled").unwrap();
+    let mut owner = start(&root).unwrap();
+    let result = async {
+        let before = until(&root, |s| s.phase == Phase::Ready).await?;
+        let address = leaf(&root).await?;
+        std::fs::write(root.join("pause-cleanup"), "barrier")?;
+        let mut stop = Request::new(Action::StopWork);
+        stop.expected_generation = before.generation.clone();
+        control(&root, stop).await?;
+        signal_fixture(paused_cleanup_guardian(&root).await?, "-KILL").await?;
+        std::fs::remove_file(root.join("pause-cleanup"))?;
+        ensure!(
+            tokio::time::timeout(Duration::from_secs(15), owner.wait())
+                .await??
+                .success(),
+            "one-shot owner did not finish the accepted stop"
+        );
+        let done = runtime_supervisor::last_snapshot(&root)?;
+        ensure!(
+            done.phase == Phase::Stopped && done.generation == before.generation,
+            "cleanup restarted a one-shot owner"
+        );
+        runtime_supervisor::verify_quiescent(
+            &root,
+            before.generation.as_deref().context("generation")?,
+        )?;
+        ensure!(
+            tokio::net::TcpStream::connect(address).await.is_err(),
+            "business survived stop"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    drop(std::fs::remove_file(root.join("pause-cleanup")));
+    shutdown(&root, &mut owner).await;
+    result.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn offline_abandoned_cleanup_retries_same_stop_and_preserves_successor() {
+    use runtime_supervisor::{Binding, CleanupCommand, Phase};
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    std::fs::write(root.join("external-cleanup-enabled"), "enabled").unwrap();
+    let mut owner = start(&root).unwrap();
+    let result = async {
+        let before = until(&root, |s| s.phase == Phase::Ready).await?;
+        let address = leaf(&root).await?;
+        std::fs::write(root.join("pause-cleanup"), "barrier")?;
+        let binding = Binding {
+            component: "runtime".into(),
+            resource: root.clone(),
+        };
+        let mut attempt = runtime_supervisor::prepare_stop_work(&root, &binding).await?;
+        control(&root, attempt.request.clone()).await?;
+        let guardian = paused_cleanup_guardian(&root).await?;
+        owner.kill().await?;
+        signal_fixture(guardian, "-KILL").await?;
+        let command = CleanupCommand {
+            program: env!("CARGO_BIN_EXE_supervision-fixture").into(),
+            args: vec!["--cleanup".into(), root.clone().into_os_string()],
+            cwd: root.clone(),
+        };
+        std::fs::write(root.join("fail-cleanup"), "temporary engine failure")?;
+        std::fs::remove_file(root.join("pause-cleanup"))?;
+        let first = runtime_supervisor::continue_stop_work_with_cleanup(
+            &mut attempt,
+            Duration::from_secs(5),
+            Some(&command),
+            |_| Ok(()),
+        )
+        .await;
+        ensure!(
+            first.is_err(),
+            "failed engine cleanup was declared complete"
+        );
+        ensure!(
+            runtime_supervisor::verify_quiescent(
+                &root,
+                before.generation.as_deref().context("generation")?
+            )
+            .is_err(),
+            "early completion receipt"
+        );
+        std::fs::remove_file(root.join("fail-cleanup"))?;
+        let done = runtime_supervisor::continue_stop_work_with_cleanup(
+            &mut attempt,
+            Duration::from_secs(5),
+            Some(&command),
+            |_| Ok(()),
+        )
+        .await?;
+        ensure!(
+            done.phase == Phase::Stopped
+                && done.operation_id.as_deref() == Some(&attempt.request.request_id),
+            "stop identity changed"
+        );
+        ensure!(
+            tokio::net::TcpStream::connect(address).await.is_err(),
+            "stopped work survived"
+        );
+        owner = start(&root)?;
+        until(&root, |s| s.phase == Phase::Ready).await?;
+        // Offline Stop restores management with business autostart suppressed.
+        shutdown(&root, &mut owner).await;
+        owner = start(&root)?;
+        until(&root, |s| s.phase == Phase::Ready).await?;
+        let next = leaf(&root).await?;
+        let late = runtime_supervisor::continue_stop_work_with_cleanup(
+            &mut attempt,
+            Duration::from_secs(3),
+            Some(&command),
+            |_| Ok(()),
+        )
+        .await;
+        ensure!(late.is_err(), "retained stop rebound to successor");
+        ensure!(
+            tokio::net::TcpStream::connect(next).await.is_ok(),
+            "late stop killed successor"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    drop(std::fs::remove_file(root.join("pause-cleanup")));
+    drop(std::fs::remove_file(root.join("fail-cleanup")));
+    shutdown(&root, &mut owner).await;
+    result.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn guardian_term_finishes_cleanup_before_restarting_worker() {
+    use runtime_supervisor::Phase;
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    std::fs::write(root.join("external-cleanup-enabled"), "enabled").unwrap();
+    let mut owner = start(&root).unwrap();
+    let result = async {
+        let before = until(&root, |s| s.phase == Phase::Ready).await?;
+        let address = leaf(&root).await?;
+        let generation = before.generation.as_deref().context("generation")?;
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            root.join("work").join(generation).join("generation.json"),
+        )?)?;
+        let pid = value["worker_pid"].as_u64().context("worker PID")?;
+        let parent = tokio::process::Command::new("ps")
+            .args(["-o", "ppid=", "-p", &pid.to_string()])
+            .output()
+            .await?;
+        ensure!(parent.status.success(), "fixture guardian lookup failed");
+        let guardian = String::from_utf8(parent.stdout)?.trim().parse::<u32>()?;
+        ensure!(
+            Some(guardian) != owner.id(),
+            "captured owner instead of guardian"
+        );
+        signal_fixture(guardian, "-TERM").await?;
+        until(&root, |s| {
+            s.phase == Phase::Ready && s.generation != before.generation
+        })
+        .await?;
+        runtime_supervisor::verify_quiescent(&root, generation)?;
+        ensure!(
+            tokio::net::TcpStream::connect(address).await.is_err(),
+            "TERM left old business running"
+        );
+        leaf(&root).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if result.is_err() {
+        eprintln!(
+            "TERM fixture: owner exit={:?}, snapshot={:?}",
+            owner.try_wait(),
+            runtime_supervisor::last_snapshot(&root)
+        );
+    }
+    shutdown(&root, &mut owner).await;
+    result.unwrap();
+}
+
 #[tokio::test]
 async fn damaged_discovery_and_completed_command_history_do_not_disable_controls() {
     use runtime_supervisor::{Intent, Phase};
@@ -566,7 +850,9 @@ async fn failed_cleanup_attempt_can_be_retried_without_losing_original_failure()
                 .unwrap_err();
             let failure = &error
                 .downcast_ref::<runtime_supervisor::RecoveryError>()
-                .context("cleanup must report its real failure, not permanent Busy")?
+                .with_context(|| {
+                    format!("cleanup must report its real failure, not permanent Busy: {error:#}")
+                })?
                 .snapshot;
             ensure!(
                 failure.phase == Phase::RecoveryRequired,

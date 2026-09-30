@@ -2,6 +2,7 @@
 //!
 //! This crate proves local process quiescence. It never authorizes replay of a
 //! database migration or claims that a remote operation completed successfully.
+mod cleanup;
 mod control;
 pub mod domain;
 mod epoch;
@@ -11,15 +12,17 @@ mod record;
 mod recovery;
 mod worker;
 
+pub use cleanup::CleanupCommand;
 pub use control::{
     Action, Binding, FailureCode, Phase, Problem, RecoveryError, Request, Snapshot, control,
-    last_snapshot,
+    control_verified, last_snapshot,
 };
 pub use monitor::{Options, Owner, Policy};
 pub use record::{Intent, Quiescence, verify_live, verify_local_quiescent, verify_quiescent};
 pub use recovery::{
     StopMode, StopRefused, StopWorkAttempt, continue_stop_work, continue_stop_work_with_checkpoint,
-    is_stop_refused, prepare_stop_work, stop_work,
+    continue_stop_work_with_cleanup, is_stop_refused, prepare_stop_work, stop_work,
+    stop_work_with_cleanup,
 };
 pub use worker::{Worker, WorkerControl};
 
@@ -27,13 +30,21 @@ pub const WORKER_ENV: &str = "RCODER_SUPERVISOR_WORKER";
 pub const TOKEN_ENV: &str = "RCODER_SUPERVISOR_TOKEN";
 const GUARDIAN_ARG: &str = "--runtime-worker-guardian";
 
+/// Retain for the entire external cleanup. A replacement cannot publish
+/// quiescence while an older cleanup callback can still mutate the engine.
+#[must_use]
+pub struct CleanupGuard {
+    _lock: std::fs::File,
+}
+
 /// Validate a cleanup-only callback launched by the guardian retaining the
 /// original generation lock. This grants no right to spawn business commands.
-pub fn verify_cleanup_callback() -> anyhow::Result<()> {
+pub fn verify_cleanup_callback() -> anyhow::Result<CleanupGuard> {
     use anyhow::{Context, ensure};
     let root = std::env::var_os("RCODER_SUPERVISOR_CLEANUP_ROOT")
         .context("cleanup callback root missing")?;
     let root = std::path::Path::new(&root);
+    let lock = record::lock(&root.join("external-cleanup.lock"))?;
     let value = record::generation(root)?;
     ensure!(
         value.phase == record::GenerationPhase::Draining,
@@ -46,7 +57,8 @@ pub fn verify_cleanup_callback() -> anyhow::Result<()> {
             == Some(value.token.as_str()),
         "cleanup callback identity mismatch"
     );
-    record::is_locked(&root.join("generation.lock"))
+    record::is_locked(&root.join("generation.lock"))?;
+    Ok(CleanupGuard { _lock: lock })
 }
 
 /// Supervisors and short-lived control clients do little work. Do not allocate
