@@ -79,7 +79,7 @@ pub(super) async fn observe_owner(address: &str) -> Result<OwnerProbe> {
     Ok(OwnerProbe::Ready(identity))
 }
 
-pub(super) async fn probe_owner(address: &str) -> Result<Option<RuntimeIdentityView>> {
+pub(crate) async fn probe_owner(address: &str) -> Result<Option<RuntimeIdentityView>> {
     match observe_owner(address).await? {
         OwnerProbe::Ready(identity) => Ok(Some(identity)),
         OwnerProbe::Absent | OwnerProbe::Legacy => Ok(None),
@@ -207,23 +207,59 @@ impl OwnerClient {
         })
     }
 
-    /// Only available after the owner acquired its lock and confirmed old process cleanup.
+    /// Only available after the owner acquired its lock and confirmed old process
+    /// cleanup. A short initializing window (unified owner booting its first
+    /// business session, e.g. a concurrent dispatched start) is retried with a
+    /// bounded budget instead of failing the build preflight（recovery v2 §9：
+    /// 短暂启动窗口使用有界等待）。
     pub(super) async fn recovery(&self) -> Result<shared_types::RuntimeRecoveryView> {
-        let body: serde_json::Value = self
-            .client
-            .get(format!("http://{}/v1/runtime/recovery", self.address))
-            .header("X-Deploy-Token", &self.token)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        serde_json::from_value(
-            body.get("data")
-                .cloned()
-                .context("recovery evidence missing")?,
-        )
-        .context("decode owner recovery evidence")
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            let response = self
+                .client
+                .get(format!("http://{}/v1/runtime/recovery", self.address))
+                .header("X-Deploy-Token", &self.token)
+                .send()
+                .await?;
+            let status = response.status();
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                let initializing_body = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|body| serde_json::to_string(&body).ok());
+                let initializing = initializing_body
+                    .as_deref()
+                    .and_then(|text| {
+                        serde_json::from_str::<serde_json::Value>(text)
+                            .ok()
+                            .and_then(|body| {
+                                body.get("code")
+                                    .and_then(|code| code.as_str())
+                                    .map(str::to_owned)
+                            })
+                    })
+                    .is_some_and(|code| code == "ERR_INITIALIZING");
+                if initializing && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
+                }
+                anyhow::bail!(
+                    "owner recovery evidence unavailable (initializing window exceeded); body={}",
+                    initializing_body.unwrap_or_default()
+                );
+            }
+            if !status.is_success() {
+                anyhow::bail!("owner recovery rejected with HTTP {status}");
+            }
+            let body: serde_json::Value = response.json().await?;
+            return serde_json::from_value(
+                body.get("data")
+                    .cloned()
+                    .context("recovery evidence missing")?,
+            )
+            .context("decode owner recovery evidence");
+        }
     }
 
     /// 当前 revision（提交操作的期望值来源）。

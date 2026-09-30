@@ -107,3 +107,35 @@ test-e2e-check:
 .PHONY: test-e2e-prune
 test-e2e-prune:
 	python3 tests-e2e/tools/prune_reports.py --days "$${DAYS:-14}" --keep "$${KEEP:-30}" $(if $(APPLY),--apply) $(if $(DEDUPE),--dedupe)
+
+# ============================================================================
+# app-cli 运行恢复专项（recovery v2 plan §11：本地 app-runtime 故障矩阵）
+# ============================================================================
+# 一次构建当前 Linux 二进制，真实容器内注入 A/B/C/G/J/I/D/E 场景：
+# 并发调用、owner 强杀/TERM、pkill 全部同名进程、挂死边界（SIGSTOP）、
+# app-11 升级 fixture、同容器重启与同卷重建。不含 LLM/RCoder 控制面。
+# 不清理工作卷（保留检查）；仅移除自建容器。ARCH 缺省取本机。
+.PHONY: test-e2e-app-cli-recovery test-e2e-app-cli-recovery-build
+
+APP_CLI_RECOVERY_ARCH ?= $(shell uname -m | sed 's/arm64/aarch64/;s/x86_64/x86_64/')
+APP_CLI_RECOVERY_TARGET ?= $(APP_CLI_RECOVERY_ARCH)-unknown-linux-gnu.2.17
+APP_CLI_RECOVERY_REPORT ?= tests-e2e/reports/app-cli-recovery-$(shell date +%Y%m%d-%H%M%S).json
+
+# Linux 二进制（zigbuild，glibc 2.17 兼容 agent-runner 镜像）。
+test-e2e-app-cli-recovery-build:
+	@set -eu; \
+	echo "🔨 构建 Linux app-cli / file-server-proxy ($(APP_CLI_RECOVERY_TARGET))"; \
+	mkdir -p tests-e2e/reports/_bin; \
+	cargo zigbuild --release --manifest-path crates/app-cli/Cargo.toml \
+	  --target $(APP_CLI_RECOVERY_TARGET) --bin app-cli; \
+	cargo zigbuild --release -p file-server-proxy \
+	  --target $(APP_CLI_RECOVERY_TARGET); \
+	cp crates/app-cli/target/$(APP_CLI_RECOVERY_ARCH)-unknown-linux-gnu/release/app-cli tests-e2e/reports/_bin/app-cli-linux; \
+	cp target/$(APP_CLI_RECOVERY_ARCH)-unknown-linux-gnu/release/file-server-proxy tests-e2e/reports/_bin/file-server-proxy-linux
+
+test-e2e-app-cli-recovery: test-e2e-app-cli-recovery-build
+	python3 tests-e2e/tools/app_cli_recovery.py \
+	  --app-cli tests-e2e/reports/_bin/app-cli-linux \
+	  --file-server-proxy tests-e2e/reports/_bin/file-server-proxy-linux \
+	  --report $(APP_CLI_RECOVERY_REPORT)
+	@echo "📋 报告: $(APP_CLI_RECOVERY_REPORT)"

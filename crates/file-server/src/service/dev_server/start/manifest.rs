@@ -271,6 +271,26 @@ impl DevServerManager {
             );
             match tokio::time::timeout(ALIVE_PROBE_BUDGET, probe).await {
                 Ok(Ok(_snapshot)) => {
+                    // recovery v2 T2：应答原生控制的活目标若同时提供运行身份
+                    //（统一 serve owner），Start 交由 start_dev 的 owner 复用
+                    // 路由处理——前置检查不再把常驻管理 owner 当"活 run"拒绝
+                    //（builder 固定 serve 后的必经形态）。仅应答 legacy 部署
+                    // 状态、无运行 API 的本地 run 维持拒绝（不猜杀）。
+                    let owner_addr = self.config.app_cli_admin_probe_addr.clone();
+                    match crate::service::dev_server::owner_client::probe_owner(&owner_addr).await {
+                        Ok(Some(_identity)) => {
+                            tracing::info!(
+                                project_id,
+                                root = %target.state_root.display(),
+                                "live managed owner detected; routing start through owner reuse"
+                            );
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "owner identity probe failed during start precheck");
+                        }
+                    }
                     return Err(AppError::business(format!(
                         "a local orchestrator for this project is still running ({}); stop or restart it before starting a new one",
                         target.snapshot.diagnostic()

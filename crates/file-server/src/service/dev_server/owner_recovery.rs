@@ -81,7 +81,20 @@ impl DevServerManager {
             OwnerProbe::Ready(identity) => identity,
             OwnerProbe::Legacy => return Ok(None), // registered local run is stopped by its retained child
             OwnerProbe::Absent if !required => return Ok(None),
-            OwnerProbe::Absent | OwnerProbe::Initializing => {
+            // recovery v2 §5.4：活 owner 的初始化窗口（统一 owner 首个业务
+            // 会话恢复中）只做有界等待——原生控制通道活着就不是"无 owner"，
+            // 派生竞争 bootstrap 会与常驻 serve 抢锁/转交，制造多余进程。
+            OwnerProbe::Initializing => {
+                let root = runtime_state_layout::ensure_state_root(
+                    workspace,
+                    std::env::var_os("APP_CLI_STATE_ROOT").as_deref(),
+                    std::env::var_os("PROJECT_ID").as_deref(),
+                )?;
+                std::fs::create_dir_all(&root)?;
+                self.wait_for_recovery_owner(project, workspace, address, &root)
+                    .await?
+            }
+            OwnerProbe::Absent => {
                 let root = runtime_state_layout::ensure_state_root(
                     workspace,
                     std::env::var_os("APP_CLI_STATE_ROOT").as_deref(),
