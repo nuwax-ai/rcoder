@@ -80,13 +80,23 @@ pub(super) struct ProxyUpstreamsData {
 #[utoipa::path(
     post,
     path = "/v1/proxy/validate",
+    params(("x-deploy-token" = Option<String>, Header, description = "Required when the runtime control token is configured")),
     responses(
+        (status = 403, description = "Runtime control token missing or invalid"),
         (status = 200, body = HttpResult<ProxyValidateData>, description = "Pingap source and plugin validation succeeded"),
         (status = 400, body = HttpResult<String>, description = "Config compile/validation failed (idle: no release)")
     ),
     tag = "Runtime Proxy"
 )]
-pub(super) async fn validate(State(state): State<AppState>) -> Response {
+pub(super) async fn validate(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if state.server.control_token().is_some()
+        && let Err(message) = super::authorize_deploy(&state, &headers)
+    {
+        return envelope::error(StatusCode::FORBIDDEN, "DEPLOY_FORBIDDEN", message);
+    }
     // The existing compiler publishes the validated config atomically, so this
     // endpoint is also a writer and must participate in runtime admission and unknown-result protection.
     let mut writer = match state.server.begin_auxiliary_write() {
@@ -128,13 +138,23 @@ pub(super) async fn validate(State(state): State<AppState>) -> Response {
 #[utoipa::path(
     post,
     path = "/v1/proxy/reload",
+    params(("x-deploy-token" = Option<String>, Header, description = "Required when the runtime control token is configured")),
     responses(
+        (status = 403, description = "Runtime control token missing or invalid"),
         (status = 200, body = HttpResult<ProxyReloadData>, description = "Effective config atomically updated and confirmed live via read-only admin config_hash"),
         (status = 400, body = HttpResult<String>, description = "Compile failed or reload verification timed out (rolled back to previous config)")
     ),
     tag = "Runtime Proxy"
 )]
-pub(super) async fn reload(State(state): State<AppState>) -> Response {
+pub(super) async fn reload(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if state.server.control_token().is_some()
+        && let Err(message) = super::authorize_deploy(&state, &headers)
+    {
+        return envelope::error(StatusCode::FORBIDDEN, "DEPLOY_FORBIDDEN", message);
+    }
     // 初始化恢复期拒绝运行态变更（P1-01：pingap 配置重载与启动恢复竞争）。
     if state.server.initializing() {
         return proxy_error(anyhow::anyhow!(

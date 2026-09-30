@@ -70,8 +70,9 @@ impl CommandContext {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
+        let bytes = serde_json::to_vec(&value)?;
         let mut temp = tempfile::NamedTempFile::new_in(&root)?;
-        serde_json::to_writer(&mut temp, &value)?;
+        temp.write_all(&bytes)?;
         temp.flush()?;
         temp.as_file().sync_all()?;
         // No replacement: a concurrent claimant must verify the same identity.
@@ -159,11 +160,11 @@ impl CommandRecord {
         let root = path
             .parent()
             .ok_or_else(|| std::io::Error::other("command journal parent missing"))?;
-        let mut temp = tempfile::NamedTempFile::new_in(root)?;
-        serde_json::to_writer(
-            &mut temp,
+        let bytes = serde_json::to_vec(
             &serde_json::json!({"version":1,"phase":phase,"diagnostic_pid":pid,"identity":self.identity}),
         )?;
+        let mut temp = tempfile::NamedTempFile::new_in(root)?;
+        temp.write_all(&bytes)?;
         temp.flush()?;
         temp.as_file().sync_all()?;
         crate::atomic_file::persist(temp, path)?;

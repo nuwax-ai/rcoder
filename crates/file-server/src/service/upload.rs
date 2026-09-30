@@ -7,7 +7,7 @@ use tokio::fs;
 
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
-use crate::path_safety::ensure_within;
+use crate::path_safety::ensure_resolved_within;
 use crate::service::version;
 use crate::workspace::{ProjectContext, WorkspaceResolver};
 
@@ -35,8 +35,8 @@ pub async fn upload_single_file(
     if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }
+    let target = ensure_resolved_within(&project_path, file_path).await?;
     version::backup_project(config, project_id, &project_path, code_version).await?;
-    let target = ensure_within(&project_path, file_path)?;
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).await?;
     }
@@ -76,7 +76,7 @@ pub async fn upload_batch_files(
 
     let mut written = Vec::new();
     for (file_path, source) in &files {
-        match ensure_within(&project_path, file_path) {
+        match ensure_resolved_within(&project_path, file_path).await {
             Ok(target) => {
                 if let Some(parent) = target.parent()
                     && let Err(e) = fs::create_dir_all(parent).await
@@ -109,10 +109,11 @@ pub async fn upload_batch_files(
                     size: copied,
                 });
             }
-            Err(_) => {
+            Err(AppError::Validation(..)) => {
                 // 越界跳过 (对齐 nuwax `uploadBatchFiles`)
                 tracing::warn!(path = %file_path, "skip unsafe path in batch upload");
             }
+            Err(error) => return Err(error),
         }
     }
     Ok(written)
@@ -139,7 +140,7 @@ pub async fn upload_attachment_file(
     if !crate::service::fs_util::path_exists(&project_path).await? {
         return Err(AppError::resource("Project does not exist"));
     }
-    let attachments_dir = project_path.join(".attachments");
+    let attachments_dir = ensure_resolved_within(&project_path, ".attachments").await?;
     fs::create_dir_all(&attachments_dir).await?;
     let requested = preferred_name
         .map(|s| s.trim().to_string())
@@ -218,6 +219,93 @@ async fn write_unique_file(dir: &Path, base: &str, source: &Path) -> AppResult<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_paths_resolve_links_without_rejecting_in_workspace_links() {
+        use crate::workspace::LocalWorkspaceResolver;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(root.join("inside")).await.unwrap();
+        fs::create_dir(&outside).await.unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        symlink(root.join("inside"), root.join("safe")).unwrap();
+        symlink(&outside, root.join(".attachments")).unwrap();
+        let source = temp.path().join("source");
+        fs::write(&source, "uploaded").await.unwrap();
+        let resolver = LocalWorkspaceResolver::new(temp.path().into(), temp.path().into());
+        let ctx = ProjectContext {
+            project_id: "project".into(),
+            tenant_id: None,
+            space_id: None,
+            isolation_type: None,
+        };
+        let config = Config {
+            git_enabled: true,
+            ..Config::default()
+        };
+
+        assert!(
+            upload_single_file(&resolver, &config, &ctx, "escape/single", &source, "1")
+                .await
+                .is_err()
+        );
+        let batch = upload_batch_files(
+            &resolver,
+            &config,
+            &ctx,
+            vec![
+                ("escape/batch".into(), source.clone()),
+                ("safe/batch".into(), source.clone()),
+            ],
+            "1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].file_path, "safe/batch");
+        assert!(
+            upload_attachment_file(&resolver, &ctx, None, "attachment", &source)
+                .await
+                .is_err()
+        );
+        assert!(
+            fs::read_dir(&outside)
+                .await
+                .unwrap()
+                .next_entry()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        upload_single_file(&resolver, &config, &ctx, "safe/single", &source, "1")
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("inside/single"))
+                .await
+                .unwrap(),
+            "uploaded"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("inside/batch")).await.unwrap(),
+            "uploaded"
+        );
+        fs::remove_file(root.join(".attachments")).await.unwrap();
+        symlink(root.join("inside"), root.join(".attachments")).unwrap();
+        upload_attachment_file(&resolver, &ctx, None, "attachment", &source)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("inside/attachment"))
+                .await
+                .unwrap(),
+            "uploaded"
+        );
+    }
 
     #[tokio::test]
     async fn unique_attachment_creation_never_overwrites() {

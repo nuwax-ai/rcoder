@@ -139,12 +139,15 @@ GET /computer/vnc/{user_id}/{project_id}/{*path}
 
 ## 工作原理
 
-1. 客户端请求到达 RCoder 服务
-2. Axum 路由器匹配到 VNC 代理路径
-3. 请求转发给 Pingora 代理服务
-4. Pingora 根据 user_id 查找容器 IP
-5. Pingora 透明代理请求到容器的 noVNC 服务（端口 6080）
-6. 响应返回给客户端
+1. 客户端通过 RCoder 的 Pingora 代理监听地址访问上述 `/computer/vnc/` 路径。
+2. Pingora 按用户及项目定位容器，透明转发 HTTP/WebSocket 到 noVNC（容器端口 6080）。
+3. 响应经 Pingora 返回客户端。
+
+本条记录描述的是代理服务的公共入口，不是主 HTTP 服务的路由。
+本地 Compose 通常将主 HTTP 服务映射到 8090、Pingora 映射到 8088；
+实际端口以部署配置为准。主 HTTP 服务上的同名 `/computer/vnc/` 路径不存在；
+`/computer/desktop-proxy/{user_id}/{project_id}/{path}` 是返回 501 提示的占位接口，
+不会替调用方转发到 Pingora。
 
 ## 使用示例
 

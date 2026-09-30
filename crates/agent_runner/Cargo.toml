@@ -66,6 +66,7 @@ model_probe = { workspace = true }
 file-server = { workspace = true }
 file-server-userapp = { workspace = true }
 file-server-proxy = { workspace = true }
+process_utils = { workspace = true }
 rcoder-proxy = { workspace = true, optional = true }
 rcoder-telemetry = { workspace = true }
 dial9 = { workspace = true, optional = true }

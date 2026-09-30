@@ -40,6 +40,16 @@ pub(crate) struct Receipt {
     pub active: Option<ActiveVersion>,
 }
 
+/// Flattening keeps old receipts readable and preserves the on-disk request
+/// redaction. History is committed with the current receipt, never separately.
+#[derive(Serialize, Deserialize)]
+struct StoredReceipt {
+    #[serde(flatten)]
+    receipt: Receipt,
+    #[serde(default)]
+    deploy_replays: super::deploy_replay::History,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum OwnerState {
@@ -61,6 +71,7 @@ pub(crate) struct Journal {
     root: PathBuf,
     lease: Option<File>,
     pub receipt: Option<Receipt>,
+    pub(super) deploy_replays: super::deploy_replay::History,
     pub process_scope: Option<String>,
     previous_owner: Option<CoordinatorOwner>,
     // Retain the old lock domain for the entire owner lifetime: an old binary
@@ -148,6 +159,7 @@ impl Journal {
             {
                 let mut old = Self::open_root_recovering(legacy.clone(), supervised)?;
                 journal.receipt = old.receipt.take();
+                journal.deploy_replays = std::mem::take(&mut old.deploy_replays);
                 journal.previous_owner = old.previous_owner.take();
                 let lease = old
                     .lease
@@ -245,12 +257,18 @@ impl Journal {
         lease
             .try_lock()
             .context("another deployment coordinator owns this volume")?;
-        let receipt = read_record(&root.join(".deploy-operation.json"), supervised)?;
+        let stored: Option<StoredReceipt> =
+            read_record(&root.join(".deploy-operation.json"), supervised)?;
+        let (receipt, deploy_replays) = match stored {
+            Some(stored) => (Some(stored.receipt), stored.deploy_replays),
+            None => (None, Default::default()),
+        };
         let previous_owner = read_record(&root.join(".deploy-coordinator.json"), supervised)?;
         Ok(Self {
             root,
             lease: Some(lease),
             receipt,
+            deploy_replays,
             process_scope: process_scope(),
             previous_owner,
             legacy_leases: Vec::new(),
@@ -278,7 +296,27 @@ impl Journal {
         Ok(readback)
     }
     pub fn write(&mut self, receipt: Receipt) -> Result<()> {
-        self.receipt = Some(self.write_verified(".deploy-operation.json", &receipt)?);
+        let mut history = self.deploy_replays.clone();
+        if let Some(replay) = history.get_mut(&receipt.operation.operation_id) {
+            replay.operation = receipt.operation.clone();
+        }
+        self.write_with_history(receipt, history)
+    }
+
+    pub(super) fn write_with_history(
+        &mut self,
+        receipt: Receipt,
+        deploy_replays: super::deploy_replay::History,
+    ) -> Result<()> {
+        let stored = self.write_verified(
+            ".deploy-operation.json",
+            &StoredReceipt {
+                receipt,
+                deploy_replays,
+            },
+        )?;
+        self.receipt = Some(stored.receipt);
+        self.deploy_replays = stored.deploy_replays;
         Ok(())
     }
 
@@ -455,6 +493,7 @@ impl Journal {
         #[cfg(unix)]
         File::open(&self.root)?.sync_all()?;
         self.receipt = None;
+        self.deploy_replays.clear();
         Ok(())
     }
     pub fn resume(&self, generation: &str) -> Result<Option<Receipt>> {

@@ -27,11 +27,11 @@ pub async fn chat(
         .map(shared_types::MaskedModelConfig);
 
     info!(
-        "🚀 [gRPC] Chat request: project_id={}, session_id={}, prompt_len={}, agent_config={:?}, model_config={:?}, service_type={:?}, user_id={:?}, has_attachments={}, has_data_source={}",
+        "🚀 [gRPC] Chat request: project_id={}, session_id={}, prompt_len={}, has_agent_config={}, model_config={:?}, service_type={:?}, user_id={:?}, has_attachments={}, has_data_source={}",
         req.project_id,
         req.session_id,
         req.prompt.len(),
-        req.agent_config,
+        req.agent_config.is_some(),
         model_config_debug,
         req.service_type,
         req.user_id,
@@ -60,20 +60,7 @@ pub async fn chat(
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().replace("-", ""));
 
-    let service_type = req
-        .service_type
-        .as_ref()
-        .and_then(|st| match st.parse::<shared_types::ServiceType>() {
-            Ok(t) => Some(t),
-            Err(e) => {
-                warn!(
-                    "[gRPC] Invalid service_type: {}, using default WebAgentRunner. Error: {}",
-                    st, e
-                );
-                None
-            }
-        })
-        .unwrap_or(shared_types::ServiceType::WebAgentRunner);
+    let service_type = parse_service_type(req.service_type.as_deref())?;
 
     let app_id = req.app_id.clone().filter(|s| !s.is_empty());
 
@@ -172,6 +159,14 @@ pub async fn chat(
     Ok(Response::new(grpc_response))
 }
 
+fn parse_service_type(value: Option<&str>) -> Result<shared_types::ServiceType, Status> {
+    value
+        .map(str::parse)
+        .transpose()
+        .map_err(|error| Status::invalid_argument(format!("Invalid service_type: {error}")))
+        .map(|value| value.unwrap_or(shared_types::ServiceType::WebAgentRunner))
+}
+
 /// UserappBuilder 场景 app_id 必填校验（Fail Fast：app_id 与 project_id 是语义
 /// 独立的字段——定位键缺失即调用方契约错误，不做 project_id 回落）。
 fn validate_userapp_app_id(
@@ -254,6 +249,24 @@ fn resolve_project_dir(
 mod tests {
     use super::*;
     use shared_types::ServiceType;
+
+    #[test]
+    fn service_type_defaults_only_when_omitted() {
+        assert_eq!(
+            parse_service_type(None).unwrap(),
+            ServiceType::WebAgentRunner
+        );
+        assert_eq!(
+            parse_service_type(Some("computer-normal-project")).unwrap(),
+            ServiceType::ComputerNormalProject
+        );
+        for invalid in ["", "not-a-service"] {
+            assert_eq!(
+                parse_service_type(Some(invalid)).unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+    }
 
     #[test]
     fn computer_normal_project_derives_default_and_keeps_absolute() {

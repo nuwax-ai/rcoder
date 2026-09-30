@@ -31,6 +31,7 @@ impl ServerState {
             initializing: std::sync::atomic::AtomicBool::new(true),
             preparations: Arc::new(preparation::Preparations::default()),
             journal: std::sync::Mutex::new(None),
+            volatile_deploy_replays: std::sync::Mutex::new(Default::default()),
             generation: std::env::var(shared_types::APP_DEPLOY_GENERATION_ID)
                 .ok()
                 .filter(|s| !s.trim().is_empty())
@@ -617,7 +618,7 @@ impl ServerState {
         })
     }
 
-    pub(super) fn initialize_owner_token(&self) -> Result<()> {
+    pub(crate) fn initialize_owner_token(&self) -> Result<()> {
         let token = self
             .control_token()
             .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
@@ -702,17 +703,47 @@ impl ServerState {
     #[cfg(test)]
     pub(crate) fn try_accept_deploy(&self, req: DeployRequest) -> Result<(), AdmissionError> {
         self.try_accept_deploy_with_id(req, uuid::Uuid::new_v4().simple().to_string())
+            .map(|_| ())
     }
 
     pub(crate) fn try_accept_deploy_with_id(
         &self,
         req: DeployRequest,
         operation_id: String,
-    ) -> Result<(), AdmissionError> {
+    ) -> Result<DeployAdmission, AdmissionError> {
         let _admission = self
             .admission
             .lock()
             .map_err(|_| "deployment admission lock poisoned")?;
+        let fingerprint = deploy_replay::fingerprint(&req)?;
+        let (old_receipt, mut history) = self.deployment_replay_snapshot()?;
+        // Preserve old non-HTTP receipts too. Redacted credentials cannot be
+        // used to reconstruct an input hash; only that old ID needs inspection.
+        if let Some(receipt) = old_receipt.as_ref() {
+            if !history.contains_key(&receipt.operation.operation_id) {
+                let fingerprint = if receipt.request.run_pg.is_none() {
+                    Some(deploy_replay::fingerprint(&receipt.request)?)
+                } else {
+                    None
+                };
+                history.insert(
+                    receipt.operation.operation_id.clone(),
+                    deploy_replay::Replay {
+                        fingerprint,
+                        operation: receipt.operation.clone(),
+                    },
+                );
+            }
+        } else if let Some(current) = self.deploy_status().operation
+            && let Some(saved) = history.get_mut(&current.operation_id)
+        {
+            saved.operation = current;
+        }
+        // Replays are reads and precede busy/recovery checks: an uncertain
+        // result is returned as recorded, never executed a second time.
+        if let Some(saved) = history.get(&operation_id) {
+            return deploy_replay::check(saved, &fingerprint).map(DeployAdmission::Replayed);
+        }
         if !self.accepting.load(std::sync::atomic::Ordering::Acquire) {
             return Err(AdmissionError::Busy(
                 "server is shutting down; deployment was not accepted".into(),
@@ -787,29 +818,46 @@ impl ServerState {
             .journal
             .lock()
             .map_err(|_| "deployment journal lock poisoned")?;
-        let old_receipt = journal_guard.as_ref().and_then(|j| j.receipt.clone());
+        let mut volatile = self
+            .volatile_deploy_replays
+            .lock()
+            .map_err(|_| "deployment replay lock poisoned")?;
+        let old_history = journal_guard
+            .as_ref()
+            .map(|j| j.deploy_replays.clone())
+            .unwrap_or_else(|| volatile.clone());
+        history.insert(
+            operation.operation_id.clone(),
+            deploy_replay::Replay {
+                fingerprint: Some(fingerprint),
+                operation: operation.clone(),
+            },
+        );
         if let Some(journal) = journal_guard.as_mut() {
             journal
-                .write(Receipt {
-                    generation: self.generation.clone(),
+                .write_with_history(
+                    Receipt {
+                        generation: self.generation.clone(),
 
-                    operation: operation.clone(),
-                    request: req.clone(),
-                    boundary: Boundary::Preparing,
-                    active: old_receipt
-                        .as_ref()
-                        .filter(|r| r.generation == self.generation)
-                        .and_then(|r| r.active.clone())
-                        .or_else(|| {
-                            (phase == ServerPhase::Running)
-                                .then(|| self.release())
-                                .flatten()
-                                .map(|release| ActiveVersion {
-                                    artifact_release_id: release.release_id,
-                                    request: None,
-                                })
-                        }),
-                })
+                        operation: operation.clone(),
+                        request: req.clone(),
+                        boundary: Boundary::Preparing,
+                        active: old_receipt
+                            .as_ref()
+                            .filter(|r| r.generation == self.generation)
+                            .and_then(|r| r.active.clone())
+                            .or_else(|| {
+                                (phase == ServerPhase::Running)
+                                    .then(|| self.release())
+                                    .flatten()
+                                    .map(|release| ActiveVersion {
+                                        artifact_release_id: release.release_id,
+                                        request: None,
+                                    })
+                            }),
+                    },
+                    history.clone(),
+                )
                 .map_err(|error| format!("persist deployment admission: {error:#}"))?;
         }
         let mut status = self
@@ -842,15 +890,70 @@ impl ServerState {
             *status = previous;
             if let Some(journal) = journal_guard.as_mut() {
                 match old_receipt {
-                    Some(receipt) => journal.write(receipt),
+                    Some(receipt) => journal.write_with_history(receipt, old_history),
                     None => journal.clear(),
                 }
                 .map_err(|e| format!("restore admission receipt: {e:#}"))?;
             }
             return Err("server loop exited".into());
         }
+        if journal_guard.is_none() {
+            *volatile = history;
+        }
         credentials.operation_id = None;
-        Ok(())
+        Ok(DeployAdmission::Accepted)
+    }
+
+    fn deployment_replay_snapshot(
+        &self,
+    ) -> Result<(Option<Receipt>, deploy_replay::History), AdmissionError> {
+        let journal = self
+            .journal
+            .lock()
+            .map_err(|_| "deployment journal lock poisoned")?;
+        if let Some(journal) = journal.as_ref() {
+            return Ok((journal.receipt.clone(), journal.deploy_replays.clone()));
+        }
+        let history = self
+            .volatile_deploy_replays
+            .lock()
+            .map_err(|_| "deployment replay lock poisoned")?
+            .clone();
+        Ok((None, history))
+    }
+
+    pub(crate) fn recorded_deployment(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<shared_types::AppDeploymentOperation>, AdmissionError> {
+        let journal = self
+            .journal
+            .lock()
+            .map_err(|_| "deployment journal lock poisoned")?;
+        if let Some(journal) = journal.as_ref() {
+            return Ok(journal
+                .receipt
+                .as_ref()
+                .filter(|receipt| receipt.operation.operation_id == operation_id)
+                .map(|receipt| receipt.operation.clone())
+                .or_else(|| {
+                    journal
+                        .deploy_replays
+                        .get(operation_id)
+                        .map(|replay| replay.operation.clone())
+                }));
+        }
+        if let Some(current) = self.deploy_status().operation
+            && current.operation_id == operation_id
+        {
+            return Ok(Some(current));
+        }
+        Ok(self
+            .volatile_deploy_replays
+            .lock()
+            .map_err(|_| "deployment replay lock poisoned")?
+            .get(operation_id)
+            .map(|replay| replay.operation.clone()))
     }
 
     /// Runtime admission already owns the operation slot. Persist its execution

@@ -209,6 +209,128 @@ mod cases {
         }
     }
 
+    #[tokio::test]
+    async fn deployment_replay_is_durable_and_does_not_block_new_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("code");
+        let first = state();
+        *first.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
+        let mut input = request();
+        input.run_pg = Some(shared_types::StartPgCredential {
+            username: "dev".into(),
+            password: "original-secret".into(),
+        });
+        assert!(matches!(
+            first
+                .try_accept_deploy_with_id(input.clone(), "a".into())
+                .unwrap(),
+            DeployAdmission::Accepted
+        ));
+        assert!(matches!(
+            first
+                .try_accept_deploy_with_id(input.clone(), "a".into())
+                .unwrap(),
+            DeployAdmission::Replayed(_)
+        ));
+        let mut changed = input.clone();
+        changed.run_pg.as_mut().unwrap().password = "changed-secret".into();
+        assert!(matches!(
+            first.try_accept_deploy_with_id(changed, "a".into()),
+            Err(AdmissionError::Conflict(_))
+        ));
+        let mut received = first.deploy_rx.lock().await;
+        assert!(received.try_recv().is_ok());
+        assert!(
+            received.try_recv().is_err(),
+            "replay must not dispatch again"
+        );
+        drop(received);
+        first
+            .fail_operation("confirmed failure".into(), Boundary::Failed)
+            .unwrap();
+        assert!(matches!(
+            first
+                .try_accept_deploy_with_id(input.clone(), "b".into())
+                .unwrap(),
+            DeployAdmission::Accepted
+        ));
+        drop(first);
+        let restarted = state();
+        *restarted.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
+        let DeployAdmission::Replayed(original) = restarted
+            .try_accept_deploy_with_id(input.clone(), "a".into())
+            .unwrap()
+        else {
+            panic!("expected original result")
+        };
+        assert_eq!(original.phase, AppCliDeployPhase::Failed);
+        assert_eq!(original.error.as_deref(), Some("confirmed failure"));
+        assert!(matches!(
+            restarted
+                .try_accept_deploy_with_id(input, "b".into())
+                .unwrap(),
+            DeployAdmission::Replayed(_)
+        ));
+        assert!(restarted.deploy_rx.lock().await.try_recv().is_err());
+        assert_eq!(
+            restarted
+                .journal
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .receipt
+                .as_ref()
+                .unwrap()
+                .operation
+                .operation_id,
+            "b"
+        );
+        assert!(
+            !std::fs::read_to_string(dir.path().join(".deploy-operation.json"))
+                .unwrap()
+                .contains("original-secret")
+        );
+        assert_eq!(
+            restarted
+                .recorded_deployment("a")
+                .unwrap()
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("confirmed failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_deployment_retries_dispatch_only_once() {
+        let state = Arc::new(state());
+        let mut threads = Vec::new();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        for _ in 0..2 {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                state
+                    .try_accept_deploy_with_id(request(), "same".into())
+                    .unwrap()
+            }));
+        }
+        barrier.wait();
+        let accepted = threads
+            .into_iter()
+            .filter_map(|thread| match thread.join().unwrap() {
+                DeployAdmission::Accepted => Some(()),
+                DeployAdmission::Replayed(_) => None,
+            })
+            .count();
+        assert_eq!(accepted, 1);
+        let mut queue = state.deploy_rx.lock().await;
+        assert!(queue.try_recv().is_ok());
+        assert!(queue.try_recv().is_err());
+    }
+
     fn release(rid: &str) -> workspace_manifest::ReleaseLock {
         let mut release: workspace_manifest::ReleaseLock = toml::from_str(
             r#"

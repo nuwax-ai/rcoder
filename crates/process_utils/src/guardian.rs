@@ -36,8 +36,11 @@ struct Receipt {
     diagnostic_pid: Option<u32>,
 }
 fn save(root: &Path, receipt: &Receipt) -> Result<()> {
+    // Buffer JSON before touching the shared filesystem; otherwise each JSON
+    // fragment is a separate write and delays startup/cleanup acknowledgements.
+    let bytes = serde_json::to_vec(receipt)?;
     let mut file = tempfile::NamedTempFile::new_in(root)?;
-    serde_json::to_writer(&mut file, receipt)?;
+    file.write_all(&bytes)?;
     file.flush()?;
     file.as_file().sync_all()?;
     crate::atomic_file::persist(file, &root.join("receipt.json"))
@@ -240,8 +243,9 @@ fn confirm_command(root: &Path, receipt: &Receipt) -> Result<()> {
     value["phase"] = "Quiescent".into();
     value["diagnostic_pid"] = serde_json::Value::Null;
     let parent = path.parent().context("command parent missing")?;
+    let bytes = serde_json::to_vec(&value)?;
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer(&mut file, &value)?;
+    file.write_all(&bytes)?;
     file.flush()?;
     file.as_file().sync_all()?;
     crate::atomic_file::persist(file, path).context("publish command cleanup receipt")?;
@@ -467,34 +471,40 @@ pub async fn spawn_guarded(
         .write_all(&frame)
         .await
         .context("send guardian command")?;
-    // Spawn means the actual command has started, not merely its guardian.
-    tokio::time::timeout(Duration::from_secs(10), async {
-        let mut unavailable_since = None;
-        loop {
-            let receipt = observe_receipt(&root, &mut unavailable_since)
-                .with_context(|| format!("read command startup receipt at {}", root.display()))?;
-            let Some(receipt) = receipt else {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                continue;
-            };
-            if receipt.diagnostic_pid.is_some() || receipt.root_status.is_some() {
-                return Ok::<_, anyhow::Error>(());
-            }
-            ensure!(
-                child.try_wait()?.is_none(),
-                "command guardian exited before command startup"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .context("command startup acknowledgement timed out")??;
+    // Startup has one existing 10s budget. The shorter steady-state visibility
+    // window must not abort this handshake before the guardian can acknowledge.
+    wait_for_start(&mut child, &root, Duration::from_secs(10)).await?;
     Ok(OwnedChild::Guarded {
         child,
         lease: Some(lease),
         root,
         receipt_unavailable_since: None,
     })
+}
+
+async fn wait_for_start(
+    child: &mut tokio::process::Child,
+    root: &Path,
+    budget: Duration,
+) -> Result<()> {
+    crate::observe::observe("command startup acknowledgement", budget, || {
+        // No spawn or other side effect is retried. Retain the original Child
+        // and validate each complete receipt; malformed/foreign records fail.
+        let result = (|| {
+            let receipt = read(root)
+                .with_context(|| format!("read command startup receipt at {}", root.display()))?;
+            if receipt.diagnostic_pid.is_some() || receipt.root_status.is_some() {
+                return Ok(Some(()));
+            }
+            ensure!(
+                child.try_wait()?.is_none(),
+                "command guardian exited before command startup"
+            );
+            Ok(None)
+        })();
+        std::future::ready(result)
+    })
+    .await
 }
 
 /// Private binary entry: hold the authorization lock before checking owner and
@@ -800,8 +810,9 @@ pub fn confirm_physical_domain_exit(work_root: &Path) -> Result<()> {
             );
             value["phase"] = "Quiescent".into();
             value["termination"] = "PhysicalDomainExited".into();
+            let bytes = serde_json::to_vec(&value)?;
             let mut temp = tempfile::NamedTempFile::new_in(&commands)?;
-            serde_json::to_writer(&mut temp, &value)?;
+            temp.write_all(&bytes)?;
             temp.flush()?;
             temp.as_file().sync_all()?;
             crate::atomic_file::persist(temp, &path)?;
@@ -948,6 +959,53 @@ mod tests {
         assert!(crate::observe::is_not_found(&error));
         assert!(format!("{error:#}").contains("not visible within"));
         assert!(!work.join("guardians").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_receipt_uses_handshake_budget_without_replacing_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&root).unwrap();
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let original_pid = child.id();
+        let receipt = Receipt {
+            version: 2,
+            id: root.file_name().unwrap().to_str().unwrap().into(),
+            instance_id: "test-instance".into(),
+            phase: "Running".into(),
+            command_record: None,
+            command_digest: "0".repeat(64),
+            root_status: None,
+            diagnostic_pid: original_pid,
+        };
+        let mut waiting = Box::pin(wait_for_start(&mut child, &root, Duration::from_secs(3)));
+        // Explicitly enter the missing-receipt observation before crossing the
+        // old 250ms steady-state limit. It is still the same startup handshake.
+        assert_pending(waiting.as_mut()).await;
+        tokio::time::sleep(RECEIPT_VISIBILITY_BUDGET + Duration::from_millis(100)).await;
+        assert_pending(waiting.as_mut()).await;
+        save(&root, &receipt).unwrap();
+        waiting.await.unwrap();
+        assert_eq!(child.id(), original_pid);
+        assert!(child.try_wait().unwrap().is_none());
+
+        std::fs::remove_file(root.join("receipt.json")).unwrap();
+        let error = wait_for_start(&mut child, &root, Duration::from_millis(30))
+            .await
+            .unwrap_err();
+        assert!(crate::observe::is_not_found(&error));
+        std::fs::write(root.join("receipt.json"), "corrupt").unwrap();
+        let error = wait_for_start(&mut child, &root, Duration::from_secs(3))
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<serde_json::Error>().is_some());
+        assert_eq!(child.id(), original_pid);
+        child.kill().await.unwrap();
     }
 
     #[cfg(unix)]

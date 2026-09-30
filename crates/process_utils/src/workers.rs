@@ -7,6 +7,14 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+static ACTIVE_IN_PROCESS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Observation for the container's idle reaper, not a lifecycle lock. Count
+/// accepted execution until its future exits, including cancellation cleanup.
+pub fn active_in_process() -> usize {
+    ACTIVE_IN_PROCESS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 struct Gate {
     closed: bool,
     active: usize,
@@ -25,6 +33,7 @@ struct Permit {
 }
 impl Drop for Permit {
     fn drop(&mut self) {
+        ACTIVE_IN_PROCESS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         if let Ok(mut gate) = self.registry.gate.lock() {
             gate.active -= 1;
             gate.unconfirmed |= !self.completed;
@@ -83,6 +92,7 @@ impl WorkerRegistry {
             .transpose()
             .map_err(|e| format!("persist worker admission: {e}"))?;
         gate.active += 1;
+        ACTIVE_IN_PROCESS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let permit = Permit {
             registry: self.clone(),
             completed: false,

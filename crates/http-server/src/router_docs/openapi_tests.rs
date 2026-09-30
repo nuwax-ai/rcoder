@@ -3,6 +3,42 @@
 use super::*;
 use axum::Router;
 
+#[test]
+fn computer_progress_and_vnc_documents_match_their_service_routes() {
+    let document = primary_document();
+    let progress = "/computer/progress/{session_id}";
+    assert!(document.paths.paths[progress].get.is_some());
+    assert!(
+        !document
+            .paths
+            .paths
+            .contains_key("/computer/agent/progress/{session_id}")
+    );
+    // Check the registered Axum route, not just another copy of the annotation.
+    let routes = include_str!("../router/computer.rs");
+    assert!(routes.contains(&format!("\"{progress}\"")));
+    assert!(!routes.contains("\"/computer/vnc/"));
+    assert!(routes.contains("\"/computer/desktop-proxy/{user_id}/{project_id}/{*path}\""));
+    let proxy = rcoder_proxy::router::create_router().unwrap();
+    for suffix in ["vnc.html", "websockify"] {
+        let path = format!("/computer/vnc/user/project/{suffix}");
+        assert_eq!(
+            *proxy.at(&path).unwrap().value,
+            rcoder_proxy::router::RouteType::VncProxy
+        );
+    }
+    let vnc = &document.paths.paths["/computer/vnc/{user_id}/{project_id}/{*path}"];
+    assert!(
+        vnc.get
+            .as_ref()
+            .unwrap()
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("Pingora")
+    );
+}
+
 /// These generated parameters and request bodies are inline. Fail explicitly
 /// if that contract changes instead of silently skipping a referenced object.
 fn inline<T>(value: &utoipa::openapi::RefOr<T>) -> &T {

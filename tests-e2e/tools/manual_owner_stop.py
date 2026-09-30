@@ -53,6 +53,20 @@ def main():
         records['container_id'] = cid
         records['image_id'] = docker('inspect', '--format', '{{.Image}}', cid).stdout.strip()
         ws = '/home/user/' + app
+        # This container requires PostgreSQL before app-cli orchestration.
+        # Complete real cold initialization before testing ownership transfer;
+        # a missing database must fail setup, not masquerade as a Stop failure.
+        pg_deadline = time.monotonic() + 180
+        while True:
+            pg = execute('PGPASSWORD="$POSTGRES_PASSWORD" PGCONNECT_TIMEOUT=2 '
+                         'psql -X -w -h 127.0.0.1 -U "$POSTGRES_USER" '
+                         '-d "$POSTGRES_DB" -qAt -c "SELECT 1"', check=False)
+            if pg.returncode == 0 and pg.stdout.strip() == '1':
+                break
+            if time.monotonic() >= pg_deadline:
+                raise RuntimeError('fixture PostgreSQL initialization/login did not complete')
+            time.sleep(2)
+        check('real PostgreSQL prerequisite ready', True)
         files = {
             'workspace.manifest.toml': 'schema_version = 1\n[workspace]\nname = "manual-stop"\n',
             'backend/project.manifest.toml': '''schema_version = 1
@@ -165,7 +179,9 @@ print(json.dumps({'supervisor_id': discovery['instance'], 'generation': active[0
         records['success'] = False
         records['error'] = str(error)
         if cid:
-            records['owner_log_tail'] = execute('tail -50 /tmp/manual-owner.log', check=False).stdout
+            records['owner_log_tail'] = execute('tail -n 50 /tmp/manual-owner.log', check=False).stdout
+            records['pg_log_tail'] = execute(
+                'tail -n 50 /app/logs/pg.out.log /app/logs/pg.err.log', check=False).stdout
     finally:
         if cid:
             cleanup = docker('rm', '-f', cid, check=False)

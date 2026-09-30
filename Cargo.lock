@@ -311,6 +311,7 @@ dependencies = [
  "percent-encoding",
  "pid1",
  "piper",
+ "process_utils",
  "procfs",
  "rcoder-proxy",
  "rcoder-telemetry",

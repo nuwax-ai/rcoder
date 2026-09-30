@@ -197,12 +197,22 @@ fn get_active_tasks_count() -> i32 {
     // 但两次对话间 agent 处于 Idle 时，靠这个计数让容器被判活跃、不被闲置回收。
     let vnc_count = crate::vnc_activity::active_vnc_client_count() as i32;
 
+    // Embedded UserApp build/start/restart workers continue after HTTP 202.
+    // Task polling is read-only and does not refresh project activity. Count
+    // their real execution so an idle scan cannot reap a building container.
+    // Explicit Stop/Restart still follows its normal cancellation path.
+    let local_workers =
+        i32::try_from(process_utils::workers::active_in_process()).unwrap_or(i32::MAX);
+
     debug!(
-        "[GET_CONTAINER_STATUS] active breakdown: agents={}, terminals={}, vnc={}",
-        agent_count, terminal_count, vnc_count
+        "[GET_CONTAINER_STATUS] active breakdown: agents={}, terminals={}, vnc={}, local_workers={}",
+        agent_count, terminal_count, vnc_count, local_workers
     );
 
-    agent_count + terminal_count + vnc_count
+    agent_count
+        .saturating_add(terminal_count)
+        .saturating_add(vnc_count)
+        .saturating_add(local_workers)
 }
 
 fn get_uptime_seconds() -> i64 {
@@ -211,4 +221,27 @@ fn get_uptime_seconds() -> i64 {
     let start = START_TIME.get_or_init(std::time::Instant::now);
 
     start.elapsed().as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn embedded_worker_keeps_container_active_until_cancelled_execution_exits() {
+        let registry = process_utils::workers::WorkerRegistry::new(None);
+        let (release, released) = tokio::sync::oneshot::channel();
+        let worker = registry
+            .spawn(async move { released.await.unwrap() })
+            .unwrap();
+        assert!(get_active_tasks_count() > 0);
+        registry.close().unwrap();
+        assert!(
+            get_active_tasks_count() > 0,
+            "cancellation is not execution exit"
+        );
+        release.send(()).unwrap();
+        worker.await.unwrap().unwrap();
+        assert_eq!(process_utils::workers::active_in_process(), 0);
+    }
 }

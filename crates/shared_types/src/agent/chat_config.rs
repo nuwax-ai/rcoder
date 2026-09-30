@@ -60,7 +60,7 @@ impl FromStr for AgentMode {
 ///
 /// 包含单个 Agent 的运行时配置和多个 MCP 服务器配置。
 /// 提示词由独立入参 (system_prompt, user_prompt) 控制，不在此结构中。
-#[derive(Debug, Clone, Serialize, Deserialize, Default, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, Default, ToSchema)]
 pub struct ChatAgentConfig {
     /// 单个 Agent 服务器配置（可选）
     ///
@@ -89,6 +89,19 @@ pub struct ChatAgentConfig {
     /// 主要用于 DevComputer 调试场景，实现热重载开发体验。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_reload: Option<AutoReloadConfig>,
+}
+
+// Commands, arguments, metadata and both agent/MCP environments may contain
+// credentials. Keep Debug useful for request logs without printing their values.
+impl std::fmt::Debug for ChatAgentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatAgentConfig")
+            .field("has_agent_server", &self.agent_server.is_some())
+            .field("context_server_count", &self.context_servers.len())
+            .field("resource_limits", &self.resource_limits)
+            .field("auto_reload", &self.auto_reload)
+            .finish_non_exhaustive()
+    }
 }
 
 /// 自动重载配置
@@ -353,6 +366,33 @@ impl ChatAgentServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_agent_debug_excludes_agent_and_mcp_secrets_without_changing_wire_data() {
+        let input = serde_json::json!({
+            "agent_server": {
+                "command": "agent-command-secret",
+                "args": ["agent-argument-secret"],
+                "env": {"API_KEY": "agent-env-secret"},
+                "metadata": {"private": "metadata-secret"}
+            },
+            "context_servers": {"mcp": {
+                "command": "mcp-command-secret",
+                "args": ["mcp-argument-secret"],
+                "env": {"API_KEY": "mcp-env-secret"}
+            }}
+        });
+        let config: ChatAgentConfig = serde_json::from_value(input).unwrap();
+        let logged = format!("{config:?}");
+        assert!(!logged.contains("secret"), "{logged}");
+        assert!(logged.contains("context_server_count: 1"));
+        let wire = serde_json::to_value(config).unwrap();
+        assert_eq!(wire["agent_server"]["env"]["API_KEY"], "agent-env-secret");
+        assert_eq!(
+            wire["context_servers"]["mcp"]["env"]["API_KEY"],
+            "mcp-env-secret"
+        );
+    }
 
     #[test]
     fn test_chat_agent_config_default() {

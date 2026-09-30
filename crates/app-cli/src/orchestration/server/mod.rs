@@ -25,7 +25,9 @@
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
+mod deploy_replay;
 pub mod journal;
+pub(crate) use deploy_replay::DeployAdmission;
 mod preparation;
 use journal::{ActiveVersion, Boundary, Journal, Receipt};
 use shared_types::AppCliDeployPhase;

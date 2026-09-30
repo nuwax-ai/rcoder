@@ -240,7 +240,7 @@ pub async fn agent_session_notification(
 
 #[utoipa::path(
     get,
-    path = "/computer/agent/progress/{session_id}",
+    path = "/computer/progress/{session_id}",
     // inline 声明 (与项目其他 handler 一致): 避免引用类型时 utoipa 宏展开
     // 生成限定路径触发 unused_qualifications
     params(

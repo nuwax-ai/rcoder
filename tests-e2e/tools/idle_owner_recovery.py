@@ -198,7 +198,13 @@ def main():
     def build_count():
         return int(execute('cat', workspace + '/web/build-count').stdout)
 
+    def keepalive():
+        result = http('/computer/pod/keepalive', {'app_id': app, 'app_stage': 'dev'})['data']
+        if result.get('created') or result['container_info']['container_id'] != cid:
+            raise RuntimeError('keepalive unexpectedly replaced the captured container')
+
     def start(action, version, previous_count):
+        keepalive()
         data = http('/api/v1/userapp/dev/' + action, {'app_id': app})['data']
         task = data['task_id']
         if task in [record['id'] for record in evidence['tasks']]:
@@ -215,6 +221,7 @@ def main():
             if state in ('failed', 'cancelled') or time.monotonic() >= deadline:
                 raise RuntimeError(f'{action} task failed/timed out: {row}')
             time.sleep(1)
+        keepalive()
         while content() != version and time.monotonic() < deadline:
             time.sleep(0.5)
         count = build_count()
@@ -311,6 +318,22 @@ def main():
         receipt['lifecycle_id'] = life
         save()
         before = capture()
+        # First initdb on a macOS shared mount can exceed the app-cli PG wait.
+        # Prepare the real prerequisite (no bypass/PGDATA edits) before testing
+        # owner recovery; keepalive is used only during this setup phase.
+        pg_deadline = time.monotonic() + 180
+        while True:
+            keepalive()
+            pg = execute('sh', '-ec',
+                         'PGPASSWORD="$POSTGRES_PASSWORD" PGCONNECT_TIMEOUT=2 '
+                         'psql -X -w -h 127.0.0.1 -U "$POSTGRES_USER" '
+                         '-d "$POSTGRES_DB" -qAt -c "SELECT 1"', check=False)
+            if pg.returncode == 0 and pg.stdout.strip() == '1':
+                break
+            if time.monotonic() >= pg_deadline:
+                raise RuntimeError('fixture PostgreSQL initialization/login did not complete')
+            time.sleep(2)
+        check('real PostgreSQL prerequisite ready', True)
         write({
             'workspace.manifest.toml': 'schema_version=1\n[workspace]\nname="idle-recovery"\n',
             'web/project.manifest.toml': '''schema_version=1
@@ -329,8 +352,10 @@ readiness_path="/health"
 path="/"
 strip_prefix=false
 ''',
-            'web/build.py': 'from pathlib import Path\nimport zipfile\n'
-            'p=Path("build-count")\np.write_text(str((int(p.read_text()) if p.exists() else 0)+1))\n'
+            'web/build.py': 'from pathlib import Path\nimport zipfile,time\n'
+            'p=Path("build-count")\n'
+            f'if not p.exists(): time.sleep({IDLE_SECONDS + SCAN_SECONDS * 3})\n'
+            'p.write_text(str((int(p.read_text()) if p.exists() else 0)+1))\n'
             'with zipfile.ZipFile("artifact.zip","w") as z:\n'
             ' for name in ("main.py","version.txt"): z.write(name)\n',
             'web/main.py': 'import os\nfrom pathlib import Path\nfrom http.server import BaseHTTPRequestHandler,HTTPServer\n'
@@ -347,6 +372,8 @@ strip_prefix=false
                '> /home/user/logs/idle-fixture-owner.log 2>&1', '--', workspace)
         wait_owner()
         count = start('start', 'before-recycle', 0)
+        check('running build survives idle scans without keepalive', inspect(cid) is not None
+              and cid == before['id'])
         original_owner = owner()
         old_state = read_json('/home/user/logs/dev-server-external.json')
         check('live owner registration persisted', old_state.get('owners', {}).get(dev_key, {}).get('owner', {}).get('runtime_instance_id') == original_owner,
@@ -392,6 +419,63 @@ print(json.dumps({'generation': generation['id'], 'guardian': parent}))
         write({'web/version.txt': 'after-restart'})
         count = start('restart', 'after-restart', count)
         check('controls retain new owner and physical container', owner() == recovered_owner and inspect(cid) is not None)
+        # Same-container fault: the worker has exited but its guardian cannot
+        # publish Quiescent. Freeze only the verified owner while injecting, so
+        # its monitor cannot complete cleanup before this condition is recorded.
+        same_container = cid
+        orphan = execute('python3', '-c', '''
+import json, os, pathlib, signal, time
+scope = pathlib.Path('/home/user/logs/.app-cli-state')
+discovery = json.loads((scope/'supervisor.json').read_text())
+path = scope/'work'/discovery['snapshot']['generation']/'generation.json'
+generation = json.loads(path.read_text())
+worker = generation['worker_pid']
+def parent(pid):
+    return int(pathlib.Path('/proc', str(pid), 'stat').read_text().rsplit(')',1)[1].split()[1])
+guardian = parent(worker)
+supervisor = parent(guardian)
+assert supervisor > 1 and guardian > 1
+cmd = pathlib.Path('/proc', str(guardian), 'cmdline').read_bytes().split(b'\\0')
+assert b'--runtime-worker-guardian' in cmd and str(path.parent).encode() in cmd
+owned = False
+for fd in pathlib.Path('/proc', str(supervisor), 'fd').iterdir():
+    try:
+        owned = owned or fd.readlink() == scope/'owner.lock'
+    except FileNotFoundError:
+        pass
+assert owned, 'captured supervisor does not own the expected workspace'
+os.kill(supervisor, signal.SIGSTOP)
+try:
+    os.kill(guardian, signal.SIGSTOP)
+    os.kill(worker, signal.SIGKILL)
+    os.kill(guardian, signal.SIGKILL)
+    deadline = time.monotonic()+10
+    while True:
+        try:
+            os.kill(worker, 0)
+        except ProcessLookupError:
+            break
+        assert time.monotonic() < deadline, 'worker exit not reaped'
+        time.sleep(.05)
+    assert json.loads(path.read_text())['phase'] in ('Running', 'Draining')
+    print(json.dumps({'generation': generation['id'], 'worker': worker,
+                      'guardian': guardian, 'supervisor': supervisor}))
+finally:
+    os.kill(supervisor, signal.SIGCONT)
+''')
+        evidence['same_container_orphan'] = json.loads(orphan.stdout)
+        write({'web/version.txt': 'after-orphan'})
+        count = start('restart', 'after-orphan', count)
+        old_generation = read_json('/home/user/logs/.app-cli-state/work/' +
+                                   evidence['same_container_orphan']['generation'] + '/generation.json')
+        check('same-container orphan automatically becomes quiescent', old_generation['phase'] == 'Quiescent'
+              and cid == same_container and inspect(cid)['RestartCount'] == 0,
+              {'phase': old_generation['phase'], 'container_id': cid})
+        control_stop('stop after same-container recovery succeeds')
+        write({'web/version.txt': 'after-orphan-start'})
+        count = start('start', 'after-orphan-start', count)
+        recovered_owner = owner()
+        after = capture()
         # A second real recycle covers Stop as the first control call against
         # stale state. Otherwise a successful Start would mask Stop's own bug.
         recycle_and_ensure(after, recovered_owner, 'second recycle')
@@ -410,6 +494,10 @@ print(json.dumps({'generation': generation['id'], 'guardian': parent}))
         try:
             if controller:
                 (root / 'controller.log').write_text(controller_logs())
+            if cid and inspect(cid) is not None:
+                for name in ('pg.out.log', 'pg.err.log'):
+                    log = execute('cat', '/app/logs/' + name, check=False)
+                    (root / name).write_text(log.stdout + log.stderr)
         except Exception as error:
             evidence.update(diagnostic_error=str(error), success=False)
         try:

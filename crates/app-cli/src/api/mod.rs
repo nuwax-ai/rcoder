@@ -283,6 +283,9 @@ pub(super) struct DeployAcceptedData {
     pub status: String,
     /// 轮询部署进度的端点路径
     pub poll: String,
+    /// Present on replay; this is the original operation, not a new deployment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<shared_types::AppDeploymentOperation>,
 }
 
 /// `POST /v1/deploy` — 热部署受理（不换 Pod：PG/ttyd/dbx 不断连，仅应用服务切换）。
@@ -292,6 +295,8 @@ pub(super) struct DeployAcceptedData {
 /// orchestrating）拒绝 409；受理后由 server 主循环执行（下载成功才停旧服务）。
 /// 若旧操作已收束，唯一恢复原因是缺少脱敏后的运行凭据，携带 pg 的显式部署
 /// 可在确认原制品和迁移回执后受理；未知操作或迁移不会因此解除保护。
+/// 相同 operation_id 与相同输入返回原操作，不重复执行；更换输入须使用新 ID。
+/// 响应 poll 可查询原操作，之后受理的新部署不会替换其结果。
 #[utoipa::path(
     post,
     path = "/v1/deploy",
@@ -300,7 +305,7 @@ pub(super) struct DeployAcceptedData {
     responses(
         (status = 202, body = envelope::HttpResult<DeployAcceptedData>, description = "Deploy accepted; poll /v1/deploy/status"),
         (status = 403, body = envelope::HttpResult<String>, description = "Token missing/mismatch or endpoint disabled"),
-        (status = 409, body = envelope::HttpResult<String>, description = "Deployment busy, generation mismatch, or unresolved recovery; credentials only resolve a verified missing-credentials hold"),
+        (status = 409, body = envelope::HttpResult<String>, description = "Deployment busy, reused operation ID with different input, generation mismatch, or unresolved recovery"),
         (status = 400, body = envelope::HttpResult<String>, description = "Invalid body (sha256 shape etc.)"),
         (status = 500, body = envelope::HttpResult<String>, description = "Deployment admission task failed; inspect operation status before retrying")
     ),
@@ -397,16 +402,27 @@ async fn submit_deploy(
         }
     };
     match admission {
-        Ok(()) => envelope::ok(
+        Ok(outcome) => envelope::ok(
             StatusCode::ACCEPTED,
             DeployAcceptedData {
+                poll: format!("/v1/deploy/status?operation_id={operation_id}"),
                 operation_id,
-                status: "accepted".to_string(),
-                poll: "/v1/deploy/status".to_string(),
+                status: match &outcome {
+                    crate::server::DeployAdmission::Accepted => "accepted",
+                    crate::server::DeployAdmission::Replayed(_) => "replayed",
+                }
+                .into(),
+                operation: match outcome {
+                    crate::server::DeployAdmission::Accepted => None,
+                    crate::server::DeployAdmission::Replayed(operation) => Some(operation),
+                },
             },
         ),
         Err(crate::server::AdmissionError::Busy(message)) => {
             envelope::error(StatusCode::CONFLICT, "DEPLOY_IN_PROGRESS", message)
+        }
+        Err(crate::server::AdmissionError::Conflict(message)) => {
+            envelope::error(StatusCode::CONFLICT, "DEPLOY_OPERATION_CONFLICT", message)
         }
         Err(error) => envelope::error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -433,16 +449,62 @@ fn authorize_deploy(state: &AppState, headers: &axum::http::HeaderMap) -> Result
     }
 }
 
+#[derive(Deserialize, utoipa::IntoParams)]
+struct DeployStatusQuery {
+    /// Omit for the current runtime; supply to read the original operation.
+    operation_id: Option<String>,
+}
+
 /// `GET /v1/deploy/status` — 部署进度快照（phase/release_id/error）。
 #[utoipa::path(
     get,
     path = "/v1/deploy/status",
+    params(DeployStatusQuery),
     responses(
         (status = 200, body = envelope::HttpResult<crate::server::DeployStatus>, description = "Current deploy/server phase"),
+        (status = 404, description = "Operation not recorded"),
+        (status = 500, description = "Recorded operation could not be read"),
     ),
     tag = "Runtime Deploy"
 )]
-async fn deploy_status(State(state): State<AppState>) -> Response {
+async fn deploy_status(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<DeployStatusQuery>,
+) -> Response {
+    if let Some(id) = query.operation_id {
+        let current = state.server.deploy_status();
+        if current
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.operation_id == id)
+        {
+            return envelope::ok(StatusCode::OK, current);
+        }
+        return match state.server.recorded_deployment(&id) {
+            Ok(Some(operation)) => envelope::ok(
+                StatusCode::OK,
+                crate::server::DeployStatus {
+                    protocol_version: state.server.deploy_status().protocol_version,
+                    phase: operation.phase,
+                    release_id: operation.artifact_release_id.clone(),
+                    request_release_id: Some(operation.request_release_id.clone()),
+                    error: operation.error.clone(),
+                    operation: Some(operation),
+                    ..Default::default()
+                },
+            ),
+            Ok(None) => envelope::error(
+                StatusCode::NOT_FOUND,
+                "DEPLOY_OPERATION_NOT_FOUND",
+                "deployment operation not recorded",
+            ),
+            Err(error) => envelope::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DEPLOY_STATUS_FAILED",
+                error.to_string(),
+            ),
+        };
+    }
     envelope::ok(StatusCode::OK, state.server.deploy_status())
 }
 
@@ -617,6 +679,71 @@ mod tests {
             server,
             pingap_bin: PathBuf::from("/bin/true"),
             log_dir: tempfile::tempdir().unwrap().keep(),
+        }
+    }
+
+    #[tokio::test]
+    async fn deploy_http_retry_returns_original_operation_and_query() {
+        let state = test_state();
+        state.server.mark_initialized();
+        state.server.initialize_owner_token().unwrap();
+        let token = state.server.control_token().unwrap();
+        for (release, expected, replay) in [
+            ("release-a", StatusCode::ACCEPTED, false),
+            ("release-a", StatusCode::ACCEPTED, true),
+            ("release-b", StatusCode::CONFLICT, false),
+        ] {
+            let request = axum::http::Request::builder().method("POST").uri("/v1/deploy")
+                .header("X-Deploy-Token", &token).header("Content-Type", "application/json")
+                .body(Body::from(json!({"url":"https://example.test/app.zip", "release_id":release, "operation_id":"retry-id"}).to_string())).unwrap();
+            let response = api_router(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected);
+            let body: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            if expected == StatusCode::ACCEPTED {
+                assert_eq!(
+                    body["data"]["status"],
+                    if replay { "replayed" } else { "accepted" }
+                );
+                if replay {
+                    assert_eq!(body["data"]["operation"]["operation_id"], "retry-id");
+                }
+                let poll = body["data"]["poll"].as_str().unwrap();
+                let (status, original) = call(&state, "GET", poll, "").await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(
+                    original["data"]["operation"]["request_release_id"],
+                    "release-a"
+                );
+            } else {
+                assert_eq!(body["code"], "DEPLOY_OPERATION_CONFLICT");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_writes_honor_configured_owner_token_before_any_runtime_mutation() {
+        let state = test_state();
+        state.server.initialize_owner_token().unwrap();
+        let token = state.server.control_token().unwrap();
+        for path in ["/v1/proxy/validate", "/v1/proxy/reload"] {
+            for provided in [None, Some("invalid"), Some(token.as_str())] {
+                let mut request = axum::http::Request::builder().method("POST").uri(path);
+                if let Some(value) = provided {
+                    request = request.header("x-deploy-token", value);
+                }
+                let response = api_router(state.clone())
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                if provided == Some(token.as_str()) {
+                    // Idle/initializing is a real runtime error, not an auth rejection.
+                    assert_ne!(response.status(), StatusCode::FORBIDDEN);
+                } else {
+                    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                }
+            }
         }
     }
 
@@ -797,7 +924,7 @@ mod tests {
         assert_eq!(body["status"], "ready");
     }
 
-    /// P1-01 初始化门：恢复期写端点拒绝运行态变更——proxy/reload 无鉴权，
+    /// P1-01 初始化门：恢复期写端点拒绝运行态变更——未配置 token 时，
     /// 直接以 initializing 门拒绝；mark_initialized 后走常规校验路径（本
     /// 测试环境无 pingap admin → 正常错误，但不再是初始化门文案）。
     /// deploy 端点的同款门在 token 校验之后（403 优先——不向未授权方暴露

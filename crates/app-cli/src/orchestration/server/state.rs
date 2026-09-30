@@ -19,6 +19,8 @@ pub struct ServerState {
     pub(super) initializing: std::sync::atomic::AtomicBool,
     pub(super) preparations: Arc<preparation::Preparations>,
     pub(super) journal: std::sync::Mutex<Option<Journal>>,
+    /// Legacy run/tests have no durable journal; preserve same-process replays.
+    pub(super) volatile_deploy_replays: std::sync::Mutex<super::deploy_replay::History>,
     pub(super) generation: String,
     pub(super) phase: RwLock<ServerPhase>,
     pub(super) release: RwLock<Option<ReleaseLock>>,
@@ -236,12 +238,15 @@ pub(super) fn serialize_redacted_run_pg<S: serde::Serializer>(
 #[derive(Debug)]
 pub(crate) enum AdmissionError {
     Busy(String),
+    Conflict(String),
     Failed(String),
 }
 impl std::fmt::Display for AdmissionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Busy(message) | Self::Failed(message) => f.write_str(message),
+            Self::Busy(message) | Self::Conflict(message) | Self::Failed(message) => {
+                f.write_str(message)
+            }
         }
     }
 }

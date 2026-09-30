@@ -116,15 +116,13 @@ impl Gate {
     }
 
     fn write(&self, accepting: bool) -> Result<()> {
+        let bytes = serde_json::to_vec(&Authority {
+            version: 1,
+            generation: self.generation()?.into(),
+            accepting,
+        })?;
         let mut file = tempfile::NamedTempFile::new_in(&self.root)?;
-        serde_json::to_writer(
-            &mut file,
-            &Authority {
-                version: 1,
-                generation: self.generation()?.into(),
-                accepting,
-            },
-        )?;
+        file.write_all(&bytes)?;
         file.flush()?;
         file.as_file().sync_all()?;
         crate::atomic_file::persist(file, &self.root.join("command-admission.json"))
