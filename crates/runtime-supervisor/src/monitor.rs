@@ -9,6 +9,7 @@ use std::{
     collections::VecDeque,
     ffi::OsString,
     fs::File,
+    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -268,9 +269,8 @@ impl Owner {
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // Also covers a crash between preserving a damaged record and
-                // publishing its replacement. Never replay one-shot deployment
-                // inputs just because discovery was lost.
+                // Never replay one-shot deployment inputs just because discovery
+                // was lost, including a gap left by older repair implementations.
                 return Ok((None, self.root.join("work").try_exists()?));
             }
             Err(error) => return Err(error).context("read supervisor discovery"),
@@ -298,7 +298,7 @@ impl Owner {
                         );
                     }
                 }
-                preserve_discovery(&path)?;
+                preserve_discovery(&path, &bytes)?;
                 tracing::warn!(%error, "rebuilding damaged supervisor discovery under owner lock");
                 return Ok((None, true));
             }
@@ -436,9 +436,20 @@ impl Owner {
     }
 }
 
-fn preserve_discovery(path: &Path) -> Result<()> {
+fn preserve_discovery(path: &Path, bytes: &[u8]) -> Result<()> {
     let backup = path.with_extension(format!("corrupt-{}.json", uuid::Uuid::new_v4().simple()));
-    std::fs::rename(path, &backup).context("preserve damaged supervisor discovery")?;
+    let parent = path.parent().context("discovery parent missing")?;
+    // Keep discovery readable until persist atomically replaces it. Moving it
+    // aside first creates an ENOENT window for concurrent Stop/Status readers.
+    // Preserve exactly the bytes inspected by the caller, not a later reread.
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.write_all(bytes)?;
+    file.as_file().sync_all()?;
+    file.persist_noclobber(&backup)
+        .map_err(|error| error.error)
+        .context("preserve damaged supervisor discovery")?;
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
     tracing::warn!(backup = %backup.display(), "preserved replaced supervisor discovery");
     Ok(())
 }
@@ -826,30 +837,35 @@ impl State {
                 }
             }
         }
-        if let Some(child) = &mut self.child {
-            if self.stopping.is_some_and(|deadline| now >= deadline) {
-                child.lease.take();
+        if self.stopping.is_some_and(|deadline| now >= deadline)
+            && let Some(child) = &mut self.child
+        {
+            child.lease.take();
+            if self.discovery.snapshot.phase != Phase::CleanupPending {
                 self.discovery.snapshot.phase = Phase::CleanupPending;
+                self.persist()?;
             }
-            if let Some(status) = child.process.try_wait()? {
-                let exit = status.code().unwrap_or(1);
-                self.child.take();
-                self.exited = Some(exit);
-                if let Some(task) = self.probe.take() {
-                    task.abort();
-                }
-                if let Some(task) = self.stop_ack.take() {
-                    task.abort();
-                }
-                let id = self
-                    .discovery
-                    .snapshot
-                    .generation
-                    .clone()
-                    .context("exited generation missing")?;
-                if let Err(error) = record::verify_quiescent(&self.root, &id) {
-                    tracing::debug!(%error, "guardian exited before aggregate cleanup; inspecting abandoned work");
-                }
+        }
+        if let Some(child) = &mut self.child
+            && let Some(status) = child.process.try_wait()?
+        {
+            let exit = status.code().unwrap_or(1);
+            self.child.take();
+            self.exited = Some(exit);
+            if let Some(task) = self.probe.take() {
+                task.abort();
+            }
+            if let Some(task) = self.stop_ack.take() {
+                task.abort();
+            }
+            let id = self
+                .discovery
+                .snapshot
+                .generation
+                .clone()
+                .context("exited generation missing")?;
+            if let Err(error) = record::verify_quiescent(&self.root, &id) {
+                tracing::debug!(%error, "guardian exited before aggregate cleanup; inspecting abandoned work");
             }
         }
         if self.child.is_none() {
@@ -1069,7 +1085,7 @@ impl State {
         let path = self.root.join("supervisor.json");
         match std::fs::read(&path) {
             Ok(bytes) if bytes == serde_json::to_vec(&self.discovery)? => return Ok(()),
-            Ok(_) => preserve_discovery(&path)?,
+            Ok(bytes) => preserve_discovery(&path, &bytes)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("check supervisor discovery"),
         }
@@ -1084,6 +1100,39 @@ async fn worker_shutdown(work: PathBuf) -> Result<worker::Observation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserving_discovery_keeps_endpoint_readable_until_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("supervisor.json");
+        let binding = control::Binding {
+            component: "test".into(),
+            resource: dir.path().to_path_buf(),
+        };
+        let mut discovery = inactive_discovery(binding);
+        record::save(&path, &discovery).unwrap();
+        let previous = std::fs::read(&path).unwrap();
+
+        // A control reader can run after the backup but before replacement.
+        // It must still find the complete old endpoint, even if repair crashes.
+        preserve_discovery(&path, &previous).unwrap();
+        let during_repair: Discovery = record::read(&path).unwrap();
+        assert_eq!(during_repair.instance, discovery.instance);
+        assert_eq!(std::fs::read(&path).unwrap(), previous);
+
+        discovery.snapshot.phase = Phase::CleanupPending;
+        record::save(&path, &discovery).unwrap();
+        let after: Discovery = record::read(&path).unwrap();
+        assert_eq!(after.instance, discovery.instance);
+        assert_eq!(after.snapshot.phase, Phase::CleanupPending);
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| entry != &path)
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), previous);
+    }
 
     #[test]
     fn rebuilding_discovery_preserves_binding_version_and_io_errors() {
