@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Pingap 版本一致性门禁（batch8-followup §5）。
 
-核对四个实际构建入口的 pingap 版本/commit 与 app-cli devtool.rs 单一事实源
+核对四个实际构建入口的 pingap 版本/commit 与 app-cli 单一事实源
 一致：
-  1. crates/app-cli/src/devtool.rs（DEFAULT_PINGAP_VERSION/COMMIT）
+  1. crates/app-cli/src/ 递归查找（DEFAULT_PINGAP_VERSION/COMMIT；aa07e6108 起
+     位于 src/build_deploy/devtool.rs，单一常量定义）
   2. make/docker.mk（dev agent-runner 镜像构建注入）
   3. docker/build-app-runtime.py（dev app-runtime 镜像 build-arg）
   4. build-agent-docker makefiles/16-app-runtime.mk（生产镜像）
@@ -48,6 +49,27 @@ def extract(text: str, patterns: list[re.Pattern]) -> tuple[str, ...] | None:
     return tuple(values)
 
 
+def find_authority(src_root: Path) -> tuple[tuple[str, str], Path] | None:
+    """递归查找 DEFAULT_PINGAP_VERSION/COMMIT 单一定义。
+
+    aa07e6108 把 devtool.rs 从 src/ 平铺移入 src/build_deploy/；改为对
+    crates/app-cli/src/ 递归查找（与 release-app-cli.yml 同法），文件再移动
+    不破坏门禁。常量消失或存在冲突定义仍 fail-fast。
+    """
+    found: dict[tuple[str, str], Path] = {}
+    for path in sorted(src_root.rglob('*.rs')):
+        pair = extract(read(path), [DEVTOOL_VERSION_RE, DEVTOOL_COMMIT_RE])
+        if pair is not None:
+            found.setdefault(tuple(pair), path)
+    if len(found) == 1:
+        pair, path = next(iter(found.items()))
+        return pair, path
+    if len(found) > 1:
+        for pair, path in found.items():
+            print(f"FAIL: DEFAULT_PINGAP_VERSION/COMMIT 存在冲突定义 {pair}：{path}")
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -67,8 +89,6 @@ def main() -> int:
     bad: Path = args.build_agent_docker
 
     sources: list[tuple[str, Path, list[re.Pattern]]] = [
-        ("app-cli devtool.rs（单一事实源）", root / "crates/app-cli/src/devtool.rs",
-         [DEVTOOL_VERSION_RE, DEVTOOL_COMMIT_RE]),
         ("make/docker.mk（dev agent-runner 注入）", root / "make/docker.mk",
          [VERSION_RE, COMMIT_RE]),
         ("docker/build-app-runtime.py（dev app-runtime build-arg）", root / "docker/build-app-runtime.py",
@@ -84,13 +104,14 @@ def main() -> int:
             return 1
         results[label] = extract(read(path), patterns)
 
-    authority = next(iter(results.values()))
-    if authority is None:
-        print("FAIL: 无法从 devtool.rs 解析 DEFAULT_PINGAP_VERSION/COMMIT")
+    authority_found = find_authority(root / "crates" / "app-cli" / "src")
+    if authority_found is None:
+        print("FAIL: 无法在 crates/app-cli/src 递归解析唯一的 DEFAULT_PINGAP_VERSION/COMMIT")
         return 1
+    authority, authority_path = authority_found
 
     failures = []
-    print(f"单一事实源（devtool.rs）：pingap {authority[0]} @ {authority[1][:12]}")
+    print(f"单一事实源（{authority_path.relative_to(root)}）：pingap {authority[0]} @ {authority[1][:12]}")
     for label, value in results.items():
         if label in ALLOWED_DIVERGENCE:
             print(f"  [允许差异] {label}: {value}（理由：{ALLOWED_DIVERGENCE[label]}）")
