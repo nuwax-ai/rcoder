@@ -108,6 +108,23 @@ pub async fn owner_serve(
             match credential_result {
                 Ok(()) => {
                     state.set_runtime_kernel(kernel.clone());
+                    // R06 事件桥：编排 EVT 同步进入活跃操作的运行事件 journal +
+                    // stdout 管道（dev 任务的 Done/阶段事件经此转发）——统一
+                    // owner 路径同样必须安装，否则 file-server 侧等待终局事件
+                    // 只能靠预算超时（app 11 式静默）。
+                    {
+                        let kernel = kernel.clone();
+                        crate::orchestration_events::install_bridge(Box::new(move |json| {
+                            if let Some(record) = bridge_event_fields(&json) {
+                                kernel.append_orchestration_event(
+                                    &record.stage,
+                                    record.service,
+                                    &record.event_name,
+                                    record.payload,
+                                );
+                            }
+                        }));
+                    }
                     let endpoint = crate::runtime_kernel::EndpointRecord {
                         protocol_version: kernel.identity().protocol_version,
                         application_id: kernel.identity().application_id.clone(),

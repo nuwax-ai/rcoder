@@ -442,6 +442,14 @@ async fn spawn_dev_task(
                 if task_clone.is_cancelled() {
                     return Ok::<(), AppError>(());
                 }
+                // recovery v2 T1b：编译完成后阶段显式切换——build_ok 不再是
+                // 任务的最后可见阶段（app 11 式"build_ok 后静默"排障黑洞）；
+                // 后续启动/管理恢复失败发生在有名字的阶段里。
+                task_clone
+                    .emit(shared_types::BuildProgressEvent::Stage {
+                        stage: "starting".into(),
+                    })
+                    .await;
                 // A registry entry only establishes ownership, not successful startup.
                 // External owners always follow the identity-bound control operation.
                 if matches!(action, DevTaskAction::Start)
