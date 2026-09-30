@@ -174,18 +174,29 @@ mod conditional_tests {
             "metadata.uid"
         );
         let mounts = app.volume_mounts.as_ref().unwrap();
-        assert_eq!(mounts.len(), 4);
+        // 4 个工作区视图 + 1 个固定只读平台绑定（recovery v2 plan §6.1）。
+        assert_eq!(mounts.len(), 5);
+        let binding = mounts
+            .iter()
+            .find(|m| m.name == "rcoder-platform-binding")
+            .expect("platform binding mount present");
+        assert_eq!(binding.read_only, Some(true));
+        let workspace_mounts: Vec<_> = mounts
+            .iter()
+            .filter(|m| m.name == "app-workspace")
+            .collect();
+        assert_eq!(workspace_mounts.len(), 4);
         let pvc = pod
             .volumes
             .as_ref()
             .unwrap()
             .iter()
-            .find(|v| mounts.iter().all(|m| m.name == v.name))
-            .unwrap()
-            .persistent_volume_claim
-            .as_ref()
+            .find_map(|v| {
+                let claim = v.persistent_volume_claim.as_ref()?;
+                (v.name == "app-workspace").then_some(claim)
+            })
             .unwrap();
-        let views = mounts
+        let views = workspace_mounts
             .iter()
             .map(|m| (m.sub_path.clone().unwrap(), m.mount_path.clone()))
             .collect::<Vec<_>>();

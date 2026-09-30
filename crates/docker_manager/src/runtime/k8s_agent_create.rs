@@ -334,6 +334,11 @@ impl KubernetesRuntime {
         for v in extra_volumes.iter().flat_map(Self::translate_k8s_volume) {
             volumes_vec.push(v);
         }
+        if matches!(service_type, ServiceType::UserappBuilder) {
+            // 固定只读平台绑定（recovery v2 plan §6.1）：Downward API 投放
+            // pod UID + 执行域注解；容器身份不再依赖 spawn 链透传 env。
+            volumes_vec.push(super::k8s_native_domain::platform_binding_volume());
+        }
 
         // 构建 volume_mounts: workspace 挂载 + 翻译 kubernetes_config 额外挂载(挂到 agent 容器)
         let mut volume_mounts_vec: Vec<VolumeMount> =
@@ -400,6 +405,15 @@ impl KubernetesRuntime {
         }
 
         let volumes = Some(volumes_vec);
+        let mut volume_mounts_vec = volume_mounts_vec;
+        if matches!(service_type, ServiceType::UserappBuilder) {
+            volume_mounts_vec.push(VolumeMount {
+                name: "rcoder-platform-binding".to_string(),
+                mount_path: super::k8s_native_domain::PLATFORM_BINDING_MOUNT.to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            });
+        }
         let volume_mounts = Some(volume_mounts_vec);
 
         // sidecar 容器(只来自 kubernetes_config):如 log-collector tail 容器内日志到 stdout

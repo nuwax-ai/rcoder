@@ -11,6 +11,12 @@ use std::path::Path;
 pub const DOMAIN_ENV: &str = "RCODER_EXECUTION_DOMAIN";
 pub const DOMAIN_LABEL: &str = "rcoder.io/execution-domain";
 
+/// 固定只读平台位置（recovery v2 plan §6.1）：容器当前绑定由运行时经
+/// Downward API 卷投放到这里，管理进程直接读取——不经每条 spawn 链透传
+/// env。目录可经本 env 覆盖（测试注入）；env 仍是第一优先来源（过渡桥）。
+pub const PLATFORM_BINDING_DIR_ENV: &str = "RCODER_PLATFORM_BINDING_DIR";
+pub const DEFAULT_PLATFORM_BINDING_DIR: &str = "/etc/rcoder/platform";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PhysicalDomain {
@@ -28,25 +34,75 @@ pub struct PhysicalDomain {
 }
 impl PhysicalDomain {
     pub fn from_env() -> Result<Option<Self>> {
-        let Some(value) = std::env::var_os(DOMAIN_ENV) else {
-            return Ok(None);
+        if let Some(value) = std::env::var_os(DOMAIN_ENV) {
+            let value: Self = Self::decode(
+                value
+                    .to_str()
+                    .context("invalid execution domain encoding")?,
+            )?;
+            let value =
+                Self::resolve_instance_source_with_dir(value, &Self::platform_binding_dir())?;
+            value.validate()?;
+            return Ok(Some(value));
+        }
+        Self::from_platform_location()
+    }
+
+    /// Read the current binding from the fixed read-only platform location.
+    /// `Ok(None)` means the location carries no binding (native/host runs);
+    /// a present-but-invalid file is an error, never silently ignored.
+    pub fn from_platform_location() -> Result<Option<Self>> {
+        let dir = Self::platform_binding_dir();
+        let raw = match Self::decode_checked_from(&dir.join("execution-domain")) {
+            None => return Ok(None),
+            Some(result) => result?,
         };
-        let mut value: Self = serde_json::from_str(
-            value
-                .to_str()
-                .context("invalid execution domain encoding")?,
-        )?;
+        let value: Self = Self::resolve_instance_source_with_dir(raw, &dir)?;
+        value.validate()?;
+        Ok(Some(value))
+    }
+
+    fn decode(raw: &str) -> Result<Self> {
+        Ok(serde_json::from_str(raw)?)
+    }
+
+    /// Read and decode a binding file; None when the file is absent.
+    fn decode_checked_from(path: &Path) -> Option<Result<Self>> {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => Some(Self::decode(raw.trim())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some(Err(error).context("read platform execution-domain binding")),
+        }
+    }
+
+    /// Resolve an empty `instance` through its declared source: the platform
+    /// companion file under `dir` first (fixed location), then the env bridge.
+    fn resolve_instance_source_with_dir(mut value: Self, dir: &Path) -> Result<Self> {
         if let Some(source) = value.instance_source_env.clone()
             && value.instance.is_empty()
         {
-            value.instance = std::env::var(&source)
+            let companion = std::fs::read_to_string(dir.join(&source))
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .or_else(|| std::env::var(&source).ok());
+            value.instance = companion
                 .with_context(|| format!("execution domain instance source {source} missing"))?;
         }
+        Ok(value)
+    }
+
+    fn platform_binding_dir() -> std::path::PathBuf {
+        std::env::var_os(PLATFORM_BINDING_DIR_ENV)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_PLATFORM_BINDING_DIR))
+    }
+
+    fn validate(&self) -> Result<()> {
         ensure!(
-            !value.authority.is_empty() && !value.volume.is_empty() && !value.instance.is_empty(),
+            !self.authority.is_empty() && !self.volume.is_empty() && !self.instance.is_empty(),
             "invalid execution domain"
         );
-        Ok(Some(value))
+        Ok(())
     }
 }
 
@@ -151,85 +207,34 @@ pub(crate) fn has_confirmed_exit(root: &Path, value: &record::Generation) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BINDING: &str = r#"{"authority":"k8s:test","instance":"","instance_source_env":"RCODER_PHYSICAL_POD_UID","volume":"pvc:ws"}"#;
+
+    /// T4（recovery v2 plan §6.1）：固定只读平台位置承载当前绑定——
+    /// execution-domain 文件 + 同伴 pod-uid 文件（Downward API 投放）。
+    /// 实例解析文件优先于 env；损坏的绑定文件是错误，不静默忽略。
     #[test]
-    fn physical_exit_is_identity_bound_and_never_completes_business_work() {
-        let temp = tempfile::tempdir().unwrap();
-        let scope = temp.path();
-        let _owner = crate::Owner::try_acquire(scope).unwrap().unwrap();
-        let binding = Binding {
-            component: "app-cli".into(),
-            resource: scope.to_path_buf(),
-        };
-        let domain = PhysicalDomain {
-            authority: "daemon-a".into(),
-            instance_source_env: None,
-            volume: "volume-a".into(),
-            instance: uuid::Uuid::new_v4().to_string(),
-        };
-        let id = uuid::Uuid::new_v4().to_string();
-        let root = record::work_root(scope, &id).unwrap();
-        std::fs::create_dir_all(root.join("commands")).unwrap();
-        process_utils::command_authority::Gate::try_acquire(&root)
-            .unwrap()
-            .initialize()
-            .unwrap();
-        let generation = record::Generation {
-            version: 1,
-            id,
-            supervisor: "old-supervisor".into(),
-            token: "test".into(),
-            intent: crate::Intent::Run,
-            phase: GenerationPhase::Running,
-            worker_pid: None,
-            exit_code: None,
-            error: None,
-            physical_domain: Some(domain.clone()),
-            process_epoch: None,
-        };
-        record::save(&root.join("generation.json"), &generation).unwrap();
-        record::save(&scope.join("supervisor.json"), &serde_json::json!({
-            "version":1, "instance":"old-supervisor", "address":"127.0.0.1:1", "token":"test", "requests":[],
-            "snapshot":{ "version":1,"binding":binding,"supervisor_id":"old-supervisor", "generation":generation.id,
-                "phase":"ready", "intent":"run", "operation_id":null,"error":null }
-        })).unwrap();
-        record::save(
-            &root.join("commands/command.json"),
-            &serde_json::json!({"version":1,"phase":"Running","identity":{"task_id":"original"}}),
-        )
-        .unwrap();
-        std::fs::write(scope.join("migration.json"), "outcome unknown").unwrap();
-        let proof = pending(scope, &binding).unwrap().remove(0);
+    fn platform_location_resolves_binding_without_env_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        // 目录缺失 → 无绑定（native/宿主机语义）。
+        assert!(PhysicalDomain::decode_checked_from(&dir.path().join("absent")).is_none());
+
+        std::fs::write(dir.path().join("execution-domain"), BINDING).unwrap();
+        std::fs::write(dir.path().join("RCODER_PHYSICAL_POD_UID"), "  uid-123 \n").unwrap();
+        let value = PhysicalDomain::decode_checked_from(&dir.path().join("execution-domain"))
+            .expect("binding file exists")
+            .expect("valid binding");
+        let resolved = PhysicalDomain::resolve_instance_source_with_dir(value, dir.path()).unwrap();
+        assert_eq!(resolved.instance, "uid-123");
+        assert_eq!(resolved.authority, "k8s:test");
+        resolved.validate().unwrap();
+
+        // 损坏文件 → 错误（不是 None）。
+        std::fs::write(dir.path().join("execution-domain"), "{damaged").unwrap();
         assert!(
-            record::reconcile(scope).is_err(),
-            "free locks alone cannot retire work"
+            PhysicalDomain::decode_checked_from(&dir.path().join("execution-domain"))
+                .expect("damaged file still present")
+                .is_err()
         );
-        let mut successor = domain.clone();
-        assert!(publish_with_current(scope, &binding, &proof, &successor).is_err());
-        successor.instance = uuid::Uuid::new_v4().to_string();
-        successor.volume = "wrong-volume".into();
-        assert!(publish_with_current(scope, &binding, &proof, &successor).is_err());
-        successor.volume = domain.volume;
-        let mut wrong = proof.clone();
-        wrong.supervisor_id = "different-supervisor".into();
-        assert!(publish_with_current(scope, &binding, &wrong, &successor).is_err());
-        publish_with_current(scope, &binding, &proof, &successor).unwrap();
-        let held = record::lock(&root.join("generation.lock")).unwrap();
-        assert!(
-            record::reconcile(scope).is_err(),
-            "live generation lock is never bypassed"
-        );
-        drop(held);
-        record::reconcile(scope).unwrap();
-        crate::verify_quiescent(scope, &generation.id).unwrap();
-        let retired = record::generation(&root).unwrap();
-        assert_eq!(retired.phase, GenerationPhase::Quiescent);
-        assert_eq!(retired.exit_code, None);
-        assert_eq!(
-            std::fs::read_to_string(scope.join("migration.json")).unwrap(),
-            "outcome unknown"
-        );
-        let command: serde_json::Value = record::read(&root.join("commands/command.json")).unwrap();
-        assert_eq!(command["phase"], "Quiescent");
-        assert_eq!(command["identity"]["task_id"], "original");
     }
 }

@@ -431,3 +431,58 @@ mod tests {
         assert_ne!(base, cluster_authority("https://10.43.0.1:443", Some(&ca)));
     }
 }
+
+/// 固定只读平台绑定的挂载点（recovery v2 plan §6.1）：app-cli 从此目录读取
+/// 当前容器绑定，不经 spawn 链透传 env。
+pub(crate) const PLATFORM_BINDING_MOUNT: &str = "/etc/rcoder/platform";
+
+/// Downward API 绑定卷：投放 pod UID 与执行域注解到固定只读位置。
+/// 注解由创建侧以与 env 相同的 JSON 盖章（单一事实源：同一次构造）。
+pub(crate) fn platform_binding_volume() -> k8s_openapi::api::core::v1::Volume {
+    use k8s_openapi::api::core::v1::{
+        DownwardAPIVolumeFile, DownwardAPIVolumeSource, ObjectFieldSelector, Volume,
+    };
+    Volume {
+        name: "rcoder-platform-binding".to_string(),
+        downward_api: Some(DownwardAPIVolumeSource {
+            items: Some(vec![
+                DownwardAPIVolumeFile {
+                    path: "RCODER_PHYSICAL_POD_UID".to_string(),
+                    field_ref: Some(ObjectFieldSelector {
+                        api_version: Some("v1".to_string()),
+                        field_path: "metadata.uid".to_string(),
+                    }),
+                    ..Default::default()
+                },
+                DownwardAPIVolumeFile {
+                    path: "execution-domain".to_string(),
+                    field_ref: Some(ObjectFieldSelector {
+                        api_version: Some("v1".to_string()),
+                        field_path: format!(
+                            "metadata.annotations['{}']",
+                            runtime_supervisor::domain::DOMAIN_LABEL
+                        ),
+                    }),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// 提取 PodSpec 内已注入的执行域 env 值（盖章注解的单一来源，避免二次
+/// 构造漂移）。None = 该 Pod 未声明执行域。
+pub(crate) fn domain_env_of_pod_spec(
+    pod_spec: &k8s_openapi::api::core::v1::PodSpec,
+) -> Option<String> {
+    pod_spec.containers.iter().find_map(|container| {
+        container
+            .env
+            .as_ref()?
+            .iter()
+            .find(|var| var.name == DOMAIN_ENV)
+            .and_then(|var| var.value.clone())
+    })
+}

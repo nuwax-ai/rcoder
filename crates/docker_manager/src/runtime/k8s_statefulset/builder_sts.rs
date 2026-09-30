@@ -28,6 +28,24 @@ impl KubernetesRuntime {
             .annotations
             .get_or_insert_default()
             .extend(context.resource_metadata());
+        // 执行域注解（recovery v2 plan §6.1）：Downward API 卷把它投放到
+        // 固定只读位置；值取 PodSpec 内同一 env 构造（单一事实源）。
+        if let Some(domain) = crate::runtime::k8s_native_domain::domain_env_of_pod_spec(
+            &desired_spec
+                .template
+                .spec
+                .as_ref()
+                .cloned()
+                .unwrap_or_default(),
+        ) {
+            desired_spec
+                .template
+                .metadata
+                .get_or_insert_default()
+                .annotations
+                .get_or_insert_default()
+                .insert(runtime_supervisor::domain::DOMAIN_LABEL.to_string(), domain);
+        }
         let name = self.pod_name(&context.app_id, &family)?;
         let api = self.statefulsets();
         let existing = match api.get_opt(&name).await {

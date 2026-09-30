@@ -146,26 +146,35 @@ impl KubernetesRuntime {
         // (Web/Computer 走 create_container 共享 PVC)。RWO 单 pod 独占
         // (Deployment replicas=1)；pod 重建需等 volume detach→attach（秒级，
         // K8s 自动处理）。
-        let volumes = Some(vec![Volume {
+        let mut volumes_vec = vec![Volume {
             name: "app-workspace".to_string(),
             persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
                 claim_name: self.app_workspace_pvc_name(app_id)?,
                 read_only: Some(false),
             }),
             ..Default::default()
-        }]);
-        let volume_mounts = Some(
-            app_flat_volume_mounts(app_id)
-                .into_iter()
-                .map(|(sub_path, mount_path)| VolumeMount {
-                    name: "app-workspace".to_string(),
-                    mount_path,
-                    sub_path: Some(sub_path),
-                    read_only: Some(false),
-                    ..Default::default()
-                })
-                .collect(),
-        );
+        }];
+        // 固定只读平台绑定（recovery v2 plan §6.1）：builder 同款 Downward API
+        // 投放（pod UID + 执行域注解）。
+        volumes_vec.push(crate::runtime::k8s_native_domain::platform_binding_volume());
+        let volumes = Some(volumes_vec);
+        let mut mounts_vec: Vec<VolumeMount> = app_flat_volume_mounts(app_id)
+            .into_iter()
+            .map(|(sub_path, mount_path)| VolumeMount {
+                name: "app-workspace".to_string(),
+                mount_path,
+                sub_path: Some(sub_path),
+                read_only: Some(false),
+                ..Default::default()
+            })
+            .collect();
+        mounts_vec.push(VolumeMount {
+            name: "rcoder-platform-binding".to_string(),
+            mount_path: crate::runtime::k8s_native_domain::PLATFORM_BINDING_MOUNT.to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+        let volume_mounts = Some(mounts_vec);
 
         let container = K8sContainer {
             name: APP_CONTAINER_NAME.to_string(),
@@ -250,6 +259,16 @@ impl KubernetesRuntime {
                                     crate::runtime::k8s_app_helpers::DEPLOY_TEMPLATE_TOKEN_ANNOTATION
                                         .to_string(),
                                     context.operation_id.clone(),
+                                );
+                            }
+                            // 执行域注解（recovery v2 plan §6.1）：与 env 同源
+                            // 构造，经 Downward API 投放到固定只读位置。
+                            if let Some(domain) =
+                                crate::runtime::k8s_native_domain::domain_env_of_pod_spec(&pod_spec)
+                            {
+                                ann.insert(
+                                    runtime_supervisor::domain::DOMAIN_LABEL.to_string(),
+                                    domain,
                                 );
                             }
                             ann
