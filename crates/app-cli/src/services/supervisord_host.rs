@@ -50,6 +50,16 @@ struct EngineReceipt {
 
 const ENGINE_RECEIPT: &str = "supervisord-engine.json";
 
+/// Record the structured outcome and return it as the error cause; the
+/// parent cleanup reads the sidecar for its own classification.
+fn record_outcome(root: &Path, outcome: runtime_supervisor::CleanupOutcome) -> anyhow::Error {
+    let detail = format!("{outcome:?}");
+    if let Err(error) = outcome.record(root) {
+        return anyhow::anyhow!("persist cleanup outcome failed: {error:#}");
+    }
+    anyhow::anyhow!("{detail}")
+}
+
 impl SupervisordHost {
     /// 引擎探测：socket 存在 + XML-RPC ping 成功（serve 启动时调用一次）。
     pub(crate) async fn detect() -> Result<Option<Self>> {
@@ -93,27 +103,70 @@ impl SupervisordHost {
     }
 
     /// Called only after the guardian authenticated the draining generation.
-    pub(crate) async fn cleanup_generation(root: &Path) -> Result<()> {
+    /// Returns the structured physical-cleanup outcome (recovery v2 §7.1) and
+    /// persists it beside the receipts; business results are never inferred.
+    pub(crate) async fn cleanup_generation(
+        root: &Path,
+    ) -> Result<runtime_supervisor::CleanupOutcome> {
         match std::fs::read(root.join(ENGINE_RECEIPT)) {
             Ok(bytes) => {
-                let receipt: EngineReceipt = serde_json::from_slice(&bytes)?;
+                let receipt: EngineReceipt = match serde_json::from_slice(&bytes) {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        return Err(record_outcome(
+                            root,
+                            runtime_supervisor::CleanupOutcome::ObservationFailed {
+                                reason: format!("decode engine receipt: {error}"),
+                            },
+                        ));
+                    }
+                };
                 let generation: serde_json::Value =
-                    serde_json::from_slice(&std::fs::read(root.join("generation.json"))?)?;
-                anyhow::ensure!(
-                    generation["id"] == receipt.generation
-                        && generation["supervisor"] == receipt.supervisor_id,
-                    "supervisord cleanup generation identity differs"
-                );
+                    match serde_json::from_slice(&std::fs::read(root.join("generation.json"))?) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return Err(record_outcome(
+                                root,
+                                runtime_supervisor::CleanupOutcome::ObservationFailed {
+                                    reason: format!("decode generation receipt: {error}"),
+                                },
+                            ));
+                        }
+                    };
+                if !(generation["id"] == receipt.generation
+                    && generation["supervisor"] == receipt.supervisor_id)
+                {
+                    // 记录属于另一管理域（前容器/换代）——保留为历史，不在
+                    // 本域执行引擎清理（plan §7.4：不考古旧本地进程）。
+                    return Err(record_outcome(
+                        root,
+                        runtime_supervisor::CleanupOutcome::ForeignIdentity {
+                            detail: format!(
+                                "supervisord cleanup generation identity differs: engine {}",
+                                receipt.generation
+                            ),
+                        },
+                    ));
+                }
                 let client = SupervisorClient::new(receipt.socket);
-                client.ping().await.context(
-                    "recorded supervisord engine is unavailable; cleanup is unconfirmed",
-                )?;
+                if let Err(error) = client.ping().await {
+                    return Err(record_outcome(
+                        root,
+                        runtime_supervisor::CleanupOutcome::ObservationFailed {
+                            reason: format!(
+                                "recorded supervisord engine is unavailable: {error:#}"
+                            ),
+                        },
+                    ));
+                }
                 Self {
                     client,
                     conf_path: CONF_PATH.into(),
                 }
                 .stop_all()
-                .await
+                .await?;
+                runtime_supervisor::CleanupOutcome::Empty.record(root)?;
+                Ok(runtime_supervisor::CleanupOutcome::Empty)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // No external-engine mutation was accepted by this worker.
@@ -121,9 +174,15 @@ impl SupervisordHost {
                 if let Some(host) = Self::detect().await? {
                     host.stop_all().await?;
                 }
-                Ok(())
+                runtime_supervisor::CleanupOutcome::Empty.record(root)?;
+                Ok(runtime_supervisor::CleanupOutcome::Empty)
             }
-            Err(error) => Err(error).context("read supervisord engine receipt"),
+            Err(error) => Err(record_outcome(
+                root,
+                runtime_supervisor::CleanupOutcome::ObservationFailed {
+                    reason: format!("read supervisord engine receipt: {error}"),
+                },
+            )),
         }
     }
 

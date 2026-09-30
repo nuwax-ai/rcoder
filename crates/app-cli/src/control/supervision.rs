@@ -21,7 +21,9 @@ pub async fn cleanup_external_engine() -> Result<()> {
     let _cleanup = runtime_supervisor::verify_cleanup_callback()?;
     let root = std::env::var_os("RCODER_SUPERVISOR_CLEANUP_ROOT")
         .context("cleanup callback root missing")?;
-    crate::supervisord_host::SupervisordHost::cleanup_generation(Path::new(&root)).await
+    crate::supervisord_host::SupervisordHost::cleanup_generation(Path::new(&root))
+        .await
+        .map(|_| ())
 }
 
 /// Private runtime adapter, used through an identity-bound container exec.

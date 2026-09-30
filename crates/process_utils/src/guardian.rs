@@ -746,6 +746,98 @@ fn decode_status(raw: i64) -> std::io::Result<ExitStatus> {
 
 /// Called only while holding the original scope owner lock. Revocation under
 /// the same guardian lock prevents a late Pending guardian from spawning.
+/// Outcome of a scope-checked guardian recovery (recovery v2 plan §7.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecoveryOutcome {
+    /// Every guardian and command record reached a settled state; no live
+    /// in-flight command remains in the captured scope.
+    Settled,
+    /// A guardian process is still alive and owns its command; cleanup must
+    /// wait or report the bounded stage instead of forcing anything.
+    Stopping { detail: String },
+}
+
+/// Recovery v2（plan §7.1）：按已灭进程范围收束死守护进程的 Running 命令
+/// 记录。守护进程自身死亡后再无人能观察其命令结果——运行授权随范围关闭，
+/// 业务结果显式保持未知（不伪造 exit=0）；守护进程仍存活时如实报告
+/// Stopping，绝不按 PID 数字强杀。PID 缺失的存量回执保持保守失败。
+pub fn recover_with_scope_check(work_root: &Path) -> Result<RecoveryOutcome> {
+    let root = work_root.join("guardians");
+    if !root.try_exists()? {
+        return Ok(RecoveryOutcome::Settled);
+    }
+    for entry in std::fs::read_dir(root)? {
+        let path = entry?.path();
+        let _lock = lock(&path)?;
+        let mut receipt = read(&path)?;
+        ensure!(
+            work_root.file_name().and_then(|s| s.to_str()) == Some(&receipt.instance_id),
+            "guardian belongs to different instance"
+        );
+        match receipt.phase.as_str() {
+            "Pending" => {
+                receipt.phase = "Revoked".into();
+                save(&path, &receipt)?;
+                confirm_command(&path, &receipt)?;
+            }
+            "Quiescent" | "Revoked" => {
+                confirm_command(&path, &receipt)?;
+            }
+            "Running" => {
+                let Some(pid) = receipt.diagnostic_pid else {
+                    bail!("guardian command outcome unknown; original authorization preserved");
+                };
+                if crate::process_exists(pid)? {
+                    return Ok(RecoveryOutcome::Stopping {
+                        detail: format!("owned command {pid} is still running"),
+                    });
+                }
+                // The guardian died without observing its command's exit. The
+                // whole captured scope was already proven ended by the caller
+                // (generation worker exit or process-space replacement), so
+                // the run authorization closes here; the command's business
+                // outcome stays explicitly unknown.
+                receipt.phase = "Quiescent".into();
+                receipt.root_status = None;
+                save(&path, &receipt)?;
+                settle_unobserved_command(&receipt)?;
+            }
+            other => bail!("guardian command outcome unknown: {other}"),
+        }
+    }
+    Ok(RecoveryOutcome::Settled)
+}
+
+/// Mark a dead guardian's command record settled without inventing an exit.
+fn settle_unobserved_command(receipt: &Receipt) -> Result<()> {
+    let Some(path) = &receipt.command_record else {
+        return Ok(());
+    };
+    let parent = path.parent().context("command parent missing")?;
+    let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    ensure!(
+        value["version"] == 1
+            && matches!(
+                value["phase"].as_str(),
+                Some("SpawnPending" | "Running" | "Quiescent")
+            ),
+        "unknown command record"
+    );
+    value["phase"] = "Quiescent".into();
+    value["termination"] = "GuardianDiedResultUnknown".into();
+    value["diagnostic_pid"] = serde_json::Value::Null;
+    let bytes = serde_json::to_vec(&value)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    use std::io::Write as _;
+    file.write_all(&bytes)?;
+    file.flush()?;
+    file.as_file().sync_all()?;
+    crate::atomic_file::persist(file, path).context("publish unobserved command settlement")?;
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 pub fn recover(work_root: &Path) -> Result<()> {
     let root = work_root.join("guardians");
     if !root.try_exists()? {
@@ -1137,5 +1229,103 @@ mod tests {
         assert!(run(&root).await.is_err());
         assert!(confirmed(&root).is_err());
         assert_eq!(std::fs::read(root.join("receipt.json")).unwrap(), before);
+    }
+
+    /// recovery v2（plan §7.1 反例）：守护进程死亡后，其 Running 命令记录
+    /// 由范围收束关闭运行授权——命令 Quiescent + termination 显式标记
+    /// 结果未知，不伪造 exit；守护进程仍存活时如实 Stopping，不强杀。
+    #[cfg(unix)]
+    #[test]
+    fn scope_checked_recovery_settles_dead_guardian_without_inventing_exit() {
+        let scope = tempfile::tempdir().unwrap();
+        let work = scope.path().join("work").join("inst-t3");
+        let commands = work.join("commands");
+        crate::command_context::create_durable_directory(&commands).unwrap();
+        // 死守护：pid 已退出（复用短命子进程）。
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        let (guardian_root, command_path) =
+            fixture_running_guardian(&work, "cmd-t3", Some(dead_pid));
+        let outcome = recover_with_scope_check(&work).unwrap();
+        assert_eq!(outcome, RecoveryOutcome::Settled);
+        let receipt: Receipt = read(&guardian_root).unwrap();
+        assert_eq!(receipt.phase, "Quiescent");
+        assert_eq!(receipt.root_status, None, "结果不得伪造");
+        let command: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&command_path).unwrap()).unwrap();
+        assert_eq!(command["phase"], "Quiescent");
+        assert_eq!(command["termination"], "GuardianDiedResultUnknown");
+        assert!(command.get("exit_code").is_none() || command["exit_code"].is_null());
+
+        // 活守护：Stopping，不触碰记录。
+        let mut alive = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (guardian_root, command_path) =
+            fixture_running_guardian(&work, "cmd-t3-live", Some(alive.id()));
+        let before = std::fs::read(guardian_root.join("receipt.json")).unwrap();
+        let outcome = recover_with_scope_check(&work).unwrap();
+        assert!(
+            matches!(outcome, RecoveryOutcome::Stopping { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(guardian_root.join("receipt.json")).unwrap(),
+            before,
+            "活守护的记录不得被改写"
+        );
+        let _ = command_path;
+        alive.kill().unwrap();
+        alive.wait().unwrap();
+    }
+
+    /// 存量回执无 PID：保持保守失败（不猜、不强收）。
+    #[test]
+    fn scope_checked_recovery_keeps_legacy_pidless_receipt_conservative() {
+        let scope = tempfile::tempdir().unwrap();
+        let work = scope.path().join("work").join("inst-t3b");
+        crate::command_context::create_durable_directory(&work.join("guardians")).unwrap();
+        fixture_running_guardian(&work, "cmd-legacy", None);
+        assert!(recover_with_scope_check(&work).is_err());
+    }
+
+    fn fixture_running_guardian(
+        work: &Path,
+        command_id: &str,
+        pid: Option<u32>,
+    ) -> (PathBuf, PathBuf) {
+        let instance = work
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap()
+            .to_owned();
+        let id = uuid::Uuid::new_v4().to_string();
+        let root = work.join("guardians").join(&id);
+        crate::command_context::create_durable_directory(&root).unwrap();
+        let command_path = work.join("commands").join(format!("{command_id}.json"));
+        crate::command_context::create_durable_directory(command_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &command_path,
+            serde_json::json!({"version":1,"phase":"Running","identity":{"task_id":command_id}})
+                .to_string(),
+        )
+        .unwrap();
+        save(
+            &root,
+            &Receipt {
+                version: 1,
+                root_status: None,
+                diagnostic_pid: pid,
+                id,
+                instance_id: instance,
+                phase: "Running".into(),
+                command_record: Some(command_path.clone()),
+                command_digest: "0".repeat(64),
+            },
+        )
+        .unwrap();
+        (root, command_path)
     }
 }

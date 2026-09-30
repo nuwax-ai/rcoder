@@ -13,7 +13,7 @@ mod recovery;
 mod session;
 mod worker;
 
-pub use cleanup::CleanupCommand;
+pub use cleanup::{CleanupCommand, CleanupOutcome};
 pub use control::{
     Action, Binding, FailureCode, Phase, Problem, RecoveryError, Request, Snapshot, control,
     control_verified, last_snapshot,
