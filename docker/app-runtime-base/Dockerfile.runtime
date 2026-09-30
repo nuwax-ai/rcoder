@@ -4,71 +4,68 @@
 # 合并原 Dockerfile.{node,python,java,go,rust} 为单镜像 —— 用户部署任意语言应用，
 # workspace 多语言项目（前端+后端不同语言）可同容器运行，不再按语言拆镜像。
 #
-# 基础设施 + Rust（rust:trixie，随 tag 浮动）继承自 app-runtime-base（Dockerfile）。本层补 Node/Python/Java/Go。
-# ENTRYPOINT=start-app.sh（base 继承），UserApp command 覆盖 CMD 作 args 传入。
-#
-# ⚠️ Python 版本契约：与 agent-runner builder 镜像统一 rust:trixie（原生 3.13
-# 双侧同 ABI）——builder pip 装的 wheel 在本运行时原生可载（cp313 ↔ cp313）。
-# ⚠️ 镜像体积：Rust(~1.5G,来自 base)+Go+JDK+Python+Node，约 4-5GB —— 全语言自由的代价。
+# 基础设施 + 语言运行时本体（node/python/java/go/deno + Rust）已在 app-runtime-base（Dockerfile）。
+# 本层只装"高频变化"内容：npm 全局工具 + app-cli / file-server-proxy
+# （rcoder 源码产物，末层 COPY）——分层原则：越稳定越靠下（base），越易变越靠上（本文件末层）。
+# （与 build-agent-docker 65a1cb8/878c3f6 分层同步。）
+# ENTRYPOINT=start-app.sh（base 继承），app-cli 从 release.lock.toml 编排服务。
 ARG BASE_IMAGE=app-runtime-base:latest
+ARG DOCKER_MIRROR
+
+# === app-cli builder（从当前 rcoder 源编译 app-cli + file-server-proxy；自 base Dockerfile 迁入）===
+# rcoder 源码产物随源频繁变化：编译放本文件（runtime 层），base 不含任何 rcoder 源码依赖，
+# app-cli 变更不再引发 base 层 digest 变化（父链失效 → runtime 全量重建）。
+# 产物 COPY 刻意落在本文件最末层，原因同上。
+# rcoder 源码经 docker/build-app-runtime.py 以命名构建上下文 rcoder= 注入（本仓源，
+# 非 build-agent-docker 的 vendored 快照）。
+FROM ${DOCKER_MIRROR}rust:trixie AS app-cli-builder
+WORKDIR /build
+# builder 阶段先换国内 apt 源(默认 deb.debian.org 从国内拉易 stall),与 base 主 stage 的换源对齐
+RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
+        --source mirrors.aliyun.com --protocol https --use-intranet-source false \
+        --install-epel false --backup false --upgrade-software false --clean-cache true --ignore-backup-tips && \
+    apt-get update && apt-get install -y --no-install-recommends cmake libclang-dev protobuf-compiler && rm -rf /var/lib/apt/lists/*
+COPY --from=rcoder / .
+# 删 rust-toolchain.toml（若存在）：仓库当前未 pin toolchain，但防御性移除可避免
+# 未来重新引入 pin 时触发 rustup 下载指定版本（~200MB,走 static.rust-lang.org 官方,国内极慢），
+# base image rust:trixie 自带的最新 stable 向下兼容。
+RUN rm -f rust-toolchain.toml
+# 配置 cargo 源(国内 rsproxy 加速)。文件在 .cargo/config.toml,查阅/修改方便。
+COPY .cargo/config.toml /usr/local/cargo/config.toml
+RUN cd crates/app-cli && cargo build --release
+# 容器内文件服务单件（RBD 卷形态·容器中心化，file-server-proxy 0.2.0 起）：file-server-proxy
+# default feature 自带 file-server lib 进程内直连（60000 AllRust，无独立 8086 进程/端口）。
+# -p 显式选 package：裸 --bin 的解析范围是 workspace default-members（不含
+# file-server-proxy），会报 no bin target ... in default-run packages。
+RUN cargo build --release -p file-server-proxy
+
 FROM ${BASE_IMAGE}
 
-# ── Node.js / TypeScript（+ pnpm 锁大版本 10 + Deno）──────────────────────────
-ENV NODE_VERSION=24
-RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
-    && apt-get install -y nodejs \
-    && npm install -g pm2 typescript ts-node pnpm@10 \
-    && rm -rf /var/lib/apt/lists/*
+# ── npm 全局工具（高频变化 → 留本镜像，不进 base）──────────────────────────────
+# node/npm 本体与语言运行时（python/java/go/deno）已在 base（Dockerfile）；
+# npm fetch-retries=5 已随 base 的 node 安装写入全局 npmrc。
+# pnpm 保持字面 major pin。（本地 dev 镜像按构建时 latest 解析；生产用
+# resolve-then-pin 版本注入，见 build-agent-docker 16-app-runtime.mk。）
+RUN npm install -g pm2 typescript ts-node pnpm@10
 
-# ── dbx MCP server（dbx 官方 MCP；与 build-agent-docker 正式镜像同款，防本地/生产工具面漂移）──
-# DBX_WEB_URL 指容器内 dbx-web :4224（WebBackend → PG socket 免密），spawn 即零配置。
-# 官方源：平台二进制 optionalDependencies（@dbx-app/mcp-linux-*）npmmirror 同步延迟
-# 404 静默跳过致二进制缺失；--verify-platform 构建期自检。
+# ── dbx MCP server（dbx 官方 MCP：与 agent-runner 镜像同款安装）─────────────────
+# DBX_WEB_URL 指容器内 supervisor 恒起的 dbx-web :4224（WebBackend → dbx-web HTTP →
+# PG socket 免密），spawn 即零配置。仅 dbx-mcp-server 读此变量，dbx-web 本体不读，无冲突。
+# 官方源：平台二进制 optionalDependencies（@dbx-app/mcp-linux-*）npmmirror 同步有延迟
+# 会 404 静默跳过致二进制缺失（.npmrc 默认国内源必须显式覆盖）；--verify-platform 构建期自检。
 RUN npm i -g @dbx-app/mcp-server@latest --registry https://registry.npmjs.org && \
     dbx-mcp-server --verify-platform
 ENV DBX_WEB_URL=http://localhost:4224
 
-# Deno（JS/TS 运行时；deno.land 安装脚本在部分构建网络不可达 exit 35——改
-# registry 镜像拉取固定版本，与 rcoder-agent-runner base 的 Deno 同源同版）
-COPY --from=denoland/deno:bin-2.5.6 /deno /usr/local/bin/deno
-RUN chmod +x /usr/local/bin/deno && rm -rf /root/.cache/deno
+# 入口继承 base：ENTRYPOINT=start-app.sh，用户服务命令来自 release.lock.toml。
 
-# ── Python（Debian trixie 自带 3.13）+ uv ────────────────────────────────────
-# uv（Astral 极速 Python 包管理器，最新版）经 pip 装到 /usr/local/bin，在默认 PATH。
-RUN apt-get update && apt-get install -y \
-       python3 \
-       python3-pip \
-       python3-venv \
-       python3-dev \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3 /usr/bin/python \
-    && pip3 install --no-cache-dir --break-system-packages --ignore-installed pip setuptools wheel virtualenv uv
-
-# ── Java (openjdk-25 + Maven + Gradle + Arthas) ─────────────────────────────
-# trixie 官方仓库原生提供 openjdk-25（bookworm 时代缺位曾走 Adoptium Temurin 源；
-# 与 agent-runner builder 的 JDK 段同源同版，builder 编 target=25 与运行时 25 对齐）。
-RUN apt-get update && \
-    apt-get install -y maven gradle openjdk-25-jdk && \
-    ARCH=$(dpkg --print-architecture) && \
-    ln -sf /usr/lib/jvm/java-25-openjdk-${ARCH} /usr/lib/jvm/java-25-openjdk-current && \
-    java -version && javac -version && \
-    rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL https://arthas.aliyun.com/arthas-boot.jar -o /usr/local/bin/arthas-boot.jar \
-    && printf '#!/bin/bash\njava -jar /usr/local/bin/arthas-boot.jar "$@"\n' > /usr/local/bin/arthas \
-    && chmod +x /usr/local/bin/arthas
-ENV JAVA_HOME=/usr/lib/jvm/java-25-openjdk-current
-ENV PATH="${JAVA_HOME}/bin:${PATH}"
-
-# ── Go ────────────────────────────────────────────────────────────────────────
-ENV GO_VERSION=1.26.4
-RUN ARCH=$(dpkg --print-architecture) \
-    && wget -q https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz -O /tmp/go.tar.gz \
-    && tar -C /usr/local -xzf /tmp/go.tar.gz \
-    && rm /tmp/go.tar.gz
-ENV GOPATH=/root/go
-
-# Rust 已在 app-runtime-base（rust:trixie）层提供，cargo 在 PATH（base ENV 透传）。
-# 聚合 PATH：Go + Go bin（node 在 /usr/bin、python/java 在默认 PATH，无需追加）
-ENV PATH="/usr/local/go/bin:${GOPATH}/bin:${PATH}"
-
-# 入口继承 base：ENTRYPOINT=start-app.sh，CMD 被 UserApp command 覆盖
+# ── app-cli + file-server-proxy（rcoder 源码产物，app-cli-builder stage 编译）──────
+# 刻意放在文件最末层：rcoder 源频繁变化时仅重建 builder + 本 COPY 层，
+# 前面的 npm 工具层与 base 的全部大层（JDK/Go/Python/Node）均缓存命中（分层迁移的原因）。
+# app-cli：UserApp 容器编排器（替代 start.sh；supervisor 托管，按 release.lock.toml 编排服务）。
+# file-server-proxy：容器内文件服务（supervisor 托管，见 app-runtime.supervisor.conf）——rcoder
+# 转发层 (x-app-stage: prod) 的上游。0.2.0 起 file-server 以 lib 直连集成，无独立 8086 进程；
+# USERAPP_SINGLE_APP_ID=APP_ID 单 app 模式由 rcoder 创建容器时注入，本地直跑无 APP_ID →
+# 空值=多 app 开发语义，无害。
+COPY --from=app-cli-builder /build/crates/app-cli/target/release/app-cli /usr/local/bin/app-cli
+COPY --from=app-cli-builder /build/target/release/file-server-proxy /usr/local/bin/file-server-proxy

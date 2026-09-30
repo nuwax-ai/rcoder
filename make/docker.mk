@@ -231,20 +231,20 @@ docker-build-agent-production:
 # ============================================================================
 # app-runtime 镜像构建（本地开发/测试，dev 前缀，不推 registry）
 # ============================================================================
-# UserApp 容器运行时。app-runtime-base/Dockerfile 用仓库根作构建上下文 (COPY . . + COPY docker/app-runtime-base/...,
-# 同 rcoder-master 模式)，根 .dockerignore 已排除 target/.git/project_workspace 等，无需 rsync / code/rcoder 中转。
-# 产物: dev-app-runtime-base:latest（基础设施+Rust app-cli）+ dev-app-runtime:latest（多语言运行时）
+# UserApp 容器运行时。分层与 build-agent-docker 65a1cb8/878c3f6 同步：
+# - base（Dockerfile）：基础设施 + 语言运行时本体（node/python/java/go/deno），不含 rcoder 源码。
+# - runtime（Dockerfile.runtime）：npm 全局工具 + app-cli/file-server-proxy（rcoder 源码产物末层）。
+# rcoder 源码经 docker/build-app-runtime.py 以命名构建上下文注入（本仓源）。
+# 产物: dev-app-runtime-base:latest + dev-app-runtime:latest
 APP_RUNTIME_DIR := docker/app-runtime-base
 
-# 构建 dev-app-runtime-base（基础设施层: PG/dbx/ttyd/supervisor + Rust app-cli）
+# 构建 dev-app-runtime-base（基础设施 + 语言运行时层: Rust/PG/dbx/ttyd/supervisor + Node/Python/Java/Go/Deno）
 docker-build-app-runtime-base:
 	@echo "🐳 构建 dev-app-runtime-base:latest ..."
 	@python3 docker/build-app-runtime.py $(APP_RUNTIME_DIR)
 	@echo "✅ dev-app-runtime-base:latest 构建完成"
 
-# 构建 dev-app-runtime（多语言运行时: base + Node/Python/Java/Go），UserApp 部署用此镜像
+# 构建 dev-app-runtime（FROM base；npm 工具 + 本仓源码编译的 app-cli/file-server-proxy）
 docker-build-app-runtime: docker-build-app-runtime-base
-	@echo "🐳 构建 dev-app-runtime:latest（基于 dev-app-runtime-base）..."
-	@docker build --build-arg BASE_IMAGE=dev-app-runtime-base:latest \
-		-t dev-app-runtime:latest -f $(APP_RUNTIME_DIR)/Dockerfile.runtime $(APP_RUNTIME_DIR)
+	@python3 docker/build-app-runtime.py $(APP_RUNTIME_DIR) --also-runtime
 	@echo "✅ dev-app-runtime:latest 构建完成"
