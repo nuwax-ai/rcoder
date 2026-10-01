@@ -556,6 +556,7 @@ pub(super) async fn server_loop(
     state: &Arc<ServerState>,
     host: Option<SupervisordHost>,
     first: Option<InitialAction>,
+    foreground: bool,
 ) -> Result<()> {
     let mut pending = first;
     let mut active_args = if pending.is_none() {
@@ -678,6 +679,16 @@ pub(super) async fn server_loop(
                             tracing::error!("{settle_error}");
                             state.set_phase(ServerPhase::Failed(settle_error));
                         }
+                    }
+                    // R4 前台契约：run 形态消费 Stop 并确认终态后，前台
+                    // 进程以停止语义退出（restart_on_exit=false 传播 0），
+                    // 不进入 serve 式的空闲驻留——用户的前台 run 不因远端
+                    // 停止而永久挂起。
+                    if foreground {
+                        tracing::info!(
+                            "foreground run consumed an admitted stop; exiting"
+                        );
+                        return Ok(());
                     }
                 }
                 Err(error) => {

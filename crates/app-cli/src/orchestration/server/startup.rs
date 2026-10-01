@@ -744,7 +744,7 @@ async fn business_session_inner(
             // operation queue. Yielding downloads/migrations stay healthy; a
             // blocked driver task or admission path cannot acknowledge them.
             let mut probes = driver_state.supervision_probe_rx.lock().await;
-            let driver = server_loop(&driver_args, &driver_state, host, first_request);
+            let driver = server_loop(&driver_args, &driver_state, host, first_request, foreground);
             tokio::pin!(driver);
             loop {
                 tokio::select! {
@@ -1265,7 +1265,7 @@ async fn serve_supervised_worker(
                 .supervision_driver_started
                 .store(true, std::sync::atomic::Ordering::Release);
             let mut probes = driver_state.supervision_probe_rx.lock().await;
-            let driver = server_loop(&driver_args, &driver_state, host, first_request);
+            let driver = server_loop(&driver_args, &driver_state, host, first_request, false);
             tokio::pin!(driver);
             loop {
                 tokio::select! {

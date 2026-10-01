@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
-"""app-cli runtime recovery v2 fault matrix (plan §11.2 scenarios).
+"""app-cli runtime recovery v2/v3 fault matrix (plan §11.2 + RV08 rework).
 
 One container chain exercises the unified in-process owner against real
 faults: concurrent callers (A), owner TERM/SIGKILL (B), pkill of every
-app-cli process (C), repeated/interleaved stop semantics (G), a frozen
-(SIGSTOP) owner with no second-owner takeover (J), an app-11 style stale
-Running + RecoveryRequired fixture upgraded in place (I), same-container
-restart (E) and same-volume container replacement (D).
+app-cli process (C), Stop-execution admission barrier with zero
+persistence (G), a frozen (SIGSTOP) owner with no second-owner takeover
+(J), an app-11 style stale Running + RecoveryRequired fixture imported
+while the owner is DOWN and read by the next boot (I), damaged-journal
+degraded management with HTTP **and** native precise Stop (R3),
+same-container restart through the image's real supervisord entrypoint
+(E) and same-volume container replacement (D), and a real-identity
+unconfirmed migration barrier with an execution counter (H).
+
+The container's pid 1 is the image's own supervisord (foreground), with
+the fixture programs mounted through /etc/supervisor/conf.d — a docker
+restart re-boots services exactly the way the platform image does, with
+no post-restart pkill or manual service relaunch.
 
 Real supervisord, real builds, real HTTP content assertions. No LLM, no
 RCoder control plane. Leaves the workspace volume intact for inspection;
@@ -17,6 +26,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import tempfile
 import time
 import uuid
 
@@ -27,6 +37,8 @@ def main():
     parser.add_argument('--app-cli', required=True, type=Path)
     parser.add_argument('--file-server-proxy', required=True, type=Path)
     parser.add_argument('--report', required=True, type=Path)
+    parser.add_argument('--source-dir', default='.', type=Path,
+                        help='repo checkout used for SHA / dirty-status capture')
     args = parser.parse_args()
     for binary in (args.app_cli, args.file_server_proxy):
         if not binary.is_file():
@@ -37,9 +49,21 @@ def main():
     workspace = '/home/user/' + app
     state_root = '/home/user/.app-cli-state/' + app
     report = {'app_id': app, 'volume': volume, 'checks': [], 'containers': [],
-              'scenarios': {}, 'binaries': {
+              'scenarios': {},
+              'required_scenarios': ['A', 'B', 'C', 'G', 'R4', 'J', 'I',
+                                     'R3', 'E', 'D', 'H'],
+              'binaries': {
                   str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest()
                   for p in (args.app_cli, args.file_server_proxy)}}
+    # RV08：报告绑定源码身份（SHA + 脏改摘要）与镜像 digest。
+    repo = Path(args.source_dir).resolve()
+    git = lambda *argv: subprocess.run(['git', '-C', str(repo), *argv],
+                                       capture_output=True, text=True, check=False)
+    report['source'] = {
+        'commit': git('rev-parse', 'HEAD').stdout.strip(),
+        'dirty': git('status', '--short').stdout.strip().splitlines()[:20],
+        'diff_stat': git('diff', '--stat', 'HEAD').stdout.strip()[:2000],
+    }
     cid = None
 
     def docker(*argv, check=True, timeout=240):
@@ -126,6 +150,10 @@ def main():
         result = try_execute('pgrep -f "[a]pp-cli serve" | head -1')
         return result.stdout.strip() or None
 
+    def supervisorctl(*argv, timeout=60):
+        return docker('exec', cid, 'supervisorctl', *argv, check=False,
+                      timeout=timeout)
+
     def new_container(instance=None):
         nonlocal cid
         image_id = docker('image', 'inspect', '--format', '{{.Id}}',
@@ -133,8 +161,37 @@ def main():
         domain = {'authority': 'app-cli-recovery-v2', 'volume': volume,
                   'instance_source_env': 'RCODER_PHYSICAL_POD_UID', 'instance': ''}
         instance = instance or str(uuid.uuid4())
-        cid = docker('run', '-d', '--name', name,
+        # RV08/E：fixture 程序经镜像自身的 supervisord 配置树装载（bind
+        # mount 到 conf.d），容器 pid1 = supervisord（前台）——docker
+        # restart 即真实入口自动重启，无需 pkill/手工拉服务。入口 wrapper
+        # 先清理上一生命周期的 socket/pid 残留再 exec supervisord。
+        conf_dir = Path(tempfile.mkdtemp(prefix='rcv-supervisor-'))
+        (conf_dir / '40-recovery.conf').write_text(f'''[program:app-cli]
+command=/usr/local/bin/app-cli serve --workspace {workspace}
+directory={workspace}
+autostart=true
+exitcodes=0
+autorestart=unexpected
+startsecs=0
+startretries=10
+stopsignal=TERM
+stopasgroup=true
+killasgroup=true
+stopwaitsecs=90
+stdout_logfile=/home/user/logs/app-cli.out.log
+redirect_stderr=true
+[program:file-server-proxy]
+command=/usr/local/bin/file-server-proxy --embed --policy all_rust --port 60000
+autostart=true
+autorestart=unexpected
+startsecs=0
+stdout_logfile=/tmp/proxy.log
+redirect_stderr=true
+''')
+        cid = docker('create', '--name', name,
                      '--mount', f'type=volume,src={volume},dst=/home/user,volume-nocopy',
+                     '--mount', f'type=bind,src={conf_dir}/40-recovery.conf,'
+                     f'dst=/etc/supervisor/conf.d/40-recovery.conf',
                      '-e', f'PROJECT_ID={app}',
                      '-e', f'USERAPP_SINGLE_APP_ID={app}',
                      '-e', f'USERAPP_WORKSPACE_DIR={workspace}',
@@ -149,52 +206,23 @@ def main():
                      # 固定 serve owner 的复用路由需要部署凭据。
                      '-e', 'APP_CLI_MANAGED=1',
                      '-e', 'APP_CLI_DEPLOY_TOKEN=' + app + '-recovery-token',
-                     '--entrypoint', 'sleep', image_id, 'infinity').stdout.strip()
+                     '--entrypoint', 'sh',
+                     image_id, '-ec',
+                     'rm -f /var/run/supervisor.sock /var/run/supervisord.pid; '
+                     f'mkdir -p /app/logs /home/user/logs {workspace}; '
+                     'exec supervisord -n -c /etc/supervisor/supervisord.conf'
+                     ).stdout.strip()
         report['containers'].append({'id': cid, 'domain_instance': instance})
+        # docker create 允许先拷二进制再启动：程序首次拉起即有真实二进制。
         docker('cp', str(args.app_cli.resolve()), f'{cid}:/usr/local/bin/app-cli')
         docker('cp', str(args.file_server_proxy.resolve()),
                f'{cid}:/usr/local/bin/file-server-proxy')
-        # 固定 serve 程序对齐真实 builder（killed owners 由 supervisord 重启；
-        # 干净退出 0 不复活）。supervisord/proxy 为 exec 派生，restart 后须重拉。
-        launch_services()
+        docker('start', cid)
+        services_ready()
         return instance
 
-    def launch_services():
-        write({'/tmp/recovery-supervisor.conf': f'''[unix_http_server]
-file=/var/run/supervisor.sock
-[supervisord]
-nodaemon=true
-logfile=/tmp/recovery-supervisor.log
-pidfile=/tmp/recovery-supervisor.pid
-[rpcinterface:supervisor]
-supervisor.rpcinterface_factory=supervisor.rpcinterface:make_main_rpcinterface
-[program:app-cli]
-command=/usr/local/bin/app-cli serve --workspace {workspace}
-directory={workspace}
-autostart=true
-exitcodes=0
-autorestart=unexpected
-startsecs=0
-startretries=10
-stopsignal=TERM
-stopasgroup=true
-killasgroup=true
-stopwaitsecs=90
-stdout_logfile=/home/user/logs/app-cli.out.log
-redirect_stderr=true
-[include]
-files=/etc/supervisor/conf.d/50-app-services.conf
-'''})
-        # docker restart 复用容器层：上一生命周期的 socket/pid 残留会阻塞
-        # supervisord 绑定（unix socket 文件存在即 bind 失败）——先清理。
-        execute('rm -f /var/run/supervisor.sock /tmp/recovery-supervisor.pid')
-        docker('exec', '-d', cid, 'supervisord', '-n',
-               '-c', '/tmp/recovery-supervisor.conf')
-        execute('mkdir -p "$1" /home/user/logs', workspace)
-        docker('exec', '-d', cid, 'sh', '-ec',
-               'exec file-server-proxy --embed --policy all_rust --port 60000 '
-               '> /tmp/proxy.log 2>&1')
-        deadline = time.monotonic() + 30
+    def services_ready(timeout=90):
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             probe = try_execute('test -S /var/run/supervisor.sock && '
                                 'curl -fsS --max-time 2 http://127.0.0.1:60000/health')
@@ -203,6 +231,59 @@ files=/etc/supervisor/conf.d/50-app-services.conf
             time.sleep(0.3)
         raise RuntimeError('file-server or supervisord did not initialize')
 
+    def runtime_status():
+        return get('/v1/runtime/status', 3010)['data']
+
+    def runtime_post(operation_id, kind, revision, profile=None):
+        """直连 owner 运行 API（3010）。返回 (status_code, body)。"""
+        body = json.dumps({
+            'operation_id': operation_id,
+            'expected_runtime_instance_id': identity(),
+            'expected_revision': revision,
+            'workspace_id': app,
+            'kind': kind,
+            'profile': profile or {'profile': 'source',
+                                   'input': {'workspace_id': app}},
+        })
+        result = try_execute(
+            'curl -sS -o /tmp/rt-out.json -w "%{http_code}" --max-time 20 '
+            '-X POST -H "content-type: application/json" '
+            '-H "x-deploy-token: $1" --data "$2" "$3"',
+            app + '-recovery-token', body,
+            'http://127.0.0.1:3010/v1/runtime/operations', timeout=40)
+        code = result.stdout.strip()
+        payload = try_execute('cat /tmp/rt-out.json').stdout
+        try:
+            parsed = json.loads(payload)
+        except ValueError:
+            parsed = {'raw': payload}
+        return int(code) if code.isdigit() else 0, parsed
+
+    def runtime_get(operation_id):
+        result = try_execute(
+            'curl -sS -o /tmp/rt-out.json -w "%{http_code}" --max-time 10 '
+            '-H "x-deploy-token: $1" "$2"',
+            app + '-recovery-token',
+            f'http://127.0.0.1:3010/v1/runtime/operations/{operation_id}',
+            timeout=30)
+        code = result.stdout.strip()
+        payload = try_execute('cat /tmp/rt-out.json').stdout
+        try:
+            parsed = json.loads(payload)
+        except ValueError:
+            parsed = {'raw': payload}
+        return int(code) if code.isdigit() else 0, parsed
+
+    def wait_terminal(operation_id, timeout=150):
+        deadline = time.monotonic() + timeout
+        state = None
+        while time.monotonic() < deadline:
+            code, body = runtime_get(operation_id)
+            state = ((body.get('data') or {}).get('state'))
+            if state in ('succeeded', 'failed', 'cancelled', 'recovery_required'):
+                return state
+            time.sleep(0.5)
+        raise RuntimeError(f'operation {operation_id} did not reach terminal: {state}')
 
     def app_files(marker):
         manifest = '''schema_version = 1
@@ -215,15 +296,23 @@ command = ["python3", "-m", "zipfile", "-c", "artifact.zip", "main.py"]
 artifact = "artifact.zip"
 [run]
 command = ["python3", "main.py"]
+migrate = ["python3", "-c", "open('migrations.log','a').write('ran\\\\n')"]
 [health]
 readiness_path = "/"
 [proxy]
 path = "/"
 strip_prefix = false
 '''
-        devrun = '\n[devrun]\ncommand = ["python3", "main.py"]\n'
-        main_py = ('import os\n'
+        devrun = ('\n[devrun]\ncommand = ["python3", "main.py"]\n')
+        # G 屏障窗口：服务捕获 SIGTERM 后有界延迟退出——物理 Stop 执行期
+        # 足够宽，受理屏障（pending Stop）期间的并发不同 Start 可靠落在
+        # Busy 判定窗口内。
+        main_py = ('import os,signal,time\n'
                    'from http.server import BaseHTTPRequestHandler,HTTPServer\n'
+                   'def _bye(sig,frame):\n'
+                   '    time.sleep(8)\n'
+                   '    os._exit(0)\n'
+                   'signal.signal(signal.SIGTERM,_bye)\n'
                    'class H(BaseHTTPRequestHandler):\n def do_GET(self):\n'
                    '  self.send_response(200)\n  self.end_headers()\n'
                    f'  self.wfile.write(b"{marker}")\n'
@@ -234,45 +323,104 @@ strip_prefix = false
                 workspace + '/web/main.py': main_py,
                 workspace + '/sentinel': marker}
 
+    def migration_runs():
+        result = try_execute(
+            'wc -l < "$1/web/migrations.log" 2>/dev/null || echo 0', workspace)
+        return int(result.stdout.strip() or 0)
+
+    def degrade_with_bad_journal():
+        """损坏业务 journal → 干净停 serve（supervisorctl，不自动复活）→
+        重新拉起 → 业务初始化失败进入降级驻留，管理面保持可用。"""
+        state_root_dir = execute(
+            'find /home/user -maxdepth 5 -name supervisor.json -printf "%h\n" '
+            '| head -1').stdout.strip()
+        write({state_root_dir + '/.deploy-operation.json': '{damaged-journal'})
+        supervisorctl('stop', 'app-cli')
+        stopped = try_execute('pgrep -f "[a]pp-cli serve" | wc -l').stdout.strip()
+        check('R3: supervisord program stopped cleanly before relaunch',
+              stopped == '0', stopped, scenario='R3')
+        supervisorctl('start', 'app-cli')
+        deadline = time.monotonic() + 120
+        probe = None
+        while time.monotonic() < deadline:
+            probe = try_execute(
+                'curl -fsS --max-time 3 http://127.0.0.1:3010/v1/runtime/identity')
+            if probe.returncode == 0:
+                return state_root_dir
+            time.sleep(1)
+        raise RuntimeError('degraded owner did not come back: '
+                           + (probe.stdout[-150:] if probe else 'timeout'))
+
     try:
         docker('volume', 'create', volume)
         # ── A：并发调用方收敛到同一 owner ─────────────────────────────
         new_container()
-        # 固定 serve 程序随容器启动；与真实平台一致先等管理面就绪
-        #（builder pod 探针等价）再发起业务请求。
-        wait_management(90)
+        wait_management(120)
         write(app_files('recovery-a-1'))
-        # 与 supervisord 常驻 serve 并发：agent 形态的手动 run 与平台 start
-        # 同时发起，只能有一个 owner/一个管理监听器。
+        # RV08/A：先完成平台 start（release.lock 落盘），再以 agent 形态手动
+        # run——第二个 CLI 入口必须显式转交给常驻 serve owner（dispatch 提交
+        # 自身 Start），不出现第二编排/监听。锁竞争面由 J/C 场景覆盖。
+        start('start')
+        check('A: business HTTP serves content', content() == 'recovery-a-1',
+              content(), scenario='A')
         docker('exec', '-d', cid, 'sh', '-ec',
                'exec app-cli run --workspace "$1" > /tmp/manual-run.log 2>&1',
                '--', workspace)
-        start('start')
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            procs = execute(
+                'ps -eo pid,args | grep "[a]pp-cli" | grep -v grep',
+                check=False).stdout
+            if 'app-cli run' in procs:
+                break
+            time.sleep(0.5)
         discovery = execute(
             'find /home/user/.app-cli-state -name supervisor.json').stdout.strip()
         check('A: exactly one supervisor discovery',
               len(discovery.splitlines()) == 1, discovery, scenario='A')
         first_identity = identity()
-        procs = execute(
-            'ps -eo pid,args | grep "[a]pp-cli" | grep -v grep').stdout
         listeners = execute(
             'pgrep -f "[a]pp-cli serve" | wc -l').stdout.strip()
         check('A: exactly one serve owner process', listeners == '1',
               procs, scenario='A')
-        check('A: business HTTP serves content', content() == 'recovery-a-1',
-              content(), scenario='A')
+        deadline = time.monotonic() + 90
+        manual = ''
+        while time.monotonic() < deadline:
+            manual = try_execute('cat /tmp/manual-run.log').stdout
+            if ('dispatching to the running owner' in manual
+                    or 'dispatched start completed' in manual
+                    or 'Error' in manual):
+                break
+            time.sleep(1)
+        # 手动 run 的 Start 走"最后受理生效"接替：等待其自然终态后业务内容
+        # 保持（同一 release 重编排）。
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            if try_execute('pgrep -f "[a]pp-cli run" | wc -l'
+                           ).stdout.strip() == '0':
+                break
+            time.sleep(1)
         manual = try_execute('cat /tmp/manual-run.log').stdout
-        # plan §8：并发请求按身份/revision 裁决——转交、明确拒绝（Busy/
-        # Conflict/前置契约失败）都证明没有第二编排；禁止的是静默第二
-        # 绑定。不变量直接断言：无第二监听冲突、单 discovery（已查）。
+        # RV08/A：裁决必须是**显式**转交/拒绝文案——"出现 owner 字样"
+        # 这类宽松匹配不算数；第二监听冲突恒为失败。
         bound_conflict = ('address already in use' in manual.lower()
                           or ('bind' in manual.lower() and 'failed' in manual.lower()))
-        ownership_enforced = ('dispatching to the running owner' in manual
-                              or 'already has an owner' in manual
-                              or 'owner' in manual.lower())
-        check('A: concurrent run did not bind a second orchestrator',
-              ownership_enforced and not bound_conflict, manual[-500:],
+        handed_over = ('dispatching to the running owner' in manual
+                       or 'dispatched start completed on the running owner' in manual)
+        rejected = ('already has an owner' in manual
+                    or 'operation is in progress' in manual.lower()
+                    or 'conflict' in manual.lower()
+                    or 'superseded' in manual.lower())
+        check('A: concurrent run explicitly handed over or rejected',
+              (handed_over or rejected) and not bound_conflict, manual[-500:],
               scenario='A')
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            if content() == 'recovery-a-1':
+                break
+            time.sleep(1)
+        check('A: business still serves after handover replacement',
+              content() == 'recovery-a-1', content(), scenario='A')
 
         # ── B：owner TERM → 干净退出不复活；SIGKILL → supervisord 自愈 ──
         identity_before = first_identity
@@ -317,21 +465,65 @@ strip_prefix = false
               execute('cat "$1/sentinel"', workspace).stdout == 'recovery-a-1',
               None, scenario='C')
 
-        # ── G：恢复后的停止/启动不排队、不误启 ───────────────────────
+        # ── G：Stop 执行屏障——不同 Start Busy 且零持久化；同 ID 重放 ──
+        # RV08/G：真实受控 Stop（物理停进行中，pending 屏障持有期间）并发
+        # 不同 Start：必须 Busy（附当前操作身份）且**零持久化**（不排队）。
         post('stop')
-        check('G: stopped business stays stopped', content() is None,
-              None, scenario='G')
         start('restart')
-        check('G: start after stop re-launches business',
-              content() == 'recovery-c-2', content(), scenario='G')
+        revision = runtime_status()['revision']
+        stop_id = 'g-stop-' + uuid.uuid4().hex[:8]
+        code, body = runtime_post(stop_id, 'stop', revision)
+        check('G: runtime stop admitted', code == 202
+              and (body.get('data') or {}).get('state') == 'accepted',
+              body, scenario='G')
+        # 屏障窗口内：不同 Start / 不同 Restart 均 Busy，零副作用。
+        # （revision 用 stop 推进后的值——目标状态是停止完成后。）
+        busy_start_id = 'g-start-' + uuid.uuid4().hex[:8]
+        code_s, body_s = runtime_post(busy_start_id, 'start', revision + 1)
+        active = body_s.get('active_operation_id')
+        check('G: different start during stop execution is Busy',
+              code_s == 409 and body_s.get('code') == 'ERR_OPERATION_IN_PROGRESS'
+              and active == stop_id, body_s, scenario='G')
+        busy_restart_id = 'g-restart-' + uuid.uuid4().hex[:8]
+        code_r, body_r = runtime_post(busy_restart_id, 'restart', revision + 1)
+        check('G: different restart during stop execution is Busy',
+              code_r == 409 and body_r.get('code') == 'ERR_OPERATION_IN_PROGRESS',
+              body_r, scenario='G')
+        record = execute(
+            'ls "$1/operations/" 2>/dev/null | grep -c "$2" || true',
+            state_root, busy_start_id).stdout.strip()
+        check('G: busy start left zero persisted record',
+              record == '0', record, scenario='G')
+        # 同 ID 重放：读回已受理进度（accepted/执行中），不重复受理。
+        code_p, body_p = runtime_post(stop_id, 'stop', revision)
+        check('G: same-id stop replays recorded state', code_p == 202
+              and (body_p.get('data') or {}).get('operation_id') == stop_id,
+              body_p, scenario='G')
+        stop_state = wait_terminal(stop_id)
+        check('G: admitted stop reaches terminal', stop_state == 'succeeded',
+              stop_state, scenario='G')
+        replay_code, replay = runtime_post(stop_id, 'stop', revision)
+        check('G: same-id stop after terminal replays terminal state',
+              replay_code == 202
+              and (replay.get('data') or {}).get('state') == 'succeeded',
+              replay, scenario='G')
+        # Stop 完成后新 Start 正常执行。
+        after_id = 'g-after-' + uuid.uuid4().hex[:8]
+        code_a, body_a = runtime_post(after_id, 'start', revision + 1)
+        check('G: fresh start after stop executes', code_a == 202, body_a,
+              scenario='G')
+        wait_terminal(after_id)
+        check('G: fresh start serves content', content() == 'recovery-c-2',
+              content(), scenario='G')
 
         # ── R4：run 首个 owner + 另一进程 HTTP Stop/Restart 消费 ──────
         post('stop')
-        execute(
-            'p="$(pgrep -f "[a]pp-cli serve" | head -1)"; '
-            '[ -n "$p" ] && kill -9 "$p" || true', check=False)
-        time.sleep(2)
-        # 真实 run 成为第一个 owner（经 supervisord 外的手动 exec）。
+        # RV08/R4：先干净停止 supervised serve 程序（exitcode=0 不复活），
+        # 隔离出"无 owner"世界，run 才是真正首发 owner。
+        supervisorctl('stop', 'app-cli')
+        stopped = try_execute('pgrep -f "[a]pp-cli serve" | wc -l').stdout.strip()
+        check('R4: supervised serve program stopped before run bootstrap',
+              stopped == '0', stopped, scenario='R4')
         docker('exec', '-d', cid, 'sh', '-ec',
                'exec app-cli run --workspace "$1" --log-dir /home/user/logs '
                '--admin-addr 0.0.0.0:3010 >/tmp/r4run.log 2>&1', '--', workspace)
@@ -341,15 +533,24 @@ strip_prefix = false
             run_owner = None
         check('R4: real run bootstraps the first owner',
               run_owner is not None, run_owner, scenario='R4')
+        run_pid = try_execute('pgrep -f "[a]pp-cli run" | head -1').stdout.strip()
+        ps_r4 = try_execute(
+            'ps -eo pid,args | grep "[a]pp-cli" | grep -v grep').stdout
+        discovery_r4 = json.loads(execute(
+            'cat "$(find /home/user/.app-cli-state -name supervisor.json | head -1)"'
+        ).stdout)
+        # pid/命令、native supervisor 身份与 API 身份对应：run 进程唯一且
+        # discovery 属活实例（phase 非 recovery_required）。
+        check('R4: run process is the sole app-cli orchestrator',
+              bool(run_pid) and ps_r4.count('app-cli run') == 1
+              and 'app-cli serve' not in ps_r4, ps_r4, scenario='R4')
+        check('R4: discovery belongs to the live run owner',
+              discovery_r4['snapshot']['phase'] in ('ready', 'stopped'),
+              discovery_r4['snapshot']['phase'], scenario='R4')
         report.setdefault('r4_diag', {})
-        report['r4_diag']['ps'] = try_execute(
-            'ps -eo pid,args | grep "[a]pp-cli" | grep -v grep',
-            timeout=30).stdout
-        report['r4_diag']['r4run'] = try_execute(
-            'cat /tmp/r4run.log 2>/dev/null | tail -c 1500', timeout=30).stdout
-        report['r4_diag']['snapshot'] = try_execute(
-            'find /home/user -name supervisor.json -exec cat {} \\;',
-            timeout=30).stdout[:800]
+        report['r4_diag']['run_pid'] = run_pid
+        report['r4_diag']['instance'] = discovery_r4['instance']
+        report['r4_diag']['api_identity'] = identity()
         # 另一进程提交的 Start（file-server 复用路由）必须被 run 的
         # server_loop 消费——操作终态 + 实际 HTTP 内容。
         try:
@@ -362,15 +563,6 @@ strip_prefix = false
                 timeout=30).stdout
             report['r4_fail']['r4run'] = try_execute(
                 'tail -c 2000 /tmp/r4run.log 2>/dev/null', timeout=30).stdout
-            report['r4_fail']['outlog'] = try_execute(
-                'tail -c 2000 /home/user/logs/app-cli.out.log 2>/dev/null',
-                timeout=30).stdout
-            report['r4_fail']['task'] = try_execute(
-                'curl -fsS --max-time 5 "http://127.0.0.1:60000/api/v1/userapp/tasks'
-                '?app_id=' + app + '" 2>/dev/null || true', timeout=30).stdout[:800]
-            report['r4_fail']['ops'] = try_execute(
-                'find /home/user -path "*operations*" -name "*.json" | head -5 | '
-                'xargs -r -n1 sh -c "echo --- $0; head -c 400 $0"', timeout=60).stdout[:2000]
             raise
         check('R4: platform-submitted start consumed by run owner',
               content() == 'recovery-c-2', content(), scenario='R4')
@@ -380,8 +572,14 @@ strip_prefix = false
         check('R4: platform-submitted stop consumed by run owner',
               stop_r4.get('message') == 'Stopped' and content() is None,
               stop_r4, scenario='R4')
-        # Restart again: run owner may have exited after stop (foreground
-        # exit semantics) — a fresh run bootstrap must take over cleanly.
+        time.sleep(2)
+        run_gone = try_execute('pgrep -f "[a]pp-cli run" | wc -l').stdout.strip()
+        check('R4: run owner exited after foreground stop', run_gone == '0',
+              run_gone, scenario='R4')
+        # Restart again: run owner 已按前台语义退出——重新拉起 supervised
+        # serve 程序接管（平台常驻形态），业务恢复。
+        supervisorctl('start', 'app-cli')
+        wait_management(120)
         start('restart')
         check('R4: restart after run-owner exit recovers',
               content() == 'recovery-c-2', content(), scenario='R4')
@@ -411,10 +609,13 @@ strip_prefix = false
         check('J: business unaffected by freeze window',
               content() == 'recovery-c-2', content(), scenario='J')
 
-        # ── I：app-11 升级 fixture（脱敏重建，非现场快照）────────────
-        # 形态：RecoveryRequired discovery + 前容器域章的 Running 旧代次
-        #（无退出回执）并存。新版启动必须零手改自动恢复且保留旧记录。
+        # ── I：app-11 升级 fixture（owner 停机导入，新 boot 读取）─────
+        # RV08/I：先结束 owner（干净停程序，不复活），再导入脱敏 fixture，
+        # 再启动新二进制——磁盘状态由下一次 owner 启动真实读取，不是活
+        # owner 的内存覆盖。形态：RecoveryRequired discovery + 前容器域章
+        # 的 Running 旧代次（无退出回执）并存。
         post('stop')
+        supervisorctl('stop', 'app-cli')
         fixture_generation = '11111111-2222-4333-8444-555555555555'
         fixture_domain = {'authority': 'app-cli-recovery-v2', 'volume': volume,
                           'instance': 'old-pod-' + uuid.uuid4().hex[:8]}
@@ -440,6 +641,8 @@ strip_prefix = false
                                                      'unconfirmed: Running',
                                             'problem': None},
                                             'requests': []})})
+        supervisorctl('start', 'app-cli')
+        wait_management(150)
         start('restart')
         check('I: app-11 style fixture recovers without manual edits',
               content() == 'recovery-c-2', content(), scenario='I')
@@ -451,57 +654,47 @@ strip_prefix = false
               and preserved['physical_domain']['instance'].startswith('old-pod-'),
               preserved['phase'], scenario='I')
 
-        # ── R3：坏 journal 期间的精确 Stop + 管理可用 ──────────────────
-        # 损坏业务部署 journal → 杀 serve 由 supervisord 重启（新 owner 的
-        # 业务初始化在坏 journal 上失败进入降级驻留）：窗口内 Stop 必须
-        # 受理、identity 可查询、3010 不消失；修复后业务恢复。
-        state_root_dir = execute(
-            'find /home/user -maxdepth 5 -name supervisor.json -printf "%h\n" '
-            '| head -1').stdout.strip()
-        check('R3: located state root', bool(state_root_dir), state_root_dir,
-              scenario='R3')
-        write({state_root_dir + '/.deploy-operation.json': '{damaged-journal'})
-        execute(
-            'p="$(pgrep -f "[a]pp-cli serve" | head -1)"; '
-            '[ -n "$p" ] && kill -9 "$p" || true', check=False)
-        # supervisord 重启 serve；新会话业务初始化失败但 owner 驻留。
-        deadline = time.monotonic() + 120
-        degraded = False
-        while time.monotonic() < deadline:
-            id_probe = try_execute(
-                'curl -fsS --max-time 3 http://127.0.0.1:3010/v1/runtime/identity')
-            if id_probe.returncode == 0:
-                degraded = True
-                break
-            time.sleep(1)
+        # ── R3：坏 journal 期间的精确 Stop（HTTP + native）+ 管理可用 ──
+        # 损坏业务部署 journal → 干净重启 serve → 新 owner 的业务初始化在
+        # 坏 journal 上失败进入降级驻留：窗口内 Stop 必须受理、identity 可
+        # 查询、3010 不消失；修复后业务恢复。覆盖 HTTP 与 native 两个停止
+        # 操作系统。
+        state_root_dir = degrade_with_bad_journal()
         check('R3: management survives damaged-journal business failure',
-              degraded, id_probe.stdout[-150:] if degraded else 'timeout',
-              scenario='R3')
+              True, None, scenario='R3')
         stop_r3 = post('stop')
-        check('R3: stop accepted during degraded business state',
+        check('R3: HTTP stop accepted during degraded business state',
               stop_r3.get('message') == 'Stopped', stop_r3, scenario='R3')
         id_probe2 = try_execute(
             'curl -fsS --max-time 3 http://127.0.0.1:3010/v1/runtime/identity')
         check('R3: identity queryable after degraded stop',
               id_probe2.returncode == 0, id_probe2.stdout[-120:], scenario='R3')
+        # native StopWork（第二辆降级列车）：控制协议直连 owner。
+        state_root_dir = degrade_with_bad_journal()
+        native = try_execute(
+            'app-cli owner stop --workspace "$1"', workspace, timeout=60)
+        check('R3: native StopWork completes on degraded owner',
+              native.returncode == 0 and 'stopped' in (native.stdout or '').lower(),
+              (native.stdout or '')[-300:], scenario='R3')
+        id_probe3 = try_execute(
+            'curl -fsS --max-time 3 http://127.0.0.1:3010/v1/runtime/identity')
+        check('R3: identity queryable after native stop',
+              id_probe3.returncode == 0, id_probe3.stdout[-120:], scenario='R3')
         # 修复 journal（合法空记录覆盖，不删除原文件的诊断需要已满足），
-        # 业务恢复。
+        # 下一显式新请求恢复业务。
         write({state_root_dir + '/.deploy-operation.json':
-                   '{\"deploy_replays\": {}}'})
+                   '{\\"deploy_replays\\": {}}'})
         start('restart')
         check('R3: business recovers after journal repaired',
               content() == 'recovery-c-2', content(), scenario='R3')
 
         # ── E：同容器重启（docker restart，容器 ID 不变）────────────
-        # 测试装置保真：exec 派生的 supervisord/proxy 在 pid1 快速退出时可能
-        # 跨 restart 存活（真实平台 supervisord 是容器入口、随容器干净重启）。
-        # 先清残留守护再重拉，保证单一管理进程的世界。
+        # RV08/E：pid1 是镜像自身 supervisord——restart 即真实入口自动重启
+        # 服务（app-cli serve / file-server-proxy / PG / ttyd），无额外
+        # pkill、无手工拉服务。
+        post('stop')
         docker('restart', cid)
-        try_execute('pkill -9 -f "[s]upervisord" || true; '
-                    'pkill -9 -f "[f]ile-server-proxy" || true; '
-                    'pkill -9 -f "[a]pp-cli serve" || true', timeout=30)
-        launch_services()
-        wait_management(120)
+        wait_management(150)
         check('E: same-container restart keeps business stopped',
               content() is None, content(), scenario='E')
         start('restart')
@@ -513,7 +706,7 @@ strip_prefix = false
         docker('rm', '-f', cid)
         cid = None
         new_container()
-        wait_management(90)
+        wait_management(120)
         start('restart')
         check('D: same-volume replacement recovers and serves',
               content() == 'recovery-c-2', content(), scenario='D')
@@ -521,14 +714,21 @@ strip_prefix = false
               execute('cat "$1/sentinel"', workspace).stdout == 'recovery-a-1',
               None, scenario='D')
 
-        # ── H：迁移结果未知 + 进程范围已空 ────────────────────────────
-        # 预置未确认迁移回执（identity 匹配当前 release，completed=false）：
-        # Stop/管理必须可用；依赖迁移的启动给出具体原因；不自动重跑、不伪造。
+        # ── H：真实身份的未确认迁移屏障 + 执行计数 ────────────────────
+        # RV08/H：从上一次成功编排写的真实回执中取当前 release/service 的
+        # identity，改写为 completed=false——这是真实的在途屏障；依赖迁移
+        # 的启动必须给出具体原因（不静默重跑、不伪造），Stop/管理可用。
         post('stop')
-        migrate_ws = workspace
         receipt_dir = state_root + '/migration-receipts'
-        write({receipt_dir + '/unconfirmed.json':
-                   json.dumps({'identity': 'H' * 64, 'completed': False})})
+        receipts = execute('ls "$1"/*.json 2>/dev/null | head -5',
+                           receipt_dir).stdout.split()
+        check('H: a real migration receipt exists from prior orchestration',
+              bool(receipts), receipt_dir, scenario='H')
+        first_receipt = json.loads(execute('cat "$1"', receipts[0]).stdout)
+        real_identity = first_receipt['identity']
+        runs_before = migration_runs()
+        write({receipts[0]: json.dumps(
+            {'identity': real_identity, 'completed': False})})
         stop_h = post('stop')
         check('H: stop works with unconfirmed migration present',
               stop_h.get('message') == 'Stopped' and content() is None,
@@ -540,20 +740,36 @@ strip_prefix = false
             restart_h = start('restart')
         except RuntimeError as error:
             restart_h = str(error)
-        # 两种合法结局：启动被拒并给出迁移具体原因；或启动成功但**没有重跑
-        # 迁移**（回执仍 completed=false——伪造成功/静默重跑都算失败）。
+        # 唯一合法结局：启动被拒并给出迁移具体原因（真实在途身份下，
+        # "绕过并成功"= 伪造/静默重跑，恒为失败）。
         refused = isinstance(restart_h, str) and (
             'migration' in restart_h.lower()
-            or 'reconciliation' in restart_h.lower())
-        started_ok = not isinstance(restart_h, str)
-        receipt_now = json.loads(execute(
-            'cat "$1"', receipt_dir + '/unconfirmed.json').stdout)
-        check('H: unconfirmed migration blocks or explains dependent start',
-              refused or started_ok, str(restart_h)[:200], scenario='H')
-        check('H: migration outcome not fabricated nor silently rerun',
-              receipt_now.get('completed') is False,
-              receipt_now, scenario='H')
+            or 'reconciliation' in restart_h.lower()
+            or 'unconfirmed' in restart_h.lower())
+        check('H: unconfirmed migration refuses dependent start with reason',
+              refused, str(restart_h)[:300], scenario='H')
+        runs_after = migration_runs()
+        receipt_now = json.loads(execute('cat "$1"', receipts[0]).stdout)
+        check('H: migration neither rerun nor fabricated',
+              receipt_now.get('completed') is False and runs_after == runs_before,
+              {'receipt': receipt_now, 'runs': [runs_before, runs_after]},
+              scenario='H')
+        # 屏障解除（如实确认）后业务恢复，迁移执行计数恰好 +1。
+        write({receipts[0]: json.dumps(
+            {'identity': real_identity, 'completed': True})})
+        start('restart')
+        check('H: business recovers after migration barrier confirmed',
+              content() == 'recovery-c-2', content(), scenario='H')
+        runs_final = migration_runs()
+        check('H: recovered orchestration ran the migration exactly once',
+              runs_final == runs_before + 1, [runs_before, runs_final],
+              scenario='H')
 
+        # RV08：必做场景清单完整性——任何未执行/无断言的场景都不算通过。
+        executed = set(report['scenarios'])
+        missing = [s for s in report['required_scenarios'] if s not in executed]
+        check('matrix: every required scenario executed with assertions',
+              not missing, missing, scenario='matrix')
         report['success'] = True
     except (Exception, KeyboardInterrupt) as error:
         report.update(success=False, error=str(error))
@@ -565,8 +781,8 @@ strip_prefix = false
                 'python3 -c \'import sys\n'
                 'from pathlib import Path\n'
                 'files=[Path("/tmp/proxy.log"),Path("/tmp/manual-run.log"),'
-                'Path("/tmp/second-owner.log"),Path("/tmp/recovery-supervisor.log"),'
-                'Path("/tmp/r4run.log")]'
+                'Path("/tmp/second-owner.log"),Path("/tmp/r4run.log"),'
+                'Path("/app/logs/supervisord.log")]'
                 '+list(Path("/home/user/logs").rglob("*.log"))\n'
                 'for p in files:\n'
                 ' if p.is_file():\n'
