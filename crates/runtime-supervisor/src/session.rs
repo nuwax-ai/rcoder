@@ -138,6 +138,9 @@ struct Incoming {
 struct SessionCore {
     root: PathBuf,
     policy: crate::Policy,
+    /// Serialize durable updates independently of the short snapshot-read lock.
+    /// The business readiness callback and the control loop are separate writers.
+    discovery_commit: Mutex<()>,
     discovery: Mutex<Discovery>,
     fence: Mutex<FenceState>,
     fence_changed: tokio::sync::Notify,
@@ -146,15 +149,21 @@ struct SessionCore {
     restarts: Mutex<VecDeque<tokio::time::Instant>>,
     /// Latest generation whose business reported management readiness.
     management_ready: Mutex<Option<String>>,
+    /// RV03：后台清理槽在途标志（spawn 置位、确认成功复位）。供 owner 侧
+    /// 的无驱动 Stop 看门狗判定"会话静止"——RunState 归 run 循环私有，
+    /// 外部任务只能经此原子位观察清理是否仍挂起。
+    cleanup_in_flight: std::sync::atomic::AtomicBool,
 }
 
 impl SessionCore {
     fn with_discovery<T>(&self, update: impl FnOnce(&mut Discovery) -> Result<T>) -> Result<T> {
-        // 持锁窗口只覆盖 clone 与 swap（内存操作）；durable 落盘
-        //（fsync，共享盘上可达数十毫秒）在锁外执行——控制连接的快照
-        // 读取不被持久化 I/O 阻塞（复核 §6）。写者串行由写路径单任务
-        //（run loop / mark_ready）保证；并发写者最多造成一次后写覆盖
-        // 先写的同代快照，与旧实现（锁内 save）语义等价。
+        // Serialize clone → update → durable save → publish. Readiness runs in
+        // the business task while Stop runs in the owner loop; both must read
+        // the latest committed state. Snapshot reads need only the short lock.
+        let _commit = self
+            .discovery_commit
+            .lock()
+            .map_err(|_| anyhow::anyhow!("discovery commit lock poisoned"))?;
         let mut next = {
             let discovery = self
                 .discovery
@@ -162,10 +171,18 @@ impl SessionCore {
                 .map_err(|_| anyhow::anyhow!("discovery lock poisoned"))?;
             discovery.clone()
         };
+        let tracked_before = next.snapshot.operation_id.clone();
         let result = update(&mut next)?;
         // Replay parity（R2.4）：受理中操作的每次快照推进同步进 requests
         // 登记，同请求重试因此反映实际进度与终态（monitor::persist 同款）。
-        if let Some(id) = next.snapshot.operation_id.clone() {
+        // RV04：终态发布会清空 operation_id——用更新前的身份继续同步这一
+        // 次，让记录的请求重放读到 Stopped 终态；此后（身份已空）不再推进。
+        let tracked = next
+            .snapshot
+            .operation_id
+            .clone()
+            .or(tracked_before.filter(|_| next.snapshot.operation_id.is_none()));
+        if let Some(id) = tracked {
             for (request, snapshot) in &mut next.requests {
                 if request.request_id == id {
                     *snapshot = next.snapshot.clone();
@@ -379,6 +396,7 @@ impl OwnerSession {
         let core = Arc::new(SessionCore {
             root: root.clone(),
             policy: options.policy,
+            discovery_commit: Mutex::new(()),
             discovery: Mutex::new(discovery),
             fence: Mutex::new(FenceState::Clear),
             fence_changed: tokio::sync::Notify::new(),
@@ -386,6 +404,7 @@ impl OwnerSession {
             cleanup_adapter: options.cleanup_adapter,
             restarts: Mutex::new(VecDeque::new()),
             management_ready: Mutex::new(None),
+            cleanup_in_flight: std::sync::atomic::AtomicBool::new(false),
         });
         let (tx, incoming) = mpsc::channel::<Incoming>(32);
         let run = RunState {
@@ -436,6 +455,31 @@ impl OwnerSession {
     /// while business is stopped) into the session's intent loop.
     pub fn request_relaunch(&self) {
         self.core.relaunch_requested.notify_one();
+    }
+
+    /// RV03：会话静止判定——无业务运行（相位不在 Reconciling/Starting/
+    /// Ready/Stopping/CleanupPending）、无在途后台清理、围栏清空。降级
+    /// 驻留（RecoveryRequired）或已停止（Stopped）的 owner 满足；据此，
+    /// 无驱动者时期受理的 Stop 可以按"已确认无执行"幂等收束。
+    pub fn management_quiescent(&self) -> bool {
+        let snapshot = self.core.snapshot();
+        if matches!(
+            snapshot.phase,
+            Phase::Reconciling
+                | Phase::Starting
+                | Phase::Ready
+                | Phase::Stopping
+                | Phase::CleanupPending
+        ) {
+            return false;
+        }
+        if !matches!(self.core.fence(), FenceState::Clear) {
+            return false;
+        }
+        !self
+            .core
+            .cleanup_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -566,6 +610,9 @@ impl RunState {
         let adapter = self.core.cleanup_adapter.clone();
         let id = value.id.clone();
         let mut owned = value;
+        self.core
+            .cleanup_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
         self.cleanup = Some(CleanupSlot {
             generation: id,
             root: root.clone(),
@@ -601,6 +648,9 @@ impl RunState {
                 match result {
                     Ok(()) => {
                         self.core.set_fence(FenceState::Clear);
+                        self.core
+                            .cleanup_in_flight
+                            .store(false, std::sync::atomic::Ordering::Release);
                         let generation = slot.generation.clone();
                         let intent = self.core.intent();
                         self.core.with_discovery(|discovery| {
@@ -615,8 +665,12 @@ impl RunState {
                             {
                                 // 终态只在清理成功后发布（R2.2）：受理的
                                 // Stop/Shutdown 以确认的清理回执收尾，同请求
-                                // 重放读取同一终态快照。
+                                // 重放读取同一终态快照。RV04：发布终态同时
+                                // 清空挂起操作身份——"已受理停止在途"的探测
+                                // 此后恒为否，会话重开的取消接力不会把已
+                                // 完成的停止当成在途交接。
                                 discovery.snapshot.phase = Phase::Stopped;
+                                discovery.snapshot.operation_id = None;
                                 discovery.snapshot.problem = None;
                                 discovery.snapshot.error = None;
                             } else if matches!(
@@ -650,7 +704,8 @@ impl RunState {
                     let CleanupSlot {
                         value, root, lock, ..
                     } = slot;
-                    self.spawn_cleanup_stage(value.expect("checked Some above"), root, lock);
+                    let value = value.context("cleanup retry receipt missing")?;
+                    self.spawn_cleanup_stage(value, root, lock);
                 } else {
                     self.cleanup = Some(slot);
                 }
@@ -839,6 +894,30 @@ impl RunState {
             process_epoch: epoch::current(),
         };
         record::save(&work.join("generation.json"), &value)?;
+        // RV06：记录本 owner 进程的创建身份（Windows PID 复用核验用；
+        // additive sidecar，unix 侧无等价稳定读取、不写——boot_id+pid1
+        // 已构成强进程空间身份）。写入失败不阻断启动（保守路径仍可用
+        // uptime+观察链），但如实记录。
+        #[cfg(windows)]
+        {
+            match process_utils::self_created_unix_ms() {
+                Ok(Some(unix_ms)) => {
+                    if let Err(error) = record::save_worker_created(
+                        &work,
+                        &record::WorkerCreated {
+                            version: 1,
+                            unix_ms,
+                        },
+                    ) {
+                        tracing::warn!(%error, "record worker creation identity failed");
+                    }
+                }
+                outcome => tracing::warn!(
+                    ?outcome,
+                    "worker creation identity unavailable; PID-reuse checks stay conservative"
+                ),
+            }
+        }
         let fresh = self.first_launch;
         // R1：安装进程级会话命令范围——业务会话内全部嵌套 spawn 的受管
         // 命令（服务/预检/迁移/Pingap）据此落 generation 作用域。
@@ -1239,6 +1318,24 @@ impl RunState {
         }
         self.next_cleanup = tokio::time::Instant::now();
         self.begin_stop(intent)?;
+        // An idle owner may be parked after a business initialization failure.
+        // With all generations reconciled and no cleanup task outstanding,
+        // Stop has no execution left to drain; do not wait for a new business
+        // session to open the same damaged journal and finish this request.
+        if request.action == control::Action::StopWork
+            && self.business.is_none()
+            && !self.cleanup_pending()
+            && self.fence_cleared()
+        {
+            self.core.with_discovery(|discovery| {
+                discovery.snapshot.phase = Phase::Stopped;
+                // RV04：立即终态同样清空挂起操作身份（见 poll_cleanup）。
+                discovery.snapshot.operation_id = None;
+                discovery.snapshot.error = None;
+                discovery.snapshot.problem = None;
+                Ok(())
+            })?;
+        }
         Ok(self.core.snapshot())
     }
 }
@@ -1292,6 +1389,123 @@ mod tests {
             .await
             .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn concurrent_discovery_commits_preserve_accepted_stop() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path()).await;
+        session
+            .core
+            .with_discovery(|discovery| {
+                discovery.snapshot.generation = Some("current".into());
+                discovery.snapshot.phase = Phase::Starting;
+                discovery.snapshot.intent = Intent::Run;
+                Ok(())
+            })
+            .unwrap();
+        let (ready_entered_tx, ready_entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let ready_core = session.core.clone();
+        let ready = std::thread::spawn(move || {
+            ready_core
+                .with_discovery(|discovery| {
+                    if discovery.snapshot.phase == Phase::Starting {
+                        discovery.snapshot.phase = Phase::Ready;
+                    }
+                    ready_entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        ready_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        // Snapshot readers stay responsive while a writer is committing.
+        assert_eq!(session.snapshot().phase, Phase::Starting);
+        let (stop_started_tx, stop_started_rx) = std::sync::mpsc::channel();
+        let (stop_committed_tx, stop_committed_rx) = std::sync::mpsc::channel();
+        let stop_core = session.core.clone();
+        let stop = std::thread::spawn(move || {
+            stop_started_tx.send(()).unwrap();
+            stop_core
+                .with_discovery(|discovery| {
+                    discovery.snapshot.phase = Phase::Stopping;
+                    discovery.snapshot.intent = Intent::Stopped;
+                    discovery.snapshot.operation_id = Some("accepted-stop".into());
+                    Ok(())
+                })
+                .unwrap();
+            stop_committed_tx.send(()).unwrap();
+        });
+        stop_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let committed_early = stop_committed_rx
+            .recv_timeout(Duration::from_millis(200))
+            .is_ok();
+        // Always release and join the writers before asserting, including on
+        // the broken implementation where Stop commits over the Ready clone.
+        release_tx.send(()).unwrap();
+        ready.join().unwrap();
+        stop.join().unwrap();
+        assert!(
+            !committed_early,
+            "concurrent commits must serialize their complete snapshot updates"
+        );
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.phase, Phase::Stopping);
+        assert_eq!(snapshot.intent, Intent::Stopped);
+        assert_eq!(snapshot.operation_id.as_deref(), Some("accepted-stop"));
+        let persisted: Discovery =
+            serde_json::from_slice(&std::fs::read(root.path().join("supervisor.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(persisted.snapshot).unwrap(),
+            serde_json::to_value(snapshot).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_stop_completes_after_cleanup_without_restarting_business() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path()).await;
+        let mut state = session.run.lock().unwrap().take().unwrap();
+        state.seed_fence().unwrap();
+        // Business initialization exhausted its retry budget, but there is no
+        // remaining execution and the cleanup fence is already clear.
+        session
+            .core
+            .with_discovery(|discovery| {
+                discovery.snapshot.phase = Phase::RecoveryRequired;
+                discovery.snapshot.error = Some("business restart budget exhausted".into());
+                Ok(())
+            })
+            .unwrap();
+        let discovery = session.core.discovery.lock().unwrap().clone();
+        let request = Envelope {
+            version: control::CONTROL_VERSION,
+            instance: discovery.instance,
+            token: discovery.token,
+            request: Request::new(Action::StopWork),
+        };
+        let stopped = state.handle_request(&request).unwrap();
+        assert_eq!(stopped.phase, Phase::Stopped);
+        assert_eq!(stopped.intent, Intent::Stopped);
+        // RV04：终态发布清空挂起操作身份——"已受理停止在途"的探测此后
+        // 恒为否，会话重开的取消接力不把已完成的停止当成在途交接。
+        assert_eq!(
+            stopped.operation_id, None,
+            "terminal publication clears the pending operation identity"
+        );
+        assert!(stopped.problem.is_none());
+        assert!(stopped.error.is_none());
+        assert!(state.business.is_none());
+        assert_eq!(
+            serde_json::to_value(state.handle_request(&request).unwrap()).unwrap(),
+            serde_json::to_value(stopped).unwrap()
+        );
     }
 
     #[tokio::test]

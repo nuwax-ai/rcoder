@@ -468,7 +468,12 @@ impl RuntimeStore {
 
     /// 启动恢复：最后一次非终态操作置 RecoveryRequired（不猜结果，写操作
     /// 被拒直至该操作显式恢复/重放完成）。
-    pub(crate) fn recover_unfinished_operations(&self) -> Result<RecoveryScan> {
+    /// RV01：`live` 集内的是本 owner 会话结束后新受理（已派发待消费）或
+    /// 待交接收束的操作——派发状态已知，不是未知结果，扫描必须跳过。
+    pub(crate) fn recover_unfinished_operations(
+        &self,
+        live: &std::collections::HashSet<String>,
+    ) -> Result<RecoveryScan> {
         let mut scan = RecoveryScan {
             recovered: Vec::new(),
             quarantined: Vec::new(),
@@ -497,6 +502,9 @@ impl RuntimeStore {
                     }
                 };
             let mut operation = operation;
+            if live.contains(&operation.view.operation_id) {
+                continue;
+            }
             if !operation.view.state.is_terminal() {
                 // recovery v3：统一 owner 的管理 API 先于首个业务会话开放
                 //（R3），Accepted 的 Stop 可能在"已受理、尚未有会话消费"的

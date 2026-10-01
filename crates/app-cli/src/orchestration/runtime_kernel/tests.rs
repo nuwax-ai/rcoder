@@ -1809,4 +1809,123 @@ mod cases {
             .expect("exists");
         assert_eq!(view.state, RuntimeOperationState::Succeeded);
     }
+
+    /// RV01 反例：降级驻留 owner 的会话交接。会话 A 结束（note_execution_
+    /// session_ended）后用户提交新 Start B——B 以自身 ID 占据新执行权；
+    /// 下一个会话的 prepare_relaunch 只收束 A 记录的交接集合，B 保持
+    /// Accepted 且 recover 不得销毁它。修复前 prepare 盲清全部 active/
+    /// pending，B 被转 RecoveryRequired（新请求被误清）。
+    #[tokio::test]
+    async fn session_handover_preserves_newly_admitted_operations() {
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-a"))
+            .await
+            .expect("admit session A operation");
+        kernel
+            .note_execution_session_ended()
+            .await
+            .expect("record handover");
+        // Parked window: the user submits a fresh Start B. It must occupy the
+        // execution slot with its own identity.
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-b"))
+            .await
+            .expect("admit parked-window operation");
+        // Next business session start settles only the recorded handover set.
+        kernel.prepare_relaunch().await.expect("prepare relaunch");
+        let a = kernel.get("op-a").await.expect("view a").expect("exists");
+        assert_eq!(a.state, RuntimeOperationState::RecoveryRequired);
+        let b = kernel.get("op-b").await.expect("view b").expect("exists");
+        assert_eq!(b.state, RuntimeOperationState::Accepted);
+        assert_eq!(
+            kernel.status().await.expect("status").active_operation_id,
+            Some("op-b".to_string())
+        );
+        // Startup recovery skips the live admission instead of destroying it;
+        // the interrupted record (not the new request) is what it recovers.
+        let recovered = kernel.recover().await.expect("recover with live slot");
+        assert_eq!(recovered, vec!["op-a".to_string()]);
+        let b = kernel
+            .get("op-b")
+            .await
+            .expect("view b after recover")
+            .expect("exists");
+        assert_eq!(b.state, RuntimeOperationState::Accepted);
+        // Startup settle then converges the interrupted record; protection lifts.
+        kernel
+            .settle_unresolved_recoveries()
+            .await
+            .expect("settle startup recoveries");
+        let a = kernel
+            .get("op-a")
+            .await
+            .expect("view a settled")
+            .expect("exists");
+        assert_eq!(a.state, RuntimeOperationState::Failed);
+        assert!(!kernel.recovery_protection_active());
+    }
+
+    /// RV01 反例（fresh 窗口）：owner 早期开放管理（R3）后、首个业务会话
+    /// recover 前已受理的 Start 占据 active。修复前 recover 的
+    /// active-is-none 硬前置失败，会话反复重启；修复后活跃受理被跳过。
+    #[tokio::test]
+    async fn recover_proceeds_with_session_window_admission_active() {
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-early"))
+            .await
+            .expect("admit early-window operation");
+        let recovered = kernel.recover().await.expect("recover");
+        assert!(recovered.is_empty());
+        let view = kernel.get("op-early").await.expect("view").expect("exists");
+        assert_eq!(view.state, RuntimeOperationState::Accepted);
+    }
+
+    /// RV01：会话交接记录的挂起 Stop 屏障在下一会话收束为幂等成功
+    /// （会话终末清理已确认物理停止），且该收束不占用/清除新受理槽位。
+    #[tokio::test]
+    async fn session_handover_settles_pending_stop_barrier_idempotently() {
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-run"))
+            .await
+            .expect("admit running operation");
+        kernel
+            .admit(request(RuntimeOperationKind::Stop, "op-stop"))
+            .await
+            .expect("admit stop barrier");
+        kernel
+            .note_execution_session_ended()
+            .await
+            .expect("record handover");
+        // A new Start arrives in the parked window after the session ended;
+        // the stop advanced the revision, so the fresh request carries it.
+        let mut next_request = request(RuntimeOperationKind::Start, "op-next");
+        next_request.expected_revision = 1;
+        kernel
+            .admit(next_request)
+            .await
+            .expect("admit next operation");
+        kernel.prepare_relaunch().await.expect("prepare relaunch");
+        let stop = kernel
+            .get("op-stop")
+            .await
+            .expect("view stop")
+            .expect("exists");
+        assert_eq!(stop.state, RuntimeOperationState::Succeeded);
+        let next = kernel
+            .get("op-next")
+            .await
+            .expect("view next")
+            .expect("exists");
+        assert_eq!(next.state, RuntimeOperationState::Accepted);
+        assert_eq!(
+            kernel.status().await.expect("status").active_operation_id,
+            Some("op-next".to_string())
+        );
+    }
 }

@@ -163,16 +163,22 @@ impl runtime_supervisor::WorkerControl for ServerState {
         Ok(())
     }
     async fn shutdown(&self) -> Result<()> {
-        // Physical shutdown cannot wait forever for a business admission lock.
-        // The retained driver handle or an external supervisor owns the
-        // precise termination path if this hangs.
-        self.trigger_cancel();
-        let _guard = self
-            .admission
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("runtime admission is busy during shutdown"))?;
-        self.accepting
-            .store(false, std::sync::atomic::Ordering::Release);
+        // RV04：取消与令牌换代共用 admission 线性化点——先取锁再取消，
+        // 与 begin_business_session 的"锁内读取消状态 → renew"互斥排序：
+        // 要么取消发生在 renew 之前（接力逻辑可见），要么发生在 renew
+        // 之后（取消落到新令牌上），不存在被 renew 静默丢弃的窗口。
+        // Physical shutdown cannot wait forever for a business admission
+        // lock; the critical sections it contends with are synchronous and
+        // short (memory + token read), so a blocking acquire cannot wedge.
+        {
+            let _guard = self
+                .admission
+                .lock()
+                .map_err(|_| anyhow::anyhow!("runtime admission lock poisoned"))?;
+            self.trigger_cancel();
+            self.accepting
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
         Ok(())
     }
 }

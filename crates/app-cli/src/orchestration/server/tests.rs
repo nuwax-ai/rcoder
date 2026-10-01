@@ -32,6 +32,111 @@ mod cases {
         ServerState::new(RuntimeStatusService::default())
     }
 
+    #[tokio::test]
+    async fn server_driver_shutdown_waits_for_drop_after_failure_or_timeout() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DriverDrop(Arc<AtomicBool>);
+        impl Drop for DriverDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        for cooperative in [true, false] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let task_dropped = dropped.clone();
+            let cancel = CancellationToken::new();
+            let task_cancel = cancel.clone();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let mut driver = tokio::spawn(async move {
+                let _drop = DriverDrop(task_dropped);
+                started.send(()).unwrap();
+                if cooperative {
+                    task_cancel.cancelled().await;
+                    anyhow::bail!("controlled driver failure");
+                }
+                std::future::pending::<Result<()>>().await
+            });
+            ready.await.unwrap();
+            cancel.cancel();
+            let deadline = if cooperative {
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1)
+            } else {
+                tokio::time::Instant::now()
+            };
+            let error = drain_server_driver(&mut driver, deadline)
+                .await
+                .unwrap_err();
+            assert!(
+                dropped.load(Ordering::Acquire),
+                "the old driver must be dropped before the business session returns"
+            );
+            if cooperative {
+                assert!(error.to_string().contains("controlled driver failure"));
+            } else {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("shutdown confirmation timed out")
+                );
+            }
+        }
+    }
+
+    /// RV04 屏障契约：取消令牌换代与 Stop 受理共用 admission 线性化点。
+    /// 停止交接在途（probe=true）且上一代令牌已取消 → 接力，Stop 不被
+    /// renew 丢弃；停止已完成（probe=false）→ 新令牌，空闲管理会话不因
+    /// 旧取消立即退出成环。
+    #[tokio::test]
+    async fn token_renewal_inherits_cancel_only_while_stop_handover_in_progress() {
+        let state = state();
+        state.trigger_cancel();
+        state.begin_business_session("gen-1".into(), true, || true);
+        assert!(
+            state.cancel_token().is_cancelled(),
+            "an accepted in-flight stop must survive token renewal"
+        );
+        state.begin_business_session("gen-2".into(), false, || false);
+        assert!(
+            !state.cancel_token().is_cancelled(),
+            "a completed stop must not cancel the fresh management session"
+        );
+    }
+
+    /// RV02：业务会话的干净关停不得关闭/排空 owner 级部署通道——统一
+    /// owner 的 ServerState 跨会话复用同一 receiver，关闭会让后续会话的
+    /// server_loop 立即返回、再部署永久失败。
+    #[tokio::test]
+    async fn session_clean_shutdown_keeps_owner_deploy_channel_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("code");
+        let state = state();
+        let mut journal = Journal::open(&workspace).unwrap();
+        journal.commit_coordinator().unwrap();
+        *state.journal.lock().unwrap() = Some(journal);
+        state.close_admission();
+        let args = RuntimeArgs {
+            workspace: workspace.clone(),
+            ..Default::default()
+        };
+        finish_clean_shutdown(&args, &state, true, false)
+            .await
+            .expect("clean session shutdown");
+        state
+            .deploy_tx
+            .send(request())
+            .expect("owner-level deploy channel survives session end");
+        let received = {
+            let mut receiver = state.deploy_rx.lock().await;
+            receiver.try_recv()
+        };
+        assert!(
+            received.is_ok(),
+            "queued request must remain consumable by the next session"
+        );
+    }
+
     #[test]
     fn local_artifact_target_and_source_profile_survive_confirmed_receipts() {
         for run_owner in [false, true] {
@@ -863,7 +968,11 @@ format = "jsonl"
             workspace,
             ..Default::default()
         };
-        assert!(finish_clean_shutdown(&args, &state, false).await.is_err());
+        assert!(
+            finish_clean_shutdown(&args, &state, false, true)
+                .await
+                .is_err()
+        );
         assert_eq!(
             std::fs::read(dir.path().join(".deploy-coordinator.json")).unwrap(),
             before
@@ -885,7 +994,11 @@ format = "jsonl"
             workspace,
             ..Default::default()
         };
-        assert!(finish_clean_shutdown(&args, &state, true).await.is_err());
+        assert!(
+            finish_clean_shutdown(&args, &state, true, true)
+                .await
+                .is_err()
+        );
         assert_eq!(
             std::fs::read(dir.path().join(".deploy-coordinator.json")).unwrap(),
             before

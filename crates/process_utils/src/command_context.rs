@@ -94,6 +94,33 @@ impl CommandContext {
     pub fn current() -> Option<Self> {
         CURRENT.try_with(Clone::clone).ok()
     }
+
+    /// RV05：以不可变的代次工作范围构造捕获上下文。业务会话的根任务在
+    /// 启动时捕获（替代"读当前全局"）——进程级会话范围后续被换代或卸下
+    /// 时，捕获任务及其显式派生的执行任务仍向旧（已闭门）范围登记，
+    /// 不能落入 Direct 或新代次。
+    pub fn for_work_root(work_root: PathBuf) -> Self {
+        Self {
+            identity: WorkIdentity::default(),
+            cancellation: CancellationToken::new(),
+            journal_root: Some(work_root.join("commands")),
+            cleanup_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+/// RV05：tokio::spawn 不传播 task-local——在已捕获命令范围的任务内派生
+/// 执行子任务时用本入口延续捕获范围（克隆当前上下文后重装）。无捕获
+/// 上下文（legacy/无范围路径）时等价于裸 spawn。
+pub fn spawn_scoped<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match CommandContext::current() {
+        Some(context) => tokio::spawn(async move { context.scope(future).await }),
+        None => tokio::spawn(future),
+    }
 }
 
 pub struct CommandRecord {
@@ -325,5 +352,39 @@ mod identity_tests {
         assert_eq!(value["identity"]["task_id"], "task-a");
         assert_eq!(value["runtime_instance_id"], "owner-a");
         assert_eq!(value["phase"], "ExternalReference");
+    }
+}
+
+#[cfg(test)]
+mod scope_capture_tests {
+    use super::*;
+
+    /// RV05 反例：捕获范围穿透 tokio::spawn 并在进程级会话范围换代后保持
+    /// 旧代次——旧任务的受管命令目标不能进入 Direct 或新代次。
+    #[tokio::test]
+    async fn captured_work_root_survives_spawn_and_global_scope_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let generation_a = dir.path().join("generation-a");
+        let generation_b = dir.path().join("generation-b");
+        std::fs::create_dir_all(&generation_a).unwrap();
+        std::fs::create_dir_all(&generation_b).unwrap();
+        let captured = CommandContext::for_work_root(generation_a.clone());
+        captured
+            .scope(async {
+                // The process-level session scope moves to a new generation
+                // while this task (and its spawned child) still run.
+                crate::command_authority::set_session_work_root(Some(generation_b.clone()));
+                let child = spawn_scoped(async move {
+                    CommandContext::current().and_then(|context| context.journal_root)
+                });
+                let observed = child.await.unwrap();
+                assert_eq!(
+                    observed,
+                    Some(generation_a.join("commands")),
+                    "a task that captured generation A must keep registering there"
+                );
+            })
+            .await;
+        crate::command_authority::set_session_work_root(None);
     }
 }

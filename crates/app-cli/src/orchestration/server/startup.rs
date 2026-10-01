@@ -189,6 +189,52 @@ pub async fn owner_serve(
         });
     }
 
+    // RV03：无业务驱动者时的 Stop 执行者。降级驻留（坏 journal/重启预算
+    // 耗尽）期间受理的 HTTP Stop 派发进控制通道后没有任何会话消费——
+    // 不能永远 Accepted。会话静止（无业务、无清理、围栏清空）即按
+    // "已确认无执行"幂等收束该 ID；静止未达成则继续等待（清理确认是
+    // Stop 终态的前置，不用重开损坏 journal 充当 Stop 执行）。
+    {
+        let session = session.clone();
+        let watch_state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let Some(kernel) = watch_state.runtime_kernel() else {
+                    continue;
+                };
+                let outstanding = match kernel.outstanding_stop_operations() {
+                    Ok(outstanding) => outstanding,
+                    Err(error) => {
+                        tracing::debug!(%error, "stop watchdog could not scan operations");
+                        continue;
+                    }
+                };
+                if outstanding.is_empty() || !session.management_quiescent() {
+                    continue;
+                }
+                for id in outstanding {
+                    tracing::warn!(
+                        operation_id = %id,
+                        "settling admitted stop with no business driver (owner parked)"
+                    );
+                    if let Err(error) = watch_state
+                        .finish_runtime_operation_by_id(
+                            &id,
+                            shared_types::RuntimeOperationState::Succeeded,
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::error!(%error, "persist parked stop settlement");
+                    }
+                }
+            }
+        });
+    }
+
     let factory_args = args.clone();
     let factory_state = state.clone();
     let factory_state_root = state_root.clone();
@@ -205,9 +251,20 @@ pub async fn owner_serve(
                 // Restart 在 run 形态下同样被消费；差异只在会话重启策略
                 //（run 的 restart_on_exit=false，前台退出码语义）。
                 let launch_generation = launch.generation.clone();
+                // RV05：业务会话根任务捕获本代次的不可变命令范围——
+                // 进程级会话范围随后被换代/卸下时，会话内（含显式派生的
+                // 执行子任务）仍向旧（已闭门）范围登记，不进入 Direct
+                // 或新代次。
+                let captured_scope = process_utils::command_context::CommandContext::for_work_root(
+                    launch.work_root.clone(),
+                );
                 let end = tokio::spawn(async move {
                     let _ = &launch_generation;
-                    business_session(args, state_root, state, session, launch, run_mode)
+                    captured_scope
+                        .scope(async move {
+                            business_session(args, state_root, state, session, launch, run_mode)
+                                .await
+                        })
                         .await
                         .map_err(|error| {
                             tracing::error!(
@@ -240,6 +297,14 @@ pub async fn owner_serve(
     {
         anyhow::bail!("app-cli management API terminated: {api_error}");
     }
+    // RV02：owner 最终退出（Shutdown 终态/前台 run 结束）才清除 endpoint
+    // 发现记录——业务会话结束但 owner 存活期间记录保持，跨会话 dispatch
+    // 依赖它；进程随 run 返回退出，此刻清除是干净关停的一部分。
+    if let Some(kernel) = state.runtime_kernel()
+        && let Err(endpoint_error) = kernel.store().clear_endpoint()
+    {
+        tracing::warn!("endpoint discovery record clear failed: {endpoint_error:#}");
+    }
     let exit = session_exit?;
     if exit != 0 {
         anyhow::bail!("unified owner exited with code {exit}");
@@ -271,7 +336,29 @@ impl Drop for DegradeManagementOnDrop<'_> {
 ///
 /// 返回 Err 时由会话重启策略收敛（预算耗尽转 RecoveryRequired，管理面
 /// 保留）；成功返回即本次会话干净收束。
+///
+/// RV01：任何出口（含 journal/恢复失败的 `?` 提前返回）都先记录内核执行
+/// 交接——本会话占据的执行槽位是它的操作集，会话结束后受理的新请求以
+/// 自身 ID 占据新执行权，不被下一会话的 prepare 误清。
 async fn business_session(
+    args: RuntimeArgs,
+    state_root: std::path::PathBuf,
+    state: Arc<ServerState>,
+    session: std::sync::Arc<runtime_supervisor::OwnerSession>,
+    launch: runtime_supervisor::BusinessLaunch,
+    foreground: bool,
+) -> Result<()> {
+    let result =
+        business_session_inner(args, state_root, state.clone(), session, launch, foreground).await;
+    if let Some(kernel) = state.runtime_kernel()
+        && let Err(error) = kernel.note_execution_session_ended().await
+    {
+        tracing::error!(%error, "record business session execution handover");
+    }
+    result
+}
+
+async fn business_session_inner(
     args: RuntimeArgs,
     state_root: std::path::PathBuf,
     state: Arc<ServerState>,
@@ -284,20 +371,21 @@ async fn business_session(
     //（deploy/status 503 → file-server 预检 90s 超时）——失败即降级开放
     // 管理查询（phase=Failed 承载原因），Stop/身份仍可用。
     let _degrade_on_error = DegradeManagementOnDrop(&state);
-    // R2.5：停止仍在进行（Stopping）时继承上一代取消信号，关闭 launch
-    // 与初始化之间的取消丢失窗口。
-    let inherit_cancel = session.snapshot().phase == runtime_supervisor::Phase::Stopping;
-    state.begin_business_session_inheriting(
-        launch.generation.clone(),
-        launch.fresh,
-        inherit_cancel,
-    );
+    // RV04：停止交接状态在 admission 线性化点内探测（durable intent +
+    // operation_id；phase 由 launch 保留 Stopped 终态），不再用会话外
+    // 的相位快照授权取消接力——Stop 落在旧快照与 token renew 之间不再
+    // 被 renew 丢弃。
+    state.begin_business_session(launch.generation.clone(), launch.fresh, {
+        let session = session.clone();
+        move || stop_handover_in_progress(&session)
+    });
     let stop_intent = session.snapshot().intent == runtime_supervisor::Intent::Stopped;
     let fresh_launch = launch.fresh;
-    // R2/R3：会话重开清槽提前到 journal 打开之前——业务初始化本身失败
-    /// （坏 journal/迁移围栏）时，上一会话/受理窗口残留的执行槽与 Stop
-    /// 屏障也必须收束（挂起 Stop 幂等成功，见 prepare_relaunch），否则
-    /// 没有任何会话能到达内核恢复段，已受理的 Stop 永不到终态。
+    // RV01：会话交接收束只针对上一会话记录的待交接集合（note_execution_
+    // session_ended），在 journal 打开之前执行——业务初始化本身失败（坏
+    // journal/迁移围栏）时，上一会话被中断的操作与 Stop 屏障也必须收束
+    // （挂起 Stop 幂等成功），否则没有任何会话能到达内核恢复段。当前
+    // 槽位中新受理的请求不受影响。
     if !fresh_launch && let Some(kernel) = state.runtime_kernel() {
         kernel
             .prepare_relaunch()
@@ -646,7 +734,9 @@ async fn business_session(
         let supervised = host.is_some();
         let driver_state = state.clone();
         let driver_args = args.clone();
-        let mut driver = tokio::spawn(async move {
+        // RV05：驱动任务延续业务会话捕获的命令范围（spawn_scoped 克隆
+        // 当前 task-local 后重装——裸 tokio::spawn 会丢失捕获）。
+        let mut driver = process_utils::command_context::spawn_scoped(async move {
             driver_state
                 .supervision_driver_started
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -663,7 +753,6 @@ async fn business_session(
                 }
             }
         });
-        let mut joined = false;
         let cancel = state.cancel_token();
         // R4 前台语义：serve 形态编排失败驻留（Failed 可查询、可再部署），
         // run 形态必须以非零退出终结——有界间隔观察相位，失败即取消并以
@@ -685,35 +774,35 @@ async fn business_session(
         tokio::pin!(failure_watch);
         let (driver_result, shutdown_deadline) = tokio::select! {
             result = &mut driver => {
-                joined = true;
                 state.close_admission();
                 (result.context("server driver panicked").and_then(|result| result), tokio::time::Instant::now().checked_add(state.shutdown_budget(supervised)).context("shutdown budget exceeds clock range")?)
             },
             () = &mut failure_watch => {
-                joined = true;
                 state.close_admission();
                 let message = match state.phase() {
                     ServerPhase::Failed(message) => message,
                     _ => "foreground orchestration failed".to_owned(),
                 };
-                (Err(anyhow::anyhow!("{message}")), tokio::time::Instant::now().checked_add(state.shutdown_budget(supervised)).context("shutdown budget exceeds clock range")?)
-            },
-            () = cancel.cancelled() => {
                 let deadline = tokio::time::Instant::now().checked_add(state.shutdown_budget(supervised)).context("shutdown budget exceeds clock range")?;
-                let result = match tokio::time::timeout_at(deadline, &mut driver).await {
-                    Ok(result) => { joined = true; result.context("server driver panicked").and_then(|result| result) },
-                    Err(error) => Err(error).context("server shutdown confirmation timed out"),
+                // A Failed phase requests shutdown; it does not prove that the
+                // driver ended. Retire the task before handing the generation
+                // to cleanup so it cannot keep writing into the next session.
+                let result = match drain_server_driver(&mut driver, deadline).await {
+                    Ok(()) => Err(anyhow::anyhow!("{message}")),
+                    Err(error) => Err(error).with_context(|| format!("foreground orchestration failed: {message}")),
                 };
                 (result, deadline)
             },
+            () = cancel.cancelled() => {
+                let deadline = tokio::time::Instant::now().checked_add(state.shutdown_budget(supervised)).context("shutdown budget exceeds clock range")?;
+                let result = drain_server_driver(&mut driver, deadline).await;
+                (result, deadline)
+            },
         };
-        if !joined {
-            driver.abort();
-        }
         match driver_result {
             Ok(()) => match tokio::time::timeout_at(
                 shutdown_deadline,
-                finish_clean_shutdown(&args, &state, ownership_claimed),
+                finish_clean_shutdown(&args, &state, ownership_claimed, false),
             )
             .await
             {
@@ -726,6 +815,45 @@ async fn business_session(
     state.close_admission();
     signal_task.abort();
     result
+}
+
+/// RV04：durable 停止交接探测——原生 Stop/Shutdown 已受理（挂起操作身份
+/// 与 intent）且尚未发布终态。终态发布（poll_cleanup 或空闲立即完成）会
+/// 清空 operation_id，使已完成的停止不构成在途交接；该探测在 admission
+/// 线性化点内执行，与 WorkerControl::shutdown 的"先取锁再取消"配合，
+/// 取消令牌换代不再丢弃已受理的停止。
+fn stop_handover_in_progress(session: &std::sync::Arc<runtime_supervisor::OwnerSession>) -> bool {
+    let snapshot = session.snapshot();
+    snapshot.operation_id.is_some()
+        && matches!(
+            snapshot.intent,
+            runtime_supervisor::Intent::Stopped | runtime_supervisor::Intent::Shutdown
+        )
+}
+
+/// Wait for cooperative shutdown within the existing budget. If it expires,
+/// abort and join the driver before releasing its generation to recovery.
+/// Aborting alone only schedules cancellation; dropping the handle detaches it.
+pub(super) async fn drain_server_driver(
+    driver: &mut tokio::task::JoinHandle<Result<()>>,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    match tokio::time::timeout_at(deadline, &mut *driver).await {
+        Ok(result) => result
+            .context("server driver panicked")
+            .and_then(|result| result),
+        Err(timeout_error) => {
+            driver.abort();
+            match (&mut *driver).await {
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => {
+                    return Err(error).context("join server driver after shutdown timeout");
+                }
+                Ok(result) => result.context("server driver failed after shutdown timeout")?,
+            }
+            Err(timeout_error).context("server shutdown confirmation timed out")
+        }
+    }
 }
 
 /// 旧版进程模式 owner 派生的 worker 子进程路径（升级窗口兼容）：保持既有
@@ -1169,7 +1297,7 @@ async fn serve_supervised_worker(
         match driver_result {
             Ok(()) => match tokio::time::timeout_at(
                 shutdown_deadline,
-                finish_clean_shutdown(args, &state, ownership_claimed),
+                finish_clean_shutdown(args, &state, ownership_claimed, true),
             )
             .await
             {
@@ -1192,10 +1320,20 @@ async fn serve_supervised_worker(
     result
 }
 
+/// 干净关停确认（RV02 重整）：
+/// - 部署/控制通道是 **owner 级**资源，业务会话退出不关闭、不排空——
+///   统一 owner 的 ServerState 跨会话复用同一 receiver，关闭会让后续
+///   会话的 server_loop 立即 recv None 返回、再部署永久失败。残留的旧
+///   信号由消费侧按内核终态核验（settle 路径跳过已收束操作），不靠盲
+///   drain（那会丢弃会话结束后新受理的请求）。
+/// - endpoint 发现记录只在 owner 最终退出时清除（legacy worker 进程随
+///   会话退出；统一 owner 由 owner_serve 在 run 返回后清除）——业务会话
+///   结束但 owner 存活期间发现记录必须保持，供跨会话 dispatch 使用。
 pub(super) async fn finish_clean_shutdown(
     args: &RuntimeArgs,
     state: &ServerState,
     ownership_claimed: bool,
+    owner_exiting: bool,
 ) -> Result<()> {
     anyhow::ensure!(ownership_claimed, "coordinator ownership was not claimed");
     anyhow::ensure!(
@@ -1210,14 +1348,11 @@ pub(super) async fn finish_clean_shutdown(
     );
     state.preparations.drain().await?;
     crate::static_hosting::reconcile(&[], &args.workspace, false).await?;
-    // 干净关停清除 endpoint 发现记录（崩溃残留的旧记录由客户端核验拒绝）
-    if let Some(kernel) = state.runtime_kernel() {
-        kernel.store().clear_endpoint()?;
-    }
-    {
-        let mut receiver = state.deploy_rx.lock().await;
-        receiver.close();
-        while receiver.try_recv().is_ok() {}
+    if owner_exiting {
+        // 干净退出清除 endpoint 发现记录（崩溃残留的旧记录由客户端核验拒绝）
+        if let Some(kernel) = state.runtime_kernel() {
+            kernel.store().clear_endpoint()?;
+        }
     }
     let mut guard = state
         .journal
@@ -1442,7 +1577,26 @@ pub(super) async fn assemble_runtime_kernel(
                     run_pg: pg,
                 };
                 if dispatch_state.deploy_tx.send(request).is_err() {
-                    tracing::error!("runtime dispatch: deploy channel closed ({operation_id})");
+                    // RV02：发送失败按原 ID 收束真实失败——内核已受理，
+                    // 不能只打日志留下永久 Accepted。
+                    let state = dispatch_state.clone();
+                    let id = operation_id.clone();
+                    tracing::error!("runtime dispatch: deploy channel closed ({id})");
+                    tokio::spawn(async move {
+                        if let Err(error) = state
+                            .finish_runtime_operation_by_id(
+                                &id,
+                                shared_types::RuntimeOperationState::Failed,
+                                Some((
+                                    "ERR_BACKEND_ERROR".into(),
+                                    "runtime deploy channel closed".into(),
+                                )),
+                            )
+                            .await
+                        {
+                            tracing::error!(%error, "persist deploy channel failure");
+                        }
+                    });
                 } else {
                     // 统一 owner：受理后若业务会话未在跑（Stopped 后的显式
                     // 部署/启动），触发会话重建消费该受理。
@@ -1483,7 +1637,25 @@ pub(super) async fn assemble_runtime_kernel(
                     run_pg: pg,
                 };
                 if dispatch_state.deploy_tx.send(request).is_err() {
-                    tracing::error!("runtime dispatch: deploy channel closed ({operation_id})");
+                    // RV02：同上——发送失败按原 ID 收束真实失败。
+                    let state = dispatch_state.clone();
+                    let id = operation_id.clone();
+                    tracing::error!("runtime dispatch: deploy channel closed ({id})");
+                    tokio::spawn(async move {
+                        if let Err(error) = state
+                            .finish_runtime_operation_by_id(
+                                &id,
+                                shared_types::RuntimeOperationState::Failed,
+                                Some((
+                                    "ERR_BACKEND_ERROR".into(),
+                                    "runtime deploy channel closed".into(),
+                                )),
+                            )
+                            .await
+                        {
+                            tracing::error!(%error, "persist deploy channel failure");
+                        }
+                    });
                 } else {
                     // 统一 owner：受理后若业务会话未在跑（Stopped 后的显式
                     // 部署/启动），触发会话重建消费该受理。
@@ -1551,7 +1723,26 @@ pub(super) async fn assemble_runtime_kernel(
                     })
                     .is_err()
                 {
-                    tracing::error!("runtime dispatch: control channel closed ({operation_id})");
+                    // RV02：发送失败按原 ID 收束真实失败；owner 驻留（无会话
+                    // 消费）期间的 Stop 由 owner_serve 的停止看门狗收束。
+                    let state = dispatch_state.clone();
+                    let id = operation_id.clone();
+                    tracing::error!("runtime dispatch: control channel closed ({id})");
+                    tokio::spawn(async move {
+                        if let Err(error) = state
+                            .finish_runtime_operation_by_id(
+                                &id,
+                                shared_types::RuntimeOperationState::Failed,
+                                Some((
+                                    "ERR_BACKEND_ERROR".into(),
+                                    "runtime control channel closed".into(),
+                                )),
+                            )
+                            .await
+                        {
+                            tracing::error!(%error, "persist control channel failure");
+                        }
+                    });
                 }
             }
         }

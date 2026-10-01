@@ -40,6 +40,17 @@ impl CleanupOutcome {
     fn path(root: &Path) -> PathBuf {
         root.join("cleanup-outcome.json")
     }
+    /// RV09：每次尝试开始前移除上一次的分类记录。此后读到的任何分类都
+    /// 属于本次尝试（适配器运行中自行写入）；本次失败时不会把上次的
+    /// ForeignIdentity/ObservationFailed 当成本次结果报告。移除失败如实
+    /// 传播——保留旧记录继续用比静默误报更糟。
+    pub fn begin_attempt(root: &Path) -> Result<()> {
+        match std::fs::remove_file(Self::path(root)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("clear prior cleanup outcome record"),
+        }
+    }
     /// Persist the structured outcome beside the generation receipts. The
     /// sidecar file is additive: older binaries ignore it, and the generation
     /// schema stays untouched (no downgrade breakage).
@@ -112,6 +123,8 @@ pub(crate) async fn once(
     settle_unspawned(root)?;
     process_utils::command_context::require_quiescent(&root.join("commands"))?;
     if let Some(adapter) = adapter {
+        // RV09：先清上一次尝试的分类——本次失败的默认分类不会沿用旧记录。
+        CleanupOutcome::begin_attempt(root)?;
         // A callback may survive a killed guardian. Let it finish before
         // dispatching another one; its guard covers the entire engine RPC.
         drop(record::lock(&root.join("external-cleanup.lock"))?);
@@ -133,9 +146,9 @@ pub(crate) async fn once(
             .await
             .context("external engine cleanup timed out")??;
         if !output.status.success() {
-            // Prefer the adapter's own structured classification when it
-            // recorded one (ForeignIdentity 等)，不回写成 ObservationFailed；
-            // 适配器未分类时才落默认 ObservationFailed。
+            // 本次尝试开始时已清空旧记录（begin_attempt）：此处读到的分类
+            // 只可能是适配器在本次运行中写入的——原样保留；未分类时落
+            // 本次默认 ObservationFailed，绝不沿用历史原因。
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             match CleanupOutcome::recorded(root) {
                 // 适配器已分类（非 Empty）：原样保留本次尝试的分类。
@@ -151,8 +164,7 @@ pub(crate) async fn once(
                         "engine cleanup failed with adapter classification"
                     );
                 }
-                // Empty 是上一次成功尝试的残留（本次失败说明记录早于本次
-                // 失败——不覆盖证据，落本次 ObservationFailed）。
+                // 本次尝试无任何分类：落默认 ObservationFailed。
                 Ok(Some(CleanupOutcome::Empty)) | Ok(None) => {
                     CleanupOutcome::ObservationFailed {
                         reason: format!("engine cleanup failed: {stderr}"),

@@ -101,6 +101,36 @@ pub(super) struct AdmissionState {
     /// Only records discovered before this owner's execution began may be
     /// settled by admission recovery. An admission mutex is not a worker lock.
     recovered_operations: std::collections::HashSet<String>,
+    /// RV01：上一个已结束业务会话遗留的待执行 Stop（意图屏障）。清理由
+    /// 会话终末的后台任务确认；下一次会话启动（prepare_relaunch）在围栏
+    /// 清空后按幂等语义收束为 Succeeded。
+    pub(super) interrupted_stop: Option<String>,
+    /// RV01：上一个已结束业务会话被中断的执行/排队操作集（active 与
+    /// pending_restart 当时占据者）。仅该集合在会话交接时收束——会话结束
+    /// 后新受理的请求占据新执行权，永不被当作旧残留清理。
+    pub(super) interrupted_operations: Vec<String>,
+}
+
+/// RV01：当前持有执行权或待交接收束的操作 ID 集——恢复扫描与保护计算
+/// 必须跳过它们（活跃受理的派发状态由通道消费路径核验，不是未知结果）。
+fn live_execution_ids(guard: &AdmissionState) -> std::collections::HashSet<String> {
+    let mut live = std::collections::HashSet::new();
+    if let Some(id) = &guard.active_operation_id {
+        live.insert(id.clone());
+    }
+    if let Some(id) = &guard.pending_stop {
+        live.insert(id.clone());
+    }
+    if let Some(id) = &guard.pending_restart {
+        live.insert(id.clone());
+    }
+    if let Some(id) = &guard.interrupted_stop {
+        live.insert(id.clone());
+    }
+    for id in &guard.interrupted_operations {
+        live.insert(id.clone());
+    }
+    live
 }
 
 impl RuntimeKernel {
@@ -127,32 +157,56 @@ impl RuntimeKernel {
         &self.store
     }
 
-    /// 启动恢复入口（serve 主流程在 quiescence/ownership 之后调用）。
-    /// 启动恢复（R04）：非终态操作置 RecoveryRequired（精确收敛路径——
-    /// journal receipt、持久化 Stop——随后裁决）；损坏记录隔离进
-    /// quarantine 目录（不再阻断）。启动序列末尾由
-    /// [`RuntimeKernel::settle_unresolved_recoveries`] 把一切仍非终态的
-    /// 操作自动收敛为 Failed——产品环境没有操作员，不允许留下"等人工
-    /// 裁决"的死锁状态。
-    /// recovery v3 R2：业务会话驱动结束即本 owner 内的执行已停——把上一
-    /// 会话残留的 active/pending 槽位显式转为 RecoveryRequired（持久化），
-    /// 清空执行槽，让下一会话的 recover() 前置条件成立。进程内合并 owner
-    /// 的内核跨会话存活（旧进程模式每个 worker 是新进程、新内核），没有
-    /// 这一步，任何一次会话中断后的重开都会撞"cannot run while executing"
-    /// 并无限重试。不伪造终态：操作保持 RecoveryRequired 语义。
+    /// RV01：一个业务会话的驱动已结束（business_session 返回，无论成败）。
+    /// 此刻占据执行槽的操作都属于该会话——它们的派发信号进入了该会话的
+    /// 消费通道。记录为待交接集合并立即让出槽位：此后受理的新请求以自身
+    /// ID 占据新执行权，不会被下一次 prepare 误当旧残留收束。记录的集合
+    /// 由下一次会话启动前的 [`RuntimeKernel::prepare_relaunch`] 收束。
+    pub(crate) async fn note_execution_session_ended(&self) -> Result<()> {
+        let mut guard = self.admission.lock().await;
+        let stop = guard.pending_stop.take();
+        let mut interrupted: Vec<String> = Vec::new();
+        if let Some(id) = guard.active_operation_id.take() {
+            interrupted.push(id);
+        }
+        if let Some(id) = guard.pending_restart.take()
+            && !interrupted.contains(&id)
+        {
+            interrupted.push(id);
+        }
+        if let Some(queued) = guard.queued_input.take()
+            && !interrupted.contains(&queued.view.operation_id)
+        {
+            interrupted.push(queued.view.operation_id);
+        }
+        guard.queued_input = None;
+        guard.interrupted_stop = stop;
+        guard.interrupted_operations = interrupted;
+        Ok(())
+    }
+
+    /// 会话交接收束（RV01 重整）：只收束 [`RuntimeKernel::note_execution_session_ended`]
+    /// 记录的、属于**已结束会话**的操作集，绝不清扫当前槽位——会话结束后
+    /// 新受理的 Start/Stop 正占据这些槽位等待下一个会话的执行循环消费。
+    /// 挂起 Stop 屏障按 Succeeded 收束：下一个会话的启动以围栏清空为前置
+    /// （上代清理已确认），物理停止由会话终末清理完成，幂等且如实。
+    /// 其余被中断操作保持 RecoveryRequired 语义，不伪造终态。
     pub(crate) async fn prepare_relaunch(&self) -> Result<()> {
         let mut guard = self.admission.lock().await;
-        let stale: Vec<String> = guard
-            .active_operation_id
-            .iter()
-            .chain(guard.pending_stop.iter())
-            .chain(guard.pending_restart.iter())
-            .cloned()
-            .collect();
+        let stop = guard.interrupted_stop.take();
+        let mut stale = std::mem::take(&mut guard.interrupted_operations);
+        if let Some(stop) = stop.as_ref()
+            && !stale.contains(stop)
+        {
+            stale.push(stop.clone());
+        }
         if stale.is_empty() {
             return Ok(());
         }
+        let mut unsettled = Vec::new();
+        let mut first_error: Option<anyhow::Error> = None;
         for id in &stale {
+            let is_pending_stop = stop.as_deref() == Some(id.as_str());
             let persisted = self.store.load_operation(id);
             match persisted {
                 Ok(Some(operation)) => {
@@ -160,7 +214,6 @@ impl RuntimeKernel {
                         // 会话结束即业务已被 business_ended 协作停止并清理
                         //（spec §2.3 幂等停止）：挂起的 Stop 屏障按 Succeeded
                         // 收束——不是伪造，物理停止由会话终末清理完成。
-                        let is_pending_stop = guard.pending_stop.as_deref() == Some(id);
                         let terminal = if is_pending_stop {
                             RuntimeOperationState::Succeeded
                         } else {
@@ -174,53 +227,62 @@ impl RuntimeKernel {
                                 "business session ended before the operation completed".to_string(),
                             ))
                         };
-                        self.write_terminal(id, terminal, detail, None)?;
+                        if let Err(error) = self.write_terminal(id, terminal, detail, None) {
+                            unsettled.push(id.clone());
+                            first_error.get_or_insert(error);
+                        }
                     }
                 }
                 Ok(None) => {
                     tracing::warn!(
                         operation_id = %id,
-                        "stale execution slot has no persisted operation; clearing"
+                        "interrupted session slot has no persisted operation; clearing"
                     );
                 }
                 Err(error) => {
-                    // 持久化读取失败：保留保护位，清槽交给下轮 recover 裁决。
-                    guard.recovery_protection = true;
-                    return Err(anyhow::anyhow!(
-                        "read stale operation {id} for relaunch: {error:#}"
-                    ));
+                    // 持久化读取/写入失败：该操作保持待收束，下一次会话重试。
+                    unsettled.push(id.clone());
+                    first_error.get_or_insert(error);
                 }
             }
         }
-        guard.active_operation_id = None;
-        guard.pending_stop = None;
-        guard.pending_restart = None;
-        guard.queued_input = None;
-        guard.recovery_protection = true;
+        if !unsettled.is_empty() {
+            guard.interrupted_operations = unsettled;
+            if let Some(stop) = stop.filter(|id| guard.interrupted_operations.contains(id)) {
+                guard.interrupted_stop = Some(stop);
+            }
+            guard.recovery_protection = true;
+            let error =
+                first_error.unwrap_or_else(|| anyhow::anyhow!("operations remain unsettled"));
+            return Err(anyhow::anyhow!(
+                "settle interrupted session operations: {error:#}"
+            ));
+        }
+        self.refresh_recovery_protection(&mut guard);
         Ok(())
     }
 
     pub(crate) async fn recover(&self) -> Result<Vec<String>> {
         let mut guard = self.admission.lock().await;
-        // recovery v3：统一 owner 的内核是进程级单例，会话初始化期间受理
-        // 的 Stop 屏障（pending_stop，无 active）不是"执行中"——它等待本
-        // 会话的 server_loop 消费。把屏障算作执行会令首个会话的 recover
-        // 前置失败（空工作区首发 Stop 即复现：owner_credentials 测试），
-        // 会话反复重启并把活 Stop 沉降为 RecoveryRequired。active 执行位
-        // 仍是硬前置。
-        anyhow::ensure!(
-            guard.active_operation_id.is_none(),
-            "startup recovery cannot run while this owner is executing"
-        );
+        // RV01：active-is-none 硬前置移除。槽位此时只可能持有**会话结束后
+        // 新受理**的操作（上一会话的占据者已由 note_execution_session_ended
+        // 移入待交接集），它们派发进通道、等待本会话的执行循环消费——不是
+        // "本 owner 正在执行"。恢复扫描跳过这些活跃受理（见 live 集），
+        // 不把已知派发状态的受理当未知结果销毁。
+        let live = live_execution_ids(&guard);
         self.store.repair_desired_after_quiescence()?;
-        let mut scan = self.store.recover_unfinished_operations()?;
+        let mut scan = self.store.recover_unfinished_operations(&live)?;
         guard
             .recovered_operations
             .extend(scan.recovered.iter().cloned());
         // 恢复保护：在途操作待精确/兜底收敛，或隔离失败（存储层故障）
         // 时拒绝新写（spec §3.3 崩溃注入语义；R04 把 fail-closed 从注释
-        // 变成实际行为）。
-        guard.recovery_protection = !scan.recovered.is_empty() || !scan.blocked.is_empty();
+        // 变成实际行为）。待交接集合尚未收束（prepare 失败重试窗口）
+        // 同样保持保护。
+        guard.recovery_protection = !scan.recovered.is_empty()
+            || !scan.blocked.is_empty()
+            || !guard.interrupted_operations.is_empty()
+            || guard.interrupted_stop.is_some();
         for id in &scan.recovered {
             let recorded = self
                 .store
@@ -460,10 +522,16 @@ impl RuntimeKernel {
     }
 
     pub(super) fn refresh_recovery_protection(&self, guard: &mut AdmissionState) {
+        let live = live_execution_ids(guard);
         let unresolved = (|| -> Result<bool> {
             for entry in std::fs::read_dir(self.store.root.join("operations"))? {
                 let bytes = std::fs::read(entry?.path())?;
                 let other: StoredOperation = serde_json::from_slice(&bytes)?;
+                if live.contains(&other.view.operation_id) {
+                    // RV01：活跃受理（已派发待消费/待交接收束）不是未知
+                    // 结果——不因其 Accepted 而挂起恢复保护。
+                    continue;
+                }
                 if !other.view.state.is_terminal() {
                     return Ok(true);
                 }
@@ -477,6 +545,40 @@ impl RuntimeKernel {
                 true
             }
         };
+    }
+
+    /// RV03：仍非终态的 Stop 操作（无驱动者时期望有执行者收尾的集合）。
+    /// 供降级驻留 owner 的 Stop 看门狗按"已确认无执行"幂等收束。
+    pub(crate) fn outstanding_stop_operations(&self) -> Result<Vec<String>> {
+        let mut outstanding = Vec::new();
+        for entry in
+            std::fs::read_dir(self.store.root.join("operations")).context("scan operations dir")?
+        {
+            let entry = entry.context("read operations dir entry")?;
+            let bytes = match std::fs::read(entry.path()) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(anyhow::Error::new(error)
+                        .context(format!("read operation record {}", entry.path().display())));
+                }
+            };
+            let operation: StoredOperation = match serde_json::from_slice(&bytes) {
+                Ok(operation) => operation,
+                Err(error) => {
+                    return Err(anyhow::Error::new(error).context(format!(
+                        "decode operation record {}",
+                        entry.path().display()
+                    )));
+                }
+            };
+            if operation.view.kind == RuntimeOperationKind::Stop
+                && !operation.view.state.is_terminal()
+            {
+                outstanding.push(operation.view.operation_id);
+            }
+        }
+        Ok(outstanding)
     }
 
     /// Called only during startup after all previous business processes have
@@ -707,10 +809,23 @@ impl RuntimeKernel {
         // 同请求重试在更早的重放判定中返回已记录进度，不受此分支影响。
         if !is_stop && (guard.pending_stop.is_some() || guard.active_operation_id.is_some()) {
             let busy_control = guard.pending_stop.is_some() || {
-                let active = guard
+                // RV09：占槽记录读取失败必须如实拒绝（不能 .ok 折叠成
+                // "非控制操作"绕过 Busy 判定后静默排队）。
+                let active = match guard
                     .active_operation_id
                     .as_deref()
-                    .and_then(|id| self.store.load_operation(id).ok().flatten());
+                    .map(|id| self.store.load_operation(id))
+                {
+                    Some(Ok(operation)) => operation,
+                    Some(Err(error)) => {
+                        return Err(AdmissionRejection {
+                            code: "ERR_BACKEND_ERROR",
+                            message: format!("read active operation record: {error:#}"),
+                            active_operation_id: None,
+                        });
+                    }
+                    None => None,
+                };
                 active.is_some_and(|stored| {
                     matches!(
                         stored.view.kind,

@@ -158,13 +158,20 @@ pub fn session_work_root() -> Option<PathBuf> {
 }
 
 pub fn current_root() -> Option<PathBuf> {
-    if let Some(root) = std::env::var_os(WORK_ROOT_ENV)
-        .filter(|s| !s.is_empty())
+    // RV05：显式会话范围优先于环境声明。WORK_ROOT_ENV 属于旧 worker
+    // 进程链（进程本身即范围，无会话槽）；统一 owner 进程内若环境残留
+    // （派生链泄漏），不得遮蔽当前会话的真实代次范围。
+    resolve_root(
+        session_work_root().as_deref(),
+        std::env::var_os(WORK_ROOT_ENV).filter(|s| !s.is_empty()),
+    )
+}
+
+/// 纯函数化的范围解析（测试用）：会话范围 → 环境声明 → 无。
+fn resolve_root(session: Option<&Path>, env: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    session
         .map(PathBuf::from)
-    {
-        return Some(root);
-    }
-    session_work_root()
+        .or_else(|| env.map(PathBuf::from))
 }
 
 pub fn is_managed(root: &Path) -> Result<bool> {
@@ -222,5 +229,27 @@ mod tests {
         assert!(!managed_scope(&root, None).unwrap());
         std::fs::write(root.join("generation.json"), "{}").unwrap();
         assert!(managed_scope(&root, None).unwrap());
+    }
+
+    /// RV05：显式会话范围优先于环境声明——统一 owner 内泄漏的 worker
+    /// 环境不得遮蔽当前代次。
+    #[test]
+    fn session_scope_shadows_environment_root() {
+        use std::ffi::OsString;
+        let session = Path::new("/session/generation-a");
+        let env = OsString::from("/env/legacy-worker-root");
+        assert_eq!(
+            resolve_root(Some(session), Some(env.clone())),
+            Some(session.to_path_buf())
+        );
+        assert_eq!(
+            resolve_root(None, Some(env)),
+            Some(PathBuf::from("/env/legacy-worker-root"))
+        );
+        assert_eq!(
+            resolve_root(Some(session), None),
+            Some(session.to_path_buf())
+        );
+        assert_eq!(resolve_root(None, None), None);
     }
 }

@@ -36,6 +36,50 @@ pub(super) enum InitialAction {
     Settled,
 }
 
+/// RV01：消费前核对原操作仍是有效执行者。信号在通道排队期间，其操作
+/// 可能已被会话交接收束（prepare_relaunch / 无驱动看门狗 / 迟到 finish /
+/// 被更新受理取代）——终态或恢复保护的操作不得再执行；记录缺失或不可读
+/// 同样不执行（无法核验的请求 fail-closed 跳过，不伪造其结果）。
+pub(super) async fn signal_operation_already_settled(
+    state: &ServerState,
+    operation_id: &str,
+) -> bool {
+    let Some(kernel) = state.runtime_kernel() else {
+        return false;
+    };
+    match kernel.get(operation_id).await {
+        Ok(Some(view)) => {
+            if view.state.is_terminal()
+                || view.state == shared_types::RuntimeOperationState::RecoveryRequired
+            {
+                tracing::warn!(
+                    operation_id,
+                    state = ?view.state,
+                    "runtime control signal skipped: operation no longer executable"
+                );
+                true
+            } else {
+                false
+            }
+        }
+        Ok(None) => {
+            tracing::warn!(
+                operation_id,
+                "runtime control signal skipped: operation record missing"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                operation_id,
+                "runtime control signal skipped: operation record unreadable"
+            );
+            true
+        }
+    }
+}
+
 /// 控制信号在服务已停止后的收束（R01）：Reorchestrate 占据执行身份由外层
 /// 重编排；Stopped 按信号自身 ID 收束（不触碰在执行的其他操作）。
 pub(super) async fn settle_control_signal(
@@ -52,6 +96,11 @@ pub(super) async fn settle_control_signal(
             // Cancelled 后零动作返回——不编排、不派发 Stop（取消收束变成
             // Stop 执行会用 Succeeded 覆盖 Cancelled 并停止无关运行实例）
             if state.settle_cancelled_before_execution(&operation_id).await {
+                return InitialAction::Settled;
+            }
+            // RV01：会话交接/取代路径已收束的操作不执行（旧信号不能执行
+            // 已失败/已取消/已恢复保护的请求）。
+            if signal_operation_already_settled(state, &operation_id).await {
                 return InitialAction::Settled;
             }
             state.set_current_runtime_operation(Some(operation_id.clone()));
@@ -162,6 +211,12 @@ pub(super) async fn next_prepared(
 ) -> Option<InitialAction> {
     loop {
         let request = rx.recv().await?;
+        if let Some(id) = &request.runtime_operation_id
+            && signal_operation_already_settled(state, id).await
+        {
+            // RV01：会话交接后残留的旧部署信号——其操作已收束，不执行。
+            continue;
+        }
         if let Some(id) = &request.runtime_operation_id {
             state.set_current_runtime_operation(Some(id.clone()));
         }
@@ -586,6 +641,15 @@ pub(super) async fn server_loop(
             continue;
         }
         if let InitialAction::StopBusiness { operation_id } = action {
+            // RV01：消费前核对——Stop 信号排队期间可能已被交接收束
+            //（prepare_relaunch 幂等成功/看门狗按已确认无执行完成），
+            // 重复执行停止无副作用但会以陈旧相位覆盖收束后的状态。
+            if signal_operation_already_settled(state, &operation_id).await {
+                if !matches!(state.phase(), ServerPhase::Failed(_)) {
+                    state.set_phase(ServerPhase::Idle);
+                }
+                continue;
+            }
             // stop：停止业务服务（保持管理面）。B01：按**自身受理 ID**收束——
             // Stop 从不占据 current 执行槽，禁止 finish_current（它会读
             // current=None 而静默丢终态，Stop 永远 Accepted）。
@@ -645,6 +709,15 @@ pub(super) async fn server_loop(
                 unreachable!("handled above")
             }
             InitialAction::Deploy(request) => {
+                if let Some(id) = &request.runtime_operation_id
+                    && signal_operation_already_settled(state, id).await
+                {
+                    // RV01：同 next_prepared——旧会话残留信号不执行。
+                    if !matches!(state.phase(), ServerPhase::Failed(_)) {
+                        state.set_phase(ServerPhase::Idle);
+                    }
+                    continue;
+                }
                 if let Some(id) = &request.runtime_operation_id {
                     state.set_current_runtime_operation(Some(id.clone()));
                 }
@@ -1015,7 +1088,9 @@ pub(super) async fn server_loop(
         let cancel = state.cancel_child_token();
         let runtime_status = state.runtime_status();
         let (running_tx, mut running_rx) = tokio::sync::oneshot::channel::<()>();
-        let mut sup = tokio::spawn(supervisor::run_with_cancel(
+        // RV05：内置引擎的服务编排任务延续捕获的命令范围——会话结束后
+        // 迟到的受管命令仍向旧（已闭门）范围登记，不进入 Direct/新代次。
+        let mut sup = process_utils::command_context::spawn_scoped(supervisor::run_with_cancel(
             args.clone(),
             runtime_status,
             cancel.clone(),
