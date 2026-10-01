@@ -45,16 +45,24 @@ pub fn process_exists(pid: u32) -> std::io::Result<bool> {
     process_observation(kill(Pid::from_raw(pid), None))
 }
 
-/// Windows 只读存活观察：OpenProcess(QUERY_LIMITED_INFORMATION)。陈旧 PID
-/// 打开失败（ERROR_INVALID_PARAMETER）即证不存在；拒绝访问（5）=存在。
+/// Windows 只读存活观察：OpenProcess(QUERY_LIMITED_INFORMATION) +
+/// WaitForSingleObject(0) 判定终止。陈旧 PID 打开失败
+///（ERROR_INVALID_PARAMETER）即证不存在；打开成功**不足以证明存活**——
+/// 其他进程保留的 HANDLE 会令已终止进程的对象继续存在（Microsoft
+/// Terminating a Process 文档明确区分对象存续与终止状态），必须观察
+/// 句柄是否已 signaled。拒绝访问（5）保守视为存在（无法证伪）。
 /// 只是观察，绝不构成对磁盘读出 PID 的信号授权。
 #[cfg(windows)]
 pub fn process_exists(pid: u32) -> std::io::Result<bool> {
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError};
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+    };
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 258;
     // HANDLE 是 *mut c_void（windows-sys 0.61 的原生形态）；跨函数边界
     // 传裸指针需要 unsafe 签名，收拢为单块 FFI。
-    #[allow(unsafe_code)] // FFI: read-only OpenProcess/query/CloseHandle on a numeric pid.
+    #[allow(unsafe_code)] // FFI: read-only OpenProcess/wait/query/CloseHandle on a numeric pid.
     fn observe_open_result(pid: u32) -> std::io::Result<bool> {
         if pid == 0 {
             return Err(std::io::Error::new(
@@ -69,10 +77,121 @@ pub fn process_exists(pid: u32) -> std::io::Result<bool> {
             let code = unsafe { GetLastError() };
             return Ok(code != ERROR_INVALID_PARAMETER);
         }
+        // A retained HANDLE keeps the process object alive after termination;
+        // only the signaled state proves whether it still executes.
+        let wait = unsafe { WaitForSingleObject(handle, 0) };
         unsafe { CloseHandle(handle) };
-        Ok(true)
+        match wait {
+            WAIT_OBJECT_0 => Ok(false),
+            WAIT_TIMEOUT => Ok(true),
+            failure => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("process wait observation failed with {failure}"),
+            )),
+        }
     }
     observe_open_result(pid)
+}
+
+/// Windows：进程创建时刻（unix 毫秒）。PID 复用核验用——同一进程的
+/// 创建时刻由内核存储、重复读取恒等；PID 被无关进程复用则创建时刻
+/// 不同。只读观察，不构成信号授权。
+#[cfg(windows)]
+pub fn process_created_unix_ms(pid: u32) -> std::io::Result<Option<u64>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    #[allow(unsafe_code)] // FFI: read-only OpenProcess/GetProcessTimes/CloseHandle.
+    fn observe_creation(pid: u32) -> std::io::Result<Option<u64>> {
+        if pid == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid process identifier",
+            ));
+        }
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            let code = unsafe { GetLastError() };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("OpenProcess for creation time failed with {code}"),
+            ));
+        }
+        let mut creation = windows_sys::Win32::Foundation::FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut exit = windows_sys::Win32::Foundation::FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut kernel = windows_sys::Win32::Foundation::FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut user = windows_sys::Win32::Foundation::FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let queried =
+            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+        unsafe { CloseHandle(handle) };
+        if queried == 0 {
+            let code = unsafe { GetLastError() };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("GetProcessTimes failed with {code}"),
+            ));
+        }
+        let ticks = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        // FILETIME: 100ns intervals since 1601-01-01 → unix milliseconds.
+        const EPOCH_DELTA_MS: u64 = 11_644_473_600_000;
+        let unix_ms = (ticks / 10_000).saturating_sub(EPOCH_DELTA_MS);
+        Ok(Some(unix_ms))
+    }
+    observe_creation(pid)
+}
+
+/// Windows：本进程创建时刻（unix 毫秒）——统一 owner 启动业务代次时
+/// 记录 worker 创建身份用。GetCurrentProcess 返回伪句柄，无需关闭。
+#[cfg(windows)]
+pub fn self_created_unix_ms() -> std::io::Result<Option<u64>> {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    #[allow(unsafe_code)] // FFI: read-only GetProcessTimes on the current pseudo-handle.
+    fn observe_self() -> std::io::Result<Option<u64>> {
+        let mut creation = windows_sys::Win32::Foundation::FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut exit = windows_sys::Win32::Foundation::FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut kernel = windows_sys::Win32::Foundation::FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut user = windows_sys::Win32::Foundation::FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let handle = unsafe { GetCurrentProcess() };
+        let queried =
+            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+        if queried == 0 {
+            let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("GetProcessTimes(self) failed with {code}"),
+            ));
+        }
+        let ticks = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        const EPOCH_DELTA_MS: u64 = 11_644_473_600_000;
+        let unix_ms = (ticks / 10_000).saturating_sub(EPOCH_DELTA_MS);
+        Ok(Some(unix_ms))
+    }
+    observe_self()
 }
 
 #[cfg(unix)]

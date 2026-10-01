@@ -405,7 +405,6 @@ impl KubernetesRuntime {
         }
 
         let volumes = Some(volumes_vec);
-        let mut volume_mounts_vec = volume_mounts_vec;
         if matches!(service_type, ServiceType::UserappBuilder) {
             volume_mounts_vec.push(VolumeMount {
                 name: "rcoder-platform-binding".to_string(),

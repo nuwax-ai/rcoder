@@ -266,19 +266,26 @@ impl AgentContainerRuntime for KubernetesRuntime {
             let binding = params.resource_binding.clone();
             return tokio::spawn(async move {
                 let result = if params.resource_binding.is_some() {
-                    runtime.resume_bound_builder(&params).await
+                    runtime
+                        .resume_bound_builder(&params)
+                        .await
+                        // RV07：本操作内执行了受控物理替换时，最终捕获与
+                        // 收据改用新物理绑定——旧 UID 绑定对替换后的 STS
+                        // 必然失配，不能让升级成功后收据失败。
+                        .map(|(info, upgraded)| (info, upgraded.or(binding.clone())))
                 } else {
                     runtime
                         .create_agent_container_with_creation_receipt(params, lease.receipt())
                         .await
+                        .map(|info| (info, binding.clone()))
                 };
                 let result = match (result, context.as_ref()) {
-                    (Ok(info), Some(context)) => {
+                    (Ok((info, effective_binding)), Some(context)) => {
                         let recorded = async {
                             let target = runtime
                                 .capture_builder_compute_with_binding(
                                     context,
-                                    binding.as_ref(),
+                                    effective_binding.as_ref(),
                                     false,
                                 )
                                 .await?;
@@ -291,7 +298,7 @@ impl AgentContainerRuntime for KubernetesRuntime {
                                     )
                                 })?,
                             };
-                            if binding.is_some() {
+                            if effective_binding.is_some() {
                                 // A resumed builder needs the same final Service
                                 // commit as a newly created one. Keep its proof
                                 // in that mutation so a crash before the archive
@@ -322,7 +329,7 @@ impl AgentContainerRuntime for KubernetesRuntime {
                             Err(error) => Err(error),
                         }
                     }
-                    (result, _) => result,
+                    (result, _) => result.map(|(info, _)| info),
                 };
                 crate::runtime::builder_completion::finish(lease, result).await
             })

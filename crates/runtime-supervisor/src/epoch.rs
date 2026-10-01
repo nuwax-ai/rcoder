@@ -41,8 +41,10 @@ pub(crate) fn same_process_space(recorded: &str, current: &str) -> bool {
         (Some(Epoch::MacBoot(a)), Some(Epoch::MacBoot(b))) => a == b,
         // GetTickCount64 在同一次开机内单调不减：current >= recorded 即
         // 同一启动会话（reboot 会归零，由 proves_replacement 的 b < a
-        // 捕获）。结合只读 PID 观察（OpenProcess）构成 Windows 同次开机
-        // 的旧 worker 退出核验；不是 PID namespace 身份，表述保持诚实。
+        // 捕获）。这不是完整的启动身份（新一次开机 uptime 更长时会误判
+        // 同次开机）——Windows 侧由"signaled 句柄观察 + worker 创建身份
+        // sidecar（RV06）"补足：uptime 只作前置过滤，误判方向是保守阻塞
+        // 清理而非误放行。表述保持诚实：不是 PID namespace 身份。
         (Some(Epoch::WindowsUptime(a)), Some(Epoch::WindowsUptime(b))) => b >= a,
         _ => false,
     }

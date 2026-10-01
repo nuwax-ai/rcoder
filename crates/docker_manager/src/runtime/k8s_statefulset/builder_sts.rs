@@ -1,16 +1,13 @@
 use super::*;
 
 impl KubernetesRuntime {
-    /// Builder creation never repairs an ownership/configuration conflict by
-    /// deleting a workload. A conflicting POST re-reads and validates the winner.
-    pub(crate) async fn ensure_builder_statefulset(
+    /// 构造期望的 builder StatefulSet（ensure 与受控升级共用；注解/执行域
+    /// 标签的单一事实源）。
+    pub(crate) fn desired_builder_statefulset(
         &self,
         context: &shared_types::UserAppExecutionContext,
         pod_spec: PodSpec,
-    ) -> ContainerRuntimeResult<()> {
-        context
-            .validate_identity(&context.app_id)
-            .map_err(ContainerRuntimeError::ConfigurationError)?;
+    ) -> ContainerRuntimeResult<StatefulSet> {
         let family = ServiceType::UserappBuilder;
         let mut desired = self.build_agent_statefulset(&context.app_id, &family, pod_spec, 1)?;
         desired
@@ -46,6 +43,21 @@ impl KubernetesRuntime {
                 .get_or_insert_default()
                 .insert(runtime_supervisor::domain::DOMAIN_LABEL.to_string(), domain);
         }
+        Ok(desired)
+    }
+
+    /// Builder creation never repairs an ownership/configuration conflict by
+    /// deleting a workload. A conflicting POST re-reads and validates the winner.
+    pub(crate) async fn ensure_builder_statefulset(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        pod_spec: PodSpec,
+    ) -> ContainerRuntimeResult<()> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let desired = self.desired_builder_statefulset(context, pod_spec)?;
+        let family = ServiceType::UserappBuilder;
         let name = self.pod_name(&context.app_id, &family)?;
         let api = self.statefulsets();
         let existing = match api.get_opt(&name).await {
@@ -77,71 +89,12 @@ impl KubernetesRuntime {
         match validate_builder_statefulset(&existing, &desired, context)? {
             BuilderTemplateCheck::Current => {}
             BuilderTemplateCheck::NeedsUpgrade => {
-                // recovery v2 R7：存量 builder 的 managed-owner 平台注入
-                // 漂移走受控模板替换——缩容到 0 → 删除 STS（工作区 PVC 为
-                // 独立对象，非 STS ownerReference 管辖，替换不触碰卷与数据）
-                // → 以期望模板重建 → 回到既有 scale-to-1 路径。升级不是
-                // 每次应用 Restart 的内部兜底：仅此签名触发一次。
-                let name = self.pod_name(&context.app_id, &family)?;
-                let api = self.statefulsets();
-                if let Some(spec) = existing.spec.as_ref()
-                    && spec.replicas.unwrap_or(1) > 0
-                {
-                    let scaled = {
-                        let mut patched = existing.clone();
-                        if let Some(spec) = patched.spec.as_mut() {
-                            spec.replicas = Some(0);
-                        }
-                        patched
-                    };
-                    api.replace(&name, &PostParams::default(), &scaled)
-                        .await
-                        .map_err(|error| {
-                            crate::runtime::builder_completion::k8s_error(
-                                format!("Scale old builder StatefulSet to 0: {error}"),
-                                error,
-                            )
-                        })?;
-                }
-                api.delete(&name, &DeleteParams::default())
-                    .await
-                    .map_err(|error| {
-                        crate::runtime::builder_completion::k8s_error(
-                            format!("Delete superseded builder StatefulSet: {error}"),
-                            error,
-                        )
-                    })?;
-                // 等待 STS 对象消失（pod 由级联终止；PVC 独立保留）。
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
-                while tokio::time::Instant::now() < deadline {
-                    if api
-                        .get_opt(&name)
-                        .await
-                        .map_err(|error| {
-                            crate::runtime::builder_completion::k8s_error(
-                                format!("Wait for builder StatefulSet removal: {error}"),
-                                error,
-                            )
-                        })?
-                        .is_none()
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-                api.create(&PostParams::default(), &desired)
-                    .await
-                    .map_err(|error| {
-                        crate::runtime::builder_completion::k8s_error(
-                            format!("Recreate upgraded builder StatefulSet: {error}"),
-                            error,
-                        )
-                    })?;
-                tracing::info!(
-                    app = %context.app_id,
-                    "upgraded legacy builder StatefulSet to the managed-owner template                      (workspace PVC preserved)"
-                );
-                return Ok(());
+                // recovery v2 R7（RV07 强化）：存量 builder 的 managed-owner
+                // 平台注入漂移走受控模板替换（见 replace_builder_state-
+                // set_controlled）。升级不是每次应用 Restart 的内部兜底：
+                // 仅此签名触发一次。
+                self.replace_builder_statefulset_controlled(context, &existing, desired)
+                    .await?;
             }
             BuilderTemplateCheck::StaleHash => {
                 // 内容等价但注解是旧算法值：纯 metadata patch 重写后复用。
@@ -160,6 +113,135 @@ impl KubernetesRuntime {
             }
         }
         self.scale_captured_statefulset(&existing, &family, 1).await
+    }
+
+    /// RV07：存量 builder 的受控模板替换。工作区 PVC 为独立对象（非 STS
+    /// ownerReference 管辖），替换不触碰卷与数据。序列：
+    /// 1. 捕获旧 STS 的 UID/resourceVersion 与全部旧 Pod 名；
+    /// 2. 缩容 0（replace 携带旧 RV，并发漂移 409）；
+    /// 3. 删除 STS，**带捕获 UID/RV 前置**——迟到的删除不得命中并发重建
+    ///    出的同名新对象；
+    /// 4. 等待 STS 对象消失**且捕获的旧 Pod 全部退出**（后台级联时 STS
+    ///    可能先消失而旧 Pod 仍 Ready——只等对象会把旧 Pod 的 readiness
+    ///    留给按名读取的后续步骤）；
+    /// 5. 超时返回 Err（操作保持可恢复，下次调用幂等重走；**绝不**在旧
+    ///    物理未确认退出时创建新对象）；
+    /// 6. 以期望模板创建。
+    pub(crate) async fn replace_builder_statefulset_controlled(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        existing: &StatefulSet,
+        desired: StatefulSet,
+    ) -> ContainerRuntimeResult<()> {
+        let family = ServiceType::UserappBuilder;
+        let name = self.pod_name(&context.app_id, &family)?;
+        let api = self.statefulsets();
+        let captured_uid = existing.metadata.uid.clone();
+        let captured_rv = existing.metadata.resource_version.clone();
+        let replicas = existing
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.replicas)
+            .unwrap_or(1);
+        let captured_pods: Vec<String> = (0..replicas)
+            .map(|ordinal| format!("{name}-{ordinal}"))
+            .collect();
+        if replicas > 0 {
+            let scaled = {
+                let mut patched = existing.clone();
+                if let Some(spec) = patched.spec.as_mut() {
+                    spec.replicas = Some(0);
+                }
+                patched
+            };
+            api.replace(&name, &PostParams::default(), &scaled)
+                .await
+                .map_err(|error| {
+                    crate::runtime::builder_completion::k8s_error(
+                        format!("Scale old builder StatefulSet to 0: {error}"),
+                        error,
+                    )
+                })?;
+        }
+        let mut delete_params = DeleteParams::default();
+        if captured_uid.is_some() || captured_rv.is_some() {
+            delete_params.preconditions = Some(kube::api::Preconditions {
+                uid: captured_uid.clone(),
+                resource_version: captured_rv.clone(),
+            });
+        }
+        api.delete(&name, &delete_params).await.map_err(|error| {
+            crate::runtime::builder_completion::k8s_error(
+                format!("Delete superseded builder StatefulSet: {error}"),
+                error,
+            )
+        })?;
+        // 等待 STS 对象消失且捕获的旧 Pod 全部退出（PVC 独立保留）。
+        let pods: Api<k8s_openapi::api::core::v1::Pod> =
+            Api::namespaced(self.client.clone(), &self.namespace);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ContainerRuntimeError::Conflict(format!(
+                    "superseded builder StatefulSet {name} (uid {:?}) or its captured pods \
+                         did not finish terminating within the upgrade budget; the operation \
+                         stays recoverable and no replacement was created",
+                    captured_uid.as_deref().unwrap_or("unknown")
+                )));
+            }
+            let sts_gone = api
+                .get_opt(&name)
+                .await
+                .map_err(|error| {
+                    crate::runtime::builder_completion::k8s_error(
+                        format!("Wait for builder StatefulSet removal: {error}"),
+                        error,
+                    )
+                })?
+                .is_none();
+            let pods_gone = if captured_pods.is_empty() {
+                true
+            } else {
+                let mut all_gone = true;
+                for pod_name in &captured_pods {
+                    match pods.get_opt(pod_name).await {
+                        Ok(None) => {}
+                        Ok(Some(pod)) => {
+                            // Terminating pods still hold the physical slot.
+                            if pod.metadata.deletion_timestamp.is_none() {
+                                all_gone = false;
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            return Err(crate::runtime::builder_completion::k8s_error(
+                                format!("Wait for captured builder pod removal: {error}"),
+                                error,
+                            ));
+                        }
+                    }
+                }
+                all_gone
+            };
+            if sts_gone && pods_gone {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        api.create(&PostParams::default(), &desired)
+            .await
+            .map_err(|error| {
+                crate::runtime::builder_completion::k8s_error(
+                    format!("Recreate upgraded builder StatefulSet: {error}"),
+                    error,
+                )
+            })?;
+        tracing::info!(
+            app = %context.app_id,
+            "upgraded legacy builder StatefulSet to the managed-owner template \
+             (workspace PVC preserved; captured pods confirmed exited)"
+        );
+        Ok(())
     }
 
     /// template-hash 注解自愈（纯 metadata，不触碰模板）：validate 已证明

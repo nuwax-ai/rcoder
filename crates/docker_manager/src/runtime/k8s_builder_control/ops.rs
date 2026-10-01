@@ -466,11 +466,17 @@ impl KubernetesRuntime {
         .await
     }
 
+    /// RV07：返回值第二项 = 本次操作内执行了受控物理替换时的新物理绑定
+    ///（新 STS UID）——调用方（agent_runtime 收据路径）必须用它取代旧
+    /// 绑定做最终捕获，否则升级成功后收据仍按旧 UID 校验而失败。
     pub(crate) async fn resume_bound_builder(
         &self,
         params: &container_runtime_api::ContainerCreateParams,
-    ) -> Result<ContainerBasicInfo> {
-        let target = async {
+    ) -> Result<(
+        ContainerBasicInfo,
+        Option<shared_types::UserAppResourceBinding>,
+    )> {
+        let (target, upgraded_binding) = async {
             let context = params.execution_context.as_ref().ok_or_else(|| {
                 Error::ConfigurationError("Bound builder requires execution context".into())
             })?;
@@ -506,16 +512,64 @@ impl KubernetesRuntime {
                     Error::ConfigurationError("Bound builder Pod template missing".into())
                 })?;
             if !configured_fields_match(
-                &serde_json::to_value(desired)
+                &serde_json::to_value(&desired)
                     .map_err(|error| Error::ConfigurationError(error.to_string()))?,
                 &serde_json::to_value(actual)
                     .map_err(|error| Error::ConfigurationError(error.to_string()))?,
             ) {
-                return Err(Error::Conflict(
-                    "Bound builder Pod configuration changed".into(),
-                ));
+                // RV07：配置漂移不再一律 Conflict 围栏——managed-owner 升级
+                // 签名内的漂移（APP_CLI_MANAGED 三键）在**本持久操作内**
+                // 执行受控替换（缩容→前置条件删除→确认旧 Pod 退出→重建；
+                // PVC 独立保留），然后按创建等价身份捕获新物理负载并交出
+                // 新绑定。任何其他漂移仍拒绝（不盲删存量）。
+                let desired_sts = self
+                    .desired_builder_statefulset(context, desired)
+                    .map_err(|error| Error::ConfigurationError(error.to_string()))?;
+                match crate::runtime::k8s_statefulset::helpers::validate_builder_statefulset(
+                    &current,
+                    &desired_sts,
+                    context,
+                )
+                .map_err(|error| Error::Conflict(error.to_string()))?
+                {
+                    crate::runtime::k8s_statefulset::helpers::BuilderTemplateCheck::NeedsUpgrade => {
+                        self.replace_builder_statefulset_controlled(context, &current, desired_sts)
+                            .await
+                            .map_err(|error| Error::Conflict(error.to_string()))?;
+                        // 新物理身份按创建等价校验捕获：替换后的 STS 带完整
+                        // 应用/lifecycle 元数据注解，无需旧 UID 绑定背书
+                        //（与全新创建同一信任级别，不是"任意通过"）。
+                        let new_target = self
+                            .capture_builder_compute_with_binding(context, None, true)
+                            .await?;
+                        let new_workload = new_target.workload.as_ref().ok_or_else(|| {
+                            Error::Conflict(
+                                "Upgraded builder StatefulSet disappeared before capture".into(),
+                            )
+                        })?;
+                        let new_binding = shared_types::UserAppResourceBinding {
+                            app_id: context.app_id.clone(),
+                            lifecycle_id: context.lifecycle_id.clone(),
+                            service_type: ServiceType::UserappBuilder,
+                            physical_uid: new_workload.uid.clone(),
+                            adopted_by_operation: context.operation_id.clone(),
+                        };
+                        tracing::info!(
+                            app = %context.app_id,
+                            old_uid = ?current.metadata.uid,
+                            new_uid = %new_workload.uid,
+                            "bound builder upgraded in-operation; durable binding handed over"
+                        );
+                        return Ok((new_target, Some(new_binding)));
+                    }
+                    _ => {
+                        return Err(Error::Conflict(
+                            "Bound builder Pod configuration changed".into(),
+                        ));
+                    }
+                }
             }
-            Ok::<_, Error>(target)
+            Ok((target, None))
         }
         .await
         .map_err(|error| rejected_before_write(error.to_string()))?;
@@ -536,7 +590,7 @@ impl KubernetesRuntime {
         // receipt, so host-side NodePort registration is not skipped.
         self.create_agent_service(&target.context.app_id, &ServiceType::UserappBuilder)
             .await?;
-        Ok(info)
+        Ok((info, upgraded_binding))
     }
 
     pub(crate) async fn capture_builder_compute(

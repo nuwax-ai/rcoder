@@ -25,7 +25,7 @@ pub(super) fn workspace_claim_name(spec: &PodSpec) -> Option<String> {
 /// 期望变更本来也不在滚动/重建语义内（ensure 恒不更新模板）。
 /// Builder 模板复用校验结论。
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum BuilderTemplateCheck {
+pub(crate) enum BuilderTemplateCheck {
     /// 记录指纹与期望一致（或内容已由下方内容校验独立证明等价），可直接复用。
     Current,
     /// launch 内容与期望等价，但记录指纹是旧算法写入的存量值（跨算法不可比）。
@@ -96,9 +96,7 @@ pub(super) fn is_managed_owner_upgrade_drift(
             }
             continue;
         };
-        if current.value != entry.value
-            || current.value_from.is_some() != entry.value_from.is_some()
-        {
+        if current.value != entry.value || current.value_from != entry.value_from {
             if UPGRADE_KEYS.contains(&entry.name.as_str()) {
                 saw_upgrade_diff = true; // 0→1 或 literal→fieldRef
             } else {
@@ -122,7 +120,7 @@ pub(super) fn is_managed_owner_upgrade_drift(
 /// 自愈。注意：指纹原本覆盖的投影外字段（probe/port 等 API 默认化字段，
 /// 既有内容校验明确忽略）不再触发拒绝，与 computer-agent 路径的 advisory
 /// 哲学一致——此类残余漂移由 cleaner 的空闲换代路径滚动，不再围栏。
-pub(super) fn validate_builder_statefulset(
+pub(crate) fn validate_builder_statefulset(
     existing: &StatefulSet,
     desired: &StatefulSet,
     context: &shared_types::UserAppExecutionContext,
@@ -166,6 +164,7 @@ pub(super) fn validate_builder_statefulset(
     if existing_pod.containers.len() != desired_pod.containers.len() {
         return Err(conflict("Builder container set changed"));
     }
+    let mut needs_upgrade = false;
     for desired_container in &desired_pod.containers {
         let actual = existing_pod
             .containers
@@ -186,13 +185,9 @@ pub(super) fn validate_builder_statefulset(
         let desired_env = canonical_env(desired_container.env.as_deref().unwrap_or(&[]));
         // recovery v2 R7：managed-owner 平台注入签名内的 env 漂移走受控
         // 模板升级（替换 STS、保留外部 PVC），不再以 Conflict 围栏存量。
-        if actual_env != desired_env
-            && is_managed_owner_upgrade_drift(&actual_env, &desired_env)
-            && actual.image == desired_container.image
-            && actual.command == desired_container.command
-            && actual.args == desired_container.args
-        {
-            return Ok(BuilderTemplateCheck::NeedsUpgrade);
+        if actual_env != desired_env && is_managed_owner_upgrade_drift(&actual_env, &desired_env) {
+            needs_upgrade = true;
+            continue;
         }
         if actual_env != desired_env {
             let actual_keys: std::collections::BTreeSet<&str> =
@@ -222,6 +217,9 @@ pub(super) fn validate_builder_statefulset(
                 drift.join(",")
             )));
         }
+    }
+    if needs_upgrade {
+        return Ok(BuilderTemplateCheck::NeedsUpgrade);
     }
     let desired_hash = desired
         .metadata
@@ -373,6 +371,114 @@ pub(super) fn validate_agent_statefulset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k8s_openapi::api::core::v1::{Container, EnvVarSource, ObjectFieldSelector};
+
+    fn managed_env(value: &str) -> EnvVar {
+        EnvVar {
+            name: "APP_CLI_MANAGED".into(),
+            value: Some(value.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn managed_owner_upgrade_rejects_unrelated_value_from_drift() {
+        let reference = |field_path: &str| EnvVar {
+            name: "CUSTOM_IDENTITY".into(),
+            value_from: Some(EnvVarSource {
+                field_ref: Some(ObjectFieldSelector {
+                    field_path: field_path.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let existing = vec![managed_env("0"), reference("metadata.name")];
+        let desired = vec![managed_env("1"), reference("metadata.uid")];
+        assert!(!is_managed_owner_upgrade_drift(&existing, &desired));
+    }
+
+    #[test]
+    fn managed_owner_upgrade_validates_every_container() {
+        let context = shared_types::UserAppExecutionContext {
+            app_id: "appone".into(),
+            lifecycle_id: "lifeone".into(),
+            operation_id: "operationone".into(),
+            executor_id: "executorone".into(),
+            request_fingerprint: "ab".repeat(32),
+        };
+        let annotations = context.resource_metadata();
+        let desired = StatefulSet {
+            metadata: ObjectMeta {
+                annotations: Some(annotations.clone()),
+                ..Default::default()
+            },
+            spec: Some(StatefulSetSpec {
+                template: PodTemplateSpec {
+                    metadata: Some(ObjectMeta {
+                        annotations: Some(annotations),
+                        ..Default::default()
+                    }),
+                    spec: Some(PodSpec {
+                        containers: vec![
+                            Container {
+                                name: "agent".into(),
+                                image: Some("builder:one".into()),
+                                env: Some(vec![managed_env("1")]),
+                                ..Default::default()
+                            },
+                            Container {
+                                name: "file-server".into(),
+                                image: Some("file-server:one".into()),
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    }),
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut existing = desired.clone();
+        let containers = &mut existing
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .spec
+            .as_mut()
+            .unwrap()
+            .containers;
+        containers[0].env = Some(vec![managed_env("0")]);
+        assert_eq!(
+            validate_builder_statefulset(&existing, &desired, &context).unwrap(),
+            BuilderTemplateCheck::NeedsUpgrade
+        );
+        for foreign_image in [true, false] {
+            let mut drifted = existing.clone();
+            let sidecar = &mut drifted
+                .spec
+                .as_mut()
+                .unwrap()
+                .template
+                .spec
+                .as_mut()
+                .unwrap()
+                .containers[1];
+            if foreign_image {
+                sidecar.image = Some("foreign:one".into());
+            } else {
+                sidecar.env = Some(vec![EnvVar {
+                    name: "UNRELATED_CONFIGURATION".into(),
+                    value: Some("changed".into()),
+                    ..Default::default()
+                }]);
+            }
+            assert!(validate_builder_statefulset(&drifted, &desired, &context).is_err());
+        }
+    }
 
     #[test]
     fn managed_owner_upgrade_drift_is_classified_precisely() {

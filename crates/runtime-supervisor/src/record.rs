@@ -96,6 +96,32 @@ pub(crate) fn generation(root: &Path) -> Result<Generation> {
     );
     Ok(value)
 }
+
+/// RV06：worker 进程创建身份（additive sidecar，旧二进制忽略）。Windows
+/// 无内核 boot UUID，uptime 单调只证明"未回退"——磁盘记录的 worker PID
+/// 被观察为存活时，用创建时间核对是否仍是原进程：不一致 = PID 已被
+/// 无关进程复用，原 worker 视为退出（不再阻塞清理）。
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(crate) struct WorkerCreated {
+    pub version: u32,
+    /// worker（统一 owner 自身/旧 worker 进程）的创建时刻，unix 毫秒。
+    pub unix_ms: u64,
+}
+
+#[cfg(windows)]
+pub(crate) fn save_worker_created(root: &Path, value: &WorkerCreated) -> Result<()> {
+    save(&root.join("worker-created.json"), &value)
+}
+
+/// 读取 worker 创建身份；缺失/损坏返回 None（legacy 记录走保守路径，
+/// 不因诊断 sidecar 拒绝恢复）。
+#[cfg(windows)]
+pub(crate) fn worker_created(root: &Path) -> Option<u64> {
+    let bytes = std::fs::read(root.join("worker-created.json")).ok()?;
+    let value: WorkerCreated = serde_json::from_slice(&bytes).ok()?;
+    (value.version == 1).then_some(value.unix_ms)
+}
 pub(crate) fn work_root(scope: &Path, id: &str) -> Result<PathBuf> {
     ensure!(
         uuid::Uuid::parse_str(id).is_ok(),
@@ -350,7 +376,7 @@ pub(crate) fn reconcile_foreign(
             value.phase,
             GenerationPhase::Running | GenerationPhase::Draining
         ) {
-            verify_abandoned_worker(&value, current.as_ref())?;
+            verify_abandoned_worker(&root, &value, current.as_ref())?;
             if abandoned.is_none() {
                 abandoned = Some(AbandonedGeneration {
                     root,
@@ -426,7 +452,7 @@ fn reconcile_local(
             value.phase,
             GenerationPhase::Running | GenerationPhase::Draining
         ) {
-            verify_abandoned_worker(&value, current)?;
+            verify_abandoned_worker(&root, &value, current)?;
             // The caller must perform full command/engine cleanup before it
             // may publish a terminal receipt or launch a successor.
             if abandoned.is_none() {
@@ -459,6 +485,7 @@ fn reconcile_local(
 }
 
 fn verify_abandoned_worker(
+    #[cfg_attr(unix, allow(unused_variables))] root: &Path,
     value: &Generation,
     current: Option<&crate::domain::PhysicalDomain>,
 ) -> Result<()> {
@@ -495,13 +522,52 @@ fn verify_abandoned_worker(
     }
     #[cfg(windows)]
     {
-        // R6：只读 OpenProcess 观察陈旧 PID（打开失败即证不存在；拒绝
-        // 访问=存在）。观察后复核 uptime 仍单调，排除窗口内重启。
-        ensure!(
-            !process_utils::process_exists(pid).context("inspect original worker process")?,
-            "generation {} worker {pid} still exists; cleanup is unconfirmed",
-            value.id
-        );
+        // R6：只读 OpenProcess+signaled 观察陈旧 PID（终止的进程即使
+        // 句柄被保留也观察为不存在）。观察后复核 uptime 仍单调，排除
+        // 窗口内重启。
+        if process_utils::process_exists(pid).context("inspect original worker process")? {
+            // RV06：观察阳性时核对进程创建身份——原 worker 的创建时刻
+            // 已随代次记录（worker-created.json sidecar）；PID 复用为无关
+            // 进程（创建时刻不一致）不阻塞清理，原 worker 视为退出。
+            // legacy 记录或身份不可读保持保守（可查询原因，非永久拒绝）。
+            let identity = worker_created(root)
+                .or_else(|| {
+                    tracing::warn!(
+                        generation = %value.id,
+                        "worker creation identity missing; PID-reuse cannot be excluded"
+                    );
+                    None
+                })
+                .and_then(|recorded_ms| {
+                    process_utils::process_created_unix_ms(pid)
+                        .context("inspect worker process creation time")
+                        .map(|observed| (recorded_ms, observed))
+                        .ok()
+                });
+            match identity {
+                Some((recorded_ms, Some(observed))) if observed.abs_diff(recorded_ms) > 1_000 => {
+                    tracing::warn!(
+                        generation = %value.id,
+                        pid,
+                        "recorded worker PID hosts an unrelated process; original worker is gone"
+                    );
+                }
+                Some((_, Some(_))) => {
+                    anyhow::bail!(
+                        "generation {} worker {pid} still exists (creation identity matches); \
+                         cleanup is unconfirmed",
+                        value.id
+                    );
+                }
+                _ => {
+                    anyhow::bail!(
+                        "generation {} worker {pid} observed alive; creation identity \
+                         unavailable, cleanup stays unconfirmed",
+                        value.id
+                    );
+                }
+            }
+        }
         let after = crate::epoch::current().context("re-read process epoch")?;
         ensure!(
             crate::epoch::same_process_space(&now, &after),
@@ -617,9 +683,9 @@ mod tests {
         let root = work_root(temp.path(), &id).unwrap();
         let mut value = generation(&root).unwrap();
         value.worker_pid = None;
-        assert!(verify_abandoned_worker(&value, None).is_err());
+        assert!(verify_abandoned_worker(&root, &value, None).is_err());
         value.worker_pid = Some(std::process::id());
-        assert!(verify_abandoned_worker(&value, None).is_err());
+        assert!(verify_abandoned_worker(&root, &value, None).is_err());
         let mut child = std::process::Command::new("true").spawn().unwrap();
         value.worker_pid = Some(child.id());
         child.wait().unwrap();
@@ -634,11 +700,13 @@ mod tests {
             drop(permit);
         }
         value.process_epoch = Some("unknown".into());
-        assert!(verify_abandoned_worker(&value, None).is_err());
+        assert!(verify_abandoned_worker(&root, &value, None).is_err());
         value.process_epoch = Some("pid1:11111111-1111-4111-8111-111111111111:100".into());
         value.physical_domain = Some(domain_fixture("pod-original"));
-        assert!(verify_abandoned_worker(&value, Some(&domain_fixture("pod-new"))).is_err());
-        assert!(verify_abandoned_worker(&value, Some(&domain_fixture("pod-original"))).is_ok());
+        assert!(verify_abandoned_worker(&root, &value, Some(&domain_fixture("pod-new"))).is_err());
+        assert!(
+            verify_abandoned_worker(&root, &value, Some(&domain_fixture("pod-original"))).is_ok()
+        );
         let mut live = value.clone();
         live.id = uuid::Uuid::new_v4().to_string();
         live.physical_domain = None;
