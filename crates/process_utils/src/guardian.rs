@@ -746,6 +746,33 @@ fn decode_status(raw: i64) -> std::io::Result<ExitStatus> {
 
 /// Called only while holding the original scope owner lock. Revocation under
 /// the same guardian lock prevents a late Pending guardian from spawning.
+/// Observe the guardian process without signaling it. Unix uses kill(0)
+/// observation (ESRCH proves absence); Windows opens the PID read-only —
+/// a stale PID fails to open, which proves absence. Never authority to
+/// signal anything.
+#[cfg(unix)]
+fn guardian_process_alive(pid: u32) -> Result<bool> {
+    Ok(crate::process_exists(pid)?)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)] // FFI: read-only Win32 handle open/query/close on a numeric pid.
+fn guardian_process_alive(pid: u32) -> Result<bool> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle == 0 {
+        // Stale PIDs surface as ERROR_INVALID_PARAMETER; access denial
+        // (5) means the process exists.
+        let code = unsafe { GetLastError() };
+        return Ok(code != ERROR_INVALID_PARAMETER);
+    }
+    unsafe { CloseHandle(handle) };
+    Ok(true)
+}
+
 /// Outcome of a scope-checked guardian recovery (recovery v2 plan §7.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecoveryOutcome {
@@ -787,7 +814,7 @@ pub fn recover_with_scope_check(work_root: &Path) -> Result<RecoveryOutcome> {
                 let Some(pid) = receipt.diagnostic_pid else {
                     bail!("guardian command outcome unknown; original authorization preserved");
                 };
-                if crate::process_exists(pid)? {
+                if guardian_process_alive(pid)? {
                     return Ok(RecoveryOutcome::Stopping {
                         detail: format!("owned command {pid} is still running"),
                     });
@@ -1276,7 +1303,6 @@ mod tests {
             before,
             "活守护的记录不得被改写"
         );
-        let _ = command_path;
         alive.kill().unwrap();
         alive.wait().unwrap();
     }

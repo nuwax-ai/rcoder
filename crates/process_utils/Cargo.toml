@@ -23,4 +23,7 @@ process-wrap = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Threading"] }
+
 [target.'cfg(unix)'.dev-dependencies]
