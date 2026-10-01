@@ -653,17 +653,30 @@ async fn business_session_inner(
     if stop_intent {
         // Only this authenticated successor writes business intent. The old
         // worker is gone; unknown migrations and operation histories remain.
-        let store = crate::runtime_kernel::RuntimeStore::open_with_root(
-            state_root.clone(),
-            &args.workspace,
-        )?;
-        let (_, revision) = store.load_desired()?;
-        store.store_desired(
-            shared_types::DesiredState::Stopped,
-            revision
-                .checked_add(1)
-                .context("desired revision overflow")?,
-        )?;
+        // 幂等且不覆盖更新的显式请求：desired 已是 Stopped 不再写——每次
+        // 管理会话重开都推进 revision 会把已受理的 start/restart 在提交
+        // 屏障误判 Superseded（容器矩阵 R3 实测：native stop 后的重开链
+        // 写出无操作对应的 revision+1）；内核已有更新的受理意图时由该
+        // 操作自身的 admit 语义管理 desired。
+        let live_admission = match state.runtime_kernel() {
+            Some(kernel) => kernel.has_live_admission().await,
+            None => false,
+        };
+        if !live_admission {
+            let store = crate::runtime_kernel::RuntimeStore::open_with_root(
+                state_root.clone(),
+                &args.workspace,
+            )?;
+            let (desired, revision) = store.load_desired()?;
+            if desired != shared_types::DesiredState::Stopped {
+                store.store_desired(
+                    shared_types::DesiredState::Stopped,
+                    revision
+                        .checked_add(1)
+                        .context("desired revision overflow")?,
+                )?;
+            }
+        }
     }
     let mut first_request = if stop_intent {
         None
