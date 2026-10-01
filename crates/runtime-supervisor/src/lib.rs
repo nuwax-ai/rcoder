@@ -27,6 +27,7 @@ pub use recovery::{
 };
 pub use session::{
     BusinessFactory, BusinessLaunch, BusinessRun, FenceState, OwnerSession, SessionOptions,
+    SessionScope, current_scope,
 };
 pub use worker::{Worker, WorkerControl};
 

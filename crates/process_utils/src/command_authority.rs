@@ -133,10 +133,38 @@ impl Gate {
     }
 }
 
+/// Explicit in-process session scope（recovery v2 R1）：统一 owner 的业务
+/// 会话在 launch 时安装当前工作范围。区别于 env（旧 worker 链）与
+/// task-local（不穿透嵌套 spawn），进程级显式会话上下文覆盖本 owner
+/// 进程内全部嵌套 tokio::spawn 的受管命令；单 owner 单工作区进程模型下
+/// 无歧义。业务结束/换代时由会话改写。
+static SESSION_WORK_ROOT: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+pub fn set_session_work_root(root: Option<PathBuf>) {
+    let mut slot = match SESSION_WORK_ROOT.write() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // 锁中毒只意味着某次写入途中 panic；本槽是可整体替换的枚举值，
+    // 覆盖写即恢复一致，不需要未知状态传播。
+    *slot = root;
+}
+
+pub fn session_work_root() -> Option<PathBuf> {
+    match SESSION_WORK_ROOT.read() {
+        Ok(slot) => slot.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
 pub fn current_root() -> Option<PathBuf> {
-    std::env::var_os(WORK_ROOT_ENV)
+    if let Some(root) = std::env::var_os(WORK_ROOT_ENV)
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
+    {
+        return Some(root);
+    }
+    session_work_root()
 }
 
 pub fn is_managed(root: &Path) -> Result<bool> {

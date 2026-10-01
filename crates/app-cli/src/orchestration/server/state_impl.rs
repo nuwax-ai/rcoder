@@ -476,12 +476,27 @@ impl ServerState {
     /// （owner token、运行内核、recovery hold、凭据恢复标记）。
     /// `fresh=false` 的恢复式会话不消费一次性部署声明 env（等效进程模式在
     /// 派生时剥除 APP_DEPLOY_* 的语义）。
-    pub(crate) fn begin_business_session(&self, generation: String, fresh: bool) {
+    /// `inherit_cancel`：停止仍在进行（native phase=Stopping）时，上一代的
+    /// 取消信号跨会话边界接力——launch 与初始化之间的竞态窗口里已受理的
+    /// Stop 不得被 renew 丢弃。终态（Stopped）后的空闲管理会话取新令牌，
+    /// 不构成停止循环。
+    pub(crate) fn begin_business_session_inheriting(
+        &self,
+        generation: String,
+        fresh: bool,
+        inherit_cancel: bool,
+    ) {
         let _admission = self
             .admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // R2.5：停止进行中（inherit_cancel）且上一代令牌已取消时接力；
+        // 无条件接力会让 Stopped 终态后的空闲管理会话立即退出成环。
+        let cancelled_before = self.cancel_token().is_cancelled();
         self.renew_cancel_locked();
+        if inherit_cancel && cancelled_before {
+            self.trigger_cancel();
+        }
         self.initializing
             .store(true, std::sync::atomic::Ordering::Release);
         self.accepting

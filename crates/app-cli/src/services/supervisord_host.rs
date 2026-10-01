@@ -73,7 +73,22 @@ impl SupervisordHost {
             .context("supervisord socket exists but RPC is unavailable")?;
         // Remember the engine before the first runtime mutation. Losing its
         // socket later cannot turn external programs into a builtin-only run.
-        if let Some(root) = std::env::var_os(runtime_supervisor::WORKER_ENV) {
+        // recovery v2 R1：统一 owner 进程内会话经显式 SessionScope 登记
+        //（不再依赖已取消的 worker env）；旧 worker 链保留 env 分支。
+        if let Some(scope) = runtime_supervisor::current_scope() {
+            let receipt = EngineReceipt {
+                generation: scope.generation.clone(),
+                supervisor_id: scope.supervisor_id.clone(),
+                socket: crate::xmlrpc::default_socket_path(),
+            };
+            let mut file = tempfile::NamedTempFile::new_in(&scope.work_root)?;
+            serde_json::to_writer(&mut file, &receipt)?;
+            std::io::Write::flush(&mut file)?;
+            file.as_file().sync_all()?;
+            process_utils::atomic_file::persist(file, &scope.work_root.join(ENGINE_RECEIPT))?;
+            #[cfg(unix)]
+            std::fs::File::open(&scope.work_root)?.sync_all()?;
+        } else if let Some(root) = std::env::var_os(runtime_supervisor::WORKER_ENV) {
             let root = Path::new(&root);
             let scope = root
                 .parent()

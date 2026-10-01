@@ -621,6 +621,43 @@ impl RuntimeKernel {
         } else {
             revision
         };
+        // R5（recovery v3）：物理 Stop/Restart 执行期间，不同的
+        // Start/Restart 在持久化新操作前返回 Busy（附当前操作身份），
+        // 不进入内部排队；普通构建/部署的自动接替规则保持不变。
+        // 同请求重试在更早的重放判定中返回已记录进度，不受此分支影响。
+        if !is_stop && (guard.pending_stop.is_some() || guard.active_operation_id.is_some()) {
+            let busy_control = guard.pending_stop.is_some() || {
+                let active = guard
+                    .active_operation_id
+                    .as_deref()
+                    .and_then(|id| self.store.load_operation(id).ok().flatten());
+                active.is_some_and(|stored| {
+                    matches!(
+                        stored.view.kind,
+                        RuntimeOperationKind::Stop | RuntimeOperationKind::Restart
+                    ) && !stored.view.state.is_terminal()
+                })
+            };
+            if busy_control {
+                // 零副作用拒绝：不持久化受理、不改意图/revision。
+                return Err(AdmissionRejection {
+                    code: ERR_OPERATION_IN_PROGRESS,
+                    message: format!(
+                        "a stop/restart control operation is executing; retry after it \
+                         reaches a terminal state (active: {})",
+                        guard
+                            .active_operation_id
+                            .as_deref()
+                            .or(guard.pending_stop.as_deref())
+                            .unwrap_or("unknown")
+                    ),
+                    active_operation_id: guard
+                        .active_operation_id
+                        .clone()
+                        .or_else(|| guard.pending_stop.clone()),
+                });
+            }
+        }
         // 持久化受理（落盘失败不入执行队列——spec §3.3）。
         let stored = StoredOperation {
             view: RuntimeOperationView {

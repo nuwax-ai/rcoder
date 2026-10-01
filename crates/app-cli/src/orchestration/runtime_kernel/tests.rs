@@ -100,22 +100,51 @@ mod cases {
                 };
                 assert_eq!(pg.password, "probe-secret");
             }
-            kernel
-                .admit(request(RuntimeOperationKind::Start, "c"))
-                .await
-                .unwrap();
-            assert_eq!(
-                kernel.admission.lock().await.pending_restart.as_deref(),
-                Some("c")
-            );
-            assert_eq!(
-                kernel.commit_execution("b").await.unwrap(),
-                CommitBarrierOutcome::Committed
-            );
-            assert_eq!(
-                kernel.commit_execution("c").await.unwrap(),
-                CommitBarrierOutcome::Committed
-            );
+            if kind == RuntimeOperationKind::Restart {
+                // recovery v3 R5：Restart 物理执行期间，不同 Start 在持久化
+                // 前返回 Busy（附执行中操作身份）——不再内部排队；"b" 到达
+                // 终态后 "c" 正常受理。
+                let rejection = kernel
+                    .admit(request(RuntimeOperationKind::Start, "c"))
+                    .await
+                    .unwrap_err();
+                assert_eq!(rejection.code, "ERR_OPERATION_IN_PROGRESS");
+                assert_eq!(rejection.active_operation_id.as_deref(), Some("b"));
+                assert!(
+                    !kernel.store.operation_path("c").exists(),
+                    "Busy 拒绝不得持久化新操作"
+                );
+                assert_eq!(
+                    kernel.commit_execution("b").await.unwrap(),
+                    CommitBarrierOutcome::Committed
+                );
+                kernel
+                    .admit(request(RuntimeOperationKind::Start, "c"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    kernel.commit_execution("c").await.unwrap(),
+                    CommitBarrierOutcome::Committed
+                );
+            } else {
+                // Deploy 属普通构建接替（已批准规则保留）：不同 Start 排队接替。
+                kernel
+                    .admit(request(RuntimeOperationKind::Start, "c"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    kernel.admission.lock().await.pending_restart.as_deref(),
+                    Some("c")
+                );
+                assert_eq!(
+                    kernel.commit_execution("b").await.unwrap(),
+                    CommitBarrierOutcome::Committed
+                );
+                assert_eq!(
+                    kernel.commit_execution("c").await.unwrap(),
+                    CommitBarrierOutcome::Committed
+                );
+            }
             assert_eq!(
                 kernel.get("b").await.unwrap().unwrap().state,
                 RuntimeOperationState::Succeeded
@@ -433,14 +462,23 @@ mod cases {
                 .admit(request(RuntimeOperationKind::Stop, "stop"))
                 .await
                 .unwrap();
-            let mut start = request(RuntimeOperationKind::Start, "start");
-            start.expected_revision = 1;
-            kernel.admit(start).await.unwrap();
-            assert_eq!(captured.lock().unwrap().len(), 1);
+            // recovery v3 R5：Stop 执行期间的不同 Start 在持久化前 Busy；
+            // 终态后同 revision 正常受理。
+            let mut during = request(RuntimeOperationKind::Start, "start");
+            during.expected_revision = 1;
+            let rejection = kernel.admit(during).await.unwrap_err();
+            assert_eq!(rejection.code, "ERR_OPERATION_IN_PROGRESS");
+            assert!(rejection.active_operation_id.is_some());
+            assert!(!kernel.store.operation_path("start").exists());
             kernel
                 .finish("stop", stop_result, None, None, 2)
                 .await
                 .unwrap();
+            let mut start = request(RuntimeOperationKind::Start, "start");
+            start.expected_revision = 1;
+            kernel.admit(start).await.unwrap();
+            // Stop 的 StopBusiness 派发 + Start 的 OrchestrateSource 派发。
+            assert_eq!(captured.lock().unwrap().len(), 2);
             assert_eq!(
                 kernel
                     .status()
@@ -450,7 +488,6 @@ mod cases {
                     .as_deref(),
                 Some("start")
             );
-            assert_eq!(captured.lock().unwrap().len(), 2);
             kernel
                 .finish("start", RuntimeOperationState::Succeeded, None, None, 2)
                 .await
@@ -544,29 +581,22 @@ mod cases {
             .finish("op-a", RuntimeOperationState::Failed, None, None, 2)
             .await
             .unwrap();
-        kernel
+        // recovery v3 R5：op-b（Restart）执行期间的不同 Start 返回 Busy。
+        let rejection = kernel
             .admit(request(RuntimeOperationKind::Start, "op-c"))
             .await
-            .unwrap();
+            .unwrap_err();
+        assert_eq!(rejection.code, "ERR_OPERATION_IN_PROGRESS");
         kernel
             .finish("op-a", RuntimeOperationState::Succeeded, None, None, 3)
             .await
             .unwrap();
-        assert_eq!(
-            kernel
-                .status()
-                .await
-                .unwrap()
-                .active_operation_id
-                .as_deref(),
-            Some("op-b")
-        );
-        assert_eq!(
-            kernel.get("op-a").await.unwrap().unwrap().state,
-            RuntimeOperationState::Failed
-        );
         kernel
             .finish("op-b", RuntimeOperationState::Succeeded, None, None, 2)
+            .await
+            .unwrap();
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-c"))
             .await
             .unwrap();
         assert_eq!(
@@ -577,6 +607,11 @@ mod cases {
                 .active_operation_id
                 .as_deref(),
             Some("op-c")
+        );
+        // 迟到的 op-a 成功回调不得改变已记录的失败终态。
+        assert_eq!(
+            kernel.get("op-a").await.unwrap().unwrap().state,
+            RuntimeOperationState::Failed
         );
         kernel
             .finish("op-c", RuntimeOperationState::Succeeded, None, None, 2)

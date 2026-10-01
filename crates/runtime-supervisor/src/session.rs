@@ -20,7 +20,7 @@ use crate::{
     record::{self, Intent},
     worker::WorkerControl,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use std::{
     collections::VecDeque,
     future::Future,
@@ -60,10 +60,45 @@ pub struct SessionOptions {
 /// One business launch requested from the session.
 pub struct BusinessLaunch {
     pub generation: String,
+    /// This generation's work root（work/<id>）. The session installs it as
+    /// the process-level command scope before the factory runs, so every
+    /// nested spawn（服务、预检、迁移、Pingap）inherits the same managed
+    /// execution range（recovery v2 R1）.
+    pub work_root: PathBuf,
     /// The first launch in this owner process consumes fresh platform inputs
     /// (one-shot deploy declarations); relaunches after an interruption are
     /// recovery launches and must not replay them.
     pub fresh: bool,
+}
+
+/// The currently installed business session scope（R1）. Exposed for
+/// engine-receipt publication and diagnostics; never authority to signal.
+#[derive(Clone, Debug)]
+pub struct SessionScope {
+    pub work_root: PathBuf,
+    pub generation: String,
+    pub supervisor_id: String,
+}
+
+static CURRENT_SCOPE: std::sync::RwLock<Option<SessionScope>> = std::sync::RwLock::new(None);
+
+/// Read the current business session scope installed by the running owner.
+pub fn current_scope() -> Option<SessionScope> {
+    match CURRENT_SCOPE.read() {
+        Ok(scope) => scope.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+fn install_scope(scope: Option<SessionScope>) {
+    let mut slot = match CURRENT_SCOPE.write() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    process_utils::command_authority::set_session_work_root(
+        scope.as_ref().map(|scope| scope.work_root.clone()),
+    );
+    *slot = scope;
 }
 
 /// A launched business: its control adapter and driver end. The driver
@@ -115,18 +150,31 @@ struct SessionCore {
 
 impl SessionCore {
     fn with_discovery<T>(&self, update: impl FnOnce(&mut Discovery) -> Result<T>) -> Result<T> {
-        let mut discovery = self.discovery.lock().expect("discovery lock poisoned");
-        let result = update(&mut discovery)?;
-        record::save(&self.root.join("supervisor.json"), &*discovery)?;
+        let mut discovery = self
+            .discovery
+            .lock()
+            .map_err(|_| anyhow::anyhow!("discovery lock poisoned"))?;
+        let mut next = discovery.clone();
+        let result = update(&mut next)?;
+        // Replay parity（R2.4）：受理中操作的每次快照推进同步进 requests
+        // 登记，同请求重试因此反映实际进度与终态（monitor::persist 同款）。
+        if let Some(id) = next.snapshot.operation_id.clone() {
+            for (request, snapshot) in &mut next.requests {
+                if request.request_id == id {
+                    *snapshot = next.snapshot.clone();
+                }
+            }
+        }
+        record::save(&self.root.join("supervisor.json"), &next)?;
+        *discovery = next;
         Ok(result)
     }
 
     fn snapshot(&self) -> Snapshot {
-        self.discovery
-            .lock()
-            .expect("discovery lock poisoned")
-            .snapshot
-            .clone()
+        match self.discovery.lock() {
+            Ok(discovery) => discovery.snapshot.clone(),
+            Err(poisoned) => poisoned.into_inner().snapshot.clone(),
+        }
     }
 
     fn intent(&self) -> Intent {
@@ -134,12 +182,20 @@ impl SessionCore {
     }
 
     fn set_fence(&self, state: FenceState) {
-        *self.fence.lock().expect("fence lock poisoned") = state;
+        let mut fence = match self.fence.lock() {
+            Ok(fence) => fence,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *fence = state;
+        drop(fence);
         self.fence_changed.notify_waiters();
     }
 
     fn fence(&self) -> FenceState {
-        self.fence.lock().expect("fence lock poisoned").clone()
+        match self.fence.lock() {
+            Ok(fence) => fence.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     fn record_problem(&self, error: &anyhow::Error) -> Result<()> {
@@ -204,25 +260,28 @@ pub struct BusinessReadyGuard {
 impl BusinessReadyGuard {
     pub fn mark_ready(mut self) -> Result<()> {
         self.armed = true;
-        self.core.with_discovery(|discovery| {
-            if discovery.snapshot.generation.as_deref() == Some(self.generation.as_str())
-                && !matches!(discovery.snapshot.phase, Phase::Stopped)
-            {
+        let current = self.core.with_discovery(|discovery| {
+            if discovery.snapshot.generation.as_deref() != Some(self.generation.as_str()) {
+                return Ok(false);
+            }
+            // Management readiness is an observation, not a new Run intent.
+            // A Stop accepted during initialization keeps its control identity.
+            if discovery.snapshot.phase == Phase::Starting {
                 discovery.snapshot.phase = Phase::Ready;
                 discovery.snapshot.error = None;
                 discovery.snapshot.problem = None;
                 discovery.snapshot.operation_id = None;
-                if discovery.snapshot.intent == Intent::Stopped {
-                    discovery.snapshot.intent = Intent::Run;
-                }
             }
-            Ok(())
+            Ok(true)
         })?;
-        *self
-            .core
-            .management_ready
-            .lock()
-            .expect("ready lock poisoned") = Some(self.generation.clone());
+        if current {
+            *self
+                .core
+                .management_ready
+                .lock()
+                .map_err(|_| anyhow::anyhow!("ready lock poisoned"))? =
+                Some(self.generation.clone());
+        }
         Ok(())
     }
 }
@@ -386,12 +445,13 @@ impl OwnerSession {
     /// (re)launches, cooperative stops and shutdown. Returns the process exit
     /// code implied by the terminal intent.
     pub async fn run(self: Arc<Self>, mut factory: BusinessFactory) -> Result<i32> {
-        let mut state = self
-            .run
-            .lock()
-            .expect("owner session run slot poisoned")
-            .take()
-            .context("owner session already running")?;
+        let mut state = match self.run.lock() {
+            Ok(mut slot) => slot.take().context("owner session already running")?,
+            Err(poisoned) => poisoned
+                .into_inner()
+                .take()
+                .context("owner session run slot poisoned mid-start")?,
+        };
         state.seed_fence()?;
         loop {
             if state.business.is_none() {
@@ -426,6 +486,24 @@ enum BusinessEvent {
     Driver(Result<Option<i32>>),
     StopDeadline,
     Request(Incoming),
+    ShutdownToken,
+}
+
+/// A background cleanup for one generation, foreign (startup fence) or the
+/// owner's own just-ended business（R2.3：清理任务化，原生控制持续响应）.
+/// The task owns the mutable receipt so a failure hands it back for a
+/// bounded retry within the same owner（R2.1：不再依赖把本 owner PID 当
+/// 旧 worker 的 reconcile 路径重试）.
+struct CleanupSlot {
+    generation: String,
+    root: PathBuf,
+    lock: std::fs::File,
+    /// Receipt retained between a failed attempt and its bounded retry.
+    value: Option<record::Generation>,
+    /// The task returns the（possibly mutated）receipt alongside its result
+    /// so a failure hands the authoritative state back for the retry.
+    task: Option<AbortOnDrop<(record::Generation, Result<()>)>>,
+    next_attempt: tokio::time::Instant,
 }
 
 struct RunState {
@@ -435,7 +513,7 @@ struct RunState {
     incoming: mpsc::Receiver<Incoming>,
     core: Arc<SessionCore>,
     business: Option<ActiveBusiness>,
-    cleanup: Option<AbortOnDrop<Result<()>>>,
+    cleanup: Option<CleanupSlot>,
     next_cleanup: tokio::time::Instant,
     next_discovery_check: tokio::time::Instant,
     first_launch: bool,
@@ -447,7 +525,8 @@ impl RunState {
     /// One initial synchronous reconcile so callers observe the startup fence
     /// immediately; retries continue while idle.
     fn seed_fence(&mut self) -> Result<()> {
-        match record::reconcile(&self.core.root) {
+        let instance = self.core.snapshot().supervisor_id;
+        match record::reconcile_foreign(&self.core.root, &instance) {
             Ok(None) => {
                 self.core.set_fence(FenceState::Clear);
                 Ok(())
@@ -457,56 +536,136 @@ impl RunState {
                     "verifying abandoned generation {} command and engine cleanup",
                     target.value.id
                 ))?;
-                self.spawn_cleanup(target);
+                self.start_cleanup(target.value, target.root, target._lock);
                 Ok(())
             }
             Err(error) => self.core.record_problem(&error),
         }
     }
 
-    fn spawn_cleanup(&mut self, target: record::AbandonedGeneration) {
-        let adapter = self.core.cleanup_adapter.clone();
-        self.cleanup = Some(AbortOnDrop(tokio::spawn(async move {
-            cleanup::abandoned(target, adapter.as_ref()).await
-        })));
+    fn start_cleanup(&mut self, value: record::Generation, root: PathBuf, lock: std::fs::File) {
+        self.spawn_cleanup_stage(value, root, lock);
     }
 
-    async fn reconcile_idle(&mut self) -> Result<()> {
-        if let Some(task) = &self.cleanup
-            && !task.0.is_finished()
-        {
-            return Ok(());
-        }
-        if let Some(mut task) = self.cleanup.take() {
-            let result = (&mut task.0)
-                .await
-                .context("abandoned cleanup task failed")
-                .and_then(|result| result);
-            match result {
-                Ok(()) => {
-                    self.core.set_fence(FenceState::Clear);
-                    self.core.with_discovery(|discovery| {
-                        if matches!(
-                            discovery.snapshot.phase,
-                            Phase::CleanupPending | Phase::RecoveryRequired
-                        ) {
-                            discovery.snapshot.problem = None;
-                            discovery.snapshot.error = None;
-                        }
-                        Ok(())
-                    })?;
-                }
-                Err(error) => {
-                    self.core.record_problem(&error)?;
-                    self.next_cleanup = tokio::time::Instant::now() + Duration::from_secs(2);
-                    return Ok(());
+    fn spawn_cleanup_stage(
+        &mut self,
+        value: record::Generation,
+        root: PathBuf,
+        lock: std::fs::File,
+    ) {
+        let adapter = self.core.cleanup_adapter.clone();
+        let id = value.id.clone();
+        let mut owned = value;
+        self.cleanup = Some(CleanupSlot {
+            generation: id,
+            root: root.clone(),
+            lock,
+            task: Some(AbortOnDrop(tokio::spawn(async move {
+                let result = cleanup::once(&root, &mut owned, adapter.as_ref()).await;
+                (owned, result)
+            }))),
+            value: None,
+            next_attempt: tokio::time::Instant::now(),
+        });
+    }
+
+    /// Poll the background cleanup slot. Control stays responsive throughout
+    ///（R2.3）；success closes the fence and publishes the terminal snapshot
+    /// for accepted Stop/Shutdown（R2.2）；failure re-arms a bounded retry
+    /// within the same owner with the handed-back receipt（R2.1）.
+    async fn poll_cleanup(&mut self) -> Result<()> {
+        let mut slot = match self.cleanup.take() {
+            Some(slot) => slot,
+            None => return Ok(()),
+        };
+        let running = match &mut slot.task {
+            Some(task) if !task.0.is_finished() => {
+                self.cleanup = Some(slot);
+                return Ok(());
+            }
+            running => running.take(),
+        };
+        match running {
+            Some(mut task) => {
+                let (returned, result) = (&mut task.0).await.context("cleanup task failed")?;
+                match result {
+                    Ok(()) => {
+                        self.core.set_fence(FenceState::Clear);
+                        let generation = slot.generation.clone();
+                        let intent = self.core.intent();
+                        self.core.with_discovery(|discovery| {
+                            if discovery.snapshot.generation.as_deref() == Some(generation.as_str())
+                            {
+                                discovery.snapshot.generation = None;
+                            }
+                            if matches!(
+                                discovery.snapshot.phase,
+                                Phase::CleanupPending | Phase::RecoveryRequired | Phase::Stopping
+                            ) && matches!(intent, Intent::Stopped | Intent::Shutdown)
+                            {
+                                // 终态只在清理成功后发布（R2.2）：受理的
+                                // Stop/Shutdown 以确认的清理回执收尾，同请求
+                                // 重放读取同一终态快照。
+                                discovery.snapshot.phase = Phase::Stopped;
+                                discovery.snapshot.problem = None;
+                                discovery.snapshot.error = None;
+                            } else if matches!(
+                                discovery.snapshot.phase,
+                                Phase::CleanupPending | Phase::RecoveryRequired
+                            ) {
+                                discovery.snapshot.problem = None;
+                                discovery.snapshot.error = None;
+                            }
+                            Ok(())
+                        })?;
+                        tracing::info!(
+                            generation = %generation,
+                            "generation cleanup confirmed; fence cleared"
+                        );
+                    }
+                    Err(error) => {
+                        // Receipt handed back by the task drives the bounded
+                        // retry; never publish Stopped or success here.
+                        slot.value = Some(returned);
+                        slot.next_attempt = tokio::time::Instant::now() + Duration::from_secs(2);
+                        self.cleanup = Some(slot);
+                        self.core.record_problem(&error)?;
+                    }
                 }
             }
+            None => {
+                // Backoff elapsed → respawn the retry stage from the retained
+                // receipt; the generation lock transfers with the slot.
+                if tokio::time::Instant::now() >= slot.next_attempt && slot.value.is_some() {
+                    let CleanupSlot {
+                        value, root, lock, ..
+                    } = slot;
+                    self.spawn_cleanup_stage(value.expect("checked Some above"), root, lock);
+                } else {
+                    self.cleanup = Some(slot);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cleanup_pending(&self) -> bool {
+        self.cleanup.is_some()
+    }
+
+    /// Idle-loop reconciliation step: poll the background cleanup, then look
+    /// for newly abandoned FOREIGN generations（own generations are tracked
+    /// in the slot machinery, R2.1）.
+    async fn reconcile_idle(&mut self) -> Result<()> {
+        self.poll_cleanup().await?;
+        if self.cleanup.is_some() {
+            return Ok(());
         }
         if tokio::time::Instant::now() < self.next_cleanup {
             return Ok(());
         }
-        match record::reconcile(&self.core.root) {
+        let instance = self.core.snapshot().supervisor_id;
+        match record::reconcile_foreign(&self.core.root, &instance) {
             Ok(None) => {
                 self.core.set_fence(FenceState::Clear);
             }
@@ -515,7 +674,7 @@ impl RunState {
                     "verifying abandoned generation {} command and engine cleanup",
                     target.value.id
                 ))?;
-                self.spawn_cleanup(target);
+                self.start_cleanup(target.value, target.root, target._lock);
             }
             Err(error) => {
                 self.core.record_problem(&error)?;
@@ -527,8 +686,13 @@ impl RunState {
 
     fn repair_discovery(&mut self) -> Result<()> {
         let path = self.core.root.join("supervisor.json");
-        let current =
-            serde_json::to_vec(&*self.core.discovery.lock().expect("discovery lock poisoned"))?;
+        let current = {
+            let discovery = match self.core.discovery.lock() {
+                Ok(discovery) => discovery,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            serde_json::to_vec(&*discovery)?
+        };
         match std::fs::read(&path) {
             Ok(bytes) if bytes == current => return Ok(()),
             Ok(bytes) => crate::monitor::preserve_discovery(&path, &bytes)?,
@@ -544,19 +708,31 @@ impl RunState {
     /// business start from the snapshot intent.
     async fn drive_idle(&mut self, factory: &mut BusinessFactory) -> Result<IdleFlow> {
         loop {
-            if self.shutdown.is_cancelled() {
+            // Shutdown completes only after the background cleanup settles
+            //（R2.2：不因进程退出把未确认清理写成 Stopped）。
+            if self.shutdown.is_cancelled() && !self.cleanup_pending() {
                 self.core.with_discovery(|discovery| {
                     if discovery.snapshot.intent != Intent::Shutdown {
                         discovery.snapshot.intent = Intent::Shutdown;
+                    }
+                    if discovery.snapshot.phase != Phase::Stopped
+                        && discovery.snapshot.problem.is_none()
+                    {
                         discovery.snapshot.phase = Phase::Stopped;
                     }
                     Ok(())
                 })?;
                 return Ok(IdleFlow::Shutdown);
             }
-            if self.fence_cleared() && self.relaunch_permitted() && self.launch(factory)? {
+            if !self.shutdown.is_cancelled()
+                && self.fence_cleared()
+                && !self.cleanup_pending()
+                && self.relaunch_permitted()
+                && self.launch(factory)?
+            {
                 return Ok(IdleFlow::Launched);
             }
+            let shutdown_latched = self.core.intent() == Intent::Shutdown;
             let event = {
                 let mut tick = tokio::time::interval(Duration::from_millis(200));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -568,7 +744,11 @@ impl RunState {
                 tokio::select! {
                     _ = tick.tick() => IdleEvent::Tick,
                     Some(incoming) = self.incoming.recv() => IdleEvent::Request(incoming),
-                    () = self.shutdown.cancelled() => IdleEvent::Shutdown,
+                    // 已取消的令牌每次立即就绪；闩锁后禁用本分支，让 tick
+                    // 正常推进清理轮询（否则 poll_cleanup 被分支饥饿饿死）。
+                    () = self.shutdown.cancelled(), if !shutdown_latched => {
+                        IdleEvent::Shutdown
+                    }
                     _ = &mut relaunch => IdleEvent::Relaunch,
                 }
             };
@@ -585,14 +765,14 @@ impl RunState {
                     self.handle_incoming(incoming)?;
                 }
                 IdleEvent::Shutdown => {
+                    // 闩锁 shutdown 意图一次；此后清理由 tick 轮询推进，
+                    // 顶部出口在清理收敛后返回。
                     self.core.with_discovery(|discovery| {
                         if discovery.snapshot.intent != Intent::Shutdown {
                             discovery.snapshot.intent = Intent::Shutdown;
-                            discovery.snapshot.phase = Phase::Stopped;
                         }
                         Ok(())
                     })?;
-                    return Ok(IdleFlow::Shutdown);
                 }
                 IdleEvent::Relaunch => {}
             }
@@ -604,7 +784,10 @@ impl RunState {
     }
 
     fn relaunch_permitted(&self) -> bool {
-        let mut restarts = self.core.restarts.lock().expect("restart lock poisoned");
+        let mut restarts = match self.core.restarts.lock() {
+            Ok(restarts) => restarts,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let now = tokio::time::Instant::now();
         while restarts
             .front()
@@ -628,7 +811,7 @@ impl RunState {
         let value = record::Generation {
             version: 1,
             id: id.clone(),
-            supervisor,
+            supervisor: supervisor.clone(),
             token: uuid::Uuid::new_v4().to_string(),
             intent,
             phase: record::GenerationPhase::Pending,
@@ -640,6 +823,13 @@ impl RunState {
         };
         record::save(&work.join("generation.json"), &value)?;
         let fresh = self.first_launch;
+        // R1：安装进程级会话命令范围——业务会话内全部嵌套 spawn 的受管
+        // 命令（服务/预检/迁移/Pingap）据此落 generation 作用域。
+        install_scope(Some(SessionScope {
+            work_root: work.clone(),
+            generation: id.clone(),
+            supervisor_id: supervisor,
+        }));
         self.core.with_discovery(|discovery| {
             discovery.snapshot.generation = Some(id.clone());
             discovery.snapshot.phase = Phase::Starting;
@@ -649,6 +839,7 @@ impl RunState {
         })?;
         let run = match factory(BusinessLaunch {
             generation: id.clone(),
+            work_root: work.clone(),
             fresh,
         }) {
             Ok(run) => run,
@@ -670,8 +861,9 @@ impl RunState {
                 self.core
                     .restarts
                     .lock()
-                    .expect("restart lock poisoned")
+                    .map_err(|_| anyhow::anyhow!("restart lock poisoned"))?
                     .push_back(tokio::time::Instant::now());
+                install_scope(None);
                 return Ok(false);
             }
         };
@@ -716,10 +908,20 @@ impl RunState {
                     }
                 };
                 tokio::pin!(stopping_sleep);
+                let shutdown = self.shutdown.cancelled();
+                tokio::pin!(shutdown);
+                let already_shutting = self.core.intent() == Intent::Shutdown;
                 tokio::select! {
                     outcome = driver => BusinessEvent::Driver(outcome),
                     _ = &mut stopping_sleep => BusinessEvent::StopDeadline,
                     Some(incoming) = self.incoming.recv() => BusinessEvent::Request(incoming),
+                    // R2.6：shutdown 令牌直接唤醒本 select——业务 future
+                    // 长期 pending 时不再依赖外部偶合驱动停止。guard 防止
+                    // 已取消令牌对 select 的分支饥饿（每次立即就绪会饿死
+                    // driver/停止期限的推进）。
+                    () = &mut shutdown, if !already_shutting => {
+                        BusinessEvent::ShutdownToken
+                    }
                 }
             };
             match event {
@@ -732,12 +934,20 @@ impl RunState {
                 BusinessEvent::Request(incoming) => {
                     self.handle_incoming(incoming)?;
                 }
+                BusinessEvent::ShutdownToken => {
+                    if self.core.intent() != Intent::Shutdown {
+                        self.begin_stop(Intent::Shutdown)?;
+                    }
+                }
             }
         }
     }
 
-    /// The business driver ended. Write cleanup receipts, then decide between
-    /// relaunch, idle and process exit.
+    /// The business driver ended（R2 rework）. The generation's physical
+    /// cleanup runs as a background task that retains the generation lock;
+    /// native control keeps answering throughout. Terminal Stop/Shutdown
+    /// snapshots are published only from the confirmed cleanup result
+    ///（poll_cleanup）, never from here.
     async fn business_ended(&mut self, outcome: Result<Option<i32>>) -> Result<Option<i32>> {
         let exit = match outcome {
             Ok(code) => code,
@@ -746,56 +956,53 @@ impl RunState {
                 Some(1)
             }
         };
-        let mut business = self
+        let business = self
             .business
             .take()
             .context("business end without an active business")?;
+        let ActiveBusiness {
+            generation,
+            mut value,
+            _generation_lock: lock,
+            ..
+        } = business;
         let was_ready = self
             .core
             .management_ready
             .lock()
-            .expect("ready lock poisoned")
+            .map_err(|_| anyhow::anyhow!("ready lock poisoned"))?
             .as_deref()
-            == Some(business.generation.as_str());
+            == Some(generation.as_str());
         if !was_ready {
             tracing::warn!(
-                generation = %business.generation,
+                generation = %generation,
                 exit = ?exit,
                 "business session ended before management readiness"
             );
         }
-        // One task owns the generation lock throughout cleanup; a replacement
-        // cannot launch while receipts are still being written.
-        let work = record::work_root(&self.core.root, &business.generation)?;
-        let adapter = self.core.cleanup_adapter.clone();
-        match cleanup::once(&work, &mut business.value, adapter.as_ref()).await {
-            Ok(()) => {}
-            Err(error) => {
-                cleanup::record_failure(&work, &mut business.value, &error);
-                self.core.record_problem(&error)?;
-            }
-        }
+        // R1：业务结束即卸下会话命令范围（清理引擎子进程经自身 env 运行）。
+        install_scope(None);
         let intent = self.core.intent();
+        // Hand the whole generation（receipt + lock）to the background
+        // cleanup; the slot machinery retries transient engine failures
+        // inside this owner instead of wedging on the live owner PID.
+        let root = record::work_root(&self.core.root, &generation)?;
+        self.core.mark_pending_cleanup(format!(
+            "confirming generation {generation} command and engine cleanup after business end"
+        ))?;
+        // The in-process business driver completing IS this owner's evidence
+        // that the execution ended; cleanup confirms the physical range.
+        value.phase = record::GenerationPhase::Draining;
+        self.spawn_cleanup_stage(value, root, lock);
         if intent == Intent::Shutdown {
-            self.core.with_discovery(|discovery| {
-                discovery.snapshot.phase = Phase::Stopped;
-                discovery.snapshot.generation = None;
-                discovery.snapshot.error = None;
-                discovery.snapshot.problem = None;
-                Ok(())
-            })?;
-            return Ok(Some(if business.stopping.is_some() {
-                0
-            } else {
-                exit.unwrap_or(0)
-            }));
+            // Exit decision waits for the cleanup slot（drive_idle gates the
+            // Shutdown return on it）——清理未确认不发布 Stopped/成功。
+            return Ok(None);
         }
-        if !self.restart_on_exit || !was_ready {
-            // Foreground runs propagate exits; a session that never reached
-            // management readiness fails fast instead of restart-looping.
+        if !self.restart_on_exit {
+            // Foreground run: propagate the exit code; the generation stays
+            // Draining on disk（honest）for the successor to reconcile.
             self.core.with_discovery(|discovery| {
-                discovery.snapshot.phase = Phase::Stopped;
-                discovery.snapshot.generation = None;
                 if let Some(code) = exit {
                     discovery.snapshot.error = Some(format!("execution process exited ({code})"));
                 }
@@ -803,8 +1010,15 @@ impl RunState {
             })?;
             return Ok(Some(exit.unwrap_or(0)));
         }
+        // serve/recovery semantics（R3）：初始化失败也保持 owner 存活——
+        // 后台清理关闭 fence 后按重启预算重试；预算耗尽停在
+        // RecoveryRequired，管理与 Stop 全程在线。
         {
-            let mut restarts = self.core.restarts.lock().expect("restart lock poisoned");
+            let mut restarts = self
+                .core
+                .restarts
+                .lock()
+                .map_err(|_| anyhow::anyhow!("restart lock poisoned"))?;
             restarts.push_back(tokio::time::Instant::now());
         }
         if !self.relaunch_permitted() {
@@ -896,13 +1110,10 @@ impl RunState {
             Ok(snapshot) => snapshot.clone(),
             Err(_) => self.core.snapshot(),
         };
-        let instance = self
-            .core
-            .discovery
-            .lock()
-            .expect("discovery lock poisoned")
-            .instance
-            .clone();
+        let instance = match self.core.discovery.lock() {
+            Ok(discovery) => discovery.instance.clone(),
+            Err(poisoned) => poisoned.into_inner().instance.clone(),
+        };
         drop(incoming.reply.send(Reply {
             instance,
             snapshot,
@@ -920,50 +1131,76 @@ impl RunState {
 
     fn handle_request(&mut self, envelope: &Envelope) -> Result<Snapshot> {
         {
-            let discovery = self.core.discovery.lock().expect("discovery lock poisoned");
-            ensure!(
-                envelope.version == control::CONTROL_VERSION
-                    && envelope.instance == discovery.instance
-                    && envelope.token == discovery.token,
-                "supervisor request identity mismatch"
-            );
+            let discovery = match self.core.discovery.lock() {
+                Ok(discovery) => discovery,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if envelope.version != control::CONTROL_VERSION
+                || envelope.instance != discovery.instance
+                || envelope.token != discovery.token
+            {
+                return Err(Problem {
+                    code: FailureCode::IdentityChanged,
+                    message: "supervisor request identity mismatch".into(),
+                }
+                .into());
+            }
         }
         let request = &envelope.request;
-        ensure!(
-            !request.request_id.is_empty() && request.request_id.len() <= 128,
-            "invalid control request identity"
-        );
+        if request.request_id.is_empty() || request.request_id.len() > 128 {
+            return Err(Problem {
+                code: FailureCode::InvalidRequest,
+                message: "invalid control request identity".into(),
+            }
+            .into());
+        }
         let snapshot = self.core.snapshot();
         if request.action == control::Action::Status {
             return Ok(snapshot);
         }
         {
-            let discovery = self.core.discovery.lock().expect("discovery lock poisoned");
+            let discovery = match self.core.discovery.lock() {
+                Ok(discovery) => discovery,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             if let Some((original, recorded)) = discovery
                 .requests
                 .iter()
                 .find(|(r, _)| r.request_id == request.request_id)
                 .map(|(r, s)| (r.clone(), s.clone()))
             {
-                ensure!(
-                    original.action == request.action
-                        && original.expected_generation == request.expected_generation,
-                    "request identity already used with different parameters"
-                );
+                if original.action != request.action
+                    || original.expected_generation != request.expected_generation
+                {
+                    return Err(Problem {
+                        code: FailureCode::IdentityChanged,
+                        message: "request identity already used with different parameters".into(),
+                    }
+                    .into());
+                }
                 return Ok(recorded);
             }
         }
-        ensure!(
-            request.expected_generation.is_none()
-                || request.expected_generation == snapshot.generation,
-            "execution generation changed"
-        );
-        if let Some(operation) = &snapshot.operation_id {
-            ensure!(
-                snapshot.phase == Phase::RecoveryRequired && self.business.is_none(),
-                "supervisor is busy with operation {operation} ({})",
-                snapshot.phase
-            );
+        if request.expected_generation.is_some()
+            && request.expected_generation != snapshot.generation
+        {
+            return Err(Problem {
+                code: FailureCode::IdentityChanged,
+                message: "execution generation changed".into(),
+            }
+            .into());
+        }
+        if let Some(operation) = &snapshot.operation_id
+            && (snapshot.phase != Phase::RecoveryRequired || self.business.is_some())
+        {
+            return Err(Problem {
+                code: FailureCode::Busy,
+                message: format!(
+                    "supervisor is busy with operation {operation} ({})",
+                    snapshot.phase
+                ),
+            }
+            .into());
         }
         let intent = match request.action {
             control::Action::Recover => snapshot.intent,
@@ -980,11 +1217,9 @@ impl RunState {
             discovery.snapshot.phase = Phase::Stopping;
             Ok(())
         })?;
-        self.core
-            .restarts
-            .lock()
-            .expect("restart lock poisoned")
-            .clear();
+        if let Ok(mut restarts) = self.core.restarts.lock() {
+            restarts.clear();
+        }
         self.next_cleanup = tokio::time::Instant::now();
         self.begin_stop(intent)?;
         Ok(self.core.snapshot())
@@ -1014,5 +1249,127 @@ async fn accept(listener: TcpListener, tx: mpsc::Sender<Incoming>) -> Result<()>
                 tracing::debug!(%error, "supervisor control connection ended");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::{Action, Request};
+
+    async fn session(root: &std::path::Path) -> Arc<OwnerSession> {
+        Arc::new(
+            OwnerSession::start(
+                Owner::try_acquire(root).unwrap().unwrap(),
+                SessionOptions {
+                    binding: control::Binding {
+                        component: "app-cli".into(),
+                        resource: root.to_path_buf(),
+                    },
+                    policy: crate::Policy::default(),
+                    cleanup_adapter: None,
+                    restart_on_exit: true,
+                    shutdown: CancellationToken::new(),
+                },
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn failed_discovery_commit_does_not_publish_unaccepted_state() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path()).await;
+        let before = serde_json::to_value(session.snapshot()).unwrap();
+        // Deterministic publication failure, independent of user permissions.
+        std::fs::remove_file(root.path().join("supervisor.json")).unwrap();
+        std::fs::create_dir(root.path().join("supervisor.json")).unwrap();
+        assert!(
+            session
+                .core
+                .with_discovery(|discovery| {
+                    discovery.snapshot.intent = Intent::Stopped;
+                    discovery.snapshot.phase = Phase::Stopping;
+                    discovery.snapshot.operation_id = Some("unaccepted".into());
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(session.snapshot()).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn late_ready_report_preserves_stop_and_current_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path()).await;
+        session
+            .core
+            .with_discovery(|discovery| {
+                discovery.snapshot.generation = Some("current".into());
+                discovery.snapshot.intent = Intent::Stopped;
+                discovery.snapshot.phase = Phase::Stopping;
+                discovery.snapshot.operation_id = Some("stop".into());
+                Ok(())
+            })
+            .unwrap();
+        let before = serde_json::to_value(session.snapshot()).unwrap();
+        session.ready_guard("current").mark_ready().unwrap();
+        assert_eq!(serde_json::to_value(session.snapshot()).unwrap(), before);
+        session.ready_guard("older").mark_ready().unwrap();
+        assert_eq!(
+            session.core.management_ready.lock().unwrap().as_deref(),
+            Some("current"),
+            "a stale callback must not replace the current readiness identity"
+        );
+        session
+            .core
+            .with_discovery(|discovery| {
+                discovery.snapshot.phase = Phase::Starting;
+                discovery.snapshot.operation_id = None;
+                Ok(())
+            })
+            .unwrap();
+        session.ready_guard("current").mark_ready().unwrap();
+        assert_eq!(session.snapshot().phase, Phase::Ready);
+        assert_eq!(session.snapshot().intent, Intent::Stopped);
+    }
+
+    #[tokio::test]
+    async fn control_rejections_keep_the_native_wire_error_codes() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path()).await;
+        let mut state = session.run.lock().unwrap().take().unwrap();
+        let discovery = session.core.discovery.lock().unwrap().clone();
+        let envelope = || Envelope {
+            version: control::CONTROL_VERSION,
+            instance: discovery.instance.clone(),
+            token: discovery.token.clone(),
+            request: Request::new(Action::StopWork),
+        };
+        let mut wrong_owner = envelope();
+        wrong_owner.instance = "another-owner".into();
+        let mut invalid_request = envelope();
+        invalid_request.request.request_id.clear();
+        let mut wrong_generation = envelope();
+        wrong_generation.request.expected_generation = Some("another-generation".into());
+        for (request, expected) in [
+            (wrong_owner, FailureCode::IdentityChanged),
+            (invalid_request, FailureCode::InvalidRequest),
+            (wrong_generation, FailureCode::IdentityChanged),
+        ] {
+            let error = state.handle_request(&request).unwrap_err();
+            assert_eq!(Problem::from_error(&error).code, expected);
+        }
+        session
+            .core
+            .with_discovery(|discovery| {
+                discovery.snapshot.operation_id = Some("already-stopping".into());
+                discovery.snapshot.phase = Phase::Stopping;
+                Ok(())
+            })
+            .unwrap();
+        let error = state.handle_request(&envelope()).unwrap_err();
+        assert_eq!(Problem::from_error(&error).code, FailureCode::Busy);
     }
 }

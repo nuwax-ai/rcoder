@@ -297,6 +297,86 @@ pub(crate) fn reconcile(scope: &Path) -> Result<Option<AbandonedGeneration>> {
     reconcile_local(scope, crate::domain::PhysicalDomain::from_env()?.as_ref())
 }
 
+/// Unified-owner variant（recovery v2 R2）：skip generations whose supervisor
+/// is the current session instance. Those belong to THIS owner's in-process
+/// business lifecycle（driver end / background cleanup already tracked in
+/// memory）; reconciling them as "abandoned" would test the live owner's own
+/// PID for exit and wedge recovery after a transient engine failure.
+pub(crate) fn reconcile_foreign(
+    scope: &Path,
+    instance: &str,
+) -> Result<Option<AbandonedGeneration>> {
+    let current = crate::domain::PhysicalDomain::from_env()?;
+    let dir = scope.join("work");
+    if !dir.try_exists()? {
+        return Ok(None);
+    }
+    let mut abandoned = None;
+    for entry in std::fs::read_dir(dir)? {
+        let root = entry?.path();
+        if !root.join("generation.json").try_exists()? {
+            continue;
+        }
+        let value = generation(&root)?;
+        if value.supervisor == instance {
+            // Own in-process generation: tracked by the session itself.
+            continue;
+        }
+        // Mirror reconcile_local's retirement/classification for the rest.
+        if previous_container(&value, current.as_ref()) {
+            continue;
+        }
+        let generation_lock = lock(&root.join("generation.lock"))?;
+        let mut value = generation(&root)?;
+        let retirable = matches!(
+            value.phase,
+            GenerationPhase::Running | GenerationPhase::Draining
+        );
+        if retirable
+            && (crate::domain::has_confirmed_exit(&root, &value)?
+                || local_process_space_ended(&value)?)
+        {
+            process_utils::command_authority::Gate::try_acquire(&root)?.close()?;
+            process_utils::guardian::confirm_physical_domain_exit(&root)?;
+            retire_confirmed(&mut value);
+            save(&root.join("generation.json"), &value)?;
+        }
+        if value.phase == GenerationPhase::Pending {
+            process_utils::command_authority::Gate::try_acquire(&root)?.close()?;
+            value.phase = GenerationPhase::Revoked;
+            save(&root.join("generation.json"), &value)?;
+        }
+        if matches!(
+            value.phase,
+            GenerationPhase::Running | GenerationPhase::Draining
+        ) {
+            verify_abandoned_worker(&value, current.as_ref())?;
+            if abandoned.is_none() {
+                abandoned = Some(AbandonedGeneration {
+                    root,
+                    value,
+                    _lock: generation_lock,
+                });
+            }
+            continue;
+        }
+        ensure!(
+            matches!(
+                value.phase,
+                GenerationPhase::Quiescent | GenerationPhase::Revoked
+            ),
+            "generation {} cleanup is unconfirmed: {:?}",
+            value.id,
+            value.phase
+        );
+        if value.phase == GenerationPhase::Revoked {
+            process_utils::guardian::recover(&root)?;
+            process_utils::command_context::require_quiescent(&root.join("commands"))?;
+        }
+    }
+    Ok(abandoned)
+}
+
 fn reconcile_local(
     scope: &Path,
     current: Option<&crate::domain::PhysicalDomain>,

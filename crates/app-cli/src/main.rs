@@ -104,10 +104,60 @@ async fn run() -> anyhow::Result<()> {
     // 承载管理面 + 业务会话（restart_on_exit=false：前台退出码语义）。
     // Dispatch = 锁被持有，走下方既有分派块；Legacy = 旧版 owner 派生的
     // worker 子进程，直接进入本地业务主体。
-    let owner_session = match app_cli::supervision::supervise(&args, false).await? {
-        app_cli::supervision::SupervisionOutcome::Owner(session) => Some(session),
-        _ => None,
+    // R4：Dispatch 后原 owner 消失 → 重新进入统一 bootstrap（有界重试），
+    // 不在二次抢锁成功后静默回退 legacy 编排——所有无 owner 入口共用同一
+    // 套统一业务 driver。Legacy（旧版 owner 派生的 worker 子进程）才走
+    // 下方 legacy 主体。
+    let mut bootstrap_attempts = 0u32;
+    let mut legacy_worker_child = false;
+    let owner_session = loop {
+        match app_cli::supervision::supervise(&args, false).await? {
+            app_cli::supervision::SupervisionOutcome::Owner(session) => break Some(session),
+            app_cli::supervision::SupervisionOutcome::Legacy => {
+                legacy_worker_child = true;
+                break None;
+            }
+            app_cli::supervision::SupervisionOutcome::Dispatch => {
+                let application_id = std::env::var("PROJECT_ID")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "unknown-app".to_string());
+                let state_root = app_cli::runtime_kernel::RuntimeStore::resolve_root(
+                    &args.workspace,
+                    &application_id,
+                )?;
+                match app_cli::owner_dispatch::dispatch_to_owner(
+                    &args.admin_addr,
+                    &args.workspace,
+                    &state_root,
+                    &application_id,
+                )
+                .await?
+                {
+                    app_cli::owner_dispatch::OwnerDispatch::Terminal(view) => {
+                        return app_cli::owner_dispatch::describe_terminal(&view);
+                    }
+                    app_cli::owner_dispatch::OwnerDispatch::NoOwner => {
+                        bootstrap_attempts += 1;
+                        anyhow::ensure!(
+                            bootstrap_attempts < 3,
+                            "owner disappeared during dispatch {bootstrap_attempts} times; \
+                             no operation was submitted and no legacy fallback is permitted"
+                        );
+                        tracing::info!(
+                            attempt = bootstrap_attempts,
+                            "owner disappeared during dispatch; re-entering unified bootstrap"
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
     };
+    anyhow::ensure!(
+        owner_session.is_some() || legacy_worker_child,
+        "unified bootstrap exhausted without a classification"
+    );
 
     // ── run 前台服务会话：持续编排与监督，直到停止或退出 ──
     let runtime_status = app_cli::runtime_status::RuntimeStatusService::default();
@@ -136,51 +186,13 @@ async fn run() -> anyhow::Result<()> {
         return app_cli::server::run_owner_serve(&args, state_root, application_id, session, true)
             .await;
     }
-    let _owner_guard = {
-        let application_id = std::env::var("PROJECT_ID")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "unknown-app".to_string());
-        let state_root =
-            app_cli::runtime_kernel::RuntimeStore::resolve_root(&args.workspace, &application_id)?;
-        if runtime_supervisor::Worker::from_env(&state_root)
-            .await?
-            .is_some()
-        {
-            None
-        } else {
-            match app_cli::platform::owner_guard::OwnerGuard::try_acquire(&state_root)? {
-                Some(guard) => Some(guard),
-                None => {
-                    anyhow::ensure!(
-                        !app_cli::deploy::deploy_requested(),
-                        "workspace already has an owner; submit artifact deployment through its deployment API"
-                    );
-                    tracing::info!(
-                        "owner lock held; dispatching to the running owner at {}",
-                        args.admin_addr
-                    );
-                    let dispatch = app_cli::owner_dispatch::dispatch_to_owner(
-                        &args.admin_addr,
-                        &args.workspace,
-                        &state_root,
-                        &application_id,
-                    )
-                    .await?;
-                    match dispatch {
-                        app_cli::owner_dispatch::OwnerDispatch::Terminal(view) => {
-                            return app_cli::owner_dispatch::describe_terminal(&view);
-                        }
-                        app_cli::owner_dispatch::OwnerDispatch::NoOwner => {
-                            anyhow::bail!(
-                                "owner disappeared during dispatch; no operation was submitted"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    };
+    // legacy 主体仅限旧版 owner 派生的 worker 子进程（升级窗口兼容）；
+    // 统一 owner 的 Dispatch 竞争已在上方循环内闭环。
+    anyhow::ensure!(
+        legacy_worker_child,
+        "run legacy body requires a worker classification"
+    );
+    let _owner_guard = ();
 
     // idle 判定（仅无部署请求且无 release.lock 时进入）——无副作用常驻探针。
     // deploy_requested() 检查不涉及3010，可在 bind 前安全调用。

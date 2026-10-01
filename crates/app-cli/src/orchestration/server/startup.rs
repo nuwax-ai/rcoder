@@ -168,14 +168,14 @@ pub async fn owner_serve(
                 let state = factory_state.clone();
                 let state_root = factory_state_root.clone();
                 let session = factory_session.clone();
+                // R4：run 与 serve 消费同一 business_session（server_loop
+                // 处理 control/deploy 通道）——API 受理的 Start/Stop/
+                // Restart 在 run 形态下同样被消费；差异只在会话重启策略
+                //（run 的 restart_on_exit=false，前台退出码语义）。
                 let end = tokio::spawn(async move {
-                    if run_mode {
-                        run_business_session(args, state_root, state, session, launch).await
-                    } else {
-                        business_session(args, state_root, state, session, launch)
-                            .await
-                            .map(|_| None::<i32>)
-                    }
+                    business_session(args, state_root, state, session, launch, run_mode)
+                        .await
+                        .map(|_| None::<i32>)
                 });
                 let control = factory_state.clone();
                 Ok(runtime_supervisor::BusinessRun {
@@ -216,9 +216,17 @@ async fn business_session(
     state: Arc<ServerState>,
     session: std::sync::Arc<runtime_supervisor::OwnerSession>,
     launch: runtime_supervisor::BusinessLaunch,
+    foreground: bool,
 ) -> Result<()> {
     let ready_guard = session.ready_guard(&launch.generation);
-    state.begin_business_session(launch.generation.clone(), launch.fresh);
+    // R2.5：停止仍在进行（Stopping）时继承上一代取消信号，关闭 launch
+    // 与初始化之间的取消丢失窗口。
+    let inherit_cancel = session.snapshot().phase == runtime_supervisor::Phase::Stopping;
+    state.begin_business_session_inheriting(
+        launch.generation.clone(),
+        launch.fresh,
+        inherit_cancel,
+    );
     let stop_intent = session.snapshot().intent == runtime_supervisor::Intent::Stopped;
     let mut journal = Journal::open_with_root(&args.workspace, state_root.clone())?;
     journal.attach_worker_generation(launch.generation.clone());
@@ -581,11 +589,38 @@ async fn business_session(
         });
         let mut joined = false;
         let cancel = state.cancel_token();
+        // R4 前台语义：serve 形态编排失败驻留（Failed 可查询、可再部署），
+        // run 形态必须以非零退出终结——有界间隔观察相位，失败即取消并以
+        // 该失败原因退出。
+        let failure_watch = async {
+            if !foreground {
+                std::future::pending::<()>().await;
+            }
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if matches!(state.phase(), ServerPhase::Failed(_)) {
+                    state.trigger_cancel();
+                    break;
+                }
+            }
+        };
+        tokio::pin!(failure_watch);
         let (driver_result, shutdown_deadline) = tokio::select! {
             result = &mut driver => {
                 joined = true;
                 state.close_admission();
                 (result.context("server driver panicked").and_then(|result| result), tokio::time::Instant::now().checked_add(state.shutdown_budget(supervised)).context("shutdown budget exceeds clock range")?)
+            },
+            () = &mut failure_watch => {
+                joined = true;
+                state.close_admission();
+                let message = match state.phase() {
+                    ServerPhase::Failed(message) => message,
+                    _ => "foreground orchestration failed".to_owned(),
+                };
+                (Err(anyhow::anyhow!("{message}")), tokio::time::Instant::now().checked_add(state.shutdown_budget(supervised)).context("shutdown budget exceeds clock range")?)
             },
             () = cancel.cancelled() => {
                 let deadline = tokio::time::Instant::now().checked_add(state.shutdown_budget(supervised)).context("shutdown budget exceeds clock range")?;
@@ -615,62 +650,6 @@ async fn business_session(
     state.close_admission();
     signal_task.abort();
     result
-}
-
-/// run 命令的业务会话（recovery v2 T2 前的过渡形态）：前台一次性编排——
-/// 与旧 run 主体同语义（env 部署段 + 前台 supervisor 循环，失败即非零
-/// 退出），差异仅在：API/管理面由 owner 进程承载（先绑定），取消经会话
-/// 协作停止。空工作区（无部署声明且无 release.lock）沿用 serve 的管理
-/// 空转语义。
-async fn run_business_session(
-    args: RuntimeArgs,
-    state_root: std::path::PathBuf,
-    state: Arc<ServerState>,
-    session: std::sync::Arc<runtime_supervisor::OwnerSession>,
-    launch: runtime_supervisor::BusinessLaunch,
-) -> Result<Option<i32>> {
-    let ready_guard = session.ready_guard(&launch.generation);
-    state.begin_business_session(launch.generation.clone(), launch.fresh);
-    let idle_workspace = !(state.deploy_inputs_eligible() && crate::deploy::deploy_requested())
-        && !tokio::fs::try_exists(args.workspace.join("release.lock.toml"))
-            .await
-            .unwrap_or(false);
-    if idle_workspace {
-        // 无业务可编排：保持管理会话（serve 业务序列的 idle 语义），前台
-        // 等待会话取消。
-        return business_session(args, state_root, state, session, launch)
-            .await
-            .map(|_| None);
-    }
-    // 部署段（仅 fresh 会话消费一次性部署声明 env）：失败即前台失败退出。
-    if state.deploy_inputs_eligible()
-        && crate::deploy::deploy_requested()
-        && let Err(error) = crate::deploy::run_from_env(&args.workspace).await
-    {
-        tracing::error!("❌ deploy stage failed: {error:#}");
-        anyhow::bail!("deploy stage failed");
-    }
-    if let Ok(release) = crate::manifest::read_release_lock(&args.workspace) {
-        state.set_release(release);
-        state.set_phase(ServerPhase::Running);
-    }
-    state.mark_initialized();
-    ready_guard.mark_ready()?;
-    let runtime_status = state.ready.clone();
-    let cancel = state.cancel_token();
-    let result = crate::supervisor::run_with_cancel(
-        args.clone(),
-        runtime_status,
-        cancel,
-        None,
-        crate::supervisor::legacy_run_profile(),
-    )
-    .await;
-    match &result {
-        Ok(()) => tracing::info!("app-cli supervisor exited normally"),
-        Err(e) => tracing::error!("app-cli supervisor error: {e:#}"),
-    }
-    result.map(|_| Some(0))
 }
 
 /// 旧版进程模式 owner 派生的 worker 子进程路径（升级窗口兼容）：保持既有
