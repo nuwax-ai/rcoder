@@ -57,8 +57,19 @@ impl CleanupOutcome {
         Ok(())
     }
     /// Read the recorded outcome, if any.
-    pub fn recorded(root: &Path) -> Option<Self> {
-        serde_json::from_slice(&std::fs::read(Self::path(root)).ok()?).ok()
+    /// Read the recorded outcome for the CURRENT attempt. `Ok(None)` = no
+    /// record（首次尝试）；读取/解码失败如实上报为 `Err`——调用方据此
+    /// 区分"无分类"与"分类损坏"，避免把上一次尝试的旧原因当成本次的。
+    pub fn recorded(root: &Path) -> Result<Option<Self>> {
+        let bytes = match std::fs::read(Self::path(root)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).context("read cleanup outcome record");
+            }
+        };
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("decode cleanup outcome record at {}", Self::path(root).display()))
     }
 }
 
@@ -123,19 +134,34 @@ pub(crate) async fn once(
             // 适配器未分类时才落默认 ObservationFailed。
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             match CleanupOutcome::recorded(root) {
-                Some(CleanupOutcome::Empty) | None => {
-                    CleanupOutcome::ObservationFailed {
-                        reason: format!("engine cleanup failed: {stderr}"),
-                    }
-                    .record(root)?;
-                }
-                Some(already) => {
+                // 适配器已分类（非 Empty）：原样保留本次尝试的分类。
+                Ok(Some(already @ (CleanupOutcome::ObservationFailed { .. }
+                | CleanupOutcome::ForeignIdentity { .. }
+                | CleanupOutcome::Stopping { .. }))) => {
                     let detail = format!("{already:?}");
                     already.record(root)?;
                     tracing::debug!(
                         %detail, %stderr,
                         "engine cleanup failed with adapter classification"
                     );
+                }
+                // Empty 是上一次成功尝试的残留（本次失败说明记录早于本次
+                // 失败——不覆盖证据，落本次 ObservationFailed）。
+                Ok(Some(CleanupOutcome::Empty)) | Ok(None) => {
+                    CleanupOutcome::ObservationFailed {
+                        reason: format!("engine cleanup failed: {stderr}"),
+                    }
+                    .record(root)?;
+                }
+                // 记录读取/解码失败：不沿用旧原因，落显式读取错误。
+                Err(record_error) => {
+                    CleanupOutcome::ObservationFailed {
+                        reason: format!(
+                            "engine cleanup failed: {stderr}; prior outcome \
+                             record unreadable: {record_error:#}"
+                        ),
+                    }
+                    .record(root)?;
                 }
             }
             anyhow::bail!("external engine cleanup failed: {stderr}");

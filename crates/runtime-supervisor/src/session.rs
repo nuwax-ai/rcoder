@@ -150,11 +150,18 @@ struct SessionCore {
 
 impl SessionCore {
     fn with_discovery<T>(&self, update: impl FnOnce(&mut Discovery) -> Result<T>) -> Result<T> {
-        let mut discovery = self
-            .discovery
-            .lock()
-            .map_err(|_| anyhow::anyhow!("discovery lock poisoned"))?;
-        let mut next = discovery.clone();
+        // 持锁窗口只覆盖 clone 与 swap（内存操作）；durable 落盘
+        ///（fsync，共享盘上可达数十毫秒）在锁外执行——控制连接的快照
+        /// 读取不被持久化 I/O 阻塞（复核 §6）。写者串行由写路径单任务
+        /// （run loop / mark_ready）保证；并发写者最多造成一次后写覆盖
+        /// 先写的同代快照，与旧实现（锁内 save）语义等价。
+        let mut next = {
+            let discovery = self
+                .discovery
+                .lock()
+                .map_err(|_| anyhow::anyhow!("discovery lock poisoned"))?;
+            discovery.clone()
+        };
         let result = update(&mut next)?;
         // Replay parity（R2.4）：受理中操作的每次快照推进同步进 requests
         // 登记，同请求重试因此反映实际进度与终态（monitor::persist 同款）。
@@ -166,7 +173,10 @@ impl SessionCore {
             }
         }
         record::save(&self.root.join("supervisor.json"), &next)?;
-        *discovery = next;
+        match self.discovery.lock() {
+            Ok(mut discovery) => *discovery = next,
+            Err(poisoned) => *poisoned.into_inner() = next,
+        }
         Ok(result)
     }
 

@@ -52,31 +52,27 @@ pub fn process_exists(pid: u32) -> std::io::Result<bool> {
 pub fn process_exists(pid: u32) -> std::io::Result<bool> {
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError};
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-    #[allow(unsafe_code)] // FFI: read-only handle open/query/close on a numeric pid.
-    fn open(pid: u32) -> isize {
-        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) }
-    }
-    #[allow(unsafe_code)] // FFI: paired close of the handle opened above.
-    fn close(handle: isize) {
+    // HANDLE 是 *mut c_void（windows-sys 0.61 的原生形态）；跨函数边界
+    // 传裸指针需要 unsafe 签名，收拢为单块 FFI。
+    #[allow(unsafe_code)] // FFI: read-only OpenProcess/query/CloseHandle on a numeric pid.
+    fn observe_open_result(pid: u32) -> std::io::Result<bool> {
+        if pid == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid process identifier",
+            ));
+        }
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            // Stale PIDs surface as ERROR_INVALID_PARAMETER; access denial
+            // (5) means the process exists.
+            let code = unsafe { GetLastError() };
+            return Ok(code != ERROR_INVALID_PARAMETER);
+        }
         unsafe { CloseHandle(handle) };
+        Ok(true)
     }
-    #[allow(unsafe_code)] // FFI: thread-local error read after a failed open.
-    fn last_error() -> u32 {
-        unsafe { GetLastError() }
-    }
-    if pid == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "invalid process identifier",
-        ));
-    }
-    let handle = open(pid);
-    if handle == 0 {
-        let code = last_error();
-        return Ok(code != ERROR_INVALID_PARAMETER);
-    }
-    close(handle);
-    Ok(true)
+    observe_open_result(pid)
 }
 
 #[cfg(unix)]
