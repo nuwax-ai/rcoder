@@ -447,7 +447,13 @@ impl OwnerClient {
             // loaded machine). Absence before the deadline is "keep waiting",
             // not a failure — the deadline still bounds the total budget.
             if let Some(view) = self.operation_if_exists(operation_id).await?
-                && view.state.is_terminal()
+                && (view.state.is_terminal()
+                    // RecoveryRequired 是持久的可查询结论（结果未知→需显
+                    // 式恢复），不会自行演进成其他状态——按终态返回，由
+                    // 调用方以 error_message 呈现具体原因（如未确认迁移），
+                    // 不等满预算超时。
+                    || view.state
+                        == shared_types::RuntimeOperationState::RecoveryRequired)
             {
                 return Ok(view);
             }
