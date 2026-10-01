@@ -346,6 +346,18 @@ impl OwnerClient {
             .context("owner operation not found")
     }
 
+    /// R4 前台契约配套：owner 是否已完全不可达（身份探针也连接失败）。
+    /// 用于轮询 Stop 结果期间 owner 按停止语义退出后的"已停止"裁决——
+    /// 仅连接级失败算不可达，HTTP 错误响应仍是活 owner。
+    pub(super) async fn probe_unreachable(&self) -> bool {
+        let url = format!("http://{}/v1/runtime/identity", self.address);
+        matches!(
+            self.client.get(&url).send().await,
+            Err(error)
+                if error.is_connect() || error.is_request()
+        )
+    }
+
     pub(super) async fn operation_if_exists(
         &self,
         operation_id: &str,
