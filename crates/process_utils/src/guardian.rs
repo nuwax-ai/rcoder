@@ -758,10 +758,8 @@ fn guardian_process_alive(pid: u32) -> Result<bool> {
 #[cfg(windows)]
 #[allow(unsafe_code)] // FFI: read-only Win32 handle open/query/close on a numeric pid.
 fn guardian_process_alive(pid: u32) -> Result<bool> {
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER};
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
         // Stale PIDs surface as ERROR_INVALID_PARAMETER; access denial
@@ -816,14 +814,29 @@ pub fn recover_with_scope_check(work_root: &Path) -> Result<RecoveryOutcome> {
                 };
                 if guardian_process_alive(pid)? {
                     return Ok(RecoveryOutcome::Stopping {
-                        detail: format!("owned command {pid} is still running"),
+                        detail: format!("owned command guardian {pid} is still running"),
                     });
                 }
-                // The guardian died without observing its command's exit. The
-                // whole captured scope was already proven ended by the caller
-                // (generation worker exit or process-space replacement), so
-                // the run authorization closes here; the command's business
-                // outcome stays explicitly unknown.
+                // 守护死亡不证明其命令死亡（SIGKILL 守护会孤儿化命令子进程）：
+                // 命令自身的 diagnostic_pid 也必须已死，"进程范围已空"才成立
+                //（plan §7.1 的收束前提）。命令仍在跑 → 如实 Stopping。
+                if let Some(command_pid) = command_record_of(receipt.command_record.as_deref())?
+                    .as_ref()
+                    .and_then(|command| command.get("diagnostic_pid"))
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|pid| u32::try_from(pid).ok())
+                    && guardian_process_alive(command_pid)?
+                {
+                    return Ok(RecoveryOutcome::Stopping {
+                        detail: format!(
+                            "guardian {pid} died but owned command {command_pid} is still running"
+                        ),
+                    });
+                }
+                // The guardian died without observing its command's exit and
+                // the command itself is gone. The run authorization closes
+                // here; the command's business outcome stays explicitly
+                // unknown (never fabricated).
                 receipt.phase = "Quiescent".into();
                 receipt.root_status = None;
                 save(&path, &receipt)?;
@@ -833,6 +846,23 @@ pub fn recover_with_scope_check(work_root: &Path) -> Result<RecoveryOutcome> {
         }
     }
     Ok(RecoveryOutcome::Settled)
+}
+
+/// Read the referenced command record; unreadable/missing records return
+/// None and keep the caller conservative only for identity-bearing failures.
+fn command_record_of(path: Option<&Path>) -> Result<Option<serde_json::Value>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
+                format!("decode command record {}", path.display())
+            })?))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read command record {}", path.display())),
+    }
 }
 
 /// Mark a dead guardian's command record settled without inventing an exit.
@@ -1305,6 +1335,52 @@ mod tests {
         );
         alive.kill().unwrap();
         alive.wait().unwrap();
+    }
+
+    /// 反例锁（竞态安全）：守护死了但其命令子进程仍存活（pkill 只杀了
+    /// app-cli 守护、孤儿命令还在写工作区）——不得收束授权，如实 Stopping；
+    /// 命令也死了才允许"结果未知"收束。
+    #[cfg(unix)]
+    #[test]
+    fn scope_checked_recovery_refuses_while_orphaned_command_lives() {
+        let scope = tempfile::tempdir().unwrap();
+        let work = scope.path().join("work").join("inst-t3c");
+        crate::command_context::create_durable_directory(&work.join("guardians")).unwrap();
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        dead.wait().unwrap();
+        // 守护 pid 已死；命令 pid 存活。
+        let mut orphan = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (guardian_root, command_path) =
+            fixture_running_guardian(&work, "cmd-orphan", Some(dead.id()));
+        let command: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&command_path).unwrap()).unwrap();
+        let mut with_pid = command.clone();
+        with_pid["diagnostic_pid"] = orphan.id().into();
+        std::fs::write(&command_path, with_pid.to_string()).unwrap();
+        let before = std::fs::read(guardian_root.join("receipt.json")).unwrap();
+        let outcome = recover_with_scope_check(&work).unwrap();
+        let detail = match outcome {
+            RecoveryOutcome::Stopping { detail } => detail,
+            other => panic!("expected Stopping, got {other:?}"),
+        };
+        assert!(detail.contains("still running"), "{detail}");
+        assert_eq!(
+            std::fs::read(guardian_root.join("receipt.json")).unwrap(),
+            before,
+            "孤儿命令存活时守护回执不得被改写"
+        );
+        // 命令也死了 → 收束为结果未知。
+        orphan.kill().unwrap();
+        orphan.wait().unwrap();
+        let outcome = recover_with_scope_check(&work).unwrap();
+        assert_eq!(outcome, RecoveryOutcome::Settled);
+        let settled: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&command_path).unwrap()).unwrap();
+        assert_eq!(settled["termination"], "GuardianDiedResultUnknown");
+        assert!(settled.get("exit_code").is_none() || settled["exit_code"].is_null());
     }
 
     /// 存量回执无 PID：保持保守失败（不猜、不强收）。

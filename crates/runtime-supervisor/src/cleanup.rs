@@ -119,19 +119,25 @@ pub(crate) async fn once(
             .context("external engine cleanup timed out")??;
         if !output.status.success() {
             // Prefer the adapter's own structured classification when it
-            // recorded one (engine identity/observability distinctions).
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let outcome =
-                CleanupOutcome::recorded(root).unwrap_or(CleanupOutcome::ObservationFailed {
-                    reason: format!("engine cleanup failed: {stderr}"),
-                });
-            CleanupOutcome::ObservationFailed {
-                reason: match &outcome {
-                    CleanupOutcome::ObservationFailed { reason } => reason.clone(),
-                    other => format!("{stderr} ({other:?})"),
-                },
+            // recorded one (ForeignIdentity 等)，不回写成 ObservationFailed；
+            // 适配器未分类时才落默认 ObservationFailed。
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            match CleanupOutcome::recorded(root) {
+                Some(CleanupOutcome::Empty) | None => {
+                    CleanupOutcome::ObservationFailed {
+                        reason: format!("engine cleanup failed: {stderr}"),
+                    }
+                    .record(root)?;
+                }
+                Some(already) => {
+                    let detail = format!("{already:?}");
+                    already.record(root)?;
+                    tracing::debug!(
+                        %detail, %stderr,
+                        "engine cleanup failed with adapter classification"
+                    );
+                }
             }
-            .record(root)?;
             anyhow::bail!("external engine cleanup failed: {stderr}");
         }
     }

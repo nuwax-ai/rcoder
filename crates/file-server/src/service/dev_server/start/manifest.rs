@@ -288,6 +288,18 @@ impl DevServerManager {
                         }
                         Ok(None) => {}
                         Err(error) => {
+                            // 初始化中的 owner（统一 owner 首个业务会话窗口）
+                            // 放行：start_dev 的复用路径对 Initializing 做有界
+                            // 等待（wait_for_recovery_owner），比此处直接拒绝
+                            // 更准确。其他探错维持安全方向拒绝。
+                            if error.to_string().contains("initializing") {
+                                tracing::info!(
+                                    project_id,
+                                    %error,
+                                    "owner initializing during start precheck; deferring to bounded reuse wait"
+                                );
+                                continue;
+                            }
                             tracing::warn!(%error, "owner identity probe failed during start precheck");
                         }
                     }

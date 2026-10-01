@@ -143,6 +143,12 @@ pub(crate) fn build_agent_env_vars(
     //   token 不入日志/事件/描述。
     // 普通 agent（Web/Computer）不注入：包装脚本 no-op，范围不扩大。
     if matches!(service_type, ServiceType::UserappBuilder) {
+        // 同步从 merged_env 摘除（同上方挂载契约键的处理）：否则下方
+        // merged_env 循环会追加第二个同名键——kubelet 取后值，存量
+        // APP_CLI_MANAGED=0 会复活灰度残留并覆盖平台的 1。
+        merged_env.remove("APP_CLI_MANAGED");
+        merged_env.remove("APP_CLI_RUNTIME_WORKSPACE");
+        merged_env.remove("APP_CLI_DEPLOY_TOKEN");
         env_vars.retain(|entry| entry.name != "APP_CLI_MANAGED");
         env_vars.push(EnvVar {
             name: "APP_CLI_MANAGED".to_string(),
@@ -332,6 +338,15 @@ mod b03_tests {
             &base,
         );
         assert_eq!(value_of(&forced, "APP_CLI_MANAGED").as_deref(), Some("1"));
+        // 键唯一性：kubelet 取后值，重复键会让 config 的 0 实际生效。
+        for name in [
+            "APP_CLI_MANAGED",
+            "APP_CLI_RUNTIME_WORKSPACE",
+            "APP_CLI_DEPLOY_TOKEN",
+        ] {
+            let hits = forced.iter().filter(|v| v.name == name).count();
+            assert_eq!(hits, 1, "{name} must appear exactly once");
+        }
 
         // 普通 agent：不注入（包装脚本 no-op，范围不扩大）
         let mut web = k8s_service(false);

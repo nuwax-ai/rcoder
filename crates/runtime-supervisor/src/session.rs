@@ -664,6 +664,14 @@ impl RunState {
                     discovery.snapshot.error = Some(format!("business launch failed: {error:#}"));
                     Ok(())
                 })?;
+                // 计入重启预算：否则工厂持续失败时 drive_idle 以 200ms
+                // 间隔无限重试（忙循环 + 日志风暴）。预算耗尽后仅在显式
+                // 请求（Recover/relaunch 通知）时再尝试。
+                self.core
+                    .restarts
+                    .lock()
+                    .expect("restart lock poisoned")
+                    .push_back(tokio::time::Instant::now());
                 return Ok(false);
             }
         };
