@@ -27,6 +27,9 @@ def main():
     parser.add_argument('--context', default='k3s-131')
     parser.add_argument('--image', required=True)
     parser.add_argument('--storage-class', default='ceph-rbd')
+    parser.add_argument('--cephfs-class', default='cephfs',
+                        help='cephfs StorageClass for the cross-client RWX '
+                             'experiment; empty string disables it')
     parser.add_argument('--report', required=True, type=str)
     parser.add_argument('--cleanup-volume', action='store_true')
     parser.add_argument('--node-ssh', action='append', default=[],
@@ -314,6 +317,59 @@ def main():
         check('T0-S: data intact after cross-node handover',
               exec_in('lock-c', 'cat /shared/sentinel').stdout.strip() == 'first',
               None, scenario='T0-S')
+
+        # ── T0-S：CephFS 跨节点独立客户端（RWX，两节点各自内核挂载）────
+        if args.cephfs_class:
+            fs_pvc = f'app-cli-lockfs-{run_id}'
+            apply(fs_pvc, {
+                'apiVersion': 'v1', 'kind': 'PersistentVolumeClaim',
+                'metadata': {'name': fs_pvc},
+                'spec': {'accessModes': ['ReadWriteMany'], 'resources': {
+                    'requests': {'storage': '1Gi'}},
+                    'storageClassName': args.cephfs_class}})
+            deadline = time.monotonic() + 120
+            fs_phase = None
+            while time.monotonic() < deadline:
+                fs_phase = json.loads(kubectl('get', 'pvc', fs_pvc, '-o',
+                                              'json').stdout)['status'].get('phase')
+                if fs_phase == 'Bound':
+                    break
+                time.sleep(2)
+            check('T0-S-fs: cephfs RWX PVC bound', fs_phase == 'Bound',
+                  fs_phase, scenario='T0-S-fs')
+            # 不同节点 = 独立 Ceph 内核客户端（各自 MDS 会话）。
+            apply('fs-a', serve_owner('fs-a', nodes[0], fs_pvc))
+            wait_ready('fs-a')
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and read_discovery('fs-a') is None:
+                time.sleep(2)
+            fs_first = read_discovery('fs-a')
+            check('T0-S-fs: owner acquires on cephfs', bool(fs_first),
+                  fs_first, scenario='T0-S-fs')
+            fs_contender = try_second_owner('fs-b', nodes[1], fs_pvc)
+            fs_refused = ('owner lock is held' in fs_contender
+                          or 'refusing to start a competing orchestrator'
+                          in fs_contender)
+            fs_transfer = ('dispatch' in fs_contender.lower()
+                           or 'second-rc=0' in fs_contender)
+            check('T0-S-fs: cross-client contender converges',
+                  fs_refused or fs_transfer, fs_contender[-300:],
+                  scenario='T0-S-fs')
+            exec_in('fs-a', 'kill -9 "$(cat /shared/logs/serve.pid)"', check=False)
+            apply('fs-c', serve_owner('fs-c', nodes[1], fs_pvc))
+            wait_ready('fs-c')
+            deadline = time.monotonic() + 120
+            fs_second = None
+            while time.monotonic() < deadline:
+                fs_second = read_discovery('fs-c')
+                if fs_second and fs_second != fs_first:
+                    break
+                time.sleep(3)
+            check('T0-S-fs: cross-client SIGKILL handover',
+                  bool(fs_second) and fs_second != fs_first,
+                  f'{fs_first} -> {fs_second}', scenario='T0-S-fs')
+            kubectl('delete', 'pod', 'fs-a', '--wait=true')
+            kubectl('delete', 'pod', 'fs-c', '--wait=true')
 
         # ── K8s E：同 Pod 容器重启（builder 形态 Downward API 绑定）────
         kubectl('delete', 'pod', 'lock-c', '--wait=true')
