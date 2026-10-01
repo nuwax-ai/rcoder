@@ -41,6 +41,10 @@ pub struct UserAppStorageConfig {
     #[serde(skip_serializing)]
     pub postgres: Option<rcoder_storage::config::PostgresConfig>,
     pub ensure_timeout_seconds: u64,
+    /// 交互转发请求（git/file 列表等）定位 builder 的等待上限；实际预算
+    /// 取 min(ensure_timeout_seconds, 本值)。冷启动（空闲回收后重建）实测
+    /// 10~13s，默认 20s 覆盖并留余量。
+    pub interactive_ensure_wait_seconds: u64,
 }
 
 impl Default for UserAppStorageConfig {
@@ -50,6 +54,7 @@ impl Default for UserAppStorageConfig {
             turso_path: PathBuf::from("data/rcoder/userapp.turso.db"),
             postgres: None,
             ensure_timeout_seconds: 90,
+            interactive_ensure_wait_seconds: 20,
         }
     }
 }
@@ -100,6 +105,15 @@ impl UserAppStorageConfig {
         }
         if self.ensure_timeout_seconds == 0 || self.ensure_timeout_seconds > 3600 {
             bail!("userApp ensure timeout must be between 1 and 3600 seconds");
+        }
+        if let Some(value) = lookup("RCODER_USERAPP_INTERACTIVE_ENSURE_WAIT_SECONDS") {
+            self.interactive_ensure_wait_seconds = value
+                .parse()
+                .context("invalid userApp interactive ensure wait")?;
+        }
+        if self.interactive_ensure_wait_seconds == 0 || self.interactive_ensure_wait_seconds > 3600
+        {
+            bail!("userApp interactive ensure wait must be between 1 and 3600 seconds");
         }
         if let Some(value) = lookup("RCODER_USERAPP_PG_URL") {
             if value.trim().is_empty() {
@@ -281,6 +295,26 @@ mod tests {
         }
     }
     #[test]
+    fn interactive_ensure_wait_defaults_and_overrides() {
+        let config = UserAppStorageConfig::default();
+        assert_eq!(config.ensure_timeout_seconds, 90);
+        assert_eq!(config.interactive_ensure_wait_seconds, 20);
+        let legacy: UserAppStorageConfig =
+            serde_yaml::from_str("ensure_timeout_seconds: 90").unwrap();
+        assert_eq!(legacy.interactive_ensure_wait_seconds, 20);
+        let mut config = UserAppStorageConfig::default();
+        config
+            .apply_overrides(|name| {
+                (name == "RCODER_USERAPP_INTERACTIVE_ENSURE_WAIT_SECONDS").then(|| "45".into())
+            })
+            .unwrap();
+        assert_eq!(config.interactive_ensure_wait_seconds, 45);
+        assert_eq!(
+            config.ensure_timeout_seconds, 90,
+            "interactive override must not touch the full ensure budget"
+        );
+    }
+    #[test]
     fn explicit_invalid_settings_never_fall_back_to_memory() {
         for (key, value) in [
             ("RCODER_USERAPP_STORAGE_BACKEND", "memory"),
@@ -289,6 +323,9 @@ mod tests {
             ("RCODER_USERAPP_SQLITE_PATH", "/old/path"),
             ("RCODER_USERAPP_ENSURE_TIMEOUT_SECONDS", "0"),
             ("RCODER_USERAPP_ENSURE_TIMEOUT_SECONDS", "oops"),
+            ("RCODER_USERAPP_INTERACTIVE_ENSURE_WAIT_SECONDS", "0"),
+            ("RCODER_USERAPP_INTERACTIVE_ENSURE_WAIT_SECONDS", "oops"),
+            ("RCODER_USERAPP_INTERACTIVE_ENSURE_WAIT_SECONDS", "3601"),
             ("RCODER_USERAPP_PG_URL", ""),
         ] {
             let mut config = UserAppStorageConfig::default();

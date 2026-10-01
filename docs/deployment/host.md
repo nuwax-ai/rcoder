@@ -87,6 +87,8 @@ CONTAINER_RUNTIME=kubernetes cargo run -p rcoder --bin rcoder --features kuberne
 
 OrbStack 首次供卷和拉起 UserApp Pod 可能超过默认 90 秒。运行本地 K8s UserApp 场景前，可在启动宿主机 RCoder 时设 `RCODER_USERAPP_ENSURE_TIMEOUT_SECONDS=240`；测试 HTTP 预算为 300 秒。一次超时不代表后台创建已结束，应先查询该测试应用的生命周期与实际资源，再通过 RCoder 的删除入口收尾。
 
+交互转发请求（git 状态/diff、文件列表等）定位 builder 的等待上限独立于上述总预算，由 `RCODER_USERAPP_INTERACTIVE_ENSURE_WAIT_SECONDS` 控制（默认 20 秒，实际取两者较小值；有效范围为 1～3600 秒）。一次测试集群的冷启动实测为 10～13 秒；调度、拉镜像或存储挂载较慢时仍可能超时。此时返回 `ERR_USERAPP_WAIT_TIMEOUT`，已受理的创建不会取消；先查询原操作状态，确认容器就绪后再重试。
+
 ## K8s 形态三前置（`make dev-host-k8s`）
 
 K8s 形态（本地 kubeconfig 直连 OrbStack k3s 等）比 Docker 形态多三个前置，缺一会在启动或首个 agent 创建时 fail-fast：

@@ -102,12 +102,12 @@ pub(super) fn missing_app_id_response() -> Response {
 /// 探活失败**不直接判死**：先经 `crate::userapp_builder::remediate_stale_registry`
 /// 以容器运行时真实状态裁决——Running 保容器（高负载超时/启动窗口抖动），
 /// 真死才清注册重建。
-/// 交互请求（file-list/git status 等）的整个定位阶段最多等待 10s；已知
-/// 冲突保留操作身份，否则返回等待超时，调用方可重试。tasks 查询不触发 ensure。
-/// 部署制品拉取（`/api/v1/userapp/static/*`）保留完整配置预算（默认 90s）。
-/// 调度、拉镜像或 drain 可能超出任一预算；HTTP 等待结束不取消创建工作者。
-const INTERACTIVE_ENSURE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-
+/// 交互请求（file-list/git status 等）的整个定位阶段最多等待
+/// `interactive_ensure_wait_seconds`（默认 20s，仍受 ensure 总预算约束）；
+/// 已知冲突保留操作身份，否则返回等待超时，调用方可重试。tasks 查询不触发
+/// ensure。部署制品拉取（`/api/v1/userapp/static/*`）保留完整配置预算
+/// （默认 90s）。调度、拉镜像或 drain 可能超出任一预算；HTTP 等待结束
+/// 不取消创建工作者。
 async fn resolve_dev_addr(
     state: &AppState,
     app_id: &str,
@@ -118,7 +118,9 @@ async fn resolve_dev_addr(
     let budget = if artifact_download {
         configured
     } else {
-        configured.min(INTERACTIVE_ENSURE_WAIT)
+        configured.min(std::time::Duration::from_secs(
+            state.config.userapp_storage.interactive_ensure_wait_seconds,
+        ))
     };
     let deadline = tokio::time::Instant::now() + budget;
     tokio::time::timeout_at(deadline, resolve_dev_addr_inner(state, app_id, deadline))
