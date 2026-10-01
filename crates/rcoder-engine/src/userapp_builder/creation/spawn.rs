@@ -30,7 +30,7 @@ pub(crate) fn spawn_operation(
         let execution = tokio::spawn(async move {
             let _flight = execution_flight;
             let _lease = lease;
-            let claimed = progress(
+            let mut claimed = progress(
                 &owned.userapp_store,
                 &initial,
                 &claimed_id,
@@ -42,6 +42,22 @@ pub(crate) fn spawn_operation(
             .await?;
             let ready_deadline = Instant::now()
                 + Duration::from_secs(owned.config.userapp_storage.ensure_timeout_seconds);
+            let predecessor = match registration::capture_predecessor(&owned, &claimed).await {
+                Ok(predecessor) => predecessor,
+                Err(error) => {
+                    // Only read-side identity/volume inspection has run. Record
+                    // that known rejection so a fresh request may retry it.
+                    progress(&owned.userapp_store, &claimed, &claimed_id,
+                        UserAppOperationState::Failed, "creation_result", serde_json::Value::Null,
+                        Some(format!("Inspect builder registration predecessor before creation: {error:#}"))).await?;
+                    return Ok(());
+                }
+            };
+            if let Some(predecessor) = predecessor {
+                claimed = progress(&owned.userapp_store, &claimed, &claimed_id,
+                    UserAppOperationState::Running, "creation_source_captured",
+                    serde_json::json!({"builder_creation_predecessor": predecessor}), None).await?;
+            }
             let creation = crate::userapp_builder::create_builder_inner(
                 &owned,
                 &claimed.app_id,
@@ -78,7 +94,7 @@ pub(crate) fn spawn_operation(
                     &claimed_id,
                     UserAppOperationState::RecoveryRequired,
                     "creation_confirmation_timed_out",
-                    serde_json::Value::Null,
+                    claimed.checkpoint.clone(),
                     Some("Builder confirmation deadline exceeded; remote execution is still being observed".into()),
                 )
                 .await?;
@@ -115,18 +131,19 @@ pub(crate) fn spawn_operation(
                         lifecycle_id: claimed.lifecycle_id.clone(), operation_id: claimed.operation_id.clone(),
                         executor_id: claimed_id.clone(), request_fingerprint: claimed.request_fingerprint.clone(),
                     };
-                    let evidence = shared_types::BuilderCreationEvidence {
+                    let evidence = registration::attach_predecessor(&owned, &claimed, shared_types::BuilderCreationEvidence {
+                        registration_predecessor: None,
                         creation_lease_released: true,
                         target: crate::userapp_builder::adoption::capture_bound_target(&owned, &context).await?,
                         container: info.clone(),
-                    };
+                    }).await?;
                     evidence.validate_operation(&claimed).map_err(anyhow::Error::msg)?;
                     completion = progress(&owned.userapp_store, &claimed, &claimed_id,
                         UserAppOperationState::Running, "builder_ready_confirmed",
                         serde_json::to_value(&evidence)?, None).await?;
                     (
                         UserAppOperationState::Succeeded,
-                        serde_json::to_value(info)?,
+                        registration::completed_checkpoint(&evidence)?,
                         None,
                     )
                 },
@@ -147,7 +164,7 @@ pub(crate) fn spawn_operation(
                         } else {
                             UserAppOperationState::RecoveryRequired
                         },
-                        if cancelled { serde_json::json!({"creation_cancelled": true}) } else { serde_json::Value::Null },
+                        if cancelled { serde_json::json!({"creation_cancelled": true}) } else { claimed.checkpoint.clone() },
                         Some(format!("{error:#}")),
                     )
                 }
@@ -327,11 +344,17 @@ pub(crate) async fn record_late_creation(
         request_fingerprint: claimed.request_fingerprint.clone(),
     };
     let target = crate::userapp_builder::adoption::capture_bound_target(state, &context).await?;
-    let evidence = shared_types::BuilderCreationEvidence {
-        creation_lease_released: true,
-        target,
-        container: info.clone(),
-    };
+    let evidence = registration::attach_predecessor(
+        state,
+        &snapshot,
+        shared_types::BuilderCreationEvidence {
+            registration_predecessor: None,
+            creation_lease_released: true,
+            target,
+            container: info.clone(),
+        },
+    )
+    .await?;
     evidence
         .validate_operation(&snapshot)
         .map_err(anyhow::Error::msg)?;
@@ -392,6 +415,7 @@ pub(crate) async fn reconcile_runtime_receipt(
         }
         Err(error) => return Err(error.into()),
     };
+    let evidence = registration::attach_predecessor(state, snapshot, evidence).await?;
     evidence
         .validate_operation(snapshot)
         .map_err(anyhow::Error::msg)?;

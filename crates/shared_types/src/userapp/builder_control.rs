@@ -211,12 +211,150 @@ mod tests {
 /// includes independently verified management readiness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct BuilderCreationPredecessor {
+    pub target: BuilderControlTarget,
+    pub volumes: Vec<crate::AppResourceIdentity>,
+}
+
+impl BuilderCreationPredecessor {
+    pub fn validate_operation(
+        &self,
+        operation: &crate::UserAppOperationRecord,
+    ) -> Result<(), String> {
+        self.target.validate()?;
+        let context = &self.target.context;
+        if operation.kind != crate::UserAppOperationKind::EnsureBuilder
+            || context.app_id != operation.app_id
+            || context.lifecycle_id != operation.lifecycle_id
+            || context.operation_id != operation.operation_id
+            || operation.executor_id.as_deref() != Some(context.executor_id.as_str())
+            || context.request_fingerprint != operation.request_fingerprint
+            || self
+                .target
+                .workload
+                .as_ref()
+                .is_none_or(|resource| resource.kind != crate::AppResourceKind::StatefulSet)
+            || self.volumes.is_empty()
+            || self.volumes.iter().any(|volume| {
+                volume.kind != crate::AppResourceKind::PersistentVolumeClaim
+                    || volume.name.is_empty()
+                    || volume.uid.is_empty()
+            })
+        {
+            return Err("Builder predecessor operation or volume identity differs".into());
+        }
+        Ok(())
+    }
+
+    pub fn validate_replacement(
+        &self,
+        target: &BuilderControlTarget,
+        volumes: &[crate::AppResourceIdentity],
+    ) -> Result<(), String> {
+        self.target.validate()?;
+        target.validate()?;
+        let source = self
+            .target
+            .workload
+            .as_ref()
+            .ok_or("Builder predecessor workload missing")?;
+        let replacement = target
+            .workload
+            .as_ref()
+            .ok_or("Builder replacement workload missing")?;
+        if self.target.context != target.context
+            || source.kind != crate::AppResourceKind::StatefulSet
+            || replacement.kind != crate::AppResourceKind::StatefulSet
+            || source.name != replacement.name
+            || source.uid == replacement.uid
+        {
+            return Err("Builder replacement operation or workload identity differs".into());
+        }
+        let identities = |items: &[crate::AppResourceIdentity]| -> Result<std::collections::BTreeMap<String, String>, String> {
+            let mut result = std::collections::BTreeMap::new();
+            for item in items {
+                if item.kind != crate::AppResourceKind::PersistentVolumeClaim
+                    || item.name.is_empty() || item.uid.is_empty()
+                    || result.insert(item.name.clone(), item.uid.clone()).is_some()
+                {
+                    return Err("Builder replacement volume identity is incomplete".into());
+                }
+            }
+            if result.is_empty() {
+                return Err("Builder replacement requires captured workspace volumes".into());
+            }
+            Ok(result)
+        };
+        if identities(&self.volumes)? != identities(volumes)? {
+            return Err("Builder replacement workspace volume identity changed".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuilderCreationEvidence {
     pub creation_lease_released: bool,
     pub target: BuilderControlTarget,
     pub container: crate::ContainerBasicInfo,
+    /// Original workload and PVC identities captured before this operation's
+    /// controlled replacement. Omitted for ordinary creation/reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_predecessor: Option<BuilderCreationPredecessor>,
 }
 impl BuilderCreationEvidence {
+    /// Registration-only repair for an acknowledged older controlled upgrade.
+    /// This does not prove historical volume preservation or authorize another
+    /// container write. The runtime creator receipt must carry its own binding.
+    pub fn validate_registration_replacement(
+        &self,
+        operation: &crate::UserAppOperationRecord,
+        volumes: &[crate::AppResourceIdentity],
+    ) -> Result<(), String> {
+        self.validate_operation(operation)?;
+        if operation.state != crate::UserAppOperationState::Succeeded {
+            return Err("Builder registration requires the succeeded original operation".into());
+        }
+        if let Some(source) = &self.registration_predecessor {
+            return source.validate_replacement(&self.target, volumes);
+        }
+        let workload = self
+            .target
+            .workload
+            .as_ref()
+            .ok_or("Builder creator workload missing")?;
+        let binding = self
+            .target
+            .resource_binding
+            .as_ref()
+            .ok_or("Original builder replacement receipt has no creator binding")?;
+        binding.validate(&self.target.context, &workload.uid)?;
+        if workload.kind != crate::AppResourceKind::StatefulSet
+            || binding.service_type != crate::ServiceType::UserappBuilder
+            || binding.adopted_by_operation != operation.operation_id
+            || self.container.workload_uid.as_deref() != Some(workload.uid.as_str())
+            || volumes.is_empty()
+            || volumes.iter().any(|volume| {
+                volume.kind != crate::AppResourceKind::PersistentVolumeClaim
+                    || volume.name.is_empty()
+                    || volume.uid.is_empty()
+            })
+            || volumes
+                .iter()
+                .map(|volume| &volume.name)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != volumes.len()
+        {
+            return Err(
+                "Original builder replacement receipt or current volume identity is incomplete"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn validate_operation(
         &self,
         operation: &crate::UserAppOperationRecord,
@@ -248,6 +386,17 @@ impl BuilderCreationEvidence {
             .map_or(workload.uid.as_str(), |pod| pod.uid.as_str());
         if self.container.container_id.is_empty() || physical != self.container.container_id {
             return Err("Builder completion physical identity mismatch".into());
+        }
+        if let Some(predecessor) = &self.registration_predecessor {
+            predecessor.validate_operation(operation)?;
+            if predecessor
+                .target
+                .workload
+                .as_ref()
+                .is_some_and(|source| source.uid == workload.uid)
+            {
+                return Err("Builder replacement did not change workload identity".into());
+            }
         }
         Ok(())
     }

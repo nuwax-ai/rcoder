@@ -450,6 +450,9 @@ async fn verify_registration(
     if !publish {
         return Ok(Some(updated));
     }
+    if creation::repair_live_registration(state, app_id, instance, &updated).await? {
+        return Ok(Some(updated));
+    }
     if let Some(mut project) = state.get_project(instance).map(|p| (*p).clone()) {
         project.set_service_type(Some(ServiceType::UserappBuilder));
         project.set_container(Some(updated.clone()));
@@ -620,7 +623,9 @@ async fn registered_or_discovered_builder(
     };
     adoption::verify_live_builder(state, instance, instance, &info.container_id).await?;
     state.runtime().refresh_container_reach(&info).await?;
-    register_builder(state, instance, &info)?;
+    if !creation::repair_live_registration(state, instance, instance, &info).await? {
+        register_builder(state, instance, &info)?;
+    }
     Ok(Some(info))
 }
 

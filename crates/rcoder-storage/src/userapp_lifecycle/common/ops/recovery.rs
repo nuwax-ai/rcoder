@@ -357,7 +357,10 @@ pub(crate) async fn confirm_builder_creation_recovery(
         before
             .validate_operation(&op)
             .map_err(Error::InvalidOperation)?;
-        if before.target != evidence.target {
+        if before.target != evidence.target
+            || serde_json::to_value(&before.registration_predecessor).map_err(storage)?
+                != serde_json::to_value(&evidence.registration_predecessor).map_err(storage)?
+        {
             return Err(Error::VersionConflict);
         }
     } else if !userapp_builder_creation_needs_runtime_receipt(&op) {

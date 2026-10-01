@@ -476,6 +476,7 @@ impl KubernetesRuntime {
         ContainerBasicInfo,
         Option<shared_types::UserAppResourceBinding>,
     )> {
+        let mut upgrade_attempted = false;
         let (target, upgraded_binding) = async {
             let context = params.execution_context.as_ref().ok_or_else(|| {
                 Error::ConfigurationError("Bound builder requires execution context".into())
@@ -533,6 +534,7 @@ impl KubernetesRuntime {
                 .map_err(|error| Error::Conflict(error.to_string()))?
                 {
                     crate::runtime::k8s_statefulset::helpers::BuilderTemplateCheck::NeedsUpgrade => {
+                        upgrade_attempted = true;
                         self.replace_builder_statefulset_controlled(context, &current, desired_sts)
                             .await
                             .map_err(|error| Error::Conflict(error.to_string()))?;
@@ -572,7 +574,7 @@ impl KubernetesRuntime {
             Ok((target, None))
         }
         .await
-        .map_err(|error| rejected_before_write(error.to_string()))?;
+        .map_err(|error| if upgrade_attempted { error } else { rejected_before_write(error.to_string()) })?;
         let outcome = self
             .apply_builder_compute_mode_inner(
                 &target,

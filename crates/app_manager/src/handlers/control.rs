@@ -414,6 +414,7 @@ mod builder_retry_tests {
                 (
                     "builder_ready_confirmed",
                     serde_json::to_value(shared_types::BuilderCreationEvidence {
+                        registration_predecessor: None,
                         creation_lease_released: true,
                         target: shared_types::BuilderControlTarget {
                             context: context.clone(),

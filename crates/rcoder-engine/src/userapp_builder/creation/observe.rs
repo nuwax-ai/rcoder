@@ -160,7 +160,7 @@ pub(crate) async fn wait(
             "Builder lifecycle changed before returning its address"
         ));
     }
-    let info: ContainerBasicInfo = serde_json::from_value(operation.checkpoint)
+    let info: ContainerBasicInfo = serde_json::from_value(operation.checkpoint.clone())
         .context("decode completed builder resource identity")?;
     let verified = crate::userapp_builder::verify_registration(
         state,
@@ -185,7 +185,7 @@ pub(crate) async fn wait(
             false,
         )
         .await?;
-    crate::userapp_builder::register_builder(state, instance, &verified)?;
+    registration::register_completion(state, &operation, instance, &verified).await?;
     Ok(verified)
 }
 
@@ -327,7 +327,11 @@ pub(crate) async fn reconcile_completed(
                 &evidence.target.context.executor_id,
                 UserAppOperationState::Succeeded,
                 "creation_result",
-                serde_json::to_value(info)?,
+                {
+                    let mut completed = evidence.clone();
+                    completed.container = info;
+                    registration::completed_checkpoint(&completed)?
+                },
                 None,
             )
             .await?;

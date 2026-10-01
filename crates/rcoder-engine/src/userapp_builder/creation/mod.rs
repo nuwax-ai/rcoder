@@ -84,10 +84,12 @@ mod fence;
 #[cfg(test)]
 pub(crate) mod fence_settler_tests;
 mod observe;
+mod registration;
 mod spawn;
 #[cfg(test)]
 mod tests;
 
 pub(super) use fence::*;
 pub(super) use observe::*;
+pub(super) use registration::repair_live_registration;
 pub(super) use spawn::*;

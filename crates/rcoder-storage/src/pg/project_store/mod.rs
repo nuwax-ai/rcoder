@@ -26,4 +26,5 @@ mod tests;
 #[cfg(test)]
 mod lifecycle_tests;
 
+mod builder_replacement;
 mod database;

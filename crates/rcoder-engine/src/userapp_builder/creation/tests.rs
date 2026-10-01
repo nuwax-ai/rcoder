@@ -281,6 +281,7 @@ mod cases {
             workload_uid: None,
         };
         let evidence = shared_types::BuilderCreationEvidence {
+            registration_predecessor: None,
             creation_lease_released: true,
             target: shared_types::BuilderControlTarget {
                 resource_binding: None,

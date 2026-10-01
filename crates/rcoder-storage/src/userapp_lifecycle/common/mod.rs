@@ -1,6 +1,12 @@
 //! One transaction algorithm for PostgreSQL and Turso. Runtime effects never
 //! execute here; the storage owner drains complete admitted transactions.
 mod activity;
+#[cfg(feature = "pg")]
+mod builder_registration;
+#[cfg(feature = "pg")]
+pub(crate) use builder_registration::{
+    bind_completed_builder_registration, completed_builder_registration_candidates,
+};
 #[cfg(test)]
 mod activity_tests;
 #[cfg(test)]

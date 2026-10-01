@@ -140,6 +140,14 @@ impl ProjectAdapter {
         // 消除 projects ↔ containers 跨 DashMap 的 TOCTOU 竞态（ref_count 泄漏根因）。
         // lockmap 的 entry_by_ref 阻塞获取 per-key 排他锁，guard drop 自动释放 + 自动清理。
         let _project_guard = self.project_locks.entry_by_ref(&project_id);
+        self.insert_locked(project_id, info)
+    }
+
+    fn insert_locked(
+        &self,
+        project_id: String,
+        info: Arc<ProjectAndContainerInfo>,
+    ) -> anyhow::Result<()> {
         // DashMap 键：优先 container_name（跨重建稳定、含 service_type 前缀防跨类型碰撞），
         // 无容器信息时回退裸 logical_id（仅占位，不建容器条目）。
         let key = container_entry_key(&info);
@@ -259,6 +267,43 @@ impl ProjectAdapter {
                 .insert(pid.to_string(), project_id);
         }
         Ok(())
+    }
+
+    pub(crate) fn insert_after_verified_builder_replacement(
+        &self,
+        info: ProjectAndContainerInfo,
+        source: &shared_types::BuilderCreationPredecessor,
+    ) -> anyhow::Result<()> {
+        let project_id = info.project_id().to_string();
+        let _project_guard = self.project_locks.entry_by_ref(&project_id);
+        let next = info
+            .container_info()
+            .ok_or_else(|| anyhow::anyhow!("Builder replacement container missing"))?;
+        let source_uid = source
+            .target
+            .workload
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Builder predecessor workload missing"))?
+            .uid
+            .as_str();
+        if let Some(current) = self.get(&project_id)
+            && let Some(container) = current.container_info()
+        {
+            anyhow::ensure!(
+                current.service_type() == Some(shared_types::ServiceType::UserappBuilder)
+                    && (container.workload_uid.as_deref() == Some(source_uid)
+                        || (container.workload_uid == next.workload_uid
+                            && container.container_id == next.container_id)),
+                "Builder registry changed before replacement publication"
+            );
+        }
+        let mut info = self
+            .get(&project_id)
+            .map(|current| (*current).clone())
+            .unwrap_or(info);
+        info.set_service_type(Some(shared_types::ServiceType::UserappBuilder));
+        info.set_container(Some(next));
+        self.insert_locked(project_id, Arc::new(info))
     }
 
     /// 删除项目（RAII 核心）

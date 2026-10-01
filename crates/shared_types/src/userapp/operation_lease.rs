@@ -72,10 +72,22 @@ pub fn userapp_builder_creation_needs_runtime_receipt(op: &crate::UserAppOperati
             crate::UserAppOperationState::Running | crate::UserAppOperationState::RecoveryRequired
         )
         && op.executor_id.is_some()
-        && op.checkpoint.is_null()
+        && (op.checkpoint.is_null()
+            || op.checkpoint.as_object().is_some_and(|checkpoint| {
+                checkpoint.len() == 1
+                    && checkpoint
+                        .get("builder_creation_predecessor")
+                        .is_some_and(|value| {
+                            serde_json::from_value::<crate::BuilderCreationPredecessor>(
+                                value.clone(),
+                            )
+                            .is_ok_and(|source| source.validate_operation(op).is_ok())
+                        })
+            }))
         && matches!(
             op.step.as_str(),
             "claimed"
+                | "creation_source_captured"
                 | "creation_confirmation_timed_out"
                 | "worker_interrupted"
                 | "creation_result"

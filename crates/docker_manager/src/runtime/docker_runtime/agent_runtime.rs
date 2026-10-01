@@ -204,6 +204,7 @@ impl AgentContainerRuntime for DockerRuntime {
         self.release_captured_file_lease(context, &receipt.lease)
             .await?;
         Ok(Some(shared_types::BuilderCreationEvidence {
+            registration_predecessor: None,
             creation_lease_released: true,
             target: receipt.target,
             container: receipt.container,

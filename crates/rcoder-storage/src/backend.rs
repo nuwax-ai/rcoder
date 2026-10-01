@@ -28,6 +28,67 @@ pub enum ProjectStoreBackend {
 }
 
 impl ProjectStoreBackend {
+    pub async fn completed_builder_registration_candidates(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        pod_uid: &str,
+        workload_uid: &str,
+    ) -> anyhow::Result<Vec<shared_types::UserAppOperationRecord>> {
+        match self {
+            Self::Memory(_) => {
+                let _ = (app_id, lifecycle_id, pod_uid, workload_uid);
+                Ok(Vec::new())
+            }
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .completed_builder_registration_candidates(
+                        app_id,
+                        lifecycle_id,
+                        pod_uid,
+                        workload_uid,
+                    )
+                    .await
+            }
+        }
+    }
+
+    /// Install only a workload replacement proven by the original successful
+    /// UserApp operation. Ordinary insert keeps its physical identity fence.
+    pub async fn register_completed_builder_replacement(
+        &self,
+        operation: &shared_types::UserAppOperationRecord,
+        evidence: &shared_types::BuilderCreationEvidence,
+        volumes: &[shared_types::AppResourceIdentity],
+    ) -> anyhow::Result<()> {
+        evidence
+            .validate_registration_replacement(operation, volumes)
+            .map_err(anyhow::Error::msg)?;
+        match self {
+            Self::Memory(inner) => {
+                let mut project = inner
+                    .get(&operation.app_id)
+                    .map(|p| (*p).clone())
+                    .unwrap_or_else(|| ProjectAndContainerInfo::new(operation.app_id.clone()));
+                project.set_service_type(Some(ServiceType::UserappBuilder));
+                project.set_container(Some(evidence.container.clone()));
+                match evidence.registration_predecessor.as_ref() {
+                    Some(source) => {
+                        inner.insert_after_verified_builder_replacement(project, source)
+                    }
+                    None => inner.insert(operation.app_id.clone(), Arc::new(project)),
+                }
+            }
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .register_completed_builder_replacement(operation, evidence, volumes)
+                    .await
+            }
+        }
+    }
+
     /// 取内层 ProjectAdapter（Memory 即自身；Postgres 为其镜像）。
     /// 供需要内存实现特有能力（如 load_from_rows）的装配代码使用。
     pub fn memory_mirror(&self) -> &ProjectAdapter {
