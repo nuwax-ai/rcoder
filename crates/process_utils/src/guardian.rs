@@ -763,7 +763,7 @@ fn guardian_process_alive(pid: u32) -> Result<bool> {
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle == 0 {
+    if handle.is_null() {
         // Stale PIDs surface as ERROR_INVALID_PARAMETER; access denial
         // (5) means the process exists.
         let code = unsafe { GetLastError() };
