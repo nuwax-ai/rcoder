@@ -683,7 +683,7 @@ strip_prefix = false
         # 修复 journal（合法空记录覆盖，不删除原文件的诊断需要已满足），
         # 下一显式新请求恢复业务。
         write({state_root_dir + '/.deploy-operation.json':
-                   '{\\"deploy_replays\\": {}}'})
+                   '{\"deploy_replays\": {}}'})
         start('restart')
         check('R3: business recovers after journal repaired',
               content() == 'recovery-c-2', content(), scenario='R3')
