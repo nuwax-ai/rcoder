@@ -415,6 +415,39 @@ strip_prefix = false
               execute('cat "$1/sentinel"', workspace).stdout == 'recovery-a-1',
               None, scenario='D')
 
+        # ── H：迁移结果未知 + 进程范围已空 ────────────────────────────
+        # 预置未确认迁移回执（identity 匹配当前 release，completed=false）：
+        # Stop/管理必须可用；依赖迁移的启动给出具体原因；不自动重跑、不伪造。
+        post('stop')
+        migrate_ws = workspace
+        receipt_dir = state_root + '/migration-receipts'
+        write({receipt_dir + '/unconfirmed.json':
+                   json.dumps({'identity': 'H' * 64, 'completed': False})})
+        stop_h = post('stop')
+        check('H: stop works with unconfirmed migration present',
+              stop_h.get('message') == 'Stopped' and content() is None,
+              stop_h, scenario='H')
+        check('H: management still queryable',
+              bool(identity()), None, scenario='H')
+        restart_h = None
+        try:
+            restart_h = start('restart')
+        except RuntimeError as error:
+            restart_h = str(error)
+        # 两种合法结局：启动被拒并给出迁移具体原因；或启动成功但**没有重跑
+        # 迁移**（回执仍 completed=false——伪造成功/静默重跑都算失败）。
+        refused = isinstance(restart_h, str) and (
+            'migration' in restart_h.lower()
+            or 'reconciliation' in restart_h.lower())
+        started_ok = not isinstance(restart_h, str)
+        receipt_now = json.loads(execute(
+            'cat "$1"', receipt_dir + '/unconfirmed.json').stdout)
+        check('H: unconfirmed migration blocks or explains dependent start',
+              refused or started_ok, str(restart_h)[:200], scenario='H')
+        check('H: migration outcome not fabricated nor silently rerun',
+              receipt_now.get('completed') is False,
+              receipt_now, scenario='H')
+
         report['success'] = True
     except (Exception, KeyboardInterrupt) as error:
         report.update(success=False, error=str(error))
