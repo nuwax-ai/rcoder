@@ -76,6 +76,73 @@ impl KubernetesRuntime {
         };
         match validate_builder_statefulset(&existing, &desired, context)? {
             BuilderTemplateCheck::Current => {}
+            BuilderTemplateCheck::NeedsUpgrade => {
+                // recovery v2 R7：存量 builder 的 managed-owner 平台注入
+                // 漂移走受控模板替换——缩容到 0 → 删除 STS（工作区 PVC 为
+                // 独立对象，非 STS ownerReference 管辖，替换不触碰卷与数据）
+                // → 以期望模板重建 → 回到既有 scale-to-1 路径。升级不是
+                // 每次应用 Restart 的内部兜底：仅此签名触发一次。
+                let name = self.pod_name(&context.app_id, &family)?;
+                let api = self.statefulsets();
+                if let Some(spec) = existing.spec.as_ref()
+                    && spec.replicas.unwrap_or(1) > 0
+                {
+                    let scaled = {
+                        let mut patched = existing.clone();
+                        if let Some(spec) = patched.spec.as_mut() {
+                            spec.replicas = Some(0);
+                        }
+                        patched
+                    };
+                    api.replace(&name, &PostParams::default(), &scaled)
+                        .await
+                        .map_err(|error| {
+                            crate::runtime::builder_completion::k8s_error(
+                                format!("Scale old builder StatefulSet to 0: {error}"),
+                                error,
+                            )
+                        })?;
+                }
+                api.delete(&name, &DeleteParams::default())
+                    .await
+                    .map_err(|error| {
+                        crate::runtime::builder_completion::k8s_error(
+                            format!("Delete superseded builder StatefulSet: {error}"),
+                            error,
+                        )
+                    })?;
+                // 等待 STS 对象消失（pod 由级联终止；PVC 独立保留）。
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+                while tokio::time::Instant::now() < deadline {
+                    if api
+                        .get_opt(&name)
+                        .await
+                        .map_err(|error| {
+                            crate::runtime::builder_completion::k8s_error(
+                                format!("Wait for builder StatefulSet removal: {error}"),
+                                error,
+                            )
+                        })?
+                        .is_none()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                api.create(&PostParams::default(), &desired)
+                    .await
+                    .map_err(|error| {
+                        crate::runtime::builder_completion::k8s_error(
+                            format!("Recreate upgraded builder StatefulSet: {error}"),
+                            error,
+                        )
+                    })?;
+                tracing::info!(
+                    app = %context.app_id,
+                    "upgraded legacy builder StatefulSet to the managed-owner template                      (workspace PVC preserved)"
+                );
+                return Ok(());
+            }
             BuilderTemplateCheck::StaleHash => {
                 // 内容等价但注解是旧算法值：纯 metadata patch 重写后复用。
                 let desired_hash = desired

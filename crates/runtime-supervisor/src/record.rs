@@ -493,7 +493,23 @@ fn verify_abandoned_worker(
         );
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // R6：只读 OpenProcess 观察陈旧 PID（打开失败即证不存在；拒绝
+        // 访问=存在）。观察后复核 uptime 仍单调，排除窗口内重启。
+        ensure!(
+            !process_utils::process_exists(pid).context("inspect original worker process")?,
+            "generation {} worker {pid} still exists; cleanup is unconfirmed",
+            value.id
+        );
+        let after = crate::epoch::current().context("re-read process epoch")?;
+        ensure!(
+            crate::epoch::same_process_space(&now, &after),
+            "process space changed during worker inspection"
+        );
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
     anyhow::bail!("local worker {pid} exit inspection is unsupported on this platform")
 }
 

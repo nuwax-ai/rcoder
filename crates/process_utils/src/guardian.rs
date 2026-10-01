@@ -744,31 +744,18 @@ fn decode_status(raw: i64) -> std::io::Result<ExitStatus> {
     ))
 }
 
-/// Called only while holding the original scope owner lock. Revocation under
-/// the same guardian lock prevents a late Pending guardian from spawning.
-/// Observe the guardian process without signaling it. Unix uses kill(0)
-/// observation (ESRCH proves absence); Windows opens the PID read-only —
-/// a stale PID fails to open, which proves absence. Never authority to
-/// signal anything.
+/// The receipt's diagnostic_pid is the managed command root, as written by
+/// execute_unconsumed, not the guardian PID. On Unix its process group can
+/// outlive the root, so both must be absent before settling an execution.
+/// Observation is never authority to signal a PID or group read from disk.
 #[cfg(unix)]
 fn guardian_process_alive(pid: u32) -> Result<bool> {
-    Ok(crate::process_exists(pid)?)
+    Ok(crate::process_exists(pid)? || crate::process_group_exists(pid)?)
 }
 
 #[cfg(windows)]
-#[allow(unsafe_code)] // FFI: read-only Win32 handle open/query/close on a numeric pid.
 fn guardian_process_alive(pid: u32) -> Result<bool> {
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError};
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        // Stale PIDs surface as ERROR_INVALID_PARAMETER; access denial
-        // (5) means the process exists.
-        let code = unsafe { GetLastError() };
-        return Ok(code != ERROR_INVALID_PARAMETER);
-    }
-    unsafe { CloseHandle(handle) };
-    Ok(true)
+    Ok(crate::process_exists(pid)?)
 }
 
 /// Outcome of a scope-checked guardian recovery (recovery v2 plan §7.1).
@@ -817,9 +804,8 @@ pub fn recover_with_scope_check(work_root: &Path) -> Result<RecoveryOutcome> {
                         detail: format!("owned command guardian {pid} is still running"),
                     });
                 }
-                // 守护死亡不证明其命令死亡（SIGKILL 守护会孤儿化命令子进程）：
-                // 命令自身的 diagnostic_pid 也必须已死，"进程范围已空"才成立
-                //（plan §7.1 的收束前提）。命令仍在跑 → 如实 Stopping。
+                // Keep a separately recorded command range protected too. On
+                // Unix absence includes its process group, not just the root.
                 if let Some(command_pid) = command_record_of(receipt.command_record.as_deref())?
                     .as_ref()
                     .and_then(|command| command.get("diagnostic_pid"))
@@ -1381,6 +1367,47 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&command_path).unwrap()).unwrap();
         assert_eq!(settled["termination"], "GuardianDiedResultUnknown");
         assert!(settled.get("exit_code").is_none() || settled["exit_code"].is_null());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scope_checked_recovery_keeps_orphaned_descendants_running() {
+        use std::os::unix::process::CommandExt;
+
+        struct GroupCleanup(u32);
+        impl Drop for GroupCleanup {
+            fn drop(&mut self) {
+                crate::kill_process_group(self.0, crate::KillSignal::SIGKILL);
+            }
+        }
+
+        let scope = tempfile::tempdir().unwrap();
+        let work = scope.path().join("work").join("orphan-tree");
+        crate::command_context::create_durable_directory(&work.join("guardians")).unwrap();
+        // The root exits but a real child stays in its managed process group.
+        let mut root = std::process::Command::new("sh");
+        root.args(["-c", "sleep 30 & exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut root = root.spawn().unwrap();
+        let pid = root.id();
+        let _cleanup = GroupCleanup(pid);
+        root.wait().unwrap();
+        assert!(!crate::process_exists(pid).unwrap());
+        assert!(crate::process_group_exists(pid).unwrap());
+        // execute_unconsumed stores the managed command PID in this receipt.
+        let (guardian_root, _) = fixture_running_guardian(&work, "orphan-tree", Some(pid));
+        let before = std::fs::read(guardian_root.join("receipt.json")).unwrap();
+        assert!(matches!(
+            recover_with_scope_check(&work).unwrap(),
+            RecoveryOutcome::Stopping { .. }
+        ));
+        assert_eq!(
+            std::fs::read(guardian_root.join("receipt.json")).unwrap(),
+            before
+        );
     }
 
     /// 存量回执无 PID：保持保守失败（不猜、不强收）。

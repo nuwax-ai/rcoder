@@ -45,6 +45,40 @@ pub fn process_exists(pid: u32) -> std::io::Result<bool> {
     process_observation(kill(Pid::from_raw(pid), None))
 }
 
+/// Windows 只读存活观察：OpenProcess(QUERY_LIMITED_INFORMATION)。陈旧 PID
+/// 打开失败（ERROR_INVALID_PARAMETER）即证不存在；拒绝访问（5）=存在。
+/// 只是观察，绝不构成对磁盘读出 PID 的信号授权。
+#[cfg(windows)]
+pub fn process_exists(pid: u32) -> std::io::Result<bool> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    #[allow(unsafe_code)] // FFI: read-only handle open/query/close on a numeric pid.
+    fn open(pid: u32) -> isize {
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) }
+    }
+    #[allow(unsafe_code)] // FFI: paired close of the handle opened above.
+    fn close(handle: isize) {
+        unsafe { CloseHandle(handle) };
+    }
+    #[allow(unsafe_code)] // FFI: thread-local error read after a failed open.
+    fn last_error() -> u32 {
+        unsafe { GetLastError() }
+    }
+    if pid == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid process identifier",
+        ));
+    }
+    let handle = open(pid);
+    if handle == 0 {
+        let code = last_error();
+        return Ok(code != ERROR_INVALID_PARAMETER);
+    }
+    close(handle);
+    Ok(true)
+}
+
 #[cfg(unix)]
 fn process_observation(result: Result<(), nix::errno::Errno>) -> std::io::Result<bool> {
     match result {

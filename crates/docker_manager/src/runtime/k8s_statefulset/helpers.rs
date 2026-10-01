@@ -33,6 +33,8 @@ pub(super) enum BuilderTemplateCheck {
     /// Current 对待——不愈合则存量 STS 的每次全量校验必然 mismatch，落成
     /// 围栏/收束循环（哈希算法演进的一次性迁移语义）。
     StaleHash,
+    /// managed-owner 注入签名内的模板漂移：受控替换（保留 PVC）。
+    NeedsUpgrade,
 }
 
 /// 哈希指纹与内容等价判定的共同 env 口径：剔除随请求/创建抖动的键
@@ -63,6 +65,55 @@ pub(super) fn canonical_env(env: &[EnvVar]) -> Vec<EnvVar> {
         .collect();
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
+}
+
+/// recovery v2 R7：识别"仅由 managed-owner 平台注入变化"造成的 env 漂移。
+/// 存量 builder（APP_CLI_MANAGED=0/缺失、无运行工作区注入）升级到固定启用
+/// 形态时的差异键集合；其他任何漂移（镜像/命令/第三方 env）不属于此列，
+/// 仍走 Conflict。仅看键级增改：APP_CLI_MANAGED 的 0→1 值变化、
+/// APP_CLI_RUNTIME_WORKSPACE 的新增，以及 RCODER_PHYSICAL_POD_UID
+/// fieldRef 重写。
+pub(super) fn is_managed_owner_upgrade_drift(
+    actual_env: &[EnvVar],
+    desired_env: &[EnvVar],
+) -> bool {
+    const UPGRADE_KEYS: [&str; 3] = [
+        "APP_CLI_MANAGED",
+        "APP_CLI_RUNTIME_WORKSPACE",
+        "RCODER_PHYSICAL_POD_UID",
+    ];
+    fn find<'a>(env: &'a [EnvVar], name: &str) -> Option<&'a EnvVar> {
+        env.iter().find(|entry| entry.name == name)
+    }
+    let mut saw_upgrade_diff = false;
+    for entry in desired_env {
+        let Some(current) = find(actual_env, &entry.name) else {
+            // 新增键：仅当属于升级注入集合才计入，否则不是升级签名。
+            if UPGRADE_KEYS.contains(&entry.name.as_str()) {
+                saw_upgrade_diff = true;
+            } else {
+                return false;
+            }
+            continue;
+        };
+        if current.value != entry.value
+            || current.value_from.is_some() != entry.value_from.is_some()
+        {
+            if UPGRADE_KEYS.contains(&entry.name.as_str()) {
+                saw_upgrade_diff = true; // 0→1 或 literal→fieldRef
+            } else {
+                return false;
+            }
+        }
+    }
+    // 期望侧删除的键（存量有、新版无）同样不得出现。
+    for entry in actual_env {
+        if find(desired_env, &entry.name).is_none() && !UPGRADE_KEYS.contains(&entry.name.as_str())
+        {
+            return false;
+        }
+    }
+    saw_upgrade_diff
 }
 
 /// 内容优先的复用校验：launch 投影（镜像/command/args/归一化 env/容器集合/
@@ -133,6 +184,16 @@ pub(super) fn validate_builder_statefulset(
         // 漂移源一眼可辨，不再需要二进制对比。
         let actual_env = canonical_env(actual.env.as_deref().unwrap_or(&[]));
         let desired_env = canonical_env(desired_container.env.as_deref().unwrap_or(&[]));
+        // recovery v2 R7：managed-owner 平台注入签名内的 env 漂移走受控
+        // 模板升级（替换 STS、保留外部 PVC），不再以 Conflict 围栏存量。
+        if actual_env != desired_env
+            && is_managed_owner_upgrade_drift(&actual_env, &desired_env)
+            && actual.image == desired_container.image
+            && actual.command == desired_container.command
+            && actual.args == desired_container.args
+        {
+            return Ok(BuilderTemplateCheck::NeedsUpgrade);
+        }
         if actual_env != desired_env {
             let actual_keys: std::collections::BTreeSet<&str> =
                 actual_env.iter().map(|entry| entry.name.as_str()).collect();
@@ -307,4 +368,29 @@ pub(super) fn validate_agent_statefulset(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_owner_upgrade_drift_is_classified_precisely() {
+        let env = |name: &str, value: Option<&str>| EnvVar {
+            name: name.into(),
+            value: value.map(Into::into),
+            ..Default::default()
+        };
+        let old = vec![
+            env("PROJECT_ID", Some("11")),
+            env("APP_CLI_MANAGED", Some("0")),
+        ];
+        let new = vec![
+            env("PROJECT_ID", Some("11")),
+            env("APP_CLI_MANAGED", Some("1")),
+            env("APP_CLI_RUNTIME_WORKSPACE", Some("/home/user/11/code")),
+        ];
+        assert!(is_managed_owner_upgrade_drift(&old, &new));
+        assert!(!is_managed_owner_upgrade_drift(&new, &new.clone()));
+    }
 }

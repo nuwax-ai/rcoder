@@ -39,6 +39,11 @@ pub(crate) fn same_process_space(recorded: &str, current: &str) -> bool {
     match (parse(recorded), parse(current)) {
         (Some(Epoch::Pid1(a, x)), Some(Epoch::Pid1(b, y))) => a == b && x == y,
         (Some(Epoch::MacBoot(a)), Some(Epoch::MacBoot(b))) => a == b,
+        // GetTickCount64 在同一次开机内单调不减：current >= recorded 即
+        // 同一启动会话（reboot 会归零，由 proves_replacement 的 b < a
+        // 捕获）。结合只读 PID 观察（OpenProcess）构成 Windows 同次开机
+        // 的旧 worker 退出核验；不是 PID namespace 身份，表述保持诚实。
+        (Some(Epoch::WindowsUptime(a)), Some(Epoch::WindowsUptime(b))) => b >= a,
         _ => false,
     }
 }
