@@ -680,13 +680,16 @@ strip_prefix = false
             'curl -fsS --max-time 3 http://127.0.0.1:3010/v1/runtime/identity')
         check('R3: identity queryable after native stop',
               id_probe3.returncode == 0, id_probe3.stdout[-120:], scenario='R3')
-        # 修复 journal（合法空记录覆盖，不删除原文件的诊断需要已满足），
-        # 下一显式新请求恢复业务。
-        write({state_root_dir + '/.deploy-operation.json':
-                   '{\"deploy_replays\": {}}'})
+        # RV03/F2 收口：损坏（无法解码）journal 由 owner 隔离为 .corrupt-*
+        # 备份并重建——**不需要手工修复/删除**，下一显式新请求直接恢复。
         start('restart')
-        check('R3: business recovers after journal repaired',
+        check('R3: business recovers from damaged journal without manual repair',
               content() == 'recovery-c-2', content(), scenario='R3')
+        corrupt_backup = execute(
+            'ls "$1"/.deploy-operation.corrupt-*.json 2>/dev/null | wc -l',
+            state_root_dir).stdout.strip()
+        check('R3: damaged journal preserved as corrupt backup',
+              corrupt_backup != '0', corrupt_backup, scenario='R3')
 
         # ── E：同容器重启（docker restart，容器 ID 不变）────────────
         # RV08/E：pid1 是镜像自身 supervisord——restart 即真实入口自动重启

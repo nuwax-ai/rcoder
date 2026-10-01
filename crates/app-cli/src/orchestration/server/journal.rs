@@ -133,7 +133,11 @@ impl Journal {
     /// Caller already holds the common OwnerGuard. Merely opening never moves
     /// records: migration waits until the management listener has bound.
     pub fn open_with_root(workspace: &Path, root: PathBuf) -> Result<Self> {
-        Self::open_recovering(workspace, root, false)
+        // RV03/F2：统一 owner 即监督者——损坏（无法解码）的业务部署 journal
+        // 与内核操作记录同语义：隔离为 .corrupt-*.json 备份后重建，不永久
+        // 否决业务启动（用户不需编辑 state）。decode 失败是客观损坏而非
+        // 结果未知；未知结果（合法记录的非终态内容）不受此路径影响。
+        Self::open_recovering(workspace, root, true)
     }
 
     /// 统一 owner 进程内会话：显式附加本会话的原生执行代次——没有 guardian
