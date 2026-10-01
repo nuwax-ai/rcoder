@@ -685,9 +685,7 @@ pub(super) async fn server_loop(
                     // 不进入 serve 式的空闲驻留——用户的前台 run 不因远端
                     // 停止而永久挂起。
                     if foreground {
-                        tracing::info!(
-                            "foreground run consumed an admitted stop; exiting"
-                        );
+                        tracing::info!("foreground run consumed an admitted stop; exiting");
                         return Ok(());
                     }
                 }

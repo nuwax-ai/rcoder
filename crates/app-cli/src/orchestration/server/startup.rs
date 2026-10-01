@@ -338,8 +338,10 @@ impl Drop for DegradeManagementOnDrop<'_> {
 /// 保留）；成功返回即本次会话干净收束。
 ///
 /// RV01：任何出口（含 journal/恢复失败的 `?` 提前返回）都先记录内核执行
-/// 交接——本会话占据的执行槽位是它的操作集，会话结束后受理的新请求以
-/// 自身 ID 占据新执行权，不被下一会话的 prepare 误清。
+/// 交接——仅当会话到达过执行驱动（server_loop）才把槽位记录为它的交接
+/// 集；驱动前失败的会话没有消费任何操作，槽位中的新受理保持原样等待
+/// 下一个会话。驱动前失败且存在已受理待消费操作时重新触发会话重建
+///（单次 relaunch 通知可能被失败重试消费掉，预算耗尽后无人唤醒）。
 async fn business_session(
     args: RuntimeArgs,
     state_root: std::path::PathBuf,
@@ -348,12 +350,29 @@ async fn business_session(
     launch: runtime_supervisor::BusinessLaunch,
     foreground: bool,
 ) -> Result<()> {
-    let result =
-        business_session_inner(args, state_root, state.clone(), session, launch, foreground).await;
-    if let Some(kernel) = state.runtime_kernel()
-        && let Err(error) = kernel.note_execution_session_ended().await
-    {
-        tracing::error!(%error, "record business session execution handover");
+    let driver_reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let result = business_session_inner(
+        args,
+        state_root,
+        state.clone(),
+        session.clone(),
+        launch,
+        foreground,
+        driver_reached.clone(),
+    )
+    .await;
+    let reached_driver = driver_reached.load(std::sync::atomic::Ordering::Acquire);
+    if let Some(kernel) = state.runtime_kernel() {
+        if let Err(error) = kernel.note_execution_session_ended(reached_driver).await {
+            tracing::error!(%error, "record business session execution handover");
+        }
+        if !reached_driver && result.is_err() && !foreground && kernel.has_live_admission().await {
+            tracing::warn!(
+                "business session failed before the driver with admitted work pending; \
+                 re-requesting relaunch"
+            );
+            session.request_relaunch();
+        }
     }
     result
 }
@@ -365,6 +384,7 @@ async fn business_session_inner(
     session: std::sync::Arc<runtime_supervisor::OwnerSession>,
     launch: runtime_supervisor::BusinessLaunch,
     foreground: bool,
+    driver_reached: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     let ready_guard = session.ready_guard(&launch.generation);
     // R3：业务初始化失败的任何路径都不得把管理面永久留在 initializing
@@ -732,6 +752,9 @@ async fn business_session_inner(
         Err(error).context("startup ownership was not claimed")
     } else {
         let supervised = host.is_some();
+        // RV01：到达此处即本会话即将成为通道消费者（server_loop 启动）——
+        // 会话结束时槽内操作按"本会话交接集"处理；此前的失败出口不记录。
+        driver_reached.store(true, std::sync::atomic::Ordering::Release);
         let driver_state = state.clone();
         let driver_args = args.clone();
         // RV05：驱动任务延续业务会话捕获的命令范围（spawn_scoped 克隆

@@ -1824,7 +1824,7 @@ mod cases {
             .await
             .expect("admit session A operation");
         kernel
-            .note_execution_session_ended()
+            .note_execution_session_ended(true)
             .await
             .expect("record handover");
         // Parked window: the user submits a fresh Start B. It must occupy the
@@ -1884,6 +1884,37 @@ mod cases {
         assert_eq!(view.state, RuntimeOperationState::Accepted);
     }
 
+    /// RV01 实测回归（容器矩阵 R3 尾部）：降级风暴中（会话在驱动前反复
+    /// 失败）受理的操作不得被会话交接误杀——note_execution_session_ended
+    /// (false)（未到达驱动的会话）保留活跃受理，下一会话的 prepare/recover
+    /// 均不把它当残留收束，等待真实消费。
+    #[tokio::test]
+    async fn pre_driver_session_end_preserves_admitted_work() {
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-storm"))
+            .await
+            .expect("admit during degraded retry storm");
+        kernel
+            .note_execution_session_ended(false)
+            .await
+            .expect("record pre-driver session end");
+        assert_eq!(
+            kernel.status().await.expect("status").active_operation_id,
+            Some("op-storm".to_string()),
+            "live admission must survive a pre-driver session end"
+        );
+        kernel.recover().await.expect("recover");
+        kernel.prepare_relaunch().await.expect("prepare relaunch");
+        let view = kernel.get("op-storm").await.expect("view").expect("exists");
+        assert_eq!(view.state, RuntimeOperationState::Accepted);
+        assert_eq!(
+            kernel.status().await.expect("status").active_operation_id,
+            Some("op-storm".to_string())
+        );
+    }
+
     /// RV01：会话交接记录的挂起 Stop 屏障在下一会话收束为幂等成功
     /// （会话终末清理已确认物理停止），且该收束不占用/清除新受理槽位。
     #[tokio::test]
@@ -1899,7 +1930,7 @@ mod cases {
             .await
             .expect("admit stop barrier");
         kernel
-            .note_execution_session_ended()
+            .note_execution_session_ended(true)
             .await
             .expect("record handover");
         // A new Start arrives in the parked window after the session ended;

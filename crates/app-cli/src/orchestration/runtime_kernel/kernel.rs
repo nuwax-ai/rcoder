@@ -158,12 +158,17 @@ impl RuntimeKernel {
     }
 
     /// RV01：一个业务会话的驱动已结束（business_session 返回，无论成败）。
-    /// 此刻占据执行槽的操作都属于该会话——它们的派发信号进入了该会话的
-    /// 消费通道。记录为待交接集合并立即让出槽位：此后受理的新请求以自身
-    /// ID 占据新执行权，不会被下一次 prepare 误当旧残留收束。记录的集合
-    /// 由下一次会话启动前的 [`RuntimeKernel::prepare_relaunch`] 收束。
-    pub(crate) async fn note_execution_session_ended(&self) -> Result<()> {
+    /// **仅当该会话到达过执行驱动阶段**（server_loop 曾在跑，是通道的
+    /// 消费者）才记录当前槽位为待交接集合并让出——这些操作派发进了它的
+    /// 消费通道。会话在驱动前失败（坏 journal/恢复失败的重试风暴）没有
+    /// 消费任何东西：此时槽位只可能持有**会话开始后新受理**的操作（等
+    /// 待下一个会话消费），必须原样保留，绝不能当旧残留收束（k3s/容器
+    /// 实测：降级风暴期间受理的 restart 被 prepare 误杀为 RecoveryRequired）。
+    pub(crate) async fn note_execution_session_ended(&self, reached_driver: bool) -> Result<()> {
         let mut guard = self.admission.lock().await;
+        if !reached_driver {
+            return Ok(());
+        }
         let stop = guard.pending_stop.take();
         let mut interrupted: Vec<String> = Vec::new();
         if let Some(id) = guard.active_operation_id.take() {
@@ -183,6 +188,14 @@ impl RuntimeKernel {
         guard.interrupted_stop = stop;
         guard.interrupted_operations = interrupted;
         Ok(())
+    }
+
+    /// RV03/RV01：是否存在已受理待消费的执行操作（驱动前失败的会话驻留
+    /// 时据此重新触发会话重建——单次 relaunch 通知可能被一次失败重试
+    /// 消费掉，预算再度耗尽后没有任何唤醒者，用户操作将无限滞留）。
+    pub(crate) async fn has_live_admission(&self) -> bool {
+        let guard = self.admission.lock().await;
+        guard.active_operation_id.is_some() || guard.pending_restart.is_some()
     }
 
     /// 会话交接收束（RV01 重整）：只收束 [`RuntimeKernel::note_execution_session_ended`]
