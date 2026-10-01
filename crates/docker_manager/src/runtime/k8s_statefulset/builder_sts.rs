@@ -92,9 +92,13 @@ impl KubernetesRuntime {
                 // recovery v2 R7（RV07 强化）：存量 builder 的 managed-owner
                 // 平台注入漂移走受控模板替换（见 replace_builder_state-
                 // set_controlled）。升级不是每次应用 Restart 的内部兜底：
-                // 仅此签名触发一次。
+                // 仅此签名触发一次。替换以 replicas=1 的期望模板重建，
+                // 直接返回——**不得**再以替换前捕获的 existing（旧 uid/RV）
+                // 走 scale 收尾：对象已删除，前置条件必然 409，物理替换
+                // 成功却被误判 Failed（k3s 实测 P1）。
                 self.replace_builder_statefulset_controlled(context, &existing, desired)
                     .await?;
+                return Ok(());
             }
             BuilderTemplateCheck::StaleHash => {
                 // 内容等价但注解是旧算法值：纯 metadata patch 重写后复用。
