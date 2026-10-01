@@ -498,11 +498,26 @@ impl RuntimeStore {
                 };
             let mut operation = operation;
             if !operation.view.state.is_terminal() {
-                operation.view.state = RuntimeOperationState::RecoveryRequired;
-                operation.view.error_code = Some(ERR_RECOVERY_REQUIRED.into());
-                operation.view.error_message =
-                    Some("process restarted before the operation reached a terminal state".into());
+                // recovery v3：统一 owner 的管理 API 先于首个业务会话开放
+                //（R3），Accepted 的 Stop 可能在"已受理、尚未有会话消费"的
+                // 窗口被本扫描视为中断。停止已确认不存在的业务幂等成功
+                //（spec §2.3）：此时没有任何会话在跑（首个会话尚未启动），
+                // 业务必然未由本操作启动——Succeeded 如实。Executing 状态
+                // 的 Stop 保守保持 RecoveryRequired（可能中断在物理停中）。
                 let id = operation.view.operation_id.clone();
+                if operation.view.kind == RuntimeOperationKind::Stop
+                    && operation.view.state == RuntimeOperationState::Accepted
+                {
+                    operation.view.state = RuntimeOperationState::Succeeded;
+                    operation.view.error_code = None;
+                    operation.view.error_message = None;
+                } else {
+                    operation.view.state = RuntimeOperationState::RecoveryRequired;
+                    operation.view.error_code = Some(ERR_RECOVERY_REQUIRED.into());
+                    operation.view.error_message = Some(
+                        "process restarted before the operation reached a terminal state".into(),
+                    );
+                }
                 self.store_operation(&operation)?;
                 scan.recovered.push(id);
             }

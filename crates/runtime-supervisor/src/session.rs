@@ -151,10 +151,10 @@ struct SessionCore {
 impl SessionCore {
     fn with_discovery<T>(&self, update: impl FnOnce(&mut Discovery) -> Result<T>) -> Result<T> {
         // 持锁窗口只覆盖 clone 与 swap（内存操作）；durable 落盘
-        ///（fsync，共享盘上可达数十毫秒）在锁外执行——控制连接的快照
-        /// 读取不被持久化 I/O 阻塞（复核 §6）。写者串行由写路径单任务
-        /// （run loop / mark_ready）保证；并发写者最多造成一次后写覆盖
-        /// 先写的同代快照，与旧实现（锁内 save）语义等价。
+        //（fsync，共享盘上可达数十毫秒）在锁外执行——控制连接的快照
+        // 读取不被持久化 I/O 阻塞（复核 §6）。写者串行由写路径单任务
+        //（run loop / mark_ready）保证；并发写者最多造成一次后写覆盖
+        // 先写的同代快照，与旧实现（锁内 save）语义等价。
         let mut next = {
             let discovery = self
                 .discovery
@@ -784,7 +784,14 @@ impl RunState {
                         Ok(())
                     })?;
                 }
-                IdleEvent::Relaunch => {}
+                IdleEvent::Relaunch => {
+                    // 显式请求（运行操作受理/Recover）触发的新一轮业务
+                    // 启动重置重启预算：预算只约束自动重试风暴，不应把
+                    // 用户请求挡在门外（停摆的 owner 无法消费已受理操作）。
+                    if let Ok(mut restarts) = self.core.restarts.lock() {
+                        restarts.clear();
+                    }
+                }
             }
         }
     }

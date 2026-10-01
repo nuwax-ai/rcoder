@@ -414,10 +414,17 @@ pub fn describe_terminal(view: &RuntimeOperationView) -> Result<()> {
             println!("dispatched start completed on the running owner");
             Ok(())
         }
-        RuntimeOperationState::Cancelled => bail!(
-            "dispatched start was cancelled by the owner (operation {})",
-            view.operation_id
-        ),
+        // R4：被更新的受理取代（plan §8"新显式请求可替代旧的可取消业务
+        // 任务"）是转交的正常结局，以 0 退出——nonzero 会让 supervisord 的
+        // serve 程序重启并再次转交，形成"转交-取代-退出-重启"循环，
+        // 反复提交新 Start 抢占用户请求。
+        RuntimeOperationState::Cancelled => {
+            println!(
+                "dispatched start was superseded by a newer request (operation {})",
+                view.operation_id
+            );
+            Ok(())
+        }
         other => bail!(
             "dispatched start failed: {other:?} ({})",
             view.error_message.as_deref().unwrap_or("no detail"),

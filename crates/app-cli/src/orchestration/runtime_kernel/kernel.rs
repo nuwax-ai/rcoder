@@ -134,12 +134,82 @@ impl RuntimeKernel {
     /// [`RuntimeKernel::settle_unresolved_recoveries`] 把一切仍非终态的
     /// 操作自动收敛为 Failed——产品环境没有操作员，不允许留下"等人工
     /// 裁决"的死锁状态。
+    /// recovery v3 R2：业务会话驱动结束即本 owner 内的执行已停——把上一
+    /// 会话残留的 active/pending 槽位显式转为 RecoveryRequired（持久化），
+    /// 清空执行槽，让下一会话的 recover() 前置条件成立。进程内合并 owner
+    /// 的内核跨会话存活（旧进程模式每个 worker 是新进程、新内核），没有
+    /// 这一步，任何一次会话中断后的重开都会撞"cannot run while executing"
+    /// 并无限重试。不伪造终态：操作保持 RecoveryRequired 语义。
+    pub(crate) async fn prepare_relaunch(&self) -> Result<()> {
+        let mut guard = self.admission.lock().await;
+        let stale: Vec<String> = guard
+            .active_operation_id
+            .iter()
+            .chain(guard.pending_stop.iter())
+            .chain(guard.pending_restart.iter())
+            .cloned()
+            .collect();
+        if stale.is_empty() {
+            return Ok(());
+        }
+        for id in &stale {
+            let persisted = self.store.load_operation(id);
+            match persisted {
+                Ok(Some(operation)) => {
+                    if !operation.view.state.is_terminal() {
+                        // 会话结束即业务已被 business_ended 协作停止并清理
+                        //（spec §2.3 幂等停止）：挂起的 Stop 屏障按 Succeeded
+                        // 收束——不是伪造，物理停止由会话终末清理完成。
+                        let is_pending_stop = guard.pending_stop.as_deref() == Some(id);
+                        let terminal = if is_pending_stop {
+                            RuntimeOperationState::Succeeded
+                        } else {
+                            RuntimeOperationState::RecoveryRequired
+                        };
+                        let detail = if is_pending_stop {
+                            None
+                        } else {
+                            Some((
+                                shared_types::ERR_RECOVERY_REQUIRED.to_string(),
+                                "business session ended before the operation completed".to_string(),
+                            ))
+                        };
+                        self.write_terminal(id, terminal, detail, None)?;
+                    }
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        operation_id = %id,
+                        "stale execution slot has no persisted operation; clearing"
+                    );
+                }
+                Err(error) => {
+                    // 持久化读取失败：保留保护位，清槽交给下轮 recover 裁决。
+                    guard.recovery_protection = true;
+                    return Err(anyhow::anyhow!(
+                        "read stale operation {id} for relaunch: {error:#}"
+                    ));
+                }
+            }
+        }
+        guard.active_operation_id = None;
+        guard.pending_stop = None;
+        guard.pending_restart = None;
+        guard.queued_input = None;
+        guard.recovery_protection = true;
+        Ok(())
+    }
+
     pub(crate) async fn recover(&self) -> Result<Vec<String>> {
         let mut guard = self.admission.lock().await;
+        // recovery v3：统一 owner 的内核是进程级单例，会话初始化期间受理
+        // 的 Stop 屏障（pending_stop，无 active）不是"执行中"——它等待本
+        // 会话的 server_loop 消费。把屏障算作执行会令首个会话的 recover
+        // 前置失败（空工作区首发 Stop 即复现：owner_credentials 测试），
+        // 会话反复重启并把活 Stop 沉降为 RecoveryRequired。active 执行位
+        // 仍是硬前置。
         anyhow::ensure!(
-            guard.active_operation_id.is_none()
-                && guard.pending_stop.is_none()
-                && guard.pending_restart.is_none(),
+            guard.active_operation_id.is_none(),
             "startup recovery cannot run while this owner is executing"
         );
         self.store.repair_desired_after_quiescence()?;
@@ -243,11 +313,21 @@ impl RuntimeKernel {
                 }
             };
             let id = operation.view.operation_id.clone();
-            self.store.settle_interrupted_operation(&mut operation)?;
-            if requested && let Ok(mut set) = self.cancelled.lock() {
-                set.insert(id.clone());
+            // recovery v3：Stop 幂等收敛——统一 owner 的 API 在首个业务
+            // 会话启动前即可受理 Stop（R3 早期开放），该操作可能在无会话
+            // 消费它的窗口内被本路径按"中断"沉降。停止已确认不存在的业务
+            // 幂等成功（spec §2.3），且会话启动的 quiescence 已实际收束
+            // 业务进程——Succeeded 是如实结果，不是伪造。非 Stop 保持
+            // Failed（不发明成功）。
+            if operation.view.kind == RuntimeOperationKind::Stop {
+                self.write_terminal(&id, RuntimeOperationState::Succeeded, None, None)?;
+            } else {
+                self.store.settle_interrupted_operation(&mut operation)?;
+                if requested && let Ok(mut set) = self.cancelled.lock() {
+                    set.insert(id.clone());
+                }
+                self.emit_terminal_record(&operation);
             }
-            self.emit_terminal_record(&operation);
             guard.recovered_operations.remove(&id);
             settled.push(id);
         }

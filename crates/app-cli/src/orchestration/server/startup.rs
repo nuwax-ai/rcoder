@@ -70,6 +70,11 @@ pub async fn owner_serve(
     let state = Arc::new(ServerState::new(ready));
     state.initialize_owner_token()?;
     state.mark_kernel_required();
+    // R3：会话以 Reconciling 起步——镜像任务启动前的窗口内同步置位，
+    // 避免部署状态查询在恢复完成前读到瞬时 200。
+    state
+        .business_recovery_active
+        .store(true, std::sync::atomic::Ordering::Release);
     let api_state = state.clone();
     let api_workspace = args.workspace.clone();
     let api_log_dir = args.log_dir.clone();
@@ -108,6 +113,12 @@ pub async fn owner_serve(
             match credential_result {
                 Ok(()) => {
                     state.set_runtime_kernel(kernel.clone());
+                    // R3：管理面可用性与业务恢复解耦——API 已绑定、身份已
+                    // 发布即开放管理查询（围栏/Stopped 驻留期间 deploy/status
+                    // 以 idle 应答而非 503；file-server 的恢复预检不再被
+                    // initializing 窗口卡死）。业务会话自身的恢复窗口仍经
+                    // begin_business_session 重新置 initializing 门控新业务受理。
+                    state.mark_initialized();
                     // R06 事件桥：编排 EVT 同步进入活跃操作的运行事件 journal +
                     // stdout 管道（dev 任务的 Done/阶段事件经此转发）——统一
                     // owner 路径同样必须安装，否则 file-server 侧等待终局事件
@@ -156,6 +167,27 @@ pub async fn owner_serve(
         let session = session.clone();
         move || session.request_relaunch()
     })?;
+    // R3：原生会话相位镜像——恢复活跃期（含围栏清理）阻塞 deploy/status，
+    // 降级驻留（RecoveryRequired）不阻塞：证据可查、精确 Stop 可达。
+    {
+        let session = session.clone();
+        let mirror_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                let active = matches!(
+                    session.snapshot().phase,
+                    runtime_supervisor::Phase::Reconciling
+                        | runtime_supervisor::Phase::Starting
+                        | runtime_supervisor::Phase::Stopping
+                        | runtime_supervisor::Phase::CleanupPending
+                );
+                mirror_state
+                    .business_recovery_active
+                    .store(active, std::sync::atomic::Ordering::Release);
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        });
+    }
 
     let factory_args = args.clone();
     let factory_state = state.clone();
@@ -172,9 +204,19 @@ pub async fn owner_serve(
                 // 处理 control/deploy 通道）——API 受理的 Start/Stop/
                 // Restart 在 run 形态下同样被消费；差异只在会话重启策略
                 //（run 的 restart_on_exit=false，前台退出码语义）。
+                let launch_generation = launch.generation.clone();
                 let end = tokio::spawn(async move {
+                    let _ = &launch_generation;
                     business_session(args, state_root, state, session, launch, run_mode)
                         .await
+                        .map_err(|error| {
+                            tracing::error!(
+                                %error,
+                                generation = %launch_generation,
+                                "business session failed"
+                            );
+                            error
+                        })
                         .map(|_| None::<i32>)
                 });
                 let control = factory_state.clone();
@@ -205,6 +247,25 @@ pub async fn owner_serve(
     Ok(())
 }
 
+/// 业务会话失败时确保管理面离开 initializing（R3）。成功路径由
+/// mark_initialized 幂等覆盖。
+struct DegradeManagementOnDrop<'a>(&'a Arc<ServerState>);
+impl Drop for DegradeManagementOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.0.initializing() {
+            self.0.mark_initialized();
+            if matches!(self.0.phase(), crate::server::ServerPhase::Idle) {
+                self.0.set_phase(crate::server::ServerPhase::Failed(
+                    "business initialization failed; management degraded but queryable".into(),
+                ));
+            }
+            tracing::warn!(
+                "business session ended in initialization; management degraded to queryable"
+            );
+        }
+    }
+}
+
 /// 统一 owner 的一个业务会话：会话状态 re-arm → journal → 启动恢复序列 →
 /// 编排主循环，直到取消（Stop/Shutdown/信号）或自身失败。
 ///
@@ -219,6 +280,10 @@ async fn business_session(
     foreground: bool,
 ) -> Result<()> {
     let ready_guard = session.ready_guard(&launch.generation);
+    // R3：业务初始化失败的任何路径都不得把管理面永久留在 initializing
+    //（deploy/status 503 → file-server 预检 90s 超时）——失败即降级开放
+    // 管理查询（phase=Failed 承载原因），Stop/身份仍可用。
+    let _degrade_on_error = DegradeManagementOnDrop(&state);
     // R2.5：停止仍在进行（Stopping）时继承上一代取消信号，关闭 launch
     // 与初始化之间的取消丢失窗口。
     let inherit_cancel = session.snapshot().phase == runtime_supervisor::Phase::Stopping;
@@ -228,6 +293,17 @@ async fn business_session(
         inherit_cancel,
     );
     let stop_intent = session.snapshot().intent == runtime_supervisor::Intent::Stopped;
+    let fresh_launch = launch.fresh;
+    // R2/R3：会话重开清槽提前到 journal 打开之前——业务初始化本身失败
+    /// （坏 journal/迁移围栏）时，上一会话/受理窗口残留的执行槽与 Stop
+    /// 屏障也必须收束（挂起 Stop 幂等成功，见 prepare_relaunch），否则
+    /// 没有任何会话能到达内核恢复段，已受理的 Stop 永不到终态。
+    if !fresh_launch && let Some(kernel) = state.runtime_kernel() {
+        kernel
+            .prepare_relaunch()
+            .await
+            .context("prepare kernel for business relaunch")?;
+    }
     let mut journal = Journal::open_with_root(&args.workspace, state_root.clone())?;
     journal.attach_worker_generation(launch.generation.clone());
     if std::env::var(shared_types::APP_DEPLOY_GENERATION_ID).is_err()

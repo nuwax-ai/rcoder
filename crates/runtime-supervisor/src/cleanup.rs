@@ -68,8 +68,12 @@ impl CleanupOutcome {
                 return Err(error).context("read cleanup outcome record");
             }
         };
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("decode cleanup outcome record at {}", Self::path(root).display()))
+        serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "decode cleanup outcome record at {}",
+                Self::path(root).display()
+            )
+        })
     }
 }
 
@@ -135,9 +139,11 @@ pub(crate) async fn once(
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             match CleanupOutcome::recorded(root) {
                 // 适配器已分类（非 Empty）：原样保留本次尝试的分类。
-                Ok(Some(already @ (CleanupOutcome::ObservationFailed { .. }
-                | CleanupOutcome::ForeignIdentity { .. }
-                | CleanupOutcome::Stopping { .. }))) => {
+                Ok(Some(
+                    already @ (CleanupOutcome::ObservationFailed { .. }
+                    | CleanupOutcome::ForeignIdentity { .. }
+                    | CleanupOutcome::Stopping { .. }),
+                )) => {
                     let detail = format!("{already:?}");
                     already.record(root)?;
                     tracing::debug!(

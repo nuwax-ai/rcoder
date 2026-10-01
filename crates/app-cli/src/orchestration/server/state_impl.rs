@@ -57,6 +57,7 @@ impl ServerState {
             log_layout: RwLock::new(LogLayout::Builtin),
             deploy_inputs_eligible: std::sync::atomic::AtomicBool::new(true),
             business_relaunch: std::sync::OnceLock::new(),
+            business_recovery_active: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

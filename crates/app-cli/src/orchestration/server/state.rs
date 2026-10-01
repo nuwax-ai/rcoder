@@ -75,6 +75,10 @@ pub struct ServerState {
     /// 统一 owner：业务重启通知（运行操作受理后，若当前无业务会话在跑，
     /// 经此触发会话重建）。由 owner 装配时注入。
     pub(super) business_relaunch: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// R3：原生会话正处启动恢复活跃相位（Reconciling/Starting/Stopping/
+    /// CleanupPending）。管理查询门控 = initializing ∨ 本位（围栏清理期
+    /// deploy/status 503；降级驻留 RecoveryRequired 不阻塞——证据可查）。
+    pub(super) business_recovery_active: std::sync::atomic::AtomicBool,
 }
 
 pub(crate) struct AuxiliaryWriter<'a> {
@@ -238,6 +242,12 @@ impl ServerState {
     /// 统一 owner：本会话是否允许消费一次性部署声明 env。
     pub(crate) fn deploy_inputs_eligible(&self) -> bool {
         self.deploy_inputs_eligible
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// R3：部署状态查询的启动恢复门（业务会话恢复活跃期）。
+    pub(crate) fn business_recovery_active(&self) -> bool {
+        self.business_recovery_active
             .load(std::sync::atomic::Ordering::Acquire)
     }
 

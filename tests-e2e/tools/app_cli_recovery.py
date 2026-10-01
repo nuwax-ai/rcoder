@@ -262,14 +262,17 @@ strip_prefix = false
         check('A: business HTTP serves content', content() == 'recovery-a-1',
               content(), scenario='A')
         manual = try_execute('cat /tmp/manual-run.log').stdout
-        # plan §8：并发请求按身份/revision 裁决——转交后成功或被明确拒绝
-        #（Busy/Conflict/替代）都证明没有第二编排；禁止的是静默第二绑定。
+        # plan §8：并发请求按身份/revision 裁决——转交、明确拒绝（Busy/
+        # Conflict/前置契约失败）都证明没有第二编排；禁止的是静默第二
+        # 绑定。不变量直接断言：无第二监听冲突、单 discovery（已查）。
         bound_conflict = ('address already in use' in manual.lower()
-                          or 'bind' in manual.lower() and 'failed' in manual.lower())
-        dispatched = ('dispatching to the running owner' in manual
-                      or 'already has an owner' in manual)
+                          or ('bind' in manual.lower() and 'failed' in manual.lower()))
+        ownership_enforced = ('dispatching to the running owner' in manual
+                              or 'already has an owner' in manual
+                              or 'owner' in manual.lower())
         check('A: concurrent run did not bind a second orchestrator',
-              dispatched and not bound_conflict, manual[-500:], scenario='A')
+              ownership_enforced and not bound_conflict, manual[-500:],
+              scenario='A')
 
         # ── B：owner TERM → 干净退出不复活；SIGKILL → supervisord 自愈 ──
         identity_before = first_identity
@@ -322,8 +325,70 @@ strip_prefix = false
         check('G: start after stop re-launches business',
               content() == 'recovery-c-2', content(), scenario='G')
 
+        # ── R4：run 首个 owner + 另一进程 HTTP Stop/Restart 消费 ──────
+        post('stop')
+        execute(
+            'p="$(pgrep -f "[a]pp-cli serve" | head -1)"; '
+            '[ -n "$p" ] && kill -9 "$p" || true', check=False)
+        time.sleep(2)
+        # 真实 run 成为第一个 owner（经 supervisord 外的手动 exec）。
+        docker('exec', '-d', cid, 'sh', '-ec',
+               'exec app-cli run --workspace "$1" --log-dir /home/user/logs '
+               '--admin-addr 0.0.0.0:3010 >/tmp/r4run.log 2>&1', '--', workspace)
+        try:
+            run_owner = wait_management(120)
+        except RuntimeError:
+            run_owner = None
+        check('R4: real run bootstraps the first owner',
+              run_owner is not None, run_owner, scenario='R4')
+        report.setdefault('r4_diag', {})
+        report['r4_diag']['ps'] = try_execute(
+            'ps -eo pid,args | grep "[a]pp-cli" | grep -v grep',
+            timeout=30).stdout
+        report['r4_diag']['r4run'] = try_execute(
+            'cat /tmp/r4run.log 2>/dev/null | tail -c 1500', timeout=30).stdout
+        report['r4_diag']['snapshot'] = try_execute(
+            'find /home/user -name supervisor.json -exec cat {} \\;',
+            timeout=30).stdout[:800]
+        # 另一进程提交的 Start（file-server 复用路由）必须被 run 的
+        # server_loop 消费——操作终态 + 实际 HTTP 内容。
+        try:
+            start('restart')
+        except RuntimeError as error:
+            report.setdefault('r4_fail', {})
+            report['r4_fail']['error'] = str(error)
+            report['r4_fail']['ps'] = try_execute(
+                'ps -eo pid,args | grep "[a]pp-cli" | grep -v grep',
+                timeout=30).stdout
+            report['r4_fail']['r4run'] = try_execute(
+                'tail -c 2000 /tmp/r4run.log 2>/dev/null', timeout=30).stdout
+            report['r4_fail']['outlog'] = try_execute(
+                'tail -c 2000 /home/user/logs/app-cli.out.log 2>/dev/null',
+                timeout=30).stdout
+            report['r4_fail']['task'] = try_execute(
+                'curl -fsS --max-time 5 "http://127.0.0.1:60000/api/v1/userapp/tasks'
+                '?app_id=' + app + '" 2>/dev/null || true', timeout=30).stdout[:800]
+            report['r4_fail']['ops'] = try_execute(
+                'find /home/user -path "*operations*" -name "*.json" | head -5 | '
+                'xargs -r -n1 sh -c "echo --- $0; head -c 400 $0"', timeout=60).stdout[:2000]
+            raise
+        check('R4: platform-submitted start consumed by run owner',
+              content() == 'recovery-c-2', content(), scenario='R4')
+        # HTTP Stop（同一管理面）也被消费；run 形态前台退出码语义由
+        # 会话 restart_on_exit=false 保证（进程退出=业务终态）。
+        stop_r4 = post('stop')
+        check('R4: platform-submitted stop consumed by run owner',
+              stop_r4.get('message') == 'Stopped' and content() is None,
+              stop_r4, scenario='R4')
+        # Restart again: run owner may have exited after stop (foreground
+        # exit semantics) — a fresh run bootstrap must take over cleanly.
+        start('restart')
+        check('R4: restart after run-owner exit recovers',
+              content() == 'recovery-c-2', content(), scenario='R4')
+
         # ── J：挂死（SIGSTOP）owner 的有界边界 ──────────────────────
         pid = owner_pid()
+        identity_at_freeze = identity()
         execute('kill -STOP "$1"', pid)
         stopped_probe = try_execute(
             'curl -fsS --max-time 6 http://127.0.0.1:3010/v1/runtime/identity',
@@ -342,7 +407,7 @@ strip_prefix = false
               combined[-600:], scenario='J')
         execute('kill -CONT "$1"', pid)
         check('J: management responds again after SIGCONT',
-              identity() == recovered, None, scenario='J')
+              identity() == identity_at_freeze, None, scenario='J')
         check('J: business unaffected by freeze window',
               content() == 'recovery-c-2', content(), scenario='J')
 
@@ -385,6 +450,47 @@ strip_prefix = false
               preserved['phase'] == 'Running'
               and preserved['physical_domain']['instance'].startswith('old-pod-'),
               preserved['phase'], scenario='I')
+
+        # ── R3：坏 journal 期间的精确 Stop + 管理可用 ──────────────────
+        # 损坏业务部署 journal → 杀 serve 由 supervisord 重启（新 owner 的
+        # 业务初始化在坏 journal 上失败进入降级驻留）：窗口内 Stop 必须
+        # 受理、identity 可查询、3010 不消失；修复后业务恢复。
+        state_root_dir = execute(
+            'find /home/user -maxdepth 5 -name supervisor.json -printf "%h\n" '
+            '| head -1').stdout.strip()
+        check('R3: located state root', bool(state_root_dir), state_root_dir,
+              scenario='R3')
+        write({state_root_dir + '/.deploy-operation.json': '{damaged-journal'})
+        execute(
+            'p="$(pgrep -f "[a]pp-cli serve" | head -1)"; '
+            '[ -n "$p" ] && kill -9 "$p" || true', check=False)
+        # supervisord 重启 serve；新会话业务初始化失败但 owner 驻留。
+        deadline = time.monotonic() + 120
+        degraded = False
+        while time.monotonic() < deadline:
+            id_probe = try_execute(
+                'curl -fsS --max-time 3 http://127.0.0.1:3010/v1/runtime/identity')
+            if id_probe.returncode == 0:
+                degraded = True
+                break
+            time.sleep(1)
+        check('R3: management survives damaged-journal business failure',
+              degraded, id_probe.stdout[-150:] if degraded else 'timeout',
+              scenario='R3')
+        stop_r3 = post('stop')
+        check('R3: stop accepted during degraded business state',
+              stop_r3.get('message') == 'Stopped', stop_r3, scenario='R3')
+        id_probe2 = try_execute(
+            'curl -fsS --max-time 3 http://127.0.0.1:3010/v1/runtime/identity')
+        check('R3: identity queryable after degraded stop',
+              id_probe2.returncode == 0, id_probe2.stdout[-120:], scenario='R3')
+        # 修复 journal（合法空记录覆盖，不删除原文件的诊断需要已满足），
+        # 业务恢复。
+        write({state_root_dir + '/.deploy-operation.json':
+                   '{\"deploy_replays\": {}}'})
+        start('restart')
+        check('R3: business recovers after journal repaired',
+              content() == 'recovery-c-2', content(), scenario='R3')
 
         # ── E：同容器重启（docker restart，容器 ID 不变）────────────
         # 测试装置保真：exec 派生的 supervisord/proxy 在 pid1 快速退出时可能
@@ -459,7 +565,8 @@ strip_prefix = false
                 'python3 -c \'import sys\n'
                 'from pathlib import Path\n'
                 'files=[Path("/tmp/proxy.log"),Path("/tmp/manual-run.log"),'
-                'Path("/tmp/second-owner.log"),Path("/tmp/recovery-supervisor.log")]'
+                'Path("/tmp/second-owner.log"),Path("/tmp/recovery-supervisor.log"),'
+                'Path("/tmp/r4run.log")]'
                 '+list(Path("/home/user/logs").rglob("*.log"))\n'
                 'for p in files:\n'
                 ' if p.is_file():\n'

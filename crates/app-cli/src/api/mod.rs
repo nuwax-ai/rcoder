@@ -475,7 +475,7 @@ async fn deploy_status(
     // deployment state machine has not been reconstructed yet — answering
     // "idle" would misreport recovery as complete. Management identity, health
     // and control stay available; callers retry like the cold-start window.
-    if state.server.initializing() {
+    if state.server.initializing() || state.server.business_recovery_active() {
         return envelope::error(
             StatusCode::SERVICE_UNAVAILABLE,
             "ERR_INITIALIZING",

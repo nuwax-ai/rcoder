@@ -462,8 +462,8 @@ mod cases {
                 .admit(request(RuntimeOperationKind::Stop, "stop"))
                 .await
                 .unwrap();
-            // recovery v3 R5：Stop 执行期间的不同 Start 在持久化前 Busy；
-            // 终态后同 revision 正常受理。
+            // 恢复 v3 R5：Stop 屏障期间的不同 Start 在持久化前 Busy；
+            // 同请求重试不受影响；屏障经 finish 到终态后新 Start 受理。
             let mut during = request(RuntimeOperationKind::Start, "start");
             during.expected_revision = 1;
             let rejection = kernel.admit(during).await.unwrap_err();
