@@ -74,3 +74,5 @@ target_DIR_PLACEHOLDER/
 
 # UserApp 错误页 dev 运行产物（上传的运行时页面，不入库）
 docker/error-pages/
+target-linux/
+target-linux-appcli/
