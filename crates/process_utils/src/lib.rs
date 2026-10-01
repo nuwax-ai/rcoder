@@ -45,7 +45,7 @@ pub fn process_exists(pid: u32) -> std::io::Result<bool> {
     process_observation(kill(Pid::from_raw(pid), None))
 }
 
-/// Windows 只读存活观察：OpenProcess(QUERY_LIMITED_INFORMATION) +
+/// Windows 只读存活观察：OpenProcess(QUERY_LIMITED_INFORMATION | SYNCHRONIZE) +
 /// WaitForSingleObject(0) 判定终止。陈旧 PID 打开失败
 ///（ERROR_INVALID_PARAMETER）即证不存在；打开成功**不足以证明存活**——
 /// 其他进程保留的 HANDLE 会令已终止进程的对象继续存在（Microsoft
@@ -54,9 +54,11 @@ pub fn process_exists(pid: u32) -> std::io::Result<bool> {
 /// 只是观察，绝不构成对磁盘读出 PID 的信号授权。
 #[cfg(windows)]
 pub fn process_exists(pid: u32) -> std::io::Result<bool> {
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, GetLastError,
+    };
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
     };
     const WAIT_OBJECT_0: u32 = 0;
     const WAIT_TIMEOUT: u32 = 258;
@@ -70,24 +72,40 @@ pub fn process_exists(pid: u32) -> std::io::Result<bool> {
                 "invalid process identifier",
             ));
         }
-        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
         if handle.is_null() {
             // Stale PIDs surface as ERROR_INVALID_PARAMETER; access denial
             // (5) means the process exists.
             let code = unsafe { GetLastError() };
-            return Ok(code != ERROR_INVALID_PARAMETER);
+            return match code {
+                ERROR_INVALID_PARAMETER => Ok(false),
+                ERROR_ACCESS_DENIED => Ok(true),
+                code => Err(std::io::Error::from_raw_os_error(code as i32)),
+            };
         }
         // A retained HANDLE keeps the process object alive after termination;
         // only the signaled state proves whether it still executes.
         let wait = unsafe { WaitForSingleObject(handle, 0) };
+        let observation_error = if matches!(wait, WAIT_OBJECT_0 | WAIT_TIMEOUT) {
+            None
+        } else {
+            Some(std::io::Error::from_raw_os_error(
+                unsafe { GetLastError() } as i32
+            ))
+        };
         unsafe { CloseHandle(handle) };
         match wait {
             WAIT_OBJECT_0 => Ok(false),
             WAIT_TIMEOUT => Ok(true),
-            failure => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("process wait observation failed with {failure}"),
-            )),
+            _ => Err(observation_error.unwrap_or_else(|| {
+                std::io::Error::other("process wait returned an unexpected status")
+            })),
         }
     }
     observe_open_result(pid)
@@ -98,7 +116,7 @@ pub fn process_exists(pid: u32) -> std::io::Result<bool> {
 /// 不同。只读观察，不构成信号授权。
 #[cfg(windows)]
 pub fn process_created_unix_ms(pid: u32) -> std::io::Result<Option<u64>> {
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError};
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
@@ -113,10 +131,11 @@ pub fn process_created_unix_ms(pid: u32) -> std::io::Result<Option<u64>> {
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle.is_null() {
             let code = unsafe { GetLastError() };
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("OpenProcess for creation time failed with {code}"),
-            ));
+            return if code == ERROR_INVALID_PARAMETER {
+                Ok(None)
+            } else {
+                Err(std::io::Error::from_raw_os_error(code as i32))
+            };
         }
         let mut creation = windows_sys::Win32::Foundation::FILETIME {
             dwLowDateTime: 0,
@@ -136,13 +155,11 @@ pub fn process_created_unix_ms(pid: u32) -> std::io::Result<Option<u64>> {
         };
         let queried =
             unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+        let query_error = (queried == 0)
+            .then(|| std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32));
         unsafe { CloseHandle(handle) };
-        if queried == 0 {
-            let code = unsafe { GetLastError() };
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("GetProcessTimes failed with {code}"),
-            ));
+        if let Some(error) = query_error {
+            return Err(error);
         }
         let ticks = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
         // FILETIME: 100ns intervals since 1601-01-01 → unix milliseconds.
@@ -181,10 +198,7 @@ pub fn self_created_unix_ms() -> std::io::Result<Option<u64>> {
             unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
         if queried == 0 {
             let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("GetProcessTimes(self) failed with {code}"),
-            ));
+            return Err(std::io::Error::from_raw_os_error(code as i32));
         }
         let ticks = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
         const EPOCH_DELTA_MS: u64 = 11_644_473_600_000;
@@ -370,6 +384,55 @@ mod tests {
     fn nonexistent_pid_returns_false() {
         // 取一个几乎不可能存在的 pid (低于 pid_max 上限)
         assert!(!kill_process_group(4_000_000, Signal::SIGTERM));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_process_observation_tests {
+    use super::*;
+    use std::os::windows::io::AsRawHandle;
+    use std::process::{Child, Command, Stdio};
+
+    struct OwnedChild(Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            drop(self.0.kill());
+            drop(self.0.wait());
+        }
+    }
+
+    #[test]
+    fn windows_process_probe_observes_running_and_retained_terminated_child() {
+        assert!(process_exists(std::process::id()).unwrap());
+        assert_eq!(
+            process_created_unix_ms(std::process::id()).unwrap(),
+            self_created_unix_ms().unwrap()
+        );
+        let mut child = OwnedChild(
+            Command::new("powershell.exe")
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "[System.Threading.Thread]::Sleep(30000)",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        assert!(process_exists(pid).unwrap());
+        let created = process_created_unix_ms(pid).unwrap().unwrap();
+        assert_eq!(process_created_unix_ms(pid).unwrap(), Some(created));
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        // The Child still owns its process HANDLE after wait. Termination,
+        // rather than object destruction, must make the observation false.
+        assert!(!child.0.as_raw_handle().is_null());
+        assert!(!process_exists(pid).unwrap());
     }
 }
 

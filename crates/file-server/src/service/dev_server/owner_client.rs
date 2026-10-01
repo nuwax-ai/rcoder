@@ -346,18 +346,6 @@ impl OwnerClient {
             .context("owner operation not found")
     }
 
-    /// R4 前台契约配套：owner 是否已完全不可达（身份探针也连接失败）。
-    /// 用于轮询 Stop 结果期间 owner 按停止语义退出后的"已停止"裁决——
-    /// 仅连接级失败算不可达，HTTP 错误响应仍是活 owner。
-    pub(super) async fn probe_unreachable(&self) -> bool {
-        let url = format!("http://{}/v1/runtime/identity", self.address);
-        matches!(
-            self.client.get(&url).send().await,
-            Err(error)
-                if error.is_connect() || error.is_request()
-        )
-    }
-
     pub(super) async fn operation_if_exists(
         &self,
         operation_id: &str,
@@ -464,6 +452,58 @@ impl OwnerClient {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
+}
+
+/// A foreground owner can exit after committing Stop but before the caller
+/// reads its reply. Read the original operation from the root captured while
+/// that owner was authenticated; a transport failure alone never proves Stop.
+pub(super) fn read_durable_stop_outcome(
+    state_root: &std::path::Path,
+    request: &RuntimeOperationRequest,
+) -> Result<Option<RuntimeOperationView>> {
+    ensure!(
+        request.kind == shared_types::RuntimeOperationKind::Stop,
+        "durable stop observation requires the original Stop request"
+    );
+    shared_types::validate_runtime_operation_request(request).map_err(anyhow::Error::msg)?;
+    let path = state_root
+        .join("operations")
+        .join(format!("{}.json", request.operation_id));
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read original durable Stop outcome"),
+    };
+    let record: serde_json::Value =
+        serde_json::from_slice(&bytes).context("decode original durable Stop outcome")?;
+    let stored_request: RuntimeOperationRequest = serde_json::from_value(
+        record
+            .get("request")
+            .cloned()
+            .context("durable Stop request missing")?,
+    )
+    .context("decode original durable Stop request")?;
+    let view: RuntimeOperationView = serde_json::from_value(
+        record
+            .get("view")
+            .cloned()
+            .context("durable Stop view missing")?,
+    )
+    .context("decode original durable Stop view")?;
+    super::external_store::verify_view(&view, request)?;
+    let original_digest =
+        shared_types::runtime_request_digest(request).map_err(anyhow::Error::msg)?;
+    let stored_digest =
+        shared_types::runtime_request_digest(&stored_request).map_err(anyhow::Error::msg)?;
+    ensure!(
+        stored_digest == original_digest
+            && view.request_digest == original_digest
+            && view.revision == request.expected_revision,
+        "durable Stop request binding changed; original outcome remains unconfirmed"
+    );
+    Ok((view.state.is_terminal()
+        || view.state == shared_types::RuntimeOperationState::RecoveryRequired)
+        .then_some(view))
 }
 
 /// 协议兼容性预检：owner 协议版本必须与平台一致。
@@ -692,6 +732,95 @@ mod r09_tests {
 #[cfg(test)]
 mod observation_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn refused_owner_connection_requires_the_exact_durable_stop_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let operations = root.path().join("operations");
+        std::fs::create_dir_all(&operations).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let client = OwnerClient::new(&address, "test-token").unwrap();
+        let request = RuntimeOperationRequest {
+            operation_id: "stop-original".into(),
+            expected_runtime_instance_id: "original-instance".into(),
+            expected_revision: 7,
+            workspace_id: "original-workspace".into(),
+            kind: shared_types::RuntimeOperationKind::Stop,
+            profile: shared_types::RunProfileInput::Source {
+                workspace_id: "original-workspace".into(),
+            },
+            run_config: None,
+            request_context: None,
+        };
+        assert!(
+            client
+                .wait_terminal(&request.operation_id, std::time::Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        assert!(
+            read_durable_stop_outcome(root.path(), &request)
+                .unwrap()
+                .is_none()
+        );
+        let path = operations.join(format!("{}.json", request.operation_id));
+        let digest = shared_types::runtime_request_digest(&request).unwrap();
+        let mut view = RuntimeOperationView {
+            operation_id: request.operation_id.clone(),
+            kind: request.kind,
+            state: shared_types::RuntimeOperationState::Stopping,
+            request_digest: digest,
+            revision: 7,
+            runtime_instance_id: request.expected_runtime_instance_id.clone(),
+            error_code: None,
+            error_message: None,
+            failure_detail: None,
+        };
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"view":view,"request":request})).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            read_durable_stop_outcome(root.path(), &request)
+                .unwrap()
+                .is_none()
+        );
+        view.state = shared_types::RuntimeOperationState::Succeeded;
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"view":view,"request":request})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_durable_stop_outcome(root.path(), &request)
+                .unwrap()
+                .unwrap()
+                .state,
+            shared_types::RuntimeOperationState::Succeeded
+        );
+        let mut different_request = request.clone();
+        different_request.workspace_id = "different-workspace".into();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"view":view,"request":different_request}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(read_durable_stop_outcome(root.path(), &request).is_err());
+        view.runtime_instance_id = "different-instance".into();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"view":view,"request":request})).unwrap(),
+        )
+        .unwrap();
+        assert!(read_durable_stop_outcome(root.path(), &request).is_err());
+        std::fs::write(&path, b"invalid").unwrap();
+        assert!(read_durable_stop_outcome(root.path(), &request).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"invalid");
+    }
 
     #[tokio::test]
     async fn explicit_run_mode_refusal_and_unknown_service_remain_distinct() {

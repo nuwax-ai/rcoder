@@ -228,6 +228,18 @@ where
                 return Err(refused(format!("{error:#}")));
             }
             Err(error) => {
+                if let Some(receipt) = control::saved_request_snapshot(&root, &attempt.request)?
+                    && receipt.supervisor_id == captured_supervisor_id
+                    && receipt.binding == binding
+                    && receipt.operation_id.as_deref() == Some(attempt.request.request_id.as_str())
+                    && receipt.phase == Phase::Stopped
+                    && receipt.intent == Intent::Stopped
+                {
+                    if let Some(generation) = &before_generation {
+                        crate::verify_local_quiescent(root.as_path(), generation)?;
+                    }
+                    return Ok(receipt);
+                }
                 let saved = last_snapshot(&root)?;
                 if saved.supervisor_id != captured_supervisor_id || saved.binding != binding {
                     return Err(refused(format!(

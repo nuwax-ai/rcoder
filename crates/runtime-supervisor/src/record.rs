@@ -101,7 +101,7 @@ pub(crate) fn generation(root: &Path) -> Result<Generation> {
 /// 无内核 boot UUID，uptime 单调只证明"未回退"——磁盘记录的 worker PID
 /// 被观察为存活时，用创建时间核对是否仍是原进程：不一致 = PID 已被
 /// 无关进程复用，原 worker 视为退出（不再阻塞清理）。
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(crate) struct WorkerCreated {
     pub version: u32,
@@ -114,13 +114,32 @@ pub(crate) fn save_worker_created(root: &Path, value: &WorkerCreated) -> Result<
     save(&root.join("worker-created.json"), &value)
 }
 
-/// 读取 worker 创建身份；缺失/损坏返回 None（legacy 记录走保守路径，
-/// 不因诊断 sidecar 拒绝恢复）。
-#[cfg(windows)]
-pub(crate) fn worker_created(root: &Path) -> Option<u64> {
-    let bytes = std::fs::read(root.join("worker-created.json")).ok()?;
-    let value: WorkerCreated = serde_json::from_slice(&bytes).ok()?;
-    (value.version == 1).then_some(value.unix_ms)
+/// Missing legacy sidecars have no creation identity. Observation and decoding
+/// errors retain their cause; callers use this only when the PID is still live.
+#[cfg(any(windows, test))]
+pub(crate) fn worker_created(root: &Path) -> Result<Option<u64>> {
+    let path = root.join("worker-created.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read worker creation identity {}", path.display()));
+        }
+    };
+    let value: WorkerCreated = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decode worker creation identity {}", path.display()))?;
+    ensure!(
+        value.version == 1 && value.unix_ms > 0,
+        "invalid worker creation identity at {}",
+        path.display()
+    );
+    Ok(Some(value.unix_ms))
+}
+
+#[cfg(any(windows, test))]
+fn worker_creation_matches(recorded_ms: u64, observed_ms: u64) -> bool {
+    recorded_ms == observed_ms
 }
 pub(crate) fn work_root(scope: &Path, id: &str) -> Result<PathBuf> {
     ensure!(
@@ -530,36 +549,41 @@ fn verify_abandoned_worker(
             // 已随代次记录（worker-created.json sidecar）；PID 复用为无关
             // 进程（创建时刻不一致）不阻塞清理，原 worker 视为退出。
             // legacy 记录或身份不可读保持保守（可查询原因，非永久拒绝）。
-            let identity = worker_created(root)
-                .or_else(|| {
-                    tracing::warn!(
-                        generation = %value.id,
-                        "worker creation identity missing; PID-reuse cannot be excluded"
-                    );
-                    None
-                })
-                .and_then(|recorded_ms| {
-                    process_utils::process_created_unix_ms(pid)
-                        .context("inspect worker process creation time")
-                        .map(|observed| (recorded_ms, observed))
-                        .ok()
-                });
-            match identity {
-                Some((recorded_ms, Some(observed))) if observed.abs_diff(recorded_ms) > 1_000 => {
+            let recorded = worker_created(root).with_context(|| {
+                format!(
+                    "inspect generation {} worker {pid} creation identity",
+                    value.id
+                )
+            })?;
+            let observed = process_utils::process_created_unix_ms(pid).with_context(|| {
+                format!(
+                    "inspect generation {} worker {pid} process creation time",
+                    value.id
+                )
+            })?;
+            match (recorded, observed) {
+                (Some(recorded_ms), Some(observed_ms))
+                    if !worker_creation_matches(recorded_ms, observed_ms) =>
+                {
                     tracing::warn!(
                         generation = %value.id,
                         pid,
                         "recorded worker PID hosts an unrelated process; original worker is gone"
                     );
                 }
-                Some((_, Some(_))) => {
+                (Some(_), Some(_)) => {
                     anyhow::bail!(
                         "generation {} worker {pid} still exists (creation identity matches); \
                          cleanup is unconfirmed",
                         value.id
                     );
                 }
-                _ => {
+                (_, None) => {
+                    // The original PID disappeared between the two read-only
+                    // observations. No live process remains to compare.
+                    tracing::debug!(generation = %value.id, pid, "worker exited during creation identity inspection");
+                }
+                (None, Some(_)) => {
                     anyhow::bail!(
                         "generation {} worker {pid} observed alive; creation identity \
                          unavailable, cleanup stays unconfirmed",
@@ -625,6 +649,30 @@ fn process_space_ended_with(
 mod tests {
     use super::*;
     use crate::epoch::EpochGuard;
+
+    #[test]
+    fn worker_creation_identity_is_exact_and_reports_invalid_sidecars() {
+        assert!(worker_creation_matches(1_000_000, 1_000_000));
+        assert!(!worker_creation_matches(1_000_000, 1_000_001));
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(worker_created(root.path()).unwrap(), None);
+        let path = root.path().join("worker-created.json");
+        std::fs::write(&path, br#"{"version":1,"unix_ms":1000000}"#).unwrap();
+        assert_eq!(worker_created(root.path()).unwrap(), Some(1_000_000));
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(
+            format!("{:#}", worker_created(root.path()).unwrap_err())
+                .contains("decode worker creation identity")
+        );
+        std::fs::write(&path, br#"{"version":2,"unix_ms":1000000}"#).unwrap();
+        assert!(worker_created(root.path()).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            format!("{:#}", worker_created(root.path()).unwrap_err())
+                .contains("read worker creation identity")
+        );
+    }
 
     /// Minimal stuck-generation scope: Running, no cleanup receipts, a live
     /// command record and an initialized admission gate.

@@ -33,6 +33,163 @@ mod cases {
     }
 
     #[tokio::test]
+    async fn delayed_generation_shutdown_does_not_cancel_its_successor() {
+        let state = Arc::new(state());
+        let old = state.generation_control("nativeold").unwrap();
+        state.begin_business_session("nativeold".into(), true, || false);
+        state.mark_initialized();
+        state.set_generation("artifactdeployment".into());
+        assert!(
+            old.ready(),
+            "artifact identity must not replace native control identity"
+        );
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let callback = tokio::spawn(async move {
+            wait.await.unwrap();
+            old.shutdown().await.unwrap();
+        });
+        let current = state.generation_control("nativenew").unwrap();
+        state.begin_business_session("nativenew".into(), false, || false);
+        let token = state.cancel_token();
+        release.send(()).unwrap();
+        callback.await.unwrap();
+        assert!(!token.is_cancelled());
+        assert!(state.accepting.load(std::sync::atomic::Ordering::Acquire));
+        current.shutdown().await.unwrap();
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn quarantined_input_keeps_management_without_guessing_source_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let root = dir.path().join("state");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            workspace.join("release.lock.toml"),
+            toml::to_string(&release("unpublishedsource")).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join(".deploy-operation.json"), "{damaged").unwrap();
+        let journal = Journal::open_with_root(&workspace, root.clone()).unwrap();
+        let state = state();
+        *state.journal.lock().unwrap() = Some(journal);
+        let args = RuntimeArgs {
+            workspace,
+            ..Default::default()
+        };
+        assert!(initialize_startup(&args, &state).await.unwrap().is_none());
+        assert!(
+            !state.runtime_recovery_hold_active(),
+            "historical input loss must not fence explicit replacement or Stop"
+        );
+        assert!(root.join(".deploy-recovery-required.json").exists());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let kernel = Arc::new(crate::runtime_kernel::RuntimeKernel::new(
+            crate::runtime_kernel::RuntimeStore::open_with_root(root, &args.workspace).unwrap(),
+            shared_types::RuntimeIdentityView {
+                application_id: "appone".into(),
+                workspace_id: "workspace".into(),
+                service_family: "userapp-dev".into(),
+                source_root: args.workspace.to_string_lossy().into_owned(),
+                runtime_instance_id: "instanceone".into(),
+                deployment_generation_id: "generationone".into(),
+                protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+                capabilities: vec![],
+            },
+            Box::new(move |action| {
+                tx.send(action).unwrap();
+            }),
+        ));
+        state.set_runtime_kernel(kernel.clone());
+        let submitted = admit_explicit_run_replacement(&args, &state)
+            .await
+            .unwrap()
+            .expect("this run submitted its own request");
+        let operation_id = match rx.try_recv().unwrap() {
+            crate::runtime_kernel::DispatchAction::OrchestrateSource { operation_id, .. } => {
+                operation_id
+            }
+            other => panic!("explicit Source run dispatched {other:?}"),
+        };
+        assert_eq!(submitted, operation_id);
+        assert_eq!(
+            kernel.get(&operation_id).await.unwrap().unwrap().state,
+            shared_types::RuntimeOperationState::Accepted
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_run_observes_its_failed_preflight_without_stopping_successors() {
+        for (terminal, successor) in [
+            (shared_types::RuntimeOperationState::Failed, false),
+            (shared_types::RuntimeOperationState::Failed, true),
+            (shared_types::RuntimeOperationState::Cancelled, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = state();
+            let kernel = kernel_for(dir.path());
+            state.set_runtime_kernel(kernel.clone());
+            state.set_phase(ServerPhase::Idle);
+            kernel
+                .admit(runtime_request(
+                    shared_types::RuntimeOperationKind::Start,
+                    "runone",
+                    0,
+                ))
+                .await
+                .unwrap();
+            kernel
+                .finish(
+                    "runone",
+                    terminal,
+                    Some(("ERR_VALIDATION".into(), "startup preflight failed".into())),
+                    None,
+                    0,
+                )
+                .await
+                .unwrap();
+            if successor {
+                kernel
+                    .admit(runtime_request(
+                        shared_types::RuntimeOperationKind::Start,
+                        "platformnext",
+                        0,
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let observation = observe_explicit_run_failure(&state, "runone")
+                .await
+                .unwrap();
+            if successor {
+                assert_eq!(observation, ExplicitRunObservation::Detached);
+                assert_eq!(
+                    kernel
+                        .status()
+                        .await
+                        .unwrap()
+                        .active_operation_id
+                        .as_deref(),
+                    Some("platformnext")
+                );
+                assert!(!state.cancel_token().is_cancelled());
+            } else {
+                assert!(
+                    matches!(observation, ExplicitRunObservation::Failure(message)
+                    if message.contains("startup preflight failed"))
+                );
+                assert_eq!(
+                    state.phase(),
+                    ServerPhase::Idle,
+                    "operation failure must be visible even if preflight never changed the business phase"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn server_driver_shutdown_waits_for_drop_after_failure_or_timeout() {
         use std::sync::atomic::{AtomicBool, Ordering};
 

@@ -3,6 +3,8 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use anyhow::Context as _;
+
 use super::log;
 use super::process;
 use super::support::lock;
@@ -357,47 +359,52 @@ impl DevServerManager {
                 external,
                 &request,
             )?;
-            self.resume_external_intent(project_id, &client, &intent, &request)
-                .await?;
-            let view = match client
-                .wait_terminal(
-                    &intent.request.operation_id,
-                    std::time::Duration::from_secs(120),
-                )
-                .await
-            {
+            // Capture the authenticated owner's state root before dispatch.
+            // A later owner restart must not redirect this request to a new
+            // instance or manufacture a terminal result from port refusal.
+            let captured_state_root = super::owner_client::find_owner_token(
+                Path::new(&identity.source_root),
+                &identity.application_id,
+            )
+            .map(|(root, _)| root);
+            let outcome = async {
+                self.resume_external_intent(project_id, &client, &intent, &request)
+                    .await?;
+                client
+                    .wait_terminal(
+                        &intent.request.operation_id,
+                        std::time::Duration::from_secs(120),
+                    )
+                    .await
+            }
+            .await;
+            let view = match outcome {
                 Ok(view) => view,
                 Err(error) => {
-                    // R4 前台契约：run 形态 owner 消费 Stop 并确认终态后以
-                    // 停止语义退出——轮询中的 owner API 随之消失（连接拒绝）。
-                    // owner 已不可达即最强停止证据（其全部业务随进程退出），
-                    // 不能把已达成的停止当失败；后续 dev start 会引导新 owner，
-                    // 残留孤儿由其启动 quiescence 收束。
-                    let unreachable = client.probe_unreachable().await;
-                    if unreachable {
-                        tracing::warn!(
-                            operation_id = %intent.request.operation_id,
-                            %error,
-                            "external owner exited while polling stop outcome; \
-                             treating the stop as confirmed by owner exit"
-                        );
-                        self.finish_external_intent(project_id, &intent.request, true)?;
-                        // 以 owner 退出为证据的合成终态（身份字段来自受理
-                        // 请求，verify_view 的身份核验照常通过）。
-                        return Ok(shared_types::RuntimeOperationView {
-                            operation_id: intent.request.operation_id.clone(),
-                            kind: shared_types::RuntimeOperationKind::Stop,
-                            state: shared_types::RuntimeOperationState::Succeeded,
-                            request_digest: shared_types::runtime_request_digest(&intent.request)
-                                .unwrap_or_default(),
-                            revision: status.revision,
-                            runtime_instance_id: external.runtime_instance_id.clone(),
-                            error_code: None,
-                            error_message: None,
-                            failure_detail: None,
-                        });
+                    let durable = captured_state_root
+                        .as_deref()
+                        .map(|root| {
+                            super::owner_client::read_durable_stop_outcome(root, &intent.request)
+                        })
+                        .transpose()
+                        .context("verify original Stop outcome after owner transport failure")?
+                        .flatten();
+                    match durable {
+                        Some(view) => {
+                            tracing::info!(
+                                operation_id = %view.operation_id,
+                                state = ?view.state,
+                                "original Stop outcome recovered from its durable receipt"
+                            );
+                            view
+                        }
+                        None => {
+                            return Err(error).context(
+                                "original Stop has no confirmed durable outcome; \
+                                 registration and request identity retained for recovery",
+                            );
+                        }
                     }
-                    return Err(error);
                 }
             };
             super::external_store::verify_view(&view, &intent.request)?;

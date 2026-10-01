@@ -50,6 +50,96 @@ mod cases {
     }
 
     #[tokio::test]
+    async fn foreground_failure_exit_and_new_admission_share_one_boundary() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        for successor_first in [false, true] {
+            let (dir, _) = temp_store();
+            let kernel = kernel(dir.path());
+            let own = request(RuntimeOperationKind::Start, "foregroundone");
+            kernel.admit(own.clone()).await.unwrap();
+            kernel
+                .finish(
+                    &own.operation_id,
+                    RuntimeOperationState::Failed,
+                    Some(("ERR_VALIDATION".into(), "preflight failed".into())),
+                    None,
+                    0,
+                )
+                .await
+                .unwrap();
+            let successor = request(RuntimeOperationKind::Start, "platformnext");
+            if successor_first {
+                kernel.admit(successor.clone()).await.unwrap();
+            }
+            let cancelled = AtomicBool::new(false);
+            let exit = kernel
+                .begin_foreground_failure_exit(&own.operation_id, || {
+                    cancelled.store(true, Ordering::Release);
+                })
+                .await
+                .unwrap();
+            if successor_first {
+                assert!(exit.is_none());
+                assert!(!cancelled.load(Ordering::Acquire));
+                assert_eq!(
+                    kernel
+                        .status()
+                        .await
+                        .unwrap()
+                        .active_operation_id
+                        .as_deref(),
+                    Some("platformnext")
+                );
+                // A successor that finished before the next observation is
+                // still newer; clearing its active slot does not revive the old
+                // foreground observer's permission to terminate business.
+                kernel
+                    .finish(
+                        "platformnext",
+                        RuntimeOperationState::Succeeded,
+                        None,
+                        None,
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    kernel
+                        .begin_foreground_failure_exit(&own.operation_id, || {
+                            cancelled.store(true, Ordering::Release);
+                        })
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(!cancelled.load(Ordering::Acquire));
+            } else {
+                assert!(exit.unwrap().contains("preflight failed"));
+                assert!(cancelled.load(Ordering::Acquire));
+                let rejection = kernel.admit(successor).await.unwrap_err();
+                assert_eq!(rejection.code, ERR_OPERATION_IN_PROGRESS);
+                assert_eq!(
+                    rejection.active_operation_id.as_deref(),
+                    Some("foregroundone")
+                );
+                assert!(kernel.get("platformnext").await.unwrap().is_none());
+                assert!(matches!(
+                    kernel.admit(own).await.unwrap(),
+                    AdmissionOutcome::Replayed(_)
+                ));
+                assert!(matches!(
+                    kernel
+                        .admit(request(RuntimeOperationKind::Stop, "stopduringexit"))
+                        .await
+                        .unwrap(),
+                    AdmissionOutcome::Accepted(_)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn queued_input_keeps_credentials_and_promotes_execution_identity() {
         for kind in [RuntimeOperationKind::Restart, RuntimeOperationKind::Deploy] {
             let (dir, _) = temp_store();
@@ -1823,6 +1913,7 @@ mod cases {
             .admit(request(RuntimeOperationKind::Start, "op-a"))
             .await
             .expect("admit session A operation");
+        assert!(kernel.mark_execution_consumed("op-a").await.unwrap());
         kernel
             .note_execution_session_ended(true)
             .await
@@ -1915,6 +2006,195 @@ mod cases {
         );
     }
 
+    #[tokio::test]
+    async fn session_end_preserves_unconsumed_admission_before_end_callback() {
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-ended"))
+            .await
+            .unwrap();
+        assert!(kernel.mark_execution_consumed("op-ended").await.unwrap());
+        kernel.commit_execution("op-ended").await.unwrap();
+        // The old driver has ended, but its callback has not acquired the
+        // kernel lock yet. A fresh request may already occupy the vacant slot.
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-fresh"))
+            .await
+            .unwrap();
+        assert!(!kernel.mark_execution_consumed("op-ended").await.unwrap());
+        kernel.note_execution_session_ended(true).await.unwrap();
+        kernel.prepare_relaunch().await.unwrap();
+        assert!(kernel.recover().await.unwrap().is_empty());
+        assert_eq!(
+            kernel.get("op-fresh").await.unwrap().unwrap().state,
+            RuntimeOperationState::Accepted
+        );
+        assert_eq!(
+            kernel
+                .status()
+                .await
+                .unwrap()
+                .active_operation_id
+                .as_deref(),
+            Some("op-fresh")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_end_preserves_queued_input_until_confirmed_recovery() {
+        let (dir, _keep) = temp_store();
+        let actions = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = actions.clone();
+        let kernel = RuntimeKernel::new(
+            open_store(&dir.path().join("workspace")),
+            identity(),
+            Box::new(move |action| sink.lock().unwrap().push(action)),
+        );
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "op-running"))
+            .await
+            .unwrap();
+        assert!(kernel.mark_execution_consumed("op-running").await.unwrap());
+        let mut queued = request(RuntimeOperationKind::Restart, "op-queued");
+        queued.run_config = Some(shared_types::OperationRunConfig {
+            pg: Some(shared_types::StartPgCredential {
+                username: "dev".into(),
+                password: "retained-input-test".into(),
+            }),
+        });
+        kernel.admit(queued).await.unwrap();
+        assert!(!kernel.mark_execution_consumed("op-queued").await.unwrap());
+        kernel.note_execution_session_ended(true).await.unwrap();
+        assert!(!kernel.dispatch_pending_after_quiescence().await.unwrap());
+        kernel.prepare_relaunch().await.unwrap();
+        assert!(!kernel.dispatch_pending_after_quiescence().await.unwrap());
+        assert_eq!(
+            kernel.get("op-queued").await.unwrap().unwrap().state,
+            RuntimeOperationState::Accepted
+        );
+        kernel.recover().await.unwrap();
+        kernel.settle_unresolved_recoveries().await.unwrap();
+        assert!(kernel.dispatch_pending_after_quiescence().await.unwrap());
+        assert!(!kernel.dispatch_pending_after_quiescence().await.unwrap());
+        assert_eq!(
+            kernel
+                .status()
+                .await
+                .unwrap()
+                .active_operation_id
+                .as_deref(),
+            Some("op-queued")
+        );
+        let actions = actions.lock().unwrap();
+        assert_eq!(actions.len(), 2);
+        let DispatchAction::OrchestrateSource {
+            operation_id,
+            pg: Some(pg),
+            ..
+        } = &actions[1]
+        else {
+            panic!("queued original input was not dispatched");
+        };
+        assert_eq!(operation_id, "op-queued");
+        assert_eq!(pg.password, "retained-input-test");
+    }
+
+    #[tokio::test]
+    async fn idle_stopped_intent_update_does_not_overwrite_fresh_admission() {
+        let (dir, _keep) = temp_store();
+        let kernel = std::sync::Arc::new(kernel(dir.path()));
+        assert!(kernel.ensure_stopped_if_idle().await.unwrap());
+        assert!(!kernel.ensure_stopped_if_idle().await.unwrap());
+        assert_eq!(
+            kernel.store.load_desired().unwrap(),
+            (DesiredState::Stopped, 1)
+        );
+        let admission_guard = kernel.admission.lock().await;
+        let (admit_entered, admit_ready) = tokio::sync::oneshot::channel();
+        let accepting = kernel.clone();
+        let admission = tokio::spawn(async move {
+            let mut fresh = request(RuntimeOperationKind::Start, "op-explicit");
+            fresh.expected_revision = 1;
+            admit_entered.send(()).unwrap();
+            accepting.admit(fresh).await
+        });
+        // On the single-thread test runtime, each task polls until it queues
+        // behind this lock before the receiver resumes. The mutex is FIFO.
+        admit_ready.await.unwrap();
+        let (idle_entered, idle_ready) = tokio::sync::oneshot::channel();
+        let stopping = kernel.clone();
+        let idle_update = tokio::spawn(async move {
+            idle_entered.send(()).unwrap();
+            stopping.ensure_stopped_if_idle().await
+        });
+        idle_ready.await.unwrap();
+        drop(admission_guard);
+        assert!(matches!(
+            admission.await.unwrap().unwrap(),
+            AdmissionOutcome::Accepted(_)
+        ));
+        assert!(!idle_update.await.unwrap().unwrap());
+        assert_eq!(
+            kernel.store.load_desired().unwrap(),
+            (DesiredState::Running, 1)
+        );
+        assert_eq!(
+            kernel
+                .status()
+                .await
+                .unwrap()
+                .active_operation_id
+                .as_deref(),
+            Some("op-explicit")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_control_busy_preserves_replay_and_rejects_without_admission() {
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        let original = request(RuntimeOperationKind::Start, "op-existing");
+        kernel.admit(original.clone()).await.unwrap();
+        let held = Some(("native-stop".to_owned(), "cleanup_pending".to_owned()));
+        assert!(matches!(
+            kernel
+                .admit_with_control_hold(original, true, held.clone())
+                .await
+                .unwrap(),
+            AdmissionOutcome::Replayed(_)
+        ));
+        for next in [
+            request(RuntimeOperationKind::Start, "op-new-start"),
+            request(RuntimeOperationKind::Restart, "op-new-restart"),
+            request_deploy_url("op-new-deploy"),
+        ] {
+            let id = next.operation_id.clone();
+            let rejection = kernel
+                .admit_with_control_hold(next, false, held.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(rejection.code, ERR_OPERATION_IN_PROGRESS);
+            assert_eq!(
+                rejection.active_operation_id.as_deref(),
+                Some("native-stop")
+            );
+            assert!(rejection.message.contains("cleanup_pending"));
+            assert!(!kernel.store.operation_path(&id).exists());
+        }
+        assert_eq!(
+            kernel.store.load_desired().unwrap(),
+            (DesiredState::Running, 0)
+        );
+        assert!(matches!(
+            kernel
+                .admit_with_control_hold(request(RuntimeOperationKind::Stop, "op-stop"), true, held)
+                .await
+                .unwrap(),
+            AdmissionOutcome::Accepted(_)
+        ));
+    }
+
     /// RV01：会话交接记录的挂起 Stop 屏障在下一会话收束为幂等成功
     /// （会话终末清理已确认物理停止），且该收束不占用/清除新受理槽位。
     #[tokio::test]
@@ -1925,10 +2205,12 @@ mod cases {
             .admit(request(RuntimeOperationKind::Start, "op-run"))
             .await
             .expect("admit running operation");
+        assert!(kernel.mark_execution_consumed("op-run").await.unwrap());
         kernel
             .admit(request(RuntimeOperationKind::Stop, "op-stop"))
             .await
             .expect("admit stop barrier");
+        assert!(kernel.mark_execution_consumed("op-stop").await.unwrap());
         kernel
             .note_execution_session_ended(true)
             .await

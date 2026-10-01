@@ -261,7 +261,12 @@ pub(super) async fn submit_operation(
     } else {
         false
     };
-    let admission = if state.server.runtime_recovery_hold_active() && !supplying_credentials {
+    let owner_hold = state.server.runtime_recovery_hold_active() && !supplying_credentials;
+    let admission = if let Some(native) = state.server.native_control_blocker() {
+        kernel
+            .admit_with_control_hold(body.request, owner_hold, Some(native))
+            .await
+    } else if owner_hold {
         kernel.admit_with_owner_hold(body.request, true).await
     } else {
         kernel.admit(body.request).await
@@ -269,7 +274,14 @@ pub(super) async fn submit_operation(
     match admission {
         Ok(outcome) => {
             let view = match outcome {
-                crate::runtime_kernel::AdmissionOutcome::Accepted(view) => view,
+                crate::runtime_kernel::AdmissionOutcome::Accepted(view) => {
+                    // A newly accepted request may be waiting behind an old
+                    // unconsumed operation after the automatic retry budget
+                    // exhausted. Wake the management session for this explicit
+                    // attempt; replaying the old request does not reset it.
+                    state.server.request_business_relaunch();
+                    view
+                }
                 crate::runtime_kernel::AdmissionOutcome::Replayed(view) => view,
             };
             Ok((

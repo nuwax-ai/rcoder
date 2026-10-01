@@ -167,6 +167,23 @@ pub async fn owner_serve(
         let session = session.clone();
         move || session.request_relaunch()
     })?;
+    state.set_native_control({
+        let session = session.clone();
+        move || {
+            let snapshot = session.snapshot();
+            snapshot
+                .operation_id
+                .filter(|_| {
+                    matches!(
+                        snapshot.phase,
+                        runtime_supervisor::Phase::Stopping
+                            | runtime_supervisor::Phase::CleanupPending
+                            | runtime_supervisor::Phase::Reconciling
+                    )
+                })
+                .map(|id| (id, snapshot.phase.to_string()))
+        }
+    })?;
     // R3：原生会话相位镜像——恢复活跃期（含围栏清理）阻塞 deploy/status，
     // 降级驻留（RecoveryRequired）不阻塞：证据可查、精确 Stop 可达。
     {
@@ -251,6 +268,7 @@ pub async fn owner_serve(
                 // Restart 在 run 形态下同样被消费；差异只在会话重启策略
                 //（run 的 restart_on_exit=false，前台退出码语义）。
                 let launch_generation = launch.generation.clone();
+                let control = factory_state.generation_control(&launch_generation)?;
                 // RV05：业务会话根任务捕获本代次的不可变命令范围——
                 // 进程级会话范围随后被换代/卸下时，会话内（含显式派生的
                 // 执行子任务）仍向旧（已闭门）范围登记，不进入 Direct
@@ -276,7 +294,6 @@ pub async fn owner_serve(
                         })
                         .map(|_| None::<i32>)
                 });
-                let control = factory_state.clone();
                 Ok(runtime_supervisor::BusinessRun {
                     control,
                     end: Box::pin(async move {
@@ -340,8 +357,8 @@ impl Drop for DegradeManagementOnDrop<'_> {
 /// RV01：任何出口（含 journal/恢复失败的 `?` 提前返回）都先记录内核执行
 /// 交接——仅当会话到达过执行驱动（server_loop）才把槽位记录为它的交接
 /// 集；驱动前失败的会话没有消费任何操作，槽位中的新受理保持原样等待
-/// 下一个会话。驱动前失败且存在已受理待消费操作时重新触发会话重建
-///（单次 relaunch 通知可能被失败重试消费掉，预算耗尽后无人唤醒）。
+/// 下一个会话。驱动前失败且存在已受理待消费操作时唤醒有限自动重试；
+/// 不能把同一旧操作的失败当成新用户请求清零重启预算。
 async fn business_session(
     args: RuntimeArgs,
     state_root: std::path::PathBuf,
@@ -369,9 +386,9 @@ async fn business_session(
         if !reached_driver && result.is_err() && !foreground && kernel.has_live_admission().await {
             tracing::warn!(
                 "business session failed before the driver with admitted work pending; \
-                 re-requesting relaunch"
+                 requesting retry within the existing restart budget"
             );
-            session.request_relaunch();
+            session.request_automatic_relaunch();
         }
     }
     result
@@ -658,59 +675,59 @@ async fn business_session_inner(
         // 屏障误判 Superseded（容器矩阵 R3 实测：native stop 后的重开链
         // 写出无操作对应的 revision+1）；内核已有更新的受理意图时由该
         // 操作自身的 admit 语义管理 desired。
-        let live_admission = match state.runtime_kernel() {
-            Some(kernel) => kernel.has_live_admission().await,
-            None => false,
-        };
-        if !live_admission {
-            let store = crate::runtime_kernel::RuntimeStore::open_with_root(
-                state_root.clone(),
-                &args.workspace,
-            )?;
-            let (desired, revision) = store.load_desired()?;
-            if desired != shared_types::DesiredState::Stopped {
-                store.store_desired(
-                    shared_types::DesiredState::Stopped,
-                    revision
-                        .checked_add(1)
-                        .context("desired revision overflow")?,
-                )?;
-            }
+        if let Some(kernel) = state.runtime_kernel() {
+            kernel
+                .ensure_stopped_if_idle()
+                .await
+                .context("persist stopped intent without overwriting an admitted request")?;
         }
     }
-    let mut first_request = if stop_intent {
-        None
-    } else if let Some(error) = startup_error.as_ref() {
-        state.begin_failure(format!("startup shutdown unconfirmed: {error:#}"), true);
-        None
-    } else if kernel_recovery_hold {
-        state.set_phase(ServerPhase::Idle);
-        None
-    } else {
-        match initialize_startup(&args, &state).await {
-            Ok(action) => action,
-            Err(error) => {
-                tracing::error!(%error, "Deployment startup reconciliation failed");
-                state.ready.set_ready(false);
-                if state.runtime_recovery_hold_active() {
-                    // Unknown identity/boundary is not a failed operation of
-                    // this owner; preserve its original durable evidence.
-                    state.begin_failure(
-                        format!("startup recovery required: {error:#}"),
-                        !state.credentials_only_hold(),
-                    );
-                } else if let Err(persist_error) =
-                    state.fail_operation(format!("deployment startup: {error:#}"), Boundary::Failed)
-                {
-                    state.begin_failure(
-                        format!("deployment startup: {error:#}; persist: {persist_error:#}"),
-                        true,
-                    );
+    let explicit_run_replacement = foreground
+        && !args.control_only
+        && !env_deploy_requested(&state)
+        && !automatic_deployment_recovery_allowed(&state)?;
+    let mut explicit_run_operation_id = None;
+    let mut first_request =
+        if explicit_run_replacement && ownership_claimed && !kernel_recovery_hold {
+            // A foreground run is an explicit request, unlike an automatic serve
+            // restart. Route lost-journal recovery through the same operation path
+            // as a CLI dispatch instead of guessing the old target/credentials.
+            state.mark_initialized();
+            explicit_run_operation_id = admit_explicit_run_replacement(&args, &state).await?;
+            None
+        } else if stop_intent {
+            None
+        } else if let Some(error) = startup_error.as_ref() {
+            state.begin_failure(format!("startup shutdown unconfirmed: {error:#}"), true);
+            None
+        } else if kernel_recovery_hold {
+            state.set_phase(ServerPhase::Idle);
+            None
+        } else {
+            match initialize_startup(&args, &state).await {
+                Ok(action) => action,
+                Err(error) => {
+                    tracing::error!(%error, "Deployment startup reconciliation failed");
+                    state.ready.set_ready(false);
+                    if state.runtime_recovery_hold_active() {
+                        // Unknown identity/boundary is not a failed operation of
+                        // this owner; preserve its original durable evidence.
+                        state.begin_failure(
+                            format!("startup recovery required: {error:#}"),
+                            !state.credentials_only_hold(),
+                        );
+                    } else if let Err(persist_error) = state
+                        .fail_operation(format!("deployment startup: {error:#}"), Boundary::Failed)
+                    {
+                        state.begin_failure(
+                            format!("deployment startup: {error:#}; persist: {persist_error:#}"),
+                            true,
+                        );
+                    }
+                    None
                 }
-                None
             }
-        }
-    };
+        };
     // R03/B05：desired 读取先于启动决策；读取失败同样压制自动启动。
     if ownership_claimed && !kernel_recovery_hold {
         let mut desired_unreadable = false;
@@ -749,6 +766,12 @@ async fn business_session_inner(
     // 启动恢复完成（含 Failed 相位）：开放写端点受理与 /ready 判定，并发布
     // 本会话的管理就绪（原生快照 phase=ready——管理就绪，非业务就绪）。
     if ownership_claimed {
+        if let Some(kernel) = state.runtime_kernel() {
+            kernel
+                .dispatch_pending_after_quiescence()
+                .await
+                .context("dispatch original queued input after confirmed startup recovery")?;
+        }
         state.mark_initialized();
         ready_guard.mark_ready()?;
     }
@@ -795,7 +818,35 @@ async fn business_session_inner(
         // 该失败原因退出。
         let failure_watch = async {
             if !foreground {
-                std::future::pending::<()>().await;
+                std::future::pending::<String>().await;
+            }
+            if explicit_run_replacement {
+                let Some(operation_id) = explicit_run_operation_id.as_deref() else {
+                    // Work accepted in the launch window belongs to its caller,
+                    // not this foreground request. Never terminate it because
+                    // this CLI did not obtain its own operation slot.
+                    return std::future::pending::<String>().await;
+                };
+                let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    match observe_explicit_run_failure(&state, operation_id).await {
+                        Ok(ExplicitRunObservation::Failure(message)) => {
+                            return message;
+                        }
+                        Ok(ExplicitRunObservation::Detached) => {
+                            // Completion, cancellation or a successor retires
+                            // this observer permanently. A late old failure
+                            // cannot stop the platform's replacement service.
+                            return std::future::pending::<String>().await;
+                        }
+                        Ok(ExplicitRunObservation::Pending) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, %operation_id, "foreground operation observation failed; preserving current business")
+                        }
+                    }
+                }
             }
             let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -803,7 +854,10 @@ async fn business_session_inner(
                 ticker.tick().await;
                 if matches!(state.phase(), ServerPhase::Failed(_)) {
                     state.trigger_cancel();
-                    break;
+                    return match state.phase() {
+                        ServerPhase::Failed(message) => message,
+                        _ => "foreground orchestration failed".to_owned(),
+                    };
                 }
             }
         };
@@ -813,12 +867,8 @@ async fn business_session_inner(
                 state.close_admission();
                 (result.context("server driver panicked").and_then(|result| result), tokio::time::Instant::now().checked_add(state.shutdown_budget(supervised)).context("shutdown budget exceeds clock range")?)
             },
-            () = &mut failure_watch => {
+            message = &mut failure_watch => {
                 state.close_admission();
-                let message = match state.phase() {
-                    ServerPhase::Failed(message) => message,
-                    _ => "foreground orchestration failed".to_owned(),
-                };
                 let deadline = tokio::time::Instant::now().checked_add(state.shutdown_budget(supervised)).context("shutdown budget exceeds clock range")?;
                 // A Failed phase requests shutdown; it does not prove that the
                 // driver ended. Retire the task before handing the generation
@@ -1201,17 +1251,30 @@ async fn serve_supervised_worker(
             .fetch_and(1, std::sync::atomic::Ordering::AcqRel);
     }
     if stop_intent {
-        let store = crate::runtime_kernel::RuntimeStore::open_with_root(
-            state_root.clone(),
-            &args.workspace,
-        )?;
-        let (_, revision) = store.load_desired()?;
-        store.store_desired(
-            shared_types::DesiredState::Stopped,
-            revision
-                .checked_add(1)
-                .context("desired revision overflow")?,
-        )?;
+        if let Some(kernel) = state.runtime_kernel() {
+            kernel
+                .ensure_stopped_if_idle()
+                .await
+                .context("persist legacy stopped intent without overwriting an admitted request")?;
+        } else {
+            let _admission = state
+                .admission
+                .lock()
+                .map_err(|_| anyhow::anyhow!("runtime admission lock poisoned"))?;
+            let store = crate::runtime_kernel::RuntimeStore::open_with_root(
+                state_root.clone(),
+                &args.workspace,
+            )?;
+            let (desired, revision) = store.load_desired()?;
+            if desired != shared_types::DesiredState::Stopped {
+                store.store_desired(
+                    shared_types::DesiredState::Stopped,
+                    revision
+                        .checked_add(1)
+                        .context("desired revision overflow")?,
+                )?;
+            }
+        }
     }
     let mut first_request = if stop_intent {
         None
@@ -2014,6 +2077,13 @@ pub(super) async fn initialize_startup(
         state.set_phase(ServerPhase::Idle);
         return Ok(None);
     }
+    if !env_deploy_requested(state) && !automatic_deployment_recovery_allowed(state)? {
+        state.set_phase(ServerPhase::Failed(
+            "Deployment input was preserved after corruption; an explicit start or deployment is required".into(),
+        ));
+        state.ready.set_ready(false);
+        return Ok(None);
+    }
     let stopped_args = restored_runtime_args_inner(args, state, false)?;
     // Decide automatic recovery before generating Switching. Stopped must not
     // leave a false interrupted-switch journal when no business was started.
@@ -2148,4 +2218,128 @@ pub(super) async fn initialize_startup(
         return Ok(Some(InitialAction::Existing));
     }
     Ok(None)
+}
+
+fn automatic_deployment_recovery_allowed(state: &ServerState) -> Result<bool> {
+    state
+        .journal
+        .lock()
+        .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
+        .as_ref()
+        .context("deployment journal missing")?
+        .automatic_recovery_allowed()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ExplicitRunObservation {
+    Pending,
+    Detached,
+    Failure(String),
+}
+
+/// Observe only the operation created by this foreground run. Terminal states
+/// in the kernel remain authoritative even when startup preflight failed before
+/// the server-loop phase changed from Idle.
+pub(super) async fn observe_explicit_run_failure(
+    state: &ServerState,
+    operation_id: &str,
+) -> Result<ExplicitRunObservation> {
+    let kernel = state
+        .runtime_kernel()
+        .context("runtime kernel unavailable for foreground observation")?;
+    let view = kernel
+        .get(operation_id)
+        .await?
+        .context("foreground operation record missing")?;
+    anyhow::ensure!(
+        view.operation_id == operation_id
+            && view.runtime_instance_id == kernel.identity().runtime_instance_id,
+        "foreground operation identity changed"
+    );
+    if matches!(
+        view.state,
+        shared_types::RuntimeOperationState::Succeeded
+            | shared_types::RuntimeOperationState::Cancelled
+    ) {
+        return Ok(ExplicitRunObservation::Detached);
+    }
+    if matches!(
+        view.state,
+        shared_types::RuntimeOperationState::Failed
+            | shared_types::RuntimeOperationState::RecoveryRequired
+    ) {
+        return Ok(
+            match kernel
+                .begin_foreground_failure_exit(operation_id, || state.trigger_cancel())
+                .await?
+            {
+                Some(message) => ExplicitRunObservation::Failure(message),
+                None => ExplicitRunObservation::Detached,
+            },
+        );
+    }
+    Ok(ExplicitRunObservation::Pending)
+}
+
+pub(super) async fn admit_explicit_run_replacement(
+    args: &RuntimeArgs,
+    state: &ServerState,
+) -> Result<Option<String>> {
+    let kernel = state
+        .runtime_kernel()
+        .context("runtime kernel unavailable for explicit run")?;
+    if kernel.has_live_admission().await {
+        return Ok(None);
+    }
+    let identity = kernel.identity();
+    let (_, revision) = kernel.store().load_desired()?;
+    let requested_workspace = std::fs::canonicalize(&args.workspace)
+        .context("resolve explicitly requested run workspace")?;
+    let artifact_workspace =
+        runtime_state_layout::canonical_project_root(&requested_workspace).join(".run");
+    let (kind, profile) = if requested_workspace == artifact_workspace {
+        let release = crate::manifest::read_release_lock(&args.workspace)
+            .context("read explicitly requested artifact identity")?;
+        (
+            shared_types::RuntimeOperationKind::Deploy,
+            shared_types::RunProfileInput::Artifact {
+                artifact: shared_types::ArtifactInput::ArtifactId {
+                    artifact_id: release.release_id,
+                },
+            },
+        )
+    } else {
+        (
+            shared_types::RuntimeOperationKind::Start,
+            shared_types::RunProfileInput::Source {
+                workspace_id: identity.workspace_id.clone(),
+            },
+        )
+    };
+    let operation_id = format!("cli-recovery-{}", uuid::Uuid::new_v4().simple());
+    let request = shared_types::RuntimeOperationRequest {
+        operation_id: operation_id.clone(),
+        expected_runtime_instance_id: identity.runtime_instance_id.clone(),
+        expected_revision: revision,
+        workspace_id: identity.workspace_id.clone(),
+        kind,
+        profile,
+        run_config: None,
+        request_context: None,
+    };
+    kernel
+        .admit_with_control_hold(
+            request,
+            state.runtime_recovery_hold_active(),
+            state.native_control_blocker(),
+        )
+        .await
+        .map_err(|rejection| {
+            anyhow::anyhow!(
+                "explicit run replacement rejected: {}: {}",
+                rejection.code,
+                rejection.message
+            )
+        })?;
+    Ok(Some(operation_id))
 }

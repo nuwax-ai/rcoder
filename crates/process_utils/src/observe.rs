@@ -144,7 +144,12 @@ mod tests {
         let writer = path.clone();
         let handle = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(120));
-            std::fs::write(&writer, "ok").expect("write fixture late");
+            // Publish like a durable receipt: create+write followed by rename.
+            // Writing the observed name directly exposes an empty file between
+            // creation and write, which is not a NotFound retry scenario.
+            let pending = writer.with_extension("pending");
+            std::fs::write(&pending, "ok").expect("write fixture late");
+            std::fs::rename(pending, writer).expect("publish complete fixture");
         });
         let value = observe("delayed-fixture", Duration::from_secs(3), || async {
             match missing_file(&path) {

@@ -298,3 +298,32 @@ pub fn last_snapshot(root: &Path) -> Result<Snapshot> {
     );
     Ok(value.snapshot)
 }
+
+/// Observe the exact durable request receipt without issuing another Stop.
+/// The terminal history keeps its request identity after the live slot clears.
+pub(crate) fn saved_request_snapshot(root: &Path, request: &Request) -> Result<Option<Snapshot>> {
+    let value: Discovery = record::read(&root.join("supervisor.json"))?;
+    ensure!(
+        matches!(value.version, 1 | CONTROL_VERSION),
+        "unsupported supervisor receipt"
+    );
+    let Some((original, snapshot)) = value
+        .requests
+        .iter()
+        .find(|(original, _)| original.request_id == request.request_id)
+    else {
+        return Ok(None);
+    };
+    ensure!(
+        original.action == request.action
+            && original.expected_generation == request.expected_generation,
+        "persisted control request parameters changed"
+    );
+    let mut snapshot = snapshot.clone();
+    if snapshot.phase == Phase::Stopped && snapshot.operation_id.is_none() {
+        // Older ledgers cleared the ID together with the live slot. The stored
+        // request key supplies it; no phase or outcome is fabricated.
+        snapshot.operation_id = Some(original.request_id.clone());
+    }
+    Ok(Some(snapshot))
+}

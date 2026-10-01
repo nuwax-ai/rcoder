@@ -59,7 +59,14 @@ pub(super) async fn signal_operation_already_settled(
                 );
                 true
             } else {
-                false
+                match kernel.mark_execution_consumed(operation_id).await {
+                    Ok(consumed) => !consumed,
+                    Err(error) => {
+                        tracing::error!(%error, operation_id,
+                            "runtime control signal could not claim its original execution");
+                        true
+                    }
+                }
             }
         }
         Ok(None) => {
@@ -677,7 +684,11 @@ pub(super) async fn server_loop(
                         Ok(()) => state.set_phase(ServerPhase::Idle),
                         Err(settle_error) => {
                             tracing::error!("{settle_error}");
-                            state.set_phase(ServerPhase::Failed(settle_error));
+                            state.set_phase(ServerPhase::Failed(settle_error.clone()));
+                            if foreground {
+                                return Err(anyhow::anyhow!(settle_error))
+                                    .context("foreground stop result could not be persisted");
+                            }
                         }
                     }
                     // R4 前台契约：run 形态消费 Stop 并确认终态后，前台

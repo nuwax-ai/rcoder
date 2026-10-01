@@ -145,6 +145,7 @@ struct SessionCore {
     fence: Mutex<FenceState>,
     fence_changed: tokio::sync::Notify,
     relaunch_requested: tokio::sync::Notify,
+    automatic_retry_requested: tokio::sync::Notify,
     cleanup_adapter: Option<CleanupCommand>,
     restarts: Mutex<VecDeque<tokio::time::Instant>>,
     /// Latest generation whose business reported management readiness.
@@ -186,6 +187,13 @@ impl SessionCore {
             for (request, snapshot) in &mut next.requests {
                 if request.request_id == id {
                     *snapshot = next.snapshot.clone();
+                    // The live slot is cleared after completion, but a durable
+                    // replay still identifies the request that actually stopped.
+                    // Stop waiters use this identity to distinguish completion
+                    // from an unrelated idle snapshot.
+                    if snapshot.operation_id.is_none() && snapshot.phase == Phase::Stopped {
+                        snapshot.operation_id = Some(id.clone());
+                    }
                 }
             }
         }
@@ -401,6 +409,7 @@ impl OwnerSession {
             fence: Mutex::new(FenceState::Clear),
             fence_changed: tokio::sync::Notify::new(),
             relaunch_requested: tokio::sync::Notify::new(),
+            automatic_retry_requested: tokio::sync::Notify::new(),
             cleanup_adapter: options.cleanup_adapter,
             restarts: Mutex::new(VecDeque::new()),
             management_ready: Mutex::new(None),
@@ -455,6 +464,12 @@ impl OwnerSession {
     /// while business is stopped) into the session's intent loop.
     pub fn request_relaunch(&self) {
         self.core.relaunch_requested.notify_one();
+    }
+
+    /// Wake reconciliation for the same failed execution without granting a new
+    /// restart budget. Only an explicit fresh request can reset that budget.
+    pub fn request_automatic_relaunch(&self) {
+        self.core.automatic_retry_requested.notify_one();
     }
 
     /// RV03：会话静止判定——无业务运行（相位不在 Reconciling/Starting/
@@ -534,6 +549,7 @@ enum IdleEvent {
     Request(Incoming),
     Shutdown,
     Relaunch,
+    AutomaticRetry,
 }
 
 enum BusinessEvent {
@@ -653,6 +669,7 @@ impl RunState {
                             .store(false, std::sync::atomic::Ordering::Release);
                         let generation = slot.generation.clone();
                         let intent = self.core.intent();
+                        let restart_budget_exhausted = !self.relaunch_permitted();
                         self.core.with_discovery(|discovery| {
                             if discovery.snapshot.generation.as_deref() == Some(generation.as_str())
                             {
@@ -678,7 +695,13 @@ impl RunState {
                                 Phase::CleanupPending | Phase::RecoveryRequired
                             ) {
                                 discovery.snapshot.problem = None;
-                                discovery.snapshot.error = None;
+                                if restart_budget_exhausted {
+                                    discovery.snapshot.phase = Phase::RecoveryRequired;
+                                    discovery.snapshot.error =
+                                        Some("business restart budget exhausted".into());
+                                } else {
+                                    discovery.snapshot.error = None;
+                                }
                             }
                             Ok(())
                         })?;
@@ -806,6 +829,8 @@ impl RunState {
                 tick.tick().await;
                 let relaunch = self.core.relaunch_requested.notified();
                 tokio::pin!(relaunch);
+                let automatic_retry = self.core.automatic_retry_requested.notified();
+                tokio::pin!(automatic_retry);
                 tokio::select! {
                     _ = tick.tick() => IdleEvent::Tick,
                     Some(incoming) = self.incoming.recv() => IdleEvent::Request(incoming),
@@ -815,6 +840,7 @@ impl RunState {
                         IdleEvent::Shutdown
                     }
                     _ = &mut relaunch => IdleEvent::Relaunch,
+                    _ = &mut automatic_retry => IdleEvent::AutomaticRetry,
                 }
             };
             match event {
@@ -846,6 +872,10 @@ impl RunState {
                     if let Ok(mut restarts) = self.core.restarts.lock() {
                         restarts.clear();
                     }
+                }
+                IdleEvent::AutomaticRetry => {
+                    // Same-operation retries wake the loop, but keep the
+                    // failures already charged to the current restart window.
                 }
             }
         }
@@ -1336,7 +1366,17 @@ impl RunState {
                 Ok(())
             })?;
         }
-        Ok(self.core.snapshot())
+        let discovery = self
+            .core
+            .discovery
+            .lock()
+            .map_err(|_| anyhow::anyhow!("discovery lock poisoned after control acceptance"))?;
+        Ok(discovery
+            .requests
+            .iter()
+            .find(|(original, _)| original.request_id == request.request_id)
+            .map(|(_, snapshot)| snapshot.clone())
+            .unwrap_or_else(|| discovery.snapshot.clone()))
     }
 }
 
@@ -1389,6 +1429,91 @@ mod tests {
             .await
             .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn automatic_relaunch_keeps_budget_and_fresh_request_can_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path()).await;
+        let mut state = session.run.lock().unwrap().take().unwrap();
+        state.seed_fence().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (attempted, mut observed) = mpsc::unbounded_channel();
+        let retry_session = session.clone();
+        let counted = attempts.clone();
+        let mut factory: BusinessFactory = Box::new(move |_| {
+            let number = counted.fetch_add(1, Ordering::Relaxed) + 1;
+            attempted.send(number).unwrap();
+            // Simulate the pre-driver failure callback's own retry signal.
+            retry_session.request_automatic_relaunch();
+            Err(anyhow::anyhow!("persistent initialization failure"))
+        });
+        let limit = session.core.policy.restart_limit;
+        for round in 0..2 {
+            if round != 0 {
+                session.request_relaunch();
+            }
+            {
+                let idle = state.drive_idle(&mut factory);
+                tokio::pin!(idle);
+                // Receipt fsync may be slow. Wait for actual attempts and the
+                // charged budget instead of requiring startup within 350ms.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                for expected in round * limit + 1..=(round + 1) * limit {
+                    let next = tokio::time::timeout_at(deadline, async {
+                        tokio::select! {
+                            number = observed.recv() => number.expect("factory attempt channel closed"),
+                            _ = &mut idle => panic!("management loop exited during failed initialization"),
+                        }
+                    })
+                    .await
+                    .expect("initialization attempts did not reach their bounded budget");
+                    assert_eq!(next, expected);
+                }
+                tokio::time::timeout_at(deadline, async {
+                    loop {
+                        if session.core.restarts.lock().unwrap().len() == limit {
+                            break;
+                        }
+                        tokio::select! {
+                            number = observed.recv() => panic!("extra automatic attempt before budget parked: {number:?}"),
+                            _ = &mut idle => panic!("management loop exited before budget parked"),
+                            () = tokio::time::sleep(Duration::from_millis(10)) => {},
+                        }
+                    }
+                })
+                .await
+                .expect("completed failures did not charge the restart budget");
+                // Observe the already exhausted loop processing another
+                // automatic wake. It must neither clear the budget nor launch.
+                session.request_automatic_relaunch();
+                tokio::select! {
+                    biased;
+                    number = observed.recv() => panic!("automatic retry exceeded the budget: {number:?}"),
+                    _ = &mut idle => panic!("exhausted budget must keep management alive"),
+                    () = tokio::time::sleep(Duration::from_millis(300)) => {},
+                }
+            }
+            assert_eq!(attempts.load(Ordering::Relaxed), (round + 1) * limit);
+            assert!(!state.relaunch_permitted());
+            assert_eq!(session.snapshot().phase, Phase::RecoveryRequired);
+        }
+
+        // Exhausted automatic retry cannot block an explicit Stop of an idle
+        // owner: its authenticated request still reaches a confirmed terminal.
+        let discovery = session.core.discovery.lock().unwrap().clone();
+        let stopped = state
+            .handle_request(&Envelope {
+                version: control::CONTROL_VERSION,
+                instance: discovery.instance,
+                token: discovery.token,
+                request: Request::new(Action::StopWork),
+            })
+            .unwrap();
+        assert_eq!(stopped.phase, Phase::Stopped);
+        assert_eq!(stopped.intent, Intent::Stopped);
     }
 
     #[tokio::test]
@@ -1468,6 +1593,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parked_owner_stop_waiter_observes_its_terminal_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path()).await;
+        let mut state = session.run.lock().unwrap().take().unwrap();
+        state.seed_fence().unwrap();
+        session
+            .core
+            .with_discovery(|discovery| {
+                discovery.snapshot.phase = Phase::RecoveryRequired;
+                discovery.snapshot.error = Some("business restart budget exhausted".into());
+                Ok(())
+            })
+            .unwrap();
+        let binding = session.snapshot().binding;
+        let driver = tokio::spawn(async move {
+            while let Some(incoming) = state.incoming.recv().await {
+                state.handle_incoming(incoming).unwrap();
+            }
+        });
+        let mut attempt = crate::prepare_stop_work(root.path(), &binding)
+            .await
+            .unwrap();
+        let result = crate::continue_stop_work(&mut attempt, Duration::from_secs(2)).await;
+        let replay = crate::control(root.path(), attempt.request.clone())
+            .await
+            .unwrap();
+        driver.abort();
+        let _joined = driver.await;
+        let stopped = result.expect("confirmed idle Stop must finish its original waiter");
+        assert_eq!(stopped.phase, Phase::Stopped);
+        assert_eq!(
+            stopped.operation_id.as_deref(),
+            Some(attempt.request.request_id.as_str())
+        );
+        assert_eq!(replay.operation_id, stopped.operation_id);
+        assert_eq!(
+            session.snapshot().operation_id,
+            None,
+            "terminal history must not occupy the live control slot"
+        );
+    }
+
+    #[tokio::test]
     async fn idle_stop_completes_after_cleanup_without_restarting_business() {
         let root = tempfile::tempdir().unwrap();
         let session = session(root.path()).await;
@@ -1496,8 +1664,14 @@ mod tests {
         // RV04：终态发布清空挂起操作身份——"已受理停止在途"的探测此后
         // 恒为否，会话重开的取消接力不把已完成的停止当成在途交接。
         assert_eq!(
-            stopped.operation_id, None,
-            "terminal publication clears the pending operation identity"
+            session.snapshot().operation_id,
+            None,
+            "terminal publication clears the live pending operation identity"
+        );
+        assert_eq!(
+            stopped.operation_id.as_deref(),
+            Some(request.request.request_id.as_str()),
+            "the original request receipt retains its completed identity"
         );
         assert!(stopped.problem.is_none());
         assert!(stopped.error.is_none());

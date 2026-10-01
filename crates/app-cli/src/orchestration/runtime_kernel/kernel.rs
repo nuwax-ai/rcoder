@@ -105,10 +105,16 @@ pub(super) struct AdmissionState {
     /// 会话终末的后台任务确认；下一次会话启动（prepare_relaunch）在围栏
     /// 清空后按幂等语义收束为 Succeeded。
     pub(super) interrupted_stop: Option<String>,
-    /// RV01：上一个已结束业务会话被中断的执行/排队操作集（active 与
-    /// pending_restart 当时占据者）。仅该集合在会话交接时收束——会话结束
-    /// 后新受理的请求占据新执行权，永不被当作旧残留清理。
+    /// Operations actually consumed by the current execution driver. Admissions
+    /// and dispatch alone do not associate a request with that driver's outcome.
+    consumed_operations: std::collections::HashSet<String>,
+    /// Consumed operations retained for recovery after their driver ended.
+    /// Unconsumed admissions keep their original slot and execution input.
     pub(super) interrupted_operations: Vec<String>,
+    /// Process-local foreground lifetime bookkeeping. Ordinary serve failures
+    /// never set the exit latch; a new owner starts with it cleared.
+    latest_admitted_operation_id: Option<String>,
+    foreground_exiting_operation: Option<String>,
 }
 
 /// RV01：当前持有执行权或待交接收束的操作 ID 集——恢复扫描与保护计算
@@ -157,37 +163,99 @@ impl RuntimeKernel {
         &self.store
     }
 
-    /// RV01：一个业务会话的驱动已结束（business_session 返回，无论成败）。
-    /// **仅当该会话到达过执行驱动阶段**（server_loop 曾在跑，是通道的
-    /// 消费者）才记录当前槽位为待交接集合并让出——这些操作派发进了它的
-    /// 消费通道。会话在驱动前失败（坏 journal/恢复失败的重试风暴）没有
-    /// 消费任何东西：此时槽位只可能持有**会话开始后新受理**的操作（等
-    /// 待下一个会话消费），必须原样保留，绝不能当旧残留收束（k3s/容器
-    /// 实测：降级风暴期间受理的 restart 被 prepare 误杀为 RecoveryRequired）。
+    /// Capture consumption at the driver's side-effect boundary. A late signal
+    /// for a released slot or a terminal record must not execute again.
+    pub(crate) async fn mark_execution_consumed(&self, operation_id: &str) -> Result<bool> {
+        let mut guard = self.admission.lock().await;
+        if guard.active_operation_id.as_deref() != Some(operation_id)
+            && guard.pending_stop.as_deref() != Some(operation_id)
+        {
+            return Ok(false);
+        }
+        let stored = self
+            .store
+            .load_operation(operation_id)?
+            .context("consumed operation record is missing")?;
+        if stored.view.state.is_terminal()
+            || stored.view.state == RuntimeOperationState::RecoveryRequired
+        {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            stored.view.operation_id == operation_id
+                && stored.request.operation_id == operation_id
+                && stored.view.runtime_instance_id == self.identity.runtime_instance_id
+                && stored.request.workspace_id == self.identity.workspace_id,
+            "consumed operation identity changed"
+        );
+        guard.consumed_operations.insert(operation_id.to_owned());
+        Ok(true)
+    }
+
+    /// End the driver's captured execution set. Reaching server_loop is not
+    /// proof that it consumed every admission currently occupying a slot.
     pub(crate) async fn note_execution_session_ended(&self, reached_driver: bool) -> Result<()> {
         let mut guard = self.admission.lock().await;
-        if !reached_driver {
+        if !reached_driver && guard.consumed_operations.is_empty() {
             return Ok(());
         }
-        let stop = guard.pending_stop.take();
-        let mut interrupted: Vec<String> = Vec::new();
-        if let Some(id) = guard.active_operation_id.take() {
-            interrupted.push(id);
+        let consumed = std::mem::take(&mut guard.consumed_operations);
+        for id in consumed {
+            if guard.active_operation_id.as_deref() == Some(id.as_str()) {
+                guard.active_operation_id = None;
+            }
+            if guard.pending_stop.as_deref() == Some(id.as_str()) {
+                guard.pending_stop = None;
+                guard.interrupted_stop = Some(id.clone());
+            }
+            if !guard.interrupted_operations.contains(&id) {
+                guard.interrupted_operations.push(id);
+            }
         }
-        if let Some(id) = guard.pending_restart.take()
-            && !interrupted.contains(&id)
-        {
-            interrupted.push(id);
-        }
-        if let Some(queued) = guard.queued_input.take()
-            && !interrupted.contains(&queued.view.operation_id)
-        {
-            interrupted.push(queued.view.operation_id);
-        }
-        guard.queued_input = None;
-        guard.interrupted_stop = stop;
-        guard.interrupted_operations = interrupted;
         Ok(())
+    }
+
+    /// Startup may preserve native Stopped intent only while no accepted request
+    /// owns the execution slots. Check and publish under the admission lock so
+    /// an explicit fresh Start cannot be overwritten after a separate idle read.
+    pub(crate) async fn ensure_stopped_if_idle(&self) -> Result<bool> {
+        let guard = self.admission.lock().await;
+        if guard.active_operation_id.is_some()
+            || guard.pending_stop.is_some()
+            || guard.pending_restart.is_some()
+            || guard.queued_input.is_some()
+            || !guard.consumed_operations.is_empty()
+            || !guard.interrupted_operations.is_empty()
+            || guard.interrupted_stop.is_some()
+        {
+            return Ok(false);
+        }
+        let (desired, revision) = self.store.load_desired()?;
+        if desired == DesiredState::Stopped {
+            return Ok(false);
+        }
+        let next_revision = revision.checked_add(1).context("revision overflow")?;
+        self.store
+            .store_desired(DesiredState::Stopped, next_revision)?;
+        Ok(true)
+    }
+
+    /// Called after physical cleanup and startup recovery are confirmed. Resume
+    /// an unconsumed queued request using its retained original input; do not
+    /// dispatch while a control barrier or uncertain prior execution remains.
+    pub(crate) async fn dispatch_pending_after_quiescence(&self) -> Result<bool> {
+        let mut guard = self.admission.lock().await;
+        if guard.active_operation_id.is_some()
+            || guard.pending_stop.is_some()
+            || guard.interrupted_stop.is_some()
+            || !guard.interrupted_operations.is_empty()
+            || guard.recovery_protection
+            || guard.pending_restart.is_none()
+        {
+            return Ok(false);
+        }
+        self.promote_queued(&mut guard)?;
+        Ok(true)
     }
 
     /// RV03/RV01：是否存在已受理待消费的执行操作（驱动前失败的会话驻留
@@ -661,6 +729,16 @@ impl RuntimeKernel {
         request: RuntimeOperationRequest,
         owner_recovery_hold: bool,
     ) -> std::result::Result<AdmissionOutcome, AdmissionRejection> {
+        self.admit_with_control_hold(request, owner_recovery_hold, None)
+            .await
+    }
+
+    pub(crate) async fn admit_with_control_hold(
+        &self,
+        request: RuntimeOperationRequest,
+        owner_recovery_hold: bool,
+        native_control: Option<(String, String)>,
+    ) -> std::result::Result<AdmissionOutcome, AdmissionRejection> {
         if let Err(error) = validate_runtime_operation_request(&request) {
             return Err(AdmissionRejection {
                 code: "ERR_VALIDATION",
@@ -741,6 +819,32 @@ impl RuntimeKernel {
                 });
             }
             return Ok(AdmissionOutcome::Replayed(existing.view));
+        }
+        if request.kind != RuntimeOperationKind::Stop
+            && let Some(operation_id) = guard.foreground_exiting_operation.as_ref()
+        {
+            return Err(AdmissionRejection {
+                code: ERR_OPERATION_IN_PROGRESS,
+                message: format!(
+                    "foreground owner is exiting after operation {operation_id}; retry after it exits"
+                ),
+                active_operation_id: Some(operation_id.clone()),
+            });
+        }
+        // Same-request replay precedes the native control barrier. A different
+        // execution request is rejected before durable admission; Stop remains
+        // available to converge the current physical execution.
+        if request.kind != RuntimeOperationKind::Stop
+            && let Some((operation_id, stage)) = native_control
+        {
+            return Err(AdmissionRejection {
+                code: ERR_OPERATION_IN_PROGRESS,
+                message: format!(
+                    "native control operation {operation_id} is in progress at {stage}; \
+                     retry after it finishes"
+                ),
+                active_operation_id: Some(operation_id),
+            });
         }
         if owner_recovery_hold && request.kind != RuntimeOperationKind::Stop {
             return Err(AdmissionRejection {
@@ -971,6 +1075,7 @@ impl RuntimeKernel {
             guard.active_operation_id = Some(stored.view.operation_id.clone());
         }
         let action = self.dispatch_action_for(&stored);
+        guard.latest_admitted_operation_id = Some(stored.view.operation_id.clone());
 
         let operation_id = stored.view.operation_id.clone();
         self.emit(
@@ -999,6 +1104,68 @@ impl RuntimeKernel {
             .store
             .load_operation(operation_id)?
             .map(|stored| stored.view))
+    }
+
+    /// Decide a foreground failure and cancellation under the same lock as
+    /// admission. A successor that wins first retires the old observer; when
+    /// exit wins first, later business requests are rejected before persistence.
+    pub(crate) async fn begin_foreground_failure_exit(
+        &self,
+        operation_id: &str,
+        cancel: impl FnOnce(),
+    ) -> Result<Option<String>> {
+        let mut guard = self.admission.lock().await;
+        let stored = self
+            .store
+            .load_operation(operation_id)?
+            .context("foreground operation record missing")?;
+        anyhow::ensure!(
+            stored.view.operation_id == operation_id
+                && stored.request.operation_id == operation_id
+                && stored.view.runtime_instance_id == self.identity.runtime_instance_id
+                && stored.request.expected_runtime_instance_id == self.identity.runtime_instance_id
+                && stored.request.workspace_id == self.identity.workspace_id
+                && stored.view.request_digest
+                    == runtime_request_digest(&stored.request).map_err(anyhow::Error::msg)?,
+            "foreground operation identity changed"
+        );
+        if !matches!(
+            stored.view.state,
+            RuntimeOperationState::Failed | RuntimeOperationState::RecoveryRequired
+        ) {
+            return Ok(None);
+        }
+        let (_, revision) = self.store.load_desired()?;
+        let other_request = guard
+            .active_operation_id
+            .iter()
+            .chain(guard.pending_restart.iter())
+            .chain(guard.pending_stop.iter())
+            .any(|id| id != operation_id)
+            || guard
+                .queued_input
+                .as_ref()
+                .is_some_and(|queued| queued.view.operation_id != operation_id);
+        if stored.request.expected_revision != revision
+            || stored.view.revision != revision
+            || guard.latest_admitted_operation_id.as_deref() != Some(operation_id)
+            || other_request
+        {
+            return Ok(None);
+        }
+        let message = format!(
+            "foreground operation {operation_id} failed: {}",
+            stored
+                .view
+                .error_message
+                .as_deref()
+                .unwrap_or("runtime operation did not complete")
+        );
+        guard.foreground_exiting_operation = Some(operation_id.to_owned());
+        // This synchronous cancellation must remain inside the admission
+        // boundary. No newer operation can enter between the check and cancel.
+        cancel();
+        Ok(Some(message))
     }
 
     /// 终态发布（server 主循环在执行完成/失败后调用；先持久化再清 active 槽）。

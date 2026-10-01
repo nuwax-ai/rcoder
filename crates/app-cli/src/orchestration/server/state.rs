@@ -1,5 +1,7 @@
 use super::*;
 
+type NativeControlProbe = Box<dyn Fn() -> Option<(String, String)> + Send + Sync>;
+
 /// server 全局状态（api 层与主循环共享；读多写少，std RwLock 短临界区不跨 await）。
 pub struct ServerState {
     pub(super) control_token: std::sync::OnceLock<String>,
@@ -24,6 +26,10 @@ pub struct ServerState {
     /// 统一 owner（recovery v2）：业务会话代次 id。跨会话可重置（RwLock），
     /// 读取方经 [`ServerState::generation_value`]。
     pub(super) generation: RwLock<String>,
+    /// Native business-session identity is independent of the deployment ID,
+    /// which a resumed journal may restore to an earlier artifact generation.
+    pub(super) business_generation: RwLock<Option<String>>,
+    pub(super) native_control: std::sync::OnceLock<NativeControlProbe>,
     pub(super) phase: RwLock<ServerPhase>,
     pub(super) release: RwLock<Option<ReleaseLock>>,
     pub(super) ready: RuntimeStatusService,
@@ -180,6 +186,57 @@ impl runtime_supervisor::WorkerControl for ServerState {
                 .store(false, std::sync::atomic::Ordering::Release);
         }
         Ok(())
+    }
+}
+
+/// The control task may run late after its business driver has ended. Capture
+/// its generation so it cannot cancel a successor through shared ServerState.
+pub(super) struct GenerationControl {
+    pub(super) state: Arc<ServerState>,
+    pub(super) generation: String,
+}
+
+#[async_trait::async_trait]
+impl runtime_supervisor::WorkerControl for GenerationControl {
+    async fn shutdown(&self) -> Result<()> {
+        let _admission = self
+            .state
+            .admission
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime admission lock poisoned"))?;
+        let generation = self
+            .state
+            .business_generation
+            .read()
+            .map_err(|_| anyhow::anyhow!("business generation lock poisoned"))?;
+        if generation.as_deref() != Some(self.generation.as_str()) {
+            return Ok(());
+        }
+        self.state.trigger_cancel();
+        self.state
+            .accepting
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    async fn probe(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.ready(),
+            "business control generation is no longer current"
+        );
+        runtime_supervisor::WorkerControl::probe(self.state.as_ref()).await
+    }
+
+    fn ready(&self) -> bool {
+        self.state
+            .business_generation
+            .read()
+            .is_ok_and(|generation| generation.as_deref() == Some(self.generation.as_str()))
+            && !self.state.initializing()
+    }
+
+    fn shutdown_grace(&self) -> std::time::Duration {
+        runtime_supervisor::WorkerControl::shutdown_grace(self.state.as_ref())
     }
 }
 

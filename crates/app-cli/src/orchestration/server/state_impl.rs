@@ -22,6 +22,8 @@ impl ServerState {
             supervision_probe_tx,
             supervision_probe_rx: tokio::sync::Mutex::new(supervision_probe_rx),
             current_runtime_operation: RwLock::new(None),
+            business_generation: RwLock::new(None),
+            native_control: std::sync::OnceLock::new(),
             admission: std::sync::Mutex::new(()),
             accepting: std::sync::atomic::AtomicBool::new(true),
             auxiliary_writers: std::sync::atomic::AtomicUsize::new(0),
@@ -457,6 +459,40 @@ impl ServerState {
         self.trigger_cancel();
     }
 
+    pub(super) fn generation_control(
+        self: &Arc<Self>,
+        generation: &str,
+    ) -> Result<Arc<dyn runtime_supervisor::WorkerControl>> {
+        let _admission = self
+            .admission
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime admission lock poisoned"))?;
+        *self
+            .business_generation
+            .write()
+            .map_err(|_| anyhow::anyhow!("business generation lock poisoned"))? =
+            Some(generation.to_owned());
+        self.initializing
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(Arc::new(super::state::GenerationControl {
+            state: self.clone(),
+            generation: generation.to_owned(),
+        }))
+    }
+
+    pub(super) fn set_native_control(
+        &self,
+        observe: impl Fn() -> Option<(String, String)> + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.native_control
+            .set(Box::new(observe))
+            .map_err(|_| anyhow::anyhow!("native control observer already installed"))
+    }
+
+    pub(crate) fn native_control_blocker(&self) -> Option<(String, String)> {
+        self.native_control.get().and_then(|observe| observe())
+    }
+
     /// 统一 owner：注入业务重启通知（运行操作受理后触发会话重建）。
     pub(crate) fn set_business_relaunch(
         &self,
@@ -495,6 +531,10 @@ impl ServerState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stop_in_progress = stop_handover_in_progress();
+        *self
+            .business_generation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(generation.clone());
         let cancelled_before = self.cancel_token().is_cancelled();
         self.renew_cancel_locked();
         if stop_in_progress && cancelled_before {
@@ -837,6 +877,11 @@ impl ServerState {
         // result is returned as recorded, never executed a second time.
         if let Some(saved) = history.get(&operation_id) {
             return deploy_replay::check(saved, &fingerprint).map(DeployAdmission::Replayed);
+        }
+        if let Some((operation, stage)) = self.native_control_blocker() {
+            return Err(AdmissionError::Busy(format!(
+                "native control operation {operation} is stopping business ({stage}); retry after it completes"
+            )));
         }
         if !self.accepting.load(std::sync::atomic::Ordering::Acquire) {
             return Err(AdmissionError::Busy(
