@@ -1290,7 +1290,7 @@ mod tests {
             .arg("30")
             .spawn()
             .unwrap();
-        let (guardian_root, command_path) =
+        let (guardian_root, _command_path) =
             fixture_running_guardian(&work, "cmd-t3-live", Some(alive.id()));
         let before = std::fs::read(guardian_root.join("receipt.json")).unwrap();
         let outcome = recover_with_scope_check(&work).unwrap();
