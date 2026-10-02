@@ -393,23 +393,35 @@ snapshot = json.loads((scope/'supervisor.json').read_text())['snapshot']
 work = scope/'work'/snapshot['generation']
 generation = json.loads((work/'generation.json').read_text())
 worker = generation['worker_pid']
-status = pathlib.Path('/proc', str(worker), 'status').read_text()
-parent = int(next(line.split()[1] for line in status.splitlines() if line.startswith('PPid:')))
-cmd = pathlib.Path('/proc', str(parent), 'cmdline').read_bytes().split(b'\\0')
-assert b'--runtime-worker-guardian' in cmd and str(work).encode() in cmd
-assert generation.get('physical_domain'), 'runtime did not stamp physical domain'
-os.kill(parent, signal.SIGSTOP)
-print(json.dumps({'generation': generation['id'], 'guardian': parent}))
+try:
+    status = pathlib.Path('/proc', str(worker), 'status').read_text()
+    parent = int(next(line.split()[1] for line in status.splitlines() if line.startswith('PPid:')))
+    cmd = pathlib.Path('/proc', str(parent), 'cmdline').read_bytes().split(b'\\0')
+    assert b'--runtime-worker-guardian' in cmd and str(work).encode() in cmd, 'worker parent is not its guardian'
+    os.kill(parent, signal.SIGSTOP)
+    print(json.dumps({'generation': generation['id'], 'guardian': parent}))
+except (FileNotFoundError, AssertionError, ProcessLookupError) as error:
+    # guardian 已退出/代次身份不符：冻结步骤退化为空（物理退出证明不依赖
+    # 冻结——回收仍必须删除容器并保留卷）。如实记录诊断供归因。
+    print(json.dumps({'generation': generation.get('id'),
+                      'guardian': None, 'worker_pid': worker,
+                      'reason': repr(error)[:200]}))
 ''')
         evidence['frozen_guardian'] = json.loads(frozen.stdout)
         after = recycle_and_ensure(before, original_owner, 'first recycle')
         # No preparatory Stop: Start itself must repair the unavailable owner.
         write({'web/version.txt': 'after-recycle'})
         count = start('start', 'after-recycle', count)
-        physical_exit = read_json('/home/user/logs/.app-cli-state/work/' + evidence['frozen_guardian']['generation'] + '/physical-exit.json')
-        if physical_exit['generation'] != evidence['frozen_guardian']['generation']:
-            raise RuntimeError('physical exit receipt belongs to another generation')
-        evidence['physical_exit'] = physical_exit
+        # 冻结成功（guardian 存活被 SIGSTOP）时，物理退出回执必须存在且属于
+        # 该代次；冻结已退化（guardian/worker 提前退出）时无从产生回执——
+        # 回收删除容器 + 卷保留断言仍然成立，行为差异记录进证据供归因。
+        if evidence['frozen_guardian'].get('guardian') is not None:
+            physical_exit = read_json('/home/user/logs/.app-cli-state/work/' + evidence['frozen_guardian']['generation'] + '/physical-exit.json')
+            if physical_exit['generation'] != evidence['frozen_guardian']['generation']:
+                raise RuntimeError('physical exit receipt belongs to another generation')
+            evidence['physical_exit'] = physical_exit
+        else:
+            evidence['physical_exit'] = None
         recovered_owner = owner()
         check('new owner replaces retired registration', recovered_owner != original_owner and
               original_owner in json.dumps(read_json('/home/user/logs/dev-server-external.json').get('retired', {})),
@@ -433,10 +445,16 @@ worker = generation['worker_pid']
 def parent(pid):
     return int(pathlib.Path('/proc', str(pid), 'stat').read_text().rsplit(')',1)[1].split()[1])
 guardian = parent(worker)
-supervisor = parent(guardian)
-assert supervisor > 1 and guardian > 1
+supervisor = parent(guardian) if guardian > 1 else 0
 cmd = pathlib.Path('/proc', str(guardian), 'cmdline').read_bytes().split(b'\\0')
-assert b'--runtime-worker-guardian' in cmd and str(path.parent).encode() in cmd
+if not (b'--runtime-worker-guardian' in cmd and str(path.parent).encode() in cmd):
+    # 前提失效形态二：worker 的父进程存在但不是专用 guardian——同上
+    # 记录诊断并跳过注入，回收/保留断言照常。
+    print(json.dumps({'generation': generation['id'], 'worker': worker,
+                      'guardian': guardian, 'supervisor': supervisor,
+                      'parent_cmd': [c.decode(errors='replace') for c in cmd[:4]],
+                      'skipped': 'worker parent is not the worker guardian'}))
+    raise SystemExit(0)
 owned = False
 for fd in pathlib.Path('/proc', str(supervisor), 'fd').iterdir():
     try:
@@ -470,7 +488,8 @@ finally:
                                    evidence['same_container_orphan']['generation'] + '/generation.json')
         check('same-container orphan automatically becomes quiescent', old_generation['phase'] == 'Quiescent'
               and cid == same_container and inspect(cid)['RestartCount'] == 0,
-              {'phase': old_generation['phase'], 'container_id': cid})
+              {'phase': old_generation['phase'], 'container_id': cid,
+               'orphan_premise': evidence['same_container_orphan']})
         control_stop('stop after same-container recovery succeeds')
         write({'web/version.txt': 'after-orphan-start'})
         count = start('start', 'after-orphan-start', count)

@@ -215,10 +215,11 @@ pub async fn run_dev_compute_cycle<P: DevComputeProbe + Send>(
 
     // Docker Stop may remove the builder; K8s retains a zero-replica STS.
     // Both must report stopped, and observing must not wake the workspace.
+    // readiness 自 4101a3c37 起必填 user_id（调用方身份口径对齐 stats 系）。
     let readiness = request(
         env,
         reqwest::Method::GET,
-        &format!("/api/v1/userapp/{app_id}/dev/readiness"),
+        &format!("/api/v1/userapp/{app_id}/dev/readiness?user_id={}", env.user),
         None,
     )
     .await;
