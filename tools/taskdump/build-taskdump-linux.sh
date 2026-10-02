@@ -104,7 +104,7 @@ echo "✅ 副本 dial9 锁定 0.5.2"
 echo "🔨 构建 rcoder（dial9+taskdump, tokio_unstable, 独立 target）..."
 export RUSTFLAGS="--cfg tokio_unstable"
 export CARGO_TARGET_DIR="$DIAG_DIR/target-taskdump"
-cargo build -p rcoder --bin rcoder --features dial9 --locked
+cargo build --release -p rcoder --bin rcoder --features dial9 --locked
 
 BIN="$CARGO_TARGET_DIR/release/rcoder"
 [ -f "$BIN" ] || { echo "❌ 构建产物缺失: $BIN" >&2; exit 1; }

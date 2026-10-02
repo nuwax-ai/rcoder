@@ -119,8 +119,16 @@ fn main() -> Result<()> {
     println!("events total            : {}", evidence.events_total);
     println!("task spawns (all)       : {}", evidence.spawns_total);
     println!("instrumented spawns     : {}", evidence.instrumented.len());
-    for (task_id, (loc, worker)) in evidence.instrumented.iter().take(20) {
-        println!("  instrumented task {task_id} worker={worker:?} loc={loc}");
+    // 按 spawn 位置聚合（各接入点的真实事件量），再抽样列前几个任务
+    let mut by_loc: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for (_task_id, (loc, _worker)) in evidence.instrumented.iter() {
+        *by_loc.entry(loc.as_str()).or_default() += 1;
+    }
+    for (loc, count) in &by_loc {
+        println!("  instrumented @ {loc} × {count}");
+    }
+    for (task_id, (loc, worker)) in evidence.instrumented.iter().take(5) {
+        println!("  e.g. task {task_id} worker={worker:?} loc={loc}");
     }
     println!("wake events (all)       : {}", evidence.wakes_total);
     println!(
