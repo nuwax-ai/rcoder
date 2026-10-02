@@ -1,5 +1,7 @@
 //! Shared control recovery for CLI clients and the platform file service.
-use crate::{Action, Binding, Intent, Owner, Phase, Request, Snapshot, control, last_snapshot};
+use crate::{
+    Action, Binding, FailureCode, Intent, Owner, Phase, Request, Snapshot, control, last_snapshot,
+};
 use anyhow::{Context, Result};
 use std::{path::Path, time::Duration};
 
@@ -155,152 +157,196 @@ where
     // 模式解析（DEV-R4）：Unresolved 首次探测后固定 Online/Offline；
     // OfflineChosen 续行不再重新探测——不因 owner 换代把离线尝试重新
     // 绑定到替换后的在线目标。
-    if attempt.mode == StopMode::Unresolved {
-        match control(&root, Request::new(Action::Status)).await {
-            Ok(before) => {
-                if before.binding != binding {
-                    return Err(refused(refused_supervisor_mismatch()));
+    //
+    // 外层 'resolve 循环：忙等窗口（上一次停止的收尾）出清后，既有捕获
+    // 的 expected_generation 可能已被那次收尾的换代作废——从模式解析重
+    // 新开始，捕获当代目标，而不是带着过期代次身份被拒。
+    'resolve: loop {
+        if attempt.mode == StopMode::Unresolved {
+            match control(&root, Request::new(Action::Status)).await {
+                Ok(before) => {
+                    if before.binding != binding {
+                        return Err(refused(refused_supervisor_mismatch()));
+                    }
+                    attempt.mode = StopMode::Online {
+                        supervisor_id: before.supervisor_id,
+                    };
+                    // Late bind: the first stop write has not happened yet, so
+                    // fixing expected_generation here still precedes it.
+                    if attempt.captured_generation.is_none() {
+                        attempt.captured_generation = before.generation.clone();
+                        attempt.request.expected_generation = attempt.captured_generation.clone();
+                    }
                 }
-                attempt.mode = StopMode::Online {
-                    supervisor_id: before.supervisor_id,
-                };
-                // Late bind: the first stop write has not happened yet, so
-                // fixing expected_generation here still precedes it.
-                if attempt.captured_generation.is_none() {
-                    attempt.captured_generation = before.generation.clone();
-                    attempt.request.expected_generation = attempt.captured_generation.clone();
+                Err(error) if error.downcast_ref::<crate::Problem>().is_some() => {
+                    return Err(refused(format!("{error:#}")));
                 }
-            }
-            Err(error) if error.downcast_ref::<crate::Problem>().is_some() => {
-                return Err(refused(format!("{error:#}")));
-            }
-            Err(error) => {
-                let owner = Owner::try_acquire(&root)?
-                    .with_context(|| format!("independent supervisor unavailable: {error:#}"))?;
-                // No stop has been sent while the live owner still holds the
-                // lock. Keep that attempt unresolved so a recovered control
-                // endpoint can be used on the next continuation.
-                let target = owner.capture_offline_target(&binding)?;
-                attempt.captured_generation = target.generation.clone();
-                attempt.request.expected_generation = target.generation;
-                attempt.mode = StopMode::OfflineChosen {
-                    supervisor_id: target.supervisor_id.clone(),
-                };
-                checkpoint(attempt)?;
-                return offline_stop(
-                    owner,
-                    &binding,
-                    &attempt.request,
-                    &target.supervisor_id,
-                    cleanup,
-                )
-                .await;
+                Err(error) => {
+                    let owner = Owner::try_acquire(&root)?.with_context(|| {
+                        format!("independent supervisor unavailable: {error:#}")
+                    })?;
+                    // No stop has been sent while the live owner still holds the
+                    // lock. Keep that attempt unresolved so a recovered control
+                    // endpoint can be used on the next continuation.
+                    let target = owner.capture_offline_target(&binding)?;
+                    attempt.captured_generation = target.generation.clone();
+                    attempt.request.expected_generation = target.generation;
+                    attempt.mode = StopMode::OfflineChosen {
+                        supervisor_id: target.supervisor_id.clone(),
+                    };
+                    checkpoint(attempt)?;
+                    return offline_stop(
+                        owner,
+                        &binding,
+                        &attempt.request,
+                        &target.supervisor_id,
+                        cleanup,
+                    )
+                    .await;
+                }
             }
         }
-    }
-    checkpoint(attempt)?;
-    let StopMode::Online {
-        supervisor_id: captured_supervisor_id,
-    } = attempt.mode.clone()
-    else {
-        if let StopMode::OfflineChosen { supervisor_id } = &attempt.mode {
-            let owner = Owner::try_acquire(&root)?.with_context(
-                || "independent supervisor unavailable: offline stop is not continuable",
-            )?;
-            return offline_stop(owner, &binding, &attempt.request, supervisor_id, cleanup).await;
-        }
-        anyhow::bail!("stop attempt mode resolved inconsistently");
-    };
-    let before_generation = attempt.captured_generation.clone();
-    // Re-sending this request only observes its own acceptance/terminal receipt.
-    loop {
-        let result = match control::control_verified(
-            &root,
-            attempt.request.clone(),
-            &captured_supervisor_id,
-        )
-        .await
-        {
-            Ok(result) => result,
-            // Busy / identity / protocol rejections are actual refusals,
-            // not transport failures to hide behind retries.
-            Err(error) if error.downcast_ref::<crate::Problem>().is_some() => {
-                return Err(refused(format!("{error:#}")));
+        checkpoint(attempt)?;
+        let StopMode::Online {
+            supervisor_id: captured_supervisor_id,
+        } = attempt.mode.clone()
+        else {
+            if let StopMode::OfflineChosen { supervisor_id } = &attempt.mode {
+                let owner = Owner::try_acquire(&root)?.with_context(
+                    || "independent supervisor unavailable: offline stop is not continuable",
+                )?;
+                return offline_stop(owner, &binding, &attempt.request, supervisor_id, cleanup)
+                    .await;
             }
-            Err(error) => {
-                if let Some(receipt) = control::saved_request_snapshot(&root, &attempt.request)?
-                    && receipt.supervisor_id == captured_supervisor_id
-                    && receipt.binding == binding
-                    && receipt.operation_id.as_deref() == Some(attempt.request.request_id.as_str())
-                    && receipt.phase == Phase::Stopped
-                    && receipt.intent == Intent::Stopped
-                {
-                    if let Some(generation) = &before_generation {
-                        crate::verify_local_quiescent(root.as_path(), generation)?;
-                    }
-                    return Ok(receipt);
-                }
-                let saved = last_snapshot(&root)?;
-                if saved.supervisor_id != captured_supervisor_id || saved.binding != binding {
-                    return Err(refused(format!(
-                        "supervisor changed while stop response was unavailable: {error:#}"
-                    )));
-                }
-                if saved.operation_id.as_deref() == Some(&attempt.request.request_id)
-                    && saved.phase == Phase::Stopped
-                    && saved.intent == Intent::Stopped
-                {
-                    if let Some(generation) = &before_generation {
-                        crate::verify_local_quiescent(root.as_path(), generation)?;
-                    }
-                    return Ok(saved);
-                }
-                // 旧 owner 确认退出（owner.lock 可获取）→ 用同一请求经离线
-                // 机制收束本代次（DEV-R4：不能永久锁死在"只能联系已死
-                // owner"的分支）；锁仍被持有 → owner 活着，重发同一请求。
-                match Owner::try_acquire(&root) {
-                    Ok(Some(owner)) => {
-                        return offline_stop(
-                            owner,
-                            &binding,
-                            &attempt.request,
-                            &captured_supervisor_id,
-                            cleanup,
-                        )
-                        .await;
-                    }
-                    Ok(None) => {}
-                    Err(lock_error) => {
-                        return Err(lock_error)
-                            .with_context(|| format!("stop response lost: {error:#}"));
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                continue;
-            }
+            anyhow::bail!("stop attempt mode resolved inconsistently");
         };
-        if result.binding != binding || result.supervisor_id != captured_supervisor_id {
-            return Err(refused("supervisor changed during stop"));
-        }
-        let completed = (result.phase == Phase::Ready
-            && result.intent == Intent::Stopped
-            && result.generation != before_generation)
-            || (result.phase == Phase::Stopped
-                && result.intent == Intent::Stopped
-                && result.operation_id.as_deref() == Some(&attempt.request.request_id));
-        if completed {
-            if let Some(generation) = &before_generation {
-                crate::verify_local_quiescent(root.as_path(), generation)?;
+        let before_generation = attempt.captured_generation.clone();
+        // Re-sending this request only observes its own acceptance/terminal receipt.
+        loop {
+            let result = match control::control_verified(
+                &root,
+                attempt.request.clone(),
+                &captured_supervisor_id,
+            )
+            .await
+            {
+                Ok(result) => result,
+                // Busy / identity / protocol rejections are actual refusals,
+                // not transport failures to hide behind retries. One exception:
+                // Busy while the supervisor finishes its own cleanup of a prior
+                // stop (Stopping/CleanupPending/Reconciling) is a transient
+                // window, not a competing execution — a successor stop must
+                // bounded-wait it out inside the same budget instead of being
+                // permanently refused by residue (recovery v2 H 尾部实测).
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::Problem>()
+                        .is_some_and(|problem| problem.code == FailureCode::Busy) =>
+                {
+                    let busy_window = control(&root, Request::new(Action::Status))
+                        .await
+                        .ok()
+                        .filter(|now| {
+                            now.supervisor_id == captured_supervisor_id
+                                && now.binding == binding
+                                && matches!(
+                                    now.phase,
+                                    Phase::Stopping | Phase::CleanupPending | Phase::Reconciling
+                                )
+                        });
+                    if busy_window.is_some() {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        // The prior stop's cleanup may retire the captured
+                        // generation while we wait; restart resolution so the
+                        // retry captures the current target instead of carrying a
+                        // stale expected_generation into an IdentityChanged
+                        // refusal.
+                        attempt.mode = StopMode::Unresolved;
+                        attempt.captured_generation = None;
+                        attempt.request.expected_generation = None;
+                        continue 'resolve;
+                    }
+                    return Err(refused(format!("{error:#}")));
+                }
+                Err(error) if error.downcast_ref::<crate::Problem>().is_some() => {
+                    return Err(refused(format!("{error:#}")));
+                }
+                Err(error) => {
+                    if let Some(receipt) = control::saved_request_snapshot(&root, &attempt.request)?
+                        && receipt.supervisor_id == captured_supervisor_id
+                        && receipt.binding == binding
+                        && receipt.operation_id.as_deref()
+                            == Some(attempt.request.request_id.as_str())
+                        && receipt.phase == Phase::Stopped
+                        && receipt.intent == Intent::Stopped
+                    {
+                        if let Some(generation) = &before_generation {
+                            crate::verify_local_quiescent(root.as_path(), generation)?;
+                        }
+                        return Ok(receipt);
+                    }
+                    let saved = last_snapshot(&root)?;
+                    if saved.supervisor_id != captured_supervisor_id || saved.binding != binding {
+                        return Err(refused(format!(
+                            "supervisor changed while stop response was unavailable: {error:#}"
+                        )));
+                    }
+                    if saved.operation_id.as_deref() == Some(&attempt.request.request_id)
+                        && saved.phase == Phase::Stopped
+                        && saved.intent == Intent::Stopped
+                    {
+                        if let Some(generation) = &before_generation {
+                            crate::verify_local_quiescent(root.as_path(), generation)?;
+                        }
+                        return Ok(saved);
+                    }
+                    // 旧 owner 确认退出（owner.lock 可获取）→ 用同一请求经离线
+                    // 机制收束本代次（DEV-R4：不能永久锁死在"只能联系已死
+                    // owner"的分支）；锁仍被持有 → owner 活着，重发同一请求。
+                    match Owner::try_acquire(&root) {
+                        Ok(Some(owner)) => {
+                            return offline_stop(
+                                owner,
+                                &binding,
+                                &attempt.request,
+                                &captured_supervisor_id,
+                                cleanup,
+                            )
+                            .await;
+                        }
+                        Ok(None) => {}
+                        Err(lock_error) => {
+                            return Err(lock_error)
+                                .with_context(|| format!("stop response lost: {error:#}"));
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+            };
+            if result.binding != binding || result.supervisor_id != captured_supervisor_id {
+                return Err(refused("supervisor changed during stop"));
             }
-            return Ok(result);
+            let completed = (result.phase == Phase::Ready
+                && result.intent == Intent::Stopped
+                && result.generation != before_generation)
+                || (result.phase == Phase::Stopped
+                    && result.intent == Intent::Stopped
+                    && result.operation_id.as_deref() == Some(&attempt.request.request_id));
+            if completed {
+                if let Some(generation) = &before_generation {
+                    crate::verify_local_quiescent(root.as_path(), generation)?;
+                }
+                return Ok(result);
+            }
+            if result.phase == Phase::RecoveryRequired {
+                // 类型化终局错误（wire 契约）：RecoveryRequired 是明确拒绝——
+                // 调用方可凭此丢弃 attempt（is_stop_refused 涵盖），新重试可
+                // 产生新身份；不是超时/丢回复类未知结果。
+                return Err(result.recovery_error());
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        if result.phase == Phase::RecoveryRequired {
-            // 类型化终局错误（wire 契约）：RecoveryRequired 是明确拒绝——
-            // 调用方可凭此丢弃 attempt（is_stop_refused 涵盖），新重试可
-            // 产生新身份；不是超时/丢回复类未知结果。
-            return Err(result.recovery_error());
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -353,7 +399,7 @@ pub async fn stop_work_with_cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::{Discovery, Envelope, Reply};
+    use crate::control::{Discovery, Envelope, FailureCode, Problem, Reply};
     use anyhow::ensure;
 
     fn fixture_binding(root: &Path) -> Binding {
@@ -784,5 +830,113 @@ mod tests {
             "replacement owner must never receive the old stop request"
         );
         b.abort();
+    }
+    /// H 尾部实链反例：supervisor 忙于**上一次停止的收尾**（CleanupPending
+    /// 残留操作 + 换代）时，后继 StopWork 不能被永久拒绝——在既有预算内
+    /// 等待该瞬态相位出清、重新解析捕获当代目标后完成；真正的执行窗口
+    /// Busy 仍然立即拒绝（F5）。
+    #[tokio::test]
+    async fn stop_waits_out_a_prior_cleanup_pending_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let _owner = Owner::try_acquire(root).unwrap().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery = fixture_discovery(root, &listener, "owner-hold");
+        crate::record::save(&root.join("supervisor.json"), &discovery).unwrap();
+
+        let stage = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stage_seen = stage.clone();
+        let instance = discovery.instance.clone();
+        let binding = fixture_binding(root);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(envelope): Result<Envelope, _> = control::receive(&mut stream).await else {
+                    return;
+                };
+                // 阶段机：忙等窗口（残留 prior-stop-op + gen-1）→ 一次 Busy →
+                // 窗口仍可见（Status=CleanupPending）→ 收敛（Ready、代次已
+                // 清）→ 接受本次请求。
+                let stage_now = stage_seen.load(std::sync::atomic::Ordering::SeqCst);
+                let converged = stage_now >= 2;
+                let mut snapshot = if converged {
+                    Snapshot {
+                        version: 1,
+                        binding: binding.clone(),
+                        supervisor_id: instance.clone(),
+                        generation: None,
+                        phase: Phase::Ready,
+                        intent: Intent::Stopped,
+                        operation_id: None,
+                        error: None,
+                        problem: None,
+                    }
+                } else {
+                    Snapshot {
+                        version: 1,
+                        binding: binding.clone(),
+                        supervisor_id: instance.clone(),
+                        generation: Some("gen-prior".into()),
+                        phase: Phase::CleanupPending,
+                        intent: Intent::Stopped,
+                        operation_id: Some("prior-stop-op".into()),
+                        error: None,
+                        problem: None,
+                    }
+                };
+                let mut problem = None;
+                match envelope.request.action {
+                    Action::Status => {
+                        if stage_now == 1 {
+                            stage_seen.store(2, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    Action::StopWork => {
+                        if converged {
+                            snapshot.phase = Phase::Stopped;
+                            snapshot.operation_id = Some(envelope.request.request_id.clone());
+                        } else {
+                            stage_seen.store(1, std::sync::atomic::Ordering::SeqCst);
+                            problem = Some(Problem {
+                                code: FailureCode::Busy,
+                                message: format!(
+                                    "supervisor is busy with operation prior-stop-op ({})",
+                                    Phase::CleanupPending
+                                ),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+                if control::send(
+                    &mut stream,
+                    &Reply {
+                        instance: instance.clone(),
+                        snapshot,
+                        error: problem,
+                    },
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        let completed = stop_work(root, &fixture_binding(root), Duration::from_secs(10))
+            .await
+            .expect("successor stop must wait out the cleanup window");
+        assert_eq!(completed.phase, Phase::Stopped);
+        assert_eq!(completed.intent, Intent::Stopped);
+        assert!(
+            completed
+                .operation_id
+                .is_some_and(|id| id != "prior-stop-op"),
+            "terminal must carry this request, not the residue"
+        );
+        server.abort();
     }
 }
