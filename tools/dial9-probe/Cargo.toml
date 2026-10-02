@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name = "dial9-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Offline dial9 trace evidence probe: instrumented spawns, wake pairs, task dumps"
+
+[dependencies]
+anyhow = "1"
+# 与主仓锁定同版（0.5.2）；analysis = 离线解码工具链（含 TraceReader/Dial9Event）。
+# 解码 TaskDumpEvent 无需 taskdump feature：wire schema 自描述，decoder 按
+# header 里的 schema 反序列化（taskdump feature 只影响“录制端”是否采集）。
+dial9 = { version = "=0.5.2", default-features = false, features = ["analysis"] }

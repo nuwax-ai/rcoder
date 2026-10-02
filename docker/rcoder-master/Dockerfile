@@ -84,9 +84,18 @@ WORKDIR /app
 
 # --- 静态层（代码无关）---
 
-# 安装 git（用于 nuwaxcode 源码安装）
+# 安装 git（用于 nuwaxcode 源码安装）+ 容器内源码构建工具。
+# cmake/protobuf（tonic gRPC → protoc/libprotobuf；duckdb → cmake）与 rsync
+# （observability taskdump 诊断副本复制）固化进镜像：dev-hot 热编译与
+# tools/taskdump/build-taskdump-linux.sh 不再每次运行时 apt 补装（见
+# docker/dev-hot-build.sh 前言与 docs/observability.md taskdump 节）。
 RUN apt-get update && apt-get install -y \
     git \
+    cmake \
+    pkg-config \
+    protobuf-compiler \
+    libprotobuf-dev \
+    rsync \
     && rm -rf /var/lib/apt/lists/*
 
 # 复制 .npmrc 文件

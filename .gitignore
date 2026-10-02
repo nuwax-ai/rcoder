@@ -77,3 +77,6 @@ docker/error-pages/
 target-linux/
 target-linux-appcli/
 /target-obs/
+
+# 独立诊断/探针工具的本地构建产物
+tools/dial9-probe/target/
