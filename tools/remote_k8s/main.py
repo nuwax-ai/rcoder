@@ -290,7 +290,10 @@ def read_receipt(c, name):
 def apply(c, row):
     alive(c)
     owned(c, row['kind'], row['metadata']['name'], optional=True)
-    c.kube('apply', '--server-side', '--field-manager=rcoder-remote-k8s', '-f', '-', data=json.dumps(row))
+    # 个人测试环境常被 kubectl set image 等手工操作留下字段管理器；
+    # 本工具是这些环境的属主，force 接管字段所有权。
+    c.kube('apply', '--server-side', '--field-manager=rcoder-remote-k8s',
+           '--force-conflicts', '-f', '-', data=json.dumps(row))
 
 
 def wait_for(action, predicate, budget=180):

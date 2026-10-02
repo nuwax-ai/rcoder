@@ -107,8 +107,10 @@ pub(super) async fn recovery(
             .and_then(|value| value.to_str().ok()),
     )?;
     if state.server.initializing() {
+        // 启动窗口码对齐协议文档与客户端重试契约（owner_client 的有界等待
+        // 只认 ERR_INITIALIZING；用 ERR_INVALID_STATE 会让调用方立即放弃）。
         return Err(reject(
-            "ERR_INVALID_STATE",
+            "ERR_INITIALIZING",
             "startup recovery has not completed",
             StatusCode::SERVICE_UNAVAILABLE,
         ));

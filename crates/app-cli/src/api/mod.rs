@@ -1056,4 +1056,26 @@ mod tests {
         assert_eq!(body["code"], "PINGAP_CONFIG_INVALID");
         assert_eq!(body["data"], serde_json::Value::Null);
     }
+
+    /// 启动窗口内 recovery 端点返回 ERR_INITIALIZING（不是 ERR_INVALID_STATE）
+    /// ——file-server owner_client 的有界等待只重试 ERR_INITIALIZING，其他码
+    /// 立即放弃（矩阵 R3 实测：降级 owner 初始化期 Stop 的恢复证据被秒拒）。
+    #[tokio::test]
+    async fn recovery_during_startup_reports_initializing_code() {
+        let state = test_state();
+        // 新建 ServerState 默认 initializing=true，不调用 mark_initialized。
+        state.server.initialize_owner_token().unwrap();
+        let token = state.server.control_token().unwrap();
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/runtime/recovery")
+            .header("X-Deploy-Token", &token)
+            .body(Body::empty())
+            .unwrap();
+        let response = api_router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON envelope");
+        assert_eq!(body["code"], "ERR_INITIALIZING");
+    }
 }

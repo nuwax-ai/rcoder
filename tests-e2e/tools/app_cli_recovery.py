@@ -51,7 +51,7 @@ def main():
     report = {'app_id': app, 'volume': volume, 'checks': [], 'containers': [],
               'scenarios': {},
               'required_scenarios': ['A', 'B', 'C', 'G', 'R4', 'J', 'I',
-                                     'R3', 'E', 'D', 'H'],
+                                     'R3', 'E', 'D', 'H', 'K'],
               'binaries': {
                   str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest()
                   for p in (args.app_cli, args.file_server_proxy)}}
@@ -583,6 +583,78 @@ strip_prefix = false
         start('restart')
         check('R4: restart after run-owner exit recovers',
               content() == 'recovery-c-2', content(), scenario='R4')
+        # R4 尾部：run owner 处理 Stop 时被 SIGKILL（应答回程丢失）——
+        # 只有磁盘上的真实原收据算数：不伪造 Succeeded、按原 ID 收束；
+        # 旧实例 ID 的重放被拒且零新记录。
+        post('stop')
+        supervisorctl('stop', 'app-cli')
+        stopped_r4b = try_execute('pgrep -f "[a]pp-cli serve" | wc -l').stdout.strip()
+        check('R4: serve stopped before the second run bootstrap',
+              stopped_r4b == '0', stopped_r4b, scenario='R4')
+        docker('exec', '-d', cid, 'sh', '-ec',
+               'exec app-cli run --workspace "$1" --log-dir /home/user/logs '
+               '--admin-addr 0.0.0.0:3010 >/tmp/r4run2.log 2>&1', '--', workspace)
+        check('R4: second run bootstraps the owner',
+              wait_management(120) is not None, None, scenario='R4')
+        start('restart')
+        check('R4: business serving before the lost-reply stop',
+              content() == 'recovery-c-2', content(), scenario='R4')
+        revision_lr = runtime_status()['revision']
+        lost_id = 'r4-lost-' + uuid.uuid4().hex[:8]
+        lost_submit = try_execute(
+            'curl -sS --max-time 60 -o /tmp/lost-reply.json '
+            '-H "content-type: application/json" -H "x-deploy-token: $1" '
+            '--data "$2" "$3" >/dev/null 2>&1 & '
+            'sleep 1; kill -9 "$(pgrep -f "[a]pp-cli run" | head -1)"',
+            app + '-recovery-token',
+            json.dumps({'operation_id': lost_id,
+                        'expected_runtime_instance_id': identity(),
+                        'expected_revision': revision_lr,
+                        'workspace_id': app,
+                        'kind': 'stop',
+                        'profile': {'profile': 'source',
+                                    'input': {'workspace_id': app}}}),
+            'http://127.0.0.1:3010/v1/runtime/operations', timeout=90)
+        assert lost_submit.returncode == 0, lost_submit.stderr[-200:]
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if try_execute('pgrep -f "[a]pp-cli run" | wc -l').stdout.strip() == '0':
+                break
+            time.sleep(0.5)
+        run2_gone = try_execute('pgrep -f "[a]pp-cli run" | wc -l').stdout.strip()
+        check('R4: run owner killed mid-stop', run2_gone == '0', run2_gone,
+              scenario='R4')
+        # 真实原收据：该 ID 恰好一条持久化记录（受理即落盘）。
+        receipt_files = execute(
+            'ls "$1/operations/" 2>/dev/null | grep -c "$2" || true',
+            state_root, lost_id).stdout.strip()
+        check('R4: exactly one persisted record for the lost-reply stop',
+              receipt_files == '1', receipt_files, scenario='R4')
+        # 新 serve 接管后按真实收据收束该 ID（未确认执行不伪造 Succeeded）。
+        supervisorctl('start', 'app-cli')
+        wait_management(150)
+        settled = None
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            code_lr, body_lr = runtime_get(lost_id)
+            settled = ((body_lr.get('data') or {}).get('state'))
+            if settled in ('succeeded', 'failed', 'cancelled',
+                           'recovery_required'):
+                break
+            time.sleep(0.5)
+        check('R4: lost-reply stop settles from its real receipt',
+              settled in ('succeeded', 'failed', 'recovery_required'), settled,
+              scenario='R4')
+        # 同 ID 重放（新实例身份）：不制造新操作（记录数不增）。
+        replay_lr = runtime_post(lost_id, 'stop', revision_lr)
+        records_lr = execute(
+            'ls "$1/operations/" 2>/dev/null | grep -c "$2" || true',
+            state_root, lost_id).stdout.strip()
+        check('R4: same-id replay creates no new records',
+              records_lr == '1', [replay_lr[0], records_lr], scenario='R4')
+        start('restart')
+        check('R4: business recovers after lost-reply reconciliation',
+              content() == 'recovery-c-2', content(), scenario='R4')
 
         # ── J：挂死（SIGSTOP）owner 的有界边界 ──────────────────────
         pid = owner_pid()
@@ -757,16 +829,138 @@ strip_prefix = false
               receipt_now.get('completed') is False and runs_after == runs_before,
               {'receipt': receipt_now, 'runs': [runs_before, runs_after]},
               scenario='H')
-        # 屏障解除（如实确认）后业务恢复，迁移执行计数恰好 +1。
+        # R-H1 实链尾部：恢复保持挂起期间的原生 Stop——修复前该窗口的
+        # stop waiter 读不到自身 ID 的终态快照（stop-owner 恢复链超时）。
+        # 现在必须按其原操作身份精确完成，且不解除数据未知保护。
+        native_h = try_execute(
+            'app-cli owner stop --workspace "$1"', workspace, timeout=90)
+        check('H: native stop during recovery hold completes exactly once',
+              native_h.returncode == 0
+              and 'stopped' in (native_h.stdout or '').lower(),
+              (native_h.stdout or '')[-200:], scenario='H')
+        # 迁移回执未确认：Stop 不解除未知迁移保护（回执仍 completed=false）。
+        receipt_after_stop = json.loads(
+            execute('cat "$1"', receipts[0]).stdout)
+        check('H: stop does not release the unconfirmed migration barrier',
+              receipt_after_stop.get('completed') is False,
+              receipt_after_stop, scenario='H')
+        # 屏障解除（如实确认）后：当前启动请求继续 → HTTP → Stop → 再启动。
         write({receipts[0]: json.dumps(
             {'identity': real_identity, 'completed': True})})
         start('restart')
         check('H: business recovers after migration barrier confirmed',
               content() == 'recovery-c-2', content(), scenario='H')
+        stop_after = post('stop')
+        check('H: stop after recovery completes',
+              stop_after.get('message') == 'Stopped' and content() is None,
+              stop_after, scenario='H')
+        start('restart')
+        check('H: restart after stop serves again',
+              content() == 'recovery-c-2', content(), scenario='H')
         runs_final = migration_runs()
         check('H: recovered orchestration ran the migration exactly once',
               runs_final == runs_before + 1, [runs_before, runs_final],
               scenario='H')
+
+        # ── K：.run 激活 + 制品 zip 缓存丢失的显式恢复 ────────────────
+        # 真实入口全链：dev/restart 产物态构建（真 zip）→ owner Deploy
+        # (ArtifactId) 激活 .run；切回源码态；删缓存后同制品重部署
+        # （运行态 next_prepared / 空闲主循环两条消费路径）；journal 损坏
+        # 隔离后前台 app-cli run <proj>/.run 恢复。
+        def artifact_files(marker):
+            files = app_files(marker)
+            files[workspace + '/web/project.manifest.toml'] = \
+                files[workspace + '/web/project.manifest.toml'].replace(
+                    '\n[devrun]\ncommand = ["python3", "main.py"]\n', '')
+            return files
+
+        marker_k = 'recovery-k-1'
+        post('stop')
+        write(artifact_files(marker_k))
+        start('restart')
+        check('K: artifact-mode build deploys and serves',
+              content() == marker_k, content(), scenario='K')
+        built = execute('ls "$1"/builds/workspace-package-*.zip 2>/dev/null',
+                        workspace).stdout.split()
+        check('K: registered artifact zip exists after build',
+              len(built) >= 1, built, scenario='K')
+        release_k = built[-1].rsplit('workspace-package-', 1)[1][:-4]
+        check('K: .run activated with the built release',
+              release_k in execute('cat "$1/.run/release.lock.toml"',
+                                   workspace).stdout, release_k, scenario='K')
+        # 切回源码态（同 owner、业务运行中）。
+        write(app_files('recovery-c-2'))
+        start('restart')
+        check('K: source mode switch back serves source content',
+              content() == 'recovery-c-2', content(), scenario='K')
+        # 清缓存 → 同制品重部署：源码态 owner 切换到已激活 .run（身份
+        # 核验后的复用，不需要 zip）。
+        execute('rm -f "$1"/builds/workspace-package-*.zip', workspace)
+        revision_k = runtime_status()['revision']
+        artifact_profile = {
+            'profile': 'artifact',
+            'input': {'artifact': {'source': 'artifact_id',
+                                   'value': {'artifact_id': release_k}}}}
+        k_switch = 'k-switch-' + uuid.uuid4().hex[:8]
+        code_k, body_k = runtime_post(k_switch, 'deploy', revision_k,
+                                      artifact_profile)
+        check('K: cache-lost redeploy admitted while source serves',
+              code_k == 202, body_k, scenario='K')
+        check('K: cache-lost redeploy switches to the activated artifact',
+              wait_terminal(k_switch) == 'succeeded'
+              and content() == marker_k, content(), scenario='K')
+        # 空闲路径：Stop 后同制品再部署（无 zip、业务已停）。
+        post('stop')
+        revision_k2 = runtime_status()['revision']
+        k_idle = 'k-idle-' + uuid.uuid4().hex[:8]
+        code_k2, body_k2 = runtime_post(k_idle, 'deploy', revision_k2,
+                                        artifact_profile)
+        check('K: idle cache-lost redeploy starts the business',
+              code_k2 == 202 and wait_terminal(k_idle) == 'succeeded'
+              and content() == marker_k, body_k2, scenario='K')
+        # journal 损坏隔离 → 前台 run <proj>/.run：唯一真实恢复入口。
+        post('stop')
+        state_root_k = execute(
+            'find /home/user -maxdepth 5 -name supervisor.json -printf "%h\n" '
+            '| head -1').stdout.strip()
+        write({state_root_k + '/.deploy-operation.json': '{damaged-k'})
+        supervisorctl('stop', 'app-cli')
+        stopped_k = try_execute('pgrep -f "[a]pp-cli serve" | wc -l').stdout.strip()
+        check('K: serve stopped before the foreground recovery run',
+              stopped_k == '0', stopped_k, scenario='K')
+        docker('exec', '-d', cid, 'sh', '-ec',
+               'exec app-cli run --workspace "$1" --log-dir /home/user/logs '
+               '--admin-addr 0.0.0.0:3010 >/tmp/krun.log 2>&1',
+               '--', workspace + '/.run')
+        try:
+            run_k = wait_management(150)
+        except RuntimeError:
+            run_k = None
+        check('K: foreground run bootstraps on the damaged journal',
+              run_k is not None, run_k, scenario='K')
+        check('K: foreground run serves the activated artifact without the zip',
+              content() == marker_k, content(), scenario='K')
+        marker_k_files = execute(
+            'ls "$1"/.deploy-recovery-required.json 2>/dev/null | wc -l',
+            state_root_k).stdout.strip()
+        check('K: replacement receipt released the recovery marker',
+              marker_k_files == '0', marker_k_files, scenario='K')
+        stop_k = post('stop')
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if try_execute('pgrep -f "[a]pp-cli run" | wc -l').stdout.strip() == '0':
+                break
+            time.sleep(0.5)
+        krun_gone = try_execute('pgrep -f "[a]pp-cli run" | wc -l').stdout.strip()
+        check('K: foreground run exits after its stop',
+              stop_k.get('message') == 'Stopped' and krun_gone == '0',
+              [stop_k, krun_gone], scenario='K')
+        # 回到平台常驻形态：新 Start/Restart 可执行（源码态恢复）。
+        supervisorctl('start', 'app-cli')
+        wait_management(120)
+        start('restart')
+        check('K: fresh restart after recovery returns to source mode',
+              content() == 'recovery-c-2', content(), scenario='K')
 
         # RV08：必做场景清单完整性——任何未执行/无断言的场景都不算通过。
         executed = set(report['scenarios'])
