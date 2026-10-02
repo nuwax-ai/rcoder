@@ -23,6 +23,121 @@ REPO = Path(__file__).resolve().parents[2]
 IDLE_SECONDS = 60
 SCAN_SECONDS = 5
 
+# Runs inside the captured Linux builder. In the unified Session topology the
+# generation's worker_pid is the owner itself, not a child of a root guardian.
+# Authenticate the control channel and pin the process with a pidfd before any
+# signal. Never signal its parent (which can be agent_runner).
+OWNER_FAULT_SCRIPT = r'''
+import fcntl, http.client, ipaddress, json, os, pathlib, select, signal, socket, sys, uuid, xmlrpc.client
+scope = pathlib.Path('/home/user/logs/.app-cli-state')
+workspace, action = pathlib.Path(sys.argv[1]).resolve(), sys.argv[2]
+assert action in ('freeze', 'kill'), 'unknown fault injection action'
+discovery = json.loads((scope/'supervisor.json').read_text())
+snapshot = discovery['snapshot']
+binding = {'component': 'app-cli', 'resource': str(workspace)}
+assert discovery['version'] == 2 and snapshot['binding'] == binding, 'owner binding differs'
+assert discovery['instance'] == snapshot['supervisor_id'], 'discovery instance differs'
+work = scope/'work'/snapshot['generation']
+generation = json.loads((work/'generation.json').read_text())
+assert generation['id'] == work.name and generation['supervisor'] == discovery['instance'], 'generation differs'
+assert generation['phase'] == 'Running', 'no running owner generation'
+pid = generation['worker_pid']
+assert isinstance(pid, int) and pid > 1, 'no managed owner PID'
+pidfd = os.pidfd_open(pid)
+try:
+    proc = pathlib.Path('/proc', str(pid))
+    cmd = [c.decode() for c in (proc/'cmdline').read_bytes().split(b'\0') if c]
+    assert (proc/'exe').resolve().name == 'app-cli', 'captured PID is not app-cli'
+    assert str(workspace) in cmd or str(workspace/'.run') in cmd, 'owner command workspace differs'
+    start_ticks = (proc/'stat').read_text().rsplit(')', 1)[1].split()[19]
+    for lock in (scope/'owner.lock', work/'generation.lock'):
+        identity = lock.stat()
+        held = False
+        for fd in (proc/'fd').iterdir():
+            try:
+                value = fd.stat()
+                held |= (value.st_dev, value.st_ino) == (identity.st_dev, identity.st_ino)
+            except FileNotFoundError:
+                pass
+        assert held, 'owner does not hold captured lock FD: ' + str(lock)
+        with lock.open('rb') as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                raise AssertionError('captured owner lock is not held: ' + str(lock))
+    host, port = discovery['address'].rsplit(':', 1)
+    assert ipaddress.ip_address(host).is_loopback, 'control address is not loopback'
+    with socket.create_connection((host, int(port)), timeout=3) as channel:
+        frame = {'version': 2, 'instance': discovery['instance'], 'token': discovery['token'],
+                 'request': {'request_id': str(uuid.uuid4()), 'action': 'status', 'expected_generation': generation['id']}}
+        channel.sendall(json.dumps(frame).encode() + b'\n')
+        with channel.makefile('rb') as stream:
+            raw = stream.readline(32769)
+        assert raw.endswith(b'\n') and len(raw) <= 32768, 'invalid control frame'
+        reply = json.loads(raw)
+        assert reply['error'] is None and reply['instance'] == discovery['instance'], 'owner control rejected'
+        assert reply['snapshot']['binding'] == binding and reply['snapshot']['generation'] == generation['id'], 'live owner differs'
+    # Killing an owner must leave a real managed execution range to recover,
+    # rather than proving only an empty management process can be restarted.
+    commands = []
+    for path in (work/'guardians').glob('*/receipt.json'):
+        receipt = json.loads(path.read_text())
+        if receipt['phase'] != 'Running' or receipt.get('diagnostic_pid') is None:
+            continue
+        assert receipt['instance_id'] == generation['id'], 'foreign command guardian'
+        assert receipt['id'] == path.parent.name, 'guardian directory identity differs'
+        # Long-lived builtin services can carry a guardian without a separate
+        # command journal. The generation-bound guardian is still real evidence.
+        if receipt['command_record'] is not None:
+            command_path = pathlib.Path(receipt['command_record'])
+            assert command_path.parent == work/'commands', 'foreign command record'
+            command = json.loads(command_path.read_text())
+            if command['phase'] != 'Running' or command.get('diagnostic_pid') != receipt['diagnostic_pid']:
+                continue
+        command_proc = pathlib.Path('/proc', str(receipt['diagnostic_pid']))
+        if command_proc.exists() and command_proc.joinpath('stat').read_text().rsplit(')', 1)[1].split()[0] != 'Z':
+            commands.append({'guardian': path.parent.name, 'command_pid': receipt['diagnostic_pid'],
+                             'command_record': receipt['command_record']})
+    engine_programs = []
+    engine_path = work/'supervisord-engine.json'
+    if engine_path.exists():
+        engine = json.loads(engine_path.read_text())
+        assert engine['generation'] == generation['id'] and engine['supervisor_id'] == discovery['instance'], 'foreign engine receipt'
+        assert pathlib.Path(engine['socket']).is_absolute(), 'engine socket is not absolute'
+        class UnixConnection(http.client.HTTPConnection):
+            def connect(self):
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.settimeout(3)
+                self.sock.connect(engine['socket'])
+        class UnixTransport(xmlrpc.client.Transport):
+            def make_connection(self, host):
+                return UnixConnection(host)
+        with xmlrpc.client.ServerProxy('http://localhost/RPC2', transport=UnixTransport()) as client:
+            for program in client.supervisor.getAllProcessInfo():
+                if (program['name'].startswith('app-svc-') or program['name'] == 'app-pingap') and program['state'] == 20:
+                    assert program['pid'] > 1 and pathlib.Path('/proc', str(program['pid'])).exists(), 'engine reports unavailable process'
+                    engine_programs.append({'name': program['name'], 'pid': program['pid']})
+    assert commands or engine_programs, 'running owner has no live managed execution range'
+    latest = json.loads((scope/'supervisor.json').read_text())
+    assert latest['instance'] == discovery['instance'] and latest['snapshot']['generation'] == generation['id'], 'owner changed before injection'
+    assert json.loads((work/'generation.json').read_text()) == generation, 'generation changed before injection'
+    assert (proc/'stat').read_text().rsplit(')', 1)[1].split()[19] == start_ticks, 'PID changed before injection'
+    if action == 'freeze':
+        assert generation['physical_domain'] is not None, 'idle proof requires physical domain'
+    signal.pidfd_send_signal(pidfd, signal.SIGSTOP if action == 'freeze' else signal.SIGKILL)
+    if action == 'kill':
+        assert select.select([pidfd], [], [], 10)[0], 'captured owner did not exit'
+        assert json.loads((work/'generation.json').read_text())['phase'] in ('Running', 'Draining'), 'fault did not leave an unfinished generation'
+    print(json.dumps({'generation': generation['id'], 'owner_pid': pid,
+                      'supervisor_id': generation['supervisor'], 'domain': generation['physical_domain'],
+                      'binding': binding, 'mode': 'unified_session', 'commands': commands,
+                      'engine_programs': engine_programs}))
+finally:
+    os.close(pidfd)
+'''
+
 
 def command(*args, check=True, timeout=180):
     result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
@@ -382,46 +497,24 @@ strip_prefix=false
         check('authoritative owner state resides on retained volume',
               any(path.endswith('/.deploy-coordinator.json') for path in kernel_before), kernel_before)
         evidence['owner_before'] = original_owner
-        # Suspend the captured root guardian, not the whole container. The real
-        # idle stop will exhaust its bounded drain and remove the container; no
-        # process is left to write Quiescent. This exercises physical-exit proof
-        # rather than passing solely because graceful shutdown now works.
-        frozen = execute('python3', '-c', '''
-import json, os, pathlib, signal
-scope = pathlib.Path('/home/user/logs/.app-cli-state')
-snapshot = json.loads((scope/'supervisor.json').read_text())['snapshot']
-work = scope/'work'/snapshot['generation']
-generation = json.loads((work/'generation.json').read_text())
-worker = generation['worker_pid']
-try:
-    status = pathlib.Path('/proc', str(worker), 'status').read_text()
-    parent = int(next(line.split()[1] for line in status.splitlines() if line.startswith('PPid:')))
-    cmd = pathlib.Path('/proc', str(parent), 'cmdline').read_bytes().split(b'\\0')
-    assert b'--runtime-worker-guardian' in cmd and str(work).encode() in cmd, 'worker parent is not its guardian'
-    os.kill(parent, signal.SIGSTOP)
-    print(json.dumps({'generation': generation['id'], 'guardian': parent}))
-except (FileNotFoundError, AssertionError, ProcessLookupError) as error:
-    # guardian 已退出/代次身份不符：冻结步骤退化为空（物理退出证明不依赖
-    # 冻结——回收仍必须删除容器并保留卷）。如实记录诊断供归因。
-    print(json.dumps({'generation': generation.get('id'),
-                      'guardian': None, 'worker_pid': worker,
-                      'reason': repr(error)[:200]}))
-''')
-        evidence['frozen_guardian'] = json.loads(frozen.stdout)
+        # Freeze the verified unified owner, not its agent_runner parent.
+        # Real idle retirement must then consume physical exit evidence, since
+        # this process cannot publish its own graceful cleanup receipt.
+        frozen = execute('python3', '-c', OWNER_FAULT_SCRIPT, workspace, 'freeze')
+        evidence['frozen_owner'] = json.loads(frozen.stdout)
         after = recycle_and_ensure(before, original_owner, 'first recycle')
         # No preparatory Stop: Start itself must repair the unavailable owner.
         write({'web/version.txt': 'after-recycle'})
         count = start('start', 'after-recycle', count)
-        # 冻结成功（guardian 存活被 SIGSTOP）时，物理退出回执必须存在且属于
-        # 该代次；冻结已退化（guardian/worker 提前退出）时无从产生回执——
-        # 回收删除容器 + 卷保留断言仍然成立，行为差异记录进证据供归因。
-        if evidence['frozen_guardian'].get('guardian') is not None:
-            physical_exit = read_json('/home/user/logs/.app-cli-state/work/' + evidence['frozen_guardian']['generation'] + '/physical-exit.json')
-            if physical_exit['generation'] != evidence['frozen_guardian']['generation']:
-                raise RuntimeError('physical exit receipt belongs to another generation')
-            evidence['physical_exit'] = physical_exit
-        else:
-            evidence['physical_exit'] = None
+        physical_exit = read_json('/home/user/logs/.app-cli-state/work/' +
+                                  evidence['frozen_owner']['generation'] + '/physical-exit.json')
+        frozen_owner = evidence['frozen_owner']
+        if (physical_exit['generation'] != frozen_owner['generation']
+                or physical_exit['supervisor_id'] != frozen_owner['supervisor_id']
+                or physical_exit['domain'] != frozen_owner['domain']
+                or physical_exit['binding'] != frozen_owner['binding']):
+            raise RuntimeError('physical exit receipt does not match the captured owner')
+        evidence['physical_exit'] = physical_exit
         recovered_owner = owner()
         check('new owner replaces retired registration', recovered_owner != original_owner and
               original_owner in json.dumps(read_json('/home/user/logs/dev-server-external.json').get('retired', {})),
@@ -431,56 +524,11 @@ except (FileNotFoundError, AssertionError, ProcessLookupError) as error:
         write({'web/version.txt': 'after-restart'})
         count = start('restart', 'after-restart', count)
         check('controls retain new owner and physical container', owner() == recovered_owner and inspect(cid) is not None)
-        # Same-container fault: the worker has exited but its guardian cannot
-        # publish Quiescent. Freeze only the verified owner while injecting, so
-        # its monitor cannot complete cleanup before this condition is recorded.
+        # Kill only the authenticated owner while managed execution is live.
+        # Pipe guardians or the recorded external engine must be settled by
+        # the next owner without restarting the container.
         same_container = cid
-        orphan = execute('python3', '-c', '''
-import json, os, pathlib, signal, time
-scope = pathlib.Path('/home/user/logs/.app-cli-state')
-discovery = json.loads((scope/'supervisor.json').read_text())
-path = scope/'work'/discovery['snapshot']['generation']/'generation.json'
-generation = json.loads(path.read_text())
-worker = generation['worker_pid']
-def parent(pid):
-    return int(pathlib.Path('/proc', str(pid), 'stat').read_text().rsplit(')',1)[1].split()[1])
-guardian = parent(worker)
-supervisor = parent(guardian) if guardian > 1 else 0
-cmd = pathlib.Path('/proc', str(guardian), 'cmdline').read_bytes().split(b'\\0')
-if not (b'--runtime-worker-guardian' in cmd and str(path.parent).encode() in cmd):
-    # 前提失效形态二：worker 的父进程存在但不是专用 guardian——同上
-    # 记录诊断并跳过注入，回收/保留断言照常。
-    print(json.dumps({'generation': generation['id'], 'worker': worker,
-                      'guardian': guardian, 'supervisor': supervisor,
-                      'parent_cmd': [c.decode(errors='replace') for c in cmd[:4]],
-                      'skipped': 'worker parent is not the worker guardian'}))
-    raise SystemExit(0)
-owned = False
-for fd in pathlib.Path('/proc', str(supervisor), 'fd').iterdir():
-    try:
-        owned = owned or fd.readlink() == scope/'owner.lock'
-    except FileNotFoundError:
-        pass
-assert owned, 'captured supervisor does not own the expected workspace'
-os.kill(supervisor, signal.SIGSTOP)
-try:
-    os.kill(guardian, signal.SIGSTOP)
-    os.kill(worker, signal.SIGKILL)
-    os.kill(guardian, signal.SIGKILL)
-    deadline = time.monotonic()+10
-    while True:
-        try:
-            os.kill(worker, 0)
-        except ProcessLookupError:
-            break
-        assert time.monotonic() < deadline, 'worker exit not reaped'
-        time.sleep(.05)
-    assert json.loads(path.read_text())['phase'] in ('Running', 'Draining')
-    print(json.dumps({'generation': generation['id'], 'worker': worker,
-                      'guardian': guardian, 'supervisor': supervisor}))
-finally:
-    os.kill(supervisor, signal.SIGCONT)
-''')
+        orphan = execute('python3', '-c', OWNER_FAULT_SCRIPT, workspace, 'kill')
         evidence['same_container_orphan'] = json.loads(orphan.stdout)
         write({'web/version.txt': 'after-orphan'})
         count = start('restart', 'after-orphan', count)

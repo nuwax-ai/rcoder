@@ -1,4 +1,5 @@
 //! Captured builder deletion. No cleanup target is rediscovered by app name.
+use shared_types::storage_contents::{CapturedStorageDirectory, StorageDirectoryLease};
 use shared_types::{AppOperationLease, BuilderDeletionSnapshot, ProjectStore, UserappDevDeletion};
 use std::sync::Arc;
 
@@ -31,7 +32,8 @@ struct CapturedDeletion {
     extra_instances: Vec<(String, BuilderDeletionSnapshot)>,
     /// 协作者实例的 operation 锁（capture 时获取，cleanup 完成后释放——
     /// 防清扫期间并发 ensure 重建实例）。
-    extra_leases: Vec<Box<dyn AppOperationLease>>,
+    extra_leases: Vec<BuilderOperation>,
+    directories: Vec<CapturedStorageDirectory>,
     _local: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 // Read-only capture may be abandoned safely. Once deletion starts, an uncertain
@@ -96,10 +98,10 @@ impl Drop for BuilderOperation {
             match tokio::runtime::Handle::try_current() {
                 Ok(runtime) => {
                     runtime.spawn(async move {
-                    if let Err(error) = lease.release().await {
-                        tracing::error!(%error, "Failed to release read-only builder operation");
-                    }
-                });
+                        if let Err(error) = lease.release().await {
+                            tracing::error!(%error, "Failed to release read-only builder operation");
+                        }
+                    });
                 }
                 Err(error) => {
                     tracing::error!(%error, "Builder operation release requires an active runtime")
@@ -110,6 +112,85 @@ impl Drop for BuilderOperation {
 }
 #[async_trait::async_trait]
 impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
+    async fn inspect_captured(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserappDevDeletionReceipt,
+    ) -> Result<shared_types::DeletionInspection, String> {
+        use shared_types::DeletionInspection as Observation;
+        let mut remaining_resources = match self
+            .runtime
+            .inspect_builder_deletion(context, receipt.lease.as_ref(), &receipt.runtime)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            Observation::ConfirmedQuiescent {
+                remaining_resources,
+            } => remaining_resources,
+            other => return Ok(other),
+        };
+        for collaborator in &receipt.collaborators {
+            let mut collaborator_context = context.clone();
+            collaborator_context.app_id = collaborator.runtime.app_id.clone();
+            match self
+                .runtime
+                .inspect_builder_deletion(
+                    &collaborator_context,
+                    collaborator.lease.as_ref(),
+                    &collaborator.runtime,
+                )
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                Observation::ConfirmedQuiescent {
+                    remaining_resources: resources,
+                } => remaining_resources.extend(resources),
+                other => return Ok(other),
+            }
+        }
+        if receipt.runtime.docker_bind_cleanup {
+            let Some(directories) = &receipt.directories else {
+                return Ok(Observation::Unknown(
+                    "Historical Docker deletion lacks directory identity witnesses".into(),
+                ));
+            };
+            // The original builder FD was proved inactive above. No background
+            // cleanup can remain active: CapturedDeletion retains it through all
+            // detached filesystem work. Observe paths only; recovery preserves data.
+            for directory in directories {
+                shared_types::storage_contents::retire_captured_directory_deletion(
+                    directory,
+                    &receipt.runtime.operation_id,
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Retire development directory deletion {}: {error}",
+                        directory.path.display()
+                    )
+                })?;
+                let current = StorageDirectoryLease::capture(&directory.path)
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "Inspect captured development directory {}: {error}",
+                            directory.path.display()
+                        )
+                    })?;
+                if let Some(identity) = current.receipt.identity {
+                    remaining_resources.push(shared_types::AppResourceIdentity {
+                        kind: shared_types::AppResourceKind::HostPath,
+                        name: directory.path.to_string_lossy().into_owned(),
+                        uid: format!("{}:{}", identity.device, identity.inode),
+                        resource_version: None,
+                    });
+                }
+            }
+        }
+        Ok(Observation::ConfirmedQuiescent {
+            remaining_resources,
+        })
+    }
     async fn capture(&self, app_id: &str) -> Result<Box<dyn UserappDevDeletion>, String> {
         let local = super::lifecycle::acquire(app_id).await;
         let lease = self
@@ -204,6 +285,7 @@ impl UserappDevResourcesCleanup {
                 .acquire_builder_operation(&instance)
                 .await
                 .map_err(|e| format!("acquire builder instance deletion ({instance}): {e}"))?;
+            let lease = BuilderOperation::new(lease);
             let extra_snapshot = self
                 .runtime
                 .capture_builder_deletion(&instance)
@@ -231,6 +313,11 @@ impl UserappDevResourcesCleanup {
                 ))
             })
             .transpose()?;
+        let directories = if snapshot.docker_bind_cleanup {
+            capture_bind_directories(app_id).await?
+        } else {
+            Vec::new()
+        };
         Ok(Box::new(CapturedDeletion {
             runtime: self.runtime.clone(),
             projects: self.projects.clone(),
@@ -239,6 +326,7 @@ impl UserappDevResourcesCleanup {
             operation,
             extra_instances,
             extra_leases,
+            directories,
             _local: local,
         }))
     }
@@ -275,6 +363,27 @@ impl UserappDevDeletion for CapturedDeletion {
                         container_id: container_id.clone(),
                     },
                 ),
+            lease: self
+                .operation
+                .lease
+                .as_ref()
+                .and_then(|lease| lease.receipt()),
+            collaborators: self
+                .extra_instances
+                .iter()
+                .zip(&self.extra_leases)
+                .map(
+                    |((_, runtime), lease)| shared_types::BuilderCollaboratorDeletionReceipt {
+                        runtime: runtime.clone(),
+                        lease: lease.lease.as_ref().and_then(|lease| lease.receipt()),
+                        registry: None,
+                    },
+                )
+                .collect(),
+            directories: self
+                .snapshot
+                .docker_bind_cleanup
+                .then(|| self.directories.clone()),
         }
     }
 
@@ -290,12 +399,14 @@ impl CapturedDeletion {
     async fn execute(mut self: Box<Self>) -> Result<(), String> {
         self.operation.mutating =
             !self.snapshot.resources.is_empty() || self.snapshot.docker_bind_cleanup;
+        for operation in &mut self.extra_leases {
+            operation.begin_external_mutation()?;
+        }
         self.runtime
             .delete_builder_snapshot(&self.snapshot)
             .await
             .map_err(|e| format!("delete captured builder: {e}"))?;
-        // 协作者实例清扫（best-effort 顺序删除；任一失败即报错保留剩余快照
-        // 供人工/再次 capture 处置）
+        // 协作者实例顺序删除；任一失败即保留未确认快照，交给原操作恢复。
         for (instance, snapshot) in &self.extra_instances {
             self.runtime
                 .delete_builder_snapshot(snapshot)
@@ -305,7 +416,19 @@ impl CapturedDeletion {
         if self.snapshot.docker_bind_cleanup {
             // snapshot.app_id 应用共享后恒纯 app_id——app_id 内部连字符已合法
             // （DNS-1123），不能按 '-' 右切还原（会把 ae2env-xxx 切成 xxx）
-            remove_bind_directories(&self.snapshot.app_id).await?;
+            for directory in &self.directories {
+                shared_types::storage_contents::remove_captured_directory(
+                    directory,
+                    &self.snapshot.operation_id,
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Remove captured builder bind directory {}: {error}",
+                        directory.path.display()
+                    )
+                })?;
+            }
         }
         match &self.registry_identity {
             Some((generation, container_id)) => {
@@ -339,8 +462,8 @@ impl CapturedDeletion {
         for (instance, _) in &self.extra_instances {
             crate::userapp_forward::invalidate_probe_cache(instance);
         }
-        for lease in self.extra_leases.drain(..) {
-            lease.release().await?;
+        for mut operation in self.extra_leases.drain(..) {
+            operation.finish_external_mutation().await?;
         }
         if let Some(operation) = self.operation.lease.take() {
             operation.release().await?;
@@ -349,17 +472,7 @@ impl CapturedDeletion {
         Ok(())
     }
 }
-async fn remove_if_present(path: &std::path::Path) -> Result<(), String> {
-    match tokio::fs::remove_dir_all(path).await {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!(
-            "remove captured builder bind directory {}: {e}",
-            path.display()
-        )),
-    }
-}
-async fn remove_bind_directories(app_id: &str) -> Result<(), String> {
+async fn capture_bind_directories(app_id: &str) -> Result<Vec<CapturedStorageDirectory>, String> {
     // deploy-host：容器常量锚点在宿主机不存在（bind 源经 host_map 映射创建），
     // 清理须走同一映射出口，否则 read_dir NotFound 被吞 → dev bind 目录泄漏
     #[cfg(feature = "deploy-host")]
@@ -367,6 +480,7 @@ async fn remove_bind_directories(app_id: &str) -> Result<(), String> {
         crate::utils::workspace_root_path(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT);
     #[cfg(not(feature = "deploy-host"))]
     let anchor = std::path::PathBuf::from(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT);
+    let mut paths = Vec::new();
     match tokio::fs::read_dir(anchor.join("dev")).await {
         Ok(mut entries) => {
             while let Some(user) = entries
@@ -383,14 +497,26 @@ async fn remove_bind_directories(app_id: &str) -> Result<(), String> {
                     continue;
                 }
                 for suffix in shared_types::paths::userapp_dev_app_suffixes(app_id) {
-                    remove_if_present(&user.path().join(suffix)).await?;
+                    paths.push(user.path().join(suffix));
                 }
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("read builder bind root: {e}")),
     }
-    remove_if_present(&anchor.join(app_id)).await
+    paths.push(anchor.join(app_id));
+    let mut directories = Vec::new();
+    for path in paths {
+        directories.push(
+            StorageDirectoryLease::capture(&path)
+                .await
+                .map_err(|error| {
+                    format!("Capture builder bind directory {}: {error}", path.display())
+                })?
+                .receipt,
+        );
+    }
+    Ok(directories)
 }
 
 #[cfg(test)]

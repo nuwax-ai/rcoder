@@ -25,6 +25,32 @@ pub struct BuilderRegistryIdentity {
 pub struct UserappDevDeletionReceipt {
     pub runtime: BuilderDeletionSnapshot,
     pub registry: Option<BuilderRegistryIdentity>,
+    /// The original builder mutex, distinct from the prod/application mutex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<crate::UserAppOperationLeaseReceipt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collaborators: Vec<BuilderCollaboratorDeletionReceipt>,
+    /// None denotes a historical capture without directory witnesses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directories: Option<Vec<crate::storage_contents::CapturedStorageDirectory>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuilderCollaboratorDeletionReceipt {
+    pub runtime: BuilderDeletionSnapshot,
+    pub lease: Option<crate::UserAppOperationLeaseReceipt>,
+    pub registry: Option<BuilderRegistryIdentity>,
+}
+
+/// Recovery observations never authorize replay of a destructive operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeletionInspection {
+    StillHeld(String),
+    ConfirmedQuiescent {
+        remaining_resources: Vec<crate::AppResourceIdentity>,
+    },
+    ForeignIdentity(String),
+    Unknown(String),
 }
 
 /// A captured deletion owns its lifecycle lease until committed or dropped.
@@ -53,6 +79,17 @@ pub trait UserappDevDeletion: Send {
 
 #[async_trait]
 pub trait UserappDevCleanup: Send + Sync {
+    /// Called only after durable execution revocation. Inspect original targets;
+    /// never capture a new same-named builder or replay storage deletion.
+    async fn inspect_captured(
+        &self,
+        _context: &crate::UserAppExecutionContext,
+        _receipt: &UserappDevDeletionReceipt,
+    ) -> Result<DeletionInspection, String> {
+        Ok(DeletionInspection::Unknown(
+            "Captured development deletion inspection is unsupported".into(),
+        ))
+    }
     /// Consume a borrowed handle to the caller's existing builder lease. Receipt
     /// data alone is not authorization; unsupported adapters must not reacquire.
     async fn capture_with_lease(

@@ -767,25 +767,26 @@ async fn unsupported_kind_fence_kept_even_when_running() {
     assert_eq!(record.state, UserAppOperationState::RecoveryRequired);
 }
 
-/// Step B 反例（修复前必挂）：删除中断后部署已缺席 = 达成证据
-/// （同 Stop 哲学），必须收束留痕而不是永久围栏。
+/// Deployment absence alone cannot authorize retiring a deletion whose original
+/// captured targets are unavailable: a detached dev/storage write may remain.
 #[tokio::test]
-async fn delete_compute_fence_settles_when_deployment_absent() {
+async fn delete_compute_absence_does_not_retire_unknown_deletion() {
     let operation_id = "op-delete-absent";
     let runtime = FenceRuntime::scenario(None, None);
     let (state, _dir) =
         fence_state(runtime, UserAppOperationKind::DeleteCompute, operation_id).await;
     let snapshot = settled(&state, operation_id).await;
-    reconcile_fenced_ensure(&state, &snapshot)
+    let error = reconcile_fenced_ensure(&state, &snapshot)
         .await
-        .expect("settle");
-    let record = settled(&state, operation_id).await;
-    assert_eq!(record.state, UserAppOperationState::Failed);
-    assert_eq!(
-        record.checkpoint["fence_released_evidence"]["kind"], "absent_confirmed",
-        "{:?}",
-        record.checkpoint["fence_released_evidence"]
+        .expect_err("deployment absence must not retire unknown deletion writes");
+    assert!(
+        error
+            .to_string()
+            .contains("Original deletion targets are unavailable")
     );
+    let record = settled(&state, operation_id).await;
+    assert_eq!(record.state, UserAppOperationState::RecoveryRequired);
+    assert!(record.checkpoint.get("fence_released_evidence").is_none());
 }
 
 /// Step B 反例（修复前必挂）：Create 报错且什么都没建出来 → no_trace

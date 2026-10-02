@@ -118,9 +118,9 @@ CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_dev E2E_FILTER=userap
 
 准备阶段先确认真实 PG 初始化及登录完成，期间通过公开 keepalive 保活并核对容器 ID 未变化。首轮构建故意持续 75 秒，构建期间不发 keepalive，验证异步任务执行能阻止误回收；任务完成后才开始真正闲置的计时。PG 初始化超时是前置失败，不跳过 PG 预检。失败时保留 PG 日志。
 
-第一轮额外挂起捕获的 root guardian，确保真实回收后必须消费绑定原物理容器和挂载的退出证据，不能只依赖优雅关闭碰巧成功。
+第一轮通过真实监督控制信封、代次、工作区和锁文件核验合并 owner，使用 Linux pidfd 精确挂起该进程，确保真实回收后必须消费绑定原容器、代次和挂载的退出证据，不能只依赖优雅关闭碰巧成功。
 
-两轮回收之间还注入同容器故障：核验 owner 锁和进程父子身份后终止 worker/guardian，保留磁盘上的 Running/Draining。随后经 RCoder Restart 重新构建、检查 HTTP 新内容，再 Stop/Start；必须自动收束旧代次为 Quiescent，且容器 ID 不变、RestartCount 仍为 0。此步骤不会清除登记或伪造清理回执。
+两轮回收之间还注入同容器故障：核验 owner、代次锁与仍运行的命令守护范围后，用 pidfd 精确终止合并 owner，保留磁盘上的 Running/Draining 和真实命令清理链。不会对其父进程 agent_runner 发送信号，也不把未知拓扑作为跳过注入的理由。随后经 RCoder Restart 重新构建、检查 HTTP 新内容，再 Stop/Start；必须自动收束旧代次为 Quiescent，且容器 ID 不变、RestartCount 仍为 0。此步骤不会清除登记或伪造清理回执。
 
 同一场景依次验证：独立 app-cli owner → RCoder 构建并登记 → 闲置回收物理容器 → 原文件和旧 owner/journal 保留 → RCoder 重新 ensure → 直接 Start 恢复管理面并重新构建 → Stop/重复 Stop/Restart → 第二次真实回收 → 先 Stop 恢复管理面再 Restart 构建。两轮回收放在同一场景，避免先成功 Start 掩盖 Stop 自身的恢复问题。必须有不同的容器与 owner 身份、相同生命周期和挂载、构建计数实际递增，以及 HTTP 返回各轮新内容；任务 `completed` 本身不能使场景通过。
 

@@ -9,7 +9,7 @@ use super::docker_runtime::DockerRuntime;
 /// userapp-workspace 根：容器形态直接用容器内常量（rcoder 容器挂载锚点）；
 /// deploy-host 宿主机形态经路径映射表解析为宿主机真实路径
 /// （~/.rcoder/workspace/userapp）。
-async fn userapp_workspace_root() -> ContainerRuntimeResult<std::path::PathBuf> {
+pub(super) async fn userapp_workspace_root() -> ContainerRuntimeResult<std::path::PathBuf> {
     #[cfg(feature = "deploy-host")]
     if shared_types::is_deploy_host() {
         return crate::path::resolve_container_path_to_host(std::path::Path::new(
@@ -24,6 +24,35 @@ async fn userapp_workspace_root() -> ContainerRuntimeResult<std::path::PathBuf> 
     }
     let root = std::path::Path::new(shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT);
     Ok(root.to_path_buf())
+}
+
+pub(super) async fn capture_prod_directories(
+    app_id: &str,
+) -> ContainerRuntimeResult<Vec<shared_types::storage_contents::CapturedStorageDirectory>> {
+    shared_types::validate_identifier(app_id, "app_id")
+        .map_err(ContainerRuntimeError::ConfigurationError)?;
+    let root = userapp_workspace_root().await?;
+    let mut paths = shared_types::paths::userapp_prod_subpaths(app_id)
+        .into_iter()
+        .map(|suffix| root.join(suffix))
+        .collect::<Vec<_>>();
+    let legacy_root = std::env::var("RCODER_WORKSPACE_ROOT")
+        .unwrap_or_else(|_| "/app/project_workspace/apps".into());
+    paths.push(std::path::PathBuf::from(legacy_root).join(app_id));
+    paths.sort();
+    paths.dedup();
+    let mut captured = Vec::new();
+    for path in paths {
+        captured.push(
+            shared_types::storage_contents::StorageDirectoryLease::capture(&path)
+                .await
+                .map_err(|error| {
+                    ContainerRuntimeError::DockerError(format!("Capture prod directory: {error}"))
+                })?
+                .receipt,
+        );
+    }
+    Ok(captured)
 }
 
 /// `list_workspace_identifiers` 仅实现 dev（UserappBuilder）形态（目录树扫描），
@@ -202,7 +231,24 @@ impl WorkspaceRuntime for DockerRuntime {
                 "application container exists; storage deletion rejected".into(),
             ));
         }
-        self.destroy_app_pvc(&snapshot.app_id).await
+        let directories = snapshot.directories.as_ref().ok_or_else(|| {
+            ContainerRuntimeError::Conflict(
+                "Historical Docker storage deletion lacks captured directory identities".into(),
+            )
+        })?;
+        for directory in directories {
+            shared_types::storage_contents::remove_captured_directory(
+                directory,
+                &snapshot.operation_id,
+            )
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::DockerError(format!(
+                    "Remove captured production directory: {error}"
+                ))
+            })?;
+        }
+        Ok(())
     }
 }
 

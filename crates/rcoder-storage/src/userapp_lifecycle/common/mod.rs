@@ -5,7 +5,8 @@ mod activity;
 mod builder_registration;
 #[cfg(feature = "pg")]
 pub(crate) use builder_registration::{
-    bind_completed_builder_registration, completed_builder_registration_candidates,
+    bind_completed_builder_registration, commit_builder_registration_adoption,
+    completed_builder_registration_candidates,
 };
 #[cfg(test)]
 mod activity_tests;
@@ -714,6 +715,44 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         let snapshot = snapshot.clone();
         self.run(false, move |tx, backend| {
             Box::pin(async move { ops::reserve_completed_operation(tx, backend, &snapshot).await })
+        })
+        .await
+    }
+    async fn reserve_interrupted_deletion(
+        &self,
+        snapshot: &UserAppOperationRecord,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move { ops::reserve_interrupted_deletion(tx, backend, &snapshot).await })
+        })
+        .await
+    }
+    async fn record_deletion_recovery_problem(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        message: &str,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let message = message.to_owned();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                ops::record_deletion_recovery_problem(tx, backend, &snapshot, &message).await
+            })
+        })
+        .await
+    }
+    async fn finalize_interrupted_deletion(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        evidence: &serde_json::Value,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let evidence = evidence.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                ops::finalize_interrupted_deletion(tx, backend, &snapshot, &evidence).await
+            })
         })
         .await
     }

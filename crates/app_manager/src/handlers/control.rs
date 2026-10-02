@@ -48,8 +48,13 @@ pub(super) async fn control_result<T>(
 
 /// Retry or reconcile an application operation.
 ///
-/// Pending commands retain their original input and identity. Running or uncertain
-/// operations require durable final evidence; unknown remote effects are not replayed.
+/// Pending commands retain their original input and identity. A Running or
+/// RecoveryRequired deletion with captured targets can inspect and retire the
+/// original writer without final completion evidence. This never replays an
+/// unknown Purge: incomplete DeleteCompute/PurgeResources becomes Failed only
+/// after all captured write scopes are confirmed quiescent; DeleteApplication
+/// keeps its deletion intent and tombstone. Other uncertain operations require
+/// their operation-specific recovery evidence; unknown effects are not replayed.
 /// A wake with a persisted acknowledged start may finalize its failed read-only
 /// observation and release its original lease. This returns the original Failed
 /// operation, not a new application start; fetch the current revision before retry.

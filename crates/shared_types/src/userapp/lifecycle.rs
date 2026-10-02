@@ -739,9 +739,48 @@ where
 
 /// A caller's waiting deadline says nothing about the remote operation outcome.
 #[derive(Debug, thiserror::Error)]
-#[error("Builder ensure deadline exceeded")]
+#[error(
+    "{}",
+    crate::get_error_message(crate::error_codes::ERR_USERAPP_WAIT_TIMEOUT, "en-US")
+)]
 pub struct UserAppWaitTimeout {
     pub operation_id: Option<String>,
+}
+
+impl From<&UserAppWaitTimeout> for crate::AppError {
+    fn from(timeout: &UserAppWaitTimeout) -> Self {
+        // HTTP rendering resolves the canonical error code in the caller's
+        // locale. The wait ending does not change the accepted operation state.
+        let response = Self::from_code(crate::error_codes::ERR_USERAPP_WAIT_TIMEOUT);
+        match &timeout.operation_id {
+            Some(id) => response.with_operation_id(id.clone()),
+            None => response,
+        }
+    }
+}
+
+#[cfg(test)]
+mod wait_timeout_tests {
+    use super::UserAppWaitTimeout;
+
+    #[test]
+    fn typed_timeout_conversion_keeps_identity_and_uses_the_error_catalog() {
+        for operation_id in [None, Some("accepted-builder".to_owned())] {
+            let timeout = UserAppWaitTimeout {
+                operation_id: operation_id.clone(),
+            };
+            let crate::AppError::Structured(detail) = crate::AppError::from(&timeout) else {
+                panic!("timeout must retain its structured business code");
+            };
+            assert_eq!(detail.code, crate::error_codes::ERR_USERAPP_WAIT_TIMEOUT);
+            assert_eq!(detail.operation_id, operation_id);
+            assert_eq!(detail.internal_message, None);
+            assert_eq!(
+                timeout.to_string(),
+                crate::get_error_message(crate::error_codes::ERR_USERAPP_WAIT_TIMEOUT, "en-US")
+            );
+        }
+    }
 }
 
 /// Structured conflict detail about the in-flight operation occupying a scope.
@@ -1186,6 +1225,38 @@ pub trait UserAppLifecycleStore: Send + Sync {
         &self,
         snapshot: &UserAppOperationRecord,
     ) -> Result<UserAppOperationRecord, UserAppStoreError>;
+    /// Revoke only the exact interrupted deletion executor. Captured targets and
+    /// its physical lease remain unchanged; this grants no resource mutation.
+    async fn reserve_interrupted_deletion(
+        &self,
+        _snapshot: &UserAppOperationRecord,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Interrupted deletion recovery is unsupported".into(),
+        ))
+    }
+    /// Record a bounded inspection failure without reopening execution authority.
+    async fn record_deletion_recovery_problem(
+        &self,
+        _snapshot: &UserAppOperationRecord,
+        _message: &str,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Deletion recovery diagnostics are unsupported".into(),
+        ))
+    }
+    /// Release the original non-lifecycle deletion slot after all captured write
+    /// scopes have been retired. Never succeeds an incomplete purge or revives a
+    /// DeleteApplication tombstone; exact snapshot and evidence are mandatory.
+    async fn finalize_interrupted_deletion(
+        &self,
+        _snapshot: &UserAppOperationRecord,
+        _evidence: &serde_json::Value,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Interrupted deletion finalization is unsupported".into(),
+        ))
+    }
     /// Finalize an uncertain password operation after identity-bound remote
     /// receipt verification (and TCP verification for Verified). Exact snapshot
     /// CAS, original lease and physical target are mandatory. Does not release

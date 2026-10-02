@@ -331,6 +331,27 @@ async fn discover(
                 continue;
             }
             if matches!(
+                operation.kind,
+                UserAppOperationKind::DeleteCompute
+                    | UserAppOperationKind::PurgeResources
+                    | UserAppOperationKind::DeleteApplication
+            ) && matches!(
+                operation.state,
+                UserAppOperationState::Running | UserAppOperationState::RecoveryRequired
+            ) && !shared_types::userapp_operation_has_final_evidence(&operation)
+            {
+                let state = state.clone();
+                tasks.push(operation.operation_id.clone(), async move {
+                    with_stall_budget(
+                        "inspect interrupted deletion",
+                        state.app_service.reconcile_interrupted_deletion(&operation),
+                    )
+                    .await??;
+                    Ok(())
+                });
+                continue;
+            }
+            if matches!(
                 operation.state,
                 UserAppOperationState::Running | UserAppOperationState::RecoveryRequired
             ) && shared_types::userapp_operation_has_final_evidence(&operation)

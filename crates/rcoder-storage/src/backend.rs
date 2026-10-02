@@ -28,6 +28,34 @@ pub enum ProjectStoreBackend {
 }
 
 impl ProjectStoreBackend {
+    /// Complete an explicit, registration-only adoption under the same PG
+    /// transaction as the lifecycle outcome. No historical creator is invented.
+    pub async fn complete_builder_registration_adoption(
+        &self,
+        expected: &ProjectAndContainerInfo,
+        target: &shared_types::BuilderControlTarget,
+        container: &ContainerBasicInfo,
+        volumes: &[shared_types::AppResourceIdentity],
+        progress: &shared_types::UserAppOperationProgress,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Memory(_) => {
+                let _ = (expected, target, container, volumes, progress);
+                anyhow::bail!(
+                    "Legacy workload registry adoption requires the durable PostgreSQL registry"
+                )
+            }
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .complete_builder_registration_adoption(
+                        expected, target, container, volumes, progress,
+                    )
+                    .await
+            }
+        }
+    }
+
     pub async fn completed_builder_registration_candidates(
         &self,
         app_id: &str,

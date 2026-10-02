@@ -3,6 +3,7 @@
 mod config_input;
 mod create;
 mod delete;
+mod deletion_recovery;
 mod deploy_control;
 mod deploy_signals;
 mod deploy_wait;

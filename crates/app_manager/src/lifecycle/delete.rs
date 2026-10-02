@@ -213,6 +213,7 @@ impl AppService {
         //    元数据行**保留**（三档语义：delete/purge 保留行支持误删找回，仅独立
         //    storage/destroy 接口删行）。
         if let Some(dev_deletion) = dev_deletion {
+            durable.authorize_mutation().await?;
             self.finish_captured_purge(app_id, durable, &mut checkpoint, dev_deletion)
                 .await?;
             info!("[APP] persistent storage destroyed: {}", app_id);

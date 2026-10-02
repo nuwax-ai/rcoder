@@ -1,5 +1,5 @@
-//! A verified UserApp workload replacement retires the old registry generation
-//! and installs its new lifecycle binding in one short database transaction.
+//! Verified replacement and explicit adoption rebind the builder registry and
+//! lifecycle outcome in one short transaction, before publishing the memory view.
 use super::{
     load,
     persist_ops::{ContainerSnapshot, ProjectSnapshot},
@@ -85,6 +85,90 @@ impl PgStore {
                 }
             }
         }).await.context("Commit verified builder registry replacement")?;
+        self.publish_rebound_builder(baseline, committed)
+    }
+
+    /// Registration-only repair for an explicitly adopted legacy workload.
+    /// The original creation history stays untouched; registry and this new
+    /// adoption outcome commit together under the application's root token.
+    pub async fn complete_builder_registration_adoption(
+        &self,
+        expected: &ProjectAndContainerInfo,
+        target: &shared_types::BuilderControlTarget,
+        container: &shared_types::ContainerBasicInfo,
+        volumes: &[AppResourceIdentity],
+        progress: &shared_types::UserAppOperationProgress,
+    ) -> Result<()> {
+        target.validate().map_err(anyhow::Error::msg)?;
+        ensure!(
+            progress.checkpoint.get("registration_target") == Some(&serde_json::to_value(target)?)
+                && progress.checkpoint.get("registration_volumes")
+                    == Some(&serde_json::to_value(volumes)?)
+                && progress.checkpoint.get("container") == Some(&serde_json::to_value(container)?),
+            "Builder adoption checkpoint differs from the inspected registry evidence"
+        );
+        ensure!(
+            !volumes.is_empty()
+                && volumes.iter().all(|volume| volume.kind
+                    == shared_types::AppResourceKind::PersistentVolumeClaim
+                    && !volume.name.is_empty()
+                    && !volume.uid.is_empty())
+                && volumes
+                    .iter()
+                    .map(|volume| &volume.name)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    == volumes.len(),
+            "Explicit builder registration adoption requires current PVC identities"
+        );
+        ensure!(
+            expected.project_id() == target.context.app_id,
+            "Old builder registry belongs to another application"
+        );
+        let expected_source_uid = expected
+            .container_info()
+            .and_then(|basic| basic.workload_uid)
+            .context("Old builder registration has no workload UID")?;
+        let baseline = {
+            let _registration = self
+                .registration
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Project registration lock poisoned"))?;
+            ensure!(
+                !self.closing.load(Ordering::Acquire),
+                "Persistence is shutting down"
+            );
+            let baseline = self.inner.get(expected.project_id());
+            self.active_writes.fetch_add(1, Ordering::AcqRel);
+            baseline
+        };
+        let _in_flight = InFlight(self);
+        let expected = expected.clone();
+        let target = target.clone();
+        let container = container.clone();
+        let progress = progress.clone();
+        let committed = self.database.execute(move |mut db| async move {
+            let mut tx = db.transaction().await?;
+            let result = async {
+                crate::userapp_lifecycle::commit_builder_registration_adoption(&mut tx, &target, &expected_source_uid, &progress).await?;
+                rebind_rows(&mut tx, &target.context, &target, &container, None, Some(&expected)).await
+            }.await;
+            match result {
+                Ok(info) => { tx.commit().await?; Ok(info) }
+                Err(error) => {
+                    tx.rollback().await.map_err(|rollback| anyhow::anyhow!("Builder adoption rollback failed: {rollback}; original error: {error}"))?;
+                    Err(error)
+                }
+            }
+        }).await.context("Commit explicit builder registration adoption")?;
+        self.publish_rebound_builder(baseline, committed)
+    }
+
+    fn publish_rebound_builder(
+        &self,
+        baseline: Option<Arc<ProjectAndContainerInfo>>,
+        committed: ProjectAndContainerInfo,
+    ) -> Result<()> {
         // Publish only after the database transaction commits. A concurrent
         // local project replacement must never be overwritten by its response.
         let registration = self
@@ -152,19 +236,36 @@ pub(super) async fn rebind(
     // This root CAS is also the competition point for deletion and Stop/Restart.
     crate::userapp_lifecycle::bind_completed_builder_registration(tx, operation, evidence, volumes)
         .await?;
-    let source = evidence
-        .registration_predecessor
-        .as_ref()
-        .and_then(|source| source.target.workload.as_ref());
-    let replacement = evidence
-        .target
+    rebind_rows(
+        tx,
+        &evidence.target.context,
+        &evidence.target,
+        &evidence.container,
+        evidence.registration_predecessor.as_ref(),
+        None,
+    )
+    .await
+}
+
+async fn rebind_rows(
+    tx: &mut dyn Executor,
+    context: &shared_types::UserAppExecutionContext,
+    target: &shared_types::BuilderControlTarget,
+    basic: &shared_types::ContainerBasicInfo,
+    predecessor: Option<&shared_types::BuilderCreationPredecessor>,
+    expected_registry: Option<&ProjectAndContainerInfo>,
+) -> Result<ProjectAndContainerInfo> {
+    let source = predecessor.and_then(|source| source.target.workload.as_ref());
+    let replacement = target
         .workload
         .as_ref()
         .context("Builder replacement workload missing")?;
-    let basic = &evidence.container;
     ensure!(
-        basic.project_id == operation.app_id
-            && basic.workload_uid.as_deref() == Some(replacement.uid.as_str()),
+        basic.project_id == context.app_id
+            && basic.workload_uid.as_deref() == Some(replacement.uid.as_str())
+            && target.pod.as_ref().is_some_and(
+                |pod| pod.uid == basic.container_id && pod.name == basic.container_name
+            ),
         "Builder registry identity differs from the captured replacement"
     );
     // Use the registry's existing lock namespace/order. These locks protect only
@@ -172,14 +273,13 @@ pub(super) async fn rebind(
     let mut keys = std::collections::BTreeSet::from([
         format!("container-name:{}", basic.container_name),
         format!("container:{}", basic.container_id),
-        format!("project:{}", operation.app_id),
+        format!("project:{}", context.app_id),
     ]);
-    if let Some(pod) = evidence
-        .registration_predecessor
-        .as_ref()
-        .and_then(|source| source.target.pod.as_ref())
-    {
+    if let Some(pod) = predecessor.and_then(|source| source.target.pod.as_ref()) {
         keys.insert(format!("container:{}", pod.uid));
+    }
+    if let Some(previous) = expected_registry.and_then(ProjectAndContainerInfo::container_info) {
+        keys.insert(format!("container:{}", previous.container_id));
     }
     for key in keys {
         toasty::sql::query("SELECT 1 FROM pg_advisory_xact_lock(hashtextextended($1, 719324))")
@@ -199,7 +299,7 @@ pub(super) async fn rebind(
             repo::ContainerRow::try_from(row)
         })
         .transpose()?;
-    let project = models::Project::filter_by_project_id(&operation.app_id)
+    let project = models::Project::filter_by_project_id(&context.app_id)
         .first()
         .exec(tx)
         .await?;
@@ -236,14 +336,36 @@ pub(super) async fn rebind(
             load::hydrate_project(&row, &container_map)?
         }
         None => {
-            let mut info = ProjectAndContainerInfo::new(operation.app_id.clone());
+            let mut info = ProjectAndContainerInfo::new(context.app_id.clone());
             info.set_service_type(Some(ServiceType::UserappBuilder));
             info
         }
     };
+    if let Some(expected) = expected_registry {
+        let expected_basic = expected
+            .container_info()
+            .context("Expected builder registration missing")?;
+        let actual = previous
+            .as_ref()
+            .context("Old builder registration disappeared")?;
+        let expected_container = expected
+            .persistence_identity()
+            .container
+            .as_ref()
+            .context("Expected builder persistence identity missing")?;
+        ensure!(
+            old.persistence_identity().generation == expected.persistence_identity().generation
+                && old.persistence_identity().revision == expected.persistence_identity().revision
+                && actual.container_generation == expected_container.generation
+                && actual.row_revision == expected_container.revision
+                && actual.container_id.as_deref() == Some(expected_basic.container_id.as_str())
+                && actual.workload_uid == expected_basic.workload_uid,
+            "Old builder registry changed during explicit adoption"
+        );
+    }
     if let Some(previous) = &previous {
         ensure!(
-            previous.logical_id == operation.app_id,
+            previous.logical_id == context.app_id,
             "Builder container is registered to another project"
         );
         if previous.workload_uid.as_deref() == Some(replacement.uid.as_str()) {
@@ -277,14 +399,14 @@ pub(super) async fn rebind(
             .await?
             .context("Legacy builder registry has no original lifecycle binding")?;
             ensure!(
-                old.app_id == operation.app_id && old.lifecycle_id == operation.lifecycle_id,
+                old.app_id == context.app_id && old.lifecycle_id == context.lifecycle_id,
                 "Legacy builder registry belongs to another lifecycle"
             );
         }
         // A UserApp builder is dedicated to its app. Do not detach an unexpected
         // project's references while handling this app's completed operation.
         let rows = toasty::sql::query("SELECT project_id FROM projects WHERE container_name=$1 AND container_generation=$2 AND project_id<>$3")
-            .bind(&previous.container_name).bind(&previous.container_generation).bind(&operation.app_id).exec(tx).await?;
+            .bind(&previous.container_name).bind(&previous.container_generation).bind(&context.app_id).exec(tx).await?;
         ensure!(
             rows.is_empty(),
             "Builder registry has unrelated project references"
@@ -355,8 +477,22 @@ mod tests {
             eprintln!("[skip] explicit isolated PostgreSQL DSN required");
             return;
         };
-        let owner = crate::pg::test_support::database(&dsn).await;
-        for legacy in [false, true] {
+        // Registration joins the project and lifecycle domains in one real
+        // transaction. A fresh disposable database needs both production
+        // migration components, rather than the project-only test helper.
+        let owner = crate::db::postgres::open(
+            &crate::config::PostgresConfig {
+                url: Some(dsn.clone()),
+                ..Default::default()
+            },
+            vec![
+                crate::db::schema::Component::Project,
+                crate::db::schema::Component::Userapp,
+            ],
+        )
+        .await
+        .expect("disposable PG project and lifecycle database");
+        for (legacy, explicit_adoption) in [(false, false), (true, false), (true, true)] {
             let control = crate::userapp_lifecycle::PgUserAppStore::from_owner(
                 owner.clone(),
                 crate::db::schema::Backend::Postgres,
@@ -544,6 +680,185 @@ mod tests {
             let mut ordinary = (*original).clone();
             ordinary.set_container(Some(evidence.container.clone()));
             assert!(store.insert(app_id.clone(), Arc::new(ordinary)).is_err());
+            if explicit_adoption {
+                // Pre-receipt workloads have no private creator acknowledgement.
+                // Their explicit Adopt request grants registration only, and the
+                // historical Succeeded Ensure remains byte-for-byte unchanged.
+                let request = AdoptBuilderRequest {
+                    lifecycle_id: app.lifecycle_id.clone(),
+                    request_id: format!("adopt{}", uuid::Uuid::new_v4().simple()),
+                    expected_container_id: pod_after.clone(),
+                };
+                let input = UserAppExecutionInput::new(serde_json::to_string(&request).unwrap());
+                let accepted = match control
+                    .admit_with_input(
+                        &UserAppAdmission {
+                            app_id: app_id.clone(),
+                            lifecycle_id: Some(app.lifecycle_id.clone()),
+                            operation_id: format!("adoptop{}", uuid::Uuid::new_v4().simple()),
+                            request_id: Some(request.request_id.clone()),
+                            request_fingerprint: input.digest(),
+                            kind: UserAppOperationKind::AdoptBuilder,
+                            command: None,
+                            metadata: None,
+                            runtime_policy_on_success: None,
+                        },
+                        Some(&input),
+                    )
+                    .await
+                    .unwrap()
+                {
+                    UserAppAdmissionOutcome::Accepted(record) => record,
+                    _ => panic!("fresh adoption"),
+                };
+                let running_adoption = control
+                    .advance(&UserAppOperationProgress {
+                        app_id: app_id.clone(),
+                        lifecycle_id: app.lifecycle_id.clone(),
+                        operation_id: accepted.operation_id.clone(),
+                        expected_revision: accepted.revision,
+                        executor_id: "adoptionworker".into(),
+                        state: UserAppOperationState::Running,
+                        step: "claimed".into(),
+                        checkpoint: serde_json::Value::Null,
+                        error_code: None,
+                        error_message: None,
+                    })
+                    .await
+                    .unwrap();
+                let mut adopted = evidence.target.clone();
+                adopted.context = UserAppExecutionContext {
+                    app_id: app_id.clone(),
+                    lifecycle_id: app.lifecycle_id.clone(),
+                    operation_id: running_adoption.operation_id.clone(),
+                    executor_id: "adoptionworker".into(),
+                    request_fingerprint: running_adoption.request_fingerprint.clone(),
+                };
+                // Already-bound current resources retain that binding's original
+                // operation identity instead of being rewritten by the repair.
+                let existing_binding = evidence.target.resource_binding.clone().unwrap();
+                let binding = existing_binding.clone();
+                owner.execute(move |mut db| async move {
+                    toasty::sql::statement("INSERT INTO userapp_resource_bindings(service_type,physical_uid,app_id,lifecycle_id,adopted_by_operation,created_at_us) VALUES($1,$2,$3,$4,$5,$6)")
+                        .bind(binding.service_type.to_string()).bind(binding.physical_uid).bind(binding.app_id)
+                        .bind(binding.lifecycle_id).bind(binding.adopted_by_operation)
+                        .bind(chrono::Utc::now().timestamp_micros()).exec(&mut db).await?;
+                    Ok(())
+                }).await.unwrap();
+                adopted.resource_binding = Some(existing_binding.clone());
+                let progress = UserAppOperationProgress {
+                    app_id: app_id.clone(),
+                    lifecycle_id: app.lifecycle_id.clone(),
+                    operation_id: running_adoption.operation_id.clone(),
+                    expected_revision: running_adoption.revision,
+                    executor_id: "adoptionworker".into(),
+                    state: UserAppOperationState::Succeeded,
+                    step: "physical_resource_adopted".into(),
+                    checkpoint: serde_json::json!({
+                        "operation_id": running_adoption.operation_id, "was_existing": true,
+                        "container": evidence.container,
+                        "registration_target": adopted, "registration_volumes": volumes,
+                    }),
+                    error_code: None,
+                    error_message: None,
+                };
+                let mut stale = (*original).clone();
+                let mut identity = stale.persistence_identity().clone();
+                identity.revision += 1;
+                stale.set_persistence_identity(identity);
+                assert!(
+                    store
+                        .complete_builder_registration_adoption(
+                            &stale,
+                            &adopted,
+                            &evidence.container,
+                            &volumes,
+                            &progress
+                        )
+                        .await
+                        .is_err()
+                );
+                assert_eq!(
+                    control
+                        .get_operation(&app_id, &running_adoption.operation_id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    running_adoption,
+                    "A stale registry CAS must roll back the adoption terminal and binding changes"
+                );
+                let mut foreign = adopted.clone();
+                foreign.context.lifecycle_id = "foreignlife".into();
+                assert!(
+                    store
+                        .complete_builder_registration_adoption(
+                            &original,
+                            &foreign,
+                            &evidence.container,
+                            &volumes,
+                            &progress
+                        )
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    store
+                        .complete_builder_registration_adoption(
+                            &original,
+                            &adopted,
+                            &evidence.container,
+                            &[],
+                            &progress
+                        )
+                        .await
+                        .is_err()
+                );
+                store
+                    .complete_builder_registration_adoption(
+                        &original,
+                        &adopted,
+                        &evidence.container,
+                        &volumes,
+                        &progress,
+                    )
+                    .await
+                    .unwrap();
+                let repaired = store.get(&app_id).unwrap();
+                assert_eq!(repaired.container_info().unwrap().container_id, pod_after);
+                assert_eq!(
+                    repaired.persistence_identity().generation,
+                    original_generation
+                );
+                assert!(repaired.sessions().contains(&session));
+                assert_eq!(
+                    control
+                        .get_operation(&app_id, &completed.operation_id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    completed,
+                    "Explicit repair cannot forge or rewrite the old creation outcome"
+                );
+                assert_eq!(
+                    control
+                        .get_resource_binding(&ServiceType::UserappBuilder, &new_uid)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    existing_binding
+                );
+                assert_eq!(
+                    control
+                        .get_operation(&app_id, &running_adoption.operation_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    UserAppOperationState::Succeeded
+                );
+                assert!(store.writer().flush_and_stop(Duration::from_secs(5)).await);
+                continue;
+            }
             let mut changed_volume = volumes.clone();
             if legacy {
                 changed_volume[0].kind = AppResourceKind::Secret;

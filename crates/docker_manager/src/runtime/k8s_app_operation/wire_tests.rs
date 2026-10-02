@@ -521,3 +521,133 @@ async fn compute_lease_lost_create_reply_is_discoverable_and_late_release_spares
         server.abort();
     }).await.expect("bounded compute lease protocol test");
 }
+
+#[tokio::test]
+async fn deletion_retirement_preserves_replacements_and_recovers_lost_patch_reply() {
+    use shared_types::{
+        AppDeletionSnapshot, AppResourceIdentity, AppResourceKind, DeletionInspection,
+        UserAppExecutionContext,
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        for scenario in ["retire", "lost-reply", "replacement", "terminating", "foreign-life"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let address = listener.local_addr().expect("address");
+            let server = tokio::spawn(async move {
+                let requests = if scenario == "lost-reply" { 7 } else if scenario == "retire" { 4 } else { 3 };
+                for step in 0..requests {
+                    let (mut stream, _) = listener.accept().await.expect("request");
+                    let (head, body) = read_request(&mut stream).await;
+                    let phase = if step >= 4 { step - 4 } else { step };
+                    let first = head.lines().next().expect("request line");
+                    if phase < 2 {
+                        assert!(first.starts_with("GET "));
+                        assert!(first.contains(if phase == 0 { "/leases/" } else { "/configmaps/" }));
+                        write_reply(&mut stream, 404, &status(404, "no original holder")).await;
+                    } else if phase == 2 {
+                        assert!(first.starts_with("GET /api/v1/namespaces/lease-test/persistentvolumeclaims/original-volume"));
+                        let mut metadata = serde_json::json!({"name":"original-volume", "uid": if scenario == "replacement" { "replacement-uid" } else { "original-uid" }, "resourceVersion": if step >= 4 { "43" } else { "42" }, "annotations":{"rcoder.io/lifecycle-id":if scenario == "foreign-life" { "different-life" } else { "life" }}});
+                        if scenario == "terminating" { metadata["deletionTimestamp"] = "2026-01-01T00:00:00Z".into(); }
+                        write_reply(&mut stream, 200, &serde_json::json!({"kind":"PersistentVolumeClaim", "apiVersion":"v1", "metadata":metadata})).await;
+                    } else {
+                        assert!(first.starts_with("PATCH /api/v1/namespaces/lease-test/persistentvolumeclaims/original-volume"));
+                        let patch: serde_json::Value = serde_json::from_slice(&body).expect("patch body");
+                        assert_eq!(patch["metadata"]["uid"], "original-uid");
+                        assert_eq!(patch["metadata"]["resourceVersion"], "42");
+                        assert_eq!(patch["metadata"]["annotations"]["rcoder.io/deletion-retired-operation"], "purge-old");
+                        assert!(patch.get("spec").is_none(), "retirement must not change replicas or volume data");
+                        if scenario != "lost-reply" {
+                            write_reply(&mut stream, 200, &serde_json::json!({"kind":"PersistentVolumeClaim", "apiVersion":"v1", "metadata":{"name":"original-volume", "uid":"original-uid", "resourceVersion":"43"}})).await;
+                        }
+                    }
+                    stream.shutdown().await.expect("close");
+                }
+            });
+            drop(rustls::crypto::ring::default_provider().install_default());
+            let config = kube::Config::new(format!("http://{address}").parse().expect("URI"));
+            let runtime = runtime_for(kube::Client::try_from(config).expect("client"));
+            let context = UserAppExecutionContext { app_id:"app".into(), lifecycle_id:"life".into(), operation_id:"purge-old".into(), executor_id:"old-executor".into(), request_fingerprint:"0".repeat(64) };
+            let snapshot = AppDeletionSnapshot { app_id:"app".into(), operation_id:"capture-old".into(), directories:None, resources:vec![AppResourceIdentity { kind:AppResourceKind::PersistentVolumeClaim, name:"original-volume".into(), uid:"original-uid".into(), resource_version:Some("42".into()) }] };
+            let mut result = runtime.inspect_captured_deletion(&context, ServiceType::Userapp, None, &snapshot.resources).await;
+            if scenario == "lost-reply" {
+                assert!(result.is_err(), "lost remote reply must remain unknown");
+                result = runtime.inspect_captured_deletion(&context, ServiceType::Userapp, None, &snapshot.resources).await;
+            }
+            match (scenario, result.expect("inspect")) {
+                ("terminating", DeletionInspection::Unknown(_)) => {},
+                ("foreign-life", DeletionInspection::ForeignIdentity(_)) => {},
+                ("replacement", DeletionInspection::ConfirmedQuiescent { remaining_resources }) => assert_eq!(remaining_resources[0].uid, "replacement-uid"),
+                (_, DeletionInspection::ConfirmedQuiescent { remaining_resources }) => {
+                    assert_eq!(remaining_resources[0].uid, "original-uid");
+                    assert_eq!(remaining_resources[0].resource_version.as_deref(), Some("43"), "recovery evidence must include the actual retired resource version");
+                },
+                (_, other) => panic!("unexpected retirement outcome: {other:?}"),
+            }
+            server.await.expect("wire assertions");
+        }
+    }).await.expect("bounded retirement scenarios");
+}
+
+#[tokio::test]
+async fn deletion_retirement_after_lease_takeover_never_deletes_successor_lease() {
+    use shared_types::{
+        AppResourceIdentity, AppResourceKind, DeletionInspection, UserAppOperationLeaseReceipt,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(async move {
+        for step in 0..5 {
+            let (mut stream, _) = listener.accept().await.expect("request");
+            let (head, body) = read_request(&mut stream).await;
+            let first = head.lines().next().expect("request line");
+            assert!(
+                !first.starts_with("DELETE"),
+                "successor lease/resources must be preserved"
+            );
+            let response = if matches!(step, 0 | 1 | 4) {
+                assert!(first.starts_with("GET /apis/coordination.k8s.io/v1/namespaces/lease-test/leases/rcoder-operation-prod-takeover"));
+                let mut successor = lease_json("successor-uid", "20", Some("new-operation"), 0, 1);
+                successor["metadata"]["annotations"]["rcoder.io/lifecycle-id"] =
+                    "lifecycle-one".into();
+                successor
+            } else {
+                assert!(first.contains("/persistentvolumeclaims/original-volume"));
+                if step == 3 {
+                    assert!(first.starts_with("PATCH "));
+                    let patch: serde_json::Value =
+                        serde_json::from_slice(&body).expect("patch body");
+                    assert_eq!(patch["metadata"]["uid"], "original-volume-uid");
+                    assert_eq!(patch["metadata"]["resourceVersion"], "7");
+                    assert!(patch.get("spec").is_none());
+                } else {
+                    assert!(first.starts_with("GET "));
+                }
+                serde_json::json!({"kind":"PersistentVolumeClaim", "apiVersion":"v1", "metadata":{"name":"original-volume", "uid":"original-volume-uid", "resourceVersion":if step == 3 { "8" } else { "7" }, "annotations":{"rcoder.io/lifecycle-id":"lifecycle-one"}}})
+            };
+            write_reply(&mut stream, 200, &response).await;
+            stream.shutdown().await.expect("close");
+        }
+    });
+    let runtime = runtime_for(client_for(address).await);
+    let context = context_for("takeover", "old-purge");
+    let original = UserAppOperationLeaseReceipt::Kubernetes {
+        service_type: ServiceType::Userapp,
+        namespace: "lease-test".into(),
+        name: "rcoder-operation-prod-takeover".into(),
+        uid: "original-lease-uid".into(),
+        resource_version: "1".into(),
+        token: "original-holder".into(),
+    };
+    let resources = vec![AppResourceIdentity {
+        kind: AppResourceKind::PersistentVolumeClaim,
+        name: "original-volume".into(),
+        uid: "original-volume-uid".into(),
+        resource_version: Some("7".into()),
+    }];
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        assert!(matches!(runtime.inspect_captured_deletion(&context, ServiceType::Userapp, Some(&original), &resources).await.expect("inspect"), DeletionInspection::ConfirmedQuiescent { remaining_resources } if remaining_resources.len() == 1));
+        runtime.release_captured_application_operation(&context, &original).await.expect("release old authority without touching successor");
+        server.await.expect("wire assertions");
+    }).await.expect("bounded lease takeover reconciliation");
+}

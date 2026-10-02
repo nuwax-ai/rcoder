@@ -24,6 +24,91 @@ pub(super) async fn application_lease_root() -> Result<std::path::PathBuf> {
 }
 
 impl DockerRuntime {
+    pub(crate) async fn inspect_captured_docker_deletion(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        family: ServiceType,
+        receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+        resources: &[AppResourceIdentity],
+    ) -> Result<shared_types::DeletionInspection> {
+        use shared_types::{
+            ComputeLeaseInspection, DeletionInspection as Observation, UserAppOperationScope,
+        };
+        let scope = if family == ServiceType::UserappBuilder {
+            UserAppOperationScope::Dev
+        } else {
+            UserAppOperationScope::Prod
+        };
+        match self
+            .inspect_compute_file_lease(context, scope, receipt)
+            .await?
+        {
+            ComputeLeaseInspection::Held => {
+                return Ok(Observation::StillHeld(
+                    "Original deletion FD is still locked".into(),
+                ));
+            }
+            ComputeLeaseInspection::IdentityChanged(message) => {
+                return Ok(Observation::ForeignIdentity(message));
+            }
+            ComputeLeaseInspection::Absent | ComputeLeaseInspection::Releasable(_) => {}
+            ComputeLeaseInspection::Discovered { .. } => {
+                return Ok(Observation::Unknown(
+                    "Deletion lease inspection unexpectedly discovered another attempt".into(),
+                ));
+            }
+        }
+        let mut remaining_resources = Vec::new();
+        for resource in resources {
+            if resource.kind != AppResourceKind::Container || resource.uid.is_empty() {
+                return Ok(Observation::Unknown(
+                    "Captured Docker deletion identity is incomplete".into(),
+                ));
+            }
+            match self
+                .inner
+                .get_docker_client()
+                .inspect_container(&resource.name, None)
+                .await
+            {
+                Ok(current) if current.id.as_deref() == Some(resource.uid.as_str()) => {
+                    remaining_resources.push(resource.clone())
+                }
+                Ok(current) => {
+                    if current
+                        .config
+                        .as_ref()
+                        .and_then(|config| config.labels.as_ref())
+                        .and_then(|labels| labels.get("rcoder.io/lifecycle-id"))
+                        .is_some_and(|lifecycle| lifecycle != &context.lifecycle_id)
+                    {
+                        return Ok(Observation::ForeignIdentity(
+                            "Replacement container belongs to another lifecycle".into(),
+                        ));
+                    }
+                    let uid = current.id.filter(|id| !id.is_empty()).ok_or_else(|| {
+                        Error::DockerError("Replacement container has no physical ID".into())
+                    })?;
+                    let mut replacement = resource.clone();
+                    replacement.uid = uid;
+                    remaining_resources.push(replacement);
+                }
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(error) => {
+                    return Err(Error::DockerError(format!(
+                        "Inspect captured deletion container: {error}"
+                    )));
+                }
+            }
+        }
+        // Docker API mutations use immutable captured IDs. An outstanding old
+        // remove may affect that old ID only, never a replacement by app name.
+        Ok(Observation::ConfirmedQuiescent {
+            remaining_resources,
+        })
+    }
     pub(crate) async fn validate_captured_file_lease(
         &self,
         context: &shared_types::UserAppExecutionContext,

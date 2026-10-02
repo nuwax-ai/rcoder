@@ -52,11 +52,13 @@ fn validate_input(
 }
 
 mod application;
+mod deletion_recovery;
 mod observed;
 mod operation;
 mod recovery;
 
 pub(crate) use application::*;
+pub(crate) use deletion_recovery::*;
 pub(crate) use observed::*;
 pub(crate) use operation::*;
 pub(crate) use recovery::*;

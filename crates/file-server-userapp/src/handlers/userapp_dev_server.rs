@@ -49,6 +49,13 @@ fn app_id_of_key(key: &str) -> Option<&str> {
 /// 最终值按 P1-06 `launch_budget()` 动态计算，此常量仅为后备默认。
 const START_DONE_WAIT_MAX_SECS: u64 = 1200;
 
+/// Whether this request produced startup events that must reach their terminal
+/// barrier. Reusing a ready service or cancelling before launch produces none.
+enum StartupCompletion {
+    NoNewExecution,
+    WaitForEvents,
+}
+
 use crate::service::userapp::start_events::{StartEvent as EvtOutcome, StartEventPipe};
 
 /// app-cli EVT JSON → 进度事件/终局（跨进程 wire 契约；与 app-cli
@@ -408,7 +415,8 @@ async fn spawn_dev_task(
                     }
                 })
                 .await;
-            let (evt_tx, event_pipe) = StartEventPipe::new(task_clone.clone());
+            let (evt_tx, mut event_pipe) = StartEventPipe::new(task_clone.clone());
+            let error_events_tx = evt_tx.clone();
             // P1-06：启动预算取配置兜底——不能用硬编码 3600s 掩盖通道语义缺陷，
             // 也不能截断合法慢启动。此处以 dev_command_timeout_secs 为基线加
             // pingap 确认余量（30s）与调度余量（120s），再取上限 1200s 兜底。
@@ -416,6 +424,8 @@ async fn spawn_dev_task(
                 START_DONE_WAIT_MAX_SECS,
                 state.fs.config.dev_command_timeout_secs.saturating_add(150),
             );
+            let launch_deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_secs(launch_budget_secs);
             let hook_tx = evt_tx.clone();
             let runtime_hooks_tx = evt_tx.clone();
             let hooks = file_server::service::dev_server::DevEventHooks {
@@ -440,7 +450,7 @@ async fn spawn_dev_task(
             let startup = async {
                 result?;
                 if task_clone.is_cancelled() {
-                    return Ok::<(), AppError>(());
+                    return Ok::<StartupCompletion, AppError>(StartupCompletion::NoNewExecution);
                 }
                 // recovery v2 T1b：编译完成后阶段显式切换——build_ok 不再是
                 // 任务的最后可见阶段（app 11 式"build_ok 后静默"排障黑洞）；
@@ -460,14 +470,14 @@ async fn spawn_dev_task(
                         .confirmed_local_manifest_ready(&key, &ws)
                         .await?
                 {
-                    return Ok::<(), AppError>(());
+                    return Ok(StartupCompletion::NoNewExecution);
                 }
                 // 编译成功但任务已被取消（cancel 落在编译完成后的打包/探活窗口
                 // ——pid 已清零只软取消）：不再执行启停，保持"取消=无副作用"
                 // 与终态 Cancelled 一致
                 if task_clone.is_cancelled() {
                     tracing::info!(%app_id, "dev task cancelled after build; skipping start/restart");
-                    return Ok(());
+                    return Ok(StartupCompletion::NoNewExecution);
                 }
                 // 启动 workspace 根（形态分派）：
                 // - 产物态（R03）：staging 只解压校验；**激活权归属 owner**——
@@ -496,7 +506,9 @@ async fn spawn_dev_task(
                             // external 登记，见 route_artifact_restart）——本地
                             // .run 未被触碰，无需 commit_start 的本地激活段
                             tracing::info!(%app_id, "artifact restart routed through runtime owner");
-                            return Ok(());
+                            // owner 仅把事件转交队列；外层统一等消费屏障，
+                            // 不能在此处 Drop 丢掉末尾服务结果日志。
+                            return Ok(StartupCompletion::WaitForEvents);
                         }
                         Ok(None) => { /* 无 owner：走下方本地激活 + spawn */ }
                         Err(error) => return Err(error),
@@ -604,7 +616,7 @@ async fn spawn_dev_task(
                     })
                     .await?
                 {
-                    return Ok(());
+                    return Ok(StartupCompletion::NoNewExecution);
                 }
                 if let Some(supervised) = state.fs.dev_server.supervised_child(&key) {
                     let exit_tx = evt_tx.clone();
@@ -625,11 +637,32 @@ async fn spawn_dev_task(
                     });
                 }
                 drop(evt_tx);
-                event_pipe
-                    .finish(std::time::Duration::from_secs(launch_budget_secs))
-                    .await
+                Ok(StartupCompletion::WaitForEvents)
             };
-            let outcome = guard.scope(startup).await;
+            let outcome = match guard.scope(startup).await {
+                Ok(StartupCompletion::WaitForEvents) => {
+                    event_pipe
+                        .finish(
+                            launch_deadline.saturating_duration_since(tokio::time::Instant::now()),
+                        )
+                        .await
+                }
+                Ok(StartupCompletion::NoNewExecution) => Ok(()),
+                Err(error) => {
+                    // 先消费已入队的模块失败原因，再发布 TaskFailed；不等待尚未
+                    // 发生的 Done，且排空失败不能覆盖原始启动错误。
+                    if let Err(drain_error) = event_pipe
+                        .flush(
+                            &error_events_tx,
+                            launch_deadline.saturating_duration_since(tokio::time::Instant::now()),
+                        )
+                        .await
+                    {
+                        tracing::warn!(%drain_error, "startup failure event drain did not complete");
+                    }
+                    Err(error)
+                }
+            };
             // Release only after startup has consumed the freshly built workspace.
             drop(guard);
             match outcome {
@@ -657,6 +690,19 @@ async fn spawn_dev_task(
                             .emit(shared_types::BuildProgressEvent::Cancelled)
                             .await;
                     } else if !task_clone.is_terminal().await {
+                        // 管理恢复/全局预检可能在任何模块事件前失败；此时只
+                        // 报告已知整体原因，不伪造 service_id 或模块结果。
+                        task_clone
+                            .emit(shared_types::BuildProgressEvent::Log {
+                                service: "workspace".into(),
+                                line: format!(
+                                    "应用服务启动失败：{}",
+                                    file_server::service::dev_server::log::sanitize_sensitive_paths(
+                                        &e.to_string()
+                                    )
+                                ),
+                            })
+                            .await;
                         task_clone
                             .emit(shared_types::BuildProgressEvent::Failed {
                                 error: e.to_string(),

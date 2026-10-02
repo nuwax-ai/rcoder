@@ -3,12 +3,13 @@
 //! P1-04：编排进程退出与管道结束也进入同一队列——终态不再只依赖 Done 或
 //! 等待窗超时：进程退出（任意退出码，含 0 但缺 Done）在短排空窗后判失败；
 //! 管道 EOF/读错在进程仍存活时判通道异常。事件顺序由队列天然保证。
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use file_server::error::{AppError, AppResult};
 use shared_types::BuildProgressEvent;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::tasks::BuildTask;
@@ -30,6 +31,10 @@ pub(crate) enum StartEvent {
     /// stdout 事件管道结束（EOF/读错）——事件通道不再有新输入。
     StreamEnded {
         reason: String,
+    },
+    /// 只确认此前入队的事件已经消费，不表示启动成功，也不等待未来的 Done。
+    Flush {
+        completed: oneshot::Sender<()>,
     },
 }
 
@@ -57,6 +62,28 @@ impl StartEventPipe {
                 Err(AppError::business("Startup completion event timed out"))
             }
         }
+    }
+
+    pub async fn flush(
+        &mut self,
+        tx: &mpsc::UnboundedSender<StartEvent>,
+        timeout: Duration,
+    ) -> AppResult<()> {
+        let (completed, barrier) = oneshot::channel();
+        let queued = tx.send(StartEvent::Flush { completed }).is_ok();
+        let drain = async {
+            if queued && barrier.await.is_ok() {
+                return Ok(());
+            }
+            // 消费者已到 Done/通道终态时屏障可能未被读取；等待它退出即可，
+            // 原启动错误由调用方保留，不能用此处的排空结果改写为启动成功。
+            (&mut self.consumer).await.map(|_| ()).map_err(|error| {
+                AppError::system(format!("Startup event consumer failed: {error}"))
+            })
+        };
+        tokio::time::timeout(timeout, drain)
+            .await
+            .map_err(|_| AppError::system("Startup event drain timed out"))?
     }
 }
 
@@ -86,6 +113,38 @@ fn exited_failure(exit: &str, detail: String) -> AppError {
     ))
 }
 
+/// 保留结构化事件，同时让只展示 `log` 的消费者看见服务启动结果。
+/// 重复同一结果不刷屏，补到具体失败原因时更新；构建成功不代表启动成功。
+async fn emit_startup_result_log(
+    task: &BuildTask,
+    results: &mut HashMap<String, Option<String>>,
+    service: &str,
+    error: Option<&str>,
+) {
+    let outcome = error
+        .map(|error| file_server::service::dev_server::log::sanitize_sensitive_paths(error.trim()));
+    if let Some(previous) = results.get(service)
+        && (previous == &outcome
+            || matches!((previous, &outcome), (Some(previous), Some(current)) if !previous.is_empty() && current.is_empty()))
+    {
+        // 重复同一结果不刷屏；没有原因的新事件不能覆盖已经展示的具体原因。
+        return;
+    }
+    results.insert(service.to_owned(), outcome.clone());
+    let line = match outcome.as_deref() {
+        None => format!("服务 {service} 启动成功（启动探测已通过）"),
+        Some("") => {
+            format!("服务 {service} 启动失败：未获取到具体原因，请查看上方日志")
+        }
+        Some(error) => format!("服务 {service} 启动失败：{error}"),
+    };
+    task.emit(BuildProgressEvent::Log {
+        service: service.to_owned(),
+        line,
+    })
+    .await;
+}
+
 async fn consume(
     task: Arc<BuildTask>,
     mut rx: mpsc::UnboundedReceiver<StartEvent>,
@@ -93,6 +152,7 @@ async fn consume(
     // 已观察到进程退出 + 排空截止（此后仍无 Done → 失败，不再等整窗）。
     let mut exited: Option<String> = None;
     let mut drain_deadline: Option<tokio::time::Instant> = None;
+    let mut startup_results = HashMap::new();
     loop {
         let event = match drain_deadline {
             Some(deadline) => match tokio::time::timeout_at(deadline, rx.recv()).await {
@@ -118,13 +178,48 @@ async fn consume(
             });
         };
         match event {
-            StartEvent::Event(event) => task.emit(event).await,
+            StartEvent::Flush { completed } => {
+                // 等待者可能已超时；它退出不改变此前事件已经消费的事实。
+                let _ = completed.send(());
+            }
+            StartEvent::Event(event) => {
+                // Copy only the small startup result fields. Ordinary log lines
+                // can be large and should move straight into the event journal.
+                let result_log = match &event {
+                    BuildProgressEvent::ServiceStarting { service } => {
+                        startup_results.remove(service);
+                        None
+                    }
+                    // 已观察到编排进程退出时，迟到的缓存事件不是启动成功证明。
+                    BuildProgressEvent::ServiceStartOk { service } if exited.is_none() => {
+                        Some((service.clone(), None))
+                    }
+                    BuildProgressEvent::ServiceStartFail { service, error } => {
+                        Some((service.clone(), Some(error.clone())))
+                    }
+                    _ => None,
+                };
+                task.emit(event).await;
+                if let Some((service, error)) = result_log {
+                    emit_startup_result_log(
+                        &task,
+                        &mut startup_results,
+                        &service,
+                        error.as_deref(),
+                    )
+                    .await;
+                }
+            }
             // Done 是终局判据——但**仅在未先观察到编排进程退出时**（R05：
             // 退出先于 Done 被观察到 → 迟到的缓存成功 Done 不能证明启动
             // 成功提交，Plan §阶段一"已观察到编排进程在启动完成提交前退出，
             // 不能仅凭缓存 Done 成功"；排空窗收集的失败清单保留在诊断里）。
             // Done 先到、之后才退出 = 成功提交后的运行健康变化，不在此路径。
             StartEvent::Done { failed } => {
+                for (service, error) in &failed {
+                    emit_startup_result_log(&task, &mut startup_results, service, Some(error))
+                        .await;
+                }
                 if let Some(exit) = exited.as_deref() {
                     let summary = failed
                         .into_iter()
@@ -180,7 +275,7 @@ mod tests {
     async fn done_waits_for_delayed_consumer_and_preserves_service_order() {
         let task = task().await;
         let (tx, rx) = mpsc::unbounded_channel();
-        let (release, barrier) = tokio::sync::oneshot::channel();
+        let (release, barrier) = oneshot::channel();
         let target = task.clone();
         let pipe = StartEventPipe {
             consumer: tokio::spawn(async move {
@@ -214,7 +309,7 @@ mod tests {
         })
         .await;
         let (events, _) = task.subscribe(0).await;
-        assert_eq!(events.len(), 3);
+        assert_eq!(events.len(), 4);
         assert!(matches!(
             events[0].1,
             BuildProgressEvent::ServiceStarting { .. }
@@ -223,7 +318,12 @@ mod tests {
             events[1].1,
             BuildProgressEvent::ServiceStartOk { .. }
         ));
-        assert!(matches!(events[2].1, BuildProgressEvent::Completed { .. }));
+        assert!(matches!(
+            &events[2].1,
+            BuildProgressEvent::Log { service, line }
+                if service == "web" && line.contains("启动成功")
+        ));
+        assert!(matches!(events[3].1, BuildProgressEvent::Completed { .. }));
     }
 
     #[tokio::test]
@@ -255,6 +355,155 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn startup_result_logs_preserve_errors_and_deduplicate_summaries() {
+        let task = task().await;
+        let (tx, pipe) = StartEventPipe::new(task.clone());
+        for event in [
+            BuildProgressEvent::BuildOk {
+                service: "build-only".into(),
+            },
+            BuildProgressEvent::ServiceStartOk {
+                service: "frontend-react-vite".into(),
+            },
+            BuildProgressEvent::ServiceStartOk {
+                service: "frontend-react-vite".into(),
+            },
+            BuildProgressEvent::ServiceStartFail {
+                service: "worker".into(),
+                error: "readiness probe timed out".into(),
+            },
+            BuildProgressEvent::ServiceStartFail {
+                service: "worker".into(),
+                error: "readiness probe timed out".into(),
+            },
+            BuildProgressEvent::ServiceStarting {
+                service: "worker".into(),
+            },
+            BuildProgressEvent::ServiceStartOk {
+                service: "worker".into(),
+            },
+            BuildProgressEvent::ServiceStartFail {
+                service: "api".into(),
+                error: "TCP connection refused".into(),
+            },
+            BuildProgressEvent::ServiceStartFail {
+                service: "api".into(),
+                error: String::new(),
+            },
+            BuildProgressEvent::ServiceStartFail {
+                service: "detail-upgrade".into(),
+                error: String::new(),
+            },
+        ] {
+            tx.send(StartEvent::Event(event)).unwrap();
+        }
+        tx.send(StartEvent::Done {
+            failed: vec![
+                ("api".into(), "TCP connection refused".into()),
+                (
+                    "detail-upgrade".into(),
+                    "  spawn failed: executable not found  ".into(),
+                ),
+                (
+                    "summary-only".into(),
+                    "migration failed: invalid SQL".into(),
+                ),
+            ],
+        })
+        .unwrap();
+        pipe.finish(Duration::from_secs(2)).await.unwrap_err();
+        let (events, _) = task.subscribe(0).await;
+        let logs = events
+            .iter()
+            .filter_map(|(_, event)| match event {
+                BuildProgressEvent::Log { service, line } => Some((service, line)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            logs.len(),
+            7,
+            "duplicate terminal events must not repeat logs"
+        );
+        assert_eq!(logs[0].0, "frontend-react-vite");
+        assert!(logs[0].1.contains("启动成功"));
+        assert!(logs[1].1.contains("readiness probe timed out"));
+        assert!(
+            logs[2].1.contains("启动成功"),
+            "a new startup attempt is visible"
+        );
+        assert!(logs[3].1.contains("TCP connection refused"));
+        assert_eq!(logs[4].0, "detail-upgrade");
+        assert!(logs[4].1.contains("未获取到具体原因"));
+        assert_eq!(logs[5].0, "detail-upgrade");
+        assert!(logs[5].1.ends_with("spawn failed: executable not found"));
+        assert_eq!(logs[6].0, "summary-only");
+        assert!(logs[6].1.contains("migration failed: invalid SQL"));
+        for (service, line) in logs {
+            assert_ne!(service, "build-only", "build_ok does not prove readiness");
+            assert!(!line.trim().is_empty());
+            let wire = serde_json::to_value(BuildProgressEvent::Log {
+                service: service.clone(),
+                line: line.clone(),
+            })
+            .unwrap();
+            assert_eq!(wire["event"], "log");
+            assert_eq!(wire["service"], service.as_str());
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_flush_keeps_service_logs_before_task_failed_without_done() {
+        let task = task().await;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (release, barrier) = oneshot::channel();
+        let target = task.clone();
+        let mut pipe = StartEventPipe {
+            consumer: tokio::spawn(async move {
+                barrier.await.unwrap();
+                consume(target, rx).await
+            }),
+        };
+        tx.send(StartEvent::Event(BuildProgressEvent::ServiceStartFail {
+            service: "frontend-react-vite".into(),
+            error: "spawn failed: executable not found".into(),
+        }))
+        .unwrap();
+        let task_for_failure = task.clone();
+        let fail = tokio::spawn(async move {
+            pipe.flush(&tx, Duration::from_secs(2)).await.unwrap();
+            task_for_failure
+                .emit(BuildProgressEvent::Failed {
+                    error: "original startup error".into(),
+                })
+                .await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !fail.is_finished(),
+            "TaskFailed must wait for queued service events"
+        );
+        release.send(()).unwrap();
+        fail.await.unwrap();
+        let (events, _) = task.subscribe(0).await;
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events[0].1,
+            BuildProgressEvent::ServiceStartFail { .. }
+        ));
+        assert!(matches!(
+            &events[1].1,
+            BuildProgressEvent::Log { service, line }
+                if service == "frontend-react-vite"
+                    && line.contains("spawn failed: executable not found")
+        ));
+        assert!(matches!(
+            &events[2].1,
+            BuildProgressEvent::Failed { error } if error == "original startup error"
+        ));
+    }
+
     /// R05：退出先于成功 Done 被观察到 → 迟到的缓存成功不能证明启动成功
     ///（exit 0 与非零同拒——Plan §阶段一"退出后无有效 Done"）。
     #[tokio::test]
@@ -262,10 +511,14 @@ mod tests {
         for exit in ["0", "1"] {
             let (tx, rx) = mpsc::unbounded_channel();
             let target = task().await;
-            let consumer = tokio::spawn(consume(target, rx));
+            let consumer = tokio::spawn(consume(target.clone(), rx));
             tx.send(StartEvent::ProducerExited {
                 exit: exit.to_string(),
             })
+            .unwrap();
+            tx.send(StartEvent::Event(BuildProgressEvent::ServiceStartOk {
+                service: "web".into(),
+            }))
             .unwrap();
             tx.send(StartEvent::Done { failed: vec![] }).unwrap();
             let error = consumer.await.unwrap().unwrap_err();
@@ -273,6 +526,10 @@ mod tests {
                 error.to_string().contains("exited before completion"),
                 "exit {exit}: {error}"
             );
+            let (events, _) = target.subscribe(0).await;
+            assert!(events.iter().all(|(_, event)| {
+                !matches!(event, BuildProgressEvent::Log { line, .. } if line.contains("启动成功"))
+            }));
         }
     }
 

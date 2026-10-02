@@ -350,14 +350,7 @@ pub fn control_error(error: &anyhow::Error) -> shared_types::AppError {
         .with_operation_id(cancelled.operation_id.clone());
     }
     if let Some(timeout) = error.downcast_ref::<shared_types::UserAppWaitTimeout>() {
-        let response = shared_types::AppError::with_message(
-            shared_types::error_codes::ERR_USERAPP_WAIT_TIMEOUT,
-            "Builder ensure deadline exceeded; the accepted operation may still be running",
-        );
-        return match &timeout.operation_id {
-            Some(id) => response.with_operation_id(id.clone()),
-            None => response,
-        };
+        return shared_types::AppError::from(timeout);
     }
     if let Some(shared_types::UserAppStoreError::OperationInProgress(blocker)) =
         error.downcast_ref::<shared_types::UserAppStoreError>()
@@ -904,7 +897,10 @@ mod control_error_tests {
             operation_id: Some("accepted-builder".into()),
         })
         .context("upstream lookup");
-        let response = control_error(&error).into_response();
+        let response = shared_types::scope_request_locale("zh-CN", async {
+            control_error(&error).into_response()
+        })
+        .await;
         assert_eq!(response.status(), axum::http::StatusCode::GATEWAY_TIMEOUT);
         let body = to_bytes(response.into_body(), 4096).await.expect("body");
         let envelope: serde_json::Value = serde_json::from_slice(&body).expect("json");
@@ -914,6 +910,13 @@ mod control_error_tests {
         );
         assert_eq!(envelope["operation_id"], "accepted-builder");
         assert_eq!(envelope["success"], false);
+        assert_eq!(
+            envelope["message"],
+            shared_types::get_error_message(
+                shared_types::error_codes::ERR_USERAPP_WAIT_TIMEOUT,
+                "zh-CN"
+            )
+        );
     }
 
     #[tokio::test]

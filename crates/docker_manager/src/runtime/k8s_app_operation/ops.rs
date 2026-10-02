@@ -1,6 +1,81 @@
 use super::*;
 
 impl KubernetesRuntime {
+    /// A successor Lease retires the captured authority only. This never proves
+    /// old resource writes complete and never releases the successor's mutex.
+    pub(crate) async fn captured_deletion_lease_replaced(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<bool> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        receipt
+            .validate()
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let shared_types::UserAppOperationLeaseReceipt::Kubernetes {
+            service_type,
+            namespace,
+            name,
+            uid,
+            token,
+            ..
+        } = receipt
+        else {
+            return Err(ContainerRuntimeError::Conflict(
+                "Deletion lease runtime differs".into(),
+            ));
+        };
+        if namespace != &self.namespace || name != &operation_name(&context.app_id, service_type)? {
+            return Err(ContainerRuntimeError::Conflict(
+                "Deletion lease scope differs".into(),
+            ));
+        }
+        let api: Api<Lease> = Api::namespaced(self.client.clone(), namespace);
+        let Some(current) = api.get_opt(name).await.map_err(|error| {
+            ContainerRuntimeError::K8sError(format!("Inspect deletion lease successor: {error}"))
+        })?
+        else {
+            // The next ordinary inspection handles absence. Do not infer a
+            // replaced legacy ConfigMap's release semantics from a Lease read.
+            return Ok(false);
+        };
+        let labels = current.metadata.labels.as_ref();
+        if labels.and_then(|labels| labels.get("rcoder.io/operation-app")) != Some(&context.app_id)
+            || labels
+                .and_then(|labels| labels.get("rcoder.io/operation-family"))
+                .map(String::as_str)
+                != Some(service_type.to_string().as_str())
+            || current
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get("rcoder.io/lifecycle-id"))
+                .is_some_and(|life| life != &context.lifecycle_id)
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "Deletion lease successor belongs to another application/family/lifecycle".into(),
+            ));
+        }
+        let current_uid = current
+            .metadata
+            .uid
+            .as_deref()
+            .filter(|uid| !uid.is_empty())
+            .ok_or_else(|| {
+                ContainerRuntimeError::K8sError("Deletion lease successor has no UID".into())
+            })?;
+        let current_token = holder_token(&current)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| {
+                ContainerRuntimeError::K8sError(
+                    "Deletion lease successor has no holder token".into(),
+                )
+            })?;
+        Ok(current_uid != uid || current_token != *token)
+    }
+
     pub(crate) async fn validate_captured_application_operation(
         &self,
         context: &shared_types::UserAppExecutionContext,

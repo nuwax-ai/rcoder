@@ -219,7 +219,10 @@ pub async fn run_dev_compute_cycle<P: DevComputeProbe + Send>(
     let readiness = request(
         env,
         reqwest::Method::GET,
-        &format!("/api/v1/userapp/{app_id}/dev/readiness?user_id={}", env.user),
+        &format!(
+            "/api/v1/userapp/{app_id}/dev/readiness?user_id={}",
+            env.user
+        ),
         None,
     )
     .await;

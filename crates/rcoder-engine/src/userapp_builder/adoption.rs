@@ -4,9 +4,10 @@ use crate::app_state::AppState;
 use anyhow::{Context as _, Result, anyhow};
 use futures::FutureExt as _;
 use shared_types::{
-    AdoptBuilderRequest, BuilderControlResult, UserAppAdmission, UserAppAdmissionOutcome,
-    UserAppExecutionContext, UserAppLifecycleState, UserAppOperationKind, UserAppOperationProgress,
-    UserAppOperationRecord, UserAppOperationState, UserAppResourceBinding, UserAppStoreError,
+    AdoptBuilderRequest, BuilderControlResult, ProjectStore, UserAppAdmission,
+    UserAppAdmissionOutcome, UserAppExecutionContext, UserAppLifecycleState, UserAppOperationKind,
+    UserAppOperationProgress, UserAppOperationRecord, UserAppOperationState,
+    UserAppResourceBinding, UserAppStoreError,
 };
 
 fn validate_request(app_id: &str, request: &AdoptBuilderRequest) -> Result<()> {
@@ -117,8 +118,6 @@ pub(super) async fn resume_pending(
 
 async fn run(state: &AppState, record: UserAppOperationRecord) -> Result<BuilderControlResult> {
     let executor = uuid::Uuid::new_v4().to_string();
-    // 应用共享：builder identifier == 纯 app_id（受理与物理资源定位同一键）
-    let instance = record.app_id.clone();
     let claimed = state
         .userapp_store
         .advance(&UserAppOperationProgress {
@@ -135,7 +134,8 @@ async fn run(state: &AppState, record: UserAppOperationRecord) -> Result<Builder
         })
         .await?;
     let context = UserAppExecutionContext {
-        app_id: instance,
+        // Builder identifier and durable admission use the same application key.
+        app_id: claimed.app_id.clone(),
         lifecycle_id: claimed.lifecycle_id.clone(),
         operation_id: claimed.operation_id.clone(),
         executor_id: executor.clone(),
@@ -156,24 +156,26 @@ async fn run(state: &AppState, record: UserAppOperationRecord) -> Result<Builder
                 .acquire_builder_operation(&context.app_id)
                 .await?,
         );
-        let inspected = state
-            .runtime()
-            .capture_builder_adoption(&context, &request.expected_container_id)
-            .await;
+        let inspected = async {
+            let target = state
+                .runtime()
+                .capture_builder_adoption(&context, &request.expected_container_id)
+                .await?;
+            target.validate().map_err(anyhow::Error::msg)?;
+            if target.context != context {
+                return Err(anyhow!("Adoption capture context mismatch"));
+            }
+            let repair = capture_registration_repair(state, &target).await?;
+            Ok::<_, anyhow::Error>((target, repair))
+        }
+        .await;
         // Inspection has no remote writes. Release the runtime read fence before
         // atomic SQL binding; SQL admission still excludes concurrent controls.
         lease_uncertain = true;
-        lease
-            .finish_read_only()
-            .await
-            .map_err(|error| anyhow!(error))?;
+        lease.finish_read_only().await.map_err(anyhow::Error::msg)?;
         lease_uncertain = false;
 
-        let target = inspected?;
-        target.validate().map_err(|error| anyhow!(error))?;
-        if target.context != context {
-            return Err(anyhow!("Adoption capture context mismatch"));
-        }
+        let (target, repair) = inspected?;
         let workload = target
             .workload
             .ok_or_else(|| anyhow!("Builder disappeared before adoption"))?;
@@ -187,27 +189,52 @@ async fn run(state: &AppState, record: UserAppOperationRecord) -> Result<Builder
         let result = BuilderControlResult {
             operation_id: context.operation_id.clone(),
             was_existing: true,
-            container: None,
+            container: repair.as_ref().map(|repair| repair.container.clone()),
         };
+        let mut checkpoint = serde_json::to_value(&result)?;
+        if let Some(repair) = &repair {
+            let object = checkpoint
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("Adoption result must be an object"))?;
+            object.insert(
+                "registration_target".into(),
+                serde_json::to_value(&repair.target)?,
+            );
+            object.insert(
+                "registration_volumes".into(),
+                serde_json::to_value(&repair.volumes)?,
+            );
+        }
         committing = true;
-        state
-            .userapp_store
-            .commit_resource_binding(
-                &binding,
-                &UserAppOperationProgress {
-                    app_id: context.app_id.clone(),
-                    lifecycle_id: context.lifecycle_id.clone(),
-                    operation_id: context.operation_id.clone(),
-                    expected_revision: claimed.revision,
-                    executor_id: executor.clone(),
-                    state: UserAppOperationState::Succeeded,
-                    step: "physical_resource_adopted".into(),
-                    checkpoint: serde_json::to_value(&result)?,
-                    error_code: None,
-                    error_message: None,
-                },
-            )
-            .await?;
+        let progress = UserAppOperationProgress {
+            app_id: context.app_id.clone(),
+            lifecycle_id: context.lifecycle_id.clone(),
+            operation_id: context.operation_id.clone(),
+            expected_revision: claimed.revision,
+            executor_id: executor.clone(),
+            state: UserAppOperationState::Succeeded,
+            step: "physical_resource_adopted".into(),
+            checkpoint,
+            error_code: None,
+            error_message: None,
+        };
+        if let Some(repair) = repair {
+            state
+                .projects
+                .complete_builder_registration_adoption(
+                    &repair.expected,
+                    &repair.target,
+                    &repair.container,
+                    &repair.volumes,
+                    &progress,
+                )
+                .await?;
+        } else {
+            state
+                .userapp_store
+                .commit_resource_binding(&binding, &progress)
+                .await?;
+        }
         Ok::<_, anyhow::Error>(result)
     })
     .catch_unwind()
@@ -254,6 +281,110 @@ async fn run(state: &AppState, record: UserAppOperationRecord) -> Result<Builder
             .into())
         }
     }
+}
+
+struct RegistrationRepair {
+    expected: std::sync::Arc<shared_types::ProjectAndContainerInfo>,
+    target: shared_types::BuilderControlTarget,
+    container: shared_types::ContainerBasicInfo,
+    volumes: Vec<shared_types::AppResourceIdentity>,
+}
+
+/// Explicit adoption repairs only the registry. It never claims that old
+/// processes exited or that historical PVC identities were preserved.
+async fn capture_registration_repair(
+    state: &AppState,
+    captured: &shared_types::BuilderControlTarget,
+) -> Result<Option<RegistrationRepair>> {
+    let Some(expected) = state.projects.get(&captured.context.app_id) else {
+        return Ok(None);
+    };
+    let Some(previous) = expected.container_info() else {
+        return Ok(None);
+    };
+    let workload = captured
+        .workload
+        .as_ref()
+        .ok_or_else(|| anyhow!("Adopted workload missing"))?;
+    if workload.kind != shared_types::AppResourceKind::StatefulSet
+        || previous
+            .workload_uid
+            .as_deref()
+            .is_none_or(|uid| uid == workload.uid)
+    {
+        return Ok(None);
+    }
+    let mut target = captured.clone();
+    target.resource_binding = Some(
+        state
+            .userapp_store
+            .get_resource_binding(&shared_types::ServiceType::UserappBuilder, &workload.uid)
+            .await?
+            .unwrap_or_else(|| UserAppResourceBinding {
+                app_id: captured.context.app_id.clone(),
+                lifecycle_id: captured.context.lifecycle_id.clone(),
+                service_type: shared_types::ServiceType::UserappBuilder,
+                physical_uid: workload.uid.clone(),
+                adopted_by_operation: captured.context.operation_id.clone(),
+            }),
+    );
+    let volumes = state
+        .runtime()
+        .capture_builder_compute_volumes(&target)
+        .await?;
+    let actual = state
+        .runtime()
+        .find_container(
+            &captured.context.app_id,
+            &shared_types::ServiceType::UserappBuilder,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("Adopted builder Pod disappeared before registration"))?;
+    if actual.identity_key() != Some(captured.context.app_id.as_str())
+        || actual.service_type != Some(shared_types::ServiceType::UserappBuilder)
+        || actual.workload_uid.as_deref() != Some(workload.uid.as_str())
+        || captured
+            .pod
+            .as_ref()
+            .is_none_or(|pod| pod.uid != actual.container_id || pod.name != actual.container_name)
+    {
+        return Err(anyhow!(
+            "Adopted builder changed during registration inspection"
+        ));
+    }
+    let after = state
+        .runtime()
+        .capture_builder_adoption(&captured.context, &actual.container_id)
+        .await?;
+    if after != *captured
+        || state
+            .runtime()
+            .capture_builder_compute_volumes(&target)
+            .await?
+            != volumes
+    {
+        return Err(anyhow!(
+            "Adopted controller or PVC identity changed during registration inspection"
+        ));
+    }
+    let container = shared_types::ContainerBasicInfo {
+        container_id: actual.container_id,
+        container_name: actual.container_name,
+        container_ip: actual.container_ip.clone(),
+        internal_port: shared_types::AGENT_FILE_SERVER_PORT,
+        external_port: 0,
+        project_id: captured.context.app_id.clone(),
+        status: String::from(actual.status),
+        created_at: actual.created_at,
+        service_url: String::new(),
+        workload_uid: actual.workload_uid,
+    };
+    Ok(Some(RegistrationRepair {
+        expected,
+        target,
+        container,
+        volumes,
+    }))
 }
 
 pub(super) async fn capture_bound_orphan_stop(
@@ -376,7 +507,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<AppState>> {
     path = "/api/v1/userapp/{app_id}/builder/adopt",
     params(("app_id" = String, Path, description = "Application identifier")),
     request_body = AdoptBuilderRequest,
-    responses((status = 200, description = "HttpResult envelope; data contains operation_id and was_existing. A conflicting physical identity or lifecycle is rejected before binding.", body = shared_types::HttpResult<serde_json::Value>)),
+    responses((status = 200, description = "HttpResult envelope; data contains operation_id and was_existing. Explicit adoption can atomically repair a stale PostgreSQL builder registration after controller, Pod, current PVC and lifecycle checks. It does not restart compute, retire previous execution or prove historical volume continuity. Physical identity or lifecycle conflicts are rejected before binding.", body = shared_types::HttpResult<serde_json::Value>)),
     tag = "Userapp · dev · 工作区与工具链",
 )]
 pub(crate) async fn adopt_builder(

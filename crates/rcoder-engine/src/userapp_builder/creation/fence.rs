@@ -159,25 +159,12 @@ pub(crate) async fn observe_fence_evidence(
                 Ok(None) | Err(_) => FenceEvidence::Insufficient,
             }
         }
-        // 删除族：资源缺席即达成证据（删除中断后残留已不在 = 目标态）；
-        // 仍在也属确定状态（留痕 still_present，后继显式删除重试）。
+        // Deletion can include detached dev/storage writes. A deployment's
+        // presence or absence does not retire those writes; its dedicated
+        // recovery path verifies every original captured target instead.
         UserAppOperationKind::DeleteCompute
         | UserAppOperationKind::PurgeResources
-        | UserAppOperationKind::DeleteApplication => {
-            match state.runtime().get_deployment_status(&record.app_id).await {
-                Ok(None) => FenceEvidence::Observed(serde_json::json!({
-                    "kind": "absent_confirmed",
-                    "observed_at_us": chrono::Utc::now().timestamp_micros(),
-                })),
-                Ok(Some(info)) => FenceEvidence::Observed(serde_json::json!({
-                    "kind": "still_present",
-                    "phase": info.phase,
-                    "replicas": info.replicas,
-                    "observed_at_us": chrono::Utc::now().timestamp_micros(),
-                })),
-                Err(_) => FenceEvidence::Insufficient,
-            }
-        }
+        | UserAppOperationKind::DeleteApplication => FenceEvidence::Insufficient,
         // 以下 kind 无只读可判定证据（存储深度/密码远端回执/热部署收敛/
         // 杂项控制）——保守保持围栏，超龄 + holder 死亡由 holder_expired
         // 兜底有界收束。**显式列出（禁通配臂）**：新增 kind 必须在此决定
@@ -215,6 +202,15 @@ const DEFAULT_FENCE_SETTLE_GRACE_SECS: u64 = 900;
 /// 正在途写的持有者；探针失败/租约仍持有/未超龄 → 保守保持围栏。
 /// 收束一律 Failed（`settle_fenced_operation`），绝不伪造 Succeeded。
 pub(crate) async fn holder_expired(state: &AppState, record: &UserAppOperationRecord) -> bool {
+    if matches!(
+        record.kind,
+        UserAppOperationKind::DeleteCompute
+            | UserAppOperationKind::PurgeResources
+            | UserAppOperationKind::DeleteApplication
+    ) {
+        // Losing lease authority does not retract an already-issued DELETE.
+        return false;
+    }
     let grace_secs = state
         .config
         .fence_settle_grace_secs
@@ -276,6 +272,18 @@ pub(crate) async fn reconcile_fenced_ensure(
     snapshot: &UserAppOperationRecord,
 ) -> Result<()> {
     if snapshot.state != UserAppOperationState::RecoveryRequired {
+        return Ok(());
+    }
+    if matches!(
+        snapshot.kind,
+        UserAppOperationKind::DeleteCompute
+            | UserAppOperationKind::PurgeResources
+            | UserAppOperationKind::DeleteApplication
+    ) {
+        state
+            .app_service
+            .reconcile_interrupted_deletion(snapshot)
+            .await?;
         return Ok(());
     }
     let Some(_local) = crate::userapp_builder::lifecycle::try_acquire(&snapshot.app_id).await

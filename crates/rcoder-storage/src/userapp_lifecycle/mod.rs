@@ -43,6 +43,16 @@ pub(crate) async fn completed_builder_registration_candidates(
     .await
 }
 
+#[cfg(feature = "pg")]
+pub(crate) async fn commit_builder_registration_adoption(
+    tx: &mut dyn toasty::Executor,
+    target: &shared_types::BuilderControlTarget,
+    expected_source_uid: &str,
+    progress: &shared_types::UserAppOperationProgress,
+) -> anyhow::Result<()> {
+    common::commit_builder_registration_adoption(tx, target, expected_source_uid, progress).await
+}
+
 fn storage(error: impl Into<anyhow::Error>) -> shared_types::UserAppStoreError {
     shared_types::UserAppStoreError::Storage(error.into())
 }

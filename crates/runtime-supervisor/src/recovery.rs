@@ -158,9 +158,8 @@ where
     // OfflineChosen 续行不再重新探测——不因 owner 换代把离线尝试重新
     // 绑定到替换后的在线目标。
     //
-    // 外层 'resolve 循环：忙等窗口（上一次停止的收尾）出清后，既有捕获
-    // 的 expected_generation 可能已被那次收尾的换代作废——从模式解析重
-    // 新开始，捕获当代目标，而不是带着过期代次身份被拒。
+    // A prior cleanup may finish while this request waits. Keep its captured
+    // owner and generation: waiting is never authority to stop a replacement.
     'resolve: loop {
         if attempt.mode == StopMode::Unresolved {
             match control(&root, Request::new(Action::Status)).await {
@@ -255,16 +254,63 @@ where
                                 )
                         });
                     if busy_window.is_some() {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        // The prior stop's cleanup may retire the captured
-                        // generation while we wait; restart resolution so the
-                        // retry captures the current target instead of carrying a
-                        // stale expected_generation into an IdentityChanged
-                        // refusal.
-                        attempt.mode = StopMode::Unresolved;
-                        attempt.captured_generation = None;
-                        attempt.request.expected_generation = None;
-                        continue 'resolve;
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            let now = control::control_verified(
+                                &root,
+                                Request::new(Action::Status),
+                                &captured_supervisor_id,
+                            )
+                            .await
+                            .map_err(|error| {
+                                if error.downcast_ref::<crate::Problem>().is_some() {
+                                    refused(format!("{error:#}"))
+                                } else {
+                                    error
+                                }
+                            })?;
+                            if now.supervisor_id != captured_supervisor_id || now.binding != binding
+                            {
+                                return Err(refused("supervisor changed during cleanup wait"));
+                            }
+                            if now.generation != before_generation {
+                                if now.generation.is_none()
+                                    && now.intent == Intent::Stopped
+                                    && matches!(now.phase, Phase::Ready | Phase::Stopped)
+                                    && let Some(generation) = &before_generation
+                                    && let Some(receipt) =
+                                        crate::verify_local_quiescent(&root, generation)?
+                                    && receipt.supervisor_id == captured_supervisor_id
+                                {
+                                    // The captured tree is already stopped. Return
+                                    // the observation, not a fabricated request receipt.
+                                    return Ok(now);
+                                }
+                                return Err(refused(
+                                    "execution generation changed during cleanup wait",
+                                ));
+                            }
+                            if before_generation.is_none() {
+                                if now.intent == Intent::Stopped
+                                    && matches!(now.phase, Phase::Ready | Phase::Stopped)
+                                {
+                                    return Ok(now);
+                                }
+                                if matches!(
+                                    now.phase,
+                                    Phase::Stopping | Phase::CleanupPending | Phase::Reconciling
+                                ) {
+                                    continue;
+                                }
+                                return Err(refused(
+                                    "cleanup ended without a captured execution to stop",
+                                ));
+                            }
+                            // The original generation remains current. Resend
+                            // only the original parameters; the server checks
+                            // them atomically before accepting the stop.
+                            continue 'resolve;
+                        }
                     }
                     return Err(refused(format!("{error:#}")));
                 }
@@ -833,8 +879,8 @@ mod tests {
     }
     /// H 尾部实链反例：supervisor 忙于**上一次停止的收尾**（CleanupPending
     /// 残留操作 + 换代）时，后继 StopWork 不能被永久拒绝——在既有预算内
-    /// 等待该瞬态相位出清、重新解析捕获当代目标后完成；真正的执行窗口
-    /// Busy 仍然立即拒绝（F5）。
+    /// 等待该瞬态相位出清、核验原代次退出后完成；不把该请求重新绑定到
+    /// 后继执行。真正的执行窗口 Busy 仍然立即拒绝（F5）。
     #[tokio::test]
     async fn stop_waits_out_a_prior_cleanup_pending_window() {
         let dir = tempfile::tempdir().unwrap();
@@ -843,6 +889,23 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let discovery = fixture_discovery(root, &listener, "owner-hold");
         crate::record::save(&root.join("supervisor.json"), &discovery).unwrap();
+        let generation = uuid::Uuid::new_v4().to_string();
+        let work = crate::record::work_root(root, &generation).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        let mut generation_record = crate::record::Generation {
+            version: 1,
+            id: generation.clone(),
+            supervisor: discovery.instance.clone(),
+            token: "generation-token".into(),
+            intent: Intent::Stopped,
+            phase: crate::record::GenerationPhase::Draining,
+            worker_pid: None,
+            exit_code: None,
+            error: None,
+            physical_domain: None,
+            process_epoch: crate::epoch::current(),
+        };
+        crate::record::save(&work.join("generation.json"), &generation_record).unwrap();
 
         let stage = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stage_seen = stage.clone();
@@ -856,12 +919,12 @@ mod tests {
                 let Ok(envelope): Result<Envelope, _> = control::receive(&mut stream).await else {
                     return;
                 };
-                // 阶段机：忙等窗口（残留 prior-stop-op + gen-1）→ 一次 Busy →
-                // 窗口仍可见（Status=CleanupPending）→ 收敛（Ready、代次已
-                // 清）→ 接受本次请求。
+                // 阶段机：忙等窗口（残留 prior-stop-op + 原代次）→ 一次 Busy →
+                // 窗口仍可见（Status=CleanupPending）→ 收敛（Ready、原代次
+                // 已清理）。原目标已退出，不需要再提交停止。
                 let stage_now = stage_seen.load(std::sync::atomic::Ordering::SeqCst);
                 let converged = stage_now >= 2;
-                let mut snapshot = if converged {
+                let snapshot = if converged {
                     Snapshot {
                         version: 1,
                         binding: binding.clone(),
@@ -878,7 +941,7 @@ mod tests {
                         version: 1,
                         binding: binding.clone(),
                         supervisor_id: instance.clone(),
-                        generation: Some("gen-prior".into()),
+                        generation: Some(generation.clone()),
                         phase: Phase::CleanupPending,
                         intent: Intent::Stopped,
                         operation_id: Some("prior-stop-op".into()),
@@ -890,23 +953,22 @@ mod tests {
                 match envelope.request.action {
                     Action::Status => {
                         if stage_now == 1 {
+                            generation_record.phase = crate::record::GenerationPhase::Quiescent;
+                            crate::record::save(&work.join("generation.json"), &generation_record)
+                                .unwrap();
                             stage_seen.store(2, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
                     Action::StopWork => {
-                        if converged {
-                            snapshot.phase = Phase::Stopped;
-                            snapshot.operation_id = Some(envelope.request.request_id.clone());
-                        } else {
-                            stage_seen.store(1, std::sync::atomic::Ordering::SeqCst);
-                            problem = Some(Problem {
-                                code: FailureCode::Busy,
-                                message: format!(
-                                    "supervisor is busy with operation prior-stop-op ({})",
-                                    Phase::CleanupPending
-                                ),
-                            });
-                        }
+                        assert!(!converged, "completed target must not be stopped again");
+                        stage_seen.store(1, std::sync::atomic::Ordering::SeqCst);
+                        problem = Some(Problem {
+                            code: FailureCode::Busy,
+                            message: format!(
+                                "supervisor is busy with operation prior-stop-op ({})",
+                                Phase::CleanupPending
+                            ),
+                        });
                     }
                     _ => {}
                 }
@@ -926,17 +988,146 @@ mod tests {
             }
         });
 
-        let completed = stop_work(root, &fixture_binding(root), Duration::from_secs(10))
+        let mut attempt = StopWorkAttempt::allocate(root, &fixture_binding(root));
+        let request = attempt.request.clone();
+        let completed = continue_stop_work(&mut attempt, Duration::from_secs(10))
             .await
             .expect("successor stop must wait out the cleanup window");
-        assert_eq!(completed.phase, Phase::Stopped);
+        assert_eq!(completed.phase, Phase::Ready);
         assert_eq!(completed.intent, Intent::Stopped);
-        assert!(
-            completed
-                .operation_id
-                .is_some_and(|id| id != "prior-stop-op"),
-            "terminal must carry this request, not the residue"
+        assert_eq!(completed.operation_id, None);
+        assert_eq!(attempt.request.request_id, request.request_id);
+        assert_eq!(
+            attempt.request.expected_generation,
+            attempt.captured_generation
         );
+        assert!(attempt.captured_generation.is_some());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn busy_cleanup_wait_does_not_stop_a_replacement_owner_or_generation() {
+        for replace_owner in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let _owner = Owner::try_acquire(root).unwrap().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut discovery = fixture_discovery(root, &listener, "owner-a");
+            let original_generation = uuid::Uuid::new_v4().to_string();
+            discovery.snapshot.generation = Some(original_generation.clone());
+            discovery.snapshot.phase = Phase::CleanupPending;
+            discovery.snapshot.intent = Intent::Stopped;
+            discovery.snapshot.operation_id = Some("prior-stop".into());
+            crate::record::save(&root.join("supervisor.json"), &discovery).unwrap();
+            let mut replacement = discovery.clone();
+            if replace_owner {
+                replacement.instance = "owner-b".into();
+                replacement.snapshot.supervisor_id = replacement.instance.clone();
+            }
+            replacement.snapshot.generation = Some(uuid::Uuid::new_v4().to_string());
+            replacement.snapshot.phase = Phase::Ready;
+            replacement.snapshot.intent = Intent::Run;
+            replacement.snapshot.operation_id = None;
+            let replacement_work =
+                crate::record::work_root(root, replacement.snapshot.generation.as_deref().unwrap())
+                    .unwrap();
+            std::fs::create_dir_all(&replacement_work).unwrap();
+            let mut replacement_record = crate::record::Generation {
+                version: 1,
+                id: replacement.snapshot.generation.clone().unwrap(),
+                supervisor: replacement.instance.clone(),
+                token: "replacement-generation-token".into(),
+                intent: Intent::Run,
+                phase: crate::record::GenerationPhase::Running,
+                worker_pid: None,
+                exit_code: None,
+                error: None,
+                physical_domain: None,
+                process_epoch: crate::epoch::current(),
+            };
+            crate::record::save(
+                &replacement_work.join("generation.json"),
+                &replacement_record,
+            )
+            .unwrap();
+            let path = root.join("supervisor.json");
+            let stops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = stops.clone();
+            let server = tokio::spawn(async move {
+                let mut busy_sent = false;
+                let mut replaced = false;
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let envelope: Envelope = control::receive(&mut stream).await.unwrap();
+                    let current = if replaced { &replacement } else { &discovery };
+                    let mut snapshot = current.snapshot.clone();
+                    let mut problem = None;
+                    let replace_after_reply =
+                        !replaced && busy_sent && envelope.request.action == Action::Status;
+                    if envelope.request.action == Action::StopWork {
+                        seen.lock().unwrap().push(envelope.request.clone());
+                        if replaced {
+                            replacement_record.phase = crate::record::GenerationPhase::Quiescent;
+                            crate::record::save(
+                                &replacement_work.join("generation.json"),
+                                &replacement_record,
+                            )
+                            .unwrap();
+                            snapshot.phase = Phase::Stopped;
+                            snapshot.intent = Intent::Stopped;
+                            snapshot.operation_id = Some(envelope.request.request_id.clone());
+                        } else {
+                            busy_sent = true;
+                            problem = Some(Problem {
+                                code: FailureCode::Busy,
+                                message: "prior cleanup is still running".into(),
+                            });
+                        }
+                    }
+                    control::send(
+                        &mut stream,
+                        &Reply {
+                            instance: current.instance.clone(),
+                            snapshot,
+                            error: problem,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    if replace_after_reply {
+                        crate::record::save(&path, &replacement).unwrap();
+                        replaced = true;
+                    }
+                }
+            });
+
+            let mut attempt = StopWorkAttempt::allocate(root, &fixture_binding(root));
+            let error = continue_stop_work(&mut attempt, Duration::from_secs(5))
+                .await
+                .expect_err("an old stop must not target the replacement");
+            assert!(is_stop_refused(&error), "{error:#}");
+            assert_eq!(
+                attempt.mode,
+                StopMode::Online {
+                    supervisor_id: "owner-a".into()
+                }
+            );
+            assert_eq!(
+                attempt.captured_generation.as_deref(),
+                Some(original_generation.as_str())
+            );
+            assert_eq!(
+                attempt.request.expected_generation,
+                attempt.captured_generation
+            );
+            let dispatched = stops.lock().unwrap();
+            assert_eq!(dispatched.len(), 1, "replacement received a Stop");
+            assert_eq!(
+                dispatched[0].expected_generation.as_deref(),
+                Some(original_generation.as_str())
+            );
+            drop(dispatched);
+            server.abort();
+        }
     }
 }

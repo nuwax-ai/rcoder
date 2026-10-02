@@ -1,6 +1,6 @@
-//! Registration is part of a verified completed replacement, not a new
-//! adoption request. The caller's short transaction also retires/rebinds the
-//! project/container rows so neither half can commit alone.
+//! Completed replacements and explicit registration repairs share the root CAS.
+//! The caller's short transaction also rebinds project/container rows so the
+//! lifecycle outcome and registry cannot commit separately.
 use super::{compute, ops, repo};
 use crate::{db::schema::Backend, userapp_lifecycle::domain};
 use anyhow::{Context, Result, ensure};
@@ -137,5 +137,116 @@ pub(crate) async fn bind_completed_builder_registration(
         persisted == binding,
         "Builder replacement binding belongs to another operation or lifecycle"
     );
+    Ok(())
+}
+
+/// Explicit adoption may repair a pre-receipt registry without manufacturing
+/// an old creation/exit receipt. This transaction grants only registration;
+/// compute controls retain their own physical leases and domain checks.
+pub(crate) async fn commit_builder_registration_adoption(
+    tx: &mut dyn Executor,
+    target: &BuilderControlTarget,
+    expected_source_uid: &str,
+    progress: &UserAppOperationProgress,
+) -> Result<()> {
+    target.validate().map_err(anyhow::Error::msg)?;
+    let context = &target.context;
+    let workload = target
+        .workload
+        .as_ref()
+        .context("Adopted builder workload missing")?;
+    ensure!(
+        workload.kind == AppResourceKind::StatefulSet
+            && !expected_source_uid.is_empty()
+            && expected_source_uid != workload.uid
+            && progress.app_id == context.app_id
+            && progress.lifecycle_id == context.lifecycle_id
+            && progress.operation_id == context.operation_id
+            && progress.executor_id == context.executor_id
+            && progress.state == UserAppOperationState::Succeeded,
+        "Builder registry adoption identity differs"
+    );
+    repo::claim_app(tx, Backend::Postgres, &context.app_id).await?;
+    compute::check_access(
+        tx,
+        Backend::Postgres,
+        &context.app_id,
+        UserAppOperationScope::Dev,
+        false,
+    )
+    .await?;
+    let app = repo::app(tx, &context.app_id)
+        .await?
+        .context("Builder lifecycle disappeared")?;
+    domain::validate_active(&app)?;
+    ensure!(
+        app.lifecycle_id == context.lifecycle_id,
+        "Builder adoption lifecycle changed"
+    );
+    let operation = repo::operation(tx, &context.app_id, &context.operation_id)
+        .await?
+        .context("Builder adoption operation disappeared")?;
+    ensure!(
+        operation.kind == UserAppOperationKind::AdoptBuilder
+            && operation.state == UserAppOperationState::Running
+            && operation.revision == progress.expected_revision
+            && operation.executor_id.as_deref() == Some(context.executor_id.as_str())
+            && operation.request_fingerprint == context.request_fingerprint,
+        "Builder registry adoption operation changed"
+    );
+    let source = ops::get_resource_binding(
+        tx,
+        Backend::Postgres,
+        &ServiceType::UserappBuilder,
+        expected_source_uid,
+    )
+    .await?
+    .context("Old builder registration has no lifecycle binding")?;
+    source
+        .validate(context, expected_source_uid)
+        .map_err(anyhow::Error::msg)?;
+    let binding = target
+        .resource_binding
+        .as_ref()
+        .context("Adopted builder binding missing")?;
+    binding
+        .validate(context, &workload.uid)
+        .map_err(anyhow::Error::msg)?;
+    ensure!(
+        binding.service_type == ServiceType::UserappBuilder,
+        "Adopted resource is not a builder"
+    );
+    let existing = ops::get_resource_binding(
+        tx,
+        Backend::Postgres,
+        &ServiceType::UserappBuilder,
+        &workload.uid,
+    )
+    .await?;
+    if let Some(existing) = existing {
+        ensure!(existing == *binding, "Adopted builder binding changed");
+    } else {
+        ensure!(
+            binding.adopted_by_operation == context.operation_id,
+            "New adoption binding has another operation"
+        );
+        toasty::sql::statement("INSERT INTO userapp_resource_bindings(service_type,physical_uid,app_id,lifecycle_id,adopted_by_operation,created_at_us) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(service_type,physical_uid) DO NOTHING")
+            .bind(binding.service_type.to_string()).bind(&binding.physical_uid)
+            .bind(&binding.app_id).bind(&binding.lifecycle_id).bind(&binding.adopted_by_operation)
+            .bind(chrono::Utc::now().timestamp_micros()).exec(tx).await?;
+        ensure!(
+            ops::get_resource_binding(
+                tx,
+                Backend::Postgres,
+                &ServiceType::UserappBuilder,
+                &workload.uid
+            )
+            .await?
+            .as_ref()
+                == Some(binding),
+            "Adopted builder binding belongs to another lifecycle"
+        );
+    }
+    ops::advance(tx, Backend::Postgres, progress).await?;
     Ok(())
 }

@@ -44,6 +44,236 @@ async fn database() -> (tempfile::TempDir, TursoUserAppStore) {
     (directory, store)
 }
 
+async fn interrupted_deletion_recovery_contract(
+    first: &dyn UserAppLifecycleStore,
+    second: &dyn UserAppLifecycleStore,
+) {
+    for kind in [
+        Kind::DeleteCompute,
+        Kind::PurgeResources,
+        Kind::DeleteApplication,
+    ] {
+        let mut admission = request(&uuid::Uuid::new_v4().to_string(), kind);
+        admission.app_id = format!("deletion-recovery-{}", uuid::Uuid::new_v4().simple());
+        let pending = operation(first.admit(&admission).await.unwrap());
+        let mut claimed = progress(&pending, State::Running);
+        claimed.step = "claimed".into();
+        claimed.checkpoint = serde_json::Value::Null;
+        let running = first.advance(&claimed).await.unwrap();
+        let context = shared_types::UserAppExecutionContext {
+            app_id: running.app_id.clone(),
+            lifecycle_id: running.lifecycle_id.clone(),
+            operation_id: running.operation_id.clone(),
+            executor_id: "worker-A".into(),
+            request_fingerprint: running.request_fingerprint.clone(),
+        };
+        let lease = shared_types::UserAppOperationLeaseReceipt::Docker {
+            service_type: shared_types::ServiceType::Userapp,
+            device: 1,
+            inode: 42,
+            token: "original-deletion-lease".into(),
+        };
+        first.bind_operation_lease(&context, &lease).await.unwrap();
+        let checkpoint = shared_types::UserAppDeletionCheckpoint {
+            schema_version: 1,
+            stage: shared_types::UserAppDeletionStage::Captured,
+            context: context.clone(),
+            kind,
+            production: shared_types::AppDeletionSnapshot {
+                app_id: running.app_id.clone(),
+                operation_id: "captured-production".into(),
+                resources: vec![],
+                directories: None,
+            },
+            development: (kind != Kind::DeleteCompute).then(|| {
+                shared_types::UserappDevDeletionReceipt {
+                    runtime: shared_types::BuilderDeletionSnapshot {
+                        app_id: running.app_id.clone(),
+                        operation_id: "captured-development".into(),
+                        resources: vec![],
+                        docker_bind_cleanup: false,
+                        resource_binding: None,
+                    },
+                    registry: None,
+                    lease: None,
+                    collaborators: vec![],
+                    directories: None,
+                }
+            }),
+        };
+        let mut captured = progress(&running, State::Running);
+        captured.step = "deleting_resources".into();
+        captured.checkpoint = serde_json::to_value(&checkpoint).unwrap();
+        let captured = first.advance(&captured).await.unwrap();
+        first.check_business_execution(&context).await.unwrap();
+        let (a, b) = tokio::join!(
+            first.reserve_interrupted_deletion(&captured),
+            second.reserve_interrupted_deletion(&captured)
+        );
+        assert_eq!(
+            usize::from(a.is_ok()) + usize::from(b.is_ok()),
+            1,
+            "only one recovery may revoke this exact execution snapshot"
+        );
+        let reserved = a.or(b).unwrap();
+        assert_eq!(reserved.state, State::RecoveryRequired);
+        assert_eq!(reserved.checkpoint, captured.checkpoint);
+        assert_eq!(reserved.executor_id, captured.executor_id);
+        assert_eq!(reserved.operation_id, captured.operation_id);
+        assert_eq!(reserved.revision, captured.revision + 1);
+        assert!(
+            first.check_business_execution(&context).await.is_err(),
+            "old executor cannot submit the next deletion stage"
+        );
+        let mut late_stage = progress(&captured, State::Running);
+        let mut next_checkpoint = checkpoint.clone();
+        next_checkpoint.stage = shared_types::UserAppDeletionStage::ComputeRemoved;
+        late_stage.checkpoint = serde_json::to_value(next_checkpoint).unwrap();
+        assert!(
+            first.advance(&late_stage).await.is_err(),
+            "a normally legal next stage is rejected after the original executor is revoked"
+        );
+        assert!(
+            first
+                .advance(&progress(&captured, State::Succeeded))
+                .await
+                .is_err()
+        );
+        assert!(first.bind_operation_lease(&context, &lease).await.is_err());
+        let binding = first
+            .get_operation_lease(&reserved.app_id, &reserved.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.context, context);
+        assert_eq!(binding.receipt, lease);
+        let mut next = request(&uuid::Uuid::new_v4().to_string(), Kind::Restart);
+        next.app_id = reserved.app_id.clone();
+        next.lifecycle_id = Some(reserved.lifecycle_id.clone());
+        assert!(
+            first.admit(&next).await.is_err(),
+            "inspection does not release the slot"
+        );
+        let evidence = serde_json::json!({
+            "execution_quiescent": true,
+            "context": context,
+            "captured_checkpoint": reserved.checkpoint,
+            "production_remaining": [],
+            "development_remaining": [],
+        });
+        let mut unknown = evidence.clone();
+        unknown["execution_quiescent"] = serde_json::json!(false);
+        assert!(
+            first
+                .finalize_interrupted_deletion(&reserved, &unknown)
+                .await
+                .is_err()
+        );
+        let mut foreign = evidence.clone();
+        foreign["context"]["executor_id"] = serde_json::json!("foreign-worker");
+        assert!(
+            first
+                .finalize_interrupted_deletion(&reserved, &foreign)
+                .await
+                .is_err()
+        );
+        if kind == Kind::DeleteApplication {
+            assert!(
+                first
+                    .finalize_interrupted_deletion(&reserved, &evidence)
+                    .await
+                    .is_err()
+            );
+            let app = first
+                .get_application(&reserved.app_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(app.state, UserAppLifecycleState::Deleting);
+            assert_eq!(
+                app.active_operations.application.as_deref(),
+                Some(reserved.operation_id.as_str())
+            );
+        } else {
+            let (a, b) = tokio::join!(
+                first.finalize_interrupted_deletion(&reserved, &evidence),
+                second.finalize_interrupted_deletion(&reserved, &evidence)
+            );
+            assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+            let failed = a.or(b).unwrap();
+            assert_eq!(
+                failed.state,
+                State::Failed,
+                "quiescent execution must not manufacture purge success"
+            );
+            assert_eq!(failed.checkpoint["stage"], captured.checkpoint["stage"]);
+            assert_eq!(failed.checkpoint["fence_released_evidence"], evidence);
+            assert!(!shared_types::userapp_operation_has_final_evidence(&failed));
+            first.forget_operation_lease(&binding).await.unwrap();
+            let successor = operation(first.admit(&next).await.unwrap());
+            assert_eq!(successor.lifecycle_id, failed.lifecycle_id);
+            assert!(
+                first
+                    .advance(&progress(&captured, State::Succeeded))
+                    .await
+                    .is_err(),
+                "old callbacks cannot clear the successor's slot"
+            );
+            assert_eq!(
+                first
+                    .get_application(&failed.app_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .active_operations
+                    .prod
+                    .as_deref(),
+                Some(successor.operation_id.as_str())
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn turso_interrupted_deletion_revokes_only_original_snapshot_and_preserves_tombstone() {
+    let (_directory, store) = database().await;
+    interrupted_deletion_recovery_contract(&store, &store).await;
+}
+
+#[cfg(feature = "pg")]
+#[tokio::test]
+#[ignore = "requires RCODER_USERAPP_PG_TEST_DSN for an isolated PostgreSQL instance"]
+async fn postgres_two_connections_interrupted_deletion_recovery_cas() {
+    let dsn = std::env::var("RCODER_USERAPP_PG_TEST_DSN")
+        .expect("explicit isolated PostgreSQL test DSN required");
+    let mut admin = toasty::Db::builder().connect(&dsn).await.unwrap();
+    let schema = format!("deletion_recovery_{}", uuid::Uuid::new_v4().simple());
+    toasty::sql::statement(format!("CREATE SCHEMA {schema}"))
+        .exec(&mut admin)
+        .await
+        .unwrap();
+    let separator = if dsn.contains('?') { '&' } else { '?' };
+    let config = crate::config::PostgresConfig {
+        url: Some(format!("{dsn}{separator}options=-csearch_path%3D{schema}")),
+        ..Default::default()
+    };
+    let first = std::sync::Arc::new(PgUserAppStore::connect(&config).await.unwrap());
+    let second = std::sync::Arc::new(PgUserAppStore::connect(&config).await.unwrap());
+    let a = first.clone();
+    let b = second.clone();
+    let outcome = tokio::spawn(async move {
+        interrupted_deletion_recovery_contract(a.as_ref(), b.as_ref()).await;
+    })
+    .await;
+    first.shutdown().await.unwrap();
+    second.shutdown().await.unwrap();
+    toasty::sql::statement(format!("DROP SCHEMA {schema} CASCADE"))
+        .exec(&mut admin)
+        .await
+        .unwrap();
+    outcome.expect("deletion recovery CAS contract");
+}
+
 async fn storage_deletion_preserves_lifecycle(store: &dyn UserAppLifecycleStore) {
     let mut req = request("storage-only", Kind::DestroyProdStorage);
     req.app_id = "storage-only-app".into();
@@ -1225,11 +1455,15 @@ async fn deletion_success_requires_committed_evidence(store: &dyn UserAppLifecyc
             request_fingerprint: input.request_fingerprint.clone(),
         },
         production: shared_types::AppDeletionSnapshot {
+            directories: None,
             app_id: input.app_id.clone(),
             operation_id: "original-production".into(),
             resources: vec![],
         },
         development: Some(shared_types::UserappDevDeletionReceipt {
+            lease: None,
+            collaborators: Vec::new(),
+            directories: None,
             runtime: shared_types::BuilderDeletionSnapshot {
                 resource_binding: None,
                 app_id: input.app_id.clone(),
@@ -1327,12 +1561,16 @@ async fn complete(store: &dyn UserAppLifecycleStore, op: &UserAppOperationRecord
             },
             production: (op.kind == Kind::DestroyProdStorage).then(|| {
                 shared_types::AppDeletionSnapshot {
+                    directories: None,
                     app_id: op.app_id.clone(),
                     operation_id: "storage-production".into(),
                     resources: vec![],
                 }
             }),
             development: shared_types::UserappDevDeletionReceipt {
+                lease: None,
+                collaborators: Vec::new(),
+                directories: None,
                 runtime: shared_types::BuilderDeletionSnapshot {
                     resource_binding: None,
                     app_id: op.app_id.clone(),
@@ -1381,12 +1619,16 @@ async fn complete(store: &dyn UserAppLifecycleStore, op: &UserAppOperationRecord
                 request_fingerprint: op.request_fingerprint.clone(),
             },
             production: shared_types::AppDeletionSnapshot {
+                directories: None,
                 app_id: op.app_id.clone(),
                 operation_id: "fixture-production".into(),
                 resources: vec![],
             },
             development: (op.kind != Kind::DeleteCompute).then(|| {
                 shared_types::UserappDevDeletionReceipt {
+                    lease: None,
+                    collaborators: Vec::new(),
+                    directories: None,
                     runtime: shared_types::BuilderDeletionSnapshot {
                         resource_binding: None,
                         app_id: op.app_id.clone(),

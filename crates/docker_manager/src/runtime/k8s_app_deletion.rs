@@ -11,7 +11,7 @@ use shared_types::{
 };
 
 impl KubernetesRuntime {
-    fn deletion_api(&self, kind: Kind) -> Result<Api<DynamicObject>> {
+    pub(super) fn deletion_api(&self, kind: Kind) -> Result<Api<DynamicObject>> {
         let (group, version, name) = match kind {
             Kind::Deployment => ("apps", "v1", "Deployment"),
             Kind::StatefulSet => ("apps", "v1", "StatefulSet"),
@@ -39,12 +39,166 @@ impl KubernetesRuntime {
         ))
     }
 
+    pub(super) async fn inspect_captured_deletion(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        family: ServiceType,
+        receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+        resources: &[AppResourceIdentity],
+    ) -> Result<shared_types::DeletionInspection> {
+        use shared_types::{
+            ComputeLeaseInspection, DeletionInspection as Observation, UserAppOperationScope,
+        };
+        context
+            .validate_identity(&context.app_id)
+            .map_err(Error::ConfigurationError)?;
+        if let Some(receipt) = receipt {
+            if receipt.service_type() != &family {
+                return Ok(Observation::ForeignIdentity(
+                    "Deletion lease family differs".into(),
+                ));
+            }
+            match self
+                .validate_captured_application_operation(context, receipt)
+                .await
+            {
+                Ok(true) => {
+                    return Ok(Observation::StillHeld(
+                        "Original deletion lease is still held".into(),
+                    ));
+                }
+                Ok(false) => {}
+                Err(Error::Conflict(message)) => {
+                    match self
+                        .captured_deletion_lease_replaced(context, receipt)
+                        .await
+                    {
+                        // Only authority changed. Retire each original exact
+                        // DELETE below before permitting the durable terminal CAS.
+                        Ok(true) => {}
+                        Ok(false) => return Ok(Observation::Unknown(message)),
+                        Err(Error::Conflict(message)) => {
+                            return Ok(Observation::ForeignIdentity(message));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            // Missing historical receipt is not itself evidence. Observe both
+            // current Lease and pre-Lease ConfigMap through the common lock domain.
+            let scope = if family == ServiceType::UserappBuilder {
+                UserAppOperationScope::Dev
+            } else {
+                UserAppOperationScope::Prod
+            };
+            match self.inspect_compute_k8s_lease(context, scope, None).await? {
+                ComputeLeaseInspection::Absent => {}
+                ComputeLeaseInspection::IdentityChanged(message) => {
+                    return Ok(Observation::ForeignIdentity(message));
+                }
+                _ => {
+                    return Ok(Observation::StillHeld(
+                        "Deletion lock has no matching captured receipt".into(),
+                    ));
+                }
+            }
+        }
+        let mut remaining_resources = Vec::new();
+        for captured in resources {
+            if captured.uid.is_empty()
+                || captured
+                    .resource_version
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+            {
+                return Ok(Observation::Unknown(
+                    "Captured Kubernetes deletion identity is incomplete".into(),
+                ));
+            }
+            let api = self.deletion_api(captured.kind)?;
+            let Some(mut current) = api
+                .get_opt(&captured.name)
+                .await
+                .map_err(|error| map_error("inspect captured deletion resource", error))?
+            else {
+                continue;
+            };
+            if current
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get("rcoder.io/lifecycle-id"))
+                .is_some_and(|lifecycle| lifecycle != &context.lifecycle_id)
+            {
+                return Ok(Observation::ForeignIdentity(
+                    "Captured resource belongs to another lifecycle".into(),
+                ));
+            }
+            if current.metadata.uid.as_deref() != Some(captured.uid.as_str()) {
+                // Exact old UID preconditions cannot delete this replacement.
+                // Preserve it untouched and report its actual identity so the
+                // coordinator records an incomplete purge, never fake success.
+                remaining_resources.push(identity(captured.kind, current)?);
+                continue;
+            }
+            if current.metadata.deletion_timestamp.is_some() {
+                return Ok(Observation::Unknown(format!(
+                    "Captured {:?} {} is still terminating",
+                    captured.kind, captured.name
+                )));
+            }
+            if current.metadata.resource_version == captured.resource_version {
+                // The old executor was revoked before this method. Advance the
+                // exact captured RV so a late, already-authorized DELETE cannot
+                // remove storage/workloads after the application slot is released.
+                let patch = serde_json::json!({"metadata":{
+                    "uid":captured.uid,
+                    "resourceVersion":captured.resource_version,
+                    "annotations":{"rcoder.io/deletion-retired-operation":context.operation_id}
+                }});
+                match api
+                    .patch(
+                        &captured.name,
+                        &PatchParams::default(),
+                        &Patch::Merge(&patch),
+                    )
+                    .await
+                {
+                    Ok(updated)
+                        if updated.metadata.uid.as_deref() == Some(captured.uid.as_str())
+                            && updated.metadata.resource_version != captured.resource_version
+                            && updated.metadata.deletion_timestamp.is_none() =>
+                    {
+                        current = updated;
+                    }
+                    Ok(_) => {
+                        return Ok(Observation::Unknown(
+                            "Deletion retirement did not advance the captured resource version"
+                                .into(),
+                        ));
+                    }
+                    Err(kube::Error::Api(error)) if error.code == 404 || error.code == 409 => {
+                        return Ok(Observation::Unknown("Captured deletion target changed while retiring its write version; reinspection required".into()));
+                    }
+                    Err(error) => return Err(map_error("retire captured deletion write", error)),
+                }
+            }
+            remaining_resources.push(identity(captured.kind, current)?);
+        }
+        Ok(Observation::ConfirmedQuiescent {
+            remaining_resources,
+        })
+    }
+
     pub(super) async fn capture_deletion(
         &self,
         app_id: &str,
         expected: Option<&str>,
     ) -> Result<AppDeletionSnapshot> {
         let mut snapshot = AppDeletionSnapshot {
+            directories: None,
             app_id: app_id.into(),
             operation_id: uuid::Uuid::new_v4().to_string(),
             resources: vec![],

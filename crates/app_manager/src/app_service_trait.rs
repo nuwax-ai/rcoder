@@ -46,6 +46,17 @@ pub trait AppServiceTrait: Send + Sync {
         &self,
         operation: &shared_types::UserAppOperationRecord,
     ) -> AppResult<bool>;
+    /// Inspect and retire only an interrupted deletion's captured write scopes.
+    /// Returns false when a live holder/another recovery still owns the attempt;
+    /// never replays an unknown purge or revives a lifecycle deletion tombstone.
+    async fn reconcile_interrupted_deletion(
+        &self,
+        _operation: &shared_types::UserAppOperationRecord,
+    ) -> AppResult<bool> {
+        Err(AppOperationError::Backend(
+            "Interrupted deletion recovery is not configured".into(),
+        ))
+    }
     async fn get_lifecycle(&self, app_id: &str) -> AppResult<shared_types::UserAppLifecycleRecord>;
     async fn get_control_operation(
         &self,

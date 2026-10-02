@@ -476,6 +476,24 @@ impl AppService {
         if operation.revision != request.expected_revision {
             return Err(shared_types::UserAppStoreError::VersionConflict.into());
         }
+        if matches!(
+            operation.kind,
+            shared_types::UserAppOperationKind::DeleteCompute
+                | shared_types::UserAppOperationKind::PurgeResources
+                | shared_types::UserAppOperationKind::DeleteApplication
+        ) && matches!(
+            operation.state,
+            UserAppOperationState::Running | UserAppOperationState::RecoveryRequired
+        ) && !shared_types::userapp_operation_has_final_evidence(&operation)
+        {
+            self.reconcile_interrupted_deletion(&operation).await?;
+            return self
+                .get_control_operation(app_id, Some(operation_id))
+                .await?
+                .ok_or_else(|| {
+                    AppOperationError::NotFound("Deletion operation disappeared".into())
+                });
+        }
         if ((operation.state == UserAppOperationState::RecoveryRequired
             && operation.step == "hot_execution")
             || (operation.state == UserAppOperationState::Failed

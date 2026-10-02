@@ -43,6 +43,10 @@ pub struct AppDeletionSnapshot {
     pub app_id: String,
     pub operation_id: String,
     pub resources: Vec<AppResourceIdentity>,
+    /// Docker filesystem targets captured before any destructive effect. None
+    /// denotes older receipts; it does not authorize rediscovery by app name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directories: Option<Vec<crate::storage_contents::CapturedStorageDirectory>>,
 }
 
 /// Captured resource target bound to one admitted control operation. Persist this

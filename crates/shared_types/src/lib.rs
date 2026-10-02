@@ -48,8 +48,8 @@ pub use userapp::dbx_readiness::{
     DbxReadinessStatus,
 };
 pub use userapp::dev_cleanup::{
-    BuilderDeletionSnapshot, BuilderRegistryIdentity, UserappDevCleanup, UserappDevDeletion,
-    UserappDevDeletionReceipt,
+    BuilderCollaboratorDeletionReceipt, BuilderDeletionSnapshot, BuilderRegistryIdentity,
+    DeletionInspection, UserappDevCleanup, UserappDevDeletion, UserappDevDeletionReceipt,
 };
 pub use userapp::dev_locator::{UserappDevEnsure, UserappDevLocator};
 pub use userapp::forward_contract::{

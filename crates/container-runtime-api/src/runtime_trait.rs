@@ -58,6 +58,19 @@ pub trait AgentContainerRuntime: Send + Sync {
         ))
     }
 
+    /// Observe/fence the original captured deletion after its durable executor
+    /// was revoked. Does not delete resources or grant continuation authority.
+    async fn inspect_builder_deletion(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+        _snapshot: &shared_types::BuilderDeletionSnapshot,
+    ) -> ContainerRuntimeResult<shared_types::DeletionInspection> {
+        Ok(shared_types::DeletionInspection::Unknown(
+            "Builder deletion inspection is unsupported".into(),
+        ))
+    }
+
     /// 按 app 维度枚举全部 builder 实例 identifier（协作模型多实例——同 app
     /// 每用户独立容器，复合键 `{user_id}-{app_id}`）。destroy 链清盘用：
     /// owner 实例之外还要清扫全部协作者实例及其 PVC。
@@ -1142,6 +1155,20 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     ) -> ContainerRuntimeResult<shared_types::AppDeletionSnapshot> {
         Err(ContainerRuntimeError::ConfigurationError(
             "identity-bound deletion is not supported by this runtime".into(),
+        ))
+    }
+
+    /// Inspect the original target set after durable deletion revocation. A
+    /// Kubernetes adapter may advance captured resource versions to retire old
+    /// conditional DELETEs; it must never replay storage destruction.
+    async fn inspect_app_deletion(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+        _snapshot: &shared_types::AppDeletionSnapshot,
+    ) -> ContainerRuntimeResult<shared_types::DeletionInspection> {
+        Ok(shared_types::DeletionInspection::Unknown(
+            "Application deletion inspection is unsupported".into(),
         ))
     }
 

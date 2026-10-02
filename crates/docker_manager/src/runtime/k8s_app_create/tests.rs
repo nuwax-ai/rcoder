@@ -750,6 +750,7 @@ mod conditional_tests {
         let config = kube::Config::new(format!("http://{address}").parse().expect("uri"));
         let runtime = runtime(kube::Client::try_from(config).expect("client"));
         let snapshot = AppDeletionSnapshot {
+            directories: None,
             app_id: "claimed-app".into(),
             operation_id: "delete-old".into(),
             resources: vec![AppResourceIdentity {
@@ -1512,6 +1513,7 @@ mod conditional_tests {
                 let config = kube::Config::new(format!("http://{address}").parse().expect("URI"));
                 let runtime = runtime(kube::Client::try_from(config).expect("client"));
                 let snapshot = AppDeletionSnapshot {
+                directories: None,
                     app_id: "app".into(), operation_id: "delete-original".into(),
                     resources: vec![
                         AppResourceIdentity { kind: AppResourceKind::Deployment, name: "original".into(), uid: "original-uid".into(), resource_version: Some("7".into()) },

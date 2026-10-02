@@ -100,9 +100,341 @@ pub async fn clear_directory_contents(root: &Path) -> io::Result<()> {
     StorageDirectoryLease::capture(root).await?.clear().await
 }
 
+/// Retire exactly a captured directory before removal. The detached blocking
+/// task holds a separate flock until filesystem work ends; cancellation cannot
+/// let a late recursive removal target a newly installed workspace pathname.
+pub async fn remove_captured_directory(
+    directory: &CapturedStorageDirectory,
+    operation_id: &str,
+) -> io::Result<()> {
+    crate::validate_identifier(operation_id, "directory_deletion_operation")
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let directory = directory.clone();
+    let operation_id = operation_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        remove_captured_directory_blocking(&directory, &operation_id)
+    })
+    .await
+    .map_err(|error| {
+        io::Error::other(format!("Directory retirement worker interrupted: {error}"))
+    })?
+}
+
+/// Persist a non-destructive cancellation witness under the same directory
+/// retirement lock. Delayed blocking tasks check this witness before moving or
+/// removing the path. A currently running removal keeps the lock and must finish
+/// before this method can succeed.
+pub async fn retire_captured_directory_deletion(
+    directory: &CapturedStorageDirectory,
+    operation_id: &str,
+) -> io::Result<()> {
+    crate::validate_identifier(operation_id, "directory_deletion_operation")
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let directory = directory.clone();
+    let operation_id = operation_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        retire_directory_deletion_blocking(&directory, &operation_id)
+    })
+    .await
+    .map_err(|error| {
+        io::Error::other(format!(
+            "Directory deletion inspection worker interrupted: {error}"
+        ))
+    })?
+}
+
+#[cfg(unix)]
+fn directory_retirement_lock(
+    directory: &CapturedStorageDirectory,
+) -> io::Result<(std::fs::File, PathBuf)> {
+    use sha2::Digest as _;
+    if !directory.path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Captured directory must be absolute",
+        ));
+    }
+    let parent = directory.path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Captured directory has no parent",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let digest = sha2::Sha256::digest(directory.path.as_os_str().as_encoded_bytes());
+    let hex = digest
+        .iter()
+        .flat_map(|byte| {
+            const DIGITS: &[u8; 16] = b"0123456789abcdef";
+            [
+                char::from(DIGITS[(byte >> 4) as usize]),
+                char::from(DIGITS[(byte & 15) as usize]),
+            ]
+        })
+        .collect::<String>();
+    let stem = parent.join(format!(".rcoder-directory-retire-{hex}"));
+    let lock = open_retirement_file(&stem.with_extension("lock"), false)?;
+    lock.try_lock().map_err(|error| {
+        io::Error::other(format!("Directory retirement remains active: {error}"))
+    })?;
+    Ok((lock, stem))
+}
+
+#[cfg(unix)]
+fn open_retirement_file(path: &Path, truncate: bool) -> io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    let mut flags = OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    if truncate {
+        flags |= OFlags::TRUNC;
+    }
+    Ok(std::fs::File::from(rustix::fs::openat(
+        rustix::fs::CWD,
+        path,
+        flags,
+        Mode::RUSR | Mode::WUSR,
+    )?))
+}
+
+#[cfg(unix)]
+fn retire_directory_deletion_blocking(
+    directory: &CapturedStorageDirectory,
+    operation_id: &str,
+) -> io::Result<()> {
+    use std::io::Write as _;
+    let (_lock, stem) = directory_retirement_lock(directory)?;
+    let marker = stem.with_extension(format!("{operation_id}.retired"));
+    let bytes = serde_json::to_vec(directory).map_err(io::Error::other)?;
+    match std::fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.is_file() => {
+            if std::fs::read(&marker)? != bytes {
+                return Err(io::Error::other(
+                    "Directory retirement witness differs from captured target",
+                ));
+            }
+            return Ok(());
+        }
+        Ok(_) => {
+            return Err(io::Error::other(
+                "Directory retirement witness is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    // A crash during persistence leaves only a replaceable temporary file, not
+    // an incomplete authoritative witness that would permanently block retry.
+    let temporary = marker.with_extension("retired.tmp");
+    let mut file = open_retirement_file(&temporary, true)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, &marker)?;
+    if let Some(parent) = marker.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn retire_directory_deletion_blocking(_: &CapturedStorageDirectory, _: &str) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Captured directory retirement requires Unix",
+    ))
+}
+
+#[cfg(unix)]
+fn remove_captured_directory_blocking(
+    directory: &CapturedStorageDirectory,
+    operation_id: &str,
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if !directory.path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Captured directory must be absolute",
+        ));
+    }
+    let parent = directory.path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Captured directory has no parent",
+        )
+    })?;
+    let (_lock, stem) = directory_retirement_lock(directory)?;
+    match std::fs::symlink_metadata(stem.with_extension(format!("{operation_id}.retired"))) {
+        Ok(_) => {
+            return Err(io::Error::other(
+                "Captured directory deletion was retired by recovery",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let identity_at = |path: &Path| -> io::Result<Option<StorageDirectoryIdentity>> {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => Ok(Some(StorageDirectoryIdentity {
+                device: meta.dev(),
+                inode: meta.ino(),
+            })),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Captured directory is not a real directory",
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    };
+    let Some(identity) = &directory.identity else {
+        return if identity_at(&directory.path)?.is_none() {
+            Ok(())
+        } else {
+            Err(io::Error::other("Directory appeared after absent capture"))
+        };
+    };
+    let retired = parent.join(format!(
+        ".rcoder-delete-{operation_id}-{}-{}",
+        identity.device, identity.inode
+    ));
+    let current = identity_at(&directory.path)?;
+    if current.is_some() && current.as_ref() != Some(identity) {
+        return Err(io::Error::other("Captured directory identity changed"));
+    }
+    match (current, identity_at(&retired)?) {
+        (None, None) => return Ok(()),
+        (None, Some(actual)) if actual == *identity => {}
+        (Some(_), None) => {
+            std::fs::rename(&directory.path, &retired)?;
+            if identity_at(&retired)?.as_ref() != Some(identity) {
+                if identity_at(&directory.path)?.is_none() {
+                    std::fs::rename(&retired, &directory.path)?;
+                }
+                return Err(io::Error::other(
+                    "Directory changed during retirement; contents preserved",
+                ));
+            }
+        }
+        _ => return Err(io::Error::other("Retired directory identity is ambiguous")),
+    }
+    std::fs::remove_dir_all(&retired)
+}
+
+#[cfg(not(unix))]
+fn remove_captured_directory_blocking(_: &CapturedStorageDirectory, _: &str) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Captured directory retirement requires Unix",
+    ))
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn retired_deletion_cannot_remove_reused_path_and_new_operation_can_proceed() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let root = fixture.path().join("workspace");
+        tokio::fs::create_dir(&root).await.expect("original root");
+        tokio::fs::write(root.join("keep"), b"original")
+            .await
+            .expect("original data");
+        let captured = StorageDirectoryLease::capture(&root)
+            .await
+            .expect("capture")
+            .receipt;
+        retire_captured_directory_deletion(&captured, "old-operation")
+            .await
+            .expect("retire");
+        retire_captured_directory_deletion(&captured, "old-operation")
+            .await
+            .expect("idempotent retirement");
+        assert!(
+            remove_captured_directory(&captured, "old-operation")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            tokio::fs::read(root.join("keep"))
+                .await
+                .expect("original retained"),
+            b"original"
+        );
+        tokio::fs::rename(&root, fixture.path().join("retained-original"))
+            .await
+            .expect("replace path");
+        tokio::fs::create_dir(&root)
+            .await
+            .expect("replacement root");
+        tokio::fs::write(root.join("keep"), b"replacement")
+            .await
+            .expect("replacement data");
+        assert!(
+            remove_captured_directory(&captured, "old-operation")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            tokio::fs::read(root.join("keep"))
+                .await
+                .expect("replacement retained"),
+            b"replacement"
+        );
+        let fresh = StorageDirectoryLease::capture(&root)
+            .await
+            .expect("fresh capture")
+            .receipt;
+        remove_captured_directory(&fresh, "new-operation")
+            .await
+            .expect("new request may delete own target");
+        assert!(!root.exists());
+        assert_eq!(
+            tokio::fs::read(fixture.path().join("retained-original/keep"))
+                .await
+                .expect("unrelated original preserved"),
+            b"original"
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_directory_replacement_and_absence_never_delete_new_contents() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let root = fixture.path().join("workspace");
+        let absent = StorageDirectoryLease::capture(&root)
+            .await
+            .expect("capture absence")
+            .receipt;
+        tokio::fs::create_dir(&root).await.expect("root");
+        tokio::fs::write(root.join("keep"), b"new")
+            .await
+            .expect("new data");
+        assert!(
+            remove_captured_directory(&absent, "absent-operation")
+                .await
+                .is_err()
+        );
+        let captured = StorageDirectoryLease::capture(&root)
+            .await
+            .expect("capture root")
+            .receipt;
+        tokio::fs::rename(&root, fixture.path().join("old-root"))
+            .await
+            .expect("move original");
+        tokio::fs::create_dir(&root).await.expect("new root");
+        tokio::fs::write(root.join("keep"), b"replacement")
+            .await
+            .expect("replacement data");
+        assert!(
+            remove_captured_directory(&captured, "old-operation")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            tokio::fs::read(root.join("keep"))
+                .await
+                .expect("replacement retained"),
+            b"replacement"
+        );
+    }
 
     #[tokio::test]
     async fn clear_retains_root_and_distinguishes_missing_from_invalid_root() {

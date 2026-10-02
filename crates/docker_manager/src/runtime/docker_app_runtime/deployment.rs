@@ -372,6 +372,65 @@ impl UserAppDeploymentRuntime for DockerRuntime {
     ) -> ContainerRuntimeResult<bool> {
         self.validate_captured_file_lease(context, receipt).await
     }
+    async fn inspect_app_deletion(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+        snapshot: &shared_types::AppDeletionSnapshot,
+    ) -> ContainerRuntimeResult<shared_types::DeletionInspection> {
+        context
+            .validate_identity(&snapshot.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let Some(directories) = &snapshot.directories else {
+            return Ok(shared_types::DeletionInspection::Unknown(
+                "Historical Docker deletion lacks captured production directory witnesses".into(),
+            ));
+        };
+        let mut observation = self
+            .inspect_captured_docker_deletion(
+                context,
+                shared_types::ServiceType::Userapp,
+                receipt,
+                &snapshot.resources,
+            )
+            .await?;
+        if let shared_types::DeletionInspection::ConfirmedQuiescent {
+            remaining_resources,
+        } = &mut observation
+        {
+            for directory in directories {
+                shared_types::storage_contents::retire_captured_directory_deletion(
+                    directory,
+                    &snapshot.operation_id,
+                )
+                .await
+                .map_err(|error| {
+                    ContainerRuntimeError::DockerError(format!(
+                        "Retire production directory deletion {}: {error}",
+                        directory.path.display()
+                    ))
+                })?;
+                let current =
+                    shared_types::storage_contents::StorageDirectoryLease::capture(&directory.path)
+                        .await
+                        .map_err(|error| {
+                            ContainerRuntimeError::DockerError(format!(
+                                "Inspect captured production directory {}: {error}",
+                                directory.path.display()
+                            ))
+                        })?;
+                if let Some(identity) = current.receipt.identity {
+                    remaining_resources.push(shared_types::AppResourceIdentity {
+                        kind: shared_types::AppResourceKind::HostPath,
+                        name: directory.path.to_string_lossy().into_owned(),
+                        uid: format!("{}:{}", identity.device, identity.inode),
+                        resource_version: None,
+                    });
+                }
+            }
+        }
+        Ok(observation)
+    }
 
     async fn app_operation_receipt_holder_dead(
         &self,
@@ -402,6 +461,9 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             app_id: app_id.into(),
             operation_id: uuid::Uuid::new_v4().to_string(),
             resources: vec![],
+            directories: Some(
+                crate::runtime::docker_workspace::capture_prod_directories(app_id).await?,
+            ),
         };
         match self
             .inner

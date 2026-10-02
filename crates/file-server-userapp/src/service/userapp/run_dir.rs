@@ -95,6 +95,11 @@ impl PreparedRun {
             self._lease.release()?;
             return Ok(run);
         }
+        // Verify the prepared input before changing the serving directory.
+        let staging = self
+            .staging
+            .take()
+            .ok_or_else(|| AppError::system("fresh preparation has no staging directory"))?;
         let previous = self.workspace.join(PREVIOUS_DIR);
         let had_run = run.try_exists()?;
         if had_run {
@@ -103,10 +108,6 @@ impl PreparedRun {
             }
             std::fs::rename(&run, &previous)?;
         }
-        let staging = self
-            .staging
-            .take()
-            .expect("fresh preparation always owns a staging directory");
         if let Err(error) = std::fs::rename(staging.path(), &run) {
             if had_run && let Err(restore) = std::fs::rename(&previous, &run) {
                 return Err(AppError::system(format!(
@@ -425,6 +426,34 @@ mod tests {
             .expect_err("swapped identity must be refused at commit boundary");
         assert!(err.to_string().contains("rel-swapped-9"));
     }
+
+    #[tokio::test]
+    async fn missing_staging_fails_before_changing_existing_directories() {
+        let ws = tempfile::tempdir().expect("ws");
+        make_full_package(ws.path(), "rel-cache-1");
+        let run = ws.path().join(RUN_DIR);
+        let previous = ws.path().join(PREVIOUS_DIR);
+        std::fs::create_dir_all(&run).expect("run directory");
+        std::fs::create_dir_all(&previous).expect("previous directory");
+        std::fs::write(run.join("marker"), "running").expect("run marker");
+        std::fs::write(previous.join("marker"), "previous").expect("previous marker");
+        let mut prepared = prepare_run_dir(ws.path(), "rel-cache-1")
+            .await
+            .expect("prepare");
+        prepared.staging = None;
+
+        let error = prepared.activate().expect_err("missing staging must fail");
+        assert!(error.to_string().contains("no staging directory"));
+        assert_eq!(
+            std::fs::read_to_string(run.join("marker")).unwrap(),
+            "running"
+        );
+        assert_eq!(
+            std::fs::read_to_string(previous.join("marker")).unwrap(),
+            "previous"
+        );
+    }
+
     #[tokio::test]
     async fn invalid_package_cleans_its_staging() {
         let ws = tempfile::tempdir().expect("ws");

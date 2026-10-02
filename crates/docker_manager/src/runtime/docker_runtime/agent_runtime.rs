@@ -118,6 +118,23 @@ impl AgentContainerRuntime for DockerRuntime {
     ) -> ContainerRuntimeResult<shared_types::BuilderDeletionSnapshot> {
         self.capture_builder(app_id).await
     }
+    async fn inspect_builder_deletion(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+        snapshot: &shared_types::BuilderDeletionSnapshot,
+    ) -> ContainerRuntimeResult<shared_types::DeletionInspection> {
+        context
+            .validate_identity(&snapshot.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        self.inspect_captured_docker_deletion(
+            context,
+            ServiceType::UserappBuilder,
+            receipt,
+            &snapshot.resources,
+        )
+        .await
+    }
     async fn find_builder_instances(&self, app_id: &str) -> ContainerRuntimeResult<Vec<String>> {
         // Docker 形态：容器名 `rcoder-app-builder-{app_id}`（纯 app_id，无用户
         // 维度）——全量列举后按 builder 族 + identifier 过滤（含已停容器——清扫

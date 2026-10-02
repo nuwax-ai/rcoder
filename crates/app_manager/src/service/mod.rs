@@ -321,6 +321,13 @@ impl super::AppServiceTrait for AppService {
         self.resume_pending_control(operation).await
     }
 
+    async fn reconcile_interrupted_deletion(
+        &self,
+        operation: &shared_types::UserAppOperationRecord,
+    ) -> AppResult<bool> {
+        AppService::reconcile_interrupted_deletion(self, operation).await
+    }
+
     async fn get_lifecycle(&self, app_id: &str) -> AppResult<shared_types::UserAppLifecycleRecord> {
         self.get_lifecycle(app_id).await
     }

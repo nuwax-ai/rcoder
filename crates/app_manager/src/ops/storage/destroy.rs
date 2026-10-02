@@ -374,8 +374,10 @@ impl crate::service::AppService {
             )
             .await?;
         // 1. prod 计算面：存在才拆（防护序列 + 失败对称恢复见 tear_down_compute_plane）
+        operation.authorize_mutation().await?;
         match self.runtime.get_deployment_status(app_id).await {
             Ok(Some(previous)) => {
+                operation.authorize_mutation().await?;
                 release_lock.mark_mutating()?;
                 self.tear_down_compute_plane(app_id, &previous, &snapshot)
                     .await?
@@ -384,6 +386,7 @@ impl crate::service::AppService {
                 if snapshot.resources.iter().any(|resource| {
                     resource.kind != shared_types::AppResourceKind::PersistentVolumeClaim
                 }) {
+                    operation.authorize_mutation().await?;
                     release_lock.mark_mutating()?;
                     self.tear_down_compute_plane(
                         app_id,
@@ -438,6 +441,7 @@ impl crate::service::AppService {
         }
         self.ensure_app_deleted(app_id, "destroying captured storage")
             .await?;
+        operation.authorize_mutation().await?;
         self.runtime
             .destroy_app_storage_snapshot(&checkpoint.production)
             .await
@@ -448,6 +452,7 @@ impl crate::service::AppService {
                 shared_types::UserAppDeletionStage::ProductionStorageRemoved,
             )
             .await?;
+        operation.authorize_mutation().await?;
         dev_deletion.cleanup().await.map_err(|error| {
             AppOperationError::Backend(format!("destroy captured userapp dev resources: {error}"))
         })?;

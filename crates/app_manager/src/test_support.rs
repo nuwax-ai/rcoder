@@ -29,6 +29,8 @@ use crate::service::AppService;
 /// 历史用途 wait_app_ready 已退役，现有消费者见 purge 链不缺席测试）。
 #[derive(Default)]
 pub(crate) struct MockRuntime {
+    pub deletion_inspection: std::sync::Mutex<Option<shared_types::DeletionInspection>>,
+    pub deletion_inspection_calls: AtomicUsize,
     pub configuration_replies:
         std::sync::Mutex<std::collections::VecDeque<container_runtime_api::ExecResult>>,
     pub configuration_commands: std::sync::Mutex<Vec<Vec<String>>>,
@@ -315,6 +317,37 @@ impl UserAppDeploymentRuntime for MockRuntime {
         Ok(())
     }
 
+    async fn app_operation_receipt_holder_dead(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(!self.lease_held.load(Ordering::SeqCst))
+    }
+
+    async fn inspect_app_deletion(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _lease: Option<&shared_types::UserAppOperationLeaseReceipt>,
+        _snapshot: &shared_types::AppDeletionSnapshot,
+    ) -> ContainerRuntimeResult<shared_types::DeletionInspection> {
+        self.deletion_inspection_calls
+            .fetch_add(1, Ordering::SeqCst);
+        self.deletion_inspection
+            .lock()
+            .map_err(|_| {
+                ContainerRuntimeError::ConfigurationError(
+                    "mock deletion inspection poisoned".into(),
+                )
+            })?
+            .clone()
+            .ok_or_else(|| {
+                ContainerRuntimeError::ConfigurationError(
+                    "mock deletion observation not configured".into(),
+                )
+            })
+    }
+
     async fn acquire_builder_family_operation(
         &self,
         app_id: &str,
@@ -383,6 +416,7 @@ impl UserAppDeploymentRuntime for MockRuntime {
             app_id: app_id.into(),
             operation_id: "test-operation".into(),
             resources: vec![],
+            directories: None,
         })
     }
 
@@ -868,6 +902,9 @@ pub(crate) fn dev_deletion_receipt(app_id: &str) -> shared_types::UserappDevDele
             generation: "fixture-project-generation".into(),
             container_id: "fixture-builder-uid".into(),
         }),
+        lease: None,
+        collaborators: Vec::new(),
+        directories: None,
     }
 }
 
@@ -886,6 +923,7 @@ pub(crate) async fn complete_empty_deletion_fixture(mut operation: crate::servic
             app_id: app_id.clone(),
             operation_id: "empty-production".into(),
             resources: vec![],
+            directories: None,
         },
         development: Some(shared_types::UserappDevDeletionReceipt {
             runtime: shared_types::BuilderDeletionSnapshot {
@@ -896,6 +934,9 @@ pub(crate) async fn complete_empty_deletion_fixture(mut operation: crate::servic
                 docker_bind_cleanup: false,
             },
             registry: None,
+            lease: None,
+            collaborators: Vec::new(),
+            directories: None,
         }),
     };
     operation

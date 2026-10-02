@@ -416,7 +416,7 @@ pub fn get_error_description(code: &str) -> &'static str {
         ERR_FILE_NOT_FOUND => "File not found",
         ERR_BACKEND_ERROR => "Backend API call failed",
         ERR_USERAPP_WAIT_TIMEOUT => {
-            "Builder ensure deadline exceeded; the accepted operation may still be running"
+            "The application container is taking longer to start. Please try again shortly."
         }
         ERR_IMAGE_PULL_FAILED => "Image pull failed",
         ERR_RESOURCE_EXHAUSTED => "Cluster resources exhausted",
@@ -436,6 +436,23 @@ pub fn get_error_description(code: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn userapp_wait_timeout_prompt_gives_a_simple_retry_action() {
+        for (locale, expected) in [
+            ("zh-CN", "应用容器启动较慢，请稍后重试。"),
+            ("zh-TW", "應用容器啟動較慢，請稍後重試。"),
+            (
+                "en-US",
+                "The application container is taking longer to start. Please try again shortly.",
+            ),
+        ] {
+            assert_eq!(
+                get_error_message(ERR_USERAPP_WAIT_TIMEOUT, locale),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn test_all_error_codes_have_messages() {

@@ -368,6 +368,19 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             .await
     }
 
+    async fn inspect_app_deletion(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+        snapshot: &shared_types::AppDeletionSnapshot,
+    ) -> ContainerRuntimeResult<shared_types::DeletionInspection> {
+        context
+            .validate_identity(&snapshot.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        self.inspect_captured_deletion(context, ServiceType::Userapp, receipt, &snapshot.resources)
+            .await
+    }
+
     async fn release_app_operation_receipt(
         &self,
         context: &shared_types::UserAppExecutionContext,

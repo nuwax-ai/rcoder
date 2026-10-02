@@ -156,6 +156,7 @@ async fn contract(store: &ToastyUserAppStore) {
                 app_id: app.app_id.clone(),
                 operation_id: "fixtureprod".into(),
                 resources: vec![],
+                directories: None,
             },
             development: Some(UserappDevDeletionReceipt {
                 runtime: BuilderDeletionSnapshot {
@@ -166,6 +167,9 @@ async fn contract(store: &ToastyUserAppStore) {
                     docker_bind_cleanup: false,
                 },
                 registry: None,
+                lease: None,
+                collaborators: Vec::new(),
+                directories: None,
             }),
         };
         for stage in [

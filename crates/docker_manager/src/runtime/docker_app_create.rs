@@ -385,6 +385,7 @@ impl DockerRuntime {
                 ));
             }
             shared_types::AppDeletionSnapshot {
+                directories: None,
                 app_id: app_id.into(),
                 operation_id: context.operation_id.clone(),
                 resources: vec![target.resource],
@@ -611,6 +612,7 @@ impl DockerRuntime {
             config: recreate_body_from_inspect(&live_config, host_config, image),
         };
         let snapshot = shared_types::AppDeletionSnapshot {
+            directories: None,
             app_id: target.context.app_id.clone(),
             operation_id: target.context.operation_id.clone(),
             resources: vec![target.resource.clone()],

@@ -47,3 +47,19 @@ python3 tests-e2e/tools/owner_recovery.py \
 该场景运行真实 supervisord、Pingap 和 HTTP 应用，覆盖 owner 强杀、重复停止、再次启动、同卷容器重建与产物态部署。只清理自己创建的容器，保留测试数据卷，报告包含镜像和容器 ID。它验证容器内管理链，不替代 RCoder/Java 全链路或远端 K8s 部署验收。
 
 完整的闲置回收链使用 `make test-e2e E2E_SUITE=compose_userapp_dev E2E_FILTER=userapp_dev_idle_recycle_owner_recovery`。它让隔离 RCoder 的真实清理器销毁 builder，保留旧 owner/journal 后再通过 RCoder ensure、Stop、构建 Start、重复 Stop、构建 Restart，并核验 HTTP 新内容和构建计数。配置与镜像前置见 [E2E 场景说明](../tests-e2e/tools/README.md#闲置回收后的-owner-恢复与重新构建)。该命令是验收入口，实际通过情况以对应报告为准。
+
+## 旧 builder 登记的显式修复
+
+早期版本可能已创建新 StatefulSet，但仍保留旧控制器 UID 的 PostgreSQL 项目登记，且没有运行时创建回执。正常 ensure 继续保留创建身份检查；此类登记通过现有显式采用接口修复：
+
+```bash
+curl -X POST "$RCODER_URL/api/v1/userapp/$APP_ID/builder/adopt" \
+  -H 'Content-Type: application/json' \
+  --data '{"lifecycle_id":"<当前应用生命周期>","request_id":"<本次修复的稳定请求身份>","expected_container_id":"<当前 builder Pod UID>"}'
+```
+
+调用方须按当前环境提供鉴权。`lifecycle_id` 使用平台当前登记，`expected_container_id` 是实时查询的 Pod UID；不能使用 Pod 名称、旧 UID 或其他生命周期。相同请求重试沿用原 `request_id` 和请求内容。
+
+接口重新核验 StatefulSet、Pod 所有权及当前 PVC UID，并在同一短事务中检查旧登记的项目/容器代次和 revision、旧 UID 的生命周期绑定、当前控制头，然后提交当前绑定、项目登记和本次 Adopt 结果。当前 UID 已有同生命周期绑定时保留其原操作身份；历史 Ensure 结果保持原样。源登记已变化、生命周期冲突、PVC 正在删除或身份读取失败时返回具体错误。
+
+这次修复只更新登记：不重建业务容器、不删除 PVC、不改变停止意图，也不制造旧进程退出或历史 PVC 连续性的证据。之后的 Stop/Restart 仍通过原运行时租约和执行域核验。当前出口支持 PostgreSQL 持久登记和已有 Pod；没有旧生命周期绑定等证据缺口仍需先恢复归属，不能按同名资源自动接管。
