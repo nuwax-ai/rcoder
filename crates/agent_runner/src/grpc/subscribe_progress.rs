@@ -545,9 +545,40 @@ mod tests {
                 .expect("subscribe_progress establishes");
             use tokio_stream::StreamExt as _;
             let mut stream = response.into_inner();
-            // 等待一段时间让转发任务真实 poll/挂起（心跳 30s tick 不必等到，
-            // spawn + 首 poll + SessionWorker 启动的事件已落 recorder 缓冲）。
-            let _ = tokio::time::timeout(Duration::from_secs(1), stream.next()).await;
+            // 等 subscribe 任务建好 session（轮询 SESSION_CACHE，最多 3s）。
+            let session_ready = 'ready: {
+                for _ in 0..30 {
+                    if SESSION_CACHE
+                        .view("dial9-evidence-session", |_, d| d.clone())
+                        .is_some()
+                    {
+                        break 'ready true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                false
+            };
+            assert!(session_ready, "subscribe 任务应在 3s 内创建 session");
+            // 真实唤醒链：push 一条消息 → command 通道 send → 唤醒 SessionWorker
+            // （worker 从 recv 挂起点被 wake）→ 订阅者通道投递 → 转发任务被 wake。
+            crate::service::push_session_update_with_project(
+                "proj-dial9-evidence",
+                "dial9-evidence-session",
+                shared_types::SessionNotify::SessionPromptEnd(shared_types::SessionPromptEnd {
+                    session_id: "dial9-evidence-session".to_string(),
+                    stop_reason: agent_client_protocol::schema::v1::StopReason::EndTurn,
+                    error_message: None,
+                    request_id: None,
+                }),
+            )
+            .await
+            .expect("push session update");
+            // 收到终态事件（转发任务被唤醒并投递）即证明整条唤醒链真实工作。
+            let got = tokio::time::timeout(Duration::from_secs(5), stream.next()).await;
+            assert!(
+                got.is_ok(),
+                "push 后 5s 内应经转发任务收到事件（wake 链断言）"
+            );
         });
         drop(runtime);
         recorder.graceful_shutdown(Duration::from_secs(5));
