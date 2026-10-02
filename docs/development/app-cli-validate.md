@@ -1,6 +1,6 @@
 # app-cli 项目配置校验
 
-`validate` 检查 UserApp 源码 workspace 的 manifest、服务依赖、端口分配和代理配置，不生成 lock、不构建、不启动服务。此命令当前位于开发分支；安装版本是否支持，以 `app-cli validate --help` 为准，不能仅依据版本号推断已发布。
+`validate` 检查 UserApp 源码 workspace 的 manifest、服务依赖、端口分配和代理配置，不生成 lock、不构建、不启动服务。app-cli 0.3.12 新增此命令；实际安装是否支持，以 `app-cli validate --help` 为准，不能仅依据源码版本号推断目标环境已升级。
 
 ```bash
 app-cli validate --workspace ./my-app
