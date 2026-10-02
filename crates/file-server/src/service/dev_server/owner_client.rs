@@ -58,24 +58,31 @@ pub(super) async fn observe_owner(address: &str) -> Result<OwnerProbe> {
     {
         return Ok(OwnerProbe::Legacy);
     }
-    let body: serde_json::Value = response.json().await.context("invalid owner response")?;
+    let body: shared_types::HttpResult<RuntimeIdentityView> =
+        response.json().await.context("invalid owner response")?;
     if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-        match body.get("code").and_then(serde_json::Value::as_str) {
-            Some("ERR_INITIALIZING") => return Ok(OwnerProbe::Initializing),
-            Some("ERR_PROTOCOL_UNSUPPORTED") => return Ok(OwnerProbe::Legacy),
-            _ => {}
+        // 0.3.10 的 run 形态按设计禁用 runtime API。
+        if body.code == "ERR_PROTOCOL_UNSUPPORTED" {
+            return Ok(OwnerProbe::Legacy);
         }
+        // 引导窗口的两种短暂形态都交给调用方有界等待：API 层门控的
+        // ERR_INITIALIZING，以及 kernel 缺席路径的 ERR_RECOVERY_REQUIRED
+        // （compose 闲置回收实测：回收后新 owner 引导期 start 被秒拒）。
+        // 其余 503 码保持显式错误，与 run 形态拒绝/未知服务区分（见
+        // observation_tests）。
+        if matches!(
+            body.code.as_str(),
+            "ERR_INITIALIZING" | "ERR_RECOVERY_REQUIRED"
+        ) {
+            return Ok(OwnerProbe::Initializing);
+        }
+        bail!("owner identity rejected with HTTP {status}: {}", body.code);
     }
     ensure!(
         status.is_success(),
         "owner identity rejected with HTTP {status}"
     );
-    let identity = serde_json::from_value(
-        body.get("data")
-            .cloned()
-            .context("owner identity missing")?,
-    )
-    .context("invalid owner identity")?;
+    let identity = body.data.context("owner identity missing")?;
     Ok(OwnerProbe::Ready(identity))
 }
 
@@ -223,42 +230,28 @@ impl OwnerClient {
                 .await?;
             let status = response.status();
             if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-                let initializing_body = response
-                    .json::<serde_json::Value>()
-                    .await
-                    .ok()
-                    .and_then(|body| serde_json::to_string(&body).ok());
-                let initializing = initializing_body
-                    .as_deref()
-                    .and_then(|text| {
-                        serde_json::from_str::<serde_json::Value>(text)
-                            .ok()
-                            .and_then(|body| {
-                                body.get("code")
-                                    .and_then(|code| code.as_str())
-                                    .map(str::to_owned)
-                            })
-                    })
-                    .is_some_and(|code| code == "ERR_INITIALIZING");
-                if initializing && tokio::time::Instant::now() < deadline {
+                // 503 body 仍是标准信封：解码失败本身即异常响应，如实上抛
+                // 而不是当"未知 body"吞掉（类型化后无需字符串匹配 code）。
+                let envelope: shared_types::HttpResult<serde_json::Value> =
+                    response
+                        .json()
+                        .await
+                        .context("decode owner initializing envelope")?;
+                if envelope.code == "ERR_INITIALIZING" && tokio::time::Instant::now() < deadline {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     continue;
                 }
                 anyhow::bail!(
-                    "owner recovery evidence unavailable (initializing window exceeded); body={}",
-                    initializing_body.unwrap_or_default()
+                    "owner recovery evidence unavailable (initializing window exceeded); code={}",
+                    envelope.code
                 );
             }
             if !status.is_success() {
                 anyhow::bail!("owner recovery rejected with HTTP {status}");
             }
-            let body: serde_json::Value = response.json().await?;
-            return serde_json::from_value(
-                body.get("data")
-                    .cloned()
-                    .context("recovery evidence missing")?,
-            )
-            .context("decode owner recovery evidence");
+            let envelope: shared_types::HttpResult<shared_types::RuntimeRecoveryView> =
+                response.json().await?;
+            return envelope.data.context("recovery evidence missing");
         }
     }
 
@@ -826,6 +819,8 @@ mod observation_tests {
     async fn explicit_run_mode_refusal_and_unknown_service_remain_distinct() {
         for (code, legacy) in [
             ("ERR_PROTOCOL_UNSUPPORTED", true),
+            // 引导期 kernel 缺席的窗口码 → 有界等待（compose 闲置回收）。
+            ("ERR_RECOVERY_REQUIRED", false),
             ("ERR_BACKEND_ERROR", false),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -835,7 +830,7 @@ mod observation_tests {
                 axum::routing::get(move || async move {
                     (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        axum::Json(serde_json::json!({"code":code})),
+                        axum::Json(serde_json::json!({"code":code,"message":"fixture"})),
                     )
                 }),
             );
@@ -845,6 +840,8 @@ mod observation_tests {
             let result = observe_owner(&address).await;
             if legacy {
                 assert!(matches!(result.unwrap(), OwnerProbe::Legacy));
+            } else if code == "ERR_RECOVERY_REQUIRED" {
+                assert!(matches!(result.unwrap(), OwnerProbe::Initializing));
             } else {
                 assert!(result.is_err());
             }

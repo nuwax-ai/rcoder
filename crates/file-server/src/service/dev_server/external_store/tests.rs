@@ -271,7 +271,11 @@ mod cases {
                     "/v1/runtime/identity",
                     axum::routing::get(move || {
                         let identity = identity.clone();
-                        async move { axum::Json(serde_json::json!({"data":identity})) }
+                        async move {
+                            axum::Json(
+                                serde_json::json!({"code":"0000","message":"ok","data":identity}),
+                            )
+                        }
                     }),
                 )
                 .route(

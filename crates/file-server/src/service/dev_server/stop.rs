@@ -1047,7 +1047,7 @@ mod external_stop_tests {
                 (
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
                     axum::Json(
-                        serde_json::json!({"success":false,"code":"ERR_PROTOCOL_UNSUPPORTED"}),
+                        serde_json::json!({"success":false,"code":"ERR_PROTOCOL_UNSUPPORTED","message":"run mode"}),
                     ),
                 )
             }),

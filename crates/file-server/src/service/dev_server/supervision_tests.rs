@@ -773,7 +773,7 @@ async fn run_mode_503_with_live_local_target_actually_stops_it() {
             (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 axum::Json(serde_json::json!({
-                    "success": false, "code": "ERR_PROTOCOL_UNSUPPORTED"
+                    "success": false, "code": "ERR_PROTOCOL_UNSUPPORTED", "message": "run mode"
                 })),
             )
         }),

@@ -414,12 +414,12 @@ mod tests {
                         if ready.load(Ordering::SeqCst) {
                             (
                                 axum::http::StatusCode::OK,
-                                axum::Json(serde_json::json!({"data": identity})),
+                                axum::Json(serde_json::json!({"code":"0000","message":"ok","data": identity})),
                             )
                         } else {
                             (
                                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                                axum::Json(serde_json::json!({"code": "ERR_INITIALIZING"})),
+                                axum::Json(serde_json::json!({"code": "ERR_INITIALIZING","message":"booting"})),
                             )
                         }
                     }
