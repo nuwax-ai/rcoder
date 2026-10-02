@@ -35,15 +35,20 @@ mod release_lock;
 mod types;
 mod validation;
 
-pub use discovery::{assemble_discovered, discover_projects, discover_projects_lenient};
+pub use discovery::{
+    DiscoveryReport, assemble_discovered, discover_projects, discover_projects_lenient,
+    discover_projects_report,
+};
 pub use error::{DiscoverError, LoadError, ManifestError};
 pub use release_lock::{ReleaseMetadata, build_release_lock, load_release_lock};
 pub use types::*;
 pub use validation::{
-    ValidationIssue, collect_topology_issues, collect_workspace_issues, manifest_file_of,
-    parse_project, parse_project_toml, parse_workspace, require_startup_probe_capability,
-    validate_project, validate_project_at, validate_release_startup, validate_service_id,
-    validate_topology, validate_workspace, validate_workspace_startup,
+    DiagnosticKind, ManifestDiagnostic, ValidationIssue, collect_topology_issues,
+    collect_workspace_issues, collect_workspace_startup_issues, manifest_file_of, parse_project,
+    parse_project_toml, parse_workspace, parse_workspace_for_inspection, parse_workspace_toml,
+    require_startup_probe_capability, validate_project, validate_project_at,
+    validate_release_startup, validate_service_id, validate_topology, validate_workspace,
+    validate_workspace_startup,
 };
 
 pub const SCHEMA_VERSION: u32 = 1;

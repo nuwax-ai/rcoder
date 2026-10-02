@@ -7,13 +7,16 @@ mod project;
 mod startup;
 mod topology;
 
-pub use issue::{ValidationIssue, manifest_file_of};
+pub use issue::{DiagnosticKind, ManifestDiagnostic, ValidationIssue, manifest_file_of};
+pub(crate) use parse::parse_project_for_inspection;
 pub use parse::{
-    parse_project, parse_project_toml, parse_workspace, validate_project, validate_workspace,
+    parse_project, parse_project_toml, parse_workspace, parse_workspace_for_inspection,
+    parse_workspace_toml, validate_project, validate_workspace,
 };
 pub use project::{collect_workspace_issues, validate_project_at, validate_service_id};
 pub use startup::{
-    require_startup_probe_capability, validate_release_startup, validate_workspace_startup,
+    collect_workspace_startup_issues, require_startup_probe_capability, validate_release_startup,
+    validate_workspace_startup,
 };
 pub use topology::{collect_topology_issues, validate_topology};
 

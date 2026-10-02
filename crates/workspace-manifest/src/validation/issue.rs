@@ -1,6 +1,8 @@
 //! 校验问题类型与渲染（agent 可按 file → 字段 → 建议直接修复）。
 
-#[derive(Debug, Clone)]
+use serde::Serialize;
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ValidationIssue {
     /// 出错的 manifest 文件相对路径（如 `backend-java-b/project.manifest.toml`）。
     pub file: Option<String>,
@@ -12,6 +14,22 @@ pub struct ValidationIssue {
     pub message: String,
     /// 修复建议（可直接执行的动作或示例值）。
     pub hint: Option<String>,
+}
+
+/// 诊断来源供只读检查选择退出码，不依赖错误文本的语言或措辞。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticKind {
+    Parse,
+    Validation,
+    Io,
+}
+
+/// 只读配置检查的诊断；不参与 manifest 或 release lock 的持久化格式。
+#[derive(Debug, Clone, Serialize)]
+pub struct ManifestDiagnostic {
+    pub kind: DiagnosticKind,
+    pub issue: ValidationIssue,
 }
 
 impl ValidationIssue {

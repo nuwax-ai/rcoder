@@ -231,6 +231,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "glob",
  "globset",
  "hex",
  "http-body-util",

@@ -113,7 +113,8 @@ pub async fn compile_and_validate(
     })
 }
 
-/// 编译 release lock 为生效 Pingap 配置 TOML —— 纯编译，不触碰文件系统、不调用 pingap 二进制。
+/// 只读编译 release lock 为生效 Pingap 配置 TOML，不落盘、不调用 pingap 二进制。
+/// custom/extend 会读取配置；原生 Pingap 校验可能解析显式 static upstream 的主机名。
 ///
 /// mode 分发(managed/extend/custom)→ `rcoder://` 地址解析 → 护栏 + 语义校验 → hash → 序列化。
 /// 供 `compile_and_validate`(运行时：再接 `pingap -t` + 原子落盘)与本地 `gen-lock` 预览共用，
@@ -128,6 +129,17 @@ pub async fn compile_effective_config(
     compile_effective_config_with_roots(workspace, release, &[], dev_profile).await
 }
 
+/// Configuration inspection shares every compilation rule, with a bounded native
+/// validation observation. Blocking resolver work may outlive this deadline;
+/// the short-lived validate executor must not wait for it during shutdown.
+pub async fn compile_effective_config_for_inspection(
+    workspace: &Path,
+    release: &ReleaseLock,
+    dev_profile: bool,
+) -> Result<(String, String)> {
+    compile_effective_config_core(workspace, release, &[], dev_profile, true).await
+}
+
 /// [`compile_effective_config`] 的可参数化核心（N02）：`extra_layout_roots`
 /// 为运行时布局根（pingap 运行目录等），与 workspace 规范化根并集做
 /// 路径护栏校验——三平台一致，不再按平台整段跳过。
@@ -136,6 +148,16 @@ pub async fn compile_effective_config_with_roots(
     release: &ReleaseLock,
     extra_layout_roots: &[PathBuf],
     dev_profile: bool,
+) -> Result<(String, String)> {
+    compile_effective_config_core(workspace, release, extra_layout_roots, dev_profile, false).await
+}
+
+async fn compile_effective_config_core(
+    workspace: &Path,
+    release: &ReleaseLock,
+    extra_layout_roots: &[PathBuf],
+    dev_profile: bool,
+    bounded_native_validation: bool,
 ) -> Result<(String, String)> {
     workspace_manifest::validate_release_startup(release)?;
     let mut layout_roots: Vec<PathBuf> = Vec::new();
@@ -150,7 +172,24 @@ pub async fn compile_effective_config_with_roots(
     };
     resolve_service_addresses(&mut config, release)?;
     validate_guardrails(&config, &layout_roots)?;
-    config.validate().context("PingapConfig::validate")?;
+    if bounded_native_validation {
+        let validation = tokio::task::spawn_blocking(move || {
+            config.validate().context("PingapConfig::validate")?;
+            Ok::<_, anyhow::Error>(config)
+        });
+        config = match tokio::time::timeout(std::time::Duration::from_secs(10), validation).await {
+            Ok(result) => result.map_err(std::io::Error::other)??,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "native Pingap configuration validation exceeded 10 seconds",
+                )
+                .into());
+            }
+        };
+    } else {
+        config.validate().context("PingapConfig::validate")?;
+    }
     // 期望 hash：与 pingap 加载同一 TOML 后 get_current_config().hash() 同算法
     //（descriptions 拼接 CRC32），供 reload 只读确认比对。
     let expected_hash = config
@@ -261,23 +300,11 @@ async fn load_user_config(workspace: &Path, release: &ReleaseLock) -> Result<Pin
     if !canonical.starts_with(&canonical_workspace) {
         anyhow::bail!("Pingap config path escapes workspace");
     }
-    let bytes = if tokio::fs::metadata(&canonical)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
-    {
-        pingap_config::read_all_config_files(&canonical.to_string_lossy())
-            .await
-            .context("read multi-file Pingap config")?
-    } else {
-        tokio::fs::read(&canonical)
-            .await
-            .with_context(|| format!("read Pingap config {}", canonical.display()))?
-    };
-    if bytes.len() > MAX_CONFIG_BYTES {
+    let source = super::config_source::read_config(&canonical, Path::new(relative)).await?;
+    if source.bytes.len() > MAX_CONFIG_BYTES {
         anyhow::bail!("Pingap source config exceeds {MAX_CONFIG_BYTES} bytes");
     }
-    PingapConfig::new(&bytes, true).context("parse user Pingap config")
+    source.parse().context("parse user Pingap config")
 }
 
 fn resolve_service_addresses(config: &mut PingapConfig, release: &ReleaseLock) -> Result<()> {
