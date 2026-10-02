@@ -259,7 +259,7 @@ jobs:
         include:
           - { target: x86_64-apple-darwin,      runner: macos-latest,  zig: false }
           - { target: aarch64-apple-darwin,     runner: macos-latest,  zig: false }
-          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest, zig: false }
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest, zig: true }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -297,12 +297,24 @@ jobs:
         shell: bash
         run: rustup show
 
+      # 随包 Pingap 与 app-cli 保持同一 Linux glibc 基线，不能由 Ubuntu
+      # 原生链接器把 libc 2.38/2.39 的强符号带进 Debian 12 用户的包。
+      - name: Install cargo-zigbuild
+        if: matrix.zig
+        run: pip3 install ziglang cargo-zigbuild
+
       # darwin arm64 runner 原生；x86_64-apple-darwin 用 --target 交叉（同 runner）
       - name: Build pingap (tls-rustls)
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          USE_ZIG: ${{ matrix.zig }}
         run: |
           set -euo pipefail
-          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
+          if [ "$USE_ZIG" = "true" ]; then
+            cargo zigbuild --release --no-default-features --features tls-rustls --target "${TARGET}.2.17"
+            cp "target/${TARGET}/release/pingap" pingap-out
+          elif [ "$TARGET" = "x86_64-apple-darwin" ]; then
             rustup target add x86_64-apple-darwin
             cargo build --release --no-default-features --features tls-rustls --target x86_64-apple-darwin
             cp target/x86_64-apple-darwin/release/pingap pingap-out
@@ -311,18 +323,40 @@ jobs:
             cp target/release/pingap pingap-out
           fi
 
+      - name: Verify Linux Pingap glibc baseline
+        if: runner.os == 'Linux'
+        run: |
+          python3 - <<'PY'
+          import re
+          import subprocess
+          versions = subprocess.check_output(["objdump", "--private-headers", "pingap-out"], text=True)
+          required = [tuple(map(int, value.split("."))) for value in re.findall(r"GLIBC_([0-9]+(?:\.[0-9]+)+)", versions)]
+          if not required or max(required) > (2, 17):
+              raise SystemExit(f"Pingap must require glibc <= 2.17; observed {sorted(set(required))}")
+          print("Pingap glibc baseline:", ".".join(map(str, max(required))))
+          PY
+
       - name: Smoke test pingap -V
         shell: bash
         run: |
           set -euo pipefail
           # 交叉产物（x86_64-apple-darwin）在 arm64 runner 上可执行（macOS
           # Rosetta 2 常开）；失败时降级为文件存在性检查 + 版本字符串提取
-          OUT=$(./pingap-out -V 2>/dev/null || strings pingap-out | grep -m1 '^${{ env.PINGAP_VERSION_EXPECTED }}' || true)
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            # 原生 Linux 上必须真正可执行，不用字符串提取掩盖链接失败。
+            OUT=$(./pingap-out -V)
+          else
+            OUT=$(./pingap-out -V 2>/dev/null || strings pingap-out | grep -m1 '^${{ env.PINGAP_VERSION_EXPECTED }}' || true)
+          fi
           if [ -n "$OUT" ]; then
             echo "$OUT"
             echo "$OUT" | grep -F "$PINGAP_VERSION_EXPECTED" || {
               echo "✗ pingap 版本与 pin 的 $PINGAP_VERSION_EXPECTED 不符"; exit 1; }
           else
+            if [ "${{ runner.os }}" = "Linux" ]; then
+              echo "✗ 原生 Linux pingap 未返回版本信息"
+              exit 1
+            fi
             echo "（交叉产物无法在 runner 执行——跳过 -V 断言，版本由构建 rev 保证）"
           fi
 
