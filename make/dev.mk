@@ -58,18 +58,20 @@ dev-restart: dev-build
 # 前提：docker-compose.yml 已挂载源码到 /app/src（首次需 make dev-restart 应用）。
 # 流程：容器内 cargo build --release --bin rcoder（增量）→ 替换 /app/bin/rcoder
 #       → docker restart 拉起新 binary。
-# dial9 恒编入（feature hotpath,dial9 + tokio_unstable，见 dev-hot-build.sh）。
+# feature 透传：构建 feature 集 = CARGO_FEATURES（与 dev-restart 同源；默认
+# otel,debug,hotpath,dial9），热编译不静默丢弃已选 feature（如 hotpath-mcp）。
+# 附加 feature 示例：make dev-hot CARGO_FEATURES='--features otel,debug,hotpath,hotpath-mcp,dial9'
 dev-hot:
-	@echo "🔥 容器内热编译 rcoder..."
+	@echo "🔥 容器内热编译 rcoder（features: $(CARGO_FEATURES)）..."
 	@DEV_CID=$$($(RCODER_COMPOSE) ps -q rcoder); \
 	if [ -z "$$DEV_CID" ]; then \
 		echo "❌ rcoder 容器未运行，请先 make dev-up"; exit 1; \
 	fi; \
-	docker exec $$DEV_CID bash /app/src/docker/dev-hot-build.sh && \
+	docker exec $$DEV_CID bash /app/src/docker/dev-hot-build.sh "$(CARGO_FEATURES)" && \
 	echo "🔄 重启 rcoder 进程（拉起新 binary）..." && \
 	docker restart $$DEV_CID >/dev/null && \
 	echo "✅ 热编译完成（日志: docker logs -f $$DEV_CID）" && \
-	echo "🔬 dial9 恒编入（运行期默认关）：make dial9-on 启用 / make dial9-off 关闭 / make dial9-view 离线查看 trace"
+	echo "🔬 dial9 运行期默认关：make dial9-on 启用 / make dial9-off 关闭 / make dial9-view 离线查看 trace"
 
 ## 启用 dial9 事件级 Tokio tracing（重建 rcoder 容器注入 DIAL9_ENABLED=1；
 ## binary 恒编入 dial9 feature，复用 target-unstable volume 编译产物，不触发

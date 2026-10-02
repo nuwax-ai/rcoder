@@ -28,6 +28,7 @@ hotpath-mcp = ["hotpath", "hotpath/hotpath-mcp"]
 # dial9 事件级 Tokio tracing（本地开发专用；编译须配 RUSTFLAGS="--cfg tokio_unstable"
 # 才有全量 task 覆盖——见 make/dev.mk dial9-on 与 docker/dev-hot-build.sh）。
 # 运行期 DIAL9_ENABLED 开关（默认关=纯 passthrough runtime，零开销）。
+# rcoder-obs/dial9：业务 spawn 点经门面插桩（feature 关=直通 Tokio）。
 dial9 = ["dep:dial9", "rcoder-obs/dial9"]
 
 # Kubernetes 支持：启用 Kubernetes 运行时模式
@@ -83,7 +84,7 @@ lockmap = { workspace = true }
 tempfile = { workspace = true }
 
 # 本地性能剖析（hotpath-rs）：非 optional + 零特性 = 零编译开销；上方 hotpath* feature 开内部特性
-hotpath = { workspace = true }
+hotpath = { workspace = true, features = ["tokio"] }
 
 # HTTP server
 axum = { workspace = true, features = ["multipart", "ws"] }

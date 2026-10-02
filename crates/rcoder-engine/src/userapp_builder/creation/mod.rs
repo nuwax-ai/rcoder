@@ -16,8 +16,16 @@ use tokio::{
 };
 
 // An optimization only. Database operation state remains authoritative across replicas.
-static SIGNALS: LazyLock<Mutex<HashMap<String, watch::Sender<u64>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+// hotpath 锁观测（T2.3 仅此登记表选点）：mutex! 关闭时原样返回原生 std::sync::Mutex，
+// 开启时包装记录锁等待（wait）与持锁（acquire）时长；lock/poison 语义与调用点不变，
+// 锁作用域与 lease 所有权不因观测改变（OwnedMutexGuard/DashMap 不接，见方案 D2-lock）。
+use hotpath::wrap::std::sync::Mutex as ObsMutex;
+static SIGNALS: LazyLock<ObsMutex<HashMap<String, watch::Sender<u64>>>> = LazyLock::new(|| {
+    hotpath::mutex!(
+        Mutex::new(HashMap::new()),
+        label = "userapp_builder_signals"
+    )
+});
 
 pub(super) async fn ensure(
     state: &AppState,

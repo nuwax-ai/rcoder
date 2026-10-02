@@ -48,6 +48,8 @@ hotpath-mcp = ["hotpath", "hotpath/hotpath-mcp"]
 
 # dial9 事件级 Tokio tracing（本地开发专用；编译须配 RUSTFLAGS="--cfg tokio_unstable"
 # 才有全量 task 覆盖）。运行期 DIAL9_ENABLED 开关（默认关=纯 passthrough，零开销）。
+# 业务 spawn 点经 rcoder-obs 门面插桩；agent_abstraction/dial9 让 ACP 连接任务
+# 一并接入（runner 不依赖 engine，经 abstraction 转发）。
 dial9 = ["dep:dial9", "rcoder-obs/dial9", "agent_abstraction/dial9"]
 
 [lints]
@@ -161,7 +163,7 @@ arc-swap = { workspace = true }
 tokio-tungstenite = { workspace = true }
 
 # 本地性能剖析（hotpath-rs）：非 optional，feature 由上方 hotpath* 打开内部特性
-hotpath = { workspace = true }
+hotpath = { workspace = true, features = ["tokio"] }
 
 # Unix 信号处理（用于僵尸进程回收，仅 Unix 平台）
 [target.'cfg(unix)'.dependencies]

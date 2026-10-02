@@ -7,6 +7,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// hotpath 通道观测稳定别名（与 session_cache.rs 的 channel! 构造同源）；
+// wrapper Receiver 的 recv/try_recv 语义与原生一致。
+use hotpath::wrap::tokio::sync::mpsc as obs_mpsc;
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use tokio::sync::{mpsc, oneshot};
@@ -20,7 +23,7 @@ use super::{
 
 pub(crate) struct SessionWorker {
     max_size: usize,
-    command_rx: mpsc::Receiver<SessionCommand>,
+    command_rx: obs_mpsc::Receiver<SessionCommand>,
     // 🎯 多订阅者注册表（与 SessionData 共享）
     connections: ConnectionRegistry,
     /// conn_id 分配器（与 SessionData 共享；Subscribe 命令在 worker 内分配）
@@ -30,7 +33,7 @@ pub(crate) struct SessionWorker {
 impl SessionWorker {
     pub(super) fn spawn(
         max_size: usize,
-        command_rx: mpsc::Receiver<SessionCommand>,
+        command_rx: obs_mpsc::Receiver<SessionCommand>,
         connections: ConnectionRegistry,
         next_conn_id: Arc<AtomicU64>,
     ) -> tokio::task::JoinHandle<()> {

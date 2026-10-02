@@ -14,6 +14,11 @@ use shared_types::{SessionMessageType, UnifiedSessionMessage};
 use std::sync::Arc;
 use tracing::{Instrument, error, info, warn};
 
+// hotpath 通道观测稳定别名：hotpath feature（经 feature 统一）开启时是插桩
+// wrapper，关闭时即原生 tokio 类型——类型由依赖自身的 feature 决定，禁止按
+// 本 crate cfg 手工切换（specs T2.1 裁定）。
+use hotpath::wrap::tokio::sync::mpsc as obs_mpsc;
+
 /// 创建基于 gRPC 的 SSE 代理流
 ///
 /// 通过 gRPC `SubscribeProgress` 方法订阅 agent_runner 的进度事件，
@@ -51,7 +56,11 @@ pub async fn create_grpc_sse_stream(
     last_seq: u64,
 ) -> impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
 {
-    let (tx, rx) = tokio::sync::mpsc::channel(100);
+    // 容量 100 不变；hotpath channel! 关闭时原样返回原生通道（零插桩），
+    // 开启时包装 Sender/Receiver 端点（send/recv 记排队延迟 delay）。
+    // wrapper 重建内部通道，表达式必须内联构造（clone 先于包装的端点会脱管）。
+    let (tx, mut rx): (obs_mpsc::Sender<_>, obs_mpsc::Receiver<_>) =
+        hotpath::channel!(tokio::sync::mpsc::channel(100), label = "sse_client_events");
 
     // SSE 在线订阅 gauge（RAII：spawn 的任务被 abort / 任何 return 路径都会 -1）
     struct SubscriptionGuard;
@@ -256,7 +265,10 @@ pub async fn create_grpc_sse_stream(
         .instrument(sse_span),
     );
 
-    tokio_stream::wrappers::ReceiverStream::new(rx)
+    // wrapper Receiver 非 tokio 原生类型，ReceiverStream 不再适用；poll_fn 薄适配
+    // 逐次委托 poll_recv：队满背压、关闭（None 终态）、游标与 panic 语义与
+    // ReceiverStream 一致（两者 poll_next 实现同为 poll_recv）。
+    futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx))
 }
 
 /// 转发一个 ProgressEvent 到 HTTP SSE channel。
@@ -266,7 +278,7 @@ pub async fn create_grpc_sse_stream(
 /// 否则后台 task 退出后客户端会 hang（broadcast `Receiver` 不会 Closed，因为 `SharedStream`
 /// 始终持有 sender）。
 async fn forward_to_client(
-    tx: &tokio::sync::mpsc::Sender<Result<axum::response::sse::Event, std::convert::Infallible>>,
+    tx: &obs_mpsc::Sender<Result<axum::response::sse::Event, std::convert::Infallible>>,
     ev: &shared_types::grpc::ProgressEvent,
     session_id: &str,
     client_last_seq: &mut u64,
@@ -432,7 +444,9 @@ mod tests {
 
     #[tokio::test]
     async fn full_subscriber_does_not_block_forwarder() {
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        // 测试通道同样经 channel! 构造：hotpath 开启时与生产同型（wrapper），
+        // 关闭时原样返回原生通道——避免 feature 统一后测试与签名错配。
+        let (tx, _rx) = hotpath::channel!(tokio::sync::mpsc::channel(1));
         tx.try_send(Ok(axum::response::sse::Event::default().data("occupied")))
             .unwrap();
         let ev = shared_types::grpc::ProgressEvent::default();
@@ -451,9 +465,9 @@ mod tests {
 
     #[tokio::test]
     async fn forward_to_client_continues_for_non_terminal_event() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<
+        let (tx, mut rx) = hotpath::channel!(tokio::sync::mpsc::channel::<
             Result<axum::response::sse::Event, std::convert::Infallible>,
-        >(10);
+        >(10));
         let mut last_seq = 0_u64;
         let ev = make_event("AgentSessionUpdate", 5);
 
@@ -465,9 +479,9 @@ mod tests {
 
     #[tokio::test]
     async fn forward_to_client_stops_on_terminal_event() {
-        let (tx, _rx) = tokio::sync::mpsc::channel::<
+        let (tx, _rx) = hotpath::channel!(tokio::sync::mpsc::channel::<
             Result<axum::response::sse::Event, std::convert::Infallible>,
-        >(10);
+        >(10));
         let mut last_seq = 10_u64;
         let ev = make_prompt_end("SessionPromptEnd", "end_turn", 0); // turn 终态 + seq=0 合成消息
 
@@ -481,9 +495,9 @@ mod tests {
 
     #[tokio::test]
     async fn forward_to_client_stops_when_client_disconnected() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<
+        let (tx, rx) = hotpath::channel!(tokio::sync::mpsc::channel::<
             Result<axum::response::sse::Event, std::convert::Infallible>,
-        >(10);
+        >(10));
         drop(rx); // 模拟 HTTP 客户端断开
         let mut last_seq = 0;
         let ev = make_event("AgentSessionUpdate", 5);
@@ -541,9 +555,9 @@ mod tests {
     async fn forward_to_client_continues_on_cancelled() {
         // cancelled = 用户连发消息自动取消当前任务：常态事件，不关流，
         // 流保留给随后的新任务实时投递
-        let (tx, _rx) = tokio::sync::mpsc::channel::<
+        let (tx, _rx) = hotpath::channel!(tokio::sync::mpsc::channel::<
             Result<axum::response::sse::Event, std::convert::Infallible>,
-        >(10);
+        >(10));
         let mut last_seq = 10_u64;
         let ev = make_prompt_end("SessionPromptEnd", "cancelled", 11);
 
@@ -554,9 +568,9 @@ mod tests {
 
     #[tokio::test]
     async fn forward_to_client_stops_on_error() {
-        let (tx, _rx) = tokio::sync::mpsc::channel::<
+        let (tx, _rx) = hotpath::channel!(tokio::sync::mpsc::channel::<
             Result<axum::response::sse::Event, std::convert::Infallible>,
-        >(10);
+        >(10));
         let mut last_seq = 10_u64;
         let ev = make_prompt_end("SessionPromptEnd", "error", 0);
 
@@ -567,9 +581,9 @@ mod tests {
     #[tokio::test]
     async fn forward_to_client_stops_on_stream_ended() {
         // rcoder 合成的流替换信号必须关流，否则客户端转发 task hang
-        let (tx, _rx) = tokio::sync::mpsc::channel::<
+        let (tx, _rx) = hotpath::channel!(tokio::sync::mpsc::channel::<
             Result<axum::response::sse::Event, std::convert::Infallible>,
-        >(10);
+        >(10));
         let mut last_seq = 10_u64;
         let ev = make_prompt_end("SessionPromptEnd", "stream_ended", 0);
 

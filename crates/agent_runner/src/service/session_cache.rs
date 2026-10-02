@@ -6,6 +6,7 @@ use crate::service::PERMISSION_MANAGER;
 use crate::{SessionNotify, UnifiedSessionMessage};
 use anyhow::Result;
 use dashmap::DashMap;
+use hotpath::wrap::tokio::sync::mpsc as obs_mpsc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::mpsc;
@@ -125,7 +126,7 @@ type ConnectionRegistry = Arc<DashMap<u64, ConnectionState>>;
 const MAX_SUBSCRIBERS: usize = 8;
 
 pub struct SessionData {
-    command_tx: mpsc::Sender<SessionCommand>,
+    command_tx: obs_mpsc::Sender<SessionCommand>,
     // 🎯 多订阅者注册表（见 ConnectionRegistry 文档）+ 单调 conn_id 分配器
     connections: ConnectionRegistry,
     next_conn_id: Arc<AtomicU64>,
@@ -153,7 +154,12 @@ impl SessionData {
         );
 
         let channel_start = std::time::Instant::now();
-        let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_BUFFER_SIZE);
+        // 容量 1000（COMMAND_CHANNEL_BUFFER_SIZE）不变；hotpath channel! 关闭时
+        // 原样返回原生通道，开启时包装端点记录排队延迟（/channels label）。
+        let (command_tx, command_rx): (obs_mpsc::Sender<_>, obs_mpsc::Receiver<_>) = hotpath::channel!(
+            mpsc::channel(COMMAND_CHANNEL_BUFFER_SIZE),
+            label = "session_worker_commands"
+        );
         debug!(
             "[SessionData::new] Channel creation took: {:?}",
             channel_start.elapsed()
