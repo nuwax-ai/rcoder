@@ -55,9 +55,14 @@ pub(super) fn staging_lease(ws: &Path) -> AppResult<StagingLease> {
 #[derive(Debug)]
 pub struct PreparedRun {
     // Field order releases the directory before the lease.
-    staging: tempfile::TempDir,
+    staging: Option<tempfile::TempDir>,
     _lease: StagingLease,
     workspace: PathBuf,
+    requested_release_id: String,
+    /// The activated `.run` already declares the requested release and the
+    /// registered zip is gone: activation is a verified no-op instead of a
+    /// directory swap.
+    reuse_activated: bool,
 }
 
 impl PreparedRun {
@@ -65,6 +70,31 @@ impl PreparedRun {
     /// two renames: cancellation cannot leave a half-promoted directory.
     pub fn activate(mut self) -> AppResult<PathBuf> {
         let run = self.workspace.join(RUN_DIR);
+        if self.reuse_activated {
+            // Re-verify at the commit boundary: identity was checked while the
+            // preparation lease was held, but the window before activation may
+            // have seen another actor replace `.run`.
+            let lock = std::fs::read_to_string(run.join("release.lock.toml")).map_err(|e| {
+                AppError::business(format!(
+                    "activated run directory lost its release lock: {e}"
+                ))
+            })?;
+            let release_id = shared_types::load_release_lock(&lock)
+                .map_err(|e| {
+                    AppError::business(format!(
+                        "activated run directory has an unreadable release lock: {e}"
+                    ))
+                })?
+                .release_id;
+            if release_id != self.requested_release_id {
+                return Err(AppError::business(format!(
+                    "activated run directory now holds release {release_id}"
+                )));
+            }
+            self.staging = None;
+            self._lease.release()?;
+            return Ok(run);
+        }
         let previous = self.workspace.join(PREVIOUS_DIR);
         let had_run = run.try_exists()?;
         if had_run {
@@ -73,7 +103,11 @@ impl PreparedRun {
             }
             std::fs::rename(&run, &previous)?;
         }
-        if let Err(error) = std::fs::rename(self.staging.path(), &run) {
+        let staging = self
+            .staging
+            .take()
+            .expect("fresh preparation always owns a staging directory");
+        if let Err(error) = std::fs::rename(staging.path(), &run) {
             if had_run && let Err(restore) = std::fs::rename(&previous, &run) {
                 return Err(AppError::system(format!(
                     "activate dev directory: {error}; restore failed: {restore}"
@@ -85,6 +119,7 @@ impl PreparedRun {
         }
         // Closing alone can leave flock held by a transient fork/dup. The
         // staging path has been promoted, so cleanup no longer needs the lease.
+        drop(staging);
         self._lease.release()?;
         Ok(run)
     }
@@ -102,6 +137,20 @@ pub async fn prepare_run_dir(ws: &Path, release_id: &str) -> AppResult<PreparedR
             Ok(m) if m.is_file() => {}
             Ok(_) => return Err(AppError::resource("deploy package is not a file")),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // The registered zip can be cleaned after activation. When the
+                // activated `.run` still carries the requested release (both
+                // required manifests present), starting it is the recovery
+                // path — do not guess a different input or demand the cache.
+                // `activate` re-verifies the identity at the commit boundary.
+                if activated_run_matches(&workspace, &release_id)? {
+                    return Ok(PreparedRun {
+                        staging: None,
+                        _lease: lease,
+                        workspace,
+                        requested_release_id: release_id,
+                        reuse_activated: true,
+                    });
+                }
                 return Err(AppError::resource(format!(
                     "deploy package missing: {}",
                     zip_path.display()
@@ -136,13 +185,37 @@ pub async fn prepare_run_dir(ws: &Path, release_id: &str) -> AppResult<PreparedR
             }
         }
         Ok(PreparedRun {
-            staging,
+            staging: Some(staging),
             _lease: lease,
             workspace,
+            requested_release_id: release_id,
+            reuse_activated: false,
         })
     })
     .await
     .map_err(|e| AppError::system(format!("dev preparation task failed: {e}")))?
+}
+
+/// Identity check for the cache-missing recovery path: the activated `.run`
+/// must declare exactly the requested release and still hold both manifests a
+/// fresh package would carry.
+fn activated_run_matches(workspace: &Path, release_id: &str) -> AppResult<bool> {
+    let run = workspace.join(RUN_DIR);
+    for required in ["workspace.manifest.toml", "release.lock.toml"] {
+        match std::fs::metadata(run.join(required)) {
+            Ok(m) if m.is_file() => {}
+            _ => return Ok(false),
+        }
+    }
+    let lock = match std::fs::read_to_string(run.join("release.lock.toml")) {
+        Ok(lock) => lock,
+        Err(_) => return Ok(false),
+    };
+    let declared = match shared_types::load_release_lock(&lock) {
+        Ok(lock) => lock.release_id,
+        Err(_) => return Ok(false),
+    };
+    Ok(declared == release_id)
 }
 
 #[cfg(test)]
@@ -254,6 +327,104 @@ mod tests {
         assert!(ws.path().join(RUN_DIR).join("start.sh").is_file());
         assert!(!ws.path().join(PREVIOUS_DIR).exists());
     }
+
+    /// 完整可解析 lock 的制品（真实构建产物形态）。
+    const FULL_LOCK_FIXTURE: &str =
+        include_str!("../../../../workspace-manifest/tests/fixtures/lock_v1.toml");
+
+    fn make_full_package(dir: &Path, release_id: &str) -> PathBuf {
+        let builds = dir.join(WORKSPACE_BUILDS_DIR);
+        std::fs::create_dir_all(&builds).expect("builds dir");
+        let zip_path = builds.join(format!("workspace-package-{release_id}.zip"));
+        let file = std::fs::File::create(&zip_path).expect("zip file");
+        let mut writer = ::zip::ZipWriter::new(file);
+        let options = ::zip::write::SimpleFileOptions::default()
+            .compression_method(::zip::CompressionMethod::Stored);
+        let lock = FULL_LOCK_FIXTURE.replace("01923a5f8c217abc9def0123456789ab", release_id);
+        for (name, content) in [
+            ("workspace.manifest.toml", "schema_version = 1\n"),
+            ("release.lock.toml", lock.as_str()),
+            ("start.sh", "#!/bin/sh\n"),
+        ] {
+            writer.start_file(name, options).expect("start entry");
+            writer.write_all(content.as_bytes()).expect("write entry");
+        }
+        writer.finish().expect("finish zip");
+        zip_path
+    }
+
+    /// 注册 zip 被清理后，激活 `.run` 仍声明同一 release：准备与激活都
+    /// 复用现有目录（内容原样保留，不产生 .previous）。
+    #[tokio::test]
+    async fn missing_zip_reuses_activated_run_identity() {
+        let ws = tempfile::tempdir().expect("ws");
+        let zip = make_full_package(ws.path(), "rel-cache-1");
+        prepare_run_dir(ws.path(), "rel-cache-1")
+            .await
+            .expect("first")
+            .activate()
+            .expect("activate");
+        std::fs::write(ws.path().join(RUN_DIR).join("data.txt"), "kept").expect("runtime data");
+        std::fs::remove_file(&zip).expect("cache cleaned");
+
+        let run = prepare_run_dir(ws.path(), "rel-cache-1")
+            .await
+            .expect("recovery prepare")
+            .activate()
+            .expect("recovery activate reuses the activated directory");
+        assert_eq!(
+            std::fs::read_to_string(run.join("data.txt")).expect("data"),
+            "kept"
+        );
+        assert!(!ws.path().join(PREVIOUS_DIR).exists());
+    }
+
+    /// 缓存缺失且激活目录声明别的 release：保持明确失败，`.run` 原样。
+    #[tokio::test]
+    async fn missing_zip_with_foreign_release_still_fails() {
+        let ws = tempfile::tempdir().expect("ws");
+        let zip = make_full_package(ws.path(), "rel-cache-1");
+        prepare_run_dir(ws.path(), "rel-cache-1")
+            .await
+            .expect("first")
+            .activate()
+            .expect("activate");
+        std::fs::remove_file(&zip).expect("cache cleaned");
+
+        let err = prepare_run_dir(ws.path(), "rel-cache-2")
+            .await
+            .expect_err("foreign identity must fail");
+        assert!(err.to_string().contains("deploy package missing"));
+        assert!(ws.path().join(RUN_DIR).join("start.sh").is_file());
+    }
+
+    /// 复用路径在激活（commit 边界）重核身份：窗口内 `.run` 被换成别的
+    /// release 时激活失败，不启动身份不明的内容。
+    #[tokio::test]
+    async fn reuse_rechecks_identity_at_commit_boundary() {
+        let ws = tempfile::tempdir().expect("ws");
+        let zip = make_full_package(ws.path(), "rel-cache-1");
+        prepare_run_dir(ws.path(), "rel-cache-1")
+            .await
+            .expect("first")
+            .activate()
+            .expect("activate");
+        std::fs::remove_file(&zip).expect("cache cleaned");
+        let prepared = prepare_run_dir(ws.path(), "rel-cache-1")
+            .await
+            .expect("recovery prepare");
+
+        // 窗口内另一个角色把 `.run` 换成别的 release。
+        let swapped =
+            FULL_LOCK_FIXTURE.replace("01923a5f8c217abc9def0123456789ab", "rel-swapped-9");
+        std::fs::write(ws.path().join(RUN_DIR).join("release.lock.toml"), swapped)
+            .expect("swap lock");
+
+        let err = prepared
+            .activate()
+            .expect_err("swapped identity must be refused at commit boundary");
+        assert!(err.to_string().contains("rel-swapped-9"));
+    }
     #[tokio::test]
     async fn invalid_package_cleans_its_staging() {
         let ws = tempfile::tempdir().expect("ws");
@@ -299,7 +470,15 @@ mod tests {
         assert!(ws.path().join(RUN_DIR).join("marker").exists());
         // A sweep while preparation is active must leave its directory intact.
         super::super::hygiene::sweep_workspace(ws.path(), &ws.path().join("logs"), 5, 7).await;
-        assert!(prepared.staging.path().join("release.lock.toml").exists());
+        assert!(
+            prepared
+                .staging
+                .as_ref()
+                .expect("fresh preparation owns staging")
+                .path()
+                .join("release.lock.toml")
+                .exists()
+        );
         *lifecycle.lock().await += 1;
         let committed = task
             .commit_start(&lifecycle, generation, async move {

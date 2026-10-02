@@ -23,8 +23,12 @@ pub(super) enum InitialAction {
     Prepared(PreparedActivation),
     /// Explicit Source switches back from .run to the canonical source root.
     Source,
-    /// 卷上既有 release.lock（Pod 重建恢复）：跳过下载直接编排。
-    Existing,
+    /// 卷上既有 release.lock（Pod 重建恢复/激活目录复用）：跳过下载直接
+    /// 编排。携带确认的执行目录——artifact 目标可能与当前执行目录不同
+    ///（源码态 owner 切回 `.run`），编排必须落在该目录上。
+    Existing {
+        workspace: std::path::PathBuf,
+    },
     /// 运行控制 stop：停止业务服务（保持管理面）。携带受理操作 ID——
     /// 从受理、排队、执行到终态完整传递（B01：Stop 不设 current，按
     /// 自身 ID 收束，绝不依赖"最近一次"全局值）。
@@ -211,8 +215,12 @@ pub(super) async fn record_uncertain_control(
 
 /// Prepare while the existing supervisor continues serving. Failed requests do
 /// not leave this wait loop and never reach the stop/activate boundary.
+/// `current_workspace` is the execution directory this loop is presently
+/// orchestrating (may differ from the owner's serve invocation directory after
+/// an artifact switch).
 pub(super) async fn next_prepared(
-    args: &RuntimeArgs,
+    owner_args: &RuntimeArgs,
+    current_workspace: &std::path::Path,
     state: &Arc<ServerState>,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<DeployRequest>,
 ) -> Option<InitialAction> {
@@ -231,15 +239,17 @@ pub(super) async fn next_prepared(
             hold_unconfirmed(state, format!("persist deployment execution: {error:#}")).await;
             return None;
         }
-        let workspace =
-            match resolved_execution_workspace(&args.workspace, request.execution_target, state) {
-                Ok(workspace) => workspace,
-                Err(error) => {
-                    fail_preparation(state, format!("resolve deployment workspace: {error:#}"))
-                        .await;
-                    continue;
-                }
-            };
+        let workspace = match resolved_execution_workspace(
+            &owner_args.workspace,
+            request.execution_target,
+            state,
+        ) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                fail_preparation(state, format!("resolve deployment workspace: {error:#}")).await;
+                continue;
+            }
+        };
         let target = request.execution_target;
         let pg = request.run_pg.clone();
         let state_clone = state.clone();
@@ -276,14 +286,18 @@ pub(super) async fn next_prepared(
                     pg,
                 }));
             }
-            Ok(None) => match crate::manifest::read_release_lock(&args.workspace) {
+            Ok(None) => match crate::manifest::read_release_lock(&workspace) {
                 Ok(release) => {
                     state.set_release(release);
                     // The artifact cache only proves that files are unchanged.
                     // Explicit operation credentials still require a business
                     // restart; publishing Running here would acknowledge a
                     // configuration that the serving processes never received.
-                    if pg.is_some() {
+                    // A resolved target different from the current execution
+                    // directory (source owner switching to a reused `.run`)
+                    // must re-orchestrate on that directory, not record a
+                    // no-op success while something else keeps serving.
+                    if pg.is_some() || current_workspace != workspace {
                         if let Err(error) = state.complete_stage() {
                             fail_preparation(
                                 state,
@@ -294,7 +308,7 @@ pub(super) async fn next_prepared(
                         }
                         state.set_pending_dev_profile(target == Some(ExecutionTarget::Source));
                         state.set_pending_run_config(pg);
-                        return Some(InitialAction::Existing);
+                        return Some(InitialAction::Existing { workspace });
                     }
                     if let Err(error) = state
                         .complete_stage()
@@ -819,7 +833,10 @@ pub(super) async fn server_loop(
                 }
                 None
             }
-            InitialAction::Existing => None,
+            InitialAction::Existing { workspace } => {
+                args.workspace = workspace;
+                None
+            }
         };
         if state.is_cancelled() {
             return Ok(());
@@ -1044,7 +1061,7 @@ pub(super) async fn server_loop(
             // 不再只能等 Idle）。锁序与 Idle 分支一致：deploy 先、control 后。
             let mut control_rx = state.control_rx.lock().await;
             let next = tokio::select! {
-                maybe = next_prepared(owner_args, state, &mut hot_rx) => match maybe {
+                maybe = next_prepared(owner_args, &args.workspace, state, &mut hot_rx) => match maybe {
                     Some(action) => Next::Redeploy(action),
                     None => Next::Exit,
                 },
@@ -1220,7 +1237,7 @@ pub(super) async fn server_loop(
                     return Ok(());
                 }
             }},
-            maybe = next_prepared(owner_args, state, &mut hot_rx) => match maybe {
+            maybe = next_prepared(owner_args, &args.workspace, state, &mut hot_rx) => match maybe {
                 Some(action) => {
                     tracing::info!("server: hot deploy received, stopping current services");
                     state.ready.set_ready(false);

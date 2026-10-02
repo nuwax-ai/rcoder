@@ -753,7 +753,7 @@ async fn business_session_inner(
             );
         }
         if desired == Some(shared_types::DesiredState::Stopped)
-            && matches!(first_request, Some(InitialAction::Existing))
+            && matches!(first_request, Some(InitialAction::Existing { .. }))
         {
             first_request = None;
             tracing::info!(
@@ -1331,7 +1331,7 @@ async fn serve_supervised_worker(
             );
         }
         if desired == Some(shared_types::DesiredState::Stopped)
-            && matches!(first_request, Some(InitialAction::Existing))
+            && matches!(first_request, Some(InitialAction::Existing { .. }))
         {
             first_request = None;
             tracing::info!(
@@ -1659,8 +1659,10 @@ pub(super) async fn assemble_runtime_kernel(
                 if let Some(path) = &local_path
                     && !path.exists()
                 {
-                    tracing::error!(
-                        "runtime dispatch: registered artifact {artifact_id} not found at {}",
+                    tracing::warn!(
+                        "runtime dispatch: registered artifact {artifact_id} not found at {}; \
+                         recovery continues only if the activated run directory still \
+                         declares this release",
                         path.display()
                     );
                 }
@@ -2170,7 +2172,9 @@ pub(super) async fn initialize_startup(
             if fresh {
                 state.set_release(release);
                 state.set_phase(ServerPhase::Orchestrating);
-                return Ok(Some(InitialAction::Existing));
+                return Ok(Some(InitialAction::Existing {
+                    workspace: args.workspace.clone(),
+                }));
             }
             state.set_release(release);
             state.set_phase(ServerPhase::Failed(
@@ -2193,7 +2197,9 @@ pub(super) async fn initialize_startup(
         // its existing boundary so a process stop cannot invent an interrupted
         // activation. MigrationJournal independently fences unknown SQL work.
         state.set_phase(ServerPhase::Orchestrating);
-        return Ok(Some(InitialAction::Existing));
+        return Ok(Some(InitialAction::Existing {
+            workspace: args.workspace.clone(),
+        }));
     }
     if env_deploy_requested(state) {
         let request = crate::deploy::request_from_env()?;
@@ -2215,7 +2221,9 @@ pub(super) async fn initialize_startup(
         return Ok(Some(InitialAction::Deploy(request)));
     }
     if tokio::fs::try_exists(args.workspace.join("release.lock.toml")).await? {
-        return Ok(Some(InitialAction::Existing));
+        return Ok(Some(InitialAction::Existing {
+            workspace: args.workspace.clone(),
+        }));
     }
     Ok(None)
 }

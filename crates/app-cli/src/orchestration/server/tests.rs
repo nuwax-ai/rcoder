@@ -803,7 +803,7 @@ format = "jsonl"
         };
         assert!(matches!(
             initialize_startup(&args, &restarted).await.unwrap(),
-            Some(InitialAction::Existing)
+            Some(InitialAction::Existing { .. })
         ));
         let op = restarted.deploy_status().operation.unwrap();
         assert_eq!(op.operation_id, "hot-b");
@@ -869,7 +869,7 @@ format = "jsonl"
         };
         assert!(matches!(
             initialize_startup(&args, &first).await.unwrap(),
-            Some(InitialAction::Existing)
+            Some(InitialAction::Existing { .. })
         ));
         first.set_release(artifact);
         first.complete_running().unwrap();
@@ -886,7 +886,7 @@ format = "jsonl"
         *restarted.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
         assert!(matches!(
             initialize_startup(&args, &restarted).await.unwrap(),
-            Some(InitialAction::Existing)
+            Some(InitialAction::Existing { .. })
         ));
         restarted.complete_running().unwrap();
         assert_eq!(restarted.release().unwrap().release_id, "existing-a");
@@ -912,7 +912,7 @@ format = "jsonl"
         *second_restart.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
         assert!(matches!(
             initialize_startup(&args, &second_restart).await.unwrap(),
-            Some(InitialAction::Existing)
+            Some(InitialAction::Existing { .. })
         ));
         second_restart.complete_running().unwrap();
         assert_eq!(second_restart.release().unwrap().release_id, "existing-a");

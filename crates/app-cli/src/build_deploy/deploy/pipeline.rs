@@ -69,6 +69,22 @@ pub(crate) async fn prepare_with_local(
         crate::manifest::preflight_startup(workspace, false).await?;
         return Ok(None);
     }
+    // Recovery after the shared-volume zip cache is cleaned: the activated
+    // directory is then the only surviving copy of the registered artifact,
+    // so reuse it only when its lock still declares exactly the requested
+    // artifact identity. The deploy-state marker cannot serve here — runtime
+    // deployments stamp it with a per-request marker, and platform-side local
+    // activation never writes it. Anything else keeps failing and asks for
+    // republication.
+    if let Some(source) = local_source
+        && !tokio::fs::try_exists(source).await?
+        && let Some(artifact_id) = url.strip_prefix("artifact://")
+        && crate::manifest::read_release_lock(workspace)
+            .is_ok_and(|release| release.release_id == artifact_id)
+    {
+        crate::manifest::preflight_startup(workspace, false).await?;
+        return Ok(None);
+    }
     tokio::fs::create_dir_all(root)
         .await
         .context("create volume root")?;

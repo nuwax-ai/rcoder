@@ -381,6 +381,137 @@ async fn fresh_deploy_extracts_and_writes_marker() {
     );
 }
 
+/// 注册制品缓存被清理后的显式恢复：激活目录仍声明该制品身份时，本地
+/// 制品部署复用激活内容（no-op），不要求重新发布、不猜别的输入。
+#[tokio::test]
+async fn missing_registered_zip_reuses_activated_release_identity() {
+    let (dir, workspace) = make_volume();
+    let builds = dir.path().join("builds");
+    std::fs::create_dir_all(&builds).expect("builds");
+    let zip_path = builds.join("workspace-package-test-release-0001.zip");
+    std::fs::write(
+        &zip_path,
+        build_zip(&[("release.lock.toml", MINIMAL_LOCK), ("web/server.js", "v1")]),
+    )
+    .expect("registered zip");
+    let prepared = prepare_with_local(
+        &workspace,
+        "artifact://test-release-0001",
+        Some(&zip_path),
+        "runtime-op-1",
+        None,
+        None,
+    )
+    .await
+    .expect("first local prepare")
+    .expect("fresh preparation");
+    activate(&workspace, prepared).await.expect("activate");
+    std::fs::remove_file(&zip_path).expect("cache cleaned");
+
+    // 新的显式恢复请求（不同操作标记）在缓存缺失下按激活身份复用。
+    let reused = prepare_with_local(
+        &workspace,
+        "artifact://test-release-0001",
+        Some(&zip_path),
+        "runtime-op-2",
+        None,
+        None,
+    )
+    .await
+    .expect("recovery prepare");
+    assert!(
+        reused.is_none(),
+        "activated identity satisfies the deployment"
+    );
+    assert!(workspace.join("web/server.js").exists());
+}
+
+/// 缓存缺失但激活目录声明别的 release、或根本没有激活目录时，部署必须
+/// 失败并指向注册 zip 路径——不静默复用身份未知的内容。
+#[tokio::test]
+async fn missing_registered_zip_with_unknown_identity_still_fails() {
+    // 激活目录声明了另一个 release。
+    let (dir, workspace) = make_volume();
+    let builds = dir.path().join("builds");
+    std::fs::create_dir_all(&builds).expect("builds");
+    let zip_path = builds.join("workspace-package-rel-other.zip");
+    std::fs::write(workspace.join("release.lock.toml"), MINIMAL_LOCK).expect("activated lock");
+    let err = prepare_with_local(
+        &workspace,
+        "artifact://rel-other",
+        Some(&zip_path),
+        "runtime-op-1",
+        None,
+        None,
+    )
+    .await
+    .err()
+    .expect("identity mismatch must fail");
+    assert!(
+        format!("{err:#}").contains("registered local artifact is missing"),
+        "unexpected error: {err:#}"
+    );
+
+    // 没有任何激活目录。
+    let (dir2, workspace2) = make_volume();
+    let zip2 = dir2
+        .path()
+        .join("builds")
+        .join("workspace-package-rel-gone.zip");
+    let err2 = prepare_with_local(
+        &workspace2,
+        "artifact://rel-gone",
+        Some(&zip2),
+        "runtime-op-1",
+        None,
+        None,
+    )
+    .await
+    .err()
+    .expect("missing activation must fail");
+    assert!(
+        format!("{err2:#}").contains("registered local artifact is missing"),
+        "unexpected error: {err2:#}"
+    );
+}
+
+/// 注册 zip 仍在时，即使激活目录声明同一 release，也必须走完整校验/
+/// 解压/换代链——内容以注册 zip 为准，不因激活命中跳过重校验。
+#[tokio::test]
+async fn present_registered_zip_still_reprepares_despite_matching_activation() {
+    let (dir, workspace) = make_volume();
+    let builds = dir.path().join("builds");
+    std::fs::create_dir_all(&builds).expect("builds");
+    let zip_path = builds.join("workspace-package-test-release-0001.zip");
+    std::fs::write(&zip_path, build_zip(&[("release.lock.toml", MINIMAL_LOCK)]))
+        .expect("registered zip");
+    let prepared = prepare_with_local(
+        &workspace,
+        "artifact://test-release-0001",
+        Some(&zip_path),
+        "runtime-op-1",
+        None,
+        None,
+    )
+    .await
+    .expect("first local prepare")
+    .expect("fresh preparation");
+    activate(&workspace, prepared).await.expect("activate");
+
+    let reprepared = prepare_with_local(
+        &workspace,
+        "artifact://test-release-0001",
+        Some(&zip_path),
+        "runtime-op-2",
+        None,
+        None,
+    )
+    .await
+    .expect("zip present must reprepare")
+    .expect("full preparation");
+    drop(reprepared);
+}
+
 #[tokio::test]
 async fn marker_hit_skips_download() {
     let (_dir, workspace) = make_volume();
