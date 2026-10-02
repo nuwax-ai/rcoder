@@ -353,7 +353,7 @@ model_probe = { path = "crates/model_probe" }
 # Hotpath 本地性能剖析（hotpath-rs，本地开发观测；见 AGENTS.md「AI 调试路由」）。
 # 非 optional（官方推荐）：不开 feature 时宏全 no-op、内部依赖零编译；
 # 不进 default features → 生产构建（build-agent-docker）完全无感。
-hotpath = { version = "0.26.1", default-features = false }
+hotpath = { version = "0.28.0", default-features = false }
 
 # dial9 事件级 Tokio tracing（本地开发观测，取代已移除的 tokio-console）。
 # default=[] 必须显式开 `tokio`（runtime hooks + recorder_from_env）；不开

@@ -76,3 +76,4 @@ target_DIR_PLACEHOLDER/
 docker/error-pages/
 target-linux/
 target-linux-appcli/
+/target-obs/
