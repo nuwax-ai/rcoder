@@ -28,13 +28,19 @@ pub async fn start_http_server(
     Ok(spawn_http_listener(listener, app, shutdown_tx.subscribe()))
 }
 
+// 观测接入（dial9）：accept 外层任务与每连接任务均经 rcoder-obs 门面 spawn——
+// feature 关闭时直通原 Tokio API（`tokio::spawn` / `JoinSet::spawn`），零插桩；
+// 开启时记录 wake 因果与 task 生命周期，JoinSet 收集/关停逻辑不变
+// （`spawn_in_join_set` 与原生同返回 AbortHandle）。
+// 未覆盖（有意保留，见 docs/observability.md dial9 节）：Hyper H2 executor
+// 内部任务与 Axum WebSocket/on_upgrade 自行 spawn 的应用任务不经本门面。
 fn spawn_http_listener(
     listener: tokio::net::TcpListener,
     app: axum::Router,
     mut shutdown_rx_clone: tokio::sync::broadcast::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     let app = app.into_make_service();
-    tokio::spawn(async move {
+    rcoder_obs::spawn(async move {
         let closing = tokio_util::sync::CancellationToken::new();
         let mut connections = tokio::task::JoinSet::new();
         loop {
@@ -54,7 +60,9 @@ fn spawn_http_listener(
                             let mut app_clone = app.clone();
 
                             let closing = closing.clone();
-                            connections.spawn(async move {
+                            rcoder_obs::spawn_in_join_set(
+                                &mut connections,
+                                async move {
                                 let mut http_builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
                                 http_builder
                                     .http1()
@@ -139,6 +147,147 @@ fn is_benign_client_disconnect(err: &(dyn std::error::Error + Send + Sync + 'sta
 #[cfg(test)]
 mod tests {
     use super::is_benign_client_disconnect;
+
+    /// 128KiB max_buf_size 的头部上下界（HTTP 431 边界）：
+    /// - 约 96KiB 合法单 header：请求 200 且 handler 收到完整值；
+    /// - 约 160KiB（高于 128KiB、低于 hyper 默认上限）：真实 431 响应、
+    ///   handler 不执行、连接关闭；
+    /// - 431 之后新连接仍 200（服务未被单条坏请求拖垮）。
+    /// 证据必须是真实 HTTP/1.1 响应状态码，不用断连日志/Router 指标代替。
+    #[tokio::test]
+    async fn header_boundary_96kib_ok_and_160kib_real_431() {
+        use axum::http::HeaderMap;
+        use http_body_util::{BodyExt, Empty};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let handler_ran = Arc::new(AtomicBool::new(false));
+        let route = axum::Router::new().route(
+            "/echo-header",
+            axum::routing::get({
+                let handler_ran = handler_ran.clone();
+                move |headers: HeaderMap| {
+                    let handler_ran = handler_ran.clone();
+                    async move {
+                        handler_ran.store(true, Ordering::SeqCst);
+                        headers
+                            .get("x-big")
+                            .map(|value| value.len().to_string())
+                            .unwrap_or_else(|| "missing".to_string())
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, rx) = tokio::sync::broadcast::channel(1);
+        let mut server = super::spawn_http_listener(listener, route, rx);
+
+        let connect = || async {
+            let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                .await
+                .unwrap()
+        };
+        let request_with = |size: usize| {
+            hyper::Request::builder()
+                .method("GET")
+                .uri("/echo-header")
+                .header("x-big", "a".repeat(size))
+                .body(Empty::<bytes::Bytes>::new())
+                .unwrap()
+        };
+
+        // 96KiB 单 header：低于 128KiB 缓冲 → 200，值完整到达 handler。
+        let (mut sender, connection) = connect().await;
+        let client = tokio::spawn(connection);
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            sender.send_request(request_with(96 * 1024)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = tokio::time::timeout(Duration::from_secs(5), response.into_body().collect())
+            .await
+            .unwrap()
+            .unwrap()
+            .to_bytes();
+        assert_eq!(
+            body,
+            (96 * 1024).to_string(),
+            "handler must see the full 96KiB value"
+        );
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(5), client)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        // 160KiB 单 header：超过 128KiB 缓冲 → 真实 431，handler 不执行。
+        handler_ran.store(false, Ordering::SeqCst);
+        let (mut sender, connection) = connect().await;
+        let client = tokio::spawn(connection);
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            sender.send_request(request_with(160 * 1024)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+        );
+        assert!(
+            !handler_ran.load(Ordering::SeqCst),
+            "431 must be rejected before the handler runs"
+        );
+        // 431 后连接关闭：同连接再发请求必须失败。
+        // 431 后连接关闭：同连接再发请求必须失败（连接已关时 hyper 客户端报
+        // Canceled/"connection was not ready"——这正是服务端关闭的证据）。
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            sender.send_request(request_with(16)),
+        )
+        .await
+        {
+            Err(_elapsed) => {} // 等待超时：同样只可能在连接死掉后发生
+            Ok(Err(_closed)) => {}
+            Ok(Ok(response)) => {
+                panic!("connection must be closed after 431, got {}", response.status())
+            }
+        }
+        drop(sender);
+        let _ = tokio::time::timeout(Duration::from_secs(5), client).await;
+
+        // 新连接恢复正常：小请求 200。
+        let (mut sender, connection) = connect().await;
+        let client = tokio::spawn(connection);
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            sender.send_request(request_with(16)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(5), client)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        shutdown.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn shutdown_waits_for_admitted_handler_and_closes_keep_alive() {

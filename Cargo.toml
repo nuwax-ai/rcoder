@@ -327,6 +327,8 @@ toasty-driver-turso = { version = "=0.11", features = ["fts"] }
 # Internal crates
 rcoder-telemetry = { path = "crates/rcoder-telemetry" }
 frontend-detector = { path = "crates/frontend-detector" }
+# dial9 spawner 门面（叶子 crate：tokio 必选 + dial9 optional；见 crates/rcoder-obs）
+rcoder-obs = { path = "crates/rcoder-obs" }
 shared_types = { path = "crates/shared_types" }
 shared_types_grpc = { path = "crates/shared_types_grpc" }
 shared_types_i18n = { path = "crates/shared_types_i18n" }

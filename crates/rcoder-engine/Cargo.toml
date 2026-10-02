@@ -28,7 +28,7 @@ hotpath-mcp = ["hotpath", "hotpath/hotpath-mcp"]
 # dial9 事件级 Tokio tracing（本地开发专用；编译须配 RUSTFLAGS="--cfg tokio_unstable"
 # 才有全量 task 覆盖——见 make/dev.mk dial9-on 与 docker/dev-hot-build.sh）。
 # 运行期 DIAL9_ENABLED 开关（默认关=纯 passthrough runtime，零开销）。
-dial9 = ["dep:dial9"]
+dial9 = ["dep:dial9", "rcoder-obs/dial9"]
 
 # Kubernetes 支持：启用 Kubernetes 运行时模式
 # 启用后可通过 CONTAINER_RUNTIME=kubernetes 环境变量切换到 K8s 模式
@@ -71,6 +71,9 @@ app_manager = { path = "../app_manager" }
 arc-swap = { workspace = true }
 docker_manager = { workspace = true }
 rcoder-telemetry = { workspace = true }
+# dial9 spawner 门面（常依赖：feature 关闭时直通 Tokio；dial9 插桩经本 crate 的
+# dial9 feature 转发 rcoder-obs/dial9）
+rcoder-obs = { workspace = true }
 dial9 = { workspace = true, optional = true }
 
 clap = { workspace = true }

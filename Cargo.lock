@@ -219,6 +219,7 @@ dependencies = [
  "nix 0.31.3",
  "notify 8.2.0",
  "process-wrap",
+ "rcoder-obs",
  "rmcp 3.5.0",
  "serde",
  "serde_json",
@@ -313,6 +314,7 @@ dependencies = [
  "piper",
  "process_utils",
  "procfs",
+ "rcoder-obs",
  "rcoder-proxy",
  "rcoder-telemetry",
  "regex",
@@ -6347,6 +6349,7 @@ dependencies = [
  "preview-coordinator",
  "rand 0.10.3",
  "rcoder-engine",
+ "rcoder-obs",
  "rcoder-proxy",
  "rcoder-storage",
  "rcoder-telemetry",
@@ -11002,6 +11005,7 @@ dependencies = [
  "piper",
  "preview-coordinator",
  "rand 0.10.3",
+ "rcoder-obs",
  "rcoder-proxy",
  "rcoder-storage",
  "rcoder-telemetry",
@@ -11055,6 +11059,14 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rcoder-obs"
+version = "0.1.3"
+dependencies = [
+ "dial9",
+ "tokio",
 ]
 
 [[package]]

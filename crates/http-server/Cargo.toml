@@ -33,6 +33,10 @@ rcoder-pg = ["rcoder-engine/rcoder-pg"]
 # deploy-host 宿主机运行形态（handler dial 点经 funnel 查表）
 deploy-host = ["rcoder-engine/deploy-host"]
 
+# dial9 事件级 Tokio tracing（本地开发专用）。本 crate 不直接依赖 dial9，
+# 仅经 rcoder-obs/dial9 让 accept/连接任务插桩（feature 关=直通 Tokio）。
+dial9 = ["rcoder-obs/dial9"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 filetime = { workspace = true }
@@ -70,6 +74,9 @@ tempfile = { workspace = true }
 
 # 本地性能剖析（hotpath-rs）：非 optional + 零特性 = 零编译开销；上方 hotpath* feature 开内部特性
 hotpath = { workspace = true }
+
+# dial9 spawner 门面（常依赖：accept/连接任务 spawn 点经它插桩）
+rcoder-obs = { workspace = true }
 
 # HTTP server
 axum = { workspace = true, features = ["multipart", "ws"] }

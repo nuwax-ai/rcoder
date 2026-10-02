@@ -213,7 +213,8 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
         // command_path 信息现在通过 full_command_line 传递
 
-        // 🔥 使用标准 tokio::spawn（无需 LocalSet！）
+        // 🔥 使用 rcoder-obs 门面 spawn（无需 LocalSet！dial9 feature 开启时
+        // 连接任务带插桩，关闭=直通 tokio::spawn）
         // 保存 JoinHandle 用于超时时取消子任务
         let spawn_project_id = project_id.clone();
         let spawn_command_line = finalized_env.full_command_line.clone();
@@ -222,7 +223,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         // 值来自 AgentStartConfig（由 GrpcTimeoutConfig.acp_session_create_timeout_secs 注入），默认 60s。
         let session_create_timeout_secs =
             start_config.acp_session_create_timeout_secs.unwrap_or(60);
-        let connection_task_handle = tokio::spawn(async move {
+        let connection_task_handle = rcoder_obs::spawn(async move {
             info!(
                 "[SACP] Spawned ACP connection task, project_id={}",
                 spawn_project_id

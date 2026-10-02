@@ -86,6 +86,8 @@ pub async fn start_cleanup_task(
             docker_manager.clone(),
             shutdown_sse,
         );
+        // 观测接入（dial9）刻意不接：后台回收循环无 wake 因果排查需求
+        // （specs/observability-hotpath-dial9-upgrade v2 撤项裁定），防未来误接。
         tokio::spawn(reaper.run());
         tracing::info!(
             "[REAPER] ResourceReaper started (docker_manager={})",

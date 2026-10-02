@@ -13,6 +13,10 @@ default = []
 # Windows 不支持 Pingora，禁用此 feature 时直接使用真实的 API Key 和 Base URL
 proxy = []
 
+# dial9 事件级 Tokio tracing（本地开发专用）。ACP 连接任务 spawn 经 rcoder-obs
+# 门面插桩（feature 关=直通 Tokio；由 agent_runner/dial9 转发打开）。
+dial9 = ["rcoder-obs/dial9"]
+
 [lints]
 workspace = true
 
@@ -20,6 +24,9 @@ workspace = true
 # 依赖其他 crate
 agent_config = { workspace = true }
 shared_types = { workspace = true }
+
+# dial9 spawner 门面（常依赖：ACP 连接任务 spawn 点经它插桩）
+rcoder-obs = { workspace = true }
 
 # 异步运行时
 tokio = { workspace = true }

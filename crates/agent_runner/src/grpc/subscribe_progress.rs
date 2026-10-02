@@ -89,7 +89,10 @@ pub async fn subscribe_progress(
         let (tx, rx) = mpsc::channel::<Result<ProgressEvent, Status>>(100);
         let session_id_clone = session_id.clone();
 
-        tokio::spawn(async move {
+        // 观测接入（dial9）：订阅中段转发任务经 rcoder-obs 门面 spawn（feature
+        // 关=直通 tokio::spawn）。locale 已显式捕获进闭包、连接清理
+        // （close_connection）与取消 token 逻辑不变。
+        rcoder_obs::spawn(async move {
             use dashmap::mapref::entry::Entry;
 
             info!(
@@ -502,5 +505,83 @@ mod tests {
             "pending (starting) agent must not be disconnected"
         );
         AGENT_REGISTRY.remove_by_project("proj-pending");
+    }
+
+    /// dial9 spawner 证据测试（observability T3.4/T3.5）：进程内挂 dial9 runtime
+    /// 直调 `subscribe_progress`，让 SessionWorker（worker.rs spawn 点）与订阅转发
+    /// 任务（本文件 spawn 点）真实运行并产生 instrumented 事件。
+    ///
+    /// 运行方式（断言由 `tools/dial9-probe` 对 trace 解码完成，本测试只负责
+    /// 产生真实事件；缺 env 直接失败，不做空转"通过"）：
+    /// ```bash
+    /// DIAL9_EVIDENCE_DIR=/tmp/dial9-evidence \
+    ///   cargo nextest run -p agent_runner --features dial9 \
+    ///   --run-ignored=only dial9_spawn_evidence
+    /// tools/dial9-probe --min-instrumented 2 --expect-wake-pairs /tmp/dial9-evidence
+    /// ```
+    #[cfg(feature = "dial9")]
+    #[test]
+    #[ignore = "证据测试：需 DIAL9_EVIDENCE_DIR 且 --features dial9（详见测试注释）"]
+    fn dial9_spawn_evidence() {
+        let evidence_dir = std::env::var("DIAL9_EVIDENCE_DIR")
+            .expect("需要 DIAL9_EVIDENCE_DIR=<trace 输出目录>（并用 --run-ignored 显式运行）");
+        // SAFETY: 测试进程内单线程环境写 env（dial9 runtime_from_env 读取），
+        // 豁免通道仅限测试模块。
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("DIAL9_ENABLED", "1");
+            std::env::set_var("DIAL9_TRACE_DIR", &evidence_dir);
+        }
+
+        let (recorder, runtime) = crate::dial9_obs::runtime_from_env().expect("dial9 runtime");
+        runtime.block_on(async {
+            let state = std::sync::Arc::new(evidence_app_state());
+            let request = Request::new(ProgressRequest {
+                session_id: "dial9-evidence-session".to_string(),
+                from_seq: Some(0),
+            });
+            let response = subscribe_progress(&state, request)
+                .await
+                .expect("subscribe_progress establishes");
+            use tokio_stream::StreamExt as _;
+            let mut stream = response.into_inner();
+            // 等待一段时间让转发任务真实 poll/挂起（心跳 30s tick 不必等到，
+            // spawn + 首 poll + SessionWorker 启动的事件已落 recorder 缓冲）。
+            let _ = tokio::time::timeout(Duration::from_secs(1), stream.next()).await;
+        });
+        drop(runtime);
+        recorder.graceful_shutdown(Duration::from_secs(5));
+        eprintln!(
+            "trace 已落 {evidence_dir}；断言：tools/dial9-probe \
+             --min-instrumented 2 --expect-wake-pairs {evidence_dir}"
+        );
+    }
+
+    /// subscribe_progress 不消费 AppState 内容（参数为 `_app_state`），构造
+    /// 最小可用实例仅为了让真实签名路径完整执行。
+    #[cfg(feature = "dial9")]
+    fn evidence_app_state() -> AppState {
+        use std::sync::Arc;
+        use std::sync::LazyLock;
+
+        static EMPTY_KEYS: LazyLock<
+            Arc<dashmap::DashMap<String, shared_types::ModelProviderConfig>>,
+        > = LazyLock::new(|| Arc::new(dashmap::DashMap::new()));
+
+        AppState {
+            sessions: Arc::new(dashmap::DashMap::new()),
+            config: crate::config::AppConfig::default(),
+            agent_session_service: Arc::new(crate::service::AgentSessionService::new(
+                Arc::new(agent_abstraction::launcher::DirectModelRuntimeEnvResolver),
+                60,
+            )),
+            api_key_manager: Arc::new(crate::api_key_manager::ApiKeyManager::new()),
+            shared_api_key_manager: Arc::clone(&EMPTY_KEYS),
+            project_uuid_map: Arc::new(dashmap::DashMap::new()),
+            agent_mgmt_registry: Arc::new(crate::agent_mgmt::AgentRegistry::empty(Default::default())),
+            agent_mgmt_path_manager: Default::default(),
+            #[cfg(feature = "proxy")]
+            pingora_service: None,
+        }
     }
 }

@@ -48,7 +48,9 @@ impl SessionWorker {
         };
 
         let spawn_start = std::time::Instant::now();
-        let handle = tokio::spawn(worker.run());
+        // 观测接入（dial9）：SessionWorker 命令循环经 rcoder-obs 门面 spawn
+        // （feature 关=直通 tokio::spawn），句柄/panic 检测逻辑不变。
+        let handle = rcoder_obs::spawn(worker.run());
         debug!(
             "[SessionWorker::spawn] tokio::spawn took: {:?}",
             spawn_start.elapsed()

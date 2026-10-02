@@ -81,7 +81,9 @@ pub async fn create_grpc_sse_stream(
     let panic_tx = tx.clone();
     let panic_sid = session_id.clone();
     let panic_registry = Arc::clone(&registry);
-    tokio::spawn(
+    // 观测接入（dial9）：SSE 转发任务经 rcoder-obs 门面 spawn（feature 关=直通
+    // tokio::spawn）；span 覆盖订阅任务整个生命周期（订阅 = 长等待，火焰图墙钟大头）。
+    rcoder_obs::spawn(
         async move {
             // panic 兜底：转发 task panic 时 JoinHandle 已被丢弃（无人观察），
             // tx drop → SSE 流无终态直接结束，EventSource 自动重连掩盖问题。

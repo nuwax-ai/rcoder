@@ -30,8 +30,9 @@ hotpath = ["hotpath/hotpath", "hotpath/threads", "hotpath/tokio", "hotpath/axum-
 hotpath-mcp = ["hotpath", "hotpath/hotpath-mcp"]
 
 # dial9 事件级 Tokio tracing（引擎侧装配已迁 rcoder-engine，此处转发 feature；
-# dial9_obs 经引擎 re-export 供 bin 调用）。
-dial9 = ["rcoder-engine/dial9"]
+# dial9_obs 经引擎 re-export 供 bin 调用）。http-server/dial9 让 HTTP accept/
+# 连接任务一并插桩（门面在 rcoder-obs，feature 关=直通 Tokio）。
+dial9 = ["rcoder-engine/dial9", "http-server/dial9"]
 
 # Kubernetes 支持：启用 Kubernetes 运行时模式
 # 启用后可通过 CONTAINER_RUNTIME=kubernetes 环境变量切换到 K8s 模式
