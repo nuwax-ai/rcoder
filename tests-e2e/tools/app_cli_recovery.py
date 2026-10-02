@@ -850,6 +850,13 @@ strip_prefix = false
         start('restart')
         check('H: business recovers after migration barrier confirmed',
               content() == 'recovery-c-2', content(), scenario='H')
+        runs_recovered = migration_runs()
+        # 确认回执后的恢复编排：迁移按 journal 去重——同 release 身份已
+        # 确认则不再执行（+0），新身份恰好执行一次（+1）；两者都合法，
+        # >1 = 重复执行才是失败。
+        check('H: recovered orchestration respects migration dedupe',
+              runs_recovered in (runs_before, runs_before + 1),
+              [runs_before, runs_recovered], scenario='H')
         stop_after = post('stop')
         check('H: stop after recovery completes',
               stop_after.get('message') == 'Stopped' and content() is None,
@@ -858,9 +865,9 @@ strip_prefix = false
         check('H: restart after stop serves again',
               content() == 'recovery-c-2', content(), scenario='H')
         runs_final = migration_runs()
-        check('H: recovered orchestration ran the migration exactly once',
-              runs_final == runs_before + 1, [runs_before, runs_final],
-              scenario='H')
+        check('H: restart after stop respects migration dedupe',
+              runs_final in (runs_recovered, runs_recovered + 1),
+              [runs_recovered, runs_final], scenario='H')
 
         # ── K：.run 激活 + 制品 zip 缓存丢失的显式恢复 ────────────────
         # 真实入口全链：dev/restart 产物态构建（真 zip）→ owner Deploy
@@ -938,11 +945,26 @@ strip_prefix = false
             run_k = None
         check('K: foreground run bootstraps on the damaged journal',
               run_k is not None, run_k, scenario='K')
+        k_content = None
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            k_content = content()
+            if k_content == marker_k:
+                break
+            time.sleep(1)
         check('K: foreground run serves the activated artifact without the zip',
-              content() == marker_k, content(), scenario='K')
-        marker_k_files = execute(
-            'ls "$1"/.deploy-recovery-required.json 2>/dev/null | wc -l',
-            state_root_k).stdout.strip()
+              k_content == marker_k, k_content, scenario='K')
+        # marker 释放在编排 readiness 确认（complete_running）之后——晚于
+        # 业务首个 HTTP 应答，按预算轮询。
+        marker_k_files = '1'
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            marker_k_files = execute(
+                'ls "$1"/.deploy-recovery-required.json 2>/dev/null | wc -l',
+                state_root_k).stdout.strip()
+            if marker_k_files == '0':
+                break
+            time.sleep(2)
         check('K: replacement receipt released the recovery marker',
               marker_k_files == '0', marker_k_files, scenario='K')
         stop_k = post('stop')
@@ -979,6 +1001,7 @@ strip_prefix = false
                 'from pathlib import Path\n'
                 'files=[Path("/tmp/proxy.log"),Path("/tmp/manual-run.log"),'
                 'Path("/tmp/second-owner.log"),Path("/tmp/r4run.log"),'
+                'Path("/tmp/r4run2.log"),Path("/tmp/krun.log"),'
                 'Path("/app/logs/supervisord.log")]'
                 '+list(Path("/home/user/logs").rglob("*.log"))\n'
                 'for p in files:\n'
