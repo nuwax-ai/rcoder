@@ -8,7 +8,7 @@ use std::path::PathBuf;
     name = "app-cli",
     version,
     about = "Cross-platform UserApp build and service manager",
-    after_help = "Typical workflow:\n  app-cli build --workspace <WORKSPACE> --deploy-dir <DEPLOY_DIR>\n  app-cli serve --workspace <DEPLOY_DIR>\n\nPlace options after the subcommand. Use app-cli <COMMAND> --help for details."
+    after_help = "Typical workflow:\n  app-cli validate --workspace <WORKSPACE>\n  app-cli gen-lock --workspace <WORKSPACE>\n  app-cli build --workspace <WORKSPACE> --deploy-dir <DEPLOY_DIR>\n  app-cli serve --workspace <DEPLOY_DIR>\n\nPlace options after the subcommand. Use app-cli <COMMAND> --help for details."
 )]
 pub struct CliArgs {
     #[command(subcommand)]
@@ -35,6 +35,11 @@ pub enum Command {
     Build(BuildArgs),
     /// Validate manifests and generate release.lock.toml without starting services.
     GenLock(GenLockArgs),
+    /// Check source configuration without writing files, building, or starting services.
+    ///
+    /// Reads workspace and project manifests and compiles the selected proxy profile.
+    /// A successful check covers configuration only; it does not prove runtime readiness.
+    Validate(ValidateArgs),
     /// Run an individual service (internal entry point used by supervisord).
     RunService(RunServiceArgs),
     /// Query application service readiness without starting or stopping services.
@@ -121,6 +126,18 @@ pub struct GenLockArgs {
     /// Preview proxy rules for devrun; the lock file retains both dev and prod settings.
     #[arg(long)]
     pub dev: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ValidateArgs {
+    #[command(flatten)]
+    pub workspace: WorkspaceArgs,
+    /// Check the development proxy profile; production manifest requirements still apply.
+    #[arg(long)]
+    pub dev: bool,
+    /// Write one structured configuration report to stdout.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug, Clone)]

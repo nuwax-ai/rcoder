@@ -2,4 +2,6 @@
 pub mod build;
 pub mod deploy;
 pub mod devtool;
+pub mod inspection;
 pub mod manifest;
+pub mod validate;

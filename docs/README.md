@@ -22,6 +22,10 @@
 - [Kubernetes 形态](deployment/kubernetes.md) —— STS + PVC 资源模型、devspace 本地开发、生产部署要点
 - [宿主机单机形态（deploy-host）](deployment/host.md) —— 控制平面直接跑在宿主机，"有 Docker 就能跑"的桌面基座形态
 
+### 开发工具
+
+- [app-cli 项目配置校验](development/app-cli-validate.md) —— validate 的只读范围、分类退出码及后续构建/运行验证
+
 ### 运维与排障
 
 - [可观测性指南](observability.md) —— 分布式追踪（Tempo）、日志链路（Loki）、事件级 Tokio tracing（dial9）、span 耗时指标

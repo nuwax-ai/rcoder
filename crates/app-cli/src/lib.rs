@@ -29,7 +29,7 @@ pub mod services;
 
 // 根级兼容别名：域目录归位前的历史路径（crate::server 等）保持可用
 // （file-server 大拆分同款范式），跨模块引用零改动；新代码优先用域路径。
-pub use build_deploy::{build, deploy, devtool, manifest};
+pub use build_deploy::{build, deploy, devtool, inspection, manifest, validate};
 pub use control::{config, owner_dispatch, readiness_query, supervision};
 pub use orchestration::{
     business_readiness, idle, orchestration_events, runtime_kernel, runtime_status, server,

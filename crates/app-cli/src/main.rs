@@ -38,11 +38,45 @@ fn main() -> anyhow::Result<()> {
     if let Some(result) = runtime_supervisor::auxiliary_entry() {
         std::process::exit(result?);
     }
-    runtime_supervisor::runtime()?.block_on(run())
+    let command = CliArgs::parse().command;
+    if let app_cli::config::Command::Validate(args) = command {
+        let result = match runtime_supervisor::runtime() {
+            Ok(runtime) => {
+                let result = runtime.block_on(app_cli::validate::run(
+                    &args.workspace.workspace,
+                    args.dev,
+                    args.json,
+                ));
+                // A timed-out DNS resolver may still be running on a blocking thread.
+                // Validation has finished; its runtime must not extend the deadline.
+                runtime.shutdown_background();
+                result
+            }
+            Err(_) => app_cli::validate::write_initialization_failure(
+                &args.workspace.workspace,
+                args.dev,
+                args.json,
+            )
+            .map(|()| 3),
+        };
+        let exit_code = match result {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("configuration validation failed: {error}");
+                3
+            }
+        };
+        // The async report writer has completed and flushed before process exit.
+        std::process::exit(exit_code);
+    }
+    runtime_supervisor::runtime()?.block_on(run(command))
 }
 
-async fn run() -> anyhow::Result<()> {
-    let args = match CliArgs::parse().command {
+async fn run(command: app_cli::config::Command) -> anyhow::Result<()> {
+    let args = match command {
+        app_cli::config::Command::Validate(_) => {
+            anyhow::bail!("validate must use the read-only entry point");
+        }
         app_cli::config::Command::GenLock(args) => {
             return app_cli::devtool::gen_lock(&args.workspace.workspace, args.dev).await;
         }

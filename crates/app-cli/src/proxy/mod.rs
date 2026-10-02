@@ -2,4 +2,5 @@
 
 pub mod admin_probe;
 pub mod compiler;
+pub(crate) mod config_source;
 pub mod pingap;

@@ -55,6 +55,7 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 axum = "0.8"
 utoipa = { version = "6", features = ["axum_extras"] }
+glob = "0.3"
 globset = "0.4"
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
