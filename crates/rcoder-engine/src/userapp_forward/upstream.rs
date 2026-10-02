@@ -103,7 +103,7 @@ pub(super) fn missing_app_id_response() -> Response {
 /// 以容器运行时真实状态裁决——Running 保容器（高负载超时/启动窗口抖动），
 /// 真死才清注册重建。
 /// 交互请求（file-list/git status 等）的整个定位阶段最多等待
-/// `interactive_ensure_wait_seconds`（默认 20s，仍受 ensure 总预算约束）；
+/// `interactive_ensure_wait_seconds`（默认 30s，仍受 ensure 总预算约束）；
 /// 已知冲突保留操作身份，否则返回等待超时，调用方可重试。tasks 查询不触发
 /// ensure。部署制品拉取（`/api/v1/userapp/static/*`）保留完整配置预算
 /// （默认 90s）。调度、拉镜像或 drain 可能超出任一预算；HTTP 等待结束

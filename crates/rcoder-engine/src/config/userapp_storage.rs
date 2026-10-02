@@ -43,7 +43,7 @@ pub struct UserAppStorageConfig {
     pub ensure_timeout_seconds: u64,
     /// 交互转发请求（git/file 列表等）定位 builder 的等待上限；实际预算
     /// 取 min(ensure_timeout_seconds, 本值)。冷启动（空闲回收后重建）实测
-    /// 10~13s，默认 20s 覆盖并留余量。
+    /// 10~13s，默认 30s 覆盖并留余量。
     pub interactive_ensure_wait_seconds: u64,
 }
 
@@ -54,7 +54,7 @@ impl Default for UserAppStorageConfig {
             turso_path: PathBuf::from("data/rcoder/userapp.turso.db"),
             postgres: None,
             ensure_timeout_seconds: 90,
-            interactive_ensure_wait_seconds: 20,
+            interactive_ensure_wait_seconds: 30,
         }
     }
 }
@@ -298,10 +298,10 @@ mod tests {
     fn interactive_ensure_wait_defaults_and_overrides() {
         let config = UserAppStorageConfig::default();
         assert_eq!(config.ensure_timeout_seconds, 90);
-        assert_eq!(config.interactive_ensure_wait_seconds, 20);
+        assert_eq!(config.interactive_ensure_wait_seconds, 30);
         let legacy: UserAppStorageConfig =
             serde_yaml::from_str("ensure_timeout_seconds: 90").unwrap();
-        assert_eq!(legacy.interactive_ensure_wait_seconds, 20);
+        assert_eq!(legacy.interactive_ensure_wait_seconds, 30);
         let mut config = UserAppStorageConfig::default();
         config
             .apply_overrides(|name| {
