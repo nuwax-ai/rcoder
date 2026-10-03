@@ -319,6 +319,15 @@ pub(crate) fn core_scenarios(fixtures: &Path) -> Result<Vec<(&'static str, Reque
             )?,
         ),
         (
+            "computer-file-list-dangling-link-hidden",
+            // 前一用例删除了 sub/nested/hello.txt → inside-link.txt 悬空。
+            // TS 0a7417f isHiddenSymlink: 断链 (realpath 失败) 不进列表,
+            // 两侧递归列表都必须不含 inside-link.txt 条目。
+            get(format!(
+                "/api/computer/get-file-list?userId={user}&cId={cid}&proxyPath=%2Fproxy"
+            )),
+        ),
+        (
             "computer-read-files-update-content",
             get(format!(
                 "/api/computer/static/{user}/{cid}/ab-write/renamed.txt"

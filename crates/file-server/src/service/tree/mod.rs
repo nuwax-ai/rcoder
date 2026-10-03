@@ -1,6 +1,7 @@
 //! 文件树遍历 (对齐 nuwax `getContentUtils.traverseDirectory` + `getProjectContent`)。
 //!
-//! 返回扁平数组 (非嵌套树): 非空目录的子文件直接展开, 仅空目录产生 `{isDir:true}` 节点。
+//! 返回扁平数组 (非嵌套树): 目录条目始终输出, 其子项紧随其后 (TS 0a7417f 起统一
+//! 口径; 此前仅空目录产生 `{isDir:true}` 节点)。
 //!
 //! 模块拆分:
 //! - 本 mod.rs: 共享类型 (`FileEntry`/`ProjectContent`) + 遍历函数 + 共享工具
@@ -86,7 +87,7 @@ pub async fn list_files(
     Ok(files)
 }
 
-/// 文件列表输出类型；递归模式中的目录仅指自然空目录。
+/// 文件列表输出类型；`type=file` 时目录条目不输出但遍历仍下钻。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MetaListType {
     #[default]
@@ -170,7 +171,7 @@ pub async fn list_files_meta(
 }
 
 /// `get-file-list` 的筛选遍历。`limit` 只计入实际输出，达到上限后停止下钻；
-/// 递归目录仍仅在自然内容为空时输出，不因 `type=file/dir` 过滤改变空目录判定。
+/// 目录条目始终输出 (TS 0a7417f)，`type=file` 时不输出但仍下钻。
 pub async fn list_files_meta_filtered(
     root: &Path,
     config: &Config,
@@ -301,6 +302,18 @@ pub(crate) async fn ensure_resolved_list_dir(
         .map_err(|_| illegal_relative_path(relative_path))
 }
 
+/// 排除目录名命中 (对齐 TS 0a7417f `isTraverseExcludedDir`): Windows 文件名不区分
+/// 大小写 (Node_Modules 与 node_modules 是同一目录), 忽略大小写匹配; POSIX 区分
+/// 大小写, 精确匹配 (Linux 下 Dist 是合法的另一个目录, 不能误杀)。
+fn is_traverse_excluded_dir(exclude_dirs: &[String], name: &str) -> bool {
+    if cfg!(windows) {
+        let lowered = name.to_lowercase();
+        exclude_dirs.iter().any(|d| d.to_lowercase() == lowered)
+    } else {
+        exclude_dirs.iter().any(|d| d == name)
+    }
+}
+
 /// 读取目录条目并按 nuwax 规则过滤 + 排序 (隐藏文件除 .gitignore / traverse_exclude_dirs /
 /// content_traverse_exclude_files; 目录在前 + 名字大小写不敏感)。供递归/单层遍历复用。
 /// 保留 symlink 作为叶条目供 metadata 列表报告 `isLink`；读取文件内容的遍历会单独跳过它们。
@@ -319,7 +332,7 @@ async fn read_filtered_entries(
         let ft = entry.file_type().await?;
         let path = entry.path();
         let is_link = ft.is_symlink();
-        if ft.is_dir() && !config.traverse_exclude_dirs.iter().any(|d| d == &name) {
+        if ft.is_dir() && !is_traverse_excluded_dir(&config.traverse_exclude_dirs, &name) {
             items.push((name, path, true, is_link));
         } else if (ft.is_file() || is_link)
             && !config
@@ -430,6 +443,11 @@ async fn list_directory_level(
     Ok(())
 }
 
+/// 递归遍历 (对齐 nuwax computer `traverseDirectory`, TS 0a7417f): **目录条目始终
+/// 输出** (非空目录不再只铺开子项, 与 `list_directory_level` 口径一致), DFS——
+/// 目录条目后紧跟其子项; `type=file` 时目录条目不输出但仍下钻 (深层文件取得到);
+/// 达 limit 后提前终止; 单个子目录不可读/扫描中被删除 → WARN 跳过其子树,
+/// 保留目录条目, 不拖垮整个请求。
 async fn traverse_meta(
     root: &Path,
     dir: &Path,
@@ -437,27 +455,20 @@ async fn traverse_meta(
     proxy_path: Option<&str>,
     options: MetaListOptions,
     out: &mut Vec<FileEntry>,
-) -> AppResult<usize> {
+) -> AppResult<()> {
     let items = read_filtered_entries(dir, config).await?;
-    let mut natural_count = 0;
     for (_name, path, is_dir, is_link) in items {
         if options.reached_limit(out.len()) {
             break;
         }
-        natural_count += 1;
         let relative = make_relative_path(root, &path);
         if !is_safe_list_link(root, &relative, is_link).await {
             continue;
         }
         if is_dir {
-            let child_count =
-                Box::pin(traverse_meta(root, &path, config, proxy_path, options, out)).await?;
-            if child_count == 0
-                && options.file_type != MetaListType::File
-                && !options.reached_limit(out.len())
-            {
+            if options.file_type != MetaListType::File && !options.reached_limit(out.len()) {
                 out.push(FileEntry {
-                    name: relative,
+                    name: relative.clone(),
                     is_dir: true,
                     binary: None,
                     size_exceeded: None,
@@ -465,6 +476,11 @@ async fn traverse_meta(
                     file_proxy_url: None,
                     is_link: Some(is_link),
                 });
+            }
+            if let Err(error) =
+                Box::pin(traverse_meta(root, &path, config, proxy_path, options, out)).await
+            {
+                tracing::warn!(error = %error, subtree = %relative, "depth descent failed, skip subtree");
             }
         } else if options.file_type != MetaListType::Dir {
             out.push(FileEntry {
@@ -478,7 +494,7 @@ async fn traverse_meta(
             });
         }
     }
-    Ok(natural_count)
+    Ok(())
 }
 
 async fn traverse(
@@ -521,10 +537,11 @@ async fn traverse(
 }
 
 /// 列表可展示根目录内的链接，但不暴露指向所选根之外的链接目标。
-/// 列表条目的链接安全判定 (对齐 TS e822516 escapesRoot): 链接目标 realpath 解析
-/// 后必须落在根内; **悬空链接 (目标不存在, realpath 失败) 按未越界处理照常列出**
-/// —— A/B 实测: 中途删除目标后 TS 列出悬空条目而本实现隐藏, 属语义分歧。
-/// canonicalize 失败的其他形态同样不在边界层隐藏, 交由常规条目流程。
+/// 列表条目的链接安全判定 (对齐 TS 0a7417f `isHiddenSymlink`): 链接目标 realpath
+/// 解析后必须落在根内; **悬空链接 (目标不存在, realpath 失败) 同样不可见**——
+/// 断链打开必 404, 混进列表只会产生打不开的条目; 根 realpath 失败也隐藏。
+/// 仅用于列表条目过滤; resolve-file 等读取链路仍走 `ensure_resolved_within`
+/// 的 fail-open 口径 (realpath 失败按未越界交常规流程, 对齐 escapesRoot)。
 async fn is_safe_list_link(root: &Path, relative: &str, is_link: bool) -> bool {
     if !is_link {
         return true;
@@ -532,9 +549,9 @@ async fn is_safe_list_link(root: &Path, relative: &str, is_link: bool) -> bool {
     match fs::canonicalize(root).await {
         Ok(resolved_root) => match fs::canonicalize(root.join(relative)).await {
             Ok(resolved) => resolved.starts_with(&resolved_root),
-            Err(_) => true,
+            Err(_) => false,
         },
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 
@@ -653,12 +670,20 @@ mod tests {
             .await
             .unwrap();
         let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
-        // 递归: 所有文件扁平展开
-        assert!(names.contains(&"a.txt"));
-        assert!(names.contains(&"b.md"));
-        assert!(names.contains(&"sub/c.txt"));
-        assert!(names.contains(&"sub/d.log"));
-        assert!(names.contains(&"sub/nested/e.txt"));
+        // TS 0a7417f: 目录条目始终输出 (非空目录不再只铺开子项), DFS——
+        // 目录条目后紧跟其子项; 根层目录在前 (sub 先于文件)
+        assert_eq!(
+            names,
+            vec![
+                "sub",
+                "sub/nested",
+                "sub/nested/e.txt",
+                "sub/c.txt",
+                "sub/d.log",
+                "a.txt",
+                "b.md"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -767,7 +792,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_files_meta_type_filter_keeps_natural_empty_dir_and_limits_output() {
+    async fn list_files_meta_type_filter_lists_dirs_and_limits_output() {
+        // TS 0a7417f: type=dir 递归输出全部目录条目 (含非空目录), 不再仅空目录
         let tmp = tempfile::tempdir().unwrap();
         make_test_tree(tmp.path()).await;
         fs::create_dir(tmp.path().join("empty")).await.unwrap();
@@ -782,9 +808,9 @@ mod tests {
         let dirs = list_files_meta_filtered(tmp.path(), &cfg, None, None, dir_options)
             .await
             .unwrap();
-        assert_eq!(dirs.len(), 1);
-        assert_eq!(dirs[0].name, "empty");
-        assert!(dirs[0].is_dir);
+        let names: Vec<&str> = dirs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["empty", "sub", "sub/nested"]);
+        assert!(dirs.iter().all(|d| d.is_dir));
 
         let files = list_files_meta_filtered(
             tmp.path(),
@@ -821,13 +847,16 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn list_keeps_dangling_in_root_link_visible() {
-        // A/B 实测回归 (2026-09-29): 目标被中途删除后, 悬空的界内链接照常列出
-        // (对齐 TS e822516 escapesRoot 的 realpath 失败=未越界语义), 不因解析
-        // 失败被边界层隐藏。单层/受限展开/递归三种模式一致。
+    async fn list_hides_dangling_in_root_link() {
+        // 对齐 TS 0a7417f isHiddenSymlink: 目标被删后悬空的界内链接不可见——
+        // 断链打开必 404, 不进列表 (TS e822516 escapesRoot 的 fail-open 口径
+        // 曾照常列出, 1.5.8 起列表收紧为隐藏); 界内实链接不受影响。
+        // 单层/受限展开/递归三种模式一致。
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("real.txt"), "x").unwrap();
+        std::fs::write(tmp.path().join("live-target.txt"), "y").unwrap();
         std::os::unix::fs::symlink("real.txt", tmp.path().join("dangling.txt")).unwrap();
+        std::os::unix::fs::symlink("live-target.txt", tmp.path().join("live-link.txt")).unwrap();
         std::fs::remove_file(tmp.path().join("real.txt")).unwrap();
         let cfg = default_test_config();
         for (recursive, levels) in [(false, 1usize), (false, 2), (true, 1)] {
@@ -847,10 +876,73 @@ mod tests {
             .unwrap();
             let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
             assert!(
-                names.iter().any(|n| n == "dangling.txt"),
-                "recursive={recursive} levels={levels}: 悬空链接必须列出: {names:?}"
+                !names.iter().any(|n| n == "dangling.txt"),
+                "recursive={recursive} levels={levels}: 悬空链接必须隐藏: {names:?}"
+            );
+            assert!(
+                names.iter().any(|n| n == "live-link.txt"),
+                "recursive={recursive} levels={levels}: 界内实链接必须列出: {names:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_files_meta_recursive_skips_unreadable_subtree() {
+        // 对齐 TS 0a7417f: 单个子目录不可读 → 保留目录条目、WARN 跳过其子树,
+        // 不拖垮整个请求 (此前错误上抛导致整个列表 500)
+        let tmp = tempfile::tempdir().unwrap();
+        make_test_tree(tmp.path()).await;
+        let locked = tmp.path().join("locked");
+        fs::create_dir(&locked).await.unwrap();
+        fs::write(locked.join("secret.txt"), "s").await.unwrap();
+        let mut perms = fs::metadata(&locked).await.unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o000);
+        fs::set_permissions(&locked, perms).await.unwrap();
+
+        let cfg = default_test_config();
+        let result = list_files_meta_filtered(
+            tmp.path(),
+            &cfg,
+            None,
+            None,
+            MetaListOptions {
+                recursive: true,
+                levels_left: 1,
+                file_type: MetaListType::All,
+                limit: None,
+            },
+        )
+        .await;
+
+        // 恢复权限保证 tempdir 清理, 再断言结果
+        let mut perms = fs::metadata(&locked).await.unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&locked, perms).await.unwrap();
+
+        let entries = result.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"locked"), "目录条目必须保留: {names:?}");
+        assert!(
+            !names.contains(&"locked/secret.txt"),
+            "不可读子树必须跳过: {names:?}"
+        );
+        assert!(names.contains(&"sub/c.txt"), "其余部分不受影响: {names:?}");
+    }
+
+    #[test]
+    fn traverse_exclude_dir_matching_is_case_sensitive_on_posix() {
+        // 对齐 TS 0a7417f isTraverseExcludedDir: POSIX 精确匹配 (Dist 是合法的
+        // 另一个目录); 仅 Windows 忽略大小写 (cfg 分支, macOS/Linux 走精确匹配)
+        let dirs: Vec<String> = ["node_modules", "dist"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(is_traverse_excluded_dir(&dirs, "node_modules"));
+        assert!(!is_traverse_excluded_dir(&dirs, "Node_Modules"));
+        assert!(is_traverse_excluded_dir(&dirs, "dist"));
+        assert!(!is_traverse_excluded_dir(&dirs, "Dist"));
     }
 
     #[cfg(unix)]
