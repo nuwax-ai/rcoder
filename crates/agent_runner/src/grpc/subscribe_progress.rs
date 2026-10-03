@@ -545,12 +545,13 @@ mod tests {
                 .expect("subscribe_progress establishes");
             use tokio_stream::StreamExt as _;
             let mut stream = response.into_inner();
-            // 等 subscribe 任务建好 session（轮询 SESSION_CACHE，最多 3s）。
+            // 等 worker 完成 Subscribe 注册；仅有 SESSION_CACHE 条目仍可能
+            // 早于注册，终态 Push 若先被消费就会清空 ring，无法向本订阅投递。
             let session_ready = 'ready: {
                 for _ in 0..30 {
-                    if SESSION_CACHE
-                        .view("dial9-evidence-session", |_, d| d.clone())
-                        .is_some()
+                    if let Some(session) =
+                        SESSION_CACHE.view("dial9-evidence-session", |_, d| d.clone())
+                        && session.connections_len() == 1
                     {
                         break 'ready true;
                     }
@@ -558,9 +559,10 @@ mod tests {
                 }
                 false
             };
-            assert!(session_ready, "subscribe 任务应在 3s 内创建 session");
+            assert!(session_ready, "worker 应在 3s 内注册本订阅");
             // 真实唤醒链：push 一条消息 → command 通道 send → 唤醒 SessionWorker
             // （worker 从 recv 挂起点被 wake）→ 订阅者通道投递 → 转发任务被 wake。
+            let request_id = "dial9-evidence-push";
             crate::service::push_session_update_with_project(
                 "proj-dial9-evidence",
                 "dial9-evidence-session",
@@ -568,17 +570,21 @@ mod tests {
                     session_id: "dial9-evidence-session".to_string(),
                     stop_reason: agent_client_protocol::schema::v1::StopReason::EndTurn,
                     error_message: None,
-                    request_id: None,
+                    request_id: Some(request_id.to_string()),
                 }),
             )
             .await
             .expect("push session update");
             // 收到终态事件（转发任务被唤醒并投递）即证明整条唤醒链真实工作。
-            let got = tokio::time::timeout(Duration::from_secs(5), stream.next()).await;
-            assert!(
-                got.is_ok(),
-                "push 后 5s 内应经转发任务收到事件（wake 链断言）"
-            );
+            let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("push 后 5s 内应经转发任务收到事件（wake 链断言）")
+                .expect("订阅不得在投递本次 push 前关闭")
+                .expect("订阅必须投递 ProgressEvent，不能返回 gRPC 错误");
+            assert_eq!(event.message_type, "SessionPromptEnd");
+            assert_eq!(event.sub_type, "end_turn");
+            assert!(event.seq > 0, "必须是 worker 分配游标的真实 push 事件");
+            assert_eq!(event.request_id.as_deref(), Some(request_id));
         });
         drop(runtime);
         recorder.graceful_shutdown(Duration::from_secs(5));
@@ -609,7 +615,9 @@ mod tests {
             api_key_manager: Arc::new(crate::api_key_manager::ApiKeyManager::new()),
             shared_api_key_manager: Arc::clone(&EMPTY_KEYS),
             project_uuid_map: Arc::new(dashmap::DashMap::new()),
-            agent_mgmt_registry: Arc::new(crate::agent_mgmt::AgentRegistry::empty(Default::default())),
+            agent_mgmt_registry: Arc::new(crate::agent_mgmt::AgentRegistry::empty(
+                Default::default(),
+            )),
             agent_mgmt_path_manager: Default::default(),
             #[cfg(feature = "proxy")]
             pingora_service: None,

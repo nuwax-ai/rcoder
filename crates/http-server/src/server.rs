@@ -182,7 +182,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (shutdown, rx) = tokio::sync::broadcast::channel(1);
-        let mut server = super::spawn_http_listener(listener, route, rx);
+        let server = super::spawn_http_listener(listener, route, rx);
 
         let connect = || async {
             let stream = tokio::net::TcpStream::connect(address).await.unwrap();
@@ -246,23 +246,26 @@ mod tests {
             !handler_ran.load(Ordering::SeqCst),
             "431 must be rejected before the handler runs"
         );
-        // 431 后连接关闭：同连接再发请求必须失败。
-        // 431 后连接关闭：同连接再发请求必须失败（连接已关时 hyper 客户端报
-        // Canceled/"connection was not ready"——这正是服务端关闭的证据）。
-        match tokio::time::timeout(
+        // 消费完 431 body，排除未消费响应导致后续请求等待的客户端背压。
+        tokio::time::timeout(Duration::from_secs(5), response.into_body().collect())
+            .await
+            .expect("431 response body must complete")
+            .expect("431 response body must be readable");
+        // 保留 sender 时连接驱动必须结束，不能用本测试 drop(sender) 触发关闭。
+        tokio::time::timeout(Duration::from_secs(5), client)
+            .await
+            .expect("server must close the connection after 431")
+            .expect("client connection task must not panic")
+            .expect("431 connection must finish cleanly");
+        // 同连接再发请求必须明确失败；超时不能证明连接已关闭。
+        let retry = tokio::time::timeout(
             Duration::from_secs(5),
             sender.send_request(request_with(16)),
         )
         .await
-        {
-            Err(_elapsed) => {} // 等待超时：同样只可能在连接死掉后发生
-            Ok(Err(_closed)) => {}
-            Ok(Ok(response)) => {
-                panic!("connection must be closed after 431, got {}", response.status())
-            }
-        }
+        .expect("request on the closed 431 connection must not hang");
+        assert!(retry.is_err(), "connection must be closed after 431");
         drop(sender);
-        let _ = tokio::time::timeout(Duration::from_secs(5), client).await;
 
         // 新连接恢复正常：小请求 200。
         let (mut sender, connection) = connect().await;

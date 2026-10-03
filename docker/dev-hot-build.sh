@@ -15,8 +15,9 @@
 # ============================================================================
 set -euo pipefail
 
-SRC_DIR=/app/src
-BIN_PATH=/app/bin/rcoder
+# 默认使用容器路径；契约测试可指向私有临时目录，避免替换共享开发环境。
+SRC_DIR="${RCODER_DEV_HOT_SRC_DIR:-/app/src}"
+BIN_PATH="${RCODER_DEV_HOT_BIN_PATH:-/app/bin/rcoder}"
 
 echo "🔥 rcoder 容器内热编译"
 
@@ -40,9 +41,9 @@ fi
 
 # 3. 增量编译 rcoder binary（release；cargo target volume 持久化 → 增量）
 cd "$SRC_DIR"
-# dial9 默认编入（独立 target-unstable 目录——tokio_unstable RUSTFLAGS 与普通
-# 缓存指纹不同，隔离避免交替全量重编）。
-# 启用与否是运行期 DIAL9_ENABLED env（默认关=纯 passthrough 零开销），经
+# dial9 默认编入（使用 target-unstable——tokio_unstable RUSTFLAGS 与普通
+# 缓存指纹不同；未选 dial9 时使用普通 target，避免交替全量重编）。
+# 启用与否是运行期 DIAL9_ENABLED env（默认关闭录制），经
 # `make dial9-on/off` 重建容器切换，功能切换不触发重编。
 # trace 落 /app/logs/dial9（compose 挂载 → 宿主 docker/logs/dial9），离线
 # `make dial9-view` 查看。hotpath 同默认编入（本地 dev 默认观测；docker
@@ -52,15 +53,35 @@ cd "$SRC_DIR"
 # feature 透传（specs observability T2.4）：$1 接受 make dev-hot 注入的
 # CARGO_FEATURES（"--features a,b,c" 或裸逗号列表），与 dev-restart 的构建
 # feature 集保持一致——dev-restart 选了 hotpath-mcp 等附加 feature 时热编译
-# 不得静默丢弃。缺省（直接 docker exec 调用）回落 hotpath,dial9。
-FEATURES_ARG="${1:-hotpath,dial9}"
+# 不得静默丢弃。未传参数回落 hotpath,dial9；显式空参数保留 Cargo 默认集。
+FEATURES_ARG="${1-hotpath,dial9}"
 case "$FEATURES_ARG" in
     --features\ *) FEATURES_ARG="${FEATURES_ARG#--features }" ;;
 esac
-echo "🔨 cargo build --release --bin rcoder --features $FEATURES_ARG（独立 target-unstable）..."
-export RUSTFLAGS="--cfg tokio_unstable"
-export CARGO_TARGET_DIR="$SRC_DIR/target-unstable"
-cargo build --release --bin rcoder --features "$FEATURES_ARG"
+CARGO_ARGS=(build --release --bin rcoder)
+if [ -n "$FEATURES_ARG" ]; then
+    CARGO_ARGS+=(--features "$FEATURES_ARG")
+fi
+# 同 dev-restart：只有 dial9 构建需要 Tokio hooks。保留调用方已有的 flags，
+# 识别逗号/空白分隔的 feature 与 crate/dial9，避免按名字子串误启用。
+export RUSTFLAGS="${RUSTFLAGS:-}"
+DIAL9_FEATURE_PATTERN='(^|[,[:space:]])([^,[:space:]]*/)?dial9([,[:space:]]|$)'
+if [[ "$FEATURES_ARG" =~ $DIAL9_FEATURE_PATTERN ]]; then
+    export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg tokio_unstable"
+    # Cargo gives encoded flags precedence, including an explicitly empty
+    # value. Preserve caller flags while enabling hooks through that input too.
+    if [ "${CARGO_ENCODED_RUSTFLAGS+x}" ]; then
+        if [ -n "$CARGO_ENCODED_RUSTFLAGS" ]; then
+            CARGO_ENCODED_RUSTFLAGS+=$'\x1f'
+        fi
+        export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}--cfg"$'\x1f'"tokio_unstable"
+    fi
+    export CARGO_TARGET_DIR="$SRC_DIR/target-unstable"
+else
+    export CARGO_TARGET_DIR="$SRC_DIR/target"
+fi
+echo "🔨 cargo ${CARGO_ARGS[*]}（target: $CARGO_TARGET_DIR）..."
+cargo "${CARGO_ARGS[@]}"
 BIN_SRC="$CARGO_TARGET_DIR/release/rcoder"
 # target directories are compilation caches only; start-rcoder.sh always uses
 # the container-local executable atomically installed below.

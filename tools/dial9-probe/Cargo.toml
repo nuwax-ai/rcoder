@@ -13,3 +13,7 @@ anyhow = "1"
 # 解码 TaskDumpEvent 无需 taskdump feature：wire schema 自描述，decoder 按
 # header 里的 schema 反序列化（taskdump feature 只影响“录制端”是否采集）。
 dial9 = { version = "=0.5.2", default-features = false, features = ["analysis"] }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"

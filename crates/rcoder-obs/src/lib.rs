@@ -11,17 +11,21 @@
 //!
 //! # 边界与退化行为（接入/排障前必读）
 //!
-//! - **未挂线静默退化**：feature 开启但当前线程不属于 dial9 attach 的 runtime
-//!   时，`spawn` / `spawn_in_join_set` 做 TLS 检查后直通原 Tokio——任务正常
+//! - **TLS 未挂线时静默退化**：feature 开启但当前线程 TLS 未标记 dial9 或未持有
+//!   已连接 recorder 时，`spawn` / `spawn_in_join_set` 直通原 Tokio——任务正常
 //!   执行，trace 无 instrumented 标记。是否编入 feature、runtime 是否 attach、
 //!   运行 env 是否启用（DIAL9_ENABLED）是三个独立轴，须分别核对，不能按进程
 //!   名一刀切（详见 specs/observability-hotpath-dial9-upgrade 挂线矩阵）。
+//! - **同线程切换 runtime 的 TLS 限制**：dial9 0.5.2 在 attach 时给构建线程设置
+//!   TLS 标记，解析句柄时不核验当前 runtime ID。该线程随后进入未 attach 的
+//!   runtime，仍可能使用先前 recorder 包装任务并记录 wake；TLS 不能保证
+//!   recorder 与执行 runtime 的身份一致。
 //! - **`spawn_in` 惰性解析**：包装 future 在目标 runtime 的工作线程首次 poll
 //!   时才解析插桩句柄，调用线程无需在 dial9 runtime 上下文内。
 //! - **根 future 无插桩**：runtime `block_on` 的根 future 在任务外执行，没有
 //!   task ID、不产生 wake/dump 事件——主服务根 future 不经本门面。
-//! - **嵌套 runtime 归属**：任务归属 spawn 它的 runtime（`spawn_in` 显式指定），
-//!   与 future 逻辑上的来源无关。
+//! - **执行 runtime 归属**：任务在 spawn 所选的 runtime（`spawn_in` 显式指定）
+//!   上执行；观测 recorder 的归属还需核对前述 TLS 限制。
 //! - **无 traced 变体的 API 维持原样**：`spawn_blocking` / `spawn_local*` /
 //!   `build_task` dial9 0.5.2 未提供 traced 变体，业务调用点不动。
 //! - **task-local 不自动继承**：Tokio task-local 本就不跨 spawn 自动继承，
@@ -137,14 +141,46 @@ mod tests {
             .enable_all()
             .build()
             .expect("test runtime");
-        // 目标 runtime 上下文内经门面 spawn 并在同一 runtime 上驱动到完成
-        // （current-thread runtime 必须被 block_on 驱动，跨 runtime 空等会挂死）。
-        let value = rt.block_on(async {
-            let handle = spawn_in(rt.handle(), async { "on-target" });
-            handle.await.expect("task completes")
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        // runtime 外先指定目标，再驱动 current-thread runtime 到任务完成。
+        // 错误使用 tokio::spawn 的实现会在 runtime 外立即失败。
+        let handle = spawn_in(rt.handle(), async {
+            tokio::runtime::Handle::current().id()
         });
-        assert_eq!(value, "on-target");
-        drop(rt);
+        let value = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+                .await
+                .expect("target runtime drives task within deadline")
+                .expect("task completes")
+        });
+        assert_eq!(value, rt.handle().id());
+    }
+
+    #[test]
+    fn spawn_in_targets_another_runtime() {
+        let caller_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("caller runtime");
+        let target_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("target runtime");
+        let handle = {
+            let _caller_context = caller_rt.enter();
+            spawn_in(target_rt.handle(), async {
+                tokio::runtime::Handle::current().id()
+            })
+        };
+        // 调用方不驱动；误派到 caller_rt 的任务会超时，不能挂住测试。
+        let task_runtime = target_rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+                .await
+                .expect("task must run on target runtime")
+                .expect("task completes")
+        });
+        assert_eq!(task_runtime, target_rt.handle().id());
+        assert_ne!(task_runtime, caller_rt.handle().id());
     }
 
     #[tokio::test]
@@ -152,9 +188,7 @@ mod tests {
         // JoinSet 元素类型统一为 u64：先 abort 一个 pending 任务，再收集一个
         // 正常完成的任务，验证句柄（AbortHandle）与 join_next 输出契约。
         let mut set = tokio::task::JoinSet::new();
-        let abort = spawn_in_join_set(&mut set, async {
-            std::future::pending::<u64>().await
-        });
+        let abort = spawn_in_join_set(&mut set, async { std::future::pending::<u64>().await });
         abort.abort();
         let first = set.join_next().await.expect("aborted task still joins");
         assert!(
