@@ -343,16 +343,34 @@ impl OwnerSession {
     /// [`OwnerSession::run`]. This never launches or stops business work, so
     /// callers may bind their management API first.
     pub async fn start(owner: Owner, options: SessionOptions) -> Result<Self> {
+        Self::start_recovering_binding(owner, options, None).await
+    }
+
+    /// Restore a same-application management binding authorized by the adapter.
+    /// Old cleanup receipts are consumed with their original binding. The new
+    /// binding is published only after all prior execution has been reconciled.
+    pub async fn start_recovering_binding(
+        owner: Owner,
+        options: SessionOptions,
+        previous: Option<control::Binding>,
+    ) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let instance = uuid::Uuid::new_v4().to_string();
         let root = owner.scope_root().to_path_buf();
-        let (mut old, rebuilt) = owner.load_discovery(&options.binding)?;
+        let (mut old, rebuilt) =
+            owner.load_discovery_for_recovery(&options.binding, previous.as_ref())?;
+        let previous_binding = old
+            .as_ref()
+            .map(|old| old.snapshot.binding.clone())
+            .filter(|binding| binding != &options.binding);
+        let pending_binding = previous_binding.as_ref().map(|_| options.binding.clone());
         let current = crate::domain::PhysicalDomain::from_env()
             .context("read execution domain before supervisor launch")?;
         if let Some(old) = &mut old {
             detach_previous_container_control(&root, old, current.as_ref())?;
         }
-        let recovery_launch = initial_recovery_launch(&root, old.as_ref(), current.as_ref());
+        let recovery_launch = pending_binding.is_some()
+            || initial_recovery_launch(&root, old.as_ref(), current.as_ref());
         let pending = old
             .as_ref()
             .filter(|d| !matches!(d.snapshot.phase, Phase::Stopped | Phase::RecoveryRequired))
@@ -382,7 +400,7 @@ impl OwnerSession {
             ),
             snapshot: Snapshot {
                 version: 1,
-                binding: options.binding.clone(),
+                binding: previous_binding.unwrap_or_else(|| options.binding.clone()),
                 supervisor_id: instance,
                 generation: old.as_ref().and_then(|d| d.snapshot.generation.clone()),
                 phase: Phase::Reconciling,
@@ -422,6 +440,7 @@ impl OwnerSession {
             core: core.clone(),
             business: None,
             cleanup: None,
+            pending_binding,
             next_cleanup: tokio::time::Instant::now(),
             next_discovery_check: tokio::time::Instant::now(),
             first_launch: !recovery_launch,
@@ -584,6 +603,8 @@ struct RunState {
     core: Arc<SessionCore>,
     business: Option<ActiveBusiness>,
     cleanup: Option<CleanupSlot>,
+    /// Retain the original binding while any old receipt may still need it.
+    pending_binding: Option<control::Binding>,
     next_cleanup: tokio::time::Instant,
     next_discovery_check: tokio::time::Instant,
     first_launch: bool,
@@ -598,6 +619,7 @@ impl RunState {
         let instance = self.core.snapshot().supervisor_id;
         match record::reconcile_foreign(&self.core.root, &instance) {
             Ok(None) => {
+                self.finish_binding_recovery()?;
                 self.core.set_fence(FenceState::Clear);
                 Ok(())
             }
@@ -611,6 +633,34 @@ impl RunState {
             }
             Err(error) => self.core.record_problem(&error),
         }
+    }
+
+    fn finish_binding_recovery(&mut self) -> Result<()> {
+        let Some(binding) = self.pending_binding.as_ref() else {
+            return Ok(());
+        };
+        let rebound = self.core.with_discovery(|discovery| {
+            // Cleanup is confirmed, but captured Shutdown still owns the old
+            // binding. Cancel this pending rebind so its exact receipt can finish
+            // and the owner can exit; a successor may authorize the new binding.
+            if discovery.snapshot.intent == Intent::Shutdown {
+                return Ok(false);
+            }
+            discovery.snapshot.binding = binding.clone();
+            // Rebinding never replays the prior workspace's automatic launch.
+            if discovery.snapshot.operation_id.is_none() && discovery.snapshot.intent == Intent::Run
+            {
+                discovery.snapshot.intent = Intent::Stopped;
+            }
+            Ok(true)
+        })?;
+        if rebound {
+            tracing::info!(resource = %binding.resource.display(), "managed owner binding recovered after cleanup");
+        } else {
+            tracing::info!("pending managed binding deferred until captured Shutdown exits");
+        }
+        self.pending_binding = None;
+        Ok(())
     }
 
     fn start_cleanup(&mut self, value: record::Generation, root: PathBuf, lock: std::fs::File) {
@@ -755,6 +805,7 @@ impl RunState {
         let instance = self.core.snapshot().supervisor_id;
         match record::reconcile_foreign(&self.core.root, &instance) {
             Ok(None) => {
+                self.finish_binding_recovery()?;
                 self.core.set_fence(FenceState::Clear);
             }
             Ok(Some(target)) => {
@@ -795,24 +846,29 @@ impl RunState {
     /// management session (idle serve); the business body suppresses actual
     /// business start from the snapshot intent.
     async fn drive_idle(&mut self, factory: &mut BusinessFactory) -> Result<IdleFlow> {
+        // Keep the deadline across control requests. Recreating this interval
+        // after each request lets frequent Status/Shutdown polling starve cleanup.
+        let mut tick = tokio::time::interval(Duration::from_millis(200));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await;
         loop {
             // Shutdown completes only after the background cleanup settles
             //（R2.2：不因进程退出把未确认清理写成 Stopped）。
-            if self.shutdown.is_cancelled() && !self.cleanup_pending() {
+            let owner_shutdown =
+                self.shutdown.is_cancelled() || self.core.intent() == Intent::Shutdown;
+            if owner_shutdown && !self.cleanup_pending() && self.fence_cleared() {
                 self.core.with_discovery(|discovery| {
                     if discovery.snapshot.intent != Intent::Shutdown {
                         discovery.snapshot.intent = Intent::Shutdown;
                     }
-                    if discovery.snapshot.phase != Phase::Stopped
-                        && discovery.snapshot.problem.is_none()
-                    {
-                        discovery.snapshot.phase = Phase::Stopped;
-                    }
+                    discovery.snapshot.phase = Phase::Stopped;
+                    discovery.snapshot.problem = None;
+                    discovery.snapshot.error = None;
                     Ok(())
                 })?;
                 return Ok(IdleFlow::Shutdown);
             }
-            if !self.shutdown.is_cancelled()
+            if !owner_shutdown
                 && self.fence_cleared()
                 && !self.cleanup_pending()
                 && self.relaunch_permitted()
@@ -822,11 +878,6 @@ impl RunState {
             }
             let shutdown_latched = self.core.intent() == Intent::Shutdown;
             let event = {
-                let mut tick = tokio::time::interval(Duration::from_millis(200));
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                // Consume the immediate first tick so timing comes from the
-                // select below, not a busy loop.
-                tick.tick().await;
                 let relaunch = self.core.relaunch_requested.notified();
                 tokio::pin!(relaunch);
                 let automatic_retry = self.core.automatic_retry_requested.notified();
@@ -882,7 +933,7 @@ impl RunState {
     }
 
     fn fence_cleared(&self) -> bool {
-        matches!(self.core.fence(), FenceState::Clear)
+        self.pending_binding.is_none() && matches!(self.core.fence(), FenceState::Clear)
     }
 
     fn relaunch_permitted(&self) -> bool {
@@ -1307,9 +1358,7 @@ impl RunState {
                 return Ok(recorded);
             }
         }
-        if request.expected_generation.is_some()
-            && request.expected_generation != snapshot.generation
-        {
+        if !request.matches_generation(snapshot.generation.as_deref()) {
             return Err(Problem {
                 code: FailureCode::IdentityChanged,
                 message: "execution generation changed".into(),
@@ -1429,6 +1478,418 @@ mod tests {
             .await
             .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn binding_recovery_consumes_original_exit_proof_before_rebinding() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = session(dir.path()).await;
+        let original = old.snapshot();
+        let previous = original.binding.clone();
+        let desired = control::Binding {
+            resource: dir.path().join("source"),
+            ..previous.clone()
+        };
+        let generation = uuid::Uuid::new_v4().to_string();
+        let work = record::work_root(dir.path(), &generation).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        process_utils::command_authority::Gate::try_acquire(&work)
+            .unwrap()
+            .initialize()
+            .unwrap();
+        let domain = crate::domain::PhysicalDomain {
+            authority: "binding-recovery".into(),
+            instance_source_env: None,
+            instance: "retired".into(),
+            volume: "same-volume".into(),
+        };
+        record::save(
+            &work.join("generation.json"),
+            &record::Generation {
+                version: 1,
+                id: generation.clone(),
+                supervisor: original.supervisor_id.clone(),
+                token: "fixture".into(),
+                intent: Intent::Stopped,
+                phase: record::GenerationPhase::Running,
+                worker_pid: None,
+                exit_code: None,
+                error: None,
+                physical_domain: Some(domain.clone()),
+                process_epoch: None,
+            },
+        )
+        .unwrap();
+        record::save(
+            &work.join("physical-exit.json"),
+            &crate::domain::Retirement {
+                binding: previous.clone(),
+                generation: generation.clone(),
+                supervisor_id: original.supervisor_id,
+                domain,
+            },
+        )
+        .unwrap();
+        let proof = std::fs::read(work.join("physical-exit.json")).unwrap();
+        old.core
+            .with_discovery(|value| {
+                value.snapshot.generation = Some(generation.clone());
+                value.snapshot.intent = Intent::Stopped;
+                Ok(())
+            })
+            .unwrap();
+        drop(old);
+        let owner = Owner::try_acquire(dir.path()).unwrap().unwrap();
+        assert!(
+            owner.load_discovery(&desired).is_err(),
+            "ordinary callers cannot rebind"
+        );
+        let restored = OwnerSession::start_recovering_binding(
+            owner,
+            SessionOptions {
+                binding: desired.clone(),
+                policy: crate::Policy::default(),
+                cleanup_adapter: None,
+                restart_on_exit: true,
+                shutdown: CancellationToken::new(),
+            },
+            Some(previous.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            restored.snapshot().binding,
+            previous,
+            "old proof still needs its original binding"
+        );
+        let mut driver = restored.run.lock().unwrap().take().unwrap();
+        driver.seed_fence().unwrap();
+        assert_eq!(
+            record::generation(&work).unwrap().phase,
+            record::GenerationPhase::Quiescent
+        );
+        assert_eq!(
+            std::fs::read(work.join("physical-exit.json")).unwrap(),
+            proof
+        );
+        assert_eq!(restored.snapshot().binding, desired);
+        assert_eq!(restored.snapshot().intent, Intent::Stopped);
+        assert!(
+            !driver.first_launch,
+            "layout recovery cannot replay initial business inputs"
+        );
+        assert!(driver.fence_cleared());
+    }
+
+    #[tokio::test]
+    async fn shutdown_accepted_during_binding_cleanup_survives_rebinding_and_exits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        let old = session(root.path()).await;
+        let before = old.snapshot();
+        let previous = before.binding.clone();
+        let desired = control::Binding {
+            resource: root.path().join("correct-source"),
+            ..previous.clone()
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        let work = record::work_root(root.path(), &id).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        process_utils::command_authority::Gate::try_acquire(&work)
+            .unwrap()
+            .initialize()
+            .unwrap();
+        // The prior driver has ended; its real cleanup still needs to run.
+        let generation = record::Generation {
+            version: 1,
+            id: id.clone(),
+            supervisor: before.supervisor_id,
+            token: "binding-cleanup-fixture".into(),
+            intent: Intent::Run,
+            phase: record::GenerationPhase::Draining,
+            worker_pid: None,
+            exit_code: None,
+            error: None,
+            physical_domain: None,
+            process_epoch: None,
+        };
+        record::save(&work.join("generation.json"), &generation).unwrap();
+        old.core
+            .with_discovery(|discovery| {
+                discovery.snapshot.generation = Some(id.clone());
+                discovery.snapshot.phase = Phase::CleanupPending;
+                Ok(())
+            })
+            .unwrap();
+        drop(old);
+        let restored = OwnerSession::start_recovering_binding(
+            Owner::try_acquire(root.path()).unwrap().unwrap(),
+            SessionOptions {
+                binding: desired.clone(),
+                policy: crate::Policy::default(),
+                cleanup_adapter: None,
+                restart_on_exit: true,
+                shutdown: CancellationToken::new(),
+            },
+            Some(previous.clone()),
+        )
+        .await
+        .unwrap();
+        let mut state = restored.run.lock().unwrap().take().unwrap();
+        restored
+            .core
+            .mark_pending_cleanup("old binding cleanup is held at the test barrier".into())
+            .unwrap();
+        let (release_cleanup, barrier) = oneshot::channel();
+        let cleanup_root = work.clone();
+        restored
+            .core
+            .cleanup_in_flight
+            .store(true, Ordering::Release);
+        // Same cleanup slot as start_cleanup; the barrier makes request ordering
+        // deterministic while still executing cleanup::once and its disk receipts.
+        state.cleanup = Some(CleanupSlot {
+            generation: id.clone(),
+            root: work.clone(),
+            lock: record::lock(&work.join("generation.lock")).unwrap(),
+            task: Some(AbortOnDrop(tokio::spawn(async move {
+                barrier.await.unwrap();
+                let mut generation = generation;
+                let result = cleanup::once(&cleanup_root, &mut generation, None).await;
+                (generation, result)
+            }))),
+            value: None,
+            next_attempt: tokio::time::Instant::now(),
+        });
+        let launches = Arc::new(AtomicUsize::new(0));
+        let counted = launches.clone();
+        let captured = restored.snapshot();
+        let mut driving = AbortOnDrop(tokio::spawn(async move {
+            let mut factory: BusinessFactory = Box::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                panic!("accepted Shutdown must not relaunch after binding cleanup")
+            });
+            let result = state.drive_idle(&mut factory).await;
+            drop(state);
+            drop(restored);
+            result
+        }));
+        let mut shutdown = Request::new(Action::Shutdown);
+        shutdown.capture_generation(Some(&id));
+        let scope = root.path().to_path_buf();
+        let request = shutdown.clone();
+        let before_shutdown = captured.clone();
+        let mut handover = AbortOnDrop(tokio::spawn(async move {
+            crate::shutdown_captured_owner(
+                &scope,
+                &before_shutdown,
+                &request,
+                Duration::from_secs(10),
+            )
+            .await
+        }));
+        let accepted = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status = crate::control_verified(
+                    root.path(),
+                    Request::new(Action::Status),
+                    &captured.supervisor_id,
+                )
+                .await
+                .unwrap();
+                if status.operation_id.as_deref() == Some(shutdown.request_id.as_str()) {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !handover.0.is_finished(),
+            "captured Shutdown must wait for cleanup and owner exit"
+        );
+        assert_eq!(accepted.intent, Intent::Shutdown);
+        assert_eq!(accepted.binding, previous);
+        assert_eq!(
+            accepted.operation_id.as_deref(),
+            Some(shutdown.request_id.as_str())
+        );
+        assert_eq!(
+            record::generation(&work).unwrap().phase,
+            record::GenerationPhase::Draining
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        assert!(Owner::try_acquire(root.path()).unwrap().is_none());
+        release_cleanup.send(()).unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(10), &mut driving.0)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, IdleFlow::Shutdown));
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            std::fs::read_dir(root.path().join("work")).unwrap().count(),
+            1,
+            "no replacement generation may be created"
+        );
+        assert_eq!(
+            record::generation(&work).unwrap().phase,
+            record::GenerationPhase::Quiescent
+        );
+        tokio::time::timeout(Duration::from_secs(10), &mut handover.0)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let after = crate::last_snapshot(root.path()).unwrap();
+        assert_eq!(
+            after.binding, previous,
+            "captured Shutdown must retain its original binding"
+        );
+        assert_eq!(after.intent, Intent::Shutdown);
+        assert_eq!(after.phase, Phase::Stopped);
+        let receipt = crate::saved_request_snapshot(root.path(), &shutdown)
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.intent, Intent::Shutdown);
+        assert_eq!(receipt.phase, Phase::Stopped);
+        assert_eq!(
+            receipt.operation_id.as_deref(),
+            Some(shutdown.request_id.as_str())
+        );
+        assert!(
+            Owner::try_acquire(root.path()).unwrap().is_some(),
+            "exited owner must release its lock"
+        );
+        // The successor can authorize the deferred binding once the captured
+        // owner has really exited; Shutdown does not leave a permanent hold.
+        let successor = OwnerSession::start_recovering_binding(
+            Owner::try_acquire(root.path()).unwrap().unwrap(),
+            SessionOptions {
+                binding: desired.clone(),
+                policy: crate::Policy::default(),
+                cleanup_adapter: None,
+                restart_on_exit: true,
+                shutdown: CancellationToken::new(),
+            },
+            Some(previous),
+        )
+        .await
+        .unwrap();
+        let mut next_driver = successor.run.lock().unwrap().take().unwrap();
+        next_driver.seed_fence().unwrap();
+        assert_eq!(successor.snapshot().binding, desired);
+        assert_eq!(successor.snapshot().intent, Intent::Stopped);
+        assert!(next_driver.fence_cleared());
+    }
+
+    #[tokio::test]
+    async fn captured_idle_shutdown_cannot_stop_a_later_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path()).await;
+        let mut state = session.run.lock().unwrap().take().unwrap();
+        let discovery = session.core.discovery.lock().unwrap().clone();
+        let mut request = Request::new(Action::Shutdown);
+        request.capture_generation(None);
+        let envelope = Envelope {
+            version: control::CONTROL_VERSION,
+            instance: discovery.instance,
+            token: discovery.token,
+            request,
+        };
+        session
+            .core
+            .with_discovery(|value| {
+                value.snapshot.generation = Some("new-generation".into());
+                value.snapshot.phase = Phase::Ready;
+                Ok(())
+            })
+            .unwrap();
+        let error = state.handle_request(&envelope).unwrap_err();
+        assert_eq!(
+            Problem::from_error(&error).code,
+            FailureCode::IdentityChanged
+        );
+        assert_eq!(session.snapshot().intent, Intent::Run);
+        session
+            .core
+            .with_discovery(|value| {
+                value.snapshot.generation = None;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            state.handle_request(&envelope).unwrap().intent,
+            Intent::Shutdown
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_frequent_status_queries_finishes_cleanup_without_relaunch() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path()).await;
+        let mut state = session.run.lock().unwrap().take().unwrap();
+        state.seed_fence().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let work = record::work_root(root.path(), &id).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        process_utils::command_authority::Gate::try_acquire(&work)
+            .unwrap()
+            .initialize()
+            .unwrap();
+        let generation = record::Generation {
+            version: 1,
+            id: id.clone(),
+            supervisor: session.snapshot().supervisor_id,
+            token: "fixture".into(),
+            intent: Intent::Shutdown,
+            phase: record::GenerationPhase::Draining,
+            worker_pid: None,
+            exit_code: None,
+            error: None,
+            physical_domain: None,
+            process_epoch: None,
+        };
+        record::save(&work.join("generation.json"), &generation).unwrap();
+        session
+            .core
+            .with_discovery(|value| {
+                value.snapshot.intent = Intent::Shutdown;
+                value.snapshot.generation = Some(id);
+                Ok(())
+            })
+            .unwrap();
+        session
+            .core
+            .mark_pending_cleanup("fixture execution has ended".into())
+            .unwrap();
+        state.start_cleanup(
+            generation,
+            work.clone(),
+            record::lock(&work.join("generation.lock")).unwrap(),
+        );
+        let scope = root.path().to_path_buf();
+        let polling = tokio::spawn(async move {
+            loop {
+                drop(crate::control(&scope, Request::new(Action::Status)).await);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        });
+        let mut factory: BusinessFactory =
+            Box::new(|_| panic!("Shutdown must not launch another generation"));
+        let result =
+            tokio::time::timeout(Duration::from_secs(3), state.drive_idle(&mut factory)).await;
+        polling.abort();
+        drop(polling.await);
+        assert!(matches!(result.unwrap().unwrap(), IdleFlow::Shutdown));
+        assert_eq!(
+            record::generation(&work).unwrap().phase,
+            record::GenerationPhase::Quiescent
+        );
+        assert_eq!(session.snapshot().phase, Phase::Stopped);
     }
 
     #[tokio::test]

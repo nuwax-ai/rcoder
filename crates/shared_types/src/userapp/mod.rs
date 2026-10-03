@@ -43,3 +43,5 @@ pub mod compute_control;
 pub mod compute_recovery;
 
 pub mod discovery;
+
+pub mod diagnostic;

@@ -10,7 +10,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use file_server::error::{AppError, AppResult};
 use file_server::service::build_manager::BuildGuard;
@@ -21,8 +20,8 @@ use shared_types::{BuildProgressEvent, DiscoveredProject};
 use super::manifest::{
     ReleaseMetadata, build_release_lock, discover_projects_async, read_workspace_manifest,
 };
+use super::spawn_build_log_pipe;
 use super::tasks::BuildTask;
-use super::{required_release_metadata, spawn_build_log_pipe};
 
 /// 源码目录 lock 文件名（与 app-cli `read_release_lock` 约定一致）。
 const LOCK_FILE: &str = "release.lock.toml";
@@ -233,89 +232,172 @@ async fn devbuild_with_no_lockfile_heal(
         Err(retry) => Err(super::self_heal_retry_error(retry, install_error)),
     }
 }
-/// ensure 源码目录 `release.lock.toml`：无 lock、或任一 manifest 比 lock 新
-/// （mtime）→ 重新生成；新鲜则 no-op。返回编排 workspace 根（= 源码 ws 本身，
-/// app-cli `--workspace` 指向这里）。
-///
-/// metadata 与发布链同源（env 必备——发布编译同进程已依赖）；
-/// `minimum_app_cli_version` 取共享常量（app-cli 版本线，见其 doc 的纪律）。
-/// 幂等，重复调用安全。
+/// Prepare the source-derived lock before any owner submission or old-service
+/// stop. Valid unchanged inputs retain the existing bytes and release identity;
+/// timestamps alone cannot prove that a derived file is valid or up to date.
 pub async fn ensure_dev_lock(ws: &Path) -> AppResult<PathBuf> {
-    let lock_path = ws.join(LOCK_FILE);
-    if fresh_lock(ws, &lock_path).await {
-        return Ok(ws.to_path_buf());
-    }
+    let value = |name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
+    ensure_dev_lock_with_metadata(
+        ws,
+        SourceLockMetadata {
+            pingap_version: value("RCODER_PINGAP_VERSION"),
+            pingap_commit: value("RCODER_PINGAP_COMMIT"),
+            runtime_image_digest: value("RCODER_RUNTIME_IMAGE_DIGEST"),
+        },
+    )
+    .await
+}
 
+/// Captured environment inputs, not another release contract. Missing values
+/// may compare an unchanged cache using its own metadata; regeneration still
+/// requires the same three explicit values as the original writer.
+struct SourceLockMetadata {
+    pingap_version: Option<String>,
+    pingap_commit: Option<String>,
+    runtime_image_digest: Option<String>,
+}
+
+impl SourceLockMetadata {
+    fn for_lock<'a>(
+        &'a self,
+        release_id: &'a str,
+        cached: Option<&'a shared_types::ReleaseLock>,
+    ) -> AppResult<ReleaseMetadata<'a>> {
+        fn require<'a>(name: &str, value: Option<&'a str>) -> AppResult<&'a str> {
+            value
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    AppError::system(format!(
+                        "required release metadata environment variable is missing: {name}"
+                    ))
+                })
+        }
+        Ok(ReleaseMetadata {
+            release_id,
+            pingap_version: require(
+                "RCODER_PINGAP_VERSION",
+                self.pingap_version
+                    .as_deref()
+                    .or_else(|| cached.map(|lock| lock.pingap.version.as_str())),
+            )?,
+            pingap_commit: require(
+                "RCODER_PINGAP_COMMIT",
+                self.pingap_commit
+                    .as_deref()
+                    .or_else(|| cached.map(|lock| lock.pingap.commit.as_str())),
+            )?,
+            minimum_app_cli_version: cached.map_or(shared_types::MINIMUM_APP_CLI_VERSION, |lock| {
+                lock.minimum_app_cli_version.as_str()
+            }),
+            runtime_image_digest: require(
+                "RCODER_RUNTIME_IMAGE_DIGEST",
+                self.runtime_image_digest
+                    .as_deref()
+                    .or_else(|| cached.map(|lock| lock.runtime_image_digest.as_str())),
+            )?,
+        })
+    }
+}
+
+async fn ensure_dev_lock_with_metadata(
+    ws: &Path,
+    metadata: SourceLockMetadata,
+) -> AppResult<PathBuf> {
+    // Validate the current authoritative source before changing its derived
+    // cache. An invalid new manifest must leave both the old lock and service intact.
     let manifest = read_workspace_manifest(ws).await?;
     let discovered = discover_ws_projects(ws).await?;
-    if discovered.is_empty() {
-        return Err(AppError::business(format!(
-            "no sub-projects found under workspace={}",
-            ws.display()
-        )));
+    let lock_path = ws.join(LOCK_FILE);
+    let cached = match tokio::fs::read(&lock_path).await {
+        Ok(bytes) => match std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|content| shared_types::load_release_lock(content).ok())
+        {
+            Some(lock)
+                if !lock.release_id.trim().is_empty()
+                    && semver::Version::parse(&lock.minimum_app_cli_version).is_ok() =>
+            {
+                Some(lock)
+            }
+            _ => {
+                tracing::warn!(lock = %lock_path.display(), "[DEV_LOCK] invalid derived source lock; regenerating from manifests");
+                None
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(AppError::system(format!(
+                "read {}: {error}",
+                lock_path.display()
+            )));
+        }
+    };
+    let serialize = |lock: &shared_types::ReleaseLock| {
+        toml::to_string_pretty(lock)
+            .map_err(|error| AppError::system(format!("serialize {LOCK_FILE}: {error}")))
+    };
+    if let Some(cached) = cached {
+        let candidate = build_release_lock(
+            &manifest,
+            &discovered,
+            metadata.for_lock(&cached.release_id, Some(&cached))?,
+        )
+        .map_err(|error| AppError::business(error.to_string()))?;
+        if serialize(&candidate)? == serialize(&cached)? {
+            return Ok(ws.to_path_buf());
+        }
     }
-    let pingap_version = required_release_metadata("RCODER_PINGAP_VERSION")?;
-    let pingap_commit = required_release_metadata("RCODER_PINGAP_COMMIT")?;
-    let runtime_image_digest = required_release_metadata("RCODER_RUNTIME_IMAGE_DIGEST")?;
     let release_id = uuid::Uuid::now_v7().simple().to_string();
     let lock = build_release_lock(
         &manifest,
         &discovered,
-        ReleaseMetadata {
-            release_id: &release_id,
-            pingap_version: &pingap_version,
-            pingap_commit: &pingap_commit,
-            minimum_app_cli_version: shared_types::MINIMUM_APP_CLI_VERSION,
-            runtime_image_digest: &runtime_image_digest,
-        },
+        metadata.for_lock(&release_id, None)?,
     )
-    .map_err(|e| AppError::business(e.to_string()))?;
-    let content = toml::to_string_pretty(&lock)
-        .map_err(|e| AppError::system(format!("serialize {LOCK_FILE}: {e}")))?;
-    tokio::fs::write(&lock_path, content)
-        .await
-        .map_err(|e| AppError::system(format!("write {}: {e}", lock_path.display())))?;
-    tracing::info!(
-        release_id,
-        lock = %lock_path.display(),
-        "[DEV_LOCK] source-mode release lock generated"
-    );
+    .map_err(|error| AppError::business(error.to_string()))?;
+    let content = serialize(&lock)?;
+    let publish_path = lock_path.clone();
+    let directory = ws.to_path_buf();
+    tokio::task::spawn_blocking(move || -> AppResult<()> {
+        use std::io::Write;
+        let publish = || -> std::io::Result<()> {
+            let previous_permissions = match std::fs::metadata(&publish_path) {
+                Ok(metadata) => Some(metadata.permissions()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            let builder = tempfile::Builder::new();
+            #[cfg(unix)]
+            let builder = {
+                use std::os::unix::fs::PermissionsExt;
+                let mut builder = builder;
+                // Ordinary source-file creation policy: 0666 filtered by umask.
+                // Receipt writers elsewhere intentionally keep their private mode.
+                builder.permissions(std::fs::Permissions::from_mode(0o666));
+                builder
+            };
+            let mut file = builder.tempfile_in(&directory)?;
+            if let Some(permissions) = previous_permissions {
+                file.as_file().set_permissions(permissions)?;
+            }
+            file.write_all(content.as_bytes())?;
+            file.as_file().sync_all()?;
+            process_utils::atomic_file::persist(file, &publish_path)?;
+            #[cfg(unix)]
+            std::fs::File::open(&directory)?.sync_all()?;
+            Ok(())
+        };
+        publish().map_err(|error| {
+            AppError::system(format!("publish {}: {error}", publish_path.display()))
+        })
+    })
+    .await
+    .map_err(|error| AppError::system(format!("join source lock publication: {error}")))??;
+    tracing::info!(release_id, lock = %lock_path.display(), "[DEV_LOCK] source-mode release lock generated");
     Ok(ws.to_path_buf())
-}
-
-/// lock 存在且比全部 manifests 新 → 新鲜（不重锁）。
-async fn fresh_lock(ws: &Path, lock_path: &Path) -> bool {
-    let Some(lock_mtime) = mtime_of(lock_path).await else {
-        return false;
-    };
-    // workspace.manifest.toml 本身也算输入（pingap/bridge_service 段变更需重锁）
-    let mut inputs = vec![ws.join("workspace.manifest.toml")];
-    // 仅扫一级子目录（与 discover 同面），mtime 比对无需解析内容
-    let Ok(mut rd) = tokio::fs::read_dir(ws).await else {
-        return false;
-    };
-    while let Ok(Some(entry)) = rd.next_entry().await {
-        if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
-            inputs.push(entry.path().join("project.manifest.toml"));
-        }
-    }
-    let mut stale = false;
-    for input in &inputs {
-        if let Some(mtime) = mtime_of(input).await
-            && mtime > lock_mtime
-        {
-            stale = true;
-            break;
-        }
-    }
-    !stale
-}
-
-async fn mtime_of(path: &Path) -> Option<SystemTime> {
-    tokio::fs::metadata(path)
-        .await
-        .ok()
-        .and_then(|meta| meta.modified().ok())
 }
 
 async fn discover_ws_projects(ws: &Path) -> AppResult<Vec<DiscoveredProject>> {
@@ -329,6 +411,7 @@ mod tests {
     use super::*;
     use file_server::service::build_manager::BuildManager;
     use std::fs;
+    use std::time::SystemTime;
 
     fn temp_ws() -> PathBuf {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -394,36 +477,324 @@ mod tests {
         file.set_modified(mtime).expect("set mtime");
     }
 
-    /// fresh_lock 判定：无 lock → 不新鲜（需生成）；lock 比全部 manifest 新 →
-    /// 新鲜（no-op）；任一 manifest 比 lock 新（agent 改过）→ 重锁。
-    #[tokio::test]
-    async fn fresh_lock_tracks_manifest_mtime() {
+    fn lock_metadata() -> SourceLockMetadata {
+        SourceLockMetadata {
+            pingap_version: Some("0.14.3".into()),
+            pingap_commit: Some("fixture-commit".into()),
+            runtime_image_digest: Some("fixture-runtime".into()),
+        }
+    }
+
+    fn source_workspace() -> PathBuf {
         let ws = temp_ws();
         fs::write(
             ws.join("workspace.manifest.toml"),
-            "schema_version = 1\n[workspace]\nname = 'ws'\n",
+            "schema_version=1\n[workspace]\nname='source-lock-test'\n",
         )
-        .expect("workspace manifest");
-        write_manifest(&ws.join("frontend"), "frontend", "");
-        let lock_path = ws.join(LOCK_FILE);
-
-        // 无 lock → 不新鲜
-        assert!(!fresh_lock(&ws, &lock_path).await);
-
-        // lock 存在且最新 → 新鲜（用显式 mtime 控制，避免文件系统时间精度 flaky）
-        fs::write(&lock_path, "schema_version = 1\n").expect("lock");
-        let base = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        set_mtime(&ws.join("workspace.manifest.toml"), base);
-        set_mtime(&ws.join("frontend").join("project.manifest.toml"), base);
-        set_mtime(&lock_path, base + std::time::Duration::from_secs(10));
-        assert!(fresh_lock(&ws, &lock_path).await);
-
-        // manifest 改动（mtime 新于 lock）→ 不新鲜
-        set_mtime(
-            &ws.join("frontend").join("project.manifest.toml"),
-            base + std::time::Duration::from_secs(20),
+        .unwrap();
+        write_manifest(
+            &ws.join("frontend"),
+            "frontend",
+            "[devrun]\ncommand=['true']",
         );
-        assert!(!fresh_lock(&ws, &lock_path).await);
+        write_manifest(&ws.join("backend"), "backend", "");
+        ws
+    }
+
+    #[tokio::test]
+    async fn source_lock_replaces_newer_corruption_and_preserves_unchanged_bytes_without_env() {
+        let ws = source_workspace();
+        let path = ws.join(LOCK_FILE);
+        fs::write(&path, "[broken-derived-lock").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let future = SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600,
+            );
+        set_mtime(&path, future);
+        ensure_dev_lock_with_metadata(&ws, lock_metadata())
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+        let generated = fs::read_to_string(&path).unwrap();
+        let mut original = shared_types::load_release_lock(&generated).unwrap();
+        original.minimum_app_cli_version = "0.3.8".into();
+        let preserved = format!(
+            "# preserve user formatting on a valid unchanged cache\n{}",
+            toml::to_string_pretty(&original).unwrap()
+        );
+        fs::write(&path, &preserved).unwrap();
+        set_mtime(&path, future);
+        ensure_dev_lock_with_metadata(
+            &ws,
+            SourceLockMetadata {
+                pingap_version: None,
+                pingap_commit: None,
+                runtime_image_digest: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), preserved);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), future);
+        assert_eq!(
+            shared_types::load_release_lock(&preserved)
+                .unwrap()
+                .release_id,
+            original.release_id
+        );
+    }
+
+    #[tokio::test]
+    async fn source_lock_tracks_manifest_and_all_runtime_metadata_without_mtime_assumptions() {
+        let ws = source_workspace();
+        let path = ws.join(LOCK_FILE);
+        ensure_dev_lock_with_metadata(&ws, lock_metadata())
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                fs::metadata(ws.join("workspace.manifest.toml"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777
+            );
+        }
+        let old = shared_types::load_release_lock(&fs::read_to_string(&path).unwrap()).unwrap();
+        write_manifest(
+            &ws.join("frontend"),
+            "frontend",
+            "[devrun]\ncommand=['changed-command']",
+        );
+        let past = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        set_mtime(&ws.join("frontend/project.manifest.toml"), past);
+        ensure_dev_lock_with_metadata(&ws, lock_metadata())
+            .await
+            .unwrap();
+        let updated = shared_types::load_release_lock(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_ne!(updated.release_id, old.release_id);
+        assert_eq!(
+            updated
+                .services
+                .iter()
+                .find(|service| service.service_id == "frontend")
+                .unwrap()
+                .devrun
+                .as_ref()
+                .unwrap()
+                .command,
+            vec!["changed-command"]
+        );
+        for field in 0..3 {
+            ensure_dev_lock_with_metadata(&ws, lock_metadata())
+                .await
+                .unwrap();
+            let before = fs::read_to_string(&path).unwrap();
+            let mut metadata = lock_metadata();
+            match field {
+                0 => metadata.pingap_version = Some("0.14.4".into()),
+                1 => metadata.pingap_commit = Some("changed-commit".into()),
+                _ => metadata.runtime_image_digest = Some("changed-runtime".into()),
+            }
+            ensure_dev_lock_with_metadata(&ws, metadata).await.unwrap();
+            let after = fs::read_to_string(&path).unwrap();
+            assert_ne!(
+                shared_types::load_release_lock(&after).unwrap().release_id,
+                shared_types::load_release_lock(&before).unwrap().release_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn source_lock_rebuilds_invalid_minimum_versions_and_preserves_valid_ones() {
+        let ws = source_workspace();
+        let path = ws.join(LOCK_FILE);
+        ensure_dev_lock_with_metadata(&ws, lock_metadata())
+            .await
+            .unwrap();
+        for minimum in ["broken", "", "0.3.8", "999.0.0"] {
+            let mut cached =
+                shared_types::load_release_lock(&fs::read_to_string(&path).unwrap()).unwrap();
+            cached.minimum_app_cli_version = minimum.into();
+            let previous_id = cached.release_id.clone();
+            let previous = toml::to_string_pretty(&cached).unwrap();
+            fs::write(&path, &previous).unwrap();
+            ensure_dev_lock_with_metadata(&ws, lock_metadata())
+                .await
+                .unwrap();
+            let repaired =
+                shared_types::load_release_lock(&fs::read_to_string(&path).unwrap()).unwrap();
+            if semver::Version::parse(minimum).is_ok() {
+                assert_eq!(fs::read_to_string(&path).unwrap(), previous);
+                assert_eq!(repaired.release_id, previous_id);
+                assert_eq!(repaired.minimum_app_cli_version, minimum);
+            } else {
+                assert_ne!(repaired.release_id, previous_id);
+                assert_eq!(
+                    repaired.minimum_app_cli_version,
+                    shared_types::MINIMUM_APP_CLI_VERSION
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_source_or_missing_rebuild_metadata_preserves_previous_lock() {
+        let ws = source_workspace();
+        let path = ws.join(LOCK_FILE);
+        ensure_dev_lock_with_metadata(&ws, lock_metadata())
+            .await
+            .unwrap();
+        let previous = fs::read(&path).unwrap();
+        let root_manifest = ws.join("workspace.manifest.toml");
+        let original = fs::read(&root_manifest).unwrap();
+        fs::write(&root_manifest, "[invalid-source").unwrap();
+        assert!(
+            ensure_dev_lock_with_metadata(&ws, lock_metadata())
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), previous);
+        fs::write(&root_manifest, original).unwrap();
+        write_manifest(
+            &ws.join("frontend"),
+            "frontend",
+            "[devrun]\ncommand=['changed-command']",
+        );
+        let error = ensure_dev_lock_with_metadata(
+            &ws,
+            SourceLockMetadata {
+                pingap_version: None,
+                pingap_commit: None,
+                runtime_image_digest: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("required release metadata environment variable is missing")
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            previous,
+            "cached metadata may compare but cannot authorize a rebuild"
+        );
+    }
+
+    /// A protocol fixture for an already healthy owner. The actual manager's
+    /// startup-contract gate must reject unsupported new source semantics
+    /// before it submits Restart/Stop or polls the deferred activation future.
+    #[tokio::test]
+    async fn prepared_source_probe_is_rejected_before_stopping_old_owner() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let ws = source_workspace();
+        write_manifest(
+            &ws.join("frontend"),
+            "frontend",
+            "kind='worker'\n[devrun]\ncommand=['true']\n[health]\nstartup_probe='process'\nstartup_timeout_seconds=10",
+        );
+        fs::write(ws.join(LOCK_FILE), "[broken-derived-lock").unwrap();
+        ensure_dev_lock_with_metadata(&ws, lock_metadata())
+            .await
+            .unwrap();
+        let prepared = fs::read(ws.join(LOCK_FILE)).unwrap();
+        let identity = shared_types::RuntimeIdentityView {
+            application_id: std::env::var("PROJECT_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "unknown-app".into()),
+            service_family: "userapp-dev".into(),
+            workspace_id: "healthy-workspace".into(),
+            source_root: ws.display().to_string(),
+            runtime_instance_id: "healthy-owner".into(),
+            deployment_generation_id: "healthy-generation".into(),
+            protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+            capabilities: Vec::new(),
+        };
+        let posts = Arc::new(AtomicUsize::new(0));
+        let count = posts.clone();
+        let router = axum::Router::new()
+            .route(
+                "/v1/runtime/identity",
+                axum::routing::get(move || {
+                    let identity = identity.clone();
+                    async move { axum::Json(shared_types::HttpResult::success(identity)) }
+                }),
+            )
+            .fallback(move |request: axum::extract::Request| {
+                let count = count.clone();
+                async move {
+                    if request.method() == axum::http::Method::POST {
+                        count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    axum::http::StatusCode::NOT_FOUND
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = Arc::new(file_server::Config {
+            app_cli_admin_probe_addr: listener.local_addr().unwrap().to_string(),
+            log_base_dir: ws.join("logs"),
+            ..file_server::Config::default()
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let manager = file_server::service::dev_server::DevServerManager::new(config);
+        let activated = AtomicBool::new(false);
+        let error = manager
+            .restart_dev_staged(
+                "userapp:probe-fixture",
+                &ws,
+                file_server::service::dev_server::DevLaunch {
+                    base_path: None,
+                    hooks: None,
+                    pg: None,
+                    request_context: Some("source-task"),
+                    artifact_release_id: None,
+                },
+                async {
+                    activated.store(true, Ordering::SeqCst);
+                    Ok(ws.clone())
+                },
+            )
+            .await
+            .unwrap_err();
+        server.abort();
+        drop(server.await);
+        assert!(
+            error
+                .to_string()
+                .contains("runtime owner lacks startup-probe-v1"),
+            "{error}"
+        );
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            0,
+            "old owner must not receive Stop or Restart"
+        );
+        assert!(!activated.load(Ordering::SeqCst));
+        assert_eq!(fs::read(ws.join(LOCK_FILE)).unwrap(), prepared);
     }
 
     // ===== 真实 pnpm devbuild 链路回归（app 110 事故修复）=====

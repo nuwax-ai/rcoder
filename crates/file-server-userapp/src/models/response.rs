@@ -210,3 +210,19 @@ pub struct DevOperationRecovery {
     /// 原操作的当前状态；调用方必须检查 state，凭据不会出现在此视图中。
     pub operation: shared_types::RuntimeOperationView,
 }
+
+/// HTTP 200 data: success=true uses Accepted; success=false uses Failed.
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(untagged)]
+pub enum BuildAdmissionData {
+    Accepted(BuildCreatedData),
+    Failed(shared_types::UserAppTaskFailureData),
+}
+
+/// HTTP 200 data for start/restart, including immediate diagnostic failures.
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(untagged)]
+pub enum DevAdmissionData {
+    Accepted(UserappDevTaskCreated),
+    Failed(shared_types::UserAppTaskFailureData),
+}

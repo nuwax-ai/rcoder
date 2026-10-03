@@ -141,6 +141,43 @@ fn validate_help_and_options_are_scoped() {
 }
 
 #[test]
+fn workspace_selection_prefers_argument_then_environment_then_current_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let mut locations = Vec::new();
+    for name in ["cwd-web", "env-web", "argument-web"] {
+        let base = root.path().join(name);
+        std::fs::create_dir(&base).unwrap();
+        let workspace = fixture(&base);
+        write_project(&workspace, "web", project(name, &[], "[proxy]\npath='/'\n"));
+        locations.push(workspace);
+    }
+    let before = snapshot(root.path());
+    for (environment, argument, expected) in [
+        (false, false, "cwd-web"),
+        (true, false, "env-web"),
+        (true, true, "argument-web"),
+    ] {
+        let mut invocation = command();
+        invocation
+            .args(["validate", "--json"])
+            .current_dir(&locations[0]);
+        if environment {
+            invocation.env("APP_CLI_WORKSPACE", &locations[1]);
+        }
+        if argument {
+            invocation.arg("--workspace").arg(&locations[2]);
+        }
+        let result = report(&invocation.output().unwrap(), 0);
+        assert_eq!(result["services"][0]["service_id"], expected);
+    }
+    assert_eq!(
+        snapshot(root.path()),
+        before,
+        "directory selection must not write state"
+    );
+}
+
+#[test]
 fn successful_validate_checks_only_configuration_and_preserves_every_file() {
     let root = tempfile::tempdir().expect("temporary fixture");
     let workspace = fixture(root.path());

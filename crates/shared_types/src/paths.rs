@@ -158,6 +158,12 @@ pub fn app_code_root(app_id: &str) -> String {
     format!("{USERAPP_DEV_HOME}/{app_id}/code")
 }
 
+/// Platform source root shared by dev chat, source builds and managed owners.
+/// Deployment code and activated artifacts do not change this root.
+pub fn userapp_dev_workspace(app_id: &str) -> String {
+    format!("{USERAPP_DEV_HOME}/{app_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

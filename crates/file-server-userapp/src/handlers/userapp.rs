@@ -29,8 +29,9 @@ use shared_types::HttpResult;
 use crate::UserAppState;
 use crate::extract::{AppJson, AppPath, AppQuery};
 use crate::models::{
-    BuildCreatedData, BuildTaskSnapshot, BuildTaskStatus, BuildUserAppBody, CancelData,
-    ConfirmData, DetectData, ProjectChainBody, StreamQuery, UserappTaskScopeQuery,
+    BuildAdmissionData, BuildCreatedData, BuildTaskKind, BuildTaskSnapshot, BuildTaskStatus,
+    BuildUserAppBody, CancelData, ConfirmData, DetectData, ProjectChainBody, StreamQuery,
+    UserappTaskScopeQuery,
 };
 use crate::service::userapp;
 use crate::service::userapp::tasks::BuildProgressEvent;
@@ -38,26 +39,39 @@ use file_server::error::{AppError, AppResult};
 
 // ── HttpResult 转换层 ──────────────────────────────────────────────────────────
 
-/// Userapp JSON 接口的统一响应：成功/失败都是 HttpResult shape + 语义 HTTP 状态码。
+/// Userapp JSON 接口的统一响应：HTTP 200 + HttpResult，失败由 success=false/code 判断。
 ///
 /// file-server 全局 AppError shape（`{success, code:"UNKNOWN_ERROR", error:{...}}`）服务于
 /// TS 对齐路由不能全局改；Userapp 是 Rust 独有新业务（TS 无此路由），此处将 AppError
-/// 映射为 HttpResult 错误（code/message + 4xx/5xx 状态码）。
+/// 映射为 HTTP 200 的 HttpResult 错误（success=false + code/message）。
 pub(crate) enum UserAppReply<T> {
     Ok(T),
     Err(AppError),
-    /// 专用错误码错误：code 显式指定（如 `ERR_WORKSPACE_EMPTY`），HTTP 400。
+    /// 专用错误码错误：code 显式指定（如 `ERR_WORKSPACE_EMPTY`），HTTP 200。
     /// 用于调用方（Java/前端）需要程序化区分的受理拒绝，AppError 类型映射
     /// 覆盖不到的细分语义。
-    ErrCode(&'static str, String),
+    ErrData(&'static str, String, shared_types::UserAppTaskFailureData),
 }
 
 impl<T: Serialize> IntoResponse for UserAppReply<T> {
     fn into_response(self) -> Response {
         match self {
             UserAppReply::Ok(data) => Json(HttpResult::success(data)).into_response(),
-            UserAppReply::ErrCode(code, message) => {
-                Json(HttpResult::<T>::error(code, &message)).into_response()
+            UserAppReply::ErrData(code, message, data) => {
+                let mut value = match data.recovery.as_ref() {
+                    Some(serde_json::Value::Object(details)) => details.clone(),
+                    _ => serde_json::Map::new(),
+                };
+                // Preserve recovery identity fields at their established top level.
+                value.insert("task_id".into(), serde_json::json!(data.task_id));
+                value.insert("status".into(), serde_json::json!(data.status));
+                value.insert("diagnostics".into(), serde_json::json!(data.diagnostics));
+                if let Some(recovery) = data.recovery {
+                    value.insert("recovery".into(), recovery);
+                }
+                let mut result = HttpResult::error(code, &message);
+                result.data = Some(serde_json::Value::Object(value));
+                Json(result).into_response()
             }
             UserAppReply::Err(e) => crate::UserAppError::from(e).into_response(),
         }
@@ -113,7 +127,7 @@ fn resolve_from_seq(last_event_id: Option<&str>, query_from_seq: u64) -> u64 {
     path = "/build",
     request_body = BuildUserAppBody,
     responses(
-        (status = 200, body = HttpResult<BuildCreatedData>, description = "构建任务已受理（异步执行）。data 立即返回 task_id（轮询/SSE 用）与 artifact_path（受理时即确定：builds/workspace-package-{release_id}.zip，release_id 预生成）+ status=pending。同 app_id 已有在途构建任务时自动接替：旧构建任务立即转 cancelled（其 SSE 流收到 cancelled 终态事件），本任务等待构建锁释放后开始——最新构建请求胜出；构建锁被 dev 启动/重启占用时，等待其编译与启动交接完成，不取消 dev 任务。执行容量暂满同样等待；等待可取消，独立预算由 USERAPP_BUILD_WAIT_TIMEOUT_SECS 配置（默认 3600 秒），不保证整个任务在此时间内完成。等待快照为 pending、stage=waiting_for_build_slot；调用方须分别处理排队和执行预算。任务表保留容量耗尽时 4xx 拒绝。后续状态：轮询 GET /tasks/{task_id} 或订阅 GET /tasks/{task_id}/logs/stream（SSE，构建日志行以 log 事件实时推送）。"),
+        (status = 200, body = HttpResult<BuildAdmissionData>, description = "构建任务已受理（异步执行）。data 立即返回 task_id（轮询/SSE 用）与 artifact_path（受理时即确定：builds/workspace-package-{release_id}.zip，release_id 预生成）+ status=pending。同 app_id 已有在途构建任务时自动接替：旧构建任务立即转 cancelled（其 SSE 流收到 cancelled 终态事件），本任务等待构建锁释放后开始——最新构建请求胜出；构建锁被 dev 启动/重启占用时，等待其编译与启动交接完成，不取消 dev 任务。执行容量暂满同样等待；等待可取消，独立预算由 USERAPP_BUILD_WAIT_TIMEOUT_SECS 配置（默认 3600 秒），不保证整个任务在此时间内完成。等待快照为 pending、stage=waiting_for_build_slot；调用方须分别处理排队和执行预算。预检或受理失败仍为 HTTP 200、success=false，保留原 code/message；data 为 UserAppTaskFailureData，含 status=failed、diagnostics 和可 GET/SSE 回查的 task_id。任务保留容量耗尽时 task_id=null，并返回容量诊断；不创建虚假任务。后续状态：轮询 GET /tasks/{task_id} 或订阅 GET /tasks/{task_id}/logs/stream（SSE，构建日志行以 log 事件实时推送）。"),
     ),
     tag = "Userapp · dev · 构建任务"
 )]
@@ -125,12 +139,12 @@ pub(crate) async fn build_workspace(
     if let Err(e) = body.validate() {
         return reply(Err(file_server::error::from_garde(e)));
     }
-    // 受理前置校验：空 workspace / manifest 无可用服务同步 4xx 拒绝
-    // （专用错误码），不再创建"受理成功 → 秒级 failed"的任务。
+    // 保留同步失败信封；预检错误另有终态任务供 GET/SSE 诊断回查。
     let precheck = match userapp::precheck_dev_workspace(&body.app_id, &state.fs.config).await {
         Ok(p) => p,
-        Err(e) => return dev_precheck_reply(e),
+        Err(e) => return dev_precheck_reply(&state, &body.app_id, BuildTaskKind::Build, e).await,
     };
+    let app_id = body.app_id.clone();
     let result = async {
         let (task_id, artifact_path) = userapp::start_build_task(
             &state.build_tasks,
@@ -149,21 +163,167 @@ pub(crate) async fn build_workspace(
             artifact_path,
         })
     };
-    reply(result.await)
+    match result.await {
+        Ok(data) => UserAppReply::Ok(data),
+        Err(error) => submission_failure_reply(&state, &app_id, BuildTaskKind::Build, error).await,
+    }
 }
 
-/// 受理前置校验失败 → 专用错误码 4xx 响应（dev/start、dev/restart、build 三链共用）。
-pub(crate) fn dev_precheck_reply<T: Serialize>(e: userapp::DevPrecheckError) -> UserAppReply<T> {
-    use shared_types::error_codes as ec;
-    match e {
-        userapp::DevPrecheckError::Resolve(e) => UserAppReply::Err(e),
-        userapp::DevPrecheckError::WorkspaceEmpty(msg) => {
-            UserAppReply::ErrCode(ec::ERR_WORKSPACE_EMPTY, msg)
+/// Precheck rejection stays HTTP 200/success=false and gains a real terminal task.
+pub(crate) async fn dev_precheck_reply<T: Serialize>(
+    state: &UserAppState,
+    app_id: &str,
+    kind: BuildTaskKind,
+    error: userapp::DevPrecheckError,
+) -> UserAppReply<T> {
+    use shared_types::{
+        UserAppDiagnosticCode as Code, UserAppDiagnosticPhase as Phase,
+        UserAppRepairTarget as Target, error_codes as ec,
+    };
+    let (code, message, diagnostics) = match error {
+        userapp::DevPrecheckError::Resolve(
+            error @ (AppError::Validation(..)
+            | AppError::ValidationI18n(..)
+            | AppError::Permission(_)),
+        ) => {
+            // No authorized/queryable application scope exists yet. Preserve the
+            // original rejection instead of registering an inaccessible task ID.
+            return UserAppReply::Err(error);
         }
-        userapp::DevPrecheckError::NoServices(msg) => {
-            UserAppReply::ErrCode(ec::ERR_WORKSPACE_NO_SERVICES, msg)
+        userapp::DevPrecheckError::Resolve(error) => {
+            let code = crate::error::app_error_code(&error);
+            let message = error.to_string();
+            let ws =
+                file_server::workspace::resolve_userapp_dev(app_id, None, &state.fs.config).ok();
+            let item = userapp::diagnostics::diagnostic(
+                Code::WorkspaceIo,
+                Phase::Precheck,
+                Target::Platform,
+                ws.as_deref(),
+                &message,
+                "检查源码根路径、文件类型及读取权限后重试。",
+            );
+            (code, message, vec![item])
+        }
+        userapp::DevPrecheckError::WorkspaceEmpty(problem) => (
+            ec::ERR_WORKSPACE_EMPTY,
+            problem.message,
+            problem.diagnostics,
+        ),
+        userapp::DevPrecheckError::NoServices(problem) => (
+            ec::ERR_WORKSPACE_NO_SERVICES,
+            problem.message,
+            problem.diagnostics,
+        ),
+    };
+    failed_task_reply(state, app_id, kind, code, message, None, diagnostics, None).await
+}
+
+pub(crate) async fn submission_failure_reply<T: Serialize>(
+    state: &UserAppState,
+    app_id: &str,
+    kind: BuildTaskKind,
+    error: userapp::diagnostics::TaskSubmissionError,
+) -> UserAppReply<T> {
+    use shared_types::{
+        UserAppDiagnosticCode as Code, UserAppDiagnosticPhase as Phase,
+        UserAppRepairTarget as Target,
+    };
+    let recovery = match error.error.as_ref() {
+        AppError::RuntimeRecovery(_, data) => Some(data.clone()),
+        _ => None,
+    };
+    let code = crate::error::app_error_code(error.error.as_ref());
+    let message = error.error.to_string();
+    let diagnostics = if error.diagnostics.is_empty() {
+        let ws = file_server::workspace::resolve_userapp_dev(app_id, None, &state.fs.config).ok();
+        vec![userapp::diagnostics::diagnostic(
+            Code::OwnerPreflight,
+            Phase::OwnerPreflight,
+            Target::Platform,
+            ws.as_deref(),
+            &message,
+            "检查运行所有者和管理通道状态；有原恢复操作时按其身份继续恢复。",
+        )]
+    } else {
+        error.diagnostics
+    };
+    failed_task_reply(
+        state,
+        app_id,
+        kind,
+        code,
+        message,
+        error.task_id,
+        diagnostics,
+        recovery,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn failed_task_reply<T: Serialize>(
+    state: &UserAppState,
+    app_id: &str,
+    kind: BuildTaskKind,
+    code: &'static str,
+    mut message: String,
+    mut task_id: Option<String>,
+    mut diagnostics: Vec<shared_types::UserAppDiagnostic>,
+    recovery: Option<serde_json::Value>,
+) -> UserAppReply<T> {
+    if task_id.is_none()
+        && !diagnostics
+            .iter()
+            .any(|item| item.code == shared_types::UserAppDiagnosticCode::TaskCapacity)
+    {
+        match state
+            .build_tasks
+            .create_failed_diagnostic(
+                app_id.to_owned(),
+                kind,
+                message.clone(),
+                diagnostics.clone(),
+            )
+            .await
+        {
+            Ok(task) => task_id = Some(task.id.clone()),
+            Err(error) => {
+                use shared_types::{
+                    UserAppDiagnosticCode as Code, UserAppDiagnosticPhase as Phase,
+                    UserAppRepairTarget as Target,
+                };
+                diagnostics.truncate(userapp::diagnostics::MAX_DIAGNOSTICS - 1);
+                diagnostics.push(userapp::diagnostics::diagnostic(
+                    Code::TaskCapacity,
+                    Phase::Admission,
+                    Target::Platform,
+                    None,
+                    error.to_string(),
+                    "等待现有任务结束后重试；本次未注册可查询的任务。",
+                ));
+                message = format!("{message}; diagnostic task not retained: {error}");
+            }
         }
     }
+    let status = if let Some(id) = task_id.as_deref()
+        && let Some(task) = state.build_tasks.get(id).await
+        && task.status().await == BuildTaskStatus::Cancelled
+    {
+        shared_types::UserAppDiagnosticTaskStatus::Cancelled
+    } else {
+        shared_types::UserAppDiagnosticTaskStatus::Failed
+    };
+    UserAppReply::ErrData(
+        code,
+        message,
+        shared_types::UserAppTaskFailureData {
+            task_id,
+            status,
+            diagnostics,
+            recovery,
+        },
+    )
 }
 
 /// 获取构建任务状态快照
@@ -534,8 +694,8 @@ mod stream_close_tests {
             "terminal must be delivered: {text}"
         );
         assert!(
-            text.contains("id: 0"),
-            "terminal cursor must be delivered: {text}"
+            text.contains("id: 1\nevent: failed"),
+            "terminal cursor must follow the failure log: {text}"
         );
     }
 
@@ -604,7 +764,9 @@ mod stream_close_tests {
                     .map(|id| id.parse().expect("sequence"))
             })
             .collect();
-        assert_eq!(ids, (0..=2100).collect::<Vec<_>>());
+        assert_eq!(ids, (0..=2101).collect::<Vec<_>>());
+        assert!(text.contains("id: 2100\nevent: log"));
+        assert!(text.contains("id: 2101\nevent: failed"));
         assert!(text.contains("event: failed"));
     }
 
@@ -661,7 +823,9 @@ mod stream_close_tests {
                     .map(|id| id.parse().expect("sequence"))
             })
             .collect();
-        assert_eq!(ids, vec![0, 1, 2]);
+        assert_eq!(ids, vec![0, 1, 2, 3]);
+        assert!(text.contains("id: 2\nevent: log"));
+        assert!(text.contains("id: 3\nevent: failed"));
         assert!(text.contains("event: failed"));
     }
 
@@ -682,7 +846,7 @@ mod stream_close_tests {
         })
         .await;
 
-        // from_seq=999 越过终态事件（seq=0）：replay 为空 + 任务已终态 → 直接关流
+        // from_seq=999 越过终态事件（seq=1）：replay 为空 + 任务已终态 → 直接关流
         let resp = stream_task_logs(
             State(state),
             AppPath(task.id.clone()),

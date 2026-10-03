@@ -14,6 +14,7 @@
 
 mod assemble;
 pub mod dev_mode;
+pub mod diagnostics;
 pub mod hygiene;
 pub mod import;
 mod manifest;
@@ -487,23 +488,40 @@ pub struct DevWorkspacePrecheck {
     pub dev_source_mode: bool,
 }
 
-/// 受理前置校验失败——同步 4xx 拒绝（不创建任务），由壳层映射专用错误码。
+/// 受理前置校验失败；壳层保留 HTTP 200 错误信封并注册终态诊断任务。
+#[derive(Debug)]
+pub struct PrecheckProblem {
+    pub message: String,
+    pub diagnostics: Vec<shared_types::UserAppDiagnostic>,
+}
+impl std::ops::Deref for PrecheckProblem {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+impl std::fmt::Display for PrecheckProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(f)
+    }
+}
+
+/// Typed precheck rejection; formatting never determines failure classification.
 #[derive(Debug)]
 pub enum DevPrecheckError {
     /// workspace 路径解析失败（appId 非法等）——沿用通用校验错误。
     Resolve(AppError),
     /// workspace 不存在或没有任何文件——`ERR_WORKSPACE_EMPTY`。
-    WorkspaceEmpty(String),
+    WorkspaceEmpty(PrecheckProblem),
     /// discover 失败（manifest 缺失/损坏、无 enabled 服务）——
     /// `ERR_WORKSPACE_NO_SERVICES`（message 保留 discover 的 fix 指引文案）。
-    NoServices(String),
+    NoServices(PrecheckProblem),
 }
 
 /// dev/build 任务受理前置校验：workspace 就绪性快速失败。
 ///
-/// 空目录 / manifest 无可用服务直接拒绝受理，不再创建"受理成功 → 秒级
-/// failed"的任务——失败对调用方即刻可见（HTTP 4xx + 专用错误码），也免去
-/// 任务注册与上游轮询开销。`/build`（产物态打包）、`/dev/start`、
+/// 空目录 / manifest 无可用服务直接返回失败信封；终态诊断任务提供
+/// GET/SSE 回查，不进入执行队列。`/build`（产物态打包）、`/dev/start`、
 /// `/dev/restart` 三链共用：discover 失败对三条链路同样致命。
 pub async fn precheck_dev_workspace(
     app_id: &str,
@@ -524,9 +542,15 @@ pub async fn precheck_dev_workspace(
         Err(error) => return Err(workspace_read_error(&ws, error)),
     };
     if !has_entries {
-        return Err(DevPrecheckError::WorkspaceEmpty(format!(
+        let message = format!(
             "userapp workspace is empty: create or import a project first ({})",
             ws.display()
+        );
+        return Err(DevPrecheckError::WorkspaceEmpty(precheck_problem(
+            &ws,
+            shared_types::UserAppDiagnosticCode::WorkspaceEmpty,
+            message,
+            "在平台源码根目录创建或导入现有项目，然后重试。",
         )));
     }
     // 非空但没有任何服务目录：与"manifest 全 disabled/语法错"分流——前者
@@ -536,31 +560,144 @@ pub async fn precheck_dev_workspace(
     // error.workspace_* 三语翻译，本地化由调用方按 code 驱动）。
     if !any_project_manifest(&ws).await? {
         if let Some(nested) = nested_code_workspace(&ws).await? {
-            return Err(DevPrecheckError::NoServices(format!(
-                "platform source workspace is {}, but workspace.manifest.toml and \
-                 service manifests were found in {}. Keep the existing project and \
-                 align its workspace and service directories with the platform source \
-                 root before building; do not initialize another empty template",
+            let message = format!(
+                "platform source workspace is {}, but workspace.manifest.toml and service manifests were found in {}. Keep the existing project and align its workspace and service directories with the platform source root before building; do not initialize another empty template",
                 ws.display(),
-                nested.display(),
-            )));
+                nested.display()
+            );
+            let mut problem = precheck_problem(
+                &ws,
+                shared_types::UserAppDiagnosticCode::WorkspaceRootMismatch,
+                message,
+                "保留现有项目，将 workspace 和服务目录与平台源码根对齐；不要初始化空模板覆盖项目。",
+            );
+            problem.diagnostics[0].detected_workspace_root = Some(nested.display().to_string());
+            return Err(DevPrecheckError::NoServices(problem));
         }
-        return Err(DevPrecheckError::NoServices(format!(
-            "workspace has no service directories: no project.manifest.toml \
-             found under {} — initialize a project template first, or place \
-             a project directory containing project.manifest.toml",
-            ws.display()
+        return Err(DevPrecheckError::NoServices(precheck_problem(
+            &ws,
+            shared_types::UserAppDiagnosticCode::NoServices,
+            format!(
+                "workspace has no service directories: no project.manifest.toml found under {} — initialize a project template first, or place a project directory containing project.manifest.toml",
+                ws.display()
+            ),
+            "检查平台源码根下的一级服务目录及 project.manifest.toml。",
         )));
     }
-    let dev_source_mode = dev_mode::dev_mode_enabled(&ws).await.map_err(|e| {
-        // e 内部已含 "discover projects in {ws}: " 前缀（dev_mode.rs 包装），
-        // 此处只加链路标识——再拼路径会双前缀重复
-        DevPrecheckError::NoServices(format!("dev mode detection: {e}"))
-    })?;
+    // Preserve typed parse/validation/I/O origins and field locations. The
+    // inspection parser does not quote source lines containing credentials.
+    let scan_root = ws.clone();
+    let report =
+        tokio::task::spawn_blocking(move || shared_types::discover_projects_report(&scan_root))
+            .await
+            .map_err(|e| {
+                DevPrecheckError::Resolve(AppError::system(format!(
+                    "workspace inspection worker failed: {e}"
+                )))
+            })?
+            .map_err(|e| DevPrecheckError::Resolve(AppError::file(e.to_string())))?;
+    if !report.diagnostics.is_empty() {
+        let message = format!(
+            "dev mode detection: discover projects in {}: {}",
+            ws.display(),
+            report.diagnostics[0].issue
+        );
+        return Err(DevPrecheckError::NoServices(PrecheckProblem {
+            message,
+            diagnostics: report
+                .diagnostics
+                .into_iter()
+                .take(diagnostics::MAX_DIAGNOSTICS)
+                .map(|item| diagnostics::from_manifest(&ws, item))
+                .collect(),
+        }));
+    }
+    let root_file = ws.join("workspace.manifest.toml");
+    let content = tokio::fs::read_to_string(&root_file)
+        .await
+        .map_err(|error| {
+            let mut problem = precheck_problem(
+                &ws,
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    shared_types::UserAppDiagnosticCode::WorkspaceManifestMissing
+                } else {
+                    shared_types::UserAppDiagnosticCode::WorkspaceIo
+                },
+                format!("read workspace.manifest.toml: {error}"),
+                "在平台源码根检查 workspace.manifest.toml 文件及读取权限。",
+            );
+            problem.diagnostics[0].file = Some("workspace.manifest.toml".into());
+            if error.kind() != std::io::ErrorKind::NotFound {
+                problem.diagnostics[0].repair_target = shared_types::UserAppRepairTarget::Platform;
+            }
+            DevPrecheckError::NoServices(problem)
+        })?;
+    let workspace =
+        shared_types::parse_workspace_for_inspection(&content, "workspace.manifest.toml").map_err(
+            |issue| {
+                DevPrecheckError::NoServices(PrecheckProblem {
+                    message: format!("parse workspace.manifest.toml: {issue}"),
+                    diagnostics: vec![diagnostics::from_manifest(
+                        &ws,
+                        shared_types::ManifestDiagnostic {
+                            kind: shared_types::DiagnosticKind::Parse,
+                            issue,
+                        },
+                    )],
+                })
+            },
+        )?;
+    let mut issues = shared_types::collect_workspace_issues(&workspace, "workspace.manifest.toml");
+    issues.extend(shared_types::collect_workspace_startup_issues(
+        &workspace,
+        &report.projects,
+    ));
+    if !issues.is_empty() {
+        return Err(DevPrecheckError::NoServices(PrecheckProblem {
+            message: format!("invalid workspace manifest: {}", issues[0]),
+            diagnostics: issues
+                .into_iter()
+                .take(diagnostics::MAX_DIAGNOSTICS)
+                .map(|issue| {
+                    diagnostics::from_manifest(
+                        &ws,
+                        shared_types::ManifestDiagnostic {
+                            kind: shared_types::DiagnosticKind::Validation,
+                            issue,
+                        },
+                    )
+                })
+                .collect(),
+        }));
+    }
+    let dev_source_mode = report
+        .projects
+        .iter()
+        .any(|project| project.manifest.project.enabled && project.manifest.devrun.is_some());
     Ok(DevWorkspacePrecheck {
         ws,
         dev_source_mode,
     })
+}
+
+fn precheck_problem(
+    ws: &Path,
+    code: shared_types::UserAppDiagnosticCode,
+    message: String,
+    hint: &str,
+) -> PrecheckProblem {
+    let item = diagnostics::diagnostic(
+        code,
+        shared_types::UserAppDiagnosticPhase::Precheck,
+        shared_types::UserAppRepairTarget::Project,
+        Some(ws),
+        &message,
+        hint,
+    );
+    PrecheckProblem {
+        message,
+        diagnostics: vec![item],
+    }
 }
 
 /// workspace 一级子目录中是否存在任何 `project.manifest.toml`。
@@ -648,13 +785,13 @@ pub async fn start_build_task(
     ws: PathBuf,
     app_id: String,
     timeout_secs: u64,
-) -> Result<(BuildTaskId, String), AppError> {
+) -> Result<(BuildTaskId, String), diagnostics::TaskSubmissionError> {
     let workspace_activity = store.workspace_activity(&app_id).await.read_owned().await;
     // 容量耗尽(全活跃任务达上限)→ 立即拒绝,不再越过上限插入(#12)。
     let task = store
         .create_superseding_build(app_id.clone())
         .await
-        .map_err(|e| AppError::business(e.to_string()))?;
+        .map_err(diagnostics::TaskSubmissionError::capacity)?;
     // release_id 预生成并预置进快照：创建响应（BuildCreatedData.artifact_path）与
     // pending 期轮询即可见确定性产物路径；build_workspace_package 消费同一值,
     // Completed 事件携带一致路径覆盖（两处同源）。
@@ -683,6 +820,11 @@ pub async fn start_build_task(
                     )
                     .await?
                     .keep_alive(activity.clone());
+                task_spawn
+                    .emit(BuildProgressEvent::Stage {
+                        stage: "building".into(),
+                    })
+                    .await;
                 guard
                     .scope(build_workspace_package_with_guard(
                         &config,
@@ -713,22 +855,21 @@ pub async fn start_build_task(
                     if task_spawn.is_cancelled() {
                         task_spawn.emit(BuildProgressEvent::Cancelled).await;
                     } else if !task_spawn.is_terminal().await {
-                        task_spawn
-                            .emit(BuildProgressEvent::Failed {
-                                error: e.to_string(),
-                            })
-                            .await;
+                        task_spawn.emit_failure(&e).await;
                     }
                 }
             }
         }),
     );
     if let Err(error) = spawned {
-        task.emit(BuildProgressEvent::Failed {
-            error: error.clone(),
-        })
-        .await;
-        return Err(AppError::system(error));
+        task.mark_admission_failure().await;
+        let error = AppError::system(error);
+        task.emit_failure(&error).await;
+        return Err(diagnostics::TaskSubmissionError {
+            error: Box::new(error),
+            task_id: Some(task.id.clone()),
+            diagnostics: task.snapshot().await.diagnostics,
+        });
     }
 
     Ok((task.id.clone(), artifact_path))
@@ -994,6 +1135,11 @@ mod precheck_tests {
         let frontend = ws.join("frontend");
         tokio::fs::create_dir_all(&frontend).await.expect("mkdir");
         write_manifest(&frontend, "frontend");
+        std::fs::write(
+            ws.join("workspace.manifest.toml"),
+            "schema_version=1\n[workspace]\nname='test'\n",
+        )
+        .unwrap();
 
         let precheck = precheck_dev_workspace("app-7", &cfg)
             .await

@@ -47,13 +47,8 @@ impl DevServerManager {
         let Some(release_id) = tokio::fs::read_to_string(workspace.join("release.lock.toml"))
             .await
             .ok()
-            .and_then(|text| text.parse::<toml::Value>().ok())
-            .and_then(|value| {
-                value
-                    .get("release_id")
-                    .and_then(toml::Value::as_str)
-                    .map(str::to_owned)
-            })
+            .and_then(|text| shared_types::load_release_lock(&text).ok())
+            .map(|lock| lock.release_id)
         else {
             return Ok(false);
         };

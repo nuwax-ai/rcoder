@@ -17,9 +17,10 @@ use super::userapp::{UserAppReply, reply};
 use crate::UserAppState;
 use crate::extract::{AppJson as Json, AppQuery as Query};
 use crate::models::{
-    BuildTaskStatus, DevOpBody, DevOperationRecovery, UserappDevList, UserappDevListQuery,
-    UserappDevProcess, UserappDevStopped, UserappDevTaskCreated, UserappFrameworkDetection,
-    UserappFrameworkInfo, UserappFrameworkInfoQuery, UserappServiceFrameworkInfo,
+    BuildTaskStatus, DevAdmissionData, DevOpBody, DevOperationRecovery, UserappDevList,
+    UserappDevListQuery, UserappDevProcess, UserappDevStopped, UserappDevTaskCreated,
+    UserappFrameworkDetection, UserappFrameworkInfo, UserappFrameworkInfoQuery,
+    UserappServiceFrameworkInfo,
 };
 use std::future::Future;
 use std::path::PathBuf;
@@ -123,7 +124,7 @@ fn map_app_cli_evt(json: &str) -> Option<EvtOutcome> {
     path = "/dev/start",
     request_body = DevOpBody,
     responses(
-        (status = 200, body = HttpResult<UserappDevTaskCreated>, description = "启动任务已创建（task_id）"),
+        (status = 200, body = HttpResult<DevAdmissionData>, description = "成功时创建 Pending 任务；预检或受理失败时 HTTP 200、success=false，保留原 code/message，data 含 Failed task_id 和 typed diagnostics 供 GET/SSE 回查。容量耗尽时 task_id=null；RuntimeRecovery 原字段保留。"),
     ),
     tag = "Userapp · dev · 进程管理"
 )]
@@ -135,18 +136,26 @@ pub(crate) async fn dev_start(
     if let Err(e) = body.validate() {
         return reply(Err(file_server::error::from_garde(e)));
     }
-    // 受理前置校验：空 workspace / manifest 无可用服务同步 4xx 拒绝
-    // （专用错误码），不再创建"受理成功 → 秒级 failed"的任务。
+    // 预检失败保留错误信封，附带可 GET/SSE 回查的终态诊断任务。
     let precheck =
         match crate::service::userapp::precheck_dev_workspace(&body.app_id, &state.fs.config).await
         {
             Ok(p) => p,
-            Err(e) => return super::userapp::dev_precheck_reply(e),
+            Err(e) => {
+                return super::userapp::dev_precheck_reply(
+                    &state,
+                    &body.app_id,
+                    crate::models::BuildTaskKind::DevStart,
+                    e,
+                )
+                .await;
+            }
         };
+    let app_id = body.app_id.clone();
     let result = async {
         tracing::info!(app_id = %body.app_id, "userapp dev start");
         let task_id = spawn_dev_task(
-            state,
+            state.clone(),
             &body.app_id,
             body.base_path.map(|s| s.to_string()),
             body.pg.clone(),
@@ -160,7 +169,18 @@ pub(crate) async fn dev_start(
             status: BuildTaskStatus::Pending,
         })
     };
-    reply(result.await)
+    match result.await {
+        Ok(data) => UserAppReply::Ok(data),
+        Err(error) => {
+            super::userapp::submission_failure_reply(
+                &state,
+                &app_id,
+                crate::models::BuildTaskKind::DevStart,
+                error,
+            )
+            .await
+        }
+    }
 }
 
 /// 停止开发服务
@@ -227,7 +247,7 @@ pub(crate) async fn dev_stop(
 /// agent 改完代码后的开发闭环——**重启前必须先编译**；异步任务立即返 task_id。
 /// 任一服务配了 `[devrun]` 时走**源码态**：编译三分派（`[devbuild]` 显式配置则
 /// 执行；只配 `[devrun]` 的服务跳过——devrun 自足；其余回落 `[build].command`），
-/// 源码目录 release.lock 按 manifest 新旧自动重锁后 app-cli
+/// 源码目录 release.lock 按当前 manifest 与运行 metadata 校验派生后 app-cli
 /// 重编源码 workspace（`[devrun]` 优先）；未配则产物态（现状：同核编译打 zip →
 /// `.run` 换入）。编译失败任务终态 Failed、旧服务原样保留（可继续用旧版本测试，
 /// 不因中间态断流）。启动阶段逐服务 SSE 事件（service_starting/start_ok/
@@ -240,7 +260,7 @@ pub(crate) async fn dev_stop(
     path = "/dev/restart",
     request_body = DevOpBody,
     responses(
-        (status = 200, body = HttpResult<UserappDevTaskCreated>, description = "重启任务已创建（task_id）"),
+        (status = 200, body = HttpResult<DevAdmissionData>, description = "成功时创建 Pending 任务；预检或受理失败时 HTTP 200、success=false，data 含 Failed task_id 和 typed diagnostics。容量耗尽时 task_id=null；RuntimeRecovery 原字段保留。"),
     ),
     tag = "Userapp · dev · 进程管理"
 )]
@@ -257,12 +277,21 @@ pub(crate) async fn dev_restart(
         match crate::service::userapp::precheck_dev_workspace(&body.app_id, &state.fs.config).await
         {
             Ok(p) => p,
-            Err(e) => return super::userapp::dev_precheck_reply(e),
+            Err(e) => {
+                return super::userapp::dev_precheck_reply(
+                    &state,
+                    &body.app_id,
+                    crate::models::BuildTaskKind::DevRestart,
+                    e,
+                )
+                .await;
+            }
         };
+    let app_id = body.app_id.clone();
     let result = async {
         tracing::info!(app_id = %body.app_id, "userapp dev restart");
         let task_id = spawn_dev_task(
-            state,
+            state.clone(),
             &body.app_id,
             body.base_path.map(|s| s.to_string()),
             body.pg.clone(),
@@ -276,7 +305,18 @@ pub(crate) async fn dev_restart(
             status: BuildTaskStatus::Pending,
         })
     };
-    reply(result.await)
+    match result.await {
+        Ok(data) => UserAppReply::Ok(data),
+        Err(error) => {
+            super::userapp::submission_failure_reply(
+                &state,
+                &app_id,
+                crate::models::BuildTaskKind::DevRestart,
+                error,
+            )
+            .await
+        }
+    }
 }
 
 /// dev 任务的后置动作（编译成功后执行哪个生命周期操作）。
@@ -291,7 +331,7 @@ pub(crate) enum DevTaskAction {
 ///
 /// workspace 就绪性（resolve + 源码态判定）由调用方受理前置校验
 /// （`precheck_dev_workspace`）完成并以 `precheck` 传入——空目录 /
-/// manifest 无可用服务在受理期即同步 4xx 拒绝，不再进入本函数。
+/// manifest 无可用服务在受理期即返回失败信封和诊断任务，不再进入本函数。
 ///
 /// `pg`：请求携带的 PG 凭据（可选）——透传给编排器 spawn（注入
 /// POSTGRES_USER/POSTGRES_PASSWORD 覆盖容器默认透传）；None 维持旧行为。
@@ -302,7 +342,7 @@ async fn spawn_dev_task(
     pg: Option<shared_types::StartPgCredential>,
     action: DevTaskAction,
     precheck: crate::service::userapp::DevWorkspacePrecheck,
-) -> Result<String, AppError> {
+) -> Result<String, crate::service::userapp::diagnostics::TaskSubmissionError> {
     let workspace_activity = state
         .build_tasks
         .workspace_activity(app_id)
@@ -323,13 +363,14 @@ async fn spawn_dev_task(
     if *lifecycle.lock().await != generation {
         return Err(AppError::business(
             "dev stop was accepted during owner recovery; retry after stop completes",
-        ));
+        )
+        .into());
     }
     let task = state
         .build_tasks
         .create(app_id.to_string(), kind)
         .await
-        .map_err(|e| AppError::business(e.to_string()))?;
+        .map_err(crate::service::userapp::diagnostics::TaskSubmissionError::capacity)?;
     // release_id 预生成（与 start_build_task 对称）：快照 pending 期即有确定性
     // artifact_path；build_workspace_package 同核产出制品 zip 落同一路径。
     let release_id = uuid::Uuid::now_v7().simple().to_string();
@@ -345,9 +386,11 @@ async fn spawn_dev_task(
     let task_clone = task.clone();
     let workers = state.build_tasks.workers.clone();
     let context = task.command_context();
+    // Generic context/worker wrappers otherwise copy this large workflow
+    // future on the thread stack, overflowing it in debug host builds.
     let spawned = workers.spawn_identified(
         context.identity.clone(),
-        context.scope(async move {
+        Box::pin(context.scope(async move {
             let activity = std::sync::Arc::new(workspace_activity);
             task_clone
                 .waiting_for_build_slot(state.fs.config.userapp_build_wait_timeout_secs)
@@ -369,14 +412,13 @@ async fn spawn_dev_task(
                             .await;
                     } else {
                         task_clone
-                            .emit(shared_types::BuildProgressEvent::Failed {
-                                error: error.to_string(),
-                            })
+                            .emit_failure(&error)
                             .await;
                     }
                     return;
                 }
             };
+            task_clone.emit(shared_types::BuildProgressEvent::Stage { stage: "building".into() }).await;
             let key = dev_key(&app_id);
             // 编译（形态分派）：
             // - 产物态（现状）：manifest 同核编译（单一编译事实源）——discover →
@@ -462,7 +504,8 @@ async fn spawn_dev_task(
                     .await;
                 // A registry entry only establishes ownership, not successful startup.
                 // External owners always follow the identity-bound control operation.
-                if matches!(action, DevTaskAction::Start)
+                if !dev_source_mode
+                    && matches!(action, DevTaskAction::Start)
                     && pg.is_none()
                     && state
                         .fs
@@ -484,7 +527,7 @@ async fn spawn_dev_task(
                 //   匹配 owner 在 → Deploy(ArtifactId)（owner 侧身份/revision
                 //   核验后自行解压/激活/编排，拒绝不改变 active 目录）；
                 //   无 owner → 本地 activate + spawn（legacy 路径不变）。
-                // - 源码态：ensure 源码目录 release.lock（mtime 检测自动重锁），
+                // - 源码态：ensure 源码目录 release.lock（按当前输入校验派生内容），
                 //   app-cli 直接编排源码 workspace（devrun 优先、run 兜底）。
                 // 两种形态失败语义一致：旧运行态原样保留，任务 Failed。
                 if !dev_source_mode {
@@ -519,8 +562,26 @@ async fn spawn_dev_task(
                 } else {
                     Some(crate::service::userapp::run_dir::prepare_run_dir(&ws, &release_id).await?)
                 };
+                let mut reused_source = false;
                 if !task_clone
                     .commit_start(&lifecycle, generation, async {
+                        // Source lock preparation is validation, not artifact activation.
+                        // Do it after the cancellation/generation barrier and before
+                        // owner capability preflight or stopping any old execution.
+                        if dev_source_mode {
+                            crate::service::userapp::dev_mode::ensure_dev_lock(&ws).await?;
+                            if matches!(action, DevTaskAction::Start)
+                                && pg.is_none()
+                                && state
+                                    .fs
+                                    .dev_server
+                                    .confirmed_local_manifest_ready(&key, &ws)
+                                    .await?
+                            {
+                                reused_source = true;
+                                return Ok::<(), AppError>(());
+                            }
+                        }
                         // DEV-1 §3.5：确认旧执行停止 → 复核任务代次/取消
                         //（commit_start 边界）→ **此时**切换运行目录 → 启动。
                         // 制品态旧顺序是 activate 先于停止——活服务继续访问
@@ -539,10 +600,7 @@ async fn spawn_dev_task(
                                     .await?;
                                 let run_root = match prepared {
                                     Some(prepared) => prepared.activate()?,
-                                    None => {
-                                        crate::service::userapp::dev_mode::ensure_dev_lock(&ws)
-                                            .await?
-                                    }
+                                    None => ws.clone(),
                                 };
                                 state
                                     .fs
@@ -568,10 +626,9 @@ async fn spawn_dev_task(
                             }
                             DevTaskAction::Restart => {
                                 // 激活夹在"确认旧执行停止"与"启动"之间（staged）。
-                                // prepared 按值捕获进盒装 future；源码态激活是
-                                // ensure_dev_lock（幂等重锁）。
-                                // 激活必须惰性：夹在"确认旧执行停止"与"启动"
-                                // 之间执行（restart_dev_staged 内 await）。
+                                // 只有制品激活必须惰性，夹在确认停止和启动之间。
+                                // 源码已在上方准备好实际 lock，owner 复用路径
+                                // 即使不消费 activate future 也会检查当前输入。
                                 let run_root: std::pin::Pin<
                                     Box<
                                         dyn Future<
@@ -583,9 +640,7 @@ async fn spawn_dev_task(
                                     Some(prepared) => {
                                         Box::pin(async move { prepared.activate() })
                                     }
-                                    None => Box::pin(
-                                        crate::service::userapp::dev_mode::ensure_dev_lock(&ws),
-                                    ),
+                                    None => Box::pin(async { Ok(ws.clone()) }),
                                 };
                                 state
                                     .fs
@@ -616,6 +671,9 @@ async fn spawn_dev_task(
                     })
                     .await?
                 {
+                    return Ok(StartupCompletion::NoNewExecution);
+                }
+                if reused_source {
                     return Ok(StartupCompletion::NoNewExecution);
                 }
                 if let Some(supervised) = state.fs.dev_server.supervised_child(&key) {
@@ -690,35 +748,23 @@ async fn spawn_dev_task(
                             .emit(shared_types::BuildProgressEvent::Cancelled)
                             .await;
                     } else if !task_clone.is_terminal().await {
-                        // 管理恢复/全局预检可能在任何模块事件前失败；此时只
-                        // 报告已知整体原因，不伪造 service_id 或模块结果。
                         task_clone
-                            .emit(shared_types::BuildProgressEvent::Log {
-                                service: "workspace".into(),
-                                line: format!(
-                                    "应用服务启动失败：{}",
-                                    file_server::service::dev_server::log::sanitize_sensitive_paths(
-                                        &e.to_string()
-                                    )
-                                ),
-                            })
-                            .await;
-                        task_clone
-                            .emit(shared_types::BuildProgressEvent::Failed {
-                                error: e.to_string(),
-                            })
+                            .emit_failure(&e)
                             .await;
                     }
                 }
             }
-        }),
+        })),
     );
     if let Err(error) = spawned {
-        task.emit(shared_types::BuildProgressEvent::Failed {
-            error: error.clone(),
-        })
-        .await;
-        return Err(AppError::system(error));
+        task.mark_admission_failure().await;
+        let error = AppError::system(error);
+        task.emit_failure(&error).await;
+        return Err(crate::service::userapp::diagnostics::TaskSubmissionError {
+            error: Box::new(error),
+            task_id: Some(task.id.clone()),
+            diagnostics: task.snapshot().await.diagnostics,
+        });
     }
 
     Ok(task.id.clone())
@@ -940,6 +986,171 @@ mod precheck_reply_tests {
 
     use super::super::userapp_files::tests_support::make_state;
 
+    /// The retained local child really answers the production status/ready
+    /// endpoints. A stale valid lock must not let that old release acknowledge
+    /// changed source manifests as an already completed start.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_start_reuse_prepares_current_lock_before_ready_fast_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("source-start");
+        std::fs::create_dir_all(workspace.join("frontend")).unwrap();
+        let root = "schema_version=1\n[workspace]\nname='source-start'\n";
+        let project = "schema_version=1\n[project]\nservice_id='frontend'\nname='frontend'\ntype='node'\n[build]\ncommand=['true']\nartifact='artifact.zip'\n[run]\ncommand=['true']\n[devrun]\ncommand=['true']\n";
+        std::fs::write(workspace.join("workspace.manifest.toml"), root).unwrap();
+        let manifest_path = workspace.join("frontend/project.manifest.toml");
+        std::fs::write(&manifest_path, project).unwrap();
+        let lock = shared_types::build_release_lock(
+            &shared_types::parse_workspace(root).unwrap(),
+            &shared_types::discover_projects(&workspace).unwrap(),
+            shared_types::ReleaseMetadata {
+                release_id: "already-running-release",
+                pingap_version: "0.14.3",
+                pingap_commit: "fixture-commit",
+                minimum_app_cli_version: shared_types::MINIMUM_APP_CLI_VERSION,
+                runtime_image_digest: "fixture-runtime",
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("release.lock.toml"),
+            toml::to_string_pretty(&lock).unwrap(),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let executable = directory.path().join("local-owner.py");
+        std::fs::write(&executable, format!(r#"#!/usr/bin/env python3
+import http.server,json
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/v1/deploy/status':
+            value={{'data':{{'release_id':'already-running-release','phase':'running','protocol_version':4}}}}
+        elif self.path == '/ready':
+            value={{'phase':'running','status':'ready'}}
+        else:
+            self.send_response(404);self.end_headers();return
+        body=json.dumps(value).encode()
+        self.send_response(200);self.send_header('Content-Length',str(len(body)))
+        self.end_headers();self.wfile.write(body)
+    def log_message(self,*args):pass
+http.server.HTTPServer(('127.0.0.1',{}),Handler).serve_forever()
+"#, address.port())).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = UserAppState::new(
+            file_server::FileServer::builder(file_server::Config {
+                userapp_workspace_dir: directory.path().into(),
+                log_base_dir: directory.path().join("logs"),
+                app_cli_admin_probe_addr: address.to_string(),
+                app_cli_bin: Some(executable.display().to_string()),
+                dev_command_timeout_secs: 5,
+                dev_alive_max_wait_ms: 50,
+                dev_alive_poll_interval_ms: 10,
+                dev_alive_check_timeout_ms: 10,
+                ..file_server::Config::default()
+            })
+            .build()
+            .unwrap()
+            .state(),
+        );
+        let key = dev_key("source-start");
+        state
+            .fs
+            .dev_server
+            .start_dev(
+                &key,
+                &workspace,
+                file_server::service::dev_server::DevLaunch {
+                    base_path: None,
+                    hooks: None,
+                    pg: None,
+                    request_context: None,
+                    artifact_release_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !state
+                .fs
+                .dev_server
+                .confirmed_local_manifest_ready(&key, &workspace)
+                .await
+                .unwrap()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if ready.is_err() {
+            let child = state
+                .fs
+                .dev_server
+                .supervised_child(&key)
+                .map(|child| child.exited());
+            let log = state.fs.dev_server.read_dev_log(&key, 0, "main").await;
+            state.fs.dev_server.stop_dev(&key).await.unwrap();
+            panic!("local owner fixture did not become ready: child={child:?}, log={log:?}");
+        }
+        let mut statuses = Vec::new();
+        for changed in [false, true] {
+            if changed {
+                std::fs::write(
+                    &manifest_path,
+                    project.replace(
+                        "[devrun]\ncommand=['true']",
+                        "[devrun]\ncommand=['true', 'changed']",
+                    ),
+                )
+                .unwrap();
+            }
+            let id = Box::pin(spawn_dev_task(
+                state.clone(),
+                "source-start",
+                None,
+                None,
+                DevTaskAction::Start,
+                crate::service::userapp::DevWorkspacePrecheck {
+                    ws: workspace.clone(),
+                    dev_source_mode: true,
+                },
+            ))
+            .await
+            .unwrap();
+            let task = state.build_tasks.get(&id).await.unwrap();
+            let status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !task.is_terminal().await {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                task.status().await
+            })
+            .await
+            .unwrap();
+            statuses.push(status);
+        }
+        let child = state.fs.dev_server.supervised_child(&key).unwrap();
+        let stopped = state.fs.dev_server.stop_dev(&key).await.unwrap();
+        assert!(stopped.killed_pids.iter().all(|pid| pid.killed));
+        assert!(
+            child
+                .wait_exit(std::time::Duration::from_secs(3))
+                .await
+                .is_some()
+        );
+        assert_eq!(
+            statuses[0],
+            BuildTaskStatus::Completed,
+            "an unchanged healthy local release stays idempotent without waiting for another Done"
+        );
+        assert_eq!(
+            statuses[1],
+            BuildTaskStatus::Failed,
+            "changed source must reach preparation/admission instead of reporting old Ready as current success"
+        );
+    }
+
     #[tokio::test]
     async fn dev_worker_admission_failure_does_not_leave_pending_tasks() {
         let directory = tempfile::tempdir().unwrap();
@@ -1001,8 +1212,7 @@ mod precheck_reply_tests {
         }
     }
 
-    /// 受理全链（handler 层）：空 workspace → HTTP 400 + 信封 code=ERR_WORKSPACE_EMPTY，
-    /// 且不创建任务（build_tasks 空）——不再走"200 受理 → 秒级 failed 任务"。
+    /// 受理全链：空 workspace 保留 HTTP 200 失败信封，诊断任务不进入 active 列表。
     #[tokio::test]
     async fn dev_start_rejects_empty_workspace_with_dedicated_code() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1029,14 +1239,14 @@ mod precheck_reply_tests {
             text.contains("ERR_WORKSPACE_EMPTY"),
             "code expected in envelope: {text}"
         );
-        // 未创建任务：被拒受理不在任务表产生残留
+        // 诊断任务已是 Failed，不进入在途任务列表
         assert!(
             state
                 .build_tasks
                 .active_tasks_for_app("app-7")
                 .await
                 .is_empty(),
-            "no task should be created"
+            "diagnostic tasks must never become active"
         );
     }
 }

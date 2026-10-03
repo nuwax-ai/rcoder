@@ -111,6 +111,7 @@ pub(super) fn verify_project_identity(
             && source.is_absolute()
             && !identity.workspace_id.trim().is_empty()
             && !identity.runtime_instance_id.trim().is_empty()
+            && identity.service_family == "userapp-dev"
             && identity.application_id == application_id,
         "different app-cli owner: project or application identity mismatch"
     );

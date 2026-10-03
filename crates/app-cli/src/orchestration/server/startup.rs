@@ -22,34 +22,51 @@ pub(super) async fn serve_without_attach(args: &RuntimeArgs) -> Result<()> {
         // 服务业务（升级窗口兼容；新 owner 不再派生 worker）。
         return serve_supervised_worker(args, state_root, worker).await;
     }
-    match crate::supervision::supervise(args, true).await? {
-        crate::supervision::SupervisionOutcome::Owner(session) => {
-            owner_serve(args, state_root, application_id, session, false).await
-        }
-        crate::supervision::SupervisionOutcome::Dispatch => {
-            // 锁被活 owner 持有：分派到其管理 API（R02）。
-            match crate::owner_dispatch::dispatch_to_owner(
-                &args.admin_addr,
-                &args.workspace,
-                &state_root,
-                &application_id,
-            )
-            .await?
-            {
-                crate::owner_dispatch::OwnerDispatch::Terminal(view) => {
-                    crate::owner_dispatch::describe_terminal(&view)
+    for _ in 0..3 {
+        match crate::supervision::supervise(args, true).await? {
+            crate::supervision::SupervisionOutcome::Owner(session) => {
+                return owner_serve(args, state_root, application_id, session, false).await;
+            }
+            crate::supervision::SupervisionOutcome::Dispatch => {
+                if args.control_only {
+                    match crate::owner_dispatch::reuse_management_owner(
+                        &args.admin_addr,
+                        &args.workspace,
+                        &state_root,
+                        &application_id,
+                    )
+                    .await?
+                    {
+                        crate::owner_dispatch::ManagementReuse::Ready => return Ok(()),
+                        crate::owner_dispatch::ManagementReuse::NoOwner => continue,
+                    }
                 }
-                crate::owner_dispatch::OwnerDispatch::NoOwner => {
-                    anyhow::bail!("owner disappeared during dispatch; no operation was submitted")
+                // 显式非 control-only serve 保留原 Source Start 分派语义。
+                // 锁被活 owner 持有：分派到其管理 API（R02）。
+                match crate::owner_dispatch::dispatch_to_owner(
+                    &args.admin_addr,
+                    &args.workspace,
+                    &state_root,
+                    &application_id,
+                )
+                .await?
+                {
+                    crate::owner_dispatch::OwnerDispatch::Terminal(view) => {
+                        return crate::owner_dispatch::describe_terminal(&view);
+                    }
+                    crate::owner_dispatch::OwnerDispatch::NoOwner => {
+                        continue;
+                    }
                 }
             }
-        }
-        crate::supervision::SupervisionOutcome::Legacy => {
-            // serve() 已先行处理 attach；此处 Legacy 仅在 worker env 下可达，
-            // 而该分支已在上方消费。
-            anyhow::bail!("unclassified serve entry; refusing to start a second orchestrator")
+            crate::supervision::SupervisionOutcome::Legacy => {
+                // serve() 已先行处理 attach；此处 Legacy 仅在 worker env 下可达，
+                // 而该分支已在上方消费。
+                anyhow::bail!("unclassified serve entry; refusing to start a second orchestrator")
+            }
         }
     }
+    anyhow::bail!("managed owner changed repeatedly during bootstrap; retry this request")
 }
 
 /// 统一 owner 服务形态：管理面（API + 原生控制）与业务会话同进程。
@@ -1515,8 +1532,12 @@ pub(super) async fn assemble_runtime_kernel(
         tracing::error!(%error, "Standalone deployment identity could not be restored; management remains available with recovery protection");
         state.begin_runtime_recovery_hold();
     }
+    let workspace_id = crate::control::managed_owner::workspace_id(
+        &args.workspace,
+        &root,
+        runtime_workspace_id(&args.workspace),
+    )?;
     let store = RuntimeStore::open_with_root(root, &args.workspace)?;
-    let workspace_id = runtime_workspace_id(&args.workspace);
     let source_root = runtime_state_layout::canonical_project_root(&args.workspace)
         .to_string_lossy()
         .into_owned();

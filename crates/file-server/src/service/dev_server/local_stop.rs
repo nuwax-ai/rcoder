@@ -213,7 +213,11 @@ impl DevServerManager {
             )
         })?;
         let mut attempt = self.seat_stop_attempt(key, root, binding)?;
-        let cleanup = self.owner_cleanup_command(&binding.resource);
+        let cleanup = self
+            .owner_cleanup_command(&binding.resource, root)
+            .map_err(|error| {
+                AppError::owner_error("prepare captured owner cleanup command", error)
+            })?;
         let outcome = runtime_supervisor::continue_stop_work_with_cleanup(
             &mut attempt,
             budget,

@@ -115,7 +115,8 @@ pub struct JournalAdoptArgs {
 #[derive(Args, Debug, Clone)]
 pub struct WorkspaceArgs {
     /// Workspace containing workspace.manifest.toml or release.lock.toml.
-    #[arg(long, default_value = "/app/code", env = "APP_CLI_WORKSPACE")]
+    /// Priority: --workspace, APP_CLI_WORKSPACE, then the current directory.
+    #[arg(long, default_value = ".", env = "APP_CLI_WORKSPACE")]
     pub workspace: PathBuf,
 }
 

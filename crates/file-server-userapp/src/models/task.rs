@@ -55,6 +55,8 @@ pub struct BuildTaskSnapshot {
     /// 任务创建时预生成(pending 期即有值),Java 取包 URL 直接拼段。
     pub artifact_path: Option<String>,
     pub error: Option<String>,
+    /// Structured source/admission/build/start diagnostics, retained in terminal snapshots.
+    pub diagnostics: Vec<shared_types::UserAppDiagnostic>,
     pub seq: u64,
     pub created_at: i64,
     pub updated_at: i64,

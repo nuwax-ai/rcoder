@@ -45,6 +45,7 @@ struct TaskState {
     /// 相对 workspace 根的产物路径(start_build_task 预生成时 set;Completed 一致覆盖)。
     artifact_path: Option<String>,
     error: Option<String>,
+    diagnostics: Vec<shared_types::UserAppDiagnostic>,
     /// workspace 根 (build/publish 工作区): logs/SSE 查询路径解析用。预 resolve 后存入。
     workspace_root: Option<PathBuf>,
     seq: u64,
@@ -112,6 +113,7 @@ impl BuildTask {
                 file_name: None,
                 artifact_path: None,
                 error: None,
+                diagnostics: Vec::new(),
                 workspace_root: None,
                 seq: 0,
                 history: VecDeque::with_capacity(RING_CAP),
@@ -202,9 +204,27 @@ impl BuildTask {
             file_name: s.file_name.clone(),
             artifact_path: s.artifact_path.clone(),
             error: s.error.clone(),
+            diagnostics: s.diagnostics.clone(),
             seq: s.seq,
             created_at: self.created_at,
             updated_at: s.updated_at,
+        }
+    }
+
+    pub(crate) async fn record_diagnostic(&self, item: shared_types::UserAppDiagnostic) {
+        let mut state = self.state.lock().await;
+        if !is_terminal_status(state.status)
+            && state.diagnostics.len() < super::diagnostics::MAX_DIAGNOSTICS
+            && !state.diagnostics.contains(&item)
+        {
+            state.diagnostics.push(item);
+        }
+    }
+
+    pub(crate) async fn mark_admission_failure(&self) {
+        let mut state = self.state.lock().await;
+        if !is_terminal_status(state.status) {
+            state.stage = Some("admission".into());
         }
     }
 
@@ -234,6 +254,72 @@ impl BuildTask {
     /// 发进度事件:取一次 state 锁 → `publish_mut` → broadcast → 释放。
     /// 已 Completed/Failed/Cancelled 的任务丢弃后续事件(终态)。
     pub async fn emit(&self, event: BuildProgressEvent) {
+        self.emit_with_diagnostic(event, None).await;
+    }
+
+    /// Keep typed infrastructure errors separate from failures emitted for a
+    /// known project service. No error-message matching participates here.
+    pub(crate) async fn emit_failure(&self, error: &file_server::error::AppError) {
+        use file_server::error::AppError;
+        use shared_types::{
+            UserAppDiagnosticCode as Code, UserAppDiagnosticPhase as Phase,
+            UserAppDiagnosticScope as Scope, UserAppRepairTarget as Target,
+        };
+        let item = {
+            let state = self.state.lock().await;
+            let phase = diagnostic_phase(state.stage.as_deref());
+            let known_service_failure = state
+                .diagnostics
+                .iter()
+                .any(|item| item.phase == phase && item.scope == Scope::Service);
+            let target = if known_service_failure
+                || (phase == Phase::Build
+                    && matches!(
+                        error,
+                        AppError::Validation(..)
+                            | AppError::ValidationI18n(..)
+                            | AppError::Business(_)
+                    )) {
+                Target::Project
+            } else {
+                Target::Platform
+            };
+            super::diagnostics::diagnostic(
+                match phase {
+                    Phase::Admission
+                        if state.stage.as_deref() == Some("waiting_for_build_slot") =>
+                    {
+                        Code::TaskCapacity
+                    }
+                    Phase::Admission => Code::WorkerAdmission,
+                    Phase::Start => Code::StartFailed,
+                    _ => Code::BuildFailed,
+                },
+                phase,
+                target,
+                state.workspace_root.as_deref(),
+                error.to_string(),
+                if target == Target::Project {
+                    "查看对应阶段和服务日志，修复失败原因后重试。"
+                } else {
+                    "检查平台运行配置、工作区权限或管理通道；保留原运行所有者身份后重试。"
+                },
+            )
+        };
+        self.emit_with_diagnostic(
+            BuildProgressEvent::Failed {
+                error: error.to_string(),
+            },
+            Some(item),
+        )
+        .await;
+    }
+
+    async fn emit_with_diagnostic(
+        &self,
+        event: BuildProgressEvent,
+        diagnostic_override: Option<shared_types::UserAppDiagnostic>,
+    ) {
         let terminal = {
             let mut s = self.state.lock().await;
             // Supersede signals cancellation under the admission lock before
@@ -242,11 +328,86 @@ impl BuildTask {
                 event,
                 BuildProgressEvent::Completed { .. } | BuildProgressEvent::Failed { .. }
             ) && self.is_cancelled()
+                // Registry shutdown may reject a worker before it ever starts.
+                // Only an explicit task cancellation wins over that admission error.
+                && !(s.stage.as_deref() == Some("admission") && !self.cancelled.load(Ordering::Relaxed))
             {
                 BuildProgressEvent::Cancelled
             } else {
                 event
             };
+            if is_terminal_status(s.status) {
+                return;
+            }
+            // Failure diagnostics and the final explanatory log are committed
+            // under the same lock, before the terminal event becomes observable.
+            let failure = match &event {
+                BuildProgressEvent::BuildFail { service, error } => Some((
+                    shared_types::UserAppDiagnosticPhase::Build,
+                    Some(service.clone()),
+                    error,
+                )),
+                BuildProgressEvent::ServiceStartFail { service, error } => Some((
+                    shared_types::UserAppDiagnosticPhase::Start,
+                    Some(service.clone()),
+                    error,
+                )),
+                BuildProgressEvent::Failed { error } => {
+                    Some((diagnostic_phase(s.stage.as_deref()), None, error))
+                }
+                _ => None,
+            };
+            if let Some((phase, service, error)) = failure {
+                use shared_types::{
+                    UserAppDiagnosticCode as Code, UserAppDiagnosticPhase as Phase,
+                    UserAppDiagnosticScope as Scope, UserAppRepairTarget as Target,
+                };
+                let mut item = super::diagnostics::diagnostic(
+                    match phase {
+                        Phase::Start => Code::StartFailed,
+                        Phase::Admission => Code::WorkerAdmission,
+                        _ => Code::BuildFailed,
+                    },
+                    phase,
+                    if phase == Phase::Admission {
+                        Target::Platform
+                    } else {
+                        Target::Project
+                    },
+                    s.workspace_root.as_deref(),
+                    error,
+                    "查看对应阶段和服务日志，修复失败原因后重试。",
+                );
+                item.scope = if service.is_some() {
+                    Scope::Service
+                } else {
+                    Scope::Task
+                };
+                item.service_id = service;
+                if let Some(override_item) = diagnostic_override {
+                    item = override_item;
+                }
+                if matches!(
+                    event,
+                    BuildProgressEvent::Failed { .. } | BuildProgressEvent::BuildFail { .. }
+                ) {
+                    // Startup service summaries already come from StartEventPipe.
+                    // Build failures need the same visibility for log-only clients.
+                    let log = BuildProgressEvent::Log {
+                        service: item
+                            .service_id
+                            .clone()
+                            .unwrap_or_else(|| "workspace".into()),
+                        line: super::diagnostics::log_line(&item),
+                    };
+                    if let Some((seq, log, _)) = publish_mut(&mut s, log) {
+                        drop(self.tx.send((seq, log)));
+                    }
+                }
+                if s.diagnostics.len() < super::diagnostics::MAX_DIAGNOSTICS {
+                    s.diagnostics.push(item);
+                }
+            }
             let Some((seq, event, terminal)) = publish_mut(&mut s, event) else {
                 return;
             };
@@ -354,6 +515,16 @@ impl BuildTask {
     }
 }
 
+fn diagnostic_phase(stage: Option<&str>) -> shared_types::UserAppDiagnosticPhase {
+    match stage {
+        Some("starting") => shared_types::UserAppDiagnosticPhase::Start,
+        Some("admission" | "waiting_for_build_slot") => {
+            shared_types::UserAppDiagnosticPhase::Admission
+        }
+        _ => shared_types::UserAppDiagnosticPhase::Build,
+    }
+}
+
 fn is_terminal_status(status: BuildTaskStatus) -> bool {
     matches!(
         status,
@@ -405,10 +576,12 @@ fn apply_event(state: &mut TaskState, event: &BuildProgressEvent) {
         // 服务）；失败记录 error（快照侧可读，终态仍由汇总 Failed 决定）。
         BuildProgressEvent::ServiceStarting { service }
         | BuildProgressEvent::ServiceStartOk { service } => {
+            state.stage = Some("starting".to_owned());
             state.current_service = Some(service.clone());
             state.status = BuildTaskStatus::Running;
         }
         BuildProgressEvent::ServiceStartFail { service, error } => {
+            state.stage = Some("starting".to_owned());
             state.current_service = Some(service.clone());
             state.error = Some(error.clone());
         }
@@ -493,7 +666,7 @@ impl BuildTaskStore {
     }
 
     #[cfg(test)]
-    fn with_max_retained_tasks(max_retained_tasks: usize) -> Self {
+    pub(crate) fn with_max_retained_tasks(max_retained_tasks: usize) -> Self {
         Self {
             workers: process_utils::workers::WorkerRegistry::new(None),
             map: Mutex::new(HashMap::new()),
@@ -532,25 +705,7 @@ impl BuildTaskStore {
         supersede: bool,
     ) -> Result<Arc<BuildTask>, BuildTaskStoreError> {
         let mut map = self.map.lock().await;
-        let now = Utc::now().timestamp();
-        map.retain(|_, existing| {
-            let terminal_at = existing.terminal_at.load(Ordering::Acquire);
-            terminal_at == 0 || now.saturating_sub(terminal_at) < TERMINAL_TASK_TTL_SECS
-        });
-        // 硬上限:全活跃任务达上限时,优先淘汰最旧终态任务;无终态可淘汰则拒绝(不再越过上限插入,#12)。
-        while map.len() >= self.max_retained_tasks {
-            let Some(oldest_terminal_id) = map
-                .values()
-                .filter(|existing| existing.terminal_at.load(Ordering::Acquire) > 0)
-                .min_by_key(|existing| existing.created_at)
-                .map(|existing| existing.id.clone())
-            else {
-                return Err(BuildTaskStoreError::CapacityExceeded {
-                    limit: self.max_retained_tasks,
-                });
-            };
-            map.remove(&oldest_terminal_id);
-        }
+        reserve_capacity(&mut map, self.max_retained_tasks)?;
         let task = BuildTask::with_cancellation(
             app_id.clone(),
             kind,
@@ -580,6 +735,100 @@ impl BuildTaskStore {
         Ok(task)
     }
 
+    /// Register a fully terminal diagnostic task. It never owns an execution
+    /// lease, build slot, worker, or cancellation child of the worker registry.
+    pub async fn create_failed_diagnostic(
+        &self,
+        app_id: String,
+        kind: BuildTaskKind,
+        error: String,
+        diagnostics: Vec<shared_types::UserAppDiagnostic>,
+    ) -> Result<Arc<BuildTask>, BuildTaskStoreError> {
+        let now = Utc::now().timestamp();
+        let (tx, _) = broadcast::channel(BROADCAST_CAP);
+        let mut diagnostics: Vec<_> = diagnostics
+            .into_iter()
+            .take(super::diagnostics::MAX_DIAGNOSTICS)
+            .collect();
+        if diagnostics.is_empty() {
+            diagnostics.push(super::diagnostics::diagnostic(
+                shared_types::UserAppDiagnosticCode::OwnerPreflight,
+                shared_types::UserAppDiagnosticPhase::Precheck,
+                shared_types::UserAppRepairTarget::Platform,
+                None,
+                &error,
+                "检查任务错误详情后重试。",
+            ));
+        }
+        let stage = match diagnostics[0].phase {
+            shared_types::UserAppDiagnosticPhase::Precheck => "precheck",
+            shared_types::UserAppDiagnosticPhase::OwnerPreflight => "owner_preflight",
+            shared_types::UserAppDiagnosticPhase::Admission => "admission",
+            shared_types::UserAppDiagnosticPhase::Build => "building",
+            shared_types::UserAppDiagnosticPhase::Start => "starting",
+        };
+        let current_service = diagnostics.iter().find_map(|item| item.service_id.clone());
+        let mut history = VecDeque::new();
+        for item in &diagnostics {
+            history.push_back((
+                history.len() as u64,
+                BuildProgressEvent::Log {
+                    service: item
+                        .service_id
+                        .clone()
+                        .unwrap_or_else(|| "workspace".into()),
+                    line: super::diagnostics::log_line(item),
+                },
+            ));
+        }
+        history.push_back((
+            history.len() as u64,
+            BuildProgressEvent::Failed {
+                error: error.clone(),
+            },
+        ));
+        let task = Arc::new(BuildTask {
+            id: Uuid::now_v7().simple().to_string(),
+            app_id: app_id.clone(),
+            kind,
+            state: Mutex::new(TaskState {
+                app_id,
+                kind,
+                status: BuildTaskStatus::Failed,
+                stage: Some(stage.into()),
+                current_service,
+                release_id: None,
+                sha256: None,
+                size_bytes: None,
+                file_name: None,
+                artifact_path: None,
+                error: Some(error),
+                workspace_root: None,
+                seq: history.len() as u64,
+                history,
+                diagnostics,
+                updated_at: now,
+            }),
+            tx,
+            cancelled: AtomicBool::new(false),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            cleanup_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            terminal_at: AtomicI64::new(now),
+            created_at: now,
+            pid: AtomicU32::new(0),
+            commit: Mutex::new(()),
+        });
+        let mut map = self.map.lock().await;
+        reserve_capacity(&mut map, self.max_retained_tasks)?;
+        map.insert(task.id.clone(), task.clone());
+        Ok(task)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn retained_count(&self) -> usize {
+        self.map.lock().await.len()
+    }
+
     pub async fn get(&self, id: &str) -> Option<Arc<BuildTask>> {
         self.map.lock().await.get(id).cloned()
     }
@@ -597,6 +846,30 @@ impl BuildTaskStore {
             .cloned()
             .collect()
     }
+}
+
+fn reserve_capacity(
+    map: &mut HashMap<BuildTaskId, Arc<BuildTask>>,
+    limit: usize,
+) -> Result<(), BuildTaskStoreError> {
+    let now = Utc::now().timestamp();
+    map.retain(|_, existing| {
+        let terminal_at = existing.terminal_at.load(Ordering::Acquire);
+        terminal_at == 0 || now.saturating_sub(terminal_at) < TERMINAL_TASK_TTL_SECS
+    });
+    // 硬上限:全活跃任务达上限时,优先淘汰最旧终态任务;无终态可淘汰则拒绝(不再越过上限插入,#12)。
+    while map.len() >= limit {
+        let Some(oldest_terminal_id) = map
+            .values()
+            .filter(|existing| existing.terminal_at.load(Ordering::Acquire) > 0)
+            .min_by_key(|existing| existing.created_at)
+            .map(|existing| existing.id.clone())
+        else {
+            return Err(BuildTaskStoreError::CapacityExceeded { limit });
+        };
+        map.remove(&oldest_terminal_id);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -715,6 +988,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failure_diagnostics_classify_phase_and_repair_target_without_message_matching() {
+        use shared_types::{
+            UserAppDiagnosticCode as Code, UserAppDiagnosticPhase as Phase,
+            UserAppRepairTarget as Target,
+        };
+        for (stage, phase, code, target) in [
+            (
+                "waiting_for_build_slot",
+                Phase::Admission,
+                Code::TaskCapacity,
+                Target::Platform,
+            ),
+            (
+                "admission",
+                Phase::Admission,
+                Code::WorkerAdmission,
+                Target::Platform,
+            ),
+            ("building", Phase::Build, Code::BuildFailed, Target::Project),
+            (
+                "starting",
+                Phase::Start,
+                Code::StartFailed,
+                Target::Platform,
+            ),
+        ] {
+            let task = BuildTask::new("app-a".into(), BuildTaskKind::DevStart);
+            task.emit(BuildProgressEvent::Stage {
+                stage: stage.into(),
+            })
+            .await;
+            task.emit_failure(&file_server::error::AppError::business(
+                "same arbitrary text",
+            ))
+            .await;
+            let snapshot = task.snapshot().await;
+            assert_eq!(snapshot.status, BuildTaskStatus::Failed);
+            assert_eq!(snapshot.diagnostics.len(), 1);
+            let item = &snapshot.diagnostics[0];
+            assert_eq!(
+                (item.phase, item.code, item.repair_target),
+                (phase, code, target)
+            );
+            let (events, _) = task.subscribe(0).await;
+            assert!(matches!(
+                events[events.len() - 2].1,
+                BuildProgressEvent::Log { .. }
+            ));
+            assert!(matches!(
+                events[events.len() - 1].1,
+                BuildProgressEvent::Failed { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn subscription_has_no_gap_between_replay_and_live_events() {
         let task = BuildTask::new("app-a".into(), BuildTaskKind::Build);
         let (replay, mut receiver) = task.subscribe(0).await;
@@ -787,13 +1116,22 @@ mod tests {
         tokio::join!(completed, failed);
 
         let snapshot = task.snapshot().await;
-        assert_eq!(snapshot.seq, 1);
         assert!(matches!(
             snapshot.status,
             BuildTaskStatus::Completed | BuildTaskStatus::Failed
         ));
         let (replay, _) = task.subscribe(0).await;
-        assert_eq!(replay.len(), 1);
+        assert_eq!(snapshot.seq as usize, replay.len());
+        assert_eq!(
+            replay
+                .iter()
+                .filter(|(_, event)| matches!(
+                    event,
+                    BuildProgressEvent::Completed { .. } | BuildProgressEvent::Failed { .. }
+                ))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

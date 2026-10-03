@@ -435,15 +435,9 @@ mod tests {
         let paths = value["paths"].as_object().expect("paths object");
         // 6 个 Rust 新契约接口（TS 无对应端点）：dev 生命周期 5 + ensure-workspace
         let expected_refs = [
-            (
-                "/api/v1/userapp/dev/start",
-                "HttpResult_UserappDevTaskCreated",
-            ),
+            ("/api/v1/userapp/dev/start", "HttpResult_DevAdmissionData"),
             ("/api/v1/userapp/dev/stop", "HttpResult_UserappDevStopped"),
-            (
-                "/api/v1/userapp/dev/restart",
-                "HttpResult_UserappDevTaskCreated",
-            ),
+            ("/api/v1/userapp/dev/restart", "HttpResult_DevAdmissionData"),
             ("/api/v1/userapp/dev/list", "HttpResult_UserappDevList"),
             (
                 "/api/v1/userapp/dev/framework-info",

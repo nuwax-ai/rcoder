@@ -301,14 +301,15 @@ pub use agent::mgmt_types::{
     UPLOAD_CHUNK_SIZE, URL_DOWNLOAD_TIMEOUT_SECS, UninstallAgentRequest, UninstallAgentResponse,
 };
 pub use workspace_manifest::{
-    BuildSection, DevbuildSection, DevrunSection, DiscoverError, DiscoveredProject, HealthSection,
-    LockedPingap, LockedService, LogFormat, LogSource, LogsSection, MINIMUM_APP_CLI_VERSION,
-    ManifestError, PingapMode, PingapSection, ProjectKind, ProjectManifest, ProjectMeta,
-    ProjectType, ProxySection, ReleaseLock, ReleaseMetadata, RunSection, STARTUP_PROBE_CAPABILITY,
-    StartupProbe, WorkspaceManifest, WorkspaceMeta, build_release_lock, discover_projects,
-    load_release_lock, parse_project, parse_workspace, require_startup_probe_capability,
-    validate_project, validate_service_id, validate_topology, validate_workspace,
-    validate_workspace_startup,
+    BuildSection, DevbuildSection, DevrunSection, DiagnosticKind, DiscoverError, DiscoveredProject,
+    DiscoveryReport, HealthSection, LockedPingap, LockedService, LogFormat, LogSource, LogsSection,
+    MINIMUM_APP_CLI_VERSION, ManifestDiagnostic, ManifestError, PingapMode, PingapSection,
+    ProjectKind, ProjectManifest, ProjectMeta, ProjectType, ProxySection, ReleaseLock,
+    ReleaseMetadata, RunSection, STARTUP_PROBE_CAPABILITY, StartupProbe, WorkspaceManifest,
+    WorkspaceMeta, build_release_lock, collect_workspace_issues, collect_workspace_startup_issues,
+    discover_projects, discover_projects_report, load_release_lock, parse_project, parse_workspace,
+    parse_workspace_for_inspection, require_startup_probe_capability, validate_project,
+    validate_service_id, validate_topology, validate_workspace, validate_workspace_startup,
 };
 
 pub mod userapp_http;
@@ -339,3 +340,5 @@ pub use userapp::compute_recovery::*;
 pub use userapp::discovery::UserAppDiscoveredIdentity;
 
 pub use app_resource_deletion::UserAppComputeStartTarget;
+
+pub use userapp::diagnostic::*;

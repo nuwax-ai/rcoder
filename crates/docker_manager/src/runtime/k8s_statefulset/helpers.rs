@@ -494,9 +494,12 @@ mod tests {
         let new = vec![
             env("PROJECT_ID", Some("11")),
             env("APP_CLI_MANAGED", Some("1")),
-            env("APP_CLI_RUNTIME_WORKSPACE", Some("/home/user/11/code")),
+            env("APP_CLI_RUNTIME_WORKSPACE", Some("/home/user/11")),
         ];
         assert!(is_managed_owner_upgrade_drift(&old, &new));
         assert!(!is_managed_owner_upgrade_drift(&new, &new.clone()));
+        let mut wrong_root = new.clone();
+        wrong_root[2].value = Some("/home/user/11/code".into());
+        assert!(is_managed_owner_upgrade_drift(&wrong_root, &new));
     }
 }

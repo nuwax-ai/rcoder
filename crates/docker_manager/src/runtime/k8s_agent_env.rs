@@ -136,8 +136,8 @@ pub(crate) fn build_agent_env_vars(
     // 是门禁；显式置 0 的存量配置被平台覆盖为 1，避免灰度残留复活旧故障
     // 模式）。注入链：
     // - APP_CLI_MANAGED=1：supervisord [program:app-cli] 进入常驻 serve；
-    // - APP_CLI_RUNTIME_WORKSPACE：真实 workspace（解包根 code/），取代包
-    //   装脚本缺省 empty（不出现 empty owner 抢 3010）；
+    // - APP_CLI_RUNTIME_WORKSPACE：与 chat/build 相同的开发源码根；
+    //   prod 解包目录 code/ 不作为开发 owner 的工作区；
     // - APP_CLI_DEPLOY_TOKEN：按创建生成的部署凭据——owner 落盘状态根
     //   （共享卷），file-server 经 R09 同一解析契约读取提交运行操作；
     //   token 不入日志/事件/描述。
@@ -158,7 +158,9 @@ pub(crate) fn build_agent_env_vars(
         env_vars.retain(|entry| entry.name != "APP_CLI_RUNTIME_WORKSPACE");
         env_vars.push(EnvVar {
             name: "APP_CLI_RUNTIME_WORKSPACE".to_string(),
-            value: Some(shared_types::paths::app_code_root(&project_id_for_env)),
+            value: Some(shared_types::paths::userapp_dev_workspace(
+                &project_id_for_env,
+            )),
             ..Default::default()
         });
         env_vars.push(EnvVar {
@@ -314,8 +316,8 @@ mod b03_tests {
             );
             assert_eq!(
                 value_of(&on, "APP_CLI_RUNTIME_WORKSPACE").as_deref(),
-                Some("/home/user/app-b03/code"),
-                "managed 必须注入真实 workspace（不是包装脚本缺省 empty）"
+                Some("/home/user/app-b03"),
+                "managed owner 必须与 chat/build 共用开发源码根"
             );
             let token = value_of(&on, "APP_CLI_DEPLOY_TOKEN").expect("token injected");
             assert!(

@@ -8,6 +8,7 @@ pub mod domain;
 mod epoch;
 mod guardian;
 mod monitor;
+mod owner_handover;
 mod record;
 mod recovery;
 mod session;
@@ -16,9 +17,10 @@ mod worker;
 pub use cleanup::{CleanupCommand, CleanupOutcome};
 pub use control::{
     Action, Binding, FailureCode, Phase, Problem, RecoveryError, Request, Snapshot, control,
-    control_verified, last_snapshot,
+    control_verified, last_snapshot, saved_request_snapshot,
 };
 pub use monitor::{Options, Owner, Policy};
+pub use owner_handover::{completed_shutdown_for, shutdown_captured_owner};
 pub use record::{Intent, Quiescence, verify_live, verify_local_quiescent, verify_quiescent};
 pub use recovery::{
     StopMode, StopRefused, StopWorkAttempt, continue_stop_work, continue_stop_work_with_checkpoint,

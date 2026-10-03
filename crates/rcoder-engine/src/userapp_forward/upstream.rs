@@ -669,3 +669,7 @@ mod control_response_tests {
 #[cfg(test)]
 #[path = "upstream_wait_tests.rs"]
 mod waitable_conflict_tests;
+
+#[cfg(test)]
+#[path = "upstream_diagnostics_tests.rs"]
+mod diagnostics_forward_tests;

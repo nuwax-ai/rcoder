@@ -208,8 +208,7 @@ impl Owner {
             }
         }
         ensure!(
-            request.expected_generation.is_none()
-                || request.expected_generation == discovery.snapshot.generation,
+            request.matches_generation(discovery.snapshot.generation.as_deref()),
             "execution generation changed"
         );
         while let Some(target) = record::reconcile(&self.root)? {
@@ -272,6 +271,23 @@ impl Owner {
         &self,
         binding: &control::Binding,
     ) -> Result<(Option<Discovery>, bool)> {
+        self.load_discovery_for_recovery(binding, None)
+    }
+
+    /// The caller holds the owner lock and has authorized a previous binding
+    /// to the same managed application. Keep that binding until its execution
+    /// receipts have been reconciled; accepting discovery proves no cleanup.
+    pub(crate) fn load_discovery_for_recovery(
+        &self,
+        binding: &control::Binding,
+        previous: Option<&control::Binding>,
+    ) -> Result<(Option<Discovery>, bool)> {
+        if let Some(previous) = previous {
+            ensure!(
+                previous.component == binding.component,
+                "owner component changed"
+            );
+        }
         let path = self.root.join("supervisor.json");
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
@@ -300,7 +316,7 @@ impl Owner {
                             serde_json::from_value::<control::Binding>(raw_binding.clone())
                     {
                         ensure!(
-                            &recorded == binding,
+                            &recorded == binding || previous == Some(&recorded),
                             "supervisor scope belongs to another resource"
                         );
                     }
@@ -315,9 +331,12 @@ impl Owner {
             "unsupported supervisor receipt"
         );
         ensure!(
-            &old.snapshot.binding == binding,
+            &old.snapshot.binding == binding || previous == Some(&old.snapshot.binding),
             "supervisor scope belongs to another resource"
         );
+        if &old.snapshot.binding != binding {
+            preserve_discovery_as(&path, &bytes, "recovered")?;
+        }
         Ok((Some(old), false))
     }
 
@@ -450,7 +469,11 @@ impl Owner {
 }
 
 pub(crate) fn preserve_discovery(path: &Path, bytes: &[u8]) -> Result<()> {
-    let backup = path.with_extension(format!("corrupt-{}.json", uuid::Uuid::new_v4().simple()));
+    preserve_discovery_as(path, bytes, "corrupt")
+}
+
+fn preserve_discovery_as(path: &Path, bytes: &[u8], reason: &str) -> Result<()> {
+    let backup = path.with_extension(format!("{reason}-{}.json", uuid::Uuid::new_v4().simple()));
     let parent = path.parent().context("discovery parent missing")?;
     // Keep discovery readable until persist atomically replaces it. Moving it
     // aside first creates an ENOENT window for concurrent Stop/Status readers.
@@ -671,9 +694,7 @@ impl State {
             }
             return Ok(snapshot.clone());
         }
-        if request.expected_generation.is_some()
-            && request.expected_generation != self.discovery.snapshot.generation
-        {
+        if !request.matches_generation(self.discovery.snapshot.generation.as_deref()) {
             return Err(Problem {
                 code: FailureCode::IdentityChanged,
                 message: "execution generation changed; inspect current owner before retrying"

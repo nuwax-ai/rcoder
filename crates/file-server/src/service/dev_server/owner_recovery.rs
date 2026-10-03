@@ -13,6 +13,8 @@ use super::{
 };
 use crate::error::{AppError, AppResult};
 
+mod handover;
+
 pub(super) struct AvailableOwner {
     pub address: String,
     pub identity: RuntimeIdentityView,
@@ -112,8 +114,11 @@ impl DevServerManager {
                     Err(std::fs::TryLockError::WouldBlock) => {
                         // Another caller is restoring the same management service.
                         // Observe its result instead of failing an ordinary start.
-                        return self
+                        let identity = self
                             .wait_for_recovery_owner(project, workspace, address, &root)
+                            .await?;
+                        return self
+                            .accept_or_repair_owner(project, workspace, address, identity)
                             .await
                             .map(Some);
                     }
@@ -135,7 +140,9 @@ impl DevServerManager {
                 }
             }
         };
-        Ok(Some(identity))
+        self.accept_or_repair_owner(project, workspace, address, identity)
+            .await
+            .map(Some)
     }
 
     async fn spawn_recovery_owner(
@@ -214,17 +221,54 @@ impl DevServerManager {
         address: &str,
         root: &Path,
     ) -> Result<RuntimeIdentityView> {
+        let managed = runtime_state_layout::ManagedWorkspace::from_env(workspace, root)?;
+        self.wait_for_recovery_owner_with_context(
+            project,
+            workspace,
+            address,
+            root,
+            managed.as_ref(),
+        )
+        .await
+    }
+
+    async fn wait_for_recovery_owner_with_context(
+        &self,
+        project: &str,
+        workspace: &Path,
+        address: &str,
+        root: &Path,
+        managed: Option<&runtime_state_layout::ManagedWorkspace>,
+    ) -> Result<RuntimeIdentityView> {
         let origin = runtime_state_layout::resolve_project_origin(workspace)?;
         let mut diagnostic = None;
         let mut resumed_shutdown = false;
         let mut recovery_request: Option<(String, runtime_supervisor::Request)> = None;
-        let result = tokio::time::timeout(Duration::from_secs(45), async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        let result = tokio::time::timeout_at(deadline, async {
             loop {
                 // Check the winner first: another managed supervisor can win the
                 // OwnerGuard race while our control-only candidate exits.
-                if let OwnerProbe::Ready(identity) = owner_client::observe_owner(address).await? {
-                    return Ok(identity);
-                }
+                let ready = if let OwnerProbe::Ready(identity) =
+                    owner_client::observe_owner(address).await?
+                {
+                    // A wrong-root owner is returned to the handover path. A
+                    // correct-root HTTP listener can precede native recovery:
+                    // keep waiting until its old binding and cleanup settle.
+                    if managed.is_none_or(|managed| {
+                        owner_client::verify_project_identity(
+                            &identity,
+                            workspace,
+                            &managed.application_id,
+                        )
+                        .is_err()
+                    }) {
+                        return Ok(identity);
+                    }
+                    Some(identity)
+                } else {
+                    None
+                };
                 let observation = runtime_supervisor::control(
                     root,
                     runtime_supervisor::Request::new(runtime_supervisor::Action::Status),
@@ -242,21 +286,33 @@ impl DevServerManager {
                     }
                     result => result,
                 };
+                let live_supervisor = observation.is_ok();
                 if let Ok(snapshot) = observation {
                     ensure!(
                         snapshot.binding.component == "app-cli"
-                            && snapshot.binding.resource == origin,
+                            && (snapshot.binding.resource == origin
+                                || managed.is_some_and(|managed| managed
+                                    .verify_contained_workspace(&snapshot.binding.resource)
+                                    .is_ok())),
                         "recovery supervisor belongs to another workspace"
                     );
                     diagnostic = Some(snapshot.diagnostic());
+                    if snapshot.binding.resource == origin
+                        && matches!(
+                            snapshot.phase,
+                            runtime_supervisor::Phase::Ready | runtime_supervisor::Phase::Stopped
+                        )
+                        && snapshot.intent != runtime_supervisor::Intent::Shutdown
+                        && let Some(identity) = ready
+                    {
+                        return Ok(identity);
+                    }
                     if snapshot.phase == runtime_supervisor::Phase::RecoveryRequired {
                         // A persisted failure describes the previous attempt.
                         // Ask this exact supervisor/generation to reassess once;
                         // it owns the worker-exit and cleanup proof. Lost replies
                         // reuse the same request, never restart a replacement.
-                        if snapshot.problem.as_ref().is_none_or(|problem| {
-                            problem.code != runtime_supervisor::FailureCode::CleanupUnconfirmed
-                        }) || recovery_request.as_ref().is_some_and(|(_, request)| {
+                        if recovery_request.as_ref().is_some_and(|(_, request)| {
                             snapshot.operation_id.as_deref() == Some(&request.request_id)
                         }) {
                             return Err(snapshot.recovery_error());
@@ -265,7 +321,7 @@ impl DevServerManager {
                             let mut request = runtime_supervisor::Request::new(
                                 runtime_supervisor::Action::Recover,
                             );
-                            request.expected_generation = snapshot.generation.clone();
+                            request.capture_generation(snapshot.generation.as_deref());
                             (snapshot.supervisor_id.clone(), request)
                         });
                         if let Err(error) =
@@ -288,6 +344,18 @@ impl DevServerManager {
                     .get(project)
                     .and_then(|child| child.exited());
                 if let Some(exit) = exited {
+                    if live_supervisor {
+                        // A competing owner may have acquired the authoritative
+                        // lock while our candidate exited during dispatch. Its
+                        // verified native endpoint remains the source of truth;
+                        // do not turn that normal startup window into a failure.
+                        diagnostic = Some(format!(
+                            "bootstrap candidate {}; verified management owner is still initializing; {}",
+                            exit.describe(), diagnostic.as_deref().unwrap_or_default()
+                        ));
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
                     // The first bootstrap may finish the original container's
                     // already accepted Shutdown. Only its confirmed terminal
                     // receipt permits one new management-only launch. This does
@@ -299,11 +367,16 @@ impl DevServerManager {
                         && snapshot.binding.resource == origin
                         && snapshot.phase == runtime_supervisor::Phase::Stopped
                         && snapshot.intent == runtime_supervisor::Intent::Shutdown
-                        && snapshot.operation_id.is_some()
                     {
-                        if let Some(generation) = &snapshot.generation {
-                            runtime_supervisor::verify_local_quiescent(root, generation)?;
-                        }
+                        let (request, mut captured) = runtime_supervisor::completed_shutdown_for(root, &snapshot.supervisor_id)?
+                            .context("bootstrap Shutdown has no unique completed request receipt")?;
+                        ensure!(captured.binding == snapshot.binding,
+                            "bootstrap Shutdown receipt belongs to another workspace");
+                        let generation = request.expected_generation.as_deref()
+                            .context("legacy bootstrap Shutdown did not capture an exact generation; retry with current management tooling")?;
+                        captured.generation = if generation.is_empty() { None } else { Some(generation.to_owned()) };
+                        runtime_supervisor::shutdown_captured_owner(root, &captured, &request,
+                            deadline.saturating_duration_since(tokio::time::Instant::now())).await?;
                         resumed_shutdown = true;
                         self.spawn_recovery_owner(project, workspace, address)
                             .await?;
@@ -390,7 +463,12 @@ mod tests {
 
     #[tokio::test]
     async fn historical_cleanup_failure_is_reassessed_once_before_continuing_request() {
-        for cleanup_succeeds in [true, false] {
+        for (cleanup_succeeds, historical_problem) in [
+            (true, Some(FailureCode::CleanupUnconfirmed)),
+            (false, Some(FailureCode::CleanupUnconfirmed)),
+            (true, Some(FailureCode::Internal)),
+            (true, None),
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let root = std::fs::canonicalize(temp.path()).unwrap();
             let ready = Arc::new(AtomicBool::new(false));
@@ -443,8 +521,8 @@ mod tests {
                 intent: Intent::Stopped,
                 operation_id: Some("old-failed-stop".into()),
                 error: Some("historical cleanup failure".into()),
-                problem: Some(Problem {
-                    code: FailureCode::CleanupUnconfirmed,
+                problem: historical_problem.map(|code| Problem {
+                    code,
                     message: "cleanup incomplete".into(),
                 }),
             };

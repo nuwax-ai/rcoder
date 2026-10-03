@@ -2,6 +2,28 @@
 
 owner 丢失的容器内专项回归使用 `owner_recovery.py`，入口与验收边界见 [开发环境 owner 恢复](../../docs/userapp-dev-owner-recovery.md)。它不替代下列完整 Compose/K8s 套件。
 
+## 真实 agent 项目适配（独立容器）
+
+`userapp_project_repair.py` 默认运行两个原始项目：`code/` 下的完整旧工程，以及未配置平台 manifest 的 Node HTTP/shared monorepo。使用镜像已有的 OpenCode CLI（可为 `nuwaxcode`），注入当前模板系统提示词及两份完整技能，让真实模型自行适配；不借用共享 RCoder 服务，也不预先替 agent 写适配结果。
+
+```bash
+python3 tests-e2e/tools/userapp_project_repair.py \
+  --app-cli tests-e2e/reports/_bin/app-cli-linux \
+  --file-server-proxy tests-e2e/reports/_bin/file-server-proxy-linux \
+  --template-root ../userapp-workspace-template \
+  --report /private/tmp/userapp-project-repair.json
+```
+
+输入必须是本轮 Linux ELF 二进制，并与 `--image` 的架构匹配；默认镜像 `dev-rcoder-agent-runner:latest` 会先解析成不可变 image ID。两个副本各有独立 app_id、容器和持久卷，容器使用 builtin 引擎；无数据库 fixture 不要求 PG。可分别用 `--case misplaced-nested`、`--case imported-source` 和不同 `--report` 并行执行。默认每 case 的 agent 总预算 900 秒、构建/运行阶段预算 180 秒，可用对应参数调整。
+
+真实执行会调用 LLM。配置只从 `--env-file`（默认仓库 `.env.local`）读取 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`，采用 OpenAI-compatible provider；key/完整 endpoint 不打印、不进入 Docker argv 或持久卷。`OPENCODE_CONFIG_CONTENT` 经 docker exec stdin 传入子进程环境，CLI 的 HOME/XDG 位于容器 tmpfs。报告保存脱敏工具轨迹、prompt/技能/二进制哈希、文件 diff、原根 validate JSON、实际构建、任务 GET/SSE、逐服务启动成功日志以及 HTTP 业务断言。仅模型回答“已完成”、任务 completed 或端口存活均不能使测试通过。
+
+首次可加 `--preflight-only`，只验证当前二进制、`--pure` 的提示词加载、完整技能、未适配 fixture 及其失败任务 GET/SSE，不发送 LLM 请求。此模式即使退出 0，也明确记录 `preflight_only=true`、`ai_executed=false`、`success=false`，不能当作真实 agent 验收。
+
+JSON/JSONL 先按结构脱敏再序列化，普通日志和 diff 使用文本脱敏。技能/源码阅读需要实际返回正文，bash 读取还要求 exit=0；不能用文件名出现在命令或最终回答中替代读取证据。Stop 后保存容器内 socket 的确切 errno，仅 ECONNREFUSED 证明业务入口关闭；Docker exec/观测错误不算关闭，同时核验容器仍运行、原管理实例仍在且 desired=stopped。
+
+所有结果必须满足固定必测项；失败、超时、缺配置或不完整轨迹均非通过。结束时按捕获的容器 ID 和本次 run 标签移除自有容器，保留卷、源码及报告；不清其他服务，不删 owner 状态或锁，不伪造模型输出。此脚本覆盖 agent → 本轮 file-server/app-cli 的容器内链路，不替代 RCoder/Java 转发、K8s 或完整部署验收。
+
 `make test-e2e` 运行基础、dev、build-rules、Docker 热部署故障与完整制品部署链。
 `make test-e2e-compose` 保留共享 chat/SSE 场景并补齐 build-rules。
 

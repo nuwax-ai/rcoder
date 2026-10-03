@@ -103,6 +103,14 @@ impl DevServerManager {
             project_path,
             &mut env_extra,
         );
+        if let Some(root) = &platform_state_root {
+            append_managed_launch_env(project_path, root, &mut env_extra, |key| {
+                std::env::var_os(key)
+            })
+            .map_err(|error| {
+                AppError::business(format!("managed launch context rejected: {error:#}"))
+            })?;
+        }
         // 迁移回执位置绑定（DEV-R5）：由 apply_migration_receipts_binding 证据
         // 决策（显式根/旧目录两侧的 pending/completed + 持久位置记录）后注入，
         // 不再按"旧目录存在"猜测——pending 不被路径切换掩盖、已完成不重跑。
@@ -326,12 +334,16 @@ impl DevServerManager {
                             let request = runtime_supervisor::Request::new(
                                 runtime_supervisor::Action::StopWork,
                             );
+                            let cleanup = self
+                                .owner_cleanup_command(workspace, &target.state_root)
+                                .map_err(|error| {
+                                    AppError::owner_error(
+                                        "prepare stale owner cleanup command",
+                                        error,
+                                    )
+                                })?;
                             let result = owner
-                                .stop_offline_with_cleanup(
-                                    target.binding(),
-                                    &request,
-                                    &self.owner_cleanup_command(workspace),
-                                )
+                                .stop_offline_with_cleanup(target.binding(), &request, &cleanup)
                                 .await
                                 .map_err(|error| {
                                     AppError::owner_error(
@@ -416,4 +428,27 @@ pub(super) fn platform_launch_env(
         env_extra.push(("APP_CLI_STATE_ROOT".to_string(), root.clone()));
     }
     root.map(std::path::PathBuf::from)
+}
+
+/// Managed authority is project-scoped; do not add these keys to the global
+/// minimal-env allowlist used by unrelated projects and generic commands.
+pub(super) fn append_managed_launch_env(
+    workspace: &Path,
+    state_root: &Path,
+    env_extra: &mut Vec<(String, String)>,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> anyhow::Result<()> {
+    if let Some(managed) =
+        runtime_state_layout::ManagedWorkspace::from_values(workspace, state_root, lookup)?
+    {
+        env_extra.extend([
+            ("SERVICE_TYPE".into(), "userapp-builder".into()),
+            ("APP_CLI_MANAGED".into(), "1".into()),
+            (
+                "APP_CLI_RUNTIME_WORKSPACE".into(),
+                managed.source_root.to_string_lossy().into_owned(),
+            ),
+        ]);
+    }
+    Ok(())
 }

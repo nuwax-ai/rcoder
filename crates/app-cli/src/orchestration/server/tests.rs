@@ -2247,4 +2247,143 @@ format = "jsonl"
         let view = kernel.get("op-queued").await.unwrap().expect("record");
         assert_eq!(view.state, shared_types::RuntimeOperationState::Cancelled);
     }
+
+    /// recovery v2 T1b：活 owner 冻结（管理面监听在、身份不应答）时，dispatch
+    /// 客户端在有界时间内返回明确错误，不产生第二 owner；持锁者精确退出、
+    /// 冻结解除后同容器可恢复 owner。自动强夺挂死 owner 明确未实施。
+    #[tokio::test]
+    async fn frozen_owner_dispatch_is_bounded_without_second_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws-frozen");
+        std::fs::create_dir_all(&ws).unwrap();
+        let application_id = std::env::var("PROJECT_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "unknown-app".into());
+        let state_root =
+            crate::runtime_kernel::RuntimeStore::resolve_root(&ws, &application_id).unwrap();
+        // 活 owner：真实持有 owner.lock。同进程第二个 fd 的 flock 按 open file
+        // description 判定争用，与跨进程持锁语义一致（owner_guard 既有测试同法）。
+        let holder = crate::platform::owner_guard::OwnerGuard::acquire(&state_root).unwrap();
+        // 冻结管理面：端口在监听、连接进入 backlog，但永不响应 HTTP。
+        let frozen = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let frozen_addr = frozen.local_addr().unwrap().to_string();
+
+        let started = tokio::time::Instant::now();
+        let dispatch = crate::control::owner_dispatch::dispatch_to_owner(
+            &frozen_addr,
+            &ws,
+            &state_root,
+            &application_id,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let error = match dispatch {
+            Err(error) => format!("{error:#}"),
+            Ok(_) => panic!("dispatch against a frozen owner must be rejected"),
+        };
+        assert!(
+            error.contains("no management API answers"),
+            "unexpected rejection: {error}"
+        );
+        // 有界：发现预算（10s）+ legacy 探测（2s）为硬上限，不随冻结挂死。
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "dispatch against a frozen owner must stay bounded (took {elapsed:?})"
+        );
+        // 无第二 owner：锁仍归原持有者——dispatch 既未强夺也未顺手释放。
+        assert!(
+            crate::platform::owner_guard::OwnerGuard::try_acquire(&state_root)
+                .unwrap()
+                .is_none(),
+            "dispatch must not steal or release the frozen owner's lock"
+        );
+
+        // 精确退出 + 冻结解除后：同容器可重新成为 owner。
+        drop(holder);
+        drop(frozen);
+        assert!(
+            crate::platform::owner_guard::OwnerGuard::try_acquire(&state_root)
+                .unwrap()
+                .is_some(),
+            "owner must be re-acquirable after the holder exits and the listener is released"
+        );
+    }
+
+    /// recovery v2 T2：两个进程并发 bootstrap 同一 workspace，恰好一个成为
+    /// 统一 owner（Owner），另一个有界分派（Dispatch）；owner 会话存活期间
+    /// 后续竞争者仍为 Dispatch，精确退出后可再次成为 owner——全程不出现
+    /// 两个可写 owner 或两个监听。
+    #[tokio::test]
+    async fn concurrent_bootstrap_yields_exactly_one_owner() {
+        fn describe(
+            outcome: &anyhow::Result<crate::control::supervision::SupervisionOutcome>,
+        ) -> String {
+            match outcome {
+                Ok(crate::control::supervision::SupervisionOutcome::Owner(_)) => "owner".into(),
+                Ok(crate::control::supervision::SupervisionOutcome::Dispatch) => "dispatch".into(),
+                Ok(crate::control::supervision::SupervisionOutcome::Legacy) => "legacy".into(),
+                Err(error) => format!("error: {error:#}"),
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws-race");
+        std::fs::create_dir_all(&ws).unwrap();
+        let args = crate::config::RuntimeArgs {
+            workspace: ws,
+            attach: false,
+            ..Default::default()
+        };
+        let (first, second) = tokio::join!(
+            crate::control::supervision::supervise(&args, false),
+            crate::control::supervision::supervise(&args, false),
+        );
+        let mut owner_session: Option<std::sync::Arc<runtime_supervisor::OwnerSession>> = None;
+        let (mut owners, mut dispatches) = (0usize, 0usize);
+        let mut unexpected = Vec::new();
+        for outcome in [first, second] {
+            match outcome {
+                Ok(crate::control::supervision::SupervisionOutcome::Owner(session)) => {
+                    owners += 1;
+                    owner_session = Some(session);
+                }
+                Ok(crate::control::supervision::SupervisionOutcome::Dispatch) => dispatches += 1,
+                other => unexpected.push(describe(&other)),
+            }
+        }
+        assert_eq!(owners, 1, "exactly one bootstrap may own: {unexpected:?}");
+        assert_eq!(
+            dispatches, 1,
+            "the loser must dispatch, not fail: {unexpected:?}"
+        );
+        assert!(
+            unexpected.is_empty(),
+            "unexpected supervision outcomes: {unexpected:?}"
+        );
+
+        // owner 会话存活期间：第三个竞争者仍只能 Dispatch，不出现第二监听。
+        let third = crate::control::supervision::supervise(&args, false)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                third,
+                crate::control::supervision::SupervisionOutcome::Dispatch
+            ),
+            "a live owner session must keep later bootstraps dispatching"
+        );
+
+        // owner 精确退出后：同容器可再次成为 owner（单活约束可恢复）。
+        drop(owner_session);
+        let fourth = crate::control::supervision::supervise(&args, false)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                fourth,
+                crate::control::supervision::SupervisionOutcome::Owner(_)
+            ),
+            "owner must be re-acquirable after the previous session exits"
+        );
+    }
 }

@@ -177,6 +177,142 @@ pub enum OwnerDispatch {
     NoOwner,
 }
 
+/// A control-only bootstrap has no business operation to report.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ManagementReuse {
+    /// The same native authority and initialized API were re-observed.
+    Ready,
+    /// An authorized misdirected owner was retired; bootstrap must reacquire.
+    NoOwner,
+}
+
+/// Reuse only management. In particular, this path never reads release.lock or
+/// submits a Source operation, so Stopped and invalid/empty source remain intact.
+pub async fn reuse_management_owner(
+    admin_addr: &str,
+    workspace: &std::path::Path,
+    state_root: &std::path::Path,
+    application_id: &str,
+) -> Result<ManagementReuse> {
+    tokio::time::timeout(std::time::Duration::from_secs(45), async {
+        let (address, identity) =
+            discover_owner(admin_addr, state_root, std::time::Duration::from_secs(10))
+                .await
+                .context("owner lock is held but no management identity is available")?;
+        anyhow::ensure!(
+            identity.protocol_version == RUNTIME_CONTROL_PROTOCOL_VERSION
+                && identity.application_id == application_id
+                && identity.service_family == "userapp-dev",
+            "management owner identity does not match this application and protocol"
+        );
+        shared_types::validate_identifier(&identity.workspace_id, "workspace_id")
+            .map_err(anyhow::Error::msg)?;
+        let managed = runtime_state_layout::ManagedWorkspace::from_env(workspace, state_root)?;
+        let expected_root = runtime_state_layout::resolve_project_origin(workspace)?;
+        let owner_root = match &managed {
+            Some(managed) => {
+                managed.verify_contained_workspace(std::path::Path::new(&identity.source_root))?
+            }
+            None => runtime_state_layout::resolve_project_origin(std::path::Path::new(
+                &identity.source_root,
+            ))?,
+        };
+        if runtime_state_layout::canonical_project_root(&owner_root)
+            != runtime_state_layout::canonical_project_root(&expected_root)
+        {
+            if let Some(managed) = &managed {
+                crate::control::managed_owner::retire_misdirected(managed, &identity).await?;
+                return Ok(ManagementReuse::NoOwner);
+            }
+            bail!("management owner belongs to another workspace");
+        }
+        verify_saved_management_identity(state_root, &identity)?;
+        let before = runtime_supervisor::control(
+            state_root,
+            runtime_supervisor::Request::new(runtime_supervisor::Action::Status),
+        )
+        .await?;
+        loop {
+            let snapshot = runtime_supervisor::control_verified(
+                state_root,
+                runtime_supervisor::Request::new(runtime_supervisor::Action::Status),
+                &before.supervisor_id,
+            )
+            .await?;
+            anyhow::ensure!(
+                snapshot.binding.component == "app-cli",
+                "native management authority belongs to another component"
+            );
+            let native_root = match &managed {
+                Some(managed) => managed.verify_contained_workspace(&snapshot.binding.resource)?,
+                None => runtime_state_layout::resolve_project_origin(&snapshot.binding.resource)?,
+            };
+            let root_matches = runtime_state_layout::canonical_project_root(&native_root)
+                == runtime_state_layout::canonical_project_root(&expected_root);
+            anyhow::ensure!(
+                root_matches || managed.is_some(),
+                "native management authority belongs to another workspace"
+            );
+            // This is management reuse, not permission to execute business.
+            // A fenced/initializing owner still owns the scope and serves Stop
+            // and diagnostics; its project health cannot cause a second owner.
+            if root_matches && snapshot.intent != runtime_supervisor::Intent::Shutdown {
+                let observed = probe_identity(&address)
+                    .await
+                    .context("management identity disappeared during readiness verification")?;
+                anyhow::ensure!(
+                    same_management_identity(&identity, &observed),
+                    "management runtime changed while reusing owner"
+                );
+                verify_saved_management_identity(state_root, &observed)?;
+                // Read native state again after the API probes, so a queued
+                // stop/rebind is not mistaken for completed management recovery.
+                let after = runtime_supervisor::control_verified(
+                    state_root,
+                    runtime_supervisor::Request::new(runtime_supervisor::Action::Status),
+                    &before.supervisor_id,
+                )
+                .await?;
+                if after.binding == snapshot.binding
+                    && after.intent != runtime_supervisor::Intent::Shutdown
+                {
+                    return Ok(ManagementReuse::Ready);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("management-only owner reuse deadline exceeded; no business request was submitted")?
+}
+
+fn same_management_identity(left: &RuntimeIdentityView, right: &RuntimeIdentityView) -> bool {
+    left.application_id == right.application_id
+        && left.service_family == right.service_family
+        && left.workspace_id == right.workspace_id
+        && left.source_root == right.source_root
+        && left.runtime_instance_id == right.runtime_instance_id
+        && left.deployment_generation_id == right.deployment_generation_id
+        && left.protocol_version == right.protocol_version
+        && left.capabilities == right.capabilities
+}
+
+fn verify_saved_management_identity(
+    state_root: &std::path::Path,
+    identity: &RuntimeIdentityView,
+) -> Result<()> {
+    let saved: RuntimeIdentityView = serde_json::from_slice(
+        &std::fs::read(state_root.join("identity.json"))
+            .context("read native management identity record")?,
+    )
+    .context("decode native management identity record")?;
+    anyhow::ensure!(
+        same_management_identity(&saved, identity),
+        "native authority does not own the observed management API identity"
+    );
+    Ok(())
+}
+
 /// OwnerGuard 被占时的分派决策（R02 主路径）。
 ///
 /// `state_root` 用于读取 owner 凭据文件（token；与 file-server 同一契约）。
@@ -230,13 +366,23 @@ async fn dispatch_to_owner_inner(
     let expected_root = workspace
         .canonicalize()
         .context("resolve dispatch workspace")?;
-    let owner_root = std::path::Path::new(&identity.source_root)
-        .canonicalize()
-        .context("resolve owner workspace identity")?;
+    let managed = runtime_state_layout::ManagedWorkspace::from_env(workspace, state_root)?;
+    let owner_root = match &managed {
+        Some(managed) => {
+            managed.verify_contained_workspace(std::path::Path::new(&identity.source_root))?
+        }
+        None => std::path::Path::new(&identity.source_root)
+            .canonicalize()
+            .context("resolve owner workspace identity")?,
+    };
     if runtime_state_layout::canonical_project_root(&owner_root)
         != runtime_state_layout::canonical_project_root(&expected_root)
         || identity.application_id != application_id
     {
+        if let Some(managed) = managed {
+            crate::control::managed_owner::retire_misdirected(&managed, &identity).await?;
+            return Ok(OwnerDispatch::NoOwner);
+        }
         bail!(
             "admin port {admin_addr} is held by a different app-cli owner \
              (app {}/{}, expected {}); refusing to start a \
@@ -309,7 +455,7 @@ async fn dispatch_to_owner_inner(
                     resource: runtime_state_layout::resolve_project_origin(workspace)?,
                 },
                 std::time::Duration::from_secs(90),
-                &crate::supervision::cleanup_command()?,
+                &crate::supervision::cleanup_command(state_root)?,
             )
             .await
             .context("restore owner before explicit start")?;
@@ -435,6 +581,196 @@ pub fn describe_terminal(view: &RuntimeOperationView) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Protocol fixture only: real TCP and a real held owner lock, with a
+    /// deliberately fenced native snapshot. It proves management reuse does
+    /// not claim business readiness or perform any business/control mutation.
+    #[tokio::test]
+    async fn control_only_reuses_recovery_required_management_without_business_operations() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        struct FixtureTask(tokio::task::JoinHandle<()>);
+        impl Drop for FixtureTask {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("fenced-project");
+        let state_root = temporary.path().canonicalize().unwrap().join("state");
+        std::fs::create_dir_all(&source).unwrap();
+        let _owner = runtime_supervisor::Owner::try_acquire(&state_root)
+            .unwrap()
+            .unwrap();
+        assert!(
+            runtime_supervisor::Owner::try_acquire(&state_root)
+                .unwrap()
+                .is_none()
+        );
+        let source_bytes = b"invalid project configuration; management must remain usable";
+        std::fs::write(source.join("release.lock.toml"), source_bytes).unwrap();
+        std::fs::create_dir_all(state_root.join("operations")).unwrap();
+        let operation_bytes = b"protocol fixture: preserve this operation byte for byte";
+        let operation_path = state_root.join("operations/original-fixture.json");
+        std::fs::write(&operation_path, operation_bytes).unwrap();
+        let identity = RuntimeIdentityView {
+            application_id: "management-fixture".into(),
+            service_family: "userapp-dev".into(),
+            workspace_id: "fenced-project".into(),
+            source_root: source.display().to_string(),
+            runtime_instance_id: "original-runtime-instance".into(),
+            deployment_generation_id: "original-deployment".into(),
+            protocol_version: RUNTIME_CONTROL_PROTOCOL_VERSION,
+            capabilities: vec!["operations".into()],
+        };
+        let identity_bytes = serde_json::to_vec(&identity).unwrap();
+        std::fs::write(state_root.join("identity.json"), &identity_bytes).unwrap();
+        let unrelated_http = Arc::new(AtomicUsize::new(0));
+        let unrelated = unrelated_http.clone();
+        let wire_identity = identity.clone();
+        let http = axum::Router::new()
+            .route(
+                "/v1/runtime/identity",
+                axum::routing::get(move || {
+                    let identity = wire_identity.clone();
+                    async move { axum::Json(envelope(&identity)) }
+                }),
+            )
+            .fallback(move || {
+                let calls = unrelated.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::BAD_REQUEST
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_address = listener.local_addr().unwrap().to_string();
+        let mut http_task = FixtureTask(tokio::spawn(async move {
+            axum::serve(listener, http).await.unwrap();
+        }));
+        let native_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let native_address = native_listener.local_addr().unwrap().to_string();
+        let snapshot = runtime_supervisor::Snapshot {
+            version: 1,
+            binding: runtime_supervisor::Binding {
+                component: "app-cli".into(),
+                resource: source.clone(),
+            },
+            supervisor_id: "original-native-instance".into(),
+            generation: Some("unconfirmed-generation".into()),
+            phase: runtime_supervisor::Phase::RecoveryRequired,
+            intent: runtime_supervisor::Intent::Stopped,
+            operation_id: None,
+            error: Some("old cleanup remains unconfirmed".into()),
+            problem: Some(runtime_supervisor::Problem {
+                code: runtime_supervisor::FailureCode::CleanupUnconfirmed,
+                message: "cleanup evidence is still missing".into(),
+            }),
+        };
+        let discovery_bytes = serde_json::to_vec(&serde_json::json!({
+            "version":2, "instance":snapshot.supervisor_id, "address":native_address,
+            "token":"protocol-fixture-token", "snapshot":snapshot, "requests":[],
+        }))
+        .unwrap();
+        std::fs::write(state_root.join("supervisor.json"), &discovery_bytes).unwrap();
+        let native_requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let requests = native_requests.clone();
+        let native_snapshot = snapshot.clone();
+        let mut native_task = FixtureTask(tokio::spawn(async move {
+            loop {
+                let (stream, _) = native_listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                let envelope: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(envelope["version"], 2);
+                assert_eq!(envelope["instance"], native_snapshot.supervisor_id);
+                assert_eq!(envelope["token"], "protocol-fixture-token");
+                let request: runtime_supervisor::Request =
+                    serde_json::from_value(envelope["request"].clone()).unwrap();
+                requests.lock().await.push(request.action);
+                let mut reply = serde_json::to_vec(&serde_json::json!({
+                    "instance":native_snapshot.supervisor_id, "snapshot":native_snapshot, "error":null,
+                })).unwrap();
+                reply.push(b'\n');
+                stream.get_mut().write_all(&reply).await.unwrap();
+            }
+        }));
+        let reused = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            reuse_management_owner(
+                &http_address,
+                &source,
+                &state_root,
+                &identity.application_id,
+            ),
+        )
+        .await
+        .expect("management reuse must not wait for the business fence to clear")
+        .unwrap();
+        assert_eq!(reused, ManagementReuse::Ready);
+        let observed = native_requests.lock().await.clone();
+        assert!(!observed.is_empty());
+        assert!(
+            observed
+                .iter()
+                .all(|action| *action == runtime_supervisor::Action::Status),
+            "management reuse must not send Stop/Recover/Shutdown: {observed:?}"
+        );
+        assert_eq!(
+            unrelated_http.load(Ordering::SeqCst),
+            0,
+            "no readiness/Start/Stop/business API calls"
+        );
+        assert_eq!(
+            std::fs::read(source.join("release.lock.toml")).unwrap(),
+            source_bytes
+        );
+        assert_eq!(
+            std::fs::read_dir(&source).unwrap().count(),
+            1,
+            "management reuse must not write source files"
+        );
+        assert_eq!(std::fs::read(&operation_path).unwrap(), operation_bytes);
+        assert_eq!(
+            std::fs::read_dir(state_root.join("operations"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read(state_root.join("identity.json")).unwrap(),
+            identity_bytes
+        );
+        assert_eq!(
+            std::fs::read(state_root.join("supervisor.json")).unwrap(),
+            discovery_bytes
+        );
+        let retained = runtime_supervisor::last_snapshot(&state_root).unwrap();
+        assert_eq!(retained.phase, runtime_supervisor::Phase::RecoveryRequired);
+        assert_eq!(
+            retained.problem, snapshot.problem,
+            "reuse cannot clear the business fence"
+        );
+        assert!(
+            runtime_supervisor::Owner::try_acquire(&state_root)
+                .unwrap()
+                .is_none()
+        );
+        for task in [&mut http_task, &mut native_task] {
+            task.0.abort();
+            assert!((&mut task.0).await.unwrap_err().is_cancelled());
+        }
+    }
 
     #[test]
     fn wildcard_listener_is_connected_through_loopback() {

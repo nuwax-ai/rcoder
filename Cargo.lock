@@ -3644,6 +3644,7 @@ dependencies = [
  "garde",
  "hex",
  "process_utils",
+ "semver",
  "serde",
  "serde_json",
  "serde_urlencoded",

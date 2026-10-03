@@ -7,11 +7,13 @@ use std::path::{Path, PathBuf};
 /// Interactive service shutdown grace, shared by both execution engines.
 pub(crate) const STOP_GRACE_SECONDS: u64 = 3;
 
-pub(crate) fn cleanup_command() -> Result<runtime_supervisor::CleanupCommand> {
+pub(crate) fn cleanup_command(state_root: &Path) -> Result<runtime_supervisor::CleanupCommand> {
     Ok(runtime_supervisor::CleanupCommand {
         program: std::env::current_exe()?,
         args: vec!["--app-cli-cleanup-engine".into()],
-        cwd: std::env::current_dir()?,
+        // Source directories may be moved during project repair. The control
+        // authority stays in place and all cleanup receipts use absolute paths.
+        cwd: state_root.to_path_buf(),
     })
 }
 
@@ -155,12 +157,15 @@ pub async fn supervise(
             resource: runtime_state_layout::resolve_project_origin(&args.workspace)?,
         },
         policy,
-        cleanup_adapter: Some(cleanup_command()?),
+        cleanup_adapter: Some(cleanup_command(&root)?),
         restart_on_exit,
         shutdown,
     };
-    let session =
-        std::sync::Arc::new(runtime_supervisor::OwnerSession::start(owner, options).await?);
+    let previous = super::managed_owner::previous_binding(&args.workspace, &root)?;
+    let session = std::sync::Arc::new(
+        runtime_supervisor::OwnerSession::start_recovering_binding(owner, options, previous)
+            .await?,
+    );
     Ok(SupervisionOutcome::Owner(session))
 }
 pub async fn control(args: &crate::config::OwnerArgs) -> Result<()> {
@@ -190,7 +195,7 @@ pub async fn control(args: &crate::config::OwnerArgs) -> Result<()> {
                                 )?,
                             },
                             &request,
-                            &cleanup_command()?,
+                            &cleanup_command(&root)?,
                         )
                         .await?
                 }

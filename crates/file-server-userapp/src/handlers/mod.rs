@@ -9,3 +9,6 @@ pub mod userapp_app_files;
 pub mod userapp_dev;
 pub mod userapp_dev_server;
 pub mod userapp_files;
+
+#[cfg(test)]
+mod task_diagnostics_tests;

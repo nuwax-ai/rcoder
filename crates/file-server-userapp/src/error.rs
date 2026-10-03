@@ -6,7 +6,6 @@
 //! 共享设施流出的 handler 出口）——`From<AppError>` 让 `?` 直接传播。
 
 use axum::Json;
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use shared_types::HttpResult;
@@ -26,30 +25,29 @@ impl From<AppError> for UserAppError {
 
 impl IntoResponse for UserAppError {
     fn into_response(self) -> Response {
-        use shared_types::error_codes as ec;
-        let (code, _status) = match &self.0 {
-            AppError::Validation(..) | AppError::ValidationI18n(..) | AppError::Business(_) => {
-                (ec::ERR_VALIDATION, StatusCode::BAD_REQUEST)
-            }
-            AppError::Conflict(_) | AppError::RuntimeRecovery(..) => {
-                (ec::ERR_CONFLICT, StatusCode::CONFLICT)
-            }
-            AppError::Resource(_) => (ec::ERR_NOT_FOUND, StatusCode::NOT_FOUND),
-            AppError::Network(_) => (ec::ERR_SERVICE_UNAVAILABLE, StatusCode::BAD_GATEWAY),
-            AppError::Permission(_)
-            | AppError::System(_)
-            | AppError::File(_)
-            | AppError::Process(_)
-            | AppError::ProcessPortInUse { .. } => (
-                ec::ERR_INTERNAL_SERVER_ERROR,
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ),
-        };
+        let code = app_error_code(&self.0);
         let mut result = HttpResult::<serde_json::Value>::error(code, &self.0.to_string());
         if let AppError::RuntimeRecovery(_, details) = &self.0 {
             result.data = Some(details.clone());
         }
         Json(result).into_response()
+    }
+}
+
+pub(crate) fn app_error_code(error: &AppError) -> &'static str {
+    use shared_types::error_codes as ec;
+    match error {
+        AppError::Validation(..) | AppError::ValidationI18n(..) | AppError::Business(_) => {
+            ec::ERR_VALIDATION
+        }
+        AppError::Conflict(_) | AppError::RuntimeRecovery(..) => ec::ERR_CONFLICT,
+        AppError::Resource(_) => ec::ERR_NOT_FOUND,
+        AppError::Network(_) => ec::ERR_SERVICE_UNAVAILABLE,
+        AppError::Permission(_)
+        | AppError::System(_)
+        | AppError::File(_)
+        | AppError::Process(_)
+        | AppError::ProcessPortInUse { .. } => ec::ERR_INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -72,6 +70,7 @@ pub fn reply<T: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
 
     #[tokio::test]
     async fn management_recovery_preserves_identity_and_reason_in_userapp_envelope() {

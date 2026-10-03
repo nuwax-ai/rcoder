@@ -1,5 +1,48 @@
-use super::manifest::platform_launch_env;
+use super::manifest::{append_managed_launch_env, platform_launch_env};
 use super::*;
+
+#[test]
+fn managed_launch_context_is_complete_and_scoped_to_the_platform_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = std::fs::canonicalize(temp.path()).unwrap().join("11");
+    let state = source.join("state/11");
+    std::fs::create_dir_all(&state).unwrap();
+    let environment = [
+        ("SERVICE_TYPE", std::ffi::OsString::from("userapp-builder")),
+        ("APP_CLI_MANAGED", "1".into()),
+        ("PROJECT_ID", "11".into()),
+        ("APP_CLI_RUNTIME_WORKSPACE", source.clone().into_os_string()),
+        ("APP_CLI_STATE_ROOT", state.clone().into_os_string()),
+    ];
+    let lookup = |key: &str| {
+        environment
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value.clone())
+    };
+    let mut extra = Vec::new();
+    platform_launch_env(
+        Some(std::ffi::OsStr::new("11")),
+        Some(state.as_os_str()),
+        &source,
+        &mut extra,
+    );
+    append_managed_launch_env(&source, &state, &mut extra, lookup).unwrap();
+    for (key, value) in &environment {
+        assert!(
+            extra
+                .iter()
+                .any(|(name, actual)| name == key && std::ffi::OsStr::new(actual) == value)
+        );
+    }
+    assert!(
+        append_managed_launch_env(&source.join("foreign"), &state, &mut Vec::new(), lookup)
+            .is_err()
+    );
+    let mut standalone = Vec::new();
+    append_managed_launch_env(&source, &state, &mut standalone, |_| None).unwrap();
+    assert!(standalone.is_empty());
+}
 
 // These two environment-injection tests execute a POSIX shell fixture.
 #[cfg(all(test, unix))]

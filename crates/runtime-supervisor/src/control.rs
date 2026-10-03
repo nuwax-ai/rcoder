@@ -38,6 +38,22 @@ impl Request {
             expected_generation: None,
         }
     }
+
+    /// Capture an exact generation, including an idle owner with no generation.
+    /// None on the wire retains the legacy unrestricted request. An empty value
+    /// is an explicit idle condition: generation IDs are nonempty UUIDs. Older
+    /// receivers reject this condition rather than stopping a newer generation.
+    pub fn capture_generation(&mut self, generation: Option<&str>) {
+        self.expected_generation = Some(generation.unwrap_or_default().to_owned());
+    }
+
+    pub(crate) fn matches_generation(&self, generation: Option<&str>) -> bool {
+        match self.expected_generation.as_deref() {
+            None => true,
+            Some("") => generation.is_none(),
+            Some(expected) => generation == Some(expected),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,7 +317,7 @@ pub fn last_snapshot(root: &Path) -> Result<Snapshot> {
 
 /// Observe the exact durable request receipt without issuing another Stop.
 /// The terminal history keeps its request identity after the live slot clears.
-pub(crate) fn saved_request_snapshot(root: &Path, request: &Request) -> Result<Option<Snapshot>> {
+pub fn saved_request_snapshot(root: &Path, request: &Request) -> Result<Option<Snapshot>> {
     let value: Discovery = record::read(&root.join("supervisor.json"))?;
     ensure!(
         matches!(value.version, 1 | CONTROL_VERSION),

@@ -130,6 +130,24 @@ async fn emit_startup_result_log(
         // 重复同一结果不刷屏；没有原因的新事件不能覆盖已经展示的具体原因。
         return;
     }
+    if let Some(error) = outcome.as_deref() {
+        use shared_types::{
+            UserAppDiagnosticCode as Code, UserAppDiagnosticPhase as Phase,
+            UserAppDiagnosticScope as Scope, UserAppRepairTarget as Target,
+        };
+        let root = task.workspace_root().await;
+        let mut item = super::diagnostics::diagnostic(
+            Code::StartFailed,
+            Phase::Start,
+            Target::Project,
+            root.as_deref(),
+            error,
+            "查看对应阶段和服务日志，修复失败原因后重试。",
+        );
+        item.scope = Scope::Service;
+        item.service_id = Some(service.to_owned());
+        task.record_diagnostic(item).await;
+    }
     results.insert(service.to_owned(), outcome.clone());
     let line = match outcome.as_deref() {
         None => format!("服务 {service} 启动成功（启动探测已通过）"),
@@ -487,7 +505,7 @@ mod tests {
         release.send(()).unwrap();
         fail.await.unwrap();
         let (events, _) = task.subscribe(0).await;
-        assert_eq!(events.len(), 3);
+        assert_eq!(events.len(), 4);
         assert!(matches!(
             events[0].1,
             BuildProgressEvent::ServiceStartFail { .. }
@@ -500,6 +518,10 @@ mod tests {
         ));
         assert!(matches!(
             &events[2].1,
+            BuildProgressEvent::Log { service, line } if service == "workspace" && line.contains("应用服务启动失败")
+        ));
+        assert!(matches!(
+            &events[3].1,
             BuildProgressEvent::Failed { error } if error == "original startup error"
         ));
     }

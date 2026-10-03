@@ -49,6 +49,7 @@ garde = { workspace = true, features = ["derive"] }
 # 错误处理
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+semver = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 

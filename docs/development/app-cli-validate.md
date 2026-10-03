@@ -8,7 +8,7 @@ app-cli validate --workspace ./my-app --dev
 app-cli validate --workspace ./my-app --json
 ```
 
-显式传入 workspace。省略时沿用 `APP_CLI_WORKSPACE` 和既有默认目录，不默认使用当前目录。`--dev` 选择开发代理规则，不放宽生产 manifest 的必填项。
+目录按 `--workspace`、`APP_CLI_WORKSPACE`、启动时工作目录的顺序选择。平台托管的 UserApp 应显式传入原始源码根，避免 agent 中途切换目录影响校验目标。`--dev` 选择开发代理规则，不放宽生产 manifest 的必填项。
 
 ## 校验内容与边界
 
