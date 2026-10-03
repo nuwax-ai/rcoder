@@ -497,10 +497,11 @@ async fn business_session_inner(
                     .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
                     .as_ref()
                     .and_then(|journal| journal.receipt.clone());
-                if let Some(receipt) = saved
-                    .as_ref()
-                    .filter(|receipt| receipt.boundary == Boundary::Switching)
-                {
+                if let Some(receipt) = saved.as_ref().filter(|receipt| {
+                    receipt.boundary == Boundary::Switching
+                        && (receipt.generation == state.generation_value()
+                            || !env_deploy_requested(&state))
+                }) {
                     let reconciled = (|| -> Result<Receipt> {
                         anyhow::ensure!(
                             receipt.generation == state.generation_value(),
@@ -1053,10 +1054,11 @@ async fn serve_supervised_worker(
                     .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
                     .as_ref()
                     .and_then(|journal| journal.receipt.clone());
-                if let Some(receipt) = saved
-                    .as_ref()
-                    .filter(|receipt| receipt.boundary == Boundary::Switching)
-                {
+                if let Some(receipt) = saved.as_ref().filter(|receipt| {
+                    receipt.boundary == Boundary::Switching
+                        && (receipt.generation == state.generation_value()
+                            || !env_deploy_requested(&state))
+                }) {
                     let reconciled = (|| -> Result<Receipt> {
                         anyhow::ensure!(
                             receipt.generation == state.generation_value(),
@@ -1504,6 +1506,15 @@ pub(super) async fn assemble_runtime_kernel(
         .unwrap_or_else(|| "unknown-app".to_string());
     // B04：显式状态根（env 权威；缺省按应用隔离）——source/.run/别名同域
     let root = RuntimeStore::resolve_root(&args.workspace, &application_id)?;
+    // Select a standalone deployment identity under the same authority/lease
+    // before publishing the immutable kernel identity. Platform env wins.
+    if std::env::var(shared_types::APP_DEPLOY_GENERATION_ID).is_err()
+        && let Err(error) =
+            restore_standalone_generation_before_identity(state, &args.workspace, &root)
+    {
+        tracing::error!(%error, "Standalone deployment identity could not be restored; management remains available with recovery protection");
+        state.begin_runtime_recovery_hold();
+    }
     let store = RuntimeStore::open_with_root(root, &args.workspace)?;
     let workspace_id = runtime_workspace_id(&args.workspace);
     let source_root = runtime_state_layout::canonical_project_root(&args.workspace)
@@ -1851,6 +1862,36 @@ pub(super) async fn assemble_runtime_kernel(
     Ok(Arc::new(RuntimeKernel::new(store, identity, dispatch)))
 }
 
+fn restore_standalone_generation_before_identity(
+    state: &ServerState,
+    workspace: &std::path::Path,
+    root: &std::path::Path,
+) -> Result<()> {
+    let mut slot = state
+        .journal
+        .lock()
+        .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?;
+    // Legacy workers already opened and selected their journal before kernel
+    // assembly. Retain that same authority instead of taking a second lease.
+    if slot.is_some() {
+        return Ok(());
+    }
+    let mut journal = Journal::open_with_root(workspace, root.to_path_buf())?;
+    journal.migrate_after_bind()?;
+    if let Some(receipt) = journal.receipt.as_ref() {
+        anyhow::ensure!(
+            !receipt.generation.trim().is_empty()
+                && receipt.operation.deployment_generation_id == receipt.generation,
+            "standalone deployment journal identity is inconsistent"
+        );
+        state.set_generation(receipt.generation.clone());
+    }
+    // Keep the real journal lease until the first native business session opens
+    // the same authority. The common OwnerGuard spans both steps.
+    *slot = Some(journal);
+    Ok(())
+}
+
 pub(super) async fn establish_startup_quiescence(
     state: &ServerState,
     supervised: bool,
@@ -1873,8 +1914,47 @@ pub(super) async fn establish_startup_quiescence(
         .lock()
         .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?;
     if let Some(journal) = guard.as_mut() {
+        if let Err(error) = normalize_platform_generation_after_quiescence(state, journal) {
+            tracing::error!(%error, "Legacy deployment identity remains unconfirmed; preserving its records and recovery protection");
+            state.begin_runtime_recovery_hold();
+        }
         journal.commit_coordinator()?;
     }
+    Ok(())
+}
+
+fn normalize_platform_generation_after_quiescence(
+    state: &ServerState,
+    journal: &mut Journal,
+) -> Result<()> {
+    let Some(owner_workspace) = state.owner_execution_workspace.get() else {
+        return Ok(());
+    };
+    // A recovery launch intentionally does not execute the env declaration, but
+    // its immutable platform values can still prove the legacy identity map.
+    if !crate::deploy::deploy_requested() {
+        return Ok(());
+    }
+    let generation = match std::env::var(shared_types::APP_DEPLOY_GENERATION_ID) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return Ok(()),
+    };
+    let operation_id = std::env::var(shared_types::APP_DEPLOY_OPERATION_ID)
+        .context("platform deployment operation identity is required for compatibility")?;
+    let seed = crate::deploy::request_from_env()?;
+    let target = journal
+        .receipt
+        .as_ref()
+        .and_then(|receipt| receipt.active.as_ref())
+        .and_then(|active| active.request.as_ref())
+        .and_then(|request| request.execution_target);
+    let workspace = resolved_execution_workspace(owner_workspace, target, state)?;
+    journal.normalize_legacy_deployment_generation(
+        &generation,
+        &operation_id,
+        &seed,
+        &workspace,
+    )?;
     Ok(())
 }
 
@@ -2209,16 +2289,10 @@ pub(super) async fn initialize_startup(
             !operation_id.trim().is_empty(),
             "APP_DEPLOY_OPERATION_ID is empty"
         );
-        state
+        let admission = state
             .try_accept_deploy_with_id(request, operation_id)
             .map_err(anyhow::Error::msg)?;
-        let request = state
-            .deploy_rx
-            .lock()
-            .await
-            .try_recv()
-            .context("initial deployment was not queued")?;
-        return Ok(Some(InitialAction::Deploy(request)));
+        return initial_action_for_deployment_admission(state, admission).await;
     }
     if tokio::fs::try_exists(args.workspace.join("release.lock.toml")).await? {
         return Ok(Some(InitialAction::Existing {
@@ -2226,6 +2300,61 @@ pub(super) async fn initialize_startup(
         }));
     }
     Ok(None)
+}
+
+pub(super) async fn initial_action_for_deployment_admission(
+    state: &ServerState,
+    admission: DeployAdmission,
+) -> Result<Option<InitialAction>> {
+    match admission {
+        DeployAdmission::Accepted => {
+            let request = state
+                .deploy_rx
+                .lock()
+                .await
+                .try_recv()
+                .context("accepted initial deployment was not queued")?;
+            Ok(Some(InitialAction::Deploy(request)))
+        }
+        DeployAdmission::Replayed(operation) => {
+            if operation.deployment_generation_id != state.generation_value() {
+                state.begin_runtime_recovery_hold();
+                anyhow::bail!(
+                    "recorded deployment generation does not match this owner; an explicit new deployment is required"
+                );
+            }
+            {
+                let mut status = state
+                    .deploy_status
+                    .write()
+                    .map_err(|_| anyhow::anyhow!("deployment status lock poisoned"))?;
+                status.phase = operation.phase;
+                status.error = operation.error.clone();
+                status.request_release_id = Some(operation.request_release_id.clone());
+                status.release_id = operation.artifact_release_id.clone();
+                status.operation = Some(operation.clone());
+            }
+            if operation.persisted
+                && operation.phase == AppCliDeployPhase::Failed
+                && operation.deploy_stage != AppDeploymentStage::Pending
+                && operation.recovery.as_ref().is_none_or(|recovery| {
+                    matches!(recovery.status.as_str(), "restored" | "failed")
+                })
+            {
+                state.set_phase(ServerPhase::Failed(operation.error.unwrap_or_else(|| {
+                    "Recorded deployment failed; submit a new operation to deploy again".into()
+                })));
+                return Ok(None);
+            }
+            // Successful startup must have taken the matching confirmed journal
+            // resume path above. A replay by itself never authorizes execution.
+            state.begin_runtime_recovery_hold();
+            anyhow::bail!(
+                "recorded deployment {} has no resumable confirmed artifact; inspect its original outcome or submit an explicit new deployment",
+                operation.operation_id
+            )
+        }
+    }
 }
 
 fn automatic_deployment_recovery_allowed(state: &ServerState) -> Result<bool> {

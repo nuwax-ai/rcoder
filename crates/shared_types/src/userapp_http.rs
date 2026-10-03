@@ -58,7 +58,10 @@ pub async fn envelope_errors(request: Request, next: Next) -> Response {
     let message = parsed
         .as_ref()
         .and_then(|v| v["message"].as_str())
-        .filter(|m| m.is_ascii())
+        // English diagnostic messages can contain UTF-8 punctuation and paths.
+        // Preserve the producer's concrete cause instead of treating ASCII as
+        // a language check; absent/empty messages still use the English fallback.
+        .filter(|m| !m.trim().is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| crate::error_codes::get_error_message(code, "en-US"));
     let mut envelope = crate::HttpResult::<()>::error(code, &message);
@@ -93,6 +96,39 @@ pub async fn envelope_errors(request: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn formal_backend_error_keeps_utf8_cause_and_operation() {
+        use tower::ServiceExt as _;
+        const MESSAGE: &str =
+            "SQL migration failed — relation already exists at /workspace/服务/schema.sql";
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/userapp/example/start",
+                axum::routing::post(|| async {
+                    crate::AppError::with_message(crate::error_codes::ERR_BACKEND_ERROR, MESSAGE)
+                        .with_operation_id("operation-original".into())
+                }),
+            )
+            .layer(axum::middleware::from_fn(envelope_errors));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/userapp/example/start")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 4096).await.expect("body");
+        let envelope: serde_json::Value = serde_json::from_slice(&bytes).expect("envelope");
+        assert_eq!(envelope["code"], crate::error_codes::ERR_BACKEND_ERROR);
+        assert_eq!(envelope["message"], MESSAGE);
+        assert_eq!(envelope["operation_id"], "operation-original");
+        assert_eq!(envelope["success"], false);
+    }
 
     #[tokio::test]
     async fn formal_error_preserves_durable_operation_identity() {

@@ -257,6 +257,10 @@ async fn replaced_container_consumes_deploy_declaration_env() {
             let body: serde_json::Value = response.json().await.unwrap();
             latest = body.clone();
             if body["data"]["operation"]["operation_id"] == operation_id {
+                assert_eq!(
+                    body["data"]["operation"]["deployment_generation_id"], operation_id,
+                    "cold deployment must keep the platform generation: {body}"
+                );
                 break;
             }
             let phase = body["data"]["phase"].as_str().unwrap_or_default();
@@ -292,5 +296,164 @@ async fn replaced_container_consumes_deploy_declaration_env() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    stop_cleanly(&mut second).await;
+}
+
+#[tokio::test]
+async fn same_container_restart_normalizes_proven_legacy_native_generation() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("code");
+    let logs = directory.path().join("logs");
+    // The production fixture has an existing workspace. On macOS /var is an
+    // alias of /private/var; creating it between launches would register a new
+    // standalone project identity and never exercise the old journal at all.
+    std::fs::create_dir_all(&workspace).unwrap();
+    let domain = domain_envs("same-container");
+    let (mut first, first_url) = start_with_env(&workspace, &logs, &domain);
+    expect_phase(&mut first, &first_url, "idle").await;
+    let root = runtime_state_layout::ensure_state_root(&workspace, None, None).unwrap();
+    let before = runtime_supervisor::last_snapshot(&root).unwrap();
+    assert_eq!(before.binding.resource, workspace.canonicalize().unwrap());
+    let native = before.generation.unwrap();
+    stop_cleanly(&mut first).await;
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        workspace.join("release.lock.toml"),
+        r#"
+schema_version = 1
+release_id = "confirmed-artifact"
+workspace_name = "legacy"
+minimum_app_cli_version = "0.1.3"
+runtime_image_digest = "registry.example/app-runtime:fixture"
+[pingap]
+mode = "managed"
+version = "0.14.3"
+commit = "fixture"
+[[services]]
+service_id = "web"
+name = "Web"
+dir = "web"
+type = "node"
+kind = "web"
+enabled = false
+port = 4200
+[services.run]
+command = ["node", "server.js"]
+migrate = []
+depends_on = []
+shutdown_timeout_seconds = 30
+[services.health]
+startup_path = "/health"
+readiness_path = "/ready"
+liveness_path = "/health"
+[[services.logs]]
+id = "application"
+glob = "web*.log*"
+format = "jsonl"
+[services.env]
+"#,
+    )
+    .unwrap();
+    let platform = uuid::Uuid::new_v4().to_string();
+    let request = serde_json::json!({
+        "url":"http://127.0.0.1:1/already-confirmed.zip", "release_id":"cold-request",
+        "sha256":null, "local_path":null, "execution_target":null, "run_pg":null
+    });
+    let operation = serde_json::json!({
+        "operation_id":platform, "deployment_generation_id":native,
+        "deploy_stage":"succeeded", "persisted":true, "request_release_id":"cold-request",
+        "artifact_release_id":"confirmed-artifact", "recovery":null,
+        "phase":"running", "error":null
+    });
+    let record = serde_json::json!({
+        "generation":native, "operation":operation, "request":request,
+        "boundary":"active", "active":{"artifact_release_id":"confirmed-artifact", "request":request},
+        "deploy_replays":{}, "unrelated_extension":{"retained":true}
+    });
+    let original = serde_json::to_vec_pretty(&record).unwrap();
+    std::fs::write(root.join(".deploy-operation.json"), &original).unwrap();
+    assert_eq!(
+        runtime_state_layout::ensure_state_root(&workspace, None, None).unwrap(),
+        root,
+        "both launches must use the same journal authority"
+    );
+    let mut envs = domain;
+    envs.extend([
+        ("APP_CLI_REQUIRE_PG".into(), "0".into()),
+        (
+            "APP_DEPLOY_URL".into(),
+            "http://127.0.0.1:1/already-confirmed.zip".into(),
+        ),
+        ("APP_RELEASE_ID".into(), "cold-request".into()),
+        ("APP_DEPLOY_OPERATION_ID".into(), platform.clone()),
+        ("APP_DEPLOY_GENERATION_ID".into(), platform.clone()),
+    ]);
+    let (mut second, second_url) = start_with_env(&workspace, &logs, &envs);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(second.0.try_wait().unwrap().is_none());
+        if let Ok(response) = client
+            .get(format!("{second_url}/v1/deploy/status"))
+            .send()
+            .await
+            && response.status().is_success()
+        {
+            let status: serde_json::Value = response.json().await.unwrap();
+            if status["data"]["operation"]["deployment_generation_id"] == platform {
+                assert_eq!(status["data"]["operation"]["operation_id"], platform);
+                assert_eq!(
+                    status["data"]["operation"]["artifact_release_id"],
+                    "confirmed-artifact"
+                );
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "legacy receipt was not normalized"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let identity: serde_json::Value = client
+        .get(format!("{second_url}/v1/runtime/identity"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(identity["data"]["deployment_generation_id"], platform);
+    assert_ne!(
+        runtime_supervisor::last_snapshot(&root)
+            .unwrap()
+            .generation
+            .as_deref(),
+        Some(native.as_str())
+    );
+    let backup = std::fs::read_dir(&root)
+        .unwrap()
+        .find_map(|entry| {
+            let path = entry.unwrap().path();
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".generation-compat-")
+                .then_some(path)
+        })
+        .expect("original receipt backup");
+    assert_eq!(std::fs::read(backup).unwrap(), original);
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(".deploy-operation.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        persisted["unrelated_extension"],
+        record["unrelated_extension"]
+    );
     stop_cleanly(&mut second).await;
 }

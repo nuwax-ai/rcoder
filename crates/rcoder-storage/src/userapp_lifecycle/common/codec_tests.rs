@@ -1,6 +1,22 @@
 //! Conversion boundaries shared by the PostgreSQL and Turso implementations.
 use super::*;
 
+#[test]
+fn desired_state_decodes_the_enum_and_rejects_unknown_storage_values() {
+    for state in [
+        shared_types::DesiredState::Running,
+        shared_types::DesiredState::Stopped,
+    ] {
+        assert_eq!(desired_state(state.as_str()).unwrap(), state);
+    }
+    for value in ["", "paused", "Running", " stopped "] {
+        assert!(
+            desired_state(value).is_err(),
+            "unknown state {value:?} must not become running"
+        );
+    }
+}
+
 fn application_fixture() -> models::Application {
     models::Application {
         app_id: "codecapp".into(),

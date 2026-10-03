@@ -35,10 +35,11 @@ mod cases {
     #[tokio::test]
     async fn delayed_generation_shutdown_does_not_cancel_its_successor() {
         let state = Arc::new(state());
+        state.set_generation("artifactdeployment".into());
         let old = state.generation_control("nativeold").unwrap();
         state.begin_business_session("nativeold".into(), true, || false);
         state.mark_initialized();
-        state.set_generation("artifactdeployment".into());
+        assert_eq!(state.generation_value(), "artifactdeployment");
         assert!(
             old.ready(),
             "artifact identity must not replace native control identity"
@@ -50,6 +51,7 @@ mod cases {
         });
         let current = state.generation_control("nativenew").unwrap();
         state.begin_business_session("nativenew".into(), false, || false);
+        assert_eq!(state.generation_value(), "artifactdeployment");
         let token = state.cancel_token();
         release.send(()).unwrap();
         callback.await.unwrap();
@@ -57,6 +59,79 @@ mod cases {
         assert!(state.accepting.load(std::sync::atomic::Ordering::Acquire));
         current.shutdown().await.unwrap();
         assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn standalone_kernel_publishes_the_resumed_deployment_generation() {
+        assert!(std::env::var_os(shared_types::APP_DEPLOY_GENERATION_ID).is_none());
+        assert!(std::env::var_os("APP_CLI_STATE_ROOT").is_none());
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let application_id = std::env::var("PROJECT_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "unknown-app".into());
+        let root =
+            crate::runtime_kernel::RuntimeStore::resolve_root(&workspace, &application_id).unwrap();
+        let first = state();
+        first.set_generation("persisted-deployment".into());
+        *first.journal.lock().unwrap() = Some(Journal::open_with_root(&workspace, root).unwrap());
+        first
+            .try_accept_deploy_with_id(request(), "original".into())
+            .unwrap();
+        first
+            .fail_operation("original failure".into(), Boundary::Failed)
+            .unwrap();
+        drop(first);
+
+        let restarted = Arc::new(state());
+        let args = RuntimeArgs {
+            workspace,
+            ..Default::default()
+        };
+        let kernel = assemble_runtime_kernel(&restarted, &args).await.unwrap();
+        assert_eq!(
+            kernel.identity().deployment_generation_id,
+            "persisted-deployment"
+        );
+        restarted.begin_business_session("new-native-session".into(), false, || false);
+        assert_eq!(restarted.generation_value(), "persisted-deployment");
+    }
+
+    #[tokio::test]
+    async fn initial_failed_replay_preserves_result_without_reading_an_empty_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state();
+        state.set_generation("deployment".into());
+        *state.journal.lock().unwrap() =
+            Some(Journal::open(&directory.path().join("code")).unwrap());
+        state
+            .try_accept_deploy_with_id(request(), "original".into())
+            .unwrap();
+        state.deploy_rx.lock().await.try_recv().unwrap();
+        state
+            .fail_operation("original failure".into(), Boundary::Failed)
+            .unwrap();
+        let before = std::fs::read(directory.path().join(".deploy-operation.json")).unwrap();
+        let admission = state
+            .try_accept_deploy_with_id(request(), "original".into())
+            .unwrap();
+        assert!(
+            super::super::startup::initial_action_for_deployment_admission(&state, admission)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(state.deploy_rx.lock().await.try_recv().is_err());
+        let operation = state.deploy_status().operation.unwrap();
+        assert_eq!(operation.operation_id, "original");
+        assert_eq!(operation.error.as_deref(), Some("original failure"));
+        assert!(!state.runtime_recovery_hold_active());
+        assert_eq!(
+            std::fs::read(directory.path().join(".deploy-operation.json")).unwrap(),
+            before
+        );
     }
 
     #[tokio::test]

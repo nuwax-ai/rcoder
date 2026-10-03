@@ -23,7 +23,7 @@ pub struct ServerState {
     pub(super) journal: std::sync::Mutex<Option<Journal>>,
     /// Legacy run/tests have no durable journal; preserve same-process replays.
     pub(super) volatile_deploy_replays: std::sync::Mutex<super::deploy_replay::History>,
-    /// 统一 owner（recovery v2）：业务会话代次 id。跨会话可重置（RwLock），
+    /// 部署代次：来自平台 env，standalone 沿用持久 journal；跨业务会话不变。
     /// 读取方经 [`ServerState::generation_value`]。
     pub(super) generation: RwLock<String>,
     /// Native business-session identity is independent of the deployment ID,
@@ -255,7 +255,7 @@ pub enum ServerPhase {
 }
 
 impl ServerState {
-    /// 当前业务会话代次（快照读取）。
+    /// 当前部署代次（快照读取），与原生业务会话身份独立。
     pub(crate) fn generation_value(&self) -> String {
         self.generation
             .read()
@@ -263,7 +263,7 @@ impl ServerState {
             .clone()
     }
 
-    /// 覆写会话代次（journal 回执延续；统一 owner 会话以启动代次为准）。
+    /// 延续 standalone journal 的部署代次；平台 env 存在时保持其权威值。
     pub(crate) fn set_generation(&self, generation: String) {
         *self
             .generation

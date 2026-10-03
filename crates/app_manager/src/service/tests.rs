@@ -4185,3 +4185,68 @@ async fn controlled_start_ignores_historical_saved_database_configuration() {
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), deletes);
     assert!(runtime.configuration_commands.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn admitted_deployment_failure_keeps_identity_and_recovery_fence() {
+    restart_image_env();
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(MockRuntime::default());
+    runtime.create_fails.store(true, Ordering::SeqCst);
+    let service = test_service(root.path(), runtime.clone()).await;
+    let request = StartAppRequest {
+        request_id: Some("failed-deployment-request".into()),
+        env: Some(std::collections::HashMap::from([(
+            "APP_FOO".into(),
+            "1".into(),
+        )])),
+        ..Default::default()
+    };
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        service.start_app_enhanced("deployment-failure", request.clone()),
+    )
+    .await
+    .expect("bounded deployment rejection")
+    .expect_err("runtime creation fails");
+    let record = service
+        .metadata
+        .store
+        .get_operation_by_request("deployment-failure", "failed-deployment-request")
+        .await
+        .unwrap()
+        .expect("durable admission exists");
+    assert_eq!(error.operation_id(), Some(record.operation_id.as_str()));
+    assert_eq!(error.code(), shared_types::ERR_BACKEND_ERROR);
+    assert!(
+        matches!(error.root_cause(), AppOperationError::Backend(message)
+        if message.contains("mock create_deployment failure")),
+        "{error}"
+    );
+    assert_eq!(
+        record.state,
+        shared_types::UserAppOperationState::RecoveryRequired
+    );
+    assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
+    let next = StartAppRequest {
+        request_id: Some("next-deployment-request".into()),
+        ..request
+    };
+    assert!(
+        service
+            .start_app_enhanced("deployment-failure", next)
+            .await
+            .is_err(),
+        "identity reporting must not release uncertain execution"
+    );
+    assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
+    let current = service
+        .get_control_operation("deployment-failure", None)
+        .await
+        .unwrap()
+        .expect("original scope is still occupied");
+    assert_eq!(current.operation_id, record.operation_id);
+    assert_eq!(
+        current.state,
+        shared_types::UserAppOperationState::RecoveryRequired
+    );
+}

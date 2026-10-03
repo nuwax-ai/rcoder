@@ -266,6 +266,9 @@ async fn correlate_deployment_response<T>(
         Ok(value) => return Ok(value),
         Err(error) => error,
     };
+    if matches!(&error, AppError::Structured(detail) if detail.operation_id.is_some()) {
+        return Err(error);
+    }
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
         state
@@ -275,7 +278,26 @@ async fn correlate_deployment_response<T>(
     .await
     {
         Ok(Ok(Some(operation))) => Err(error.with_operation_id(operation.operation_id)),
-        _ => Err(error),
+        Ok(Ok(None)) => {
+            tracing::debug!(
+                app_id,
+                request_id,
+                "Deployment error has no admitted operation for this request"
+            );
+            Err(error)
+        }
+        Ok(Err(lookup_error)) => {
+            tracing::warn!(app_id, request_id, %lookup_error, "Deployment error operation correlation failed");
+            Err(error)
+        }
+        Err(_) => {
+            tracing::warn!(
+                app_id,
+                request_id,
+                "Deployment error operation correlation exceeded its 5 second budget"
+            );
+            Err(error)
+        }
     }
 }
 
@@ -378,56 +400,205 @@ mod deployment_response_tests {
     /// 一环降级为 i18n key（前端拿到 "en-US.error.backend_error" 不可行动）。
     #[tokio::test]
     async fn backend_failure_message_reaches_http_response() {
-        use axum::response::IntoResponse as _;
-        use shared_types::AppError;
+        use tower::ServiceExt as _;
+        const MESSAGE: &str = "deterministic deployment failure on app 210 (operation op-x): SQL migration failed — relation already exists";
+        async fn failed_deployment() -> Result<Json<()>, AppError> {
+            let task = tokio::spawn(async {
+                Err::<(), crate::error::AppOperationError>(
+                    crate::error::AppOperationError::Backend(MESSAGE.into())
+                        .with_operation_id("op-x".into()),
+                )
+            });
+            await_deployment_response(task, std::time::Duration::from_secs(5)).await?;
+            Ok(Json(()))
+        }
+        // Include the final formal middleware: IntoResponse alone previously
+        // missed the ASCII filter that replaced this English UTF-8 cause.
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/userapp/210/start",
+                axum::routing::post(failed_deployment),
+            )
+            .route(
+                "/api/v1/userapp/210/restart",
+                axum::routing::post(failed_deployment),
+            )
+            .layer(axum::middleware::from_fn(
+                shared_types::userapp_http::envelope_errors,
+            ));
+        for action in ["start", "restart"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/userapp/210/{action}"))
+                        .body(axum::body::Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("body bytes");
+            let envelope: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("envelope JSON");
+            assert_eq!(
+                envelope["code"],
+                shared_types::error_codes::ERR_BACKEND_ERROR
+            );
+            assert_eq!(envelope["message"], MESSAGE);
+            assert_eq!(envelope["operation_id"], "op-x");
+            assert_eq!(envelope["success"], false);
+        }
+    }
 
-        // 路径 1: service 错误 → From 转换 → correlate 补 operation_id → 响应
-        let op_err = crate::error::AppOperationError::Backend(
-            "deterministic deployment failure on app 105 (operation op-x): \
-             CrashLoopBackOff (never ready, restart_count=4)"
-                .into(),
+    #[tokio::test]
+    async fn direct_deployment_identity_is_not_replaced_by_fallback_lookup() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Arc::new(
+            crate::test_support::test_service(
+                directory.path(),
+                Arc::new(crate::test_support::MockRuntime::default()),
+            )
+            .await,
         );
-        let app_err: AppError = op_err.into();
-        let app_err = app_err.with_operation_id("op-x".into());
-        let response = app_err.into_response();
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        let identity = service
+            .metadata
+            .store
+            .ensure_identity("identity")
             .await
-            .expect("body bytes");
-        let envelope: serde_json::Value = serde_json::from_slice(&bytes).expect("envelope JSON");
-        assert_eq!(
-            envelope["code"],
-            shared_types::error_codes::ERR_BACKEND_ERROR
-        );
-        let message = envelope["message"].as_str().expect("message");
-        assert!(
-            message.contains("CrashLoopBackOff"),
-            "root-cause message must reach the response, got: {message}"
-        );
-        assert!(
-            !message.contains("error.backend_error"),
-            "i18n key must not leak into the response, got: {message}"
-        );
-        assert_eq!(envelope["operation_id"], "op-x");
-
-        // 路径 2: 经 await_deployment_response 的完整链（JoinHandle 输出 Err）
-        // ——根因文本必须在该链中幸存（无论包装成什么 code/前缀）。
-        let task = tokio::spawn(async move {
-            Err::<(), crate::error::AppOperationError>(crate::error::AppOperationError::Backend(
-                "deterministic deployment failure on app 105: CrashLoopBackOff".into(),
+            .unwrap();
+        let accepted = crate::service::OwnedOperation::admit(
+            service.metadata.store.clone(),
+            shared_types::UserAppAdmission {
+                runtime_policy_on_success: None,
+                command: None,
+                metadata: None,
+                app_id: "identity".into(),
+                lifecycle_id: Some(identity.lifecycle_id.clone()),
+                operation_id: "original-operation".into(),
+                request_id: Some("original-request".into()),
+                request_fingerprint: "b".repeat(64),
+                kind: shared_types::UserAppOperationKind::Start,
+            },
+        )
+        .await
+        .unwrap();
+        accepted
+            .reject_without_mutation(&crate::error::AppOperationError::Backend(
+                "Original failure".into(),
             ))
-        });
-        let outcome = await_deployment_response(task, std::time::Duration::from_secs(5)).await;
-        let err = outcome.expect_err("failure expected");
-        let response = err.into_response();
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
             .await
-            .expect("body bytes");
-        let envelope: serde_json::Value = serde_json::from_slice(&bytes).expect("envelope JSON");
-        let message = envelope["message"].as_str().expect("message");
-        assert!(
-            message.contains("CrashLoopBackOff"),
-            "root-cause must survive await_deployment_response, got: {message}"
+            .unwrap();
+        let outcome = service
+            .metadata
+            .store
+            .admit(&shared_types::UserAppAdmission {
+                runtime_policy_on_success: None,
+                command: None,
+                metadata: None,
+                app_id: "identity".into(),
+                lifecycle_id: Some(identity.lifecycle_id),
+                operation_id: "other-operation".into(),
+                request_id: Some("other-request".into()),
+                request_fingerprint: "a".repeat(64),
+                kind: shared_types::UserAppOperationKind::Start,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            shared_types::UserAppAdmissionOutcome::Accepted(_)
+        ));
+        let state = AppManagerState {
+            app_service: service,
+            http_client: reqwest::Client::new(),
+        };
+        let original: AppError = crate::error::AppOperationError::Backend(
+            "Original failure — preserve this cause".into(),
+        )
+        .with_operation_id("original-operation".into())
+        .into();
+        let error = correlate_deployment_response::<()>(
+            &state,
+            "identity",
+            "",
+            "other-request",
+            Err(original),
+        )
+        .await
+        .expect_err("original failure");
+        let AppError::Structured(detail) = error else {
+            panic!("structured error expected");
+        };
+        assert_eq!(detail.operation_id.as_deref(), Some("original-operation"));
+        assert_eq!(detail.code, shared_types::ERR_BACKEND_ERROR);
+        assert_eq!(
+            detail.internal_message.as_deref(),
+            Some("Original failure — preserve this cause")
         );
+        let recovered = correlate_deployment_response::<()>(
+            &state,
+            "identity",
+            "",
+            "original-request",
+            Err(AppError::with_message(
+                shared_types::ERR_BACKEND_ERROR,
+                "Uncorrelated failure",
+            )),
+        )
+        .await
+        .expect_err("persisted correlation");
+        let AppError::Structured(detail) = recovered else {
+            panic!("structured error expected");
+        };
+        assert_eq!(
+            detail.operation_id.as_deref(),
+            Some("original-operation"),
+            "fallback must use the exact request, not the current other operation"
+        );
+        let error = correlate_deployment_response::<()>(
+            &state,
+            "identity",
+            "",
+            "not-admitted",
+            Err(AppError::with_message(
+                shared_types::ERR_BACKEND_ERROR,
+                "Unaccepted failure",
+            )),
+        )
+        .await
+        .expect_err("unaccepted failure");
+        let AppError::Structured(detail) = error else {
+            panic!("structured error expected");
+        };
+        assert!(
+            detail.operation_id.is_none(),
+            "unaccepted request must not inherit a different operation"
+        );
+        let error = correlate_deployment_response::<()>(
+            &state,
+            "missing-identity",
+            "",
+            "original-request",
+            Err(AppError::with_message(
+                shared_types::ERR_BACKEND_ERROR,
+                "Original backend cause",
+            )),
+        )
+        .await
+        .expect_err("failed lookup preserves original failure");
+        let AppError::Structured(detail) = error else {
+            panic!("structured error expected");
+        };
+        assert_eq!(detail.code, shared_types::ERR_BACKEND_ERROR);
+        assert_eq!(
+            detail.internal_message.as_deref(),
+            Some("Original backend cause")
+        );
+        assert!(detail.operation_id.is_none());
     }
 
     #[tokio::test]

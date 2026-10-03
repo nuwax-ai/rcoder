@@ -53,10 +53,24 @@ impl From<crate::error::AppOperationError> for shared_types::AppError {
     fn from(e: crate::error::AppOperationError) -> Self {
         let error = shared_types::AppError::with_message(e.code(), e.message().to_string());
         match e {
+            crate::error::AppOperationError::Operation {
+                operation_id,
+                source,
+            } => Self::from(*source).with_operation_id(operation_id),
             crate::error::AppOperationError::ConflictBlocked { blocker, .. } => {
                 error.with_blocker(blocker)
             }
-            _ => error,
+            crate::error::AppOperationError::NotFound(_)
+            | crate::error::AppOperationError::AlreadyExists(_)
+            | crate::error::AppOperationError::InvalidState(_)
+            | crate::error::AppOperationError::FileNotFound(_)
+            | crate::error::AppOperationError::Validation(_)
+            | crate::error::AppOperationError::DevNotRunning(_)
+            | crate::error::AppOperationError::Backend(_)
+            | crate::error::AppOperationError::CredentialApplication { .. }
+            | crate::error::AppOperationError::RuntimeRejected(_)
+            | crate::error::AppOperationError::Conflict(_)
+            | crate::error::AppOperationError::HotDeployEnvChange(_) => error,
         }
     }
 }

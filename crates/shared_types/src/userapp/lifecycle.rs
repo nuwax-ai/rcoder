@@ -896,6 +896,15 @@ pub trait UserAppLifecycleStore: Send + Sync {
         operation_id: &str,
     ) -> Result<Option<crate::ComputeControlRecord>, UserAppStoreError>;
 
+    /// Read the current lifecycle/scope intent and its associated operation,
+    /// including terminal results, in one short read-only transaction.
+    async fn read_compute_status(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        scope: UserAppOperationScope,
+    ) -> Result<crate::UserAppComputeStatus, UserAppStoreError>;
+
     /// Non-terminal compute controls (restart/stop) of one app. They occupy
     /// their scope's physical lease without entering the userapp operation
     /// slots; callers merge them into operation views so in-flight compute

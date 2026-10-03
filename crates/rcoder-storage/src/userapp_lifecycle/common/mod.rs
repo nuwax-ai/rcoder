@@ -185,6 +185,20 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         .await
     }
 
+    async fn read_compute_status(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        scope: UserAppOperationScope,
+    ) -> Result<UserAppComputeStatus, UserAppStoreError> {
+        let app_id = app_id.to_owned();
+        let lifecycle_id = lifecycle_id.to_owned();
+        self.run(true, move |tx, _| {
+            Box::pin(async move { compute::read_status(tx, &app_id, &lifecycle_id, scope).await })
+        })
+        .await
+    }
+
     async fn active_compute_controls(
         &self,
         app_id: &str,

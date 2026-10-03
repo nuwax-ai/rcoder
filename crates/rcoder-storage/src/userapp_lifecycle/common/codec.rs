@@ -3,6 +3,7 @@
 use crate::db::models;
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
+use serde::Deserialize as _;
 use shared_types::{
     UserAppActiveOperations, UserAppLifecycleRecord, UserAppLifecycleState, UserAppOperationKind,
     UserAppOperationRecord, UserAppOperationScope, UserAppOperationState, UserAppRuntimePolicy,
@@ -19,6 +20,15 @@ macro_rules! codec {
 codec!(lifecycle_name, lifecycle, UserAppLifecycleState, {
     Active => "active", Deleting => "deleting", Deleted => "deleted"
 });
+
+/// TEXT is an external storage representation. Decode it once at the boundary;
+/// consumers then exhaustively match the shared desired-state enum.
+pub(super) fn desired_state(value: &str) -> Result<shared_types::DesiredState> {
+    shared_types::DesiredState::deserialize(serde::de::value::StrDeserializer::<
+        serde::de::value::Error,
+    >::new(value))
+    .context("unknown persisted compute desired state")
+}
 codec!(scope_name, scope, UserAppOperationScope, {
     Dev => "dev", Prod => "prod", Application => "application"
 });

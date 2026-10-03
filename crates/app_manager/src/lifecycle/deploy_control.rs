@@ -80,8 +80,10 @@ fn control_request(request: &StartAppRequest) -> shared_types::UserAppControlReq
 fn decode_stored_deploy_result(
     previous: &shared_types::UserAppOperationRecord,
 ) -> AppResult<StartAppResult> {
-    serde_json::from_value(previous.checkpoint.clone())
-        .map_err(|_| AppOperationError::Backend("Stored deployment result is unavailable".into()))
+    serde_json::from_value(previous.checkpoint.clone()).map_err(|_| {
+        AppOperationError::Backend("Stored deployment result is unavailable".into())
+            .with_operation_id(previous.operation_id.clone())
+    })
 }
 
 impl AppService {
@@ -99,11 +101,21 @@ impl AppService {
         let result = self
             .deploy_admitted(app_id, request, restart, guard.clone())
             .await;
+        let operation_id = match &result {
+            Ok(result) => result.operation_id.clone(),
+            Err(error) => error.operation_id().map(str::to_owned),
+        };
+        let correlate = |error: AppOperationError| match &operation_id {
+            Some(id) => error.with_operation_id(id.clone()),
+            None => error,
+        };
         let guard = Arc::try_unwrap(guard).map_err(|_| {
-            AppOperationError::Conflict("Deployment executor still owns its resource lease".into())
+            correlate(AppOperationError::Conflict(
+                "Deployment executor still owns its resource lease".into(),
+            ))
         })?;
         if result.is_ok() || !guard.has_unfinished_mutation() {
-            guard.finish().await?;
+            guard.finish().await.map_err(correlate)?;
         }
         result
     }
@@ -170,17 +182,10 @@ impl AppService {
         // side-effect). Failure here is fail-closed: if we cannot persist the
         // deadline, we must not proceed with the deploy.
         {
-            let context = operation.execution_context();
             let now_ms = chrono::Utc::now().timestamp_millis();
             let absolute_ms = (self.config.deploy_budget.absolute_budget_secs as i64) * 1000;
-            self.metadata
-                .store
-                .bind_operation_deadline(
-                    &context.app_id,
-                    &context.operation_id,
-                    &context.lifecycle_id,
-                    now_ms.saturating_add(absolute_ms),
-                )
+            operation
+                .bind_deadline(now_ms.saturating_add(absolute_ms))
                 .await?;
         }
         let result = self
@@ -188,18 +193,27 @@ impl AppService {
             .await;
         match result {
             Ok(result) => {
-                operation.succeed().await?;
+                operation
+                    .succeed()
+                    .await
+                    .map_err(|error| error.with_operation_id(operation_id.clone()))?;
                 guard.mark_completed();
                 self.activity.mark_running(app_id);
                 Ok(result)
             }
             Err(error) => {
                 if guard.has_unfinished_mutation() {
-                    operation.fail(&error).await?;
+                    operation
+                        .fail(&error)
+                        .await
+                        .map_err(|error| error.with_operation_id(operation_id.clone()))?;
                 } else {
-                    operation.reject_without_mutation(&error).await?;
+                    operation
+                        .reject_without_mutation(&error)
+                        .await
+                        .map_err(|error| error.with_operation_id(operation_id.clone()))?;
                 }
-                Err(error)
+                Err(error.with_operation_id(operation_id))
             }
         }
     }

@@ -95,6 +95,15 @@ impl OwnedOperation {
                 )));
             }
         };
+        Self::claim_admitted(store, record).await
+    }
+
+    /// The record is already durable even if the execution claim fails.
+    async fn claim_admitted(
+        store: Arc<dyn UserAppLifecycleStore>,
+        record: UserAppOperationRecord,
+    ) -> AppResult<Self> {
+        let operation_id = record.operation_id.clone();
         let mut owned = Self {
             store,
             record,
@@ -107,8 +116,24 @@ impl OwnedOperation {
                 serde_json::Value::Null,
                 None,
             )
-            .await?;
+            .await
+            .map_err(|error| error.with_operation_id(operation_id))?;
         Ok(owned)
+    }
+
+    /// Bind before runtime writes, retaining the accepted identity on failure.
+    pub(crate) async fn bind_deadline(&self, deadline_epoch_ms: i64) -> AppResult<i64> {
+        self.store
+            .bind_operation_deadline(
+                &self.record.app_id,
+                &self.record.operation_id,
+                &self.record.lifecycle_id,
+                deadline_epoch_ms,
+            )
+            .await
+            .map_err(|error| {
+                AppOperationError::from(error).with_operation_id(self.record.operation_id.clone())
+            })
     }
 
     pub(crate) async fn execution_input(&self) -> AppResult<shared_types::UserAppExecutionInput> {
@@ -369,11 +394,13 @@ impl super::AppService {
                     .error_message
                     .as_deref()
                     .unwrap_or("No failure details recorded")
-            ))),
+            ))
+            .with_operation_id(operation.operation_id.clone())),
             _ => Err(AppOperationError::Conflict(format!(
                 "Application operation {} is not complete ({:?})",
                 operation.operation_id, operation.state
-            ))),
+            ))
+            .with_operation_id(operation.operation_id.clone())),
         }
     }
     pub async fn get_lifecycle(
@@ -634,7 +661,8 @@ mod tests {
             let error = AppOperationError::CredentialApplication {
                 message: "Credential result requires recovery".into(),
                 mutation,
-            };
+            }
+            .with_operation_id(operation_id.clone());
             operation.reject_without_mutation(&error).await.unwrap();
             let current = service
                 .get_control_operation(&app_id, Some(&operation_id))
@@ -651,6 +679,84 @@ mod tests {
                 "uncertain credentials must retain the operation slot"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn accepted_claim_and_deadline_failures_keep_the_durable_operation() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = test_service(directory.path(), Arc::new(MockRuntime::default())).await;
+        let app_id = "admission-identity";
+        let identity = service
+            .metadata
+            .store
+            .ensure_identity(app_id)
+            .await
+            .unwrap();
+        let outcome = service
+            .metadata
+            .store
+            .admit(&UserAppAdmission {
+                runtime_policy_on_success: None,
+                command: None,
+                metadata: None,
+                app_id: app_id.into(),
+                lifecycle_id: Some(identity.lifecycle_id),
+                operation_id: "accepted-operation".into(),
+                request_id: Some("accepted-request".into()),
+                request_fingerprint: "a".repeat(64),
+                kind: shared_types::UserAppOperationKind::Start,
+            })
+            .await
+            .unwrap();
+        let UserAppAdmissionOutcome::Accepted(admitted) = outcome else {
+            panic!("fresh request must be accepted");
+        };
+        let owner =
+            OwnedOperation::claim_admitted(service.metadata.store.clone(), admitted.clone())
+                .await
+                .unwrap();
+        // The accepted receipt became stale before another executor's claim.
+        let claim_error =
+            match OwnedOperation::claim_admitted(service.metadata.store.clone(), admitted).await {
+                Ok(_) => panic!("stale claim must not replace the executor"),
+                Err(error) => error,
+            };
+        assert_eq!(claim_error.operation_id(), Some("accepted-operation"));
+        assert_eq!(claim_error.code(), shared_types::ERR_CONFLICT);
+        let before = service
+            .metadata
+            .store
+            .get_operation(app_id, "accepted-operation")
+            .await
+            .unwrap()
+            .unwrap();
+        // Invalid deadline exercises a real store rejection after admission.
+        let bind_error = owner
+            .bind_deadline(0)
+            .await
+            .expect_err("deadline must be positive");
+        assert_eq!(bind_error.operation_id(), Some("accepted-operation"));
+        assert!(bind_error.message().contains("deadline must be positive"));
+        let after = service
+            .metadata
+            .store
+            .get_operation(app_id, "accepted-operation")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "failed claim/bind must preserve execution evidence"
+        );
+        assert_eq!(after.state, UserAppOperationState::Running);
+        assert!(
+            service
+                .get_control_operation(app_id, None)
+                .await
+                .unwrap()
+                .is_some(),
+            "the accepted operation must still occupy its original scope"
+        );
     }
 
     #[tokio::test]

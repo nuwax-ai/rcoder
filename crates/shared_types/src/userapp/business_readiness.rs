@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::app_stage::UserappStage;
+use super::compute_control::{ComputeControlAction, ComputeControlRecord, ComputeControlState};
 
 /// app-cli 能力位（`GET /v1/deploy/status` 的 capabilities 与 identity 均透出）。
 /// 旧运行时无此能力/端点 → rcoder 侧归一为 `unsupported/RUNTIME_UPGRADE_REQUIRED`。
@@ -183,6 +184,57 @@ pub struct UserAppBusinessReadiness {
     pub services: Vec<UserAppServiceReadiness>,
 }
 
+/// Compute progress is independent from the application's HTTP readiness.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UserAppContainerStatus {
+    Missing,
+    Starting,
+    Restarting,
+    Stopping,
+    Running,
+    Stopped,
+    Failed,
+    RecoveryRequired,
+    #[default]
+    Unknown,
+}
+
+/// Public control receipt; physical leases, executor credentials and checkpoints
+/// are deliberately excluded. Revision orders observations of this operation only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct UserAppContainerOperation {
+    pub operation_id: String,
+    pub action: ComputeControlAction,
+    pub state: ComputeControlState,
+    pub stage: String,
+    pub revision: i64,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
+impl From<&ComputeControlRecord> for UserAppContainerOperation {
+    fn from(record: &ComputeControlRecord) -> Self {
+        Self {
+            operation_id: record.operation_id.clone(),
+            action: record.action,
+            state: record.state,
+            stage: record.stage.clone(),
+            revision: record.revision,
+            error_code: record.error_code.clone(),
+            error_message: record.error_message.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct UserAppContainerReadiness {
+    pub status: UserAppContainerStatus,
+    /// Current intent's operation, including its terminal outcome. None does
+    /// not mean a previously accepted operation succeeded; query its ID.
+    pub operation: Option<UserAppContainerOperation>,
+}
+
 /// rcoder 就绪查询响应（app_manager 合并业务快照与平台事实后的最终 data）。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UserAppReadinessResponse {
@@ -192,6 +244,10 @@ pub struct UserAppReadinessResponse {
     pub ready: bool,
     /// 顶层业务状态：not_deployed / starting / stopping / stopped / ready / degraded / failed / unknown / unsupported
     pub status: UserAppReadinessStatus,
+    /// Container state/control progress, separate from business ready/status.
+    /// Older responses without this field mean unknown, never not deployed.
+    #[serde(default)]
+    pub container: UserAppContainerReadiness,
     /// 结构化原因（全集：ADMIN_UNREACHABLE / ADMIN_PROTOCOL_INVALID / INSTANCE_CHANGED /
     /// RUNTIME_UPGRADE_REQUIRED / NO_PROXIED_WEB_SERVICES / CUSTOM_ROUTE_UNVERIFIED /
     /// OBSERVE_INCOMPLETE / SERVICE_STARTING / HEALTH_HTTP_FAILURE / STATIC_ENTRY_UNAVAILABLE /

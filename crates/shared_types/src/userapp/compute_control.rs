@@ -106,6 +106,16 @@ pub struct ComputeControlRecord {
     pub interrupted_operations: Vec<String>,
 }
 
+/// Read-only snapshot of a scope's current intent and its exact operation.
+/// Terminal operations remain observable until a later intent replaces them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserAppComputeStatus {
+    pub desired_stopped: bool,
+    pub generation: i64,
+    pub revision: i64,
+    pub operation: Option<ComputeControlRecord>,
+}
+
 /// Identity attached to every compute mutation and progress commit. A successful
 /// check authorizes a caller; it does not fence a request already sent remotely.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

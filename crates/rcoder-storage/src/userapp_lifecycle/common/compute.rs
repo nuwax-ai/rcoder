@@ -10,6 +10,12 @@ type Error = UserAppStoreError;
 fn invalid(message: &str) -> Error {
     Error::InvalidOperation(message.into())
 }
+fn persisted_desired_stopped(value: &str) -> Result<bool, Error> {
+    match codec::desired_state(value).map_err(storage)? {
+        DesiredState::Stopped => Ok(true),
+        DesiredState::Running => Ok(false),
+    }
+}
 fn action(value: ComputeControlAction) -> &'static str {
     match value {
         ComputeControlAction::Stop => "stop",
@@ -89,6 +95,61 @@ pub(super) async fn get(
     row.filter(|row| row.app_id == app_id)
         .map(decode)
         .transpose()
+}
+
+pub(super) async fn read_status(
+    tx: &mut dyn Executor,
+    app_id: &str,
+    lifecycle_id: &str,
+    scope: UserAppOperationScope,
+) -> Result<UserAppComputeStatus, Error> {
+    if scope == UserAppOperationScope::Application {
+        return Err(invalid("Compute status requires dev or prod scope"));
+    }
+    let app = repo::app(tx, app_id).await?.ok_or(Error::NotFound)?;
+    if app.state == UserAppLifecycleState::Deleted {
+        return Err(Error::NotFound);
+    }
+    if app.lifecycle_id != lifecycle_id {
+        return Err(Error::LifecycleConflict);
+    }
+    let Some(head) =
+        models::ComputeIntent::filter_by_app_id_and_scope(app_id, codec::scope_name(scope))
+            .first()
+            .exec(tx)
+            .await
+            .map_err(storage)?
+    else {
+        return Ok(UserAppComputeStatus::default());
+    };
+    if head.lifecycle_id != lifecycle_id {
+        return Err(Error::LifecycleConflict);
+    }
+    if head.generation < 1 || head.revision < 1 {
+        return Err(invalid("Invalid compute intent revision"));
+    }
+    let desired_stopped = persisted_desired_stopped(&head.desired_state)?;
+    let operation = match head.control_operation_id {
+        Some(id) => {
+            let control = get(tx, app_id, &id)
+                .await?
+                .ok_or_else(|| invalid("Compute intent operation missing"))?;
+            if control.lifecycle_id != lifecycle_id
+                || control.scope != scope
+                || control.generation != head.generation
+            {
+                return Err(invalid("Compute intent operation identity mismatch"));
+            }
+            Some(control)
+        }
+        None => None,
+    };
+    Ok(UserAppComputeStatus {
+        desired_stopped,
+        generation: head.generation,
+        revision: head.revision,
+        operation,
+    })
 }
 
 /// All non-terminal compute controls of one app. Compute operations occupy
@@ -204,12 +265,14 @@ pub(super) async fn admit(
         .exec(tx)
         .await
         .map_err(storage)?;
-    if idle_only
-        && head
-            .as_ref()
-            .is_some_and(|head| head.desired_state == "stopped")
-    {
-        return Err(Error::VersionConflict);
+    // Only background repair consumes the old desired state. An explicit
+    // Stop/Restart replaces that intent and must not gain a new admission
+    // restriction merely because an obsolete desired value cannot be decoded.
+    if idle_only && let Some(head) = &head {
+        match codec::desired_state(&head.desired_state).map_err(storage)? {
+            DesiredState::Stopped => return Err(Error::VersionConflict),
+            DesiredState::Running => {}
+        }
     }
     let now = chrono::Utc::now().timestamp_micros();
     let mut interrupted = Vec::new();
@@ -265,11 +328,11 @@ pub(super) async fn admit(
         .bind(action(request.action)).bind(&request.request_id).bind(&request.request_fingerprint)
         .bind(serde_json::json!({"restart_image_roll":request.restart_image_roll}).to_string())
         .bind(serde_json::to_string(&interrupted).map_err(storage)?).bind(now).exec(tx).await.map_err(storage)?;
-    let desired = if request.action == ComputeControlAction::Stop {
-        "stopped"
-    } else {
-        "running"
-    };
+    let desired = match request.action {
+        ComputeControlAction::Stop => DesiredState::Stopped,
+        ComputeControlAction::Restart => DesiredState::Running,
+    }
+    .as_str();
     if let Some(head) = head {
         let changed = toasty::sql::statement(repo::sql(backend,"UPDATE userapp_compute_intents SET generation=$4,revision=$5,desired_state=$6,control_operation_id=$7,updated_at_us=$8 WHERE app_id=$1 AND scope=$2 AND lifecycle_id=$3 AND revision=$9 AND generation=$10"))
             .bind(&request.app_id).bind(scope).bind(&request.lifecycle_id).bind(generation).bind(revision).bind(desired).bind(&request.operation_id).bind(now).bind(head.revision).bind(head.generation).exec(tx).await.map_err(storage)?;
@@ -650,7 +713,7 @@ pub(super) async fn desired_stopped(
         .map_err(storage)?;
     match head {
         Some(head) if head.lifecycle_id != lifecycle_id => Err(Error::LifecycleConflict),
-        Some(head) => Ok(head.desired_state == "stopped"),
+        Some(head) => persisted_desired_stopped(&head.desired_state),
         None => Ok(false),
     }
 }
@@ -689,7 +752,7 @@ pub(super) async fn check_access(
             return Err(control_conflict(control));
         }
     }
-    if head.desired_state == "stopped" {
+    if persisted_desired_stopped(&head.desired_state)? {
         if !explicit_start {
             return Err(invalid(
                 "Compute is stopped; explicitly start or restart it before accessing this service",

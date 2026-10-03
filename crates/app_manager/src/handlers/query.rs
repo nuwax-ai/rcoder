@@ -84,9 +84,20 @@ pub struct ReadinessParams {
   未就绪/启动中/已停止/失败/未知/不支持都是合法观察结果。
 - `status`：`not_deployed` / `starting` / `stopping` / `stopped` / `ready` /
   `degraded` / `failed` / `unknown` / `unsupported`；`reason_code` 为结构化原因。
+- `container.status` 独立描述计算资源：`missing` / `starting` / `restarting` /
+  `stopping` / `running` / `stopped` / `failed` / `recovery_required` / `unknown`。
+  `running` 不表示业务可用；控制操作恢复未确认时为 `recovery_required`。
+- `container.operation` 为当前 dev/prod 控制头关联的操作，包含终态及错误。
+  容器 Restart 的停止、启动、验证阶段均显示 `restarting`；物理 Start 复用
+  Restart 协调器时同样按该动作展示。业务热部署不伪装为容器重启。
+- `container.operation=null` 不证明之前的操作成功；新请求可替换当前控制头，
+  查询原操作请使用 `/computer/pod/operations/{app_id}/{operation_id}`。
+  调用方应关联已受理的操作 ID，忽略旧请求迟到的观察，不因 `ready=false`
+  或业务 `not_deployed` 自动重复部署。
 - 只读保证：不启动/唤醒/停止容器，不刷新闲置计时，不阻塞 Stop/Restart。
 - 已停止的计算资源（含 Stop 后删除的开发容器）→ `stopped`；调度中/创建中 → `starting`。
-- 查询包含定位、控制意图复核的总预算为 8 秒，耗尽返回 `unknown/OBSERVE_INCOMPLETE`，不改变业务状态。
+- 查询包含定位、控制意图复核的总预算为 8 秒，耗尽标记 `OBSERVE_INCOMPLETE`；
+  保留本次已经读取的容器控制操作，未观察的物理状态为 `unknown`，不改变业务状态。
 - 查询期间停止已受理 → `stopping`；旧运行时无新接口 → `unsupported`
   （`RUNTIME_UPGRADE_REQUIRED`）。
 - 应用权威记录不存在或已删除、`app_stage` 非法、查询系统故障分别走错误信封

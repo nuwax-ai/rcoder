@@ -53,18 +53,83 @@ pub enum AppOperationError {
         blocker: shared_types::UserAppOperationBlocker,
     },
     HotDeployEnvChange(String),
+    /// Identity from a durable admission receipt. This adds correlation only;
+    /// the underlying error still decides its code and recovery requirements.
+    Operation {
+        operation_id: String,
+        source: Box<AppOperationError>,
+    },
 }
 
 impl AppOperationError {
+    pub(crate) fn with_operation_id(self, operation_id: String) -> Self {
+        // Preserve the first known operation rather than replacing it with a
+        // caller's later lookup or a newly generated candidate identity.
+        if self.operation_id().is_some() {
+            return self;
+        }
+        Self::Operation {
+            operation_id,
+            source: Box::new(self),
+        }
+    }
+
+    pub fn operation_id(&self) -> Option<&str> {
+        match self {
+            Self::Operation { operation_id, .. } => Some(operation_id),
+            Self::NotFound(_)
+            | Self::AlreadyExists(_)
+            | Self::InvalidState(_)
+            | Self::FileNotFound(_)
+            | Self::Validation(_)
+            | Self::DevNotRunning(_)
+            | Self::Backend(_)
+            | Self::CredentialApplication { .. }
+            | Self::RuntimeRejected(_)
+            | Self::Conflict(_)
+            | Self::ConflictBlocked { .. }
+            | Self::HotDeployEnvChange(_) => None,
+        }
+    }
+
+    pub fn root_cause(&self) -> &Self {
+        match self {
+            Self::Operation { source, .. } => source.root_cause(),
+            Self::NotFound(_)
+            | Self::AlreadyExists(_)
+            | Self::InvalidState(_)
+            | Self::FileNotFound(_)
+            | Self::Validation(_)
+            | Self::DevNotRunning(_)
+            | Self::Backend(_)
+            | Self::CredentialApplication { .. }
+            | Self::RuntimeRejected(_)
+            | Self::Conflict(_)
+            | Self::ConflictBlocked { .. }
+            | Self::HotDeployEnvChange(_) => self,
+        }
+    }
+
     pub(crate) fn requires_recovery(&self) -> bool {
-        matches!(
-            self,
-            Self::CredentialApplication {
-                mutation: shared_types::CredentialMutationEvidence::Unknown
-                    | shared_types::CredentialMutationEvidence::AppliedButUnverified,
-                ..
-            }
-        )
+        match self {
+            Self::Operation { source, .. } => source.requires_recovery(),
+            Self::CredentialApplication { mutation, .. } => match mutation {
+                shared_types::CredentialMutationEvidence::Unknown
+                | shared_types::CredentialMutationEvidence::AppliedButUnverified => true,
+                shared_types::CredentialMutationEvidence::NotAttempted => false,
+            },
+            Self::NotFound(_)
+            | Self::AlreadyExists(_)
+            | Self::InvalidState(_)
+            | Self::FileNotFound(_)
+            | Self::Validation(_)
+            | Self::DevNotRunning(_)
+            | Self::Backend(_)
+            | Self::RuntimeRejected(_)
+            | Self::Conflict(_)
+            | Self::ConflictBlocked { .. }
+            | Self::HotDeployEnvChange(_) => false,
+        }
     }
 
     pub(crate) fn credential_failure(error: shared_types::AlignError, password: &str) -> Self {
@@ -102,12 +167,14 @@ impl AppOperationError {
             Self::Conflict(_) => ERR_CONFLICT,
             Self::ConflictBlocked { .. } => ERR_CONFLICT,
             Self::HotDeployEnvChange(_) => shared_types::error_codes::ERR_HOT_DEPLOY_ENV_CHANGE,
+            Self::Operation { source, .. } => source.code(),
         }
     }
 
     /// 人读错误信息（含完整因果链，由 service 构造时拼入）
     pub fn message(&self) -> &str {
         match self {
+            Self::Operation { source, .. } => source.message(),
             Self::RuntimeRejected(rejection) => &rejection.message,
             Self::ConflictBlocked { message, .. } | Self::CredentialApplication { message, .. } => {
                 message
@@ -131,7 +198,25 @@ impl fmt::Display for AppOperationError {
     }
 }
 
-impl std::error::Error for AppOperationError {}
+impl std::error::Error for AppOperationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Operation { source, .. } => Some(source.as_ref()),
+            Self::NotFound(_)
+            | Self::AlreadyExists(_)
+            | Self::InvalidState(_)
+            | Self::FileNotFound(_)
+            | Self::Validation(_)
+            | Self::DevNotRunning(_)
+            | Self::Backend(_)
+            | Self::CredentialApplication { .. }
+            | Self::RuntimeRejected(_)
+            | Self::Conflict(_)
+            | Self::ConflictBlocked { .. }
+            | Self::HotDeployEnvChange(_) => None,
+        }
+    }
+}
 
 impl From<shared_types::UserAppStoreError> for AppOperationError {
     fn from(error: shared_types::UserAppStoreError) -> Self {
@@ -185,5 +270,50 @@ mod credential_tests {
                 matches!(error, AppOperationError::CredentialApplication { mutation: actual, .. } if actual == mutation)
             );
         }
+    }
+
+    #[test]
+    fn operation_context_keeps_original_identity_code_and_recovery() {
+        let cause = AppOperationError::CredentialApplication {
+            message: "Credential verification failed — outcome unknown".into(),
+            mutation: shared_types::CredentialMutationEvidence::Unknown,
+        };
+        let message = cause.message().to_owned();
+        let code = cause.code();
+        let error = cause
+            .with_operation_id("accepted-operation".into())
+            .with_operation_id("later-operation".into());
+        assert_eq!(error.operation_id(), Some("accepted-operation"));
+        assert_eq!(error.code(), code);
+        assert_eq!(error.message(), message);
+        assert!(error.requires_recovery());
+        assert!(matches!(
+            error.root_cause(),
+            AppOperationError::CredentialApplication { .. }
+        ));
+    }
+
+    #[test]
+    fn operation_context_preserves_independent_conflict_blocker() {
+        let error = AppOperationError::ConflictBlocked {
+            message: "Original scope conflict".into(),
+            blocker: shared_types::UserAppOperationBlocker {
+                scope: shared_types::UserAppOperationScope::Prod,
+                operation_id: "blocking-operation".into(),
+                kind: shared_types::UserAppOperationKind::Start,
+                state: shared_types::UserAppOperationState::RecoveryRequired,
+                step: "claimed".into(),
+            },
+        }
+        .with_operation_id("accepted-operation".into());
+        let converted: shared_types::AppError = error.into();
+        let shared_types::AppError::Structured(detail) = converted else {
+            panic!("structured conflict expected");
+        };
+        assert_eq!(detail.code, ERR_CONFLICT);
+        assert_eq!(detail.operation_id.as_deref(), Some("accepted-operation"));
+        let blocker = detail.blocker.expect("original blocker");
+        assert_eq!(blocker.operation_id, "blocking-operation");
+        assert_eq!(blocker.scope, shared_types::UserAppOperationScope::Prod);
     }
 }

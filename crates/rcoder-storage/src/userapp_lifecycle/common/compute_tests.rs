@@ -17,6 +17,102 @@ fn request(
     }
 }
 
+async fn compute_status_scope_contract(store: &ToastyUserAppStore) {
+    let app_id = format!("readstatus{}", uuid::Uuid::new_v4().simple());
+    let app = store.ensure_identity(&app_id).await.unwrap();
+    let dev_request = request(&app, &format!("dev{app_id}"), ComputeControlAction::Stop);
+    let dev = store.admit_compute_control(&dev_request).await.unwrap();
+    let mut prod_request = request(
+        &app,
+        &format!("prod{app_id}"),
+        ComputeControlAction::Restart,
+    );
+    prod_request.scope = UserAppOperationScope::Prod;
+    let prod = store.admit_compute_control(&prod_request).await.unwrap();
+    let before = store.get_application(&app_id).await.unwrap();
+    assert_eq!(
+        store
+            .read_compute_status(&app_id, &app.lifecycle_id, UserAppOperationScope::Dev)
+            .await
+            .unwrap()
+            .operation,
+        Some(dev)
+    );
+    assert_eq!(
+        store
+            .read_compute_status(&app_id, &app.lifecycle_id, UserAppOperationScope::Prod)
+            .await
+            .unwrap()
+            .operation,
+        Some(prod.clone())
+    );
+    assert_eq!(store.get_application(&app_id).await.unwrap(), before);
+    assert!(
+        store
+            .read_compute_status(
+                &app_id,
+                &app.lifecycle_id,
+                UserAppOperationScope::Application
+            )
+            .await
+            .is_err()
+    );
+    // A valid operation ID belonging to another scope must not be followed.
+    // Deliberately corrupt only this fixture's head, not production state.
+    let id = app_id.clone();
+    let operation_id = prod.operation_id.clone();
+    store.run(false, move |tx, backend| {
+        let id = id.clone();
+        let operation_id = operation_id.clone();
+        Box::pin(async move {
+            toasty::sql::statement(super::repo::sql(backend,
+                "UPDATE userapp_compute_intents SET control_operation_id=$2 WHERE app_id=$1 AND scope='dev'"))
+                .bind(id).bind(operation_id).exec(tx).await.map_err(super::storage)?;
+            Ok(())
+        })
+    }).await.unwrap();
+    assert!(matches!(
+        store
+            .read_compute_status(&app_id, &app.lifecycle_id, UserAppOperationScope::Dev)
+            .await,
+        Err(UserAppStoreError::InvalidOperation(_))
+    ));
+    assert_eq!(
+        store
+            .read_compute_status(&app_id, &app.lifecycle_id, UserAppOperationScope::Prod)
+            .await
+            .unwrap()
+            .operation,
+        Some(prod)
+    );
+}
+
+#[tokio::test]
+async fn compute_status_is_read_only_and_rejects_cross_scope_references() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ToastyUserAppStore::open_exclusive(&root.path().join("status.db"))
+        .await
+        .unwrap();
+    compute_status_scope_contract(&store).await;
+    store.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "pg")]
+#[tokio::test]
+#[ignore = "requires explicit disposable PostgreSQL database"]
+async fn compute_status_pg_is_read_only_and_rejects_cross_scope_references() {
+    let config = crate::config::PostgresConfig {
+        url: Some(std::env::var("RCODER_USERAPP_PG_TEST_DSN").expect("disposable PG required")),
+        max_connections: Some(1),
+        min_connections: Some(1),
+        statement_timeout_secs: Some(5),
+        ..Default::default()
+    };
+    let store = ToastyUserAppStore::connect(&config).await.unwrap();
+    compute_status_scope_contract(&store).await;
+    store.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn automatic_repair_only_claims_idle_scope_and_explicit_restart_supersedes_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -723,6 +819,33 @@ async fn compute_completion_requires_ordered_progress_and_exact_receipt_cleanup(
     finish.state = ComputeControlState::Succeeded;
     let completed = store.advance_compute_control(&finish).await.unwrap();
     assert_eq!(completed.lease, Some(receipt.clone()));
+    let status = store
+        .read_compute_status(&app.app_id, &app.lifecycle_id, UserAppOperationScope::Dev)
+        .await
+        .unwrap();
+    assert!(status.desired_stopped);
+    assert_eq!(status.operation, Some(completed.clone()));
+    assert_eq!(
+        store
+            .read_compute_status(&app.app_id, &app.lifecycle_id, UserAppOperationScope::Dev)
+            .await
+            .unwrap(),
+        status,
+        "readiness must not advance the intent or hide terminal results"
+    );
+    assert_eq!(
+        store
+            .read_compute_status(&app.app_id, &app.lifecycle_id, UserAppOperationScope::Prod)
+            .await
+            .unwrap(),
+        UserAppComputeStatus::default()
+    );
+    assert!(matches!(
+        store
+            .read_compute_status(&app.app_id, "foreignlife", UserAppOperationScope::Dev)
+            .await,
+        Err(UserAppStoreError::LifecycleConflict)
+    ));
     assert!(
         !serde_json::to_string(&completed)
             .unwrap()
@@ -733,6 +856,15 @@ async fn compute_completion_requires_ordered_progress_and_exact_receipt_cleanup(
         .admit_compute_control(&request(&app, "restart", ComputeControlAction::Restart))
         .await
         .unwrap();
+    assert_eq!(
+        store
+            .read_compute_status(&app.app_id, &app.lifecycle_id, UserAppOperationScope::Dev)
+            .await
+            .unwrap()
+            .operation,
+        Some(restart.clone()),
+        "the current head must replace the old result with the exact new operation"
+    );
     assert!(store.forget_compute_lease(&identity, &wrong).await.is_err());
     store
         .forget_compute_lease(&identity, &receipt)

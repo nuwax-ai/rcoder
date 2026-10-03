@@ -699,23 +699,28 @@ fn derive_top_level(
     }
 }
 
-/// 顶层原因码：取代表性的第一个服务级证据。
+/// An orchestration failure is authoritative even if services never started.
+/// Preserve those service observations below, not as a contradictory top reason.
 fn top_level_reason(
     status: UserAppReadinessStatus,
     services: &[UserAppServiceReadiness],
 ) -> Option<UserAppReadinessReason> {
-    if status.is_ready() {
-        return None;
-    }
+    let fallback = match status {
+        UserAppReadinessStatus::Ready => return None,
+        UserAppReadinessStatus::Failed => return Some(UserAppReadinessReason::OrchestrationFailed),
+        UserAppReadinessStatus::Degraded => Some(UserAppReadinessReason::HealthDegraded),
+        UserAppReadinessStatus::NotDeployed
+        | UserAppReadinessStatus::Starting
+        | UserAppReadinessStatus::Stopping
+        | UserAppReadinessStatus::Stopped
+        | UserAppReadinessStatus::Unknown
+        | UserAppReadinessStatus::Unsupported => None,
+    };
     services
         .iter()
         .find(|service| !service.ready)
         .and_then(|service| service.reason_code)
-        .or(match status {
-            UserAppReadinessStatus::Failed => Some(UserAppReadinessReason::OrchestrationFailed),
-            UserAppReadinessStatus::Degraded => Some(UserAppReadinessReason::HealthDegraded),
-            _ => None,
-        })
+        .or(fallback)
 }
 
 #[cfg(test)]
@@ -814,6 +819,11 @@ mod tests {
                 UserAppReadinessStatus::Starting
             ),
             UserAppReadinessStatus::Failed
+        );
+        assert_eq!(
+            top_level_reason(UserAppReadinessStatus::Failed, &dead),
+            Some(UserAppReadinessReason::OrchestrationFailed),
+            "PG/bootstrap failure must not tell callers that startup is still in progress"
         );
     }
 

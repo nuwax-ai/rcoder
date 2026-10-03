@@ -94,6 +94,43 @@ async fn control(env: &Env, app_id: &str, lifecycle_id: &str, action: &str) -> R
         .ok_or_else(|| format!("{action}: operation_id missing: {body}"))?;
     let deadline = Instant::now() + Duration::from_secs(240);
     loop {
+        let (readiness_status, readiness) = request(
+            env,
+            reqwest::Method::GET,
+            &format!(
+                "/api/v1/userapp/{app_id}/dev/readiness?user_id={}",
+                env.user
+            ),
+            None,
+        )
+        .await?;
+        if !success(readiness_status, &readiness) {
+            return Err(format!(
+                "{action} readiness HTTP {readiness_status}: {readiness}"
+            ));
+        }
+        let container = &readiness["data"]["container"];
+        let observed = &container["operation"];
+        if observed["operation_id"].as_str() != Some(operation_id)
+            || observed["action"].as_str() != Some(action)
+        {
+            return Err(format!(
+                "{action} readiness lost current operation: {container}"
+            ));
+        }
+        if matches!(observed["state"].as_str(), Some("pending" | "running")) {
+            let expected = if action == "stop" {
+                "stopping"
+            } else {
+                "restarting"
+            };
+            if container["status"].as_str() != Some(expected) || readiness["data"]["ready"] != false
+            {
+                return Err(format!(
+                    "{action} readiness hides compute progress: {readiness}"
+                ));
+            }
+        }
         let (query_status, query) = request(
             env,
             reqwest::Method::GET,
@@ -114,7 +151,29 @@ async fn control(env: &Env, app_id: &str, lifecycle_id: &str, action: &str) -> R
             return Err(format!("{action} operation identity changed: {record}"));
         }
         match record["state"].as_str() {
-            Some("succeeded") if record["stage"] == "completed" => return Ok(()),
+            Some("succeeded") if record["stage"] == "completed" => {
+                // The two HTTP reads can straddle completion. Re-read until
+                // readiness itself exposes the terminal receipt, not merely
+                // the disappearance of an in-flight operation.
+                if observed["state"] == "succeeded" {
+                    let expected = if action == "stop" {
+                        "stopped"
+                    } else {
+                        "running"
+                    };
+                    if container["status"] != expected {
+                        return Err(format!(
+                            "{action} terminal container observation disagrees: {container}"
+                        ));
+                    }
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "{action} readiness did not expose terminal receipt: {container}"
+                    ));
+                }
+            }
             Some("failed" | "recovery_required" | "superseded") => {
                 return Err(format!("{action} operation did not succeed: {record}"));
             }

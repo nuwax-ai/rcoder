@@ -508,7 +508,7 @@ impl ServerState {
         self.initializing.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// 统一 owner（recovery v2）：进入新的业务会话。重置会话级运行面（代次、
+    /// 统一 owner（recovery v2）：进入新的业务会话。重置会话级运行面（监督代次、
     /// 取消令牌、部署受理、journal 槽位、相位与部署进度），保留跨会话事实
     /// （owner token、运行内核、recovery hold、凭据恢复标记）。
     /// `fresh=false` 的恢复式会话不消费一次性部署声明 env（等效进程模式在
@@ -534,7 +534,7 @@ impl ServerState {
         *self
             .business_generation
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(generation.clone());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(generation);
         let cancelled_before = self.cancel_token().is_cancelled();
         self.renew_cancel_locked();
         if stop_in_progress && cancelled_before {
@@ -550,10 +550,8 @@ impl ServerState {
             .store(false, std::sync::atomic::Ordering::Release);
         self.deploy_inputs_eligible
             .store(fresh, std::sync::atomic::Ordering::Release);
-        *self
-            .generation
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = generation;
+        // Deployment identity comes from platform env or the durable journal.
+        // A new native execution scope must not replace that identity.
         *self
             .journal
             .lock()

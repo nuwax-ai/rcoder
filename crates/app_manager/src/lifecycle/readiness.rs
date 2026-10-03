@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use shared_types::{
-    ComputeControlAction, UserAppLifecycleState, UserAppNoComputeState, UserAppOperationKind,
-    UserAppOperationRecord, UserAppOperationScope, UserAppProxyReadiness,
-    UserAppReadinessObservation, UserAppReadinessReason, UserAppReadinessResponse,
-    UserAppReadinessStatus, UserappStage,
+    ComputeControlAction, ComputeControlState, UserAppComputeStatus, UserAppContainerOperation,
+    UserAppContainerReadiness, UserAppContainerStatus, UserAppLifecycleState,
+    UserAppNoComputeState, UserAppOperationKind, UserAppOperationRecord, UserAppOperationScope,
+    UserAppProxyReadiness, UserAppReadinessObservation, UserAppReadinessReason,
+    UserAppReadinessResponse, UserAppReadinessStatus, UserappStage,
 };
 use tokio::time::Instant;
 
@@ -148,6 +149,9 @@ impl AppService {
     ) -> AppResult<UserAppReadinessResponse> {
         validate_app_id(app_id)?;
         let deadline = Instant::now() + budget;
+        // Keep completed authoritative reads if the next I/O exhausts the
+        // shared deadline. A slow app-cli cannot erase an accepted Restart.
+        let mut latest_control = ReadinessControl::ordinary(None);
         let observe = async {
             let Some(reader) = self.readiness_reader() else {
                 return Err(AppOperationError::Backend(
@@ -155,6 +159,7 @@ impl AppService {
                 ));
             };
             let mut before = self.read_readiness_control(app_id, stage).await?;
+            latest_control = before.clone();
             for attempt in 0..2 {
                 let observation = reader
                     .observe(
@@ -171,6 +176,7 @@ impl AppService {
                 // Stop/Restart use independent compute controls, not business
                 // slots. Reread both after I/O so an old ready cannot hide Stop.
                 let after = self.read_readiness_control(app_id, stage).await?;
+                latest_control = after.clone();
                 if before.lifecycle_id != after.lifecycle_id {
                     return Ok(merge_observation(
                         app_id,
@@ -206,7 +212,7 @@ impl AppService {
             Err(_) => Ok(merge_observation(
                 app_id,
                 stage,
-                &ReadinessControl::ordinary(None),
+                &latest_control,
                 UserAppReadinessObservation::TimedOut,
             )),
         }
@@ -241,30 +247,23 @@ impl AppService {
         };
         let mut control = ReadinessControl::ordinary(operation.as_ref());
         control.lifecycle_id = record.lifecycle_id.clone();
-        if let Some(compute) = self
+        control.compute = self
             .metadata
             .store
-            .active_compute_controls(app_id)
-            .await?
-            .into_iter()
-            .filter(|control| {
-                control.lifecycle_id == record.lifecycle_id
-                    && control.scope == scope
-                    && !control.state.is_terminal()
-            })
-            .max_by_key(|control| control.generation)
+            .read_compute_status(app_id, &record.lifecycle_id, scope)
+            .await?;
+        if let Some(compute) = control
+            .compute
+            .operation
+            .as_ref()
+            .filter(|operation| !operation.state.is_terminal())
         {
             control.intent = match compute.action {
                 ComputeControlAction::Stop => ControlIntent::StopAccepted,
                 ComputeControlAction::Restart => ControlIntent::Restarting,
             };
-            control.operation_id = Some(compute.operation_id);
+            control.operation_id = Some(compute.operation_id.clone());
         }
-        control.desired_stopped = self
-            .metadata
-            .store
-            .compute_desired_stopped(app_id, &record.lifecycle_id, scope)
-            .await?;
         if record.state == UserAppLifecycleState::Deleting {
             control.intent = ControlIntent::StopAccepted;
         }
@@ -285,7 +284,7 @@ struct ReadinessControl {
     lifecycle_id: String,
     intent: ControlIntent,
     operation_id: Option<String>,
-    desired_stopped: bool,
+    compute: UserAppComputeStatus,
 }
 
 impl ReadinessControl {
@@ -315,7 +314,7 @@ impl ReadinessControl {
             lifecycle_id: String::new(),
             intent,
             operation_id: operation.map(|op| op.operation_id.clone()),
-            desired_stopped: false,
+            compute: UserAppComputeStatus::default(),
         }
     }
 }
@@ -332,11 +331,14 @@ fn merge_observation(
 ) -> UserAppReadinessResponse {
     use UserAppReadinessReason as Reason;
     use UserAppReadinessStatus as Status;
+    let container = container_readiness(control, &observation);
+    let incomplete = matches!(observation, UserAppReadinessObservation::TimedOut);
     let base = |status: Status, reason: Option<Reason>| UserAppReadinessResponse {
         app_id: app_id.into(),
         app_stage: app_stage.as_str().into(),
         ready: false,
         status,
+        container: container.clone(),
         reason_code: reason,
         checked_at: now_rfc3339(),
         runtime_instance_id: None,
@@ -382,7 +384,7 @@ fn merge_observation(
                 UserAppNoComputeState::Missing
                 | UserAppNoComputeState::Stopped
                 | UserAppNoComputeState::Failed
-                    if control.desired_stopped =>
+                    if control.compute.desired_stopped =>
                 {
                     Status::Stopped
                 }
@@ -407,6 +409,7 @@ fn merge_observation(
             app_stage: app_stage.as_str().into(),
             ready: snapshot.ready && snapshot.status.is_ready(),
             status: snapshot.status,
+            container: container.clone(),
             reason_code: snapshot.reason_code,
             checked_at: snapshot.checked_at,
             runtime_instance_id: snapshot.runtime_instance_id,
@@ -431,7 +434,62 @@ fn merge_observation(
         response.status = Status::Starting;
         response.reason_code = Some(Reason::ServiceStarting);
     }
+    if container.status == UserAppContainerStatus::RecoveryRequired || incomplete {
+        response.ready = false;
+        if container.status == UserAppContainerStatus::RecoveryRequired {
+            response.status = Status::Unknown;
+        }
+        response.reason_code = Some(Reason::ObserveIncomplete);
+    }
     response
+}
+
+fn container_readiness(
+    control: &ReadinessControl,
+    observation: &UserAppReadinessObservation,
+) -> UserAppContainerReadiness {
+    use UserAppContainerStatus as Status;
+    let operation = control.compute.operation.as_ref();
+    // Docker may report an intentional forced stop as exited(137)/Failed.
+    // Only the current, confirmed Stop can classify that exit as stopped;
+    // an unconfirmed/failed request or a running instance cannot do so.
+    let confirmed_stop = control.compute.desired_stopped
+        && operation.is_some_and(|record| {
+            record.action == ComputeControlAction::Stop
+                && record.state == ComputeControlState::Succeeded
+        });
+    let progress = operation.and_then(|record| match record.state {
+        ComputeControlState::Pending | ComputeControlState::Running => Some(match record.action {
+            ComputeControlAction::Stop => Status::Stopping,
+            ComputeControlAction::Restart => Status::Restarting,
+        }),
+        ComputeControlState::RecoveryRequired => Some(Status::RecoveryRequired),
+        ComputeControlState::Succeeded
+        | ComputeControlState::Failed
+        | ComputeControlState::Superseded => None,
+    });
+    let status = progress.unwrap_or(match observation {
+        UserAppReadinessObservation::Snapshot { .. }
+        | UserAppReadinessObservation::AdminUnreachable { .. }
+        | UserAppReadinessObservation::UnsupportedRuntime { .. } => Status::Running,
+        UserAppReadinessObservation::InstanceChanged | UserAppReadinessObservation::TimedOut => {
+            Status::Unknown
+        }
+        UserAppReadinessObservation::NoCompute { state } => match state {
+            UserAppNoComputeState::Missing if control.compute.desired_stopped => Status::Stopped,
+            UserAppNoComputeState::Missing => Status::Missing,
+            UserAppNoComputeState::Starting => Status::Starting,
+            UserAppNoComputeState::Stopping => Status::Stopping,
+            UserAppNoComputeState::Stopped => Status::Stopped,
+            UserAppNoComputeState::Failed if confirmed_stop => Status::Stopped,
+            UserAppNoComputeState::Failed => Status::Failed,
+            UserAppNoComputeState::Unknown => Status::Unknown,
+        },
+    });
+    UserAppContainerReadiness {
+        status,
+        operation: operation.map(UserAppContainerOperation::from),
+    }
 }
 
 #[cfg(test)]
@@ -653,7 +711,7 @@ mod tests {
             },
         );
         assert_eq!(response.status, UserAppReadinessStatus::Stopped);
-        control.desired_stopped = true;
+        control.compute.desired_stopped = true;
         let response = merge_observation(
             "194",
             UserappStage::Dev,
@@ -743,6 +801,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status, UserAppReadinessStatus::Stopping);
+        assert_eq!(response.container.status, UserAppContainerStatus::Stopping);
+        assert_eq!(
+            response.container.operation.as_ref().unwrap().operation_id,
+            "stopdev"
+        );
         assert!(!response.ready);
         assert_eq!(response.operation_id.as_deref(), Some("stopdev"));
         let response = service
@@ -750,6 +813,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status, UserAppReadinessStatus::Ready);
+        assert_eq!(response.container.status, UserAppContainerStatus::Running);
+        assert!(response.container.operation.is_none());
         assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
         assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
         assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
@@ -760,8 +825,222 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            shared_types::ComputeControlState::Pending
+            ComputeControlState::Pending
         );
+    }
+
+    #[tokio::test]
+    async fn container_control_result_and_business_health_are_independent() {
+        let root = tempfile::tempdir().unwrap();
+        let (service, store) = crate::test_support::test_service_with_store(
+            root.path(),
+            Arc::new(crate::test_support::MockRuntime::default()),
+        )
+        .await;
+        let app = store.ensure_identity("194").await.unwrap();
+        let record = store
+            .admit_compute_control(&shared_types::ComputeControlRequest {
+                app_id: app.app_id.clone(),
+                lifecycle_id: app.lifecycle_id,
+                scope: UserAppOperationScope::Prod,
+                operation_id: "restartprod".into(),
+                request_id: "restartprod".into(),
+                request_fingerprint: "a".repeat(64),
+                action: ComputeControlAction::Restart,
+                restart_image_roll: true,
+            })
+            .await
+            .unwrap();
+        let baseline = service
+            .read_readiness_control("194", UserappStage::Prod)
+            .await
+            .unwrap();
+        for (state, expected) in [
+            (
+                ComputeControlState::Pending,
+                UserAppContainerStatus::Restarting,
+            ),
+            (
+                ComputeControlState::Running,
+                UserAppContainerStatus::Restarting,
+            ),
+            (
+                ComputeControlState::RecoveryRequired,
+                UserAppContainerStatus::RecoveryRequired,
+            ),
+            (
+                ComputeControlState::Succeeded,
+                UserAppContainerStatus::Running,
+            ),
+            (ComputeControlState::Failed, UserAppContainerStatus::Running),
+            (
+                ComputeControlState::Superseded,
+                UserAppContainerStatus::Running,
+            ),
+        ] {
+            let mut control = baseline.clone();
+            let mut current = record.clone();
+            current.state = state;
+            current.error_code =
+                (state == ComputeControlState::Failed).then(|| "ERR_BACKEND_ERROR".into());
+            current.error_message =
+                (state == ComputeControlState::Failed).then(|| "earlier restart failed".into());
+            control.compute.operation = Some(current);
+            if state.is_terminal() {
+                control.intent = ControlIntent::None;
+            }
+            let response = merge_observation(
+                "194",
+                UserappStage::Prod,
+                &control,
+                UserAppReadinessObservation::Snapshot {
+                    physical: UserAppReadinessPhysical {
+                        instance_id: Some("live-pod".into()),
+                        address: None,
+                        channel: UserAppReadinessChannel::Direct,
+                    },
+                    snapshot: ready_snapshot(),
+                },
+            );
+            assert_eq!(response.container.status, expected, "{state:?}");
+            assert_eq!(response.container.operation.as_ref().unwrap().state, state);
+            assert_eq!(response.ready, state.is_terminal());
+            let json = serde_json::to_value(&response).unwrap();
+            assert!(json["container"]["operation"].get("lease").is_none());
+            assert!(json["container"]["operation"].get("checkpoint").is_none());
+            if state == ComputeControlState::Failed {
+                assert_eq!(
+                    json["container"]["operation"]["error_message"],
+                    "earlier restart failed"
+                );
+            }
+            let mut old_response = json;
+            old_response.as_object_mut().unwrap().remove("container");
+            let decoded: UserAppReadinessResponse = serde_json::from_value(old_response).unwrap();
+            assert_eq!(decoded.container.status, UserAppContainerStatus::Unknown);
+        }
+        // A successful deliberate stop may end with Docker's non-zero exit
+        // status. It must not turn into a failure or hide a later live instance.
+        let mut stopped = baseline.clone();
+        stopped.intent = ControlIntent::None;
+        stopped.compute.desired_stopped = true;
+        let stop = stopped.compute.operation.as_mut().unwrap();
+        stop.action = ComputeControlAction::Stop;
+        stop.state = ComputeControlState::Succeeded;
+        let exit = UserAppReadinessObservation::NoCompute {
+            state: UserAppNoComputeState::Failed,
+        };
+        assert_eq!(
+            container_readiness(&stopped, &exit).status,
+            UserAppContainerStatus::Stopped
+        );
+        assert_eq!(
+            container_readiness(
+                &stopped,
+                &UserAppReadinessObservation::AdminUnreachable {
+                    physical: UserAppReadinessPhysical {
+                        instance_id: Some("manually-started".into()),
+                        address: None,
+                        channel: UserAppReadinessChannel::Direct
+                    },
+                }
+            )
+            .status,
+            UserAppContainerStatus::Running
+        );
+        stopped.compute.operation.as_mut().unwrap().state = ComputeControlState::Failed;
+        assert_eq!(
+            container_readiness(&stopped, &exit).status,
+            UserAppContainerStatus::Failed
+        );
+
+        // A business restart does not claim the container itself is restarting.
+        let response = merge_observation(
+            "194",
+            UserappStage::Prod,
+            &ReadinessControl::ordinary(Some(&operation(UserAppOperationKind::RestartDeployment))),
+            UserAppReadinessObservation::AdminUnreachable {
+                physical: UserAppReadinessPhysical {
+                    instance_id: Some("live-pod".into()),
+                    address: None,
+                    channel: UserAppReadinessChannel::Direct,
+                },
+            },
+        );
+        assert_eq!(response.status, UserAppReadinessStatus::Starting);
+        assert_eq!(response.container.status, UserAppContainerStatus::Running);
+        assert!(response.container.operation.is_none());
+    }
+
+    #[tokio::test]
+    async fn readiness_deadline_preserves_accepted_restart_without_waking_compute() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct StalledReader(Arc<AtomicBool>);
+        #[async_trait::async_trait]
+        impl shared_types::UserAppReadinessReader for StalledReader {
+            async fn observe(
+                &self,
+                _: &str,
+                _: UserappStage,
+                _: Duration,
+            ) -> Result<UserAppReadinessObservation, String> {
+                self.0.store(true, Ordering::SeqCst);
+                std::future::pending().await
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::test_support::MockRuntime::default());
+        let (service, store) =
+            crate::test_support::test_service_with_store(root.path(), runtime.clone()).await;
+        let app = store.ensure_identity("194").await.unwrap();
+        let accepted = store
+            .admit_compute_control(&shared_types::ComputeControlRequest {
+                app_id: app.app_id.clone(),
+                lifecycle_id: app.lifecycle_id,
+                scope: UserAppOperationScope::Prod,
+                operation_id: "restartpending".into(),
+                request_id: "restartpending".into(),
+                request_fingerprint: "b".repeat(64),
+                action: ComputeControlAction::Restart,
+                restart_image_roll: true,
+            })
+            .await
+            .unwrap();
+        let reached = Arc::new(AtomicBool::new(false));
+        service
+            .set_readiness_reader(Arc::new(StalledReader(reached.clone())))
+            .unwrap();
+        let response = service
+            .get_readiness_with_budget(UserappStage::Prod, "194", Duration::from_millis(250))
+            .await
+            .unwrap();
+        assert!(
+            reached.load(Ordering::SeqCst),
+            "the timeout must occur in the runtime observation"
+        );
+        assert!(!response.ready);
+        assert_eq!(
+            response.reason_code,
+            Some(UserAppReadinessReason::ObserveIncomplete)
+        );
+        assert_eq!(
+            response.container.status,
+            UserAppContainerStatus::Restarting
+        );
+        assert_eq!(
+            response.container.operation.as_ref().unwrap().operation_id,
+            accepted.operation_id
+        );
+        assert_eq!(
+            store
+                .get_compute_control("194", &accepted.operation_id)
+                .await
+                .unwrap(),
+            Some(accepted)
+        );
+        assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
     }
 
     /// dbx readiness：prober 三态映射 + 探测失败降级 unknown（带原因码）+

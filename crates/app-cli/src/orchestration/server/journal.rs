@@ -9,6 +9,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod generation_compat;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Boundary {
@@ -472,13 +474,23 @@ impl Journal {
         receipt: Receipt,
         deploy_replays: super::deploy_replay::History,
     ) -> Result<()> {
-        let stored = self.write_verified(
-            ".deploy-operation.json",
-            &StoredReceipt {
-                receipt,
-                deploy_replays,
-            },
-        )?;
+        let mut document = serde_json::to_value(StoredReceipt {
+            receipt,
+            deploy_replays,
+        })?;
+        match std::fs::read(self.root.join(".deploy-operation.json")) {
+            Ok(bytes) => {
+                let previous: serde_json::Value = serde_json::from_slice(&bytes)
+                    .context("decode deployment fields before journal update")?;
+                preserve_unknown_deployment_fields(&mut document, previous);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context("read deployment fields before journal update");
+            }
+        }
+        let stored: StoredReceipt =
+            serde_json::from_value(self.write_verified(".deploy-operation.json", &document)?)?;
         self.receipt = Some(stored.receipt);
         self.deploy_replays = stored.deploy_replays;
         let explicit_replacement = self
@@ -660,6 +672,9 @@ impl Journal {
     /// Call only after the previous coordinator's processes are confirmed stopped.
     /// Opening the journal never overwrites the evidence needed for that decision.
     pub fn commit_coordinator(&mut self) -> Result<()> {
+        // A temporary compatibility failure must not erase the retired native
+        // identity needed to prove the same repair on the next launch.
+        self.preserve_legacy_generation_owner()?;
         let owner = CoordinatorOwner {
             state: OwnerState::Active,
             process_scope: self.process_scope.clone(),
@@ -711,6 +726,61 @@ impl Journal {
                 "deployment preparation has no confirmed active version; explicit redeployment required"
             ),
             _ => Ok(Some(receipt.clone())),
+        }
+    }
+}
+
+/// Preserve extensions without retaining replay entries deliberately removed by
+/// an admission rollback. Known fields always come from the new typed record.
+fn preserve_unknown_deployment_fields(
+    current: &mut serde_json::Value,
+    mut previous: serde_json::Value,
+) {
+    // These are known retired fields, not forward-compatible extensions.
+    // DeployRequest.runtime_operation_id is process-local and serde(skip):
+    // an old on-disk copy must not be restored by the raw-field merge.
+    if let Some(object) = previous.as_object_mut() {
+        object.remove("generation_handoff");
+    }
+    for pointer in ["/request", "/active/request"] {
+        if let Some(request) = previous
+            .pointer_mut(pointer)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            request.remove("requires_configuration_activation");
+            request.remove("runtime_operation_id");
+        }
+    }
+    let previous_replays = previous
+        .as_object_mut()
+        .and_then(|object| object.remove("deploy_replays"));
+    if let (Some(current), Some(previous)) = (
+        current
+            .get_mut("deploy_replays")
+            .and_then(serde_json::Value::as_object_mut),
+        previous_replays
+            .as_ref()
+            .and_then(serde_json::Value::as_object),
+    ) {
+        for (id, replay) in current {
+            if let Some(old) = previous.get(id) {
+                preserve_unknown_fields(replay, old.clone());
+            }
+        }
+    }
+    preserve_unknown_fields(current, previous);
+}
+
+fn preserve_unknown_fields(current: &mut serde_json::Value, previous: serde_json::Value) {
+    if let (Some(current), serde_json::Value::Object(previous)) =
+        (current.as_object_mut(), previous)
+    {
+        for (key, old) in previous {
+            if let Some(new) = current.get_mut(&key) {
+                preserve_unknown_fields(new, old);
+            } else {
+                current.insert(key, old);
+            }
         }
     }
 }
@@ -1219,6 +1289,99 @@ mod tests {
             saved["request"]
                 .get("requires_configuration_activation")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn journal_write_retires_known_fields_and_preserves_extensions_without_reviving_replays() {
+        use super::super::deploy_replay::{History, Replay};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let original_receipt = receipt(Boundary::RestoredActive);
+        let mut history = History::new();
+        for id in ["hot-b", "retained-op", "removed-op"] {
+            let mut operation = original_receipt.operation.clone();
+            operation.operation_id = id.into();
+            history.insert(
+                id.into(),
+                Replay {
+                    fingerprint: Some(format!("fingerprint-{id}")),
+                    operation,
+                },
+            );
+        }
+        let mut original = serde_json::to_value(StoredReceipt {
+            receipt: original_receipt,
+            deploy_replays: history,
+        })
+        .unwrap();
+        original["generation_handoff"] = serde_json::json!({"retired": true});
+        for pointer in ["/request", "/active/request"] {
+            let request = original
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            request.insert("requires_configuration_activation".into(), true.into());
+            request.insert("runtime_operation_id".into(), "retired-runtime".into());
+            request.insert(
+                "unknown_input_extension".into(),
+                serde_json::json!({"keep": true}),
+            );
+        }
+        original["unknown_receipt_extension"] = serde_json::json!({"keep": [1, 2, 3]});
+        original["operation"]["unknown_result_extension"] = "keep".into();
+        for id in ["hot-b", "retained-op", "removed-op"] {
+            original["deploy_replays"][id]["unknown_replay_extension"] = id.into();
+        }
+        let original_bytes = serde_json::to_vec_pretty(&original).unwrap();
+        std::fs::write(root.join(".deploy-operation.json"), &original_bytes).unwrap();
+        let backup = root.join(".deploy-operation.json.generation-compat-fixture.backup");
+        std::fs::write(&backup, &original_bytes).unwrap();
+
+        let mut journal = Journal::open_root(root.clone()).unwrap();
+        let mut updated = journal.receipt.clone().unwrap();
+        updated.request.runtime_operation_id = Some("current-process-only".into());
+        let mut history = journal.deploy_replays.clone();
+        history.remove("removed-op");
+        journal.write_with_history(updated, history).unwrap();
+        // Exercise a subsequent ordinary boundary write and a real disk reopen.
+        journal.write(journal.receipt.clone().unwrap()).unwrap();
+        drop(journal);
+        let reopened = Journal::open_root(root.clone()).unwrap();
+        assert!(!reopened.deploy_replays.contains_key("removed-op"));
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join(".deploy-operation.json")).unwrap())
+                .unwrap();
+        assert!(saved.get("generation_handoff").is_none());
+        for pointer in ["/request", "/active/request"] {
+            let request = saved.pointer(pointer).unwrap();
+            assert!(request.get("requires_configuration_activation").is_none());
+            assert!(request.get("runtime_operation_id").is_none());
+            assert_eq!(
+                request["unknown_input_extension"],
+                original.pointer(pointer).unwrap()["unknown_input_extension"]
+            );
+        }
+        assert_eq!(
+            saved["unknown_receipt_extension"],
+            original["unknown_receipt_extension"]
+        );
+        assert_eq!(
+            saved["operation"]["unknown_result_extension"],
+            original["operation"]["unknown_result_extension"]
+        );
+        for id in ["hot-b", "retained-op"] {
+            assert_eq!(
+                saved["deploy_replays"][id]["unknown_replay_extension"],
+                original["deploy_replays"][id]["unknown_replay_extension"]
+            );
+        }
+        assert!(saved["deploy_replays"].get("removed-op").is_none());
+        assert_eq!(
+            std::fs::read(backup).unwrap(),
+            original_bytes,
+            "raw backup must remain byte-for-byte intact"
         );
     }
 
