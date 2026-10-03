@@ -469,6 +469,32 @@ pub(crate) fn core_scenarios(fixtures: &Path) -> Result<Vec<(&'static str, Reque
         ),
     ];
 
+    #[cfg(unix)]
+    {
+        // POSIX 的反斜杠是原始文件名的一部分；目标删除前核对两条列表链路。
+        let before_delete = scenarios
+            .iter()
+            .position(|(name, _)| *name == "computer-files-update-mixed-operations")
+            .context("find files-update case before its live symlink target is deleted")?;
+        scenarios.splice(
+            before_delete..before_delete,
+            [
+                (
+                    "computer-file-list-posix-backslash-link-recursive",
+                    get(format!(
+                        "/api/computer/get-file-list?userId={user}&cId={cid}&recursive=true&depth=2&type=file&proxyPath=%2Fproxy"
+                    )),
+                ),
+                (
+                    "computer-file-list-posix-backslash-link-depth-two",
+                    get(format!(
+                        "/api/computer/get-file-list?userId={user}&cId={cid}&recursive=false&depth=2&type=file&proxyPath=%2Fproxy"
+                    )),
+                ),
+            ],
+        );
+    }
+
     scenarios.extend(core_lifecycle_scenarios(
         &skills_zip,
         &workspace_zip,
@@ -896,6 +922,7 @@ pub(crate) fn prepare_computer_fixture(root: &Path) -> Result<()> {
         use std::os::unix::fs::symlink;
 
         symlink("sub/nested/hello.txt", dir.join("inside-link.txt"))?;
+        symlink("sub/nested/hello.txt", dir.join("literal\\link.txt"))?;
         symlink(
             "../../file-server-ab-outside-secret.txt",
             dir.join("outside-link.txt"),

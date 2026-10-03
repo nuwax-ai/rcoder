@@ -568,6 +568,33 @@ pub(crate) fn validate_semver_field(body: &[u8], field: &str) -> Result<(), Stri
     Ok(())
 }
 
+pub(crate) fn validate_posix_backslash_list_link(body: &[u8]) -> Result<(), String> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("file list response is not JSON: {error}"))?;
+    if value.get("success").and_then(Value::as_bool) != Some(true) {
+        return Err("file list response must contain success=true".into());
+    }
+    let files = value
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "file list response must contain files".to_string())?;
+    let link = files
+        .iter()
+        .find(|entry| entry.get("name").and_then(Value::as_str) == Some("literal\\link.txt"))
+        .ok_or_else(|| {
+            "live POSIX link literal\\link.txt must be listed with its original name".to_string()
+        })?;
+    if link.get("isDir").and_then(Value::as_bool) != Some(false)
+        || link.get("isLink").and_then(Value::as_bool) != Some(true)
+        || link.get("fileProxyUrl").and_then(Value::as_str) != Some("/proxy/literal%5Clink.txt")
+    {
+        return Err(format!(
+            "POSIX link must remain a link with a percent-encoded literal backslash URL: {link}"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_meta_response(body: &[u8]) -> Result<(), String> {
     let value: Value = serde_json::from_slice(body)
         .map_err(|error| format!("file metadata response is not JSON: {error}"))?;
@@ -727,4 +754,47 @@ pub(crate) fn response_has_project(body: &[u8], project_id: &str) -> bool {
 
 pub(crate) fn assertion_difference(case: &str, path: &str, message: String) -> Difference {
     diff(case, path, "assertion_failed", Some(json!(message)), None)
+}
+
+#[cfg(test)]
+mod posix_backslash_list_link_tests {
+    use super::*;
+
+    #[test]
+    fn validates_original_symlink_name_and_encoded_proxy_url() {
+        let expected = json!({
+            "success": true,
+            "files": [{
+                "name": "literal\\link.txt",
+                "isDir": false,
+                "isLink": true,
+                "fileProxyUrl": "/proxy/literal%5Clink.txt"
+            }]
+        });
+        let validate =
+            |value: &Value| validate_posix_backslash_list_link(&serde_json::to_vec(value).unwrap());
+        assert!(validate(&expected).is_ok());
+
+        let mut missing = expected.clone();
+        missing["files"] = json!([]);
+        assert!(validate(&missing).is_err(), "hidden live link must fail");
+
+        let mut normalized_name = expected.clone();
+        normalized_name["files"][0]["name"] = json!("literal/link.txt");
+        assert!(
+            validate(&normalized_name).is_err(),
+            "rewritten name must fail"
+        );
+
+        let mut lost_link_flag = expected.clone();
+        lost_link_flag["files"][0]["isLink"] = json!(false);
+        assert!(
+            validate(&lost_link_flag).is_err(),
+            "lost link identity must fail"
+        );
+
+        let mut rewritten_url = expected;
+        rewritten_url["files"][0]["fileProxyUrl"] = json!("/proxy/literal/link.txt");
+        assert!(validate(&rewritten_url).is_err(), "rewritten URL must fail");
+    }
 }

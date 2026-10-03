@@ -310,6 +310,8 @@
         "computer-file-list-depth-decimal-rejected",
         "computer-file-list-limit-whitespace-rejected",
         "computer-file-list-relative-path-outside-dir-link",
+        "computer-file-list-posix-backslash-link-recursive",
+        "computer-file-list-posix-backslash-link-depth-two",
         "computer-file-list-dangling-link-hidden"
       ]
     },

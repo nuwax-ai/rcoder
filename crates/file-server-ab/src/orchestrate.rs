@@ -439,6 +439,10 @@ pub(crate) async fn run_suite(options: RunOptions) -> Result<()> {
                         "computer-file-meta-boundary" => {
                             validate_boundary_meta_response(&exchange.body, side)
                         }
+                        "computer-file-list-posix-backslash-link-recursive"
+                        | "computer-file-list-posix-backslash-link-depth-two" => {
+                            validate_posix_backslash_list_link(&exchange.body)
+                        }
                         "computer-files-update-mixed-operations" => {
                             validate_files_update_response(&exchange.body, CASE_USER, CASE_CID, 5)
                         }
