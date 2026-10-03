@@ -515,8 +515,13 @@ pub async fn precheck_dev_workspace(
     // discover 只会报 "no enabled services"，与 manifest 损坏无法区分——
     // 提前分流才能给出 ERR_WORKSPACE_EMPTY 的精确指引。
     let has_entries = match tokio::fs::read_dir(&ws).await {
-        Ok(mut entries) => matches!(entries.next_entry().await, Ok(Some(_))),
-        Err(_) => false,
+        Ok(mut entries) => entries
+            .next_entry()
+            .await
+            .map_err(|error| workspace_read_error(&ws, error))?
+            .is_some(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(workspace_read_error(&ws, error)),
     };
     if !has_entries {
         return Err(DevPrecheckError::WorkspaceEmpty(format!(
@@ -529,7 +534,17 @@ pub async fn precheck_dev_workspace(
     // 混在一个文案会把排障方向带偏（线上 app 35：空 workspace 被误读成
     // 接口/manifest 问题）。message 英文（项目惯例：错误码经 i18n 表
     // error.workspace_* 三语翻译，本地化由调用方按 code 驱动）。
-    if !any_project_manifest(&ws).await {
+    if !any_project_manifest(&ws).await? {
+        if let Some(nested) = nested_code_workspace(&ws).await? {
+            return Err(DevPrecheckError::NoServices(format!(
+                "platform source workspace is {}, but workspace.manifest.toml and \
+                 service manifests were found in {}. Keep the existing project and \
+                 align its workspace and service directories with the platform source \
+                 root before building; do not initialize another empty template",
+                ws.display(),
+                nested.display(),
+            )));
+        }
         return Err(DevPrecheckError::NoServices(format!(
             "workspace has no service directories: no project.manifest.toml \
              found under {} — initialize a project template first, or place \
@@ -552,19 +567,62 @@ pub async fn precheck_dev_workspace(
 ///
 /// 只做文件存在性探测，不解析内容——用于 [`precheck_dev_workspace`] 的
 /// 错误文案分流（"先放项目" vs "查 manifest 配置"）。
-async fn any_project_manifest(ws: &Path) -> bool {
-    let Ok(mut entries) = tokio::fs::read_dir(ws).await else {
-        return false;
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if tokio::fs::metadata(entry.path().join("project.manifest.toml"))
+async fn any_project_manifest(ws: &Path) -> Result<bool, DevPrecheckError> {
+    let mut entries = tokio::fs::read_dir(ws)
+        .await
+        .map_err(|error| workspace_read_error(ws, error))?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| workspace_read_error(ws, error))?
+    {
+        if !entry
+            .file_type()
             .await
-            .is_ok()
+            .map_err(|error| workspace_read_error(&entry.path(), error))?
+            .is_dir()
         {
-            return true;
+            continue;
+        }
+        let candidate = entry.path().join("project.manifest.toml");
+        match tokio::fs::metadata(&candidate).await {
+            // Discovery retains the precise malformed-file/type diagnostic.
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(workspace_read_error(&candidate, error)),
         }
     }
-    false
+    Ok(false)
+}
+
+fn workspace_read_error(path: &Path, error: std::io::Error) -> DevPrecheckError {
+    DevPrecheckError::Resolve(AppError::file(format!(
+        "Read workspace path {}: {error}",
+        path.display()
+    )))
+}
+
+/// Inspect only the known mistaken `code/` layout for a precise diagnostic.
+/// This observation never selects a different source root or moves files.
+async fn nested_code_workspace(ws: &Path) -> Result<Option<PathBuf>, DevPrecheckError> {
+    let nested = ws.join("code");
+    match tokio::fs::symlink_metadata(&nested).await {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(workspace_read_error(&nested, error)),
+    }
+    let manifest = nested.join("workspace.manifest.toml");
+    let has_workspace = match tokio::fs::metadata(&manifest).await {
+        Ok(metadata) => metadata.is_file(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(workspace_read_error(&manifest, error)),
+    };
+    if has_workspace && any_project_manifest(&nested).await? {
+        Ok(Some(nested))
+    } else {
+        Ok(None)
+    }
 }
 
 /// 异步发起 build 任务（不阻塞，立即返 task_id + 预生成的产物相对路径）。进度事件
@@ -852,6 +910,47 @@ mod precheck_tests {
             }
             _ => panic!("expected NoServices"),
         }
+    }
+
+    #[tokio::test]
+    async fn precheck_names_nested_workspace_without_adopting_or_replacing_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = config_with_root(tmp.path());
+        let ws = tmp.path().join("app-7");
+        let nested = ws.join("code");
+        let service = nested.join("frontend");
+        std::fs::create_dir_all(&service).unwrap();
+        std::fs::write(
+            nested.join("workspace.manifest.toml"),
+            "[workspace]\nname='old'\n",
+        )
+        .unwrap();
+        write_manifest(&service, "frontend");
+        let original = std::fs::read(service.join("project.manifest.toml")).unwrap();
+        match precheck_dev_workspace("app-7", &cfg).await {
+            Err(DevPrecheckError::NoServices(message)) => {
+                assert!(message.contains("platform source workspace"), "{message}");
+                assert!(message.contains(&nested.display().to_string()), "{message}");
+                assert!(message.contains("Keep the existing project"), "{message}");
+                assert!(!message.contains("initialize a project template first"));
+            }
+            other => panic!("expected explicit nested-root diagnostic, got {other:?}"),
+        }
+        assert!(!ws.join("workspace.manifest.toml").exists());
+        assert_eq!(
+            std::fs::read(service.join("project.manifest.toml")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn precheck_reports_workspace_io_failure_instead_of_empty_project() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("app-7"), "not a directory").unwrap();
+        assert!(matches!(
+            precheck_dev_workspace("app-7", &config_with_root(tmp.path())).await,
+            Err(DevPrecheckError::Resolve(AppError::File(_)))
+        ));
     }
 
     /// 有服务目录但全部 disabled → discover 路径原文案（查 manifest 配置的
