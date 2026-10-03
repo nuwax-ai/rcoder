@@ -1166,48 +1166,121 @@ mod operation_recovery_tests {
             let post_committed = committed.clone();
             let get_committed = committed.clone();
             let owner = Router::new()
-                .route("/v1/runtime/identity", axum::routing::get(move || { let identity = identity.clone(); async move { axum::Json(serde_json::json!({"data": identity})) } }))
-                .route("/v1/runtime/recovery", axum::routing::get(|| async {
-                    axum::Json(serde_json::json!({"data": shared_types::RuntimeRecoveryView {
-                        runtime_instance_id: "original-instance".into(),
-                        deployment_generation_id: "generation".into(), revision: 7,
-                        kernel_protected: false, owner_protected: false,
-                        operation_id: None, boundary: None, generation_matches: Some(true),
-                        credentials_required: false, migrations: Default::default(),
-                    }}))
-                }))
-                .route("/v1/runtime/status", axum::routing::get(|| async {
-                    axum::Json(serde_json::json!({"data": shared_types::RuntimeStatusView {
-                        desired: shared_types::DesiredState::Stopped,
-                        observed: shared_types::ObservedHealth::Stopped,
-                        active_target: None, revision: 7, active_operation_id: None,
-                        recovery_protection: false, runtime_instance_id: "original-instance".into(),
-                    }}))
-                }))
-                .route("/v1/runtime/operations", axum::routing::post(move |axum::Json(request): axum::Json<shared_types::RuntimeOperationRequest>| {
-                    let posts = post_sink.clone(); let committed = post_committed.clone();
-                    async move {
-                        let mut posts = posts.lock().unwrap(); posts.push(request.clone());
-                        if posts.len() == 1 {
-                            committed.store(accepted_before_loss, std::sync::atomic::Ordering::SeqCst);
-                            return (axum::http::StatusCode::OK, "lost-response".to_string());
-                        }
-                        committed.store(true, std::sync::atomic::Ordering::SeqCst);
-                        (axum::http::StatusCode::ACCEPTED, serde_json::json!({"data": shared_types::RuntimeOperationAccepted {
-                            operation_id: request.operation_id.clone(), state: shared_types::RuntimeOperationState::Accepted,
-                            poll: format!("/v1/runtime/operations/{}", request.operation_id),
-                        }}).to_string())
-                    }
-                }))
-                .route("/v1/runtime/operations/{id}", axum::routing::get(move |axum::extract::Path(id): axum::extract::Path<String>| {
-                    let committed = get_committed.clone(); async move {
-                        if !committed.load(std::sync::atomic::Ordering::SeqCst) { return (axum::http::StatusCode::NOT_FOUND, axum::Json(serde_json::json!({}))); }
-                        (axum::http::StatusCode::OK, axum::Json(serde_json::json!({"data": shared_types::RuntimeOperationView {
-                            operation_id: id, kind: shared_types::RuntimeOperationKind::Restart, state: shared_types::RuntimeOperationState::Succeeded,
-                            request_digest: "digest".into(), revision: 8, runtime_instance_id: "original-instance".into(), error_code: None, error_message: None, failure_detail: None,
-                        }})))
-                    }
-                }));
+                .route(
+                    "/v1/runtime/identity",
+                    axum::routing::get(move || {
+                        let identity = identity.clone();
+                        async move { axum::Json(HttpResult::success(identity)) }
+                    }),
+                )
+                .route(
+                    "/v1/runtime/recovery",
+                    axum::routing::get(|| async {
+                        axum::Json(HttpResult::success(shared_types::RuntimeRecoveryView {
+                            runtime_instance_id: "original-instance".into(),
+                            deployment_generation_id: "generation".into(),
+                            revision: 7,
+                            kernel_protected: false,
+                            owner_protected: false,
+                            operation_id: None,
+                            boundary: None,
+                            generation_matches: Some(true),
+                            credentials_required: false,
+                            migrations: Default::default(),
+                        }))
+                    }),
+                )
+                .route(
+                    "/v1/runtime/status",
+                    axum::routing::get(|| async {
+                        axum::Json(HttpResult::success(shared_types::RuntimeStatusView {
+                            desired: shared_types::DesiredState::Stopped,
+                            observed: shared_types::ObservedHealth::Stopped,
+                            active_target: None,
+                            revision: 7,
+                            active_operation_id: None,
+                            recovery_protection: false,
+                            runtime_instance_id: "original-instance".into(),
+                        }))
+                    }),
+                )
+                .route(
+                    "/v1/runtime/operations",
+                    axum::routing::post(
+                        move |axum::Json(request): axum::Json<
+                            shared_types::RuntimeOperationRequest,
+                        >| {
+                            let posts = post_sink.clone();
+                            let committed = post_committed.clone();
+                            async move {
+                                let mut posts = posts.lock().unwrap();
+                                posts.push(request.clone());
+                                if posts.len() == 1 {
+                                    committed.store(
+                                        accepted_before_loss,
+                                        std::sync::atomic::Ordering::SeqCst,
+                                    );
+                                    return (
+                                        axum::http::StatusCode::OK,
+                                        "lost-response".to_string(),
+                                    );
+                                }
+                                committed.store(true, std::sync::atomic::Ordering::SeqCst);
+                                (
+                                    axum::http::StatusCode::ACCEPTED,
+                                    serde_json::to_string(&HttpResult::success(
+                                        shared_types::RuntimeOperationAccepted {
+                                            operation_id: request.operation_id.clone(),
+                                            state: shared_types::RuntimeOperationState::Accepted,
+                                            poll: format!(
+                                                "/v1/runtime/operations/{}",
+                                                request.operation_id
+                                            ),
+                                        },
+                                    ))
+                                    .unwrap(),
+                                )
+                            }
+                        },
+                    ),
+                )
+                .route(
+                    "/v1/runtime/operations/{id}",
+                    axum::routing::get(
+                        move |axum::extract::Path(id): axum::extract::Path<String>| {
+                            let committed = get_committed.clone();
+                            async move {
+                                if !committed.load(std::sync::atomic::Ordering::SeqCst) {
+                                    return (
+                                        axum::http::StatusCode::NOT_FOUND,
+                                        axum::Json(
+                                            HttpResult::<shared_types::RuntimeOperationView>::error(
+                                                "ERR_NOT_FOUND",
+                                                "operation not committed yet",
+                                            ),
+                                        ),
+                                    );
+                                }
+                                (
+                                    axum::http::StatusCode::OK,
+                                    axum::Json(HttpResult::success(
+                                        shared_types::RuntimeOperationView {
+                                            operation_id: id,
+                                            kind: shared_types::RuntimeOperationKind::Restart,
+                                            state: shared_types::RuntimeOperationState::Succeeded,
+                                            request_digest: "digest".into(),
+                                            revision: 8,
+                                            runtime_instance_id: "original-instance".into(),
+                                            error_code: None,
+                                            error_message: None,
+                                            failure_detail: None,
+                                        },
+                                    )),
+                                )
+                            }
+                        },
+                    ),
+                );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap().to_string();
             let server = tokio::spawn(async move {
