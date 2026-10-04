@@ -17,12 +17,77 @@ const ORCHESTRATOR_SOURCE_ID: &str = "orchestrator";
 /// 直接落在 log_root 根目录（与 LogService 同一 log_dir）。
 const ORCHESTRATOR_GLOB: &str = "app-cli.log.*";
 
+/// Provenance is assigned by platform registration, never inferred from a source name.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformSourceKind {
+    Runtime,
+    Build,
+    Orchestrator,
+    ManagementLaunch,
+    OwnerRecovery,
+    DevServer,
+}
+
+pub(crate) type PlatformSources = BTreeMap<String, PlatformSourceKind>;
+// 64 build sources + two runtime layouts per service + four management sources.
+pub(crate) const MAX_PLATFORM_SOURCES: usize = shared_types::MAX_SERVICES * 3 + 4;
+
+pub(crate) fn validate_source_budget<'a>(
+    sources: impl IntoIterator<Item = (&'a str, &'a LogSource)>,
+    platform_sources: &PlatformSources,
+) -> anyhow::Result<()> {
+    let mut business = 0;
+    let mut platform = 0;
+    for (service_id, source) in sources {
+        if platform_sources.contains_key(&source_key(service_id, &source.id)) {
+            platform += 1;
+        } else {
+            business += 1;
+        }
+    }
+    anyhow::ensure!(
+        business <= shared_types::MAX_SOURCES && platform <= MAX_PLATFORM_SOURCES,
+        "selected sources exceeds maximum of {} business sources and {MAX_PLATFORM_SOURCES} platform sources",
+        shared_types::MAX_SOURCES
+    );
+    Ok(())
+}
+
+pub(crate) fn source_key(service_id: &str, source_id: &str) -> String {
+    format!("{service_id}/{source_id}")
+}
+
+pub(crate) fn available_platform_id(sources: &[LogSource], preferred: &str) -> String {
+    if !sources.iter().any(|source| source.id == preferred) {
+        return preferred.to_owned();
+    }
+    let candidate = format!("platform-{preferred}");
+    if !sources.iter().any(|source| source.id == candidate) {
+        return candidate;
+    }
+    let mut suffix = 2;
+    loop {
+        let candidate = format!("platform-{preferred}-{suffix}");
+        if !sources.iter().any(|source| source.id == candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
 /// runtime 日志源为平台注入：supervisor 会为每个服务落盘 runtime.out.log /
 /// runtime.err.log（轮转命名 runtime.out.N.log），即使 manifest 未声明也应可查。
-/// 纯内存变换，不写回 release.lock；用户已声明同 id source 时以用户声明为准，不覆盖。
-pub(super) fn inject_runtime_log_sources(release: &mut ReleaseLock, layout: LogLayout) {
+/// 纯内存变换，不写回 release.lock；用户声明不覆盖，平台源使用独立稳定 id。
+pub(super) fn inject_runtime_log_sources(
+    release: &mut ReleaseLock,
+    layout: LogLayout,
+) -> PlatformSources {
+    let mut platform_sources = PlatformSources::new();
     for service in &mut release.services {
-        if service.logs.iter().any(|source| source.id == "runtime") {
+        if !service.enabled {
             continue;
         }
         // static 服务无进程——runtime.{out,err}.log 永不存在，注入只会让每次
@@ -35,28 +100,46 @@ pub(super) fn inject_runtime_log_sources(release: &mut ReleaseLock, layout: LogL
             // supervisord 单目录合流文件：{svc}.log（glob 相对 services/ 目录）
             LogLayout::Supervisord => format!("{}.log", service.service_id),
         };
+        let id = available_platform_id(&service.logs, "runtime");
+        platform_sources.insert(
+            source_key(&service.service_id, &id),
+            PlatformSourceKind::Runtime,
+        );
         service.logs.push(LogSource {
-            id: "runtime".into(),
+            id,
             glob,
             format: LogFormat::Text,
             multiline_start_pattern: None,
         });
     }
+    platform_sources
 }
 
 /// 编排器内置日志源注入：把 app-cli 自身日志（log_root 根目录的 app-cli.log.<date>，
 /// JSON 行格式）以虚拟服务 `app-cli` + 源 `orchestrator` 挂进查询面——logs/query|stream
 /// 从此覆盖启停过程，无需独立的 dev server 进程日志接口。纯内存变换，不写回
-/// release.lock；用户已声明同名服务时以用户为准，不注入。
-pub(super) fn inject_orchestrator_log_source(release: &mut ReleaseLock) {
-    if release
+/// release.lock；同名用户服务或源保留，平台源使用稳定的可用 source id。
+pub(super) fn inject_orchestrator_log_source(release: &mut ReleaseLock) -> PlatformSources {
+    let mut platform_sources = PlatformSources::new();
+    let source_id = if let Some(service) = release
         .services
-        .iter()
-        .any(|service| service.service_id == ORCHESTRATOR_SERVICE_ID)
+        .iter_mut()
+        .find(|service| service.enabled && service.service_id == ORCHESTRATOR_SERVICE_ID)
     {
-        return;
-    }
-    release.services.push(orchestrator_service());
+        let mut source = orchestrator_service().logs.remove(0);
+        source.id = available_platform_id(&service.logs, ORCHESTRATOR_SOURCE_ID);
+        let source_id = source.id.clone();
+        service.logs.push(source);
+        source_id
+    } else {
+        release.services.push(orchestrator_service());
+        ORCHESTRATOR_SOURCE_ID.to_owned()
+    };
+    platform_sources.insert(
+        source_key(ORCHESTRATOR_SERVICE_ID, &source_id),
+        PlatformSourceKind::Orchestrator,
+    );
+    platform_sources
 }
 
 /// 合成的编排器虚拟服务：仅存在于日志查询面（enabled 服务集），不参与启停、

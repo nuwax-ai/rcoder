@@ -15,6 +15,8 @@
 //! - pnpm devbuild 无 lockfile（app 110 事故回归）：--no-frozen-lockfile 安装
 //!   成功并生成 lockfile、devrun 可用；--frozen-lockfile + 过期 lockfile →
 //!   任务 failed（错误如实传播）
+//! - Python 使用冻结的真实模板构建脚本和本地 wheel 索引，重复编译及平台
+//!   stop/ensure 重建后复用依赖，并核验实际 HTTP 与制品缓存排除规则。
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -323,6 +325,71 @@ async fn userapp_static_proxy_escape_build_fails() {
 
     assert_hard_all(report).await;
     cleanup_builder(&app);
+}
+
+/// Real pip dependency cache, repeated public builds and compute recreation on
+/// the same volume. Missing fixture prerequisites fail the strict report.
+#[tokio::test]
+async fn userapp_python_dependency_cache_survives_builder_recycle() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    let Some((env, report)) = Env::compose_or_skip(
+        "userapp_python_dependency_cache_survives_builder_recycle",
+        "compose",
+    )
+    .await
+    else {
+        return;
+    };
+    let path = report
+        .path
+        .parent()
+        .expect("report directory")
+        .join("python-dependency-cache.json");
+    let result = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tools/python_dependency_cache_contract.py"
+        ))
+        .arg("--rcoder")
+        .arg(&env.rcoder)
+        .arg("--report")
+        .arg(&path)
+        .status();
+    report.assert_hard(
+        "Python cache contract process completed",
+        result.is_ok_and(|status| status.success()),
+        "See python-dependency-cache.json for template hashes, real pip requests, physical identities and cleanup".into(),
+    );
+    let evidence = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    if let Some(evidence) = evidence {
+        if let Some(checks) = evidence["checks"].as_array() {
+            for check in checks {
+                report.assert_hard(
+                    check["name"]
+                        .as_str()
+                        .unwrap_or("invalid Python cache check"),
+                    check["ok"] == true,
+                    check["detail"].to_string(),
+                );
+            }
+        }
+        report.assert_hard(
+            "Python cache complete mandatory evidence present",
+            evidence["success"] == true
+                && evidence["missing"].as_array().is_some_and(Vec::is_empty),
+            evidence["error"].to_string(),
+        );
+    } else {
+        report.assert_hard(
+            "Python cache evidence readable",
+            false,
+            path.display().to_string(),
+        );
+    }
+    assert!(report.finish(), "Python dependency cache contract failed");
 }
 
 // ============================================================

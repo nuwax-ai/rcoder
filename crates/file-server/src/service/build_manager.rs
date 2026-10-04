@@ -333,7 +333,7 @@ mod tests {
             .unwrap();
         child.wait().await.unwrap();
         let mut owned = OwnedChild::Guarded {
-            child,
+            child: Box::new(child),
             lease: None,
             root: command_root.clone(),
             receipt_unavailable_since: None,

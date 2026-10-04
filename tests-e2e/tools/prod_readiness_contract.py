@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
-"""Real, no-LLM prod contract against an already running isolated Docker RCoder.
+"""Real, no-LLM prod contract with a private Docker RCoder control plane.
 
-Python >= 3.11. No builds, shared service updates, database cleanup or volume
+Python >= 3.11. A frozen paired build receipt is required; no builds,
+shared service updates, database cleanup or volume
 deletion. The fixture follows workspace-manifest/tests/fixtures/lock_v1.toml,
 workspace-manifest/src/release_lock.rs and app-cli's static_content_dir contract.
 An empty Start first provisions the base container; real business PostgreSQL
 SELECT 1 is a fixture prerequisite before cold replacement on the same mounts.
-Success removes only captured, identity-checked containers; failure keeps them.
+Success removes only captured containers and the owned control plane/network.
+On failure the strict parent uses ownership.json for precise fallback cleanup;
+unknown creation cannot be treated as cleaned. All volumes and data remain.
 The ZIP and report remain on disk. Missing evidence is failure, never a skip.
 
 Example: python3 tests-e2e/tools/prod_readiness_contract.py \
   --url http://127.0.0.1:18080 --runtime-image rcoder-userapp-contract:local \
-  --report /tmp/prod-contract.json
+  --controller-container <full-owned-controller-id> \
+  --build-receipt /tmp/frozen-paired-build.json --report /tmp/prod-contract.json
 """
 import argparse
 import hashlib
 import http.server
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -39,19 +44,242 @@ def run(argv, timeout=30):
     return result.stdout
 
 
-def source_identity(repo):
-    git = lambda *args: subprocess.check_output(['git', '-C', str(repo), *args])
-    diff = git('diff', '--binary', 'HEAD')
-    untracked = {}
-    for name in git('ls-files', '--others', '--exclude-standard', '-z').split(b'\0'):
-        if name:
-            relative = os.fsdecode(name)
-            path = repo / relative
-            if path.is_file():
-                untracked[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
-    return {'commit': git('rev-parse', 'HEAD').decode().strip(),
-            'diff_sha256': hashlib.sha256(diff).hexdigest(),
-            'untracked_sha256': untracked}
+REQUIRED_STEPS = frozenset({
+    'paired build inputs verified',
+    'owned isolated controller prepared',
+    'isolated controller and project network removed with data retained',
+    'cold deployment declaration matches runtime receipt',
+    'cold native and deployment generations are separate',
+    'hot new artifact B is committed without container replacement',
+    'readiness observes the admitted restarting operation',
+    'readiness keeps the exact terminal restart receipt',
+    'Stop is Stopped with its original succeeded receipt',
+    'explicit Start restores business readiness',
+    'supervisord restores a new owner in the same container',
+    'owner recovery keeps exact physical container',
+    'invalid artifact retains concrete failure and accepted operation',
+    'invalid artifact result belongs to accepted operation',
+    'source stayed stable throughout the run',
+    'owned containers removed and volumes retained',
+})
+
+
+def source_identity(repo, input_manifest=None):
+    """Match strict launcher input hashing, including snapshots without .git."""
+    manifest = input_manifest or os.environ.get('E2E_INPUT_MANIFEST')
+    if manifest:
+        entries = json.loads(Path(manifest).read_text())
+        if not isinstance(entries, dict) or not entries:
+            raise ValueError('frozen input manifest must be a nonempty mapping')
+        names = sorted(entries)
+        head = os.environ.get('E2E_ORIGIN_HEAD')
+        if not head:
+            raise ValueError('frozen snapshot requires E2E_ORIGIN_HEAD')
+    else:
+        names = sorted(set(os.fsdecode(name) for name in subprocess.check_output(
+            ['git', '-C', str(repo), 'ls-files', '-z', '--cached', '--others', '--exclude-standard']
+        ).split(b'\0') if name))
+        head = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD']).decode().strip()
+    digest = hashlib.sha256()
+    for name in names:
+        relative = Path(name)
+        if relative.is_absolute() or '..' in relative.parts:
+            raise ValueError('input manifest path escapes source root')
+        path = repo / relative
+        digest.update(name.encode() + b'\0')
+        if path.is_symlink():
+            digest.update(b'<link>' + os.readlink(path).encode())
+        elif path.is_file():
+            digest.update(path.read_bytes())
+        else:
+            digest.update(b'<missing>')
+    return {'origin_head': head, 'worktree_sha256': digest.hexdigest()}
+
+
+def require_report_complete(report, owned_controller=True):
+    checks = report.get('checks', [])
+    names = {row.get('name') for row in checks if row.get('ok') is True}
+    required = REQUIRED_STEPS if owned_controller else REQUIRED_STEPS - {
+        'owned isolated controller prepared',
+        'isolated controller and project network removed with data retained',
+    }
+    missing = required - names
+    if missing:
+        raise ValueError('missing required steps: ' + ', '.join(sorted(missing)))
+    if any(row.get('ok') is not True for row in checks):
+        raise ValueError('report contains failed checks')
+    cleanup = report.get('cleanup') or {}
+    if cleanup.get('captured_containers_removed') is not True or cleanup.get('volumes_removed') is not False:
+        raise ValueError('owned cleanup not confirmed')
+
+
+def validate_receipt(receipt, source):
+    import re
+    if receipt.get('version') != 1 or receipt.get('source') != source:
+        raise ValueError('build receipt does not match frozen source inputs')
+    for role, key in (('rcoder', 'binary_sha256'), ('runtime', 'app_cli_sha256')):
+        record = receipt.get(role) or {}
+        if not re.fullmatch(r'sha256:[0-9a-f]{64}', str(record.get('image_id', ''))):
+            raise ValueError('missing immutable ' + role + ' image identity')
+        if not re.fullmatch(r'[0-9a-f]{64}', str(record.get(key, ''))):
+            raise ValueError('missing build-time ' + role + ' binary identity')
+    return receipt
+
+
+
+def persist_ownership(root, receipt):
+    path = Path(root) / 'ownership.json'
+    temporary = path.with_suffix('.tmp')
+    with temporary.open('w') as handle:
+        json.dump(receipt, handle, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+
+
+def validate_controller(row, receipt):
+    from turso_runtime_contract import validate_owned
+    validate_owned(row, receipt)
+    if (row['Image'] != receipt['rcoder_image_id'] or row['Name'] != '/' + receipt['project'] + '-rcoder-1'
+            or receipt.get('controller_id') not in (None, row['Id'])):
+        raise ValueError('isolated controller physical identity mismatch')
+    mounts = {mount['Destination']: mount for mount in row['Mounts']}
+    for folder in ('data', 'logs', 'project_workspace', 'computer-project-workspace', 'userapp-workspace', 'app-workspace'):
+        mount = mounts.get('/app/' + folder) or {}
+        if mount.get('Type') != 'bind' or Path(mount.get('Source', '')).resolve() != Path(receipt['root']) / folder:
+            raise ValueError('isolated controller writable mount is foreign')
+
+
+def prepare_controller(root, repo, build, source, run_id, case_id, app_id):
+    """Only a frozen, validated build may create a private control plane."""
+    from turso_runtime_contract import isolated_config, service_config, wait_ready
+    validate_receipt(build, source)  # Before directory/ownership or Docker side effects.
+    root = Path(root).resolve()
+    if (root / 'ownership.json').exists():
+        raise ValueError('owned fixture already exists; preserve the previous run')
+    root.mkdir(parents=True, exist_ok=True)
+    receipt = {'version': 1, 'root': str(root), 'run_id': run_id, 'case_id': case_id,
+               'project': 'rcoder-prod-' + uuid.uuid4().hex[:16], 'app_id': app_id,
+               'rcoder_image_id': build['rcoder']['image_id'], 'runtime_image_id': build['runtime']['image_id'],
+               'controller_state': 'not_started', 'application_state': 'not_started',
+               'controller_id': None, 'application_containers': {}, 'source': source}
+    source_config = isolated_config((repo / 'docker/config.yml').read_text())
+    # Service image references remain unused in this no-agent fixture. The one
+    # production runtime is selected by the same platform env used by Start.
+    source_config = source_config.replace('sha256:local-development', build['runtime']['image_id'])
+    config_path = root / 'config.yml'
+    config_path.write_text(source_config)
+    config_path.chmod(0o600)
+    config = service_config(root, build['rcoder']['image_id'], run_id, case_id,
+                            os.environ.get('DOCKER_SOCKET_PATH', '/var/run/docker.sock'), config_path)
+    service = config['services']['rcoder']
+    service['environment'].update(RCODER_RUNTIME_IMAGE_DIGEST=build['runtime']['image_id'],
+                                  COMPOSE_PROJECT_NAME=receipt['project'], DOCKER_NETWORK_BASE_NAME='agent-network')
+    service['networks'] = ['agent-network']
+    config['networks'] = {'agent-network': {'labels': {'rcoder.e2e.run': run_id, 'rcoder.e2e.case': case_id}}}
+    for mount in service['volumes']:
+        if mount.get('type') == 'bind' and not mount.get('read_only') and mount['target'] != '/var/run/docker.sock':
+            Path(mount['source']).mkdir(parents=True, exist_ok=True)
+    (root / 'compose.json').write_text(json.dumps(config, indent=2))
+    persist_ownership(root, receipt)
+    compose = ['docker', 'compose', '-p', receipt['project'], '-f', str(root / 'compose.json')]
+    receipt['controller_state'] = 'unknown'
+    persist_ownership(root, receipt)
+    try:
+        run(compose + ['up', '-d', '--no-build', '--pull', 'never'], timeout=120)
+        ids = run(['docker', 'ps', '-aq', '--no-trunc', '--filter', 'label=com.docker.compose.project=' + receipt['project']]).split()
+        if len(ids) != 1:
+            raise RuntimeError('isolated controller creation has ambiguous physical results')
+        row = json.loads(run(['docker', 'inspect', ids[0]]))[0]
+        validate_controller(row, receipt)
+        receipt.update(controller_state='completed', controller_id=row['Id'])
+        address = run(compose + ['port', 'rcoder', '8090']).strip()
+        receipt['base'] = 'http://' + address
+        persist_ownership(root, receipt)
+        wait_ready(receipt['base'])
+        return receipt
+    except Exception as error:
+        receipt['prepare_error'] = type(error).__name__ + ': ' + str(error)
+        persist_ownership(root, receipt)
+        raise
+
+
+def cleanup(root, run_id, case_id, existing_ids=()):
+    """Parent fallback: exact captured objects, no volume deletion or unknown success."""
+    root = Path(root).resolve()
+    receipt = json.loads((root / 'ownership.json').read_text())
+    if (receipt.get('version') != 1 or receipt.get('run_id') != run_id or receipt.get('case_id') != case_id
+            or receipt.get('root') != str(root) or not re.fullmatch(r'rcoder-prod-[0-9a-f]{16}', receipt.get('project', ''))):
+        raise ValueError('prod cleanup ownership receipt mismatch')
+    if receipt['controller_state'] == 'not_started':
+        return {'ok': True, 'creation_started': False, 'volumes_removed': False, 'retained_data': str(root)}
+    ids = run(['docker', 'ps', '-aq', '--no-trunc', '--filter', 'label=com.docker.compose.project=' + receipt['project']]).split()
+    rows = json.loads(run(['docker', 'inspect', *ids])) if ids else []
+    if len(rows) > 1:
+        raise ValueError('unexpected isolated control plane container set')
+    for row in rows:
+        if row['Id'] in existing_ids:
+            raise ValueError('refusing preexisting controller')
+        validate_controller(row, receipt)
+    if receipt['controller_state'] == 'unknown' and not rows:
+        return {'ok': False, 'detail': 'controller creation outcome unknown; empty inventory is not completion',
+                'volumes_removed': False, 'retained_data': str(root)}
+    if rows:
+        row = rows[0]
+        receipt.update(controller_state='completed', controller_id=row['Id'])
+        persist_ownership(root, receipt)
+        # Stop the one captured writer before examining application resources.
+        run(['docker', 'stop', '-t', '10', row['Id']], timeout=30)
+    all_ids = set(run(['docker', 'ps', '-aq', '--no-trunc']).split())
+    captured = receipt['application_containers']
+    app_ids = set(run(['docker', 'ps', '-aq', '--no-trunc', '--filter', 'label=app-id=' + receipt['app_id']]).split())
+    if app_ids - set(captured) or (receipt['application_state'] == 'unknown' and not captured):
+        return {'ok': False, 'detail': 'application creation outcome needs exact physical inspection',
+                'volumes_removed': False, 'retained_data': str(root)}
+    app_rows = []
+    for cid, frozen in captured.items():
+        if cid not in all_ids:
+            continue
+        if cid in existing_ids:
+            raise ValueError('refusing preexisting application container')
+        row = json.loads(run(['docker', 'inspect', cid]))[0]
+        labels = row['Config'].get('Labels') or {}
+        mounts = [{key: mount.get(key) for key in ('Type', 'Name', 'Source', 'Destination')} for mount in row['Mounts']]
+        environment = dict(item.split('=', 1) for item in row['Config']['Env'] if '=' in item)
+        if (row['Id'] != cid or row['Name'].lstrip('/') != frozen['name']
+                or row['Image'] != receipt['runtime_image_id'] or mounts != frozen['mounts']
+                or environment.get('APP_ID') != receipt['app_id'] or environment.get('PROJECT_ID') != receipt['app_id']
+                or labels.get('app-id') != receipt['app_id'] or labels.get('service-type') != 'user-app'
+                or labels.get('managed-by') != 'rcoder-app-manager'):
+            raise ValueError('application container no longer matches captured ownership')
+        app_rows.append(row)
+    for row in app_rows:
+        run(['docker', 'rm', '-f', row['Id']])
+    for row in rows:
+        run(['docker', 'rm', row['Id']])
+    network_ids = run(['docker', 'network', 'ls', '-q', '--filter', 'label=com.docker.compose.project=' + receipt['project']]).split()
+    networks = json.loads(run(['docker', 'network', 'inspect', *network_ids])) if network_ids else []
+    for network in networks:
+        labels = network.get('Labels') or {}
+        if (network['Name'] != receipt['project'] + '_agent-network'
+                or labels.get('rcoder.e2e.run') != run_id or labels.get('rcoder.e2e.case') != case_id
+                or network.get('Containers')):
+            raise ValueError('project network identity changed or still has consumers')
+    for network in networks:
+        run(['docker', 'network', 'rm', network['Id']])
+    receipt['cleanup_complete'] = True
+    persist_ownership(root, receipt)
+    return {'ok': True, 'captured_containers_removed': True, 'network_removed': True,
+            'volumes_removed': False, 'retained_data': str(root)}
+
+
+def declaration_matches(raw_environment, expected):
+    """Require each actual cold declaration exactly once, not dict first-wins."""
+    for key, value in expected.items():
+        matches = [item.split('=', 1)[1] for item in raw_environment if item.startswith(key + '=')]
+        if matches != [value]:
+            return False
+    return True
 
 
 def make_artifact(repo, directory, release, marker):
@@ -130,6 +358,9 @@ class Contract:
         self.sentinel = f'/home/user/data/.prod-contract-{app}'
         self.marker = f'PROD_CONTRACT_{app}'
         self.lifecycle = None
+        self.build_receipt = None
+        self.owned_controller = None
+        self.fixture_root = None
 
     def check(self, name, ok, detail=None):
         self.report['checks'].append({'name': name, 'ok': bool(ok), 'detail': detail})
@@ -137,7 +368,7 @@ class Contract:
         if not ok:
             raise RuntimeError(f'{name}: {detail}')
 
-    def api(self, path, body=None, timeout=20):
+    def api_raw(self, path, body=None, timeout=20):
         headers = {'content-type': 'application/json'}
         if self.args.api_key:
             headers['x-api-key'] = self.args.api_key
@@ -147,8 +378,11 @@ class Contract:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 status, raw = response.status, response.read()
         except urllib.error.HTTPError as error:
-            raise RuntimeError(f'{path}: HTTP {error.code} {error.read().decode(errors="replace")}') from error
-        envelope = json.loads(raw)
+            status, raw = error.code, error.read()
+        return status, json.loads(raw)
+
+    def api(self, path, body=None, timeout=20):
+        status, envelope = self.api_raw(path, body, timeout)
         if envelope.get('code') != '0000' or envelope.get('success') is not True:
             raise RuntimeError(f'{path}: {envelope}')
         return status, envelope
@@ -189,13 +423,20 @@ class Contract:
                 or labels.get('managed-by') != 'rcoder-app-manager'
                 or labels.get('service-type') != 'user-app'):
             raise RuntimeError(f'refusing foreign or ambiguous container {cid}')
+        environment = dict(item.split('=', 1) for item in value['Config']['Env'] if '=' in item)
+        if environment.get('APP_ID') != self.app or environment.get('PROJECT_ID') != self.app:
+            raise ValueError('application env identity differs from the owned fixture')
         if value['Image'] != self.report['expected_image_id']:
             raise RuntimeError(f'container {cid} is not running the requested test image')
         mounts = [{key: mount.get(key) for key in ('Type', 'Name', 'Source', 'Destination')}
                   for mount in value['Mounts']]
-        self.containers[cid] = {'id': cid, 'image_id': value['Image'],
+        self.containers[cid] = {'id': cid, 'name': value['Name'].lstrip('/'), 'image_id': value['Image'],
             'image_ref': value['Config']['Image'], 'mounts': mounts}
         self.report['containers'] = list(self.containers.values())
+        if self.owned_controller is not None:
+            self.owned_controller['application_containers'] = dict(self.containers)
+            self.owned_controller['application_state'] = 'completed'
+            persist_ownership(self.fixture_root, self.owned_controller)
         return value
 
     def current(self):
@@ -284,7 +525,9 @@ exec psql -h "${PGHOST:-localhost}" -p "${PGPORT:-5432}" \
         self.check(phase + ': data sentinel retained', self.execute(cid, 'cat', self.sentinel) == self.marker)
         return relevant
 
-    def verify_runtime(self, phase, expected_deployment):
+    def verify_runtime(self, phase, expected_deployment, expected_generation=None, marker=None, release=None):
+        expected_generation = expected_generation or expected_deployment
+        marker = marker or self.marker
         cid, mounts = self.current()
         identity = self.runtime_json(cid, '/v1/runtime/identity')
         deploy = self.runtime_json(cid, '/v1/deploy/status')
@@ -296,15 +539,21 @@ exec psql -h "${PGHOST:-localhost}" -p "${PGPORT:-5432}" \
         generation = operation.get('deployment_generation_id')
         self.check(phase + ': persisted original deployment identity',
                    operation.get('operation_id') == expected_deployment and operation.get('persisted') is True
-                   and generation == expected_deployment and identity['deployment_generation_id'] == generation,
+                   and generation == expected_generation and identity['deployment_generation_id'] == generation,
                    {'operation': operation, 'identity': identity})
-        self.check(phase + ': native and deployment generations are separate',
+        self.check(('cold native and deployment generations are separate' if phase == 'deploy' else phase + ': native and deployment generations are separate'),
                    native.get('phase') == 'ready' and bool(native.get('generation'))
                    and native['generation'] != generation, native)
         self.check(phase + ': static HTML reachable',
-                   self.marker in self.execute(cid, 'curl', '-fsS', '--max-time', '8', 'http://127.0.0.1:9080/'))
+                   marker in self.execute(cid, 'curl', '-fsS', '--max-time', '8', 'http://127.0.0.1:9080/'))
         self.check(phase + ': static JS reachable',
-                   self.marker in self.execute(cid, 'curl', '-fsS', '--max-time', '8', 'http://127.0.0.1:9080/app.js'))
+                   marker in self.execute(cid, 'curl', '-fsS', '--max-time', '8', 'http://127.0.0.1:9080/app.js'))
+        if release is not None:
+            self.check(phase + ': exact artifact release committed', operation.get('artifact_release_id') == release
+                       and operation.get('request_release_id') == release
+                       and operation.get('phase') == 'running' and operation.get('deploy_stage') == 'succeeded', operation)
+        self.check(phase + ': app-cli matches frozen build',
+                   self.execute(cid, 'sha256sum', '/usr/local/bin/app-cli').split()[0] == self.build_receipt['runtime']['app_cli_sha256'])
         self.verify_mounts(cid, mounts, phase)
         self.check(phase + ': original PostgreSQL row retained',
             self.sql(cid, 'SELECT marker FROM public.codex_contract_sentinel WHERE id=1') == self.marker)
@@ -359,12 +608,62 @@ exec psql -h "${PGHOST:-localhost}" -p "${PGPORT:-5432}" \
                 candidates.append((words[0], pid, raw))
         self.check('exact supervised owner identified', len(candidates) == 1, candidates)
         program, pid, _ = candidates[0]
-        # Check the actual argv again in the same process that sends SIGKILL.
-        code = ('import os,sys,signal;from pathlib import Path;p=int(sys.argv[1]);'
-                'a=Path(f"/proc/{p}/cmdline").read_bytes().split(b"\\0");'
-                'assert p>1 and Path(os.fsdecode(a[0])).name=="app-cli" and a[1]==b"serve";'
-                'os.kill(p,signal.SIGKILL)')
-        self.execute(cid, 'python3', '-c', code, pid)
+        # A retained Linux pidfd pins the captured process across PID reuse.
+        # Recheck live management identity and native ownership before signaling.
+        code = r'''import fcntl,json,os,select,signal,sys,urllib.request
+from pathlib import Path
+pid, expected_instance, expected_app = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+assert pid > 1
+pidfd = os.pidfd_open(pid)
+try:
+    proc = Path('/proc', str(pid))
+    argv = proc.joinpath('cmdline').read_bytes().split(b"\0")
+    assert Path(os.fsdecode(argv[0])).name == 'app-cli' and argv[1] == b'serve'
+    with urllib.request.urlopen('http://127.0.0.1:3010/v1/runtime/identity', timeout=3) as response:
+        envelope = json.load(response)
+    identity = envelope['data']
+    assert envelope['code'] == 'OK' and envelope['success'] is True
+    assert identity['runtime_instance_id'] == expected_instance and identity['application_id'] == expected_app
+    roots = set()
+    for handle in proc.joinpath('fd').iterdir():
+        try:
+            target = Path(os.readlink(handle))
+        except FileNotFoundError:
+            continue
+        if target.is_absolute() and target.name == 'owner.lock':
+            roots.add(target.parent)
+    assert len(roots) == 1, 'captured owner native lock root is ambiguous'
+    scope = roots.pop()
+    discovery = json.loads(scope.joinpath('supervisor.json').read_text())
+    snapshot = discovery['snapshot']
+    assert snapshot['binding'] == {'component': 'app-cli', 'resource': identity['source_root']}
+    generation = json.loads(scope.joinpath('work', snapshot['generation'], 'generation.json').read_text())
+    assert generation['worker_pid'] == pid and generation['supervisor'] == discovery['instance']
+    assert generation['phase'] == 'Running'
+    for lock in (scope/'owner.lock', scope/'work'/generation['id']/'generation.lock'):
+        stat = lock.stat()
+        held = False
+        for handle in proc.joinpath('fd').iterdir():
+            try:
+                fd = handle.stat()
+                held |= (fd.st_dev, fd.st_ino) == (stat.st_dev, stat.st_ino)
+            except FileNotFoundError:
+                continue
+        assert held, 'captured process does not hold native lock'
+        with lock.open('rb') as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                raise AssertionError('native lock is not currently held')
+    assert json.loads(scope.joinpath('supervisor.json').read_text())['instance'] == discovery['instance']
+    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+    assert select.select([pidfd], [], [], 10)[0], 'captured owner did not exit'
+finally:
+    os.close(pidfd)
+'''
+        self.execute(cid, 'python3', '-c', code, pid, original_identity['runtime_instance_id'], self.app)
         self.report['owner_fault'] = {'container_id': cid, 'program': program, 'pid': int(pid)}
         def recovered():
             # A temporary TCP failure is an expected observation after SIGKILL;
@@ -395,22 +694,30 @@ exec psql -h "${PGHOST:-localhost}" -p "${PGPORT:-5432}" \
                 self.inspect(cid)
                 run(['docker', 'rm', '-f', cid])
         self.report['cleanup'] = {'captured_containers_removed': True, 'volumes_removed': False}
+        self.check('owned containers removed and volumes retained', True, self.report['cleanup'])
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--url', required=True)
-    parser.add_argument('--runtime-image', required=True,
+    parser.add_argument('--url', help='optional existing isolated loopback controller; requires --controller-container')
+    parser.add_argument('--runtime-image',
                         help='already built local image configured on the isolated RCoder')
     parser.add_argument('--artifact-advertise-host', default='host.docker.internal')
     parser.add_argument('--report', required=True, type=Path)
-    parser.add_argument('--source-dir', default=Path(__file__).resolve().parents[2], type=Path)
+    parser.add_argument('--source-dir', default=Path(os.environ.get('E2E_SOURCE_ROOT') or Path(__file__).resolve().parents[2]), type=Path)
+    parser.add_argument('--build-receipt', required=True, type=Path)
+    parser.add_argument('--controller-container', help='captured isolated RCoder full container ID')
     parser.add_argument('--user-id', default='prod-contract-user')
     parser.add_argument('--api-key', default=os.environ.get('RCODER_E2E_API_KEY'))
     args = parser.parse_args()
-    parsed = urllib.parse.urlsplit(args.url)
-    if parsed.scheme not in ('http', 'https') or parsed.hostname not in ('127.0.0.1', 'localhost', '::1'):
-        parser.error('--url must target the already started isolated loopback RCoder')
+    if bool(args.url) != bool(args.controller_container):
+        parser.error('--url and --controller-container must be supplied together')
+    if args.url:
+        parsed = urllib.parse.urlsplit(args.url)
+        if (parsed.scheme not in ('http', 'https') or parsed.hostname not in ('127.0.0.1', 'localhost', '::1')
+                or parsed.username or parsed.password or parsed.query or parsed.fragment
+                or parsed.path not in ('', '/') or parsed.port is None):
+            parser.error('--url must be an explicit isolated loopback endpoint')
     if args.report.exists():
         parser.error('--report already exists; preserve previous evidence and choose a new path')
     args.report.parent.mkdir(parents=True, exist_ok=True)
@@ -420,11 +727,45 @@ def main():
     contract = Contract(args, report, app)
     server = None
     try:
+        contract.build_receipt = validate_receipt(json.loads(args.build_receipt.read_text()), report['source'])
+        if not args.controller_container:
+            contract.fixture_root = args.report.parent.resolve()
+            run_id = os.environ.get('E2E_RUN_ID') or uuid.uuid4().hex
+            case_id = os.environ.get('E2E_CASE_ID') or uuid.uuid4().hex
+            contract.owned_controller = prepare_controller(contract.fixture_root, repo, contract.build_receipt,
+                                                           report['source'], run_id, case_id, app)
+            args.controller_container = contract.owned_controller['controller_id']
+            args.url = contract.owned_controller['base']
+        args.runtime_image = args.runtime_image or contract.build_receipt['runtime']['image_id']
+        parsed = urllib.parse.urlsplit(args.url)
+        controller = json.loads(run(['docker', 'inspect', args.controller_container]))[0]
+        labels = controller['Config'].get('Labels') or {}
+        if controller['Id'] != args.controller_container or not controller['State']['Running']:
+            raise ValueError('captured controller is not the running physical instance')
+        if os.environ.get('E2E_STRICT') == '1' and (labels.get('rcoder.e2e.run') != os.environ.get('E2E_RUN_ID')
+                or labels.get('rcoder.e2e.case') != os.environ.get('E2E_CASE_ID')):
+            raise ValueError('controller does not belong to strict case')
+        ports = controller['NetworkSettings'].get('Ports') or {}
+        matches_url = any(binding.get('HostPort') == str(parsed.port) and binding.get('HostIp') in ('127.0.0.1', '::1')
+                          for bindings in ports.values() for binding in (bindings or []))
+        if not matches_url:
+            raise ValueError('loopback URL is not bound to captured controller')
         image = json.loads(run(['docker', 'image', 'inspect', args.runtime_image]))[0]
-        report['expected_image_id'] = image['Id']
+        expected = contract.build_receipt
+        controller_hash = run(['docker', 'exec', args.controller_container, 'sha256sum', '/app/bin/rcoder']).split()[0]
+        contract.check('paired build inputs verified', controller['Image'] == expected['rcoder']['image_id']
+                       and controller_hash == expected['rcoder']['binary_sha256']
+                       and image['Id'] == expected['runtime']['image_id'], {'source': report['source'], 'build': expected})
+        report['expected_image_id'] = expected['runtime']['image_id']
         report['runtime_image'] = args.runtime_image
+        if contract.owned_controller is not None:
+            contract.check('owned isolated controller prepared', True,
+                           {'id': args.controller_container, 'project': contract.owned_controller['project']})
         contract.check('no existing resource has this generated app identity',
             not run(['docker', 'ps', '-aq', '--filter', f'label=app-id={app}']).strip())
+        if contract.owned_controller is not None:
+            contract.owned_controller['application_state'] = 'unknown'
+            persist_ownership(contract.fixture_root, contract.owned_controller)
         _, base = contract.api(f'/api/v1/userapp/{app}/start', {
             'user_id': args.user_id, 'request_id': 'base-' + uuid.uuid4().hex,
             'env': {'PROJECT_ID': app}}, timeout=330)
@@ -434,6 +775,9 @@ def main():
         contract.lifecycle = lifecycle['data']['lifecycle_id']
         base_cid, base_mounts = contract.current()
         report['base_container_id'] = base_cid
+        contract.check('base runtime app-cli matches frozen build',
+                       contract.execute(base_cid, 'sha256sum', '/usr/local/bin/app-cli').split()[0]
+                       == contract.build_receipt['runtime']['app_cli_sha256'])
         contract.wait_postgres(base_cid)
         contract.sql(base_cid, 'CREATE TABLE public.codex_contract_sentinel (id integer PRIMARY KEY, marker text NOT NULL)')
         contract.sql(base_cid, f"INSERT INTO public.codex_contract_sentinel VALUES (1, '{contract.marker}')")
@@ -442,18 +786,24 @@ def main():
         artifact = make_artifact(repo, directory, release, contract.marker)
         payload = artifact.read_bytes()
         artifact_path = '/' + artifact.name
+        release_b = uuid.uuid4().hex
+        marker_b = contract.marker + '_B'
+        artifact_b = make_artifact(repo, directory, release_b, marker_b)
+        payload_b = artifact_b.read_bytes()
+        paths = {artifact_path: payload, '/' + artifact_b.name: payload_b, '/invalid.zip': b'not a ZIP archive'}
         downloads = []
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
-                if self.path != artifact_path:
+                if self.path not in paths:
                     self.send_error(404)
                     return
-                downloads.append({'client': self.client_address[0], 'at': time.time()})
+                downloads.append({'path': self.path, 'client': self.client_address[0], 'at': time.time()})
+                content = paths[self.path]
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/zip')
-                self.send_header('Content-Length', str(len(payload)))
+                self.send_header('Content-Length', str(len(content)))
                 self.end_headers()
-                self.wfile.write(payload)
+                self.wfile.write(content)
             def log_message(self, *_):
                 pass
         server = http.server.ThreadingHTTPServer(('0.0.0.0', 0), Handler)
@@ -478,18 +828,37 @@ def main():
             {'before': pg_before, 'after': pg_after})
         contract.verify_mounts(cold_cid, cold_mounts, 'cold-deployed')
         contract.wait('deployed static frontend is ready', contract.readiness, lambda data: data['ready'] is True)
-        cid, identity = contract.verify_runtime('deploy', deployment)
+        cid, identity = contract.verify_runtime('deploy', deployment, release=release)
+        expected_env = {'APP_DEPLOY_OPERATION_ID': deployment, 'APP_DEPLOY_GENERATION_ID': deployment,
+                        'APP_RELEASE_ID': release, 'APP_DEPLOY_URL': artifact_url, 'APP_DEPLOY_SHA256': report['artifact']['sha256']}
+        raw_cold_env = contract.inspect(cid)['Config']['Env']
+        contract.check('cold deployment declaration matches runtime receipt',
+                       declaration_matches(raw_cold_env, expected_env), expected_env)
         contract.check('real ZIP was fetched', bool(downloads), downloads)
         initial_downloads = len(downloads)
         contract.owner_recovery(cid, identity)
         contract.verify_runtime('owner-recovered', deployment)
         contract.check('owner recovery reuses the confirmed artifact', len(downloads) == initial_downloads, downloads)
+        hot_url = f'http://{args.artifact_advertise_host}:{server.server_port}/{artifact_b.name}'
+        _, hot = contract.api(f'/api/v1/userapp/{app}/start', {
+            'user_id': args.user_id, 'request_id': 'hot-' + uuid.uuid4().hex,
+            'lifecycle_id': contract.lifecycle, 'deploy_mode': 'hot', 'url': hot_url,
+            'sha256': hashlib.sha256(payload_b).hexdigest(), 'release_id': release_b,
+            'auto_execute_sql': False}, timeout=330)
+        hot_operation = hot.get('operation_id')
+        contract.check('hot response carries accepted operation', bool(hot_operation)
+                       and hot['data'].get('operation_id') == hot_operation, hot['data'])
+        contract.wait('hot deployment B becomes business ready', contract.readiness, lambda data: data['ready'] is True)
+        hot_cid, _ = contract.verify_runtime('hot', hot_operation, deployment, marker_b, release_b)
+        contract.check('hot new artifact B is committed without container replacement', hot_cid == cid
+                       and any(row['path'] == '/' + artifact_b.name for row in downloads))
+        initial_downloads = len(downloads)
         restart = contract.control('restart')
         ready = contract.wait('business ready after physical restart', contract.readiness, lambda data: data['ready'] is True)
         contract.check('readiness keeps the exact terminal restart receipt',
             (ready['container'].get('operation') or {}).get('operation_id') == restart
             and ready['container']['operation'].get('state') == 'succeeded', ready['container'])
-        contract.verify_runtime('restarted', deployment)
+        contract.verify_runtime('restarted', hot_operation, deployment, marker_b, release_b)
         stop = contract.control('stop')
         contract.wait('Stop is Stopped with its original succeeded receipt', contract.readiness,
             lambda data: data['ready'] is False and data['container']['status'] == 'stopped'
@@ -498,15 +867,49 @@ def main():
         contract.api(f'/api/v1/userapp/{app}/start', {'user_id': args.user_id,
             'lifecycle_id': contract.lifecycle, 'request_id': 'resume-' + uuid.uuid4().hex}, timeout=330)
         contract.wait('explicit Start restores business readiness', contract.readiness, lambda data: data['ready'] is True)
-        contract.verify_runtime('started-again', deployment)
+        contract.verify_runtime('started-again', hot_operation, deployment, marker_b, release_b)
         contract.check('compute restarts reuse the confirmed artifact', len(downloads) == initial_downloads, downloads)
+        invalid_release = uuid.uuid4().hex
+        invalid_url = f'http://{args.artifact_advertise_host}:{server.server_port}/invalid.zip'
+        status, failed = contract.api_raw(f'/api/v1/userapp/{app}/start', {
+            'user_id': args.user_id, 'request_id': 'bad-artifact-' + uuid.uuid4().hex,
+            'lifecycle_id': contract.lifecycle, 'deploy_mode': 'hot', 'url': invalid_url,
+            'sha256': hashlib.sha256(paths['/invalid.zip']).hexdigest(), 'release_id': invalid_release,
+            'auto_execute_sql': False}, timeout=330)
+        failed_id = failed.get('operation_id')
+        contract.check('invalid artifact retains concrete failure and accepted operation', status >= 400
+                       and failed.get('success') is False and bool(failed_id)
+                       and bool(failed.get('message')) and 'underlying cause' not in failed['message']
+                       and failed['message'] != 'Backend service failed', failed)
+        _, failure_observation = contract.api(f'/api/v1/userapp/{app}/operations/{urllib.parse.quote(failed_id, safe="")}')
+        contract.check('invalid artifact result belongs to accepted operation',
+                       failure_observation['data'].get('operation_id') == failed_id
+                       and failure_observation['data'].get('app_id') == app
+                       and failure_observation['data'].get('state') == 'Failed'
+                       and bool(failure_observation['data'].get('error_message')), failure_observation['data'])
         contract.check('source stayed stable throughout the run', source_identity(repo) == report['source'])
-        contract.cleanup()
+        if contract.owned_controller is not None:
+            outcome = cleanup(contract.fixture_root, contract.owned_controller['run_id'], contract.owned_controller['case_id'])
+            report['controller_cleanup'] = outcome
+            report['cleanup'] = outcome
+            contract.check('owned containers removed and volumes retained',
+                           outcome.get('ok') is True and outcome.get('captured_containers_removed') is True
+                           and outcome.get('volumes_removed') is False, outcome)
+            contract.check('isolated controller and project network removed with data retained',
+                           outcome.get('ok') is True and outcome.get('network_removed') is True
+                           and outcome.get('volumes_removed') is False, outcome)
+        else:
+            contract.cleanup()
+        report['full_owned_acceptance'] = contract.owned_controller is not None
+        if contract.owned_controller is None:
+            report['compatibility_mode'] = 'external-controller-core-only'
+        require_report_complete(report, owned_controller=contract.owned_controller is not None)
         report['success'] = True
     except Exception as error:
         report['error'] = f'{type(error).__name__}: {error}'
         report['traceback'] = traceback.format_exc()
-        report['cleanup'] = {'failure_scene_preserved': True, 'volumes_removed': False}
+        if not report.get('cleanup', {}).get('captured_containers_removed'):
+            report['cleanup'] = {'failure_scene_preserved': True, 'volumes_removed': False}
         try:
             # Capture even when initial deployment failed before readiness.
             # Only exact own-app labels are followed; nothing is stopped here.

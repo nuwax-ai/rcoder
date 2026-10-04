@@ -538,5 +538,17 @@
       "scenario": "userapp_dev_idle_recycle_owner_recovery",
       "backend": "compose"
     }
+  ],
+  "userapp_python_dependency_cache_survives_builder_recycle": [
+    {
+      "scenario": "userapp_python_dependency_cache_survives_builder_recycle",
+      "backend": "compose"
+    }
+  ],
+  "userapp_prod_readiness_contract": [
+    {
+      "scenario": "userapp_prod_readiness_contract",
+      "backend": "compose"
+    }
   ]
 }

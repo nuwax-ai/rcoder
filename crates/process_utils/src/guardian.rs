@@ -116,7 +116,7 @@ fn lock(root: &Path) -> Result<File> {
 pub enum OwnedChild {
     Direct(ManagedChild),
     Guarded {
-        child: tokio::process::Child,
+        child: Box<tokio::process::Child>,
         lease: Option<tokio::process::ChildStdin>,
         root: PathBuf,
         receipt_unavailable_since: Option<std::time::Instant>,
@@ -475,7 +475,7 @@ pub async fn spawn_guarded(
     // window must not abort this handshake before the guardian can acknowledge.
     wait_for_start(&mut child, &root, Duration::from_secs(10)).await?;
     Ok(OwnedChild::Guarded {
-        child,
+        child: Box::new(child),
         lease: Some(lease),
         root,
         receipt_unavailable_since: None,
@@ -962,6 +962,22 @@ pub fn confirm_physical_domain_exit(work_root: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn owned_child_size_is_bounded_by_handles_and_receipt_metadata() {
+        let guarded = size_of::<Box<tokio::process::Child>>()
+            + size_of::<Option<tokio::process::ChildStdin>>()
+            + size_of::<PathBuf>()
+            + size_of::<Option<std::time::Instant>>();
+        // Allow the discriminant and alignment padding without embedding the
+        // platform-specific Tokio Child implementation in every OwnedChild.
+        let bound = guarded.max(size_of::<ManagedChild>()) + 2 * size_of::<usize>();
+        assert!(
+            size_of::<OwnedChild>() <= bound,
+            "OwnedChild must not inline a platform-specific process handle: {} > {bound}",
+            size_of::<OwnedChild>()
+        );
+    }
+
     fn managed_work(root: &Path) -> PathBuf {
         let instance = uuid::Uuid::new_v4().to_string();
         let work = root.join("work").join(&instance);
@@ -1167,7 +1183,7 @@ mod tests {
             .unwrap();
         let original_pid = child.id();
         let mut owned = OwnedChild::Guarded {
-            child,
+            child: Box::new(child),
             lease: None,
             root: root.clone(),
             receipt_unavailable_since: None,

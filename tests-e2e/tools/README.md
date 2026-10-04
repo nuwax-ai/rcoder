@@ -1,6 +1,60 @@
 # 严格 userApp 回归入口
 
+整体入口、分组、验收与清理逻辑见 [测试逻辑与验收流程](../architecture.md)；本页维护场景命令和前置条件。
+
 owner 丢失的容器内专项回归使用 `owner_recovery.py`，入口与验收边界见 [开发环境 owner 恢复](../../docs/userapp-dev-owner-recovery.md)。它不替代下列完整 Compose/K8s 套件。
+
+## UserApp 核心场景聚焦回归
+
+这些场景均无 LLM，已加入固定套件、报告身份与必测步骤登记。可以分别运行，不必每次执行完整 E2E：
+
+```bash
+# 原平台闲置回收 → 同卷重建 → 编译/HTTP → Stop/再Start，含准确 owner 强杀。
+CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_dev E2E_FILTER=userapp_dev_idle_recycle_owner_recovery
+
+# Rust RCoder冷部署A/热部署B/容器Restart/readiness操作身份与数据保留。
+E2E_PROD_BUILD_RECEIPT=/absolute/frozen-paired-build.json \
+  CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_faults E2E_FILTER=userapp_prod_readiness_contract
+
+# 实际模板脚本+真实pip：连续构建、平台停容器后原卷重建、缓存与两层ZIP。
+E2E_TEMPLATE_SOURCE_DIR=/absolute/frozen-userapp-workspace-template \
+  CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_build_rules E2E_FILTER=userapp_python_dependency_cache_survives_builder_recycle
+```
+
+prod 用例先核验构建输入，随后自动创建本 case 的私有 Compose RCoder/Turso、工作目录、loopback 端口，结束与中断后均按捕获身份清计算，保留数据。构建阶段生成的 `E2E_PROD_BUILD_RECEIPT` 格式如下；不能在验收时给任意旧镜像现算哈希冒充本轮构建：
+
+```json
+{
+  "version": 1,
+  "source": {"origin_head": "本次源码提交", "worktree_sha256": "本次冻结输入内容摘要"},
+  "rcoder": {"image_id": "sha256:不可变镜像ID", "binary_sha256": "镜像内/app/bin/rcoder的构建摘要"},
+  "runtime": {"image_id": "sha256:不可变镜像ID", "app_cli_sha256": "镜像内app-cli的构建摘要"}
+}
+```
+
+源码摘要使用 `prod_readiness_contract.source_identity`，与严格启动器的冻结清单口径一致，支持 `E2E_SOURCE_ROOT`、`E2E_INPUT_MANIFEST`、`E2E_ORIGIN_HEAD`。构建后固定镜像及二进制摘要，运行时逐一核验。前置缺失或来源不匹配立即失败。
+
+Python用例冻结真实模板脚本并记录模板版本、提交及文件摘要；用有效的小 wheel 和本 run 的 Docker HTTP索引执行真实pip，比较索引请求、deps库存、stamp、mtime与解释器。全链缺数据、缓存重新下载或ZIP夹带缓存都不能通过。模板源仍需显式准备；工具单测不等于组合链已验收。
+
+### 显式 CephFS 跨节点 owner 互斥
+
+该实验只在获准的个人集群执行，独立于默认 Compose 套件，不会被普通 `make test-e2e` 触发：
+
+```bash
+K8S_LOCK_CONTEXT='<个人context>' \
+K8S_LOCK_NODE_A='<Ready节点A>' K8S_LOCK_NODE_B='<不同Ready节点B>' \
+K8S_LOCK_IMAGE='<单平台镜像@sha256:摘要>' \
+K8S_LOCK_BUILD_RECEIPT=/absolute/app-cli-lock-build.json \
+  make test-e2e-app-cli-cephfs-lock
+```
+
+回执字段为 `schema_version:1`、`image`（上述digest引用）、`app_cli_sha256`、`source_commit`、`source_digest`。镜像必须包含本次编译的app-cli、Python3.9+；节点内核支持pidfd，测试凭据有读取PVC/PV权限。每个Pod实际镜像、app-cli摘要、实际节点与CSI类型都核验。
+
+`source_commit/source_digest` 使用与上方prod构建receipt相同的 `origin_head/worktree_sha256` 口径；首次访问集群前匹配当前冻结源码，结束清理后再次核验未漂移。旧镜像配套旧回执不能冒充当前源码；可通过 `E2E_SOURCE_ROOT` 指向构建时冻结的目录。
+
+验收要求首owner持锁且实例不变、竞争节点没有独立管理监听，准确终止首holder后新实例接续并保留哨兵。只按捕获Pod UID/resourceVersion清计算，namespace及所有PVC保留；`--cleanup-volume` 明确拒绝。`test-e2e-app-cli-k8s-lock` 还包含RBD与同Pod容器重启，额外提供首节点免密SSH映射 `K8S_LOCK_NODE_SSH=node=host:user`。
+
+**仍需后续新增的断言**：prod旧容器仍Running时的可控Restart屏障、迟到Ready在真实观察链被丢弃，以及K8s RCoder原入口的编译/HTTP组合链。当前case的代码和工具自测不能替代最终配对镜像、真实Compose或CephFS集群执行结果。
 
 ## 真实 agent 项目适配（独立容器）
 

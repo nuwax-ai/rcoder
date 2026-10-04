@@ -22,6 +22,38 @@ pub(super) struct ReadOutcome {
     pub(super) complete: bool,
 }
 
+/// Open a captured regular file without following a replaced symlink or waiting
+/// on a FIFO. Unix additionally verifies the captured device/inode identity.
+/// Non-Unix platforms retain the existing path-based identity check.
+pub fn open_regular_file(
+    path: &std::path::Path,
+    expected: &std::fs::Metadata,
+) -> Result<std::fs::File> {
+    anyhow::ensure!(
+        expected.is_file() && !expected.file_type().is_symlink(),
+        "log file must be a real file"
+    );
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags};
+        std::fs::File::from(rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )?)
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path)?;
+    let opened = file.metadata()?;
+    anyhow::ensure!(opened.is_file(), "log file must be a real file");
+    anyhow::ensure!(
+        super::sources::file_identity(path, expected)
+            == super::sources::file_identity(path, &opened),
+        "log file changed while opening; retry query"
+    );
+    Ok(file)
+}
+
 pub(super) fn read_file(
     matched: &MatchedLogFile,
     start: u64,
@@ -34,11 +66,7 @@ pub(super) fn read_file(
     let path = &matched.path;
     let expected_identity = matched.identity.as_str();
     let before = std::fs::symlink_metadata(path)?;
-    anyhow::ensure!(
-        before.is_file() && !before.file_type().is_symlink(),
-        "log file must be a real file"
-    );
-    let mut file = std::fs::File::open(path)?;
+    let mut file = open_regular_file(path, &before)?;
     let metadata = file.metadata()?;
     anyhow::ensure!(
         super::sources::file_identity(path, &before) == expected_identity
@@ -179,4 +207,66 @@ fn parse_line(line: &str, format: &LogFormat) -> (Option<String>, Option<String>
         return (timestamp, level, message);
     }
     (None, None, line.to_owned())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use rustix::fs::{Mode, OFlags};
+
+    #[test]
+    fn replaced_file_cannot_block_reader_on_fifo() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("runtime.out.log");
+        std::fs::write(&path, "before\n").unwrap();
+        let captured = std::fs::symlink_metadata(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .expect("POSIX mkfifo is required by this Unix fixture")
+                .success()
+        );
+        let opened_path = path.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            sender
+                .send(open_regular_file(&opened_path, &captured))
+                .unwrap();
+        });
+        let observed = receiver.recv_timeout(std::time::Duration::from_secs(1));
+        if observed.is_err() {
+            // Unblock a regressed blocking open before failing the assertion, so
+            // the counterexample itself never leaves a hanging reader thread.
+            let writer =
+                rustix::fs::open(&path, OFlags::WRONLY | OFlags::NONBLOCK, Mode::empty()).unwrap();
+            reader.join().unwrap();
+            drop(writer);
+        } else {
+            reader.join().unwrap();
+        }
+        let error = observed
+            .expect("opening a replaced FIFO must finish promptly")
+            .unwrap_err();
+        assert!(error.to_string().contains("real file"), "{error:#}");
+    }
+
+    #[test]
+    fn captured_file_rejects_symlink_and_inode_replacements() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("runtime.out.log");
+        let replacement = root.path().join("replacement.log");
+        std::fs::write(&path, "before\n").unwrap();
+        std::fs::write(&replacement, "different\n").unwrap();
+        let captured = std::fs::symlink_metadata(&path).unwrap();
+        assert!(open_regular_file(&path, &captured).is_ok());
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&replacement, &path).unwrap();
+        assert!(open_regular_file(&path, &captured).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let error = open_regular_file(&path, &captured).unwrap_err();
+        assert!(error.to_string().contains("changed while opening"));
+    }
 }

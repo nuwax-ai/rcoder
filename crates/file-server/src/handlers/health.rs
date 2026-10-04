@@ -100,7 +100,6 @@ fn rss_mb() -> f64 {
             for line in s.lines() {
                 if let Some(rest) = line.strip_prefix("VmRSS:") {
                     let kb: f64 = rest
-                        .trim()
                         .split_whitespace()
                         .next()
                         .and_then(|t| t.parse::<f64>().ok())

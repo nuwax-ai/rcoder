@@ -136,11 +136,14 @@ test-e2e-app-cli-recovery-build:
 # 聚焦真实链：旧 code 管理目录、停服日志、同容器强杀恢复；不跑完整 E2E。
 USERAPP_ROOT_LOGS_REPORT ?= tests-e2e/reports/userapp-root-logs-$(shell date +%Y%m%d-%H%M%S).json
 .PHONY: test-e2e-userapp-root-logs
-test-e2e-userapp-root-logs: test-e2e-app-cli-recovery-build
+USERAPP_ROOT_LOGS_BUILD_SOURCE ?= tests-e2e/reports/userapp-root-logs-source.json
+test-e2e-userapp-root-logs:
+	python3 tests-e2e/tools/userapp_root_logs.py --write-build-source "$(USERAPP_ROOT_LOGS_BUILD_SOURCE)"
+	$(MAKE) test-e2e-app-cli-recovery-build
 	python3 tests-e2e/tools/userapp_root_logs.py \
 	  --app-cli tests-e2e/reports/_bin/app-cli-linux \
 	  --file-server-proxy tests-e2e/reports/_bin/file-server-proxy-linux \
-	  --build-source . --report "$(USERAPP_ROOT_LOGS_REPORT)"
+	  --build-source "$(USERAPP_ROOT_LOGS_BUILD_SOURCE)" --report "$(USERAPP_ROOT_LOGS_REPORT)"
 
 test-e2e-app-cli-recovery: test-e2e-app-cli-recovery-build
 	python3 tests-e2e/tools/app_cli_recovery.py \
@@ -152,26 +155,29 @@ test-e2e-app-cli-recovery: test-e2e-app-cli-recovery-build
 # ============================================================================
 # app-cli K8s 实机恢复实验（recovery v2 plan §11.2/§11.3：RBD 锁链 + 同 Pod 重启）
 # ============================================================================
-# 真实集群（默认 k3s-131 个人测试集群）：ceph-rbd RWO 卷上两个同节点 Pod 经
-# app-cli 真实 owner 获取链争锁/SIGKILL 释放/角色互换/跨节点卸载挂载交接；
-# builder 形态 Downward API 绑定 Pod 的同容器原地重启（Pod UID 不变 +
-# containerID/restartCount/pid1 纪元变化 + PVC 保留）。
-# 凭据不入库：节点 ssh 映射经环境变量注入。
-#   export K8S_LOCK_NODES='soddy=192.168.32.131:soddy:<pw> swufe-x10dai=192.168.32.226:swufe:<pw>'
-#   export K8S_LOCK_CONTEXT=k3s-131
-.PHONY: test-e2e-app-cli-k8s-lock
-test-e2e-app-cli-k8s-lock: test-e2e-app-cli-recovery-build
+# 显式个人集群实验：冻结的单平台镜像与构建回执先准备，不在测试时猜测旧缓存。
+# K8S_LOCK_NODE_A/B 必须两个不同 Ready 节点。CephFS-only 不要求节点 SSH。
+# all 另含 RBD + 同 Pod 重启，需要 K8S_LOCK_NODE_SSH（首节点免密 SSH 映射）。
+.PHONY: test-e2e-app-cli-k8s-lock test-e2e-app-cli-cephfs-lock
+
+test-e2e-app-cli-k8s-lock test-e2e-app-cli-cephfs-lock:
 	@set -eu; \
-	test -n "$$K8S_LOCK_NODES" || { echo "K8S_LOCK_NODES 未设置（节点 ssh 映射，见上方注释）"; exit 2; }; \
-	nodes=""; for m in $$K8S_LOCK_NODES; do nodes="$$nodes --node-ssh $$m"; done; \
-	ARCH=$$(uname -m | sed 's/arm64/aarch64/'); \
-	if [ "$$ARCH" = "aarch64" ]; then \
-	  docker build --platform linux/amd64 -t rcoder/app-cli-recovery-test:local tests-e2e/reports/_k8s-img >/dev/null 2>&1 || \
-	  { mkdir -p tests-e2e/reports/_k8s-img; cp crates/app-cli/target/x86_64-unknown-linux-gnu/release/app-cli tests-e2e/reports/_k8s-img/ 2>/dev/null || true; }; \
-	fi; \
-	echo "⚠️  镜像需为 linux/amd64 并导入集群节点（k3s ctr images import）"; \
+	test -n "$$K8S_LOCK_CONTEXT" || { echo "K8S_LOCK_CONTEXT 未设置"; exit 2; }; \
+	test -n "$$K8S_LOCK_IMAGE" || { echo "K8S_LOCK_IMAGE 必须是单平台 @sha256 镜像"; exit 2; }; \
+	test -f "$${K8S_LOCK_BUILD_RECEIPT:-}" || { echo "K8S_LOCK_BUILD_RECEIPT 缺失"; exit 2; }; \
+	test -n "$$K8S_LOCK_NODE_A" && test -n "$$K8S_LOCK_NODE_B" || { echo "须显式指定两个节点"; exit 2; }; \
+	scenario=all; \
+	if [ "$@" = "test-e2e-app-cli-cephfs-lock" ]; then scenario=cephfs-lock; fi; \
+	mkdir -p tests-e2e/reports; \
+	if [ "$$scenario" = "all" ]; then \
+	  test -n "$$K8S_LOCK_NODE_SSH" || { echo "all 需要首节点免密 K8S_LOCK_NODE_SSH"; exit 2; }; \
+	  set -- --node-ssh "$$K8S_LOCK_NODE_SSH"; \
+	else set --; fi; \
 	python3 tests-e2e/tools/app_cli_k8s_lock.py \
-	  --context $${K8S_LOCK_CONTEXT:-k3s-131} \
-	  --image $${K8S_LOCK_IMAGE:-registry.local/app-cli-recovery-test:local} \
-	  $$nodes \
-	  --report tests-e2e/reports/app-cli-k8s-lock-$$(date +%Y%m%d-%H%M%S).json
+	  --context "$$K8S_LOCK_CONTEXT" --scenario "$$scenario" \
+	  --image "$$K8S_LOCK_IMAGE" --build-receipt "$$K8S_LOCK_BUILD_RECEIPT" \
+	  --source-dir "$${E2E_SOURCE_ROOT:-.}" \
+	  --node "$$K8S_LOCK_NODE_A" --node "$$K8S_LOCK_NODE_B" \
+	  --storage-class "$${K8S_LOCK_RBD_CLASS:-ceph-rbd}" \
+	  --cephfs-class "$${K8S_LOCK_CEPHFS_CLASS:-cephfs}" \
+	  "$$@" --report "tests-e2e/reports/app-cli-$$scenario-$$(date +%Y%m%d-%H%M%S).json"

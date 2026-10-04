@@ -103,10 +103,7 @@ mod tests {
 
         let mut cmd = silent(tokio::process::Command::new("cmd"));
         cmd.current_dir(&workdir);
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.raw_arg(format!("/C echo ok>\"{}\"", marker.display()));
-        }
+        cmd.raw_arg(format!("/C echo ok>\"{}\"", marker.display()));
         let mut child = spawn_managed(cmd).unwrap();
         let status = child.wait_root().await.unwrap();
         assert!(

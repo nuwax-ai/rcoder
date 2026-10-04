@@ -25,6 +25,9 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 tempfile = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 toml = { workspace = true }
 tokio = { workspace = true, features = ["macros", "test-util"] }

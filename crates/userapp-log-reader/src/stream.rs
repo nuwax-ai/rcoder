@@ -73,12 +73,28 @@ pub fn stream(
         let mut first = true;
         let mut checkpoint: Option<String> = None;
         let mut failures: BTreeSet<(String, String)> = BTreeSet::new();
-        let mut last_heartbeat = tokio::time::Instant::now();
+        let heartbeat_period = Duration::from_secs(15);
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + heartbeat_period,
+            heartbeat_period,
+        );
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             if !first { request.tail = None; }
-            let result = match provider.load().await {
-                Ok(logs) => logs.query_with_cancel(request.clone(), cancelled.clone()).await,
-                Err(error) => Err(error),
+            let result = {
+                let observation = async {
+                    match provider.load().await {
+                        Ok(logs) => logs.query_with_cancel(request.clone(), cancelled.clone()).await,
+                        Err(error) => Err(error),
+                    }
+                };
+                tokio::pin!(observation);
+                loop {
+                    tokio::select! {
+                        result = &mut observation => break result,
+                        _ = heartbeat.tick() => yield LogStreamEvent::Heartbeat,
+                    }
+                }
             };
             match result {
                 Ok(response) => {
@@ -95,6 +111,7 @@ pub fn stream(
                     }
                     failures = current;
                     request.cursor = Some(response.cursor.clone());
+                    first = false;
                     if checkpoint.as_deref() != Some(&response.cursor) {
                         checkpoint = Some(response.cursor.clone());
                         yield LogStreamEvent::Checkpoint(response.cursor);
@@ -111,11 +128,6 @@ pub fn stream(
                     // A transient observation failure is not a catalog change.
                     // Preserve the checkpoint so recovery cannot silently drop data.
                 }
-            }
-            first = false;
-            if last_heartbeat.elapsed() >= Duration::from_secs(15) {
-                yield LogStreamEvent::Heartbeat;
-                last_heartbeat = tokio::time::Instant::now();
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -203,5 +215,98 @@ mod tests {
         let guard = CancelOnDrop(cancelled.clone());
         drop(guard);
         assert!(cancelled.load(Ordering::Relaxed));
+    }
+
+    struct DelayedProvider {
+        root: std::path::PathBuf,
+        calls: AtomicUsize,
+    }
+
+    impl LogProvider for DelayedProvider {
+        fn load(&self) -> BoxFuture<'_, Result<LogService>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(31)).await;
+                Ok(LogService::idle(self.root.clone()))
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_does_not_restart_a_pending_observation() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(DelayedProvider {
+            root: root.path().to_path_buf(),
+            calls: AtomicUsize::new(0),
+        });
+        let mut events = stream(provider.clone(), LogQueryRequest::default());
+        for _ in 0..2 {
+            let event = tokio::time::timeout(Duration::from_secs(16), events.next())
+                .await
+                .expect("pending observation must not suppress the 15-second heartbeat");
+            assert!(matches!(event, Some(LogStreamEvent::Heartbeat)));
+            assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+        }
+        assert!(matches!(
+            events.next().await,
+            Some(LogStreamEvent::Checkpoint(_))
+        ));
+    }
+
+    struct FirstLoadFails {
+        root: std::path::PathBuf,
+        calls: AtomicUsize,
+    }
+
+    impl LogProvider for FirstLoadFails {
+        fn load(&self) -> BoxFuture<'_, Result<LogService>> {
+            let first = self.calls.fetch_add(1, Ordering::Relaxed) == 0;
+            Box::pin(async move {
+                if first {
+                    anyhow::bail!("transient catalog observation failed");
+                }
+                Ok(LogService::idle(self.root.clone()))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_observation_failure_preserves_requested_tail() {
+        let root = tempfile::tempdir().unwrap();
+        let content = (0..500)
+            .map(|i| format!("{{\"message\":\"line-{i}\"}}\n"))
+            .collect::<String>();
+        std::fs::write(root.path().join("app-cli.log.2026-10-04"), content).unwrap();
+        let provider = Arc::new(FirstLoadFails {
+            root: root.path().to_path_buf(),
+            calls: AtomicUsize::new(0),
+        });
+        let mut events = stream(
+            provider,
+            LogQueryRequest {
+                tail: Some(500),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            events.next().await,
+            Some(LogStreamEvent::SourceError(_))
+        ));
+        let mut count = 0;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(3), events.next())
+                .await
+                .unwrap()
+            {
+                Some(LogStreamEvent::Log(_)) => count += 1,
+                Some(LogStreamEvent::Checkpoint(_)) => break,
+                Some(_) => {}
+                None => panic!("stream closed before checkpoint"),
+            }
+        }
+        assert_eq!(
+            count, 500,
+            "a failed observation did not consume the requested initial tail"
+        );
     }
 }
