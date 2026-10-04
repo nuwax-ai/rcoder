@@ -10,15 +10,41 @@ import uuid
 from pathlib import Path
 
 
+def source_snapshot(repo):
+    def git(*argv):
+        return subprocess.run(['git', '-C', str(repo), *argv], check=True,
+                              capture_output=True, text=True).stdout
+    paths = set(git('ls-files').splitlines() + git('ls-files', '--others', '--exclude-standard').splitlines())
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        if not (path.startswith('crates/') or path in ('Cargo.toml', 'Cargo.lock')):
+            continue
+        if Path(path).suffix not in ('.rs', '.toml', '.lock', '.proto', '.yml', '.json'):
+            continue
+        absolute = repo / path
+        if absolute.is_file():
+            digest.update(path.encode() + b'\0' + absolute.read_bytes() + b'\0')
+    return {'commit': git('rev-parse', 'HEAD').strip(), 'status': git('status', '--short'),
+            'diff_sha256': hashlib.sha256(git('diff', 'HEAD').encode()).hexdigest(),
+            'source_inputs_sha256': digest.hexdigest()}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--image', default='dev-rcoder-agent-runner:latest')
-    parser.add_argument('--app-cli', required=True, type=Path)
-    parser.add_argument('--file-server-proxy', required=True, type=Path)
-    parser.add_argument('--report', required=True, type=Path)
+    parser.add_argument('--app-cli', type=Path)
+    parser.add_argument('--file-server-proxy', type=Path)
+    parser.add_argument('--report', type=Path)
     parser.add_argument('--source-dir', default='.', type=Path)
-    parser.add_argument('--build-source', required=True, type=Path)
+    parser.add_argument('--build-source', type=Path)
+    parser.add_argument('--write-build-source', type=Path, help='Save source fingerprint before compiling the test binaries')
     args = parser.parse_args()
+    if args.write_build_source:
+        args.write_build_source.parent.mkdir(parents=True, exist_ok=True)
+        args.write_build_source.write_text(json.dumps(source_snapshot(args.source_dir.resolve()), indent=2) + '\n')
+        return 0
+    if not all([args.app_cli, args.file_server_proxy, args.report, args.build_source]):
+        parser.error('--app-cli, --file-server-proxy, --report and --build-source are required for verification')
     app = 'core' + uuid.uuid4().hex[:10]
     name = 'rcoder-root-logs-' + app
     volume = name + '-workspace'
@@ -162,22 +188,8 @@ def main():
         def git(*argv):
             return run(['git', '-C', str(repo), *argv]).stdout
         def source_inputs_hash():
-            paths = set(git('ls-files').splitlines() +
-                        git('ls-files', '--others', '--exclude-standard').splitlines())
-            digest = hashlib.sha256()
-            for path in sorted(paths):
-                if not (path.startswith('crates/') or path in ('Cargo.toml', 'Cargo.lock')):
-                    continue
-                if Path(path).suffix not in ('.rs', '.toml', '.lock', '.proto', '.yml', '.json'):
-                    continue
-                absolute = repo / path
-                if absolute.is_file():
-                    digest.update(path.encode() + b'\0' + absolute.read_bytes() + b'\0')
-            return digest.hexdigest()
-        report['source'] = {'commit': git('rev-parse', 'HEAD').strip(),
-                            'status': git('status', '--short'),
-                            'diff_sha256': hashlib.sha256(git('diff', 'HEAD').encode()).hexdigest(),
-                            'source_inputs_sha256': source_inputs_hash()}
+            return source_snapshot(repo)['source_inputs_sha256']
+        report['source'] = source_snapshot(repo)
         report['build_source'] = json.loads(args.build_source.read_text())
         assert_check('binary build source matches current input snapshot',
                      report['build_source']['source_inputs_sha256'] ==
@@ -283,7 +295,7 @@ redirect_stderr=true
                      any(source['source_id'] == 'owner-recovery' for source in sources), sources)
         logs = request(f'/api/v1/userapp/{app}/dev/logs/query', {})
         assert_check('snapshot exposes early management failure without owner',
-                     any('preserved diagnostic' in row['line'] for row in logs['logs']), logs)
+                     any('preserved diagnostic' in row['message'] for row in logs['logs']), logs)
         stream = execute('curl -fsS --max-time 2 -H "content-type: application/json" --data "{}" "$1"',
                          f'http://127.0.0.1:60000/api/v1/userapp/{app}/dev/logs/stream', check=False, timeout=6)
         assert_check('SSE exposes early management failure without owner',

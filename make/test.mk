@@ -136,11 +136,14 @@ test-e2e-app-cli-recovery-build:
 # 聚焦真实链：旧 code 管理目录、停服日志、同容器强杀恢复；不跑完整 E2E。
 USERAPP_ROOT_LOGS_REPORT ?= tests-e2e/reports/userapp-root-logs-$(shell date +%Y%m%d-%H%M%S).json
 .PHONY: test-e2e-userapp-root-logs
-test-e2e-userapp-root-logs: test-e2e-app-cli-recovery-build
+USERAPP_ROOT_LOGS_BUILD_SOURCE ?= tests-e2e/reports/userapp-root-logs-source.json
+test-e2e-userapp-root-logs:
+	python3 tests-e2e/tools/userapp_root_logs.py --write-build-source "$(USERAPP_ROOT_LOGS_BUILD_SOURCE)"
+	$(MAKE) test-e2e-app-cli-recovery-build
 	python3 tests-e2e/tools/userapp_root_logs.py \
 	  --app-cli tests-e2e/reports/_bin/app-cli-linux \
 	  --file-server-proxy tests-e2e/reports/_bin/file-server-proxy-linux \
-	  --build-source . --report "$(USERAPP_ROOT_LOGS_REPORT)"
+	  --build-source "$(USERAPP_ROOT_LOGS_BUILD_SOURCE)" --report "$(USERAPP_ROOT_LOGS_REPORT)"
 
 test-e2e-app-cli-recovery: test-e2e-app-cli-recovery-build
 	python3 tests-e2e/tools/app_cli_recovery.py \

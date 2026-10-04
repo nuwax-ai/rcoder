@@ -65,10 +65,10 @@ impl DevLogProvider {
             file_server::service::dev_server::log::log_dir(&self.config, &self.app_id)
                 .join("app-cli");
         let mut roots = vec![fallback_root.clone()];
-        if let Some(root) = &self.main_root {
-            if !roots.contains(root) {
-                roots.push(root.clone());
-            }
+        if let Some(root) = &self.main_root
+            && !roots.contains(root)
+        {
+            roots.push(root.clone());
         }
         let primary_root = self
             .main_root
