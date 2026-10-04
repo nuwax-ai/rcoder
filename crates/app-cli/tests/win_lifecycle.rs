@@ -142,9 +142,12 @@ fn xp01_two_cli_concurrent_first_start_single_winner() {
         let first_alive = first.try_wait().expect("try_wait first").is_none();
         let second_status = second.try_wait().expect("try_wait second");
 
-        if http_get_health(&address) == Some(200) && first_alive && second_status.is_some() {
+        if http_get_health(&address) == Some(200)
+            && first_alive
+            && let Some(status) = second_status
+        {
             assert!(
-                !second_status.unwrap().success(),
+                !status.success(),
                 "loser must exit non-zero (owner lock / bind conflict)"
             );
             let _ = Command::new("taskkill")

@@ -242,6 +242,7 @@ redirect_stderr=true
                      '--mount', f'type=volume,src={volume},dst=/home/user,volume-nocopy',
                      '--mount', f'type=bind,src={conf_dir}/40-recovery.conf,dst=/etc/supervisor/conf.d/40-recovery.conf',
                      '-e', f'PROJECT_ID={app}', '-e', f'USERAPP_SINGLE_APP_ID={app}',
+                     '-e', f'APP_ID={app}',
                      '-e', f'USERAPP_WORKSPACE_DIR={workspace}',
                      '-e', 'LOG_BASE_DIR=/home/user/logs',
                      '-e', f'APP_CLI_STATE_ROOT={state_root}',

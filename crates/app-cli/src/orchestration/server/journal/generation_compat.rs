@@ -120,10 +120,6 @@ impl Journal {
         seed_request: &DeployRequest,
         workspace: &Path,
     ) -> Result<bool> {
-        anyhow::ensure!(
-            !expected_generation.trim().is_empty() && expected_generation == seed_operation_id,
-            "legacy deployment normalization requires the original cold operation generation"
-        );
         anyhow::ensure!(self.lease.is_some(), "deployment journal lease missing");
         let Some(receipt) = self.receipt.as_ref() else {
             return Ok(false);
@@ -135,6 +131,10 @@ impl Journal {
         {
             return Ok(false);
         }
+        anyhow::ensure!(
+            !expected_generation.trim().is_empty() && expected_generation == seed_operation_id,
+            "legacy deployment normalization requires the original cold operation generation"
+        );
         let Some(legacy_owner) = self.legacy_generation_owner(receipt)? else {
             return Ok(false);
         };
@@ -472,6 +472,110 @@ format = "jsonl"
                         .contains(".generation-compat-")
                 })
                 .collect()
+        }
+    }
+
+    #[test]
+    fn fresh_journal_accepts_distinct_cold_operation_and_generation_without_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open_root(directory.path().to_path_buf()).unwrap();
+        let seed = DeployRequest {
+            runtime_operation_id: None,
+            url: "http://artifact/cold".into(),
+            release_id: "cold-release".into(),
+            sha256: Some("a".repeat(64)),
+            local_path: None,
+            execution_target: None,
+            run_pg: None,
+        };
+        let before: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(
+            !journal
+                .normalize_legacy_deployment_generation(
+                    "platform-generation",
+                    "cold-operation",
+                    &seed,
+                    &directory.path().join("code"),
+                )
+                .unwrap()
+        );
+        assert!(journal.receipt.is_none());
+        assert!(journal.deploy_replays.is_empty());
+        let after: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(after, before, "no receipt, replay or backup may be created");
+    }
+
+    #[test]
+    fn correct_receipt_accepts_distinct_cold_operation_and_generation_without_changes() {
+        let mut fixture = Fixture::new(true);
+        let expected = uuid::Uuid::new_v4().to_string();
+        let mut value: serde_json::Value = serde_json::from_slice(&fixture.original).unwrap();
+        value["generation"] = expected.clone().into();
+        value["operation"]["deployment_generation_id"] = expected.clone().into();
+        value["deploy_replays"]["cold-op"]["operation"]["deployment_generation_id"] =
+            expected.clone().into();
+        let stored: StoredReceipt = serde_json::from_value(value.clone()).unwrap();
+        fixture.journal.receipt = Some(stored.receipt);
+        fixture.journal.deploy_replays = stored.deploy_replays;
+        fixture.original = serde_json::to_vec(&value).unwrap();
+        std::fs::write(
+            fixture.journal.root.join(OPERATION_RECORD),
+            &fixture.original,
+        )
+        .unwrap();
+        let history_before = serde_json::to_value(&fixture.journal.deploy_replays).unwrap();
+        let migration_before = std::fs::read(&fixture.migration_path).unwrap();
+        assert!(
+            !fixture
+                .journal
+                .normalize_legacy_deployment_generation(
+                    &expected,
+                    "cold-op",
+                    &fixture.seed,
+                    &fixture.workspace,
+                )
+                .unwrap()
+        );
+        assert_eq!(fixture.bytes(), fixture.original);
+        assert_eq!(
+            serde_json::to_value(&fixture.journal.deploy_replays).unwrap(),
+            history_before
+        );
+        assert_eq!(
+            std::fs::read(&fixture.migration_path).unwrap(),
+            migration_before
+        );
+        assert!(fixture.backups().is_empty());
+    }
+
+    #[test]
+    fn missing_lease_and_legacy_seed_mismatch_remain_rejected_without_changes() {
+        let mut fixture = Fixture::new(true);
+        let lease = fixture.journal.lease.take().unwrap();
+        assert!(format!("{:#}", fixture.normalize().unwrap_err()).contains("lease missing"));
+        fixture.journal.lease = Some(lease);
+        for current_is_seed in [true, false] {
+            let mut fixture = Fixture::new(current_is_seed);
+            for expected in ["", "another-cold-generation"] {
+                let error = fixture
+                    .journal
+                    .normalize_legacy_deployment_generation(
+                        expected,
+                        "cold-op",
+                        &fixture.seed,
+                        &fixture.workspace,
+                    )
+                    .unwrap_err();
+                assert!(format!("{error:#}").contains("original cold operation generation"));
+                assert_eq!(fixture.bytes(), fixture.original);
+                assert!(fixture.backups().is_empty());
+            }
         }
     }
 

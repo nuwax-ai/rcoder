@@ -287,7 +287,7 @@ impl RuntimeStore {
             let username =
                 std::env::var("USERNAME").context("resolve current user for token ACL")?;
             let status = std::process::Command::new("icacls")
-                .arg(&path)
+                .arg(path)
                 .arg("/inheritance:r")
                 .arg("/grant:r")
                 .arg(format!("{username}:(F)"))

@@ -138,7 +138,7 @@ pub(crate) async fn run_transient_with_env(
     run_transient_with_environment_and_timeout(argv, cwd, env, Duration::from_secs(300)).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) async fn run_transient_with_timeout(
     argv: &[String],
     cwd: &Path,
