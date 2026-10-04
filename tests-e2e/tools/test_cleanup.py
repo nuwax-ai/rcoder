@@ -7,6 +7,39 @@ from unittest.mock import patch
 from cleanup import owned, cleanup_case
 
 class OwnershipTests(unittest.TestCase):
+    def test_python_cache_fallback_keeps_own_compute_out_of_generic_purge(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cache = root / 'python-dependency-cache'
+            cache.mkdir()
+            name = 'rcoder-app-builder-pyc' + 'a' * 19
+            (cache / 'ownership.json').write_text(json.dumps({
+                'app_id': 'pyc' + 'a' * 19, 'index_name': 'rcoder-pip-index-' + 'b' * 16}))
+            late = self.container(name, labels={'rcoder.e2e.run': 'run'})
+            with patch('python_dependency_cache_contract.cleanup', return_value={'ok': False}), \
+                 patch('cleanup.command', side_effect=['new', json.dumps([late])]) as api:
+                errors = cleanup_case('case', 'run', root)
+            self.assertTrue(any('Python cache fixture cleanup incomplete' in error for error in errors))
+            self.assertEqual(api.call_count, 2, 'no generic removal or application purge')
+            self.assertTrue((cache / 'fallback-cleanup.json').exists())
+
+    def test_prod_fallback_uses_captured_names_and_keeps_data(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            prod = root / 'prod-readiness-contract'
+            prod.mkdir()
+            name = 'rcoder-app-captured'
+            (prod / 'ownership.json').write_text(json.dumps({
+                'project': 'rcoder-prod-' + 'a' * 16,
+                'application_containers': {'new': {'name': name}}}))
+            late = self.container(name, labels={'rcoder.e2e.run': 'run'})
+            with patch('prod_readiness_contract.cleanup', return_value={'ok': False}) as reclaim, \
+                 patch('cleanup.command', side_effect=['new', json.dumps([late])]) as api:
+                errors = cleanup_case('case', 'run', root)
+            reclaim.assert_called_once_with(prod, 'run', 'case', ())
+            self.assertTrue(any('Prod readiness fixture cleanup incomplete' in error for error in errors))
+            self.assertEqual(api.call_count, 2, 'an uncertain fixture must not fall through to generic removal')
+
     def test_shutdown_exact_receipt_reuses_creation_aware_cleanup(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -8,7 +8,7 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import tempfile
@@ -28,16 +28,21 @@ SCAN_SECONDS = 5
 # Authenticate the control channel and pin the process with a pidfd before any
 # signal. Never signal its parent (which can be agent_runner).
 OWNER_FAULT_SCRIPT = r'''
-import fcntl, http.client, ipaddress, json, os, pathlib, select, signal, socket, sys, uuid, xmlrpc.client
-scope = pathlib.Path('/home/user/logs/.app-cli-state')
+import fcntl, http.client, ipaddress, json, os, pathlib, re, select, signal, socket, sys, uuid, xmlrpc.client
 workspace, action = pathlib.Path(sys.argv[1]).resolve(), sys.argv[2]
+scope, app_id = pathlib.Path(sys.argv[3]).resolve(), sys.argv[4]
+assert re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', app_id), 'invalid application ID'
+assert workspace == pathlib.Path('/home/user')/app_id, 'cross-application source root'
+assert scope == workspace/'state'/app_id and scope.is_relative_to(workspace), 'foreign managed state root'
 assert action in ('freeze', 'kill'), 'unknown fault injection action'
 discovery = json.loads((scope/'supervisor.json').read_text())
 snapshot = discovery['snapshot']
 binding = {'component': 'app-cli', 'resource': str(workspace)}
 assert discovery['version'] == 2 and snapshot['binding'] == binding, 'owner binding differs'
 assert discovery['instance'] == snapshot['supervisor_id'], 'discovery instance differs'
-work = scope/'work'/snapshot['generation']
+assert str(uuid.UUID(snapshot['generation'])) == snapshot['generation'], 'invalid generation identity'
+work = (scope/'work'/snapshot['generation']).resolve()
+assert work.parent == scope/'work', 'generation scope escapes the managed state root'
 generation = json.loads((work/'generation.json').read_text())
 assert generation['id'] == work.name and generation['supervisor'] == discovery['instance'], 'generation differs'
 assert generation['phase'] == 'Running', 'no running owner generation'
@@ -160,26 +165,99 @@ def inspect(cid):
     return json.loads(docker('inspect', cid).stdout)[0]
 
 
-def idle_config(source, builder_image):
+def fixture_layout(app_id, source_root):
+    """固定本实验的平台源码根，不接受 code/ 或跨应用路径作为别名。"""
+    if not isinstance(app_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', app_id):
+        raise ValueError('idle fixture application ID must be one normal path component')
+    expected = '/home/user/' + app_id
+    if str(source_root) != expected:
+        raise ValueError('idle fixture source root does not match its application')
+    root = PurePosixPath(expected)
+    return {'source_root': str(root), 'state_root': str(root / 'state' / app_id)}
+
+
+def retained_state_root(mounts, app_id, source_root, owned_root):
+    layout = fixture_layout(app_id, source_root)
+    selected = [m for m in mounts if m['destination'] == layout['source_root']]
+    if len(selected) != 1 or selected[0]['type'] != 'bind' or selected[0].get('read_only'):
+        raise ValueError('managed state needs the exact writable retained source mount')
+    physical_root = Path(owned_root).resolve()
+    physical_source = Path(selected[0]['source']).resolve()
+    if not physical_source.is_relative_to(physical_root) or physical_source == physical_root:
+        raise ValueError('source mount is outside this fixture retained workspace')
+    physical_scope = physical_source / 'state' / app_id
+    if physical_scope.resolve() != physical_scope or not physical_scope.is_relative_to(physical_source):
+        raise ValueError('managed state mount path crosses an unexpected symlink')
+    return physical_scope
+
+
+def verify_builder_layout(environment, mounts, app_id, source_root, owned_root):
+    layout = fixture_layout(app_id, source_root)
+    expected = {'PROJECT_ID': app_id, 'USERAPP_WORKSPACE_DIR': '/home/user',
+                'APP_CLI_RUNTIME_WORKSPACE': layout['source_root'],
+                'APP_CLI_STATE_ROOT': layout['state_root']}
+    for key, value in expected.items():
+        actual = [entry.partition('=')[2] for entry in environment
+                  if entry.partition('=')[0] == key]
+        if actual != [value]:
+            raise ValueError(f'builder managed directory declaration differs: {key}')
+    retained = retained_state_root(mounts, app_id, source_root, owned_root)
+    return dict(layout, retained_state_root=str(retained))
+
+
+def generation_file(state_root, app_id, source_root, generation, filename):
+    layout = fixture_layout(app_id, source_root)
+    if str(state_root) != layout['state_root']:
+        raise ValueError('generation belongs to another managed state root')
+    try:
+        canonical = str(uuid.UUID(generation))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise ValueError('invalid captured generation identity') from error
+    if canonical != generation or filename not in ('generation.json', 'physical-exit.json'):
+        raise ValueError('invalid captured generation path')
+    return str(PurePosixPath(state_root) / 'work' / generation / filename)
+
+
+def physical_exit_matches(proof, captured, app_id, source_root):
+    layout = fixture_layout(app_id, source_root)
+    binding = {'component': 'app-cli', 'resource': layout['source_root']}
+    return (isinstance(proof, dict) and isinstance(captured, dict)
+            and isinstance(captured.get('generation'), str) and bool(captured['generation'])
+            and isinstance(captured.get('supervisor_id'), str) and bool(captured['supervisor_id'])
+            and isinstance(captured.get('domain'), dict) and bool(captured['domain'])
+            and captured.get('binding') == binding
+            and proof.get('generation') == captured['generation']
+            and proof.get('supervisor_id') == captured['supervisor_id']
+            and proof.get('domain') == captured['domain'] and proof.get('binding') == binding)
+
+
+def idle_config(source, builder_image, app_id, source_root):
+    layout = fixture_layout(app_id, source_root)
     cleanup = f'''cleanup_config:
   enabled: true
   idle_timeout_seconds: {IDLE_SECONDS}
   long_idle_timeout_seconds: {IDLE_SECONDS}
   cleanup_interval_seconds: {SCAN_SECONDS}
   container_protection_seconds: 15
-  docker_stop_timeout_seconds: 30
+  docker_stop_timeout_seconds: 3
 
 '''
     result, count = re.subn(r'(?ms)^cleanup_config:\n.*?(?=^[^ \t#\n]|\Z)', cleanup, source)
     if count != 1 or 'dev-rcoder-agent-runner:latest' not in result:
         raise ValueError('Compose fixture configuration changed; update idle fixture explicitly')
     result = result.replace('dev-rcoder-agent-runner:latest', builder_image)
-    # K8s keeps the entire workspace PVC, including the authoritative app-cli
-    # journal. Docker's default /home/user parent is ephemeral: explicitly put
-    # that journal on this builder's retained log mount so recreation cannot
-    # appear to pass merely by losing the problematic receipt.
+    # 源码目录本身就是按应用保留的 bind。状态必须置于其原生 state/app 布局；
+    # /home/user/logs 中另设 state 根会被现代 managed 身份校验拒绝。
+    declarations = ''.join('          ' + key + ': ' + json.dumps(value) + '\n'
+                           for key, value in (
+                               ('APP_CLI_STATE_ROOT', layout['state_root']),
+                               ('APP_CLI_RUNTIME_WORKSPACE', layout['source_root'])))
+    section = re.search(r'(?ms)^      user-app-builder:\n.*?(?=^      \S|\Z)', result)
+    if section is None or re.search(r'(?m)^          APP_CLI_(STATE_ROOT|RUNTIME_WORKSPACE):',
+                                    section.group()):
+        raise ValueError('builder fixture already declares managed directory authority')
     result, count = re.subn(r'(?m)^(      user-app-builder:\n(?:.*\n)*?        environment:\n)',
-                            r'\1          APP_CLI_STATE_ROOT: "/home/user/logs/.app-cli-state"\n', result, count=1)
+                            lambda match: match.group(1) + declarations, result, count=1)
     if count != 1:
         raise ValueError('expected one UserApp builder environment section')
     return result
@@ -253,6 +331,8 @@ def main():
     cid = controller = base = life = None
     private_config = None
     workspace = '/home/user/' + app
+    state_root = fixture_layout(app, workspace)['state_root']
+    evidence.update(source_root=workspace, state_root=state_root)
     dev_key = 'userapp:' + app
 
     def save():
@@ -356,10 +436,16 @@ def main():
             raise RuntimeError('builder lifecycle or image identity mismatch')
         cid = row['Id']
         snapshot = {'id': cid, 'image': row['Image'], 'lifecycle': life,
-                    'mounts': sorted(({'type': m['Type'], 'source': m['Source'], 'destination': m['Destination']}
+                    'mounts': sorted(({'type': m['Type'], 'source': m['Source'], 'destination': m['Destination'],
+                                      'read_only': not m.get('RW', False)}
                                       for m in row['Mounts'] if m['Destination'].startswith('/home/user')),
                                      key=lambda m: m['destination']),
                     'binaries': execute('sha256sum', '/usr/local/bin/agent_runner', '/usr/local/bin/app-cli').stdout}
+        layout = verify_builder_layout(row['Config'].get('Env') or [], snapshot['mounts'],
+                                       app, workspace, root / 'userapp-workspace')
+        snapshot.update(layout)
+        if not evidence['containers']:
+            check('builder source and state roots match managed scope', True, layout)
         evidence['containers'].append(snapshot)
         save()
         return snapshot
@@ -391,7 +477,8 @@ def main():
         log_mount = next(m for m in before['mounts'] if m['destination'] == '/home/user/logs')
         retained = Path(log_mount['source']) / 'dev-server-external.json'
         persisted = json.loads(retained.read_text())
-        coordinator = Path(log_mount['source']) / '.app-cli-state/.deploy-coordinator.json'
+        coordinator = retained_state_root(before['mounts'], app, workspace,
+                                           root / 'userapp-workspace') / '.deploy-coordinator.json'
         check(cycle + ': stale owner registration retained', persisted['owners'][dev_key]['owner']['runtime_instance_id'] == original_owner and coordinator.is_file(),
               {'state_sha256': hashlib.sha256(retained.read_bytes()).hexdigest(),
                'coordinator_retained': coordinator.is_file()})
@@ -408,7 +495,8 @@ def main():
         evidence['builder_image'] = docker('image', 'inspect', '--format', '{{.Id}}', args.builder_image).stdout.strip()
         receipt['builder_image'] = evidence['builder_image']
         private_config = Path(tempfile.mkdtemp(prefix=project + '-')) / 'config.yml'
-        private_config.write_text(idle_config((REPO / 'docker/config.yml').read_text(), evidence['builder_image']))
+        private_config.write_text(idle_config((REPO / 'docker/config.yml').read_text(),
+                                             evidence['builder_image'], app, workspace))
         private_config.chmod(0o600)
         config = service_config(root, evidence['rcoder_image'], run_id, case_id,
                                 os.environ.get('DOCKER_SOCKET_PATH', '/var/run/docker.sock'), private_config)
@@ -493,27 +581,33 @@ strip_prefix=false
         old_state = read_json('/home/user/logs/dev-server-external.json')
         check('live owner registration persisted', old_state.get('owners', {}).get(dev_key, {}).get('owner', {}).get('runtime_instance_id') == original_owner,
               {'owner': original_owner})
-        kernel_before = execute('find', '/home/user/logs/.app-cli-state', '-type', 'f').stdout.splitlines()
+        kernel_before = execute('find', state_root, '-type', 'f').stdout.splitlines()
         check('authoritative owner state resides on retained volume',
               any(path.endswith('/.deploy-coordinator.json') for path in kernel_before), kernel_before)
         evidence['owner_before'] = original_owner
         # Freeze the verified unified owner, not its agent_runner parent.
         # Real idle retirement must then consume physical exit evidence, since
         # this process cannot publish its own graceful cleanup receipt.
-        frozen = execute('python3', '-c', OWNER_FAULT_SCRIPT, workspace, 'freeze')
+        frozen = execute('python3', '-c', OWNER_FAULT_SCRIPT, workspace, 'freeze', state_root, app)
         evidence['frozen_owner'] = json.loads(frozen.stdout)
         after = recycle_and_ensure(before, original_owner, 'first recycle')
         # No preparatory Stop: Start itself must repair the unavailable owner.
         write({'web/version.txt': 'after-recycle'})
         count = start('start', 'after-recycle', count)
-        physical_exit = read_json('/home/user/logs/.app-cli-state/work/' +
-                                  evidence['frozen_owner']['generation'] + '/physical-exit.json')
         frozen_owner = evidence['frozen_owner']
-        if (physical_exit['generation'] != frozen_owner['generation']
-                or physical_exit['supervisor_id'] != frozen_owner['supervisor_id']
-                or physical_exit['domain'] != frozen_owner['domain']
-                or physical_exit['binding'] != frozen_owner['binding']):
-            raise RuntimeError('physical exit receipt does not match the captured owner')
+        retained_generation = read_json(generation_file(state_root, app, workspace,
+                                       frozen_owner['generation'], 'generation.json'))
+        check('first recycle: retained generation automatically becomes quiescent',
+              retained_generation['phase'] == 'Quiescent'
+              and retained_generation['id'] == frozen_owner['generation']
+              and retained_generation['supervisor'] == frozen_owner['supervisor_id']
+              and retained_generation['physical_domain'] == frozen_owner['domain'],
+              {'generation': retained_generation['id'], 'phase': retained_generation['phase'],
+               'supervisor': retained_generation['supervisor']})
+        physical_exit = read_json(generation_file(state_root, app, workspace,
+                                 frozen_owner['generation'], 'physical-exit.json'))
+        check('first recycle: physical exit matches captured owner',
+              physical_exit_matches(physical_exit, frozen_owner, app, workspace), physical_exit)
         evidence['physical_exit'] = physical_exit
         recovered_owner = owner()
         check('new owner replaces retired registration', recovered_owner != original_owner and
@@ -528,12 +622,12 @@ strip_prefix=false
         # Pipe guardians or the recorded external engine must be settled by
         # the next owner without restarting the container.
         same_container = cid
-        orphan = execute('python3', '-c', OWNER_FAULT_SCRIPT, workspace, 'kill')
+        orphan = execute('python3', '-c', OWNER_FAULT_SCRIPT, workspace, 'kill', state_root, app)
         evidence['same_container_orphan'] = json.loads(orphan.stdout)
         write({'web/version.txt': 'after-orphan'})
         count = start('restart', 'after-orphan', count)
-        old_generation = read_json('/home/user/logs/.app-cli-state/work/' +
-                                   evidence['same_container_orphan']['generation'] + '/generation.json')
+        old_generation = read_json(generation_file(state_root, app, workspace,
+                                  evidence['same_container_orphan']['generation'], 'generation.json'))
         check('same-container orphan automatically becomes quiescent', old_generation['phase'] == 'Quiescent'
               and cid == same_container and inspect(cid)['RestartCount'] == 0,
               {'phase': old_generation['phase'], 'container_id': cid,

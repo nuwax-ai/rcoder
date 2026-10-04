@@ -1,468 +1,739 @@
 #!/usr/bin/env python3
-"""app-cli recovery v2 K8s real-cluster experiments (plan §11.2/§11.3).
+"""app-cli 的个人 K8s 存储锁与容器重启实验。
 
-Runs against a personal test cluster (default context k3s-131):
-
-- T0-S RBD lock chain on real ceph-rbd storage: two same-node pods mounting
-  one RWO PVC contend through app-cli's ACTUAL owner acquisition path
-  (File::try_lock); SIGKILL releases; roles swap; a normal cross-node
-  detach/attach handover follows. No lock-file deletion anywhere.
-- K8s E same-Pod container restart: a builder-shaped pod (Downward API
-  platform binding) restarts its container in place — asserts Pod UID
-  unchanged, container identity changed, pid1 epoch changed, PVC sentinel
-  preserved, and the new owner reconciling the old generation.
-
-Only resources it creates are removed (namespace-scoped); PVC data of the
-retained volume is left for inspection unless --cleanup-volume is passed.
+cephfs-lock 只跑两个 Ready 节点共同挂载同一 RWX PVC 的真实 owner 竞争；
+all 另跑同节点 RBD 竞争、正常跨节点挂载交接与同 Pod 容器重启。
+必须显式指定节点、不可变镜像与构建回执。仅删除捕获 UID 的测试 Pod，
+使用 UID/resourceVersion 前置条件；namespace 和所有 PVC 永久保留。
 """
+
 import argparse
 import json
+import os
+import re
+import shlex
 import subprocess
 import time
 import uuid
+from pathlib import Path
+from urllib.parse import quote
+
+from prod_readiness_contract import source_identity
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--context', default='k3s-131')
-    parser.add_argument('--image', required=True)
-    parser.add_argument('--storage-class', default='ceph-rbd')
-    parser.add_argument('--cephfs-class', default='cephfs',
-                        help='cephfs StorageClass for the cross-client RWX '
-                             'experiment; empty string disables it')
-    parser.add_argument('--report', required=True, type=str)
-    parser.add_argument('--cleanup-volume', action='store_true')
-    parser.add_argument('--node-ssh', action='append', default=[],
-                        help='node=host[:user[:password]] mapping for runtime '
-                             'container restarts, e.g. soddy=192.168.32.131:soddy:pw')
-    args = parser.parse_args()
+SOURCE_STEP = 'source matches frozen build receipt and stays unchanged'
 
-    run_id = 'rcv' + uuid.uuid4().hex[:8]
-    namespace = f'rcoder-e2e-soddy-lock-{run_id}'
-    report = {'run_id': run_id, 'namespace': namespace, 'image': args.image,
-              'storage_class': args.storage_class, 'checks': [], 'scenarios': {}}
 
-    def kubectl(*argv, check=True, timeout=180, input_text=None):
-        cmd = ['kubectl', '--context', args.context, '-n', namespace, *argv]
-        return subprocess.run(cmd, capture_output=True, text=True, check=check,
-                              timeout=timeout, input=input_text)
+CEPHFS_STEPS = (
+    'T0-S-fs: cephfs RWX PVC bound',
+    'T0-S-fs: owner acquires on cephfs',
+    'T0-S-fs: independent Ready nodes share the exact PVC',
+    'T0-S-fs: cross-client contender converges',
+    'T0-S-fs: holder identity stays live and unchanged',
+    'T0-S-fs: contender has no independent management listener',
+    'T0-S-fs: cross-client SIGKILL handover',
+    'T0-S-fs: sentinel survives cross-client handover',
+)
+RBD_STEPS = (
+    'setup: RBD PVC bound',
+    'T0-S: first owner acquires on RBD volume',
+    'T0-S: same-node competitor converges to the single owner',
+    'T0-S: still exactly one discovery after contention',
+    'T0-S: holder identity stays live and unchanged',
+    'T0-S: contender has no independent management listener',
+    'T0-S: SIGKILL releases lock; successor acquires',
+    'T0-S: sentinel data preserved across owner change',
+    'T0-S: role swap keeps single owner semantics',
+    'T0-S: role swap holder stays live and contender has no API',
+    'T0-S: cross-node detach/attach handover',
+    'T0-S: data intact after cross-node handover',
+)
+RESTART_STEPS = (
+    'K8s-E: owner running with platform binding',
+    'K8s-E: downward API binding files present',
+    'K8s-E: container restarted in place',
+    'K8s-E: Pod UID unchanged',
+    'K8s-E: container identity changed',
+    'K8s-E: pid1 epoch changed',
+    'K8s-E: new owner reconciles and serves after restart',
+    'K8s-E: PVC sentinel preserved',
+)
+REQUIRED_STEPS = {
+    'cephfs-lock': (SOURCE_STEP,) + CEPHFS_STEPS,
+    'all': (SOURCE_STEP,) + RBD_STEPS + CEPHFS_STEPS + RESTART_STEPS,
+}
 
-    def kubectl_raw(*argv, check=True, timeout=180):
-        return subprocess.run(['kubectl', '--context', args.context, *argv],
-                              capture_output=True, text=True, check=check, timeout=timeout)
 
-    def check(label, passed, detail=None, scenario=None):
-        report['checks'].append({'name': label, 'ok': bool(passed), 'detail': detail})
+def validate_required_steps(report, scenario):
+    """缺失/重复必测步骤和任何失败都不能被总 success 掩盖。"""
+    checks = report.get('checks', [])
+    failures = [c['name'] for c in checks if not c.get('ok')]
+    names = [c['name'] for c in checks]
+    missing = [name for name in REQUIRED_STEPS[scenario]
+               if names.count(name) != 1]
+    if missing or failures:
+        raise RuntimeError(f'incomplete acceptance: missing/duplicate={missing}; '
+                           f'failed={failures}')
+
+
+def select_nodes(document, selected):
+    if len(selected) != 2 or len(set(selected)) != 2:
+        raise ValueError('exactly two distinct --node arguments are required')
+    nodes = {item['metadata']['name']: item for item in document['items']}
+    for name in selected:
+        info = nodes.get(name)
+        if info is None:
+            raise ValueError(f'node not found: {name}')
+        if info.get('spec', {}).get('unschedulable'):
+            raise ValueError(f'node is unschedulable: {name}')
+        ready = any(c.get('type') == 'Ready' and c.get('status') == 'True'
+                    for c in info.get('status', {}).get('conditions', []))
+        if not ready:
+            raise ValueError(f'node is not Ready: {name}')
+    return list(selected)
+
+
+def require_build_source(value, current):
+    """使用严格启动器的冻结清单口径，不接受仅具备合法 hash 形状的旧回执。"""
+    if (not re.fullmatch(r'[0-9a-f]{40}', current.get('origin_head', ''))
+            or not re.fullmatch(r'[0-9a-f]{64}', current.get('worktree_sha256', ''))):
+        raise ValueError('current frozen source identity is unavailable')
+    if (value.get('source_commit') != current['origin_head']
+            or value.get('source_digest') != current['worktree_sha256']):
+        raise ValueError('build receipt does not match current frozen source')
+
+
+def load_build_receipt(path, image, current):
+    value = json.loads(Path(path).read_text(encoding='utf-8'))
+    if value.get('schema_version') != 1 or value.get('image') != image:
+        raise ValueError('build receipt schema/image does not match this run')
+    if not re.fullmatch(r'.+@sha256:[0-9a-f]{64}', image):
+        raise ValueError('--image must be an immutable @sha256 digest reference')
+    for key, width in (('app_cli_sha256', 64), ('source_commit', 40),
+                       ('source_digest', 64)):
+        if not re.fullmatch(r'[0-9a-f]{' + str(width) + r'}', value.get(key, '')):
+            raise ValueError(f'build receipt has no valid {key}')
+    require_build_source(value, current)
+    return value
+
+
+class ClusterExperiment:
+    def __init__(self, args, runner=subprocess.run, sleep=time.sleep,
+                 clock=time.monotonic):
+        self.args = args
+        self.runner = runner
+        self.sleep = sleep
+        self.clock = clock
+        self.run_id = 'rcv' + uuid.uuid4().hex[:8]
+        self.namespace = f'rcoder-e2e-soddy-lock-{self.run_id}'
+        self.pods = {}
+        self.volumes = {}
+        self.unconfirmed_creations = []
+        self.namespace_uid = None
+        self.receipt = None
+        self.source_dir = Path(args.source_dir).resolve()
+        self.source_before = None
+        self.report = {
+            'run_id': self.run_id, 'namespace': self.namespace,
+            'context': args.context, 'scenario': args.scenario,
+            'image': args.image, 'storage_class': args.storage_class,
+            'checks': [], 'scenarios': {}, 'pods': {}, 'retained_volumes': [],
+            'deleted_pods': [],
+            'evidence_level': 'real K8s only when all required checks pass',
+        }
+
+    def kubectl(self, *argv, check=True, timeout=180, input_text=None,
+                cluster=False):
+        cmd = ['kubectl', '--context', self.args.context]
+        if not cluster:
+            cmd += ['-n', self.namespace]
+        return self.runner(cmd + list(argv), capture_output=True, text=True,
+                           check=check, timeout=timeout, input=input_text)
+
+    def check(self, label, passed, detail=None, scenario=None):
+        self.report['checks'].append(
+            {'name': label, 'ok': bool(passed), 'detail': detail})
         if scenario:
-            report['scenarios'].setdefault(scenario, []).append(label)
+            self.report['scenarios'].setdefault(scenario, []).append(label)
         print(label, 'PASS' if passed else 'FAIL', flush=True)
         if not passed:
             raise RuntimeError(label)
 
-    def apply(name, manifest):
-        kubectl('apply', '-f', '-', input_text=json.dumps(manifest))
+    def create(self, manifest):
+        manifest['metadata'].setdefault('labels', {})[
+            'rcoder.io/lock-test-run'] = self.run_id
+        attempt = {'kind': manifest['kind'], 'name': manifest['metadata']['name']}
+        self.unconfirmed_creations.append(attempt)
+        result = self.kubectl('create', '-f', '-', '-o', 'json',
+                              input_text=json.dumps(manifest))
+        info = json.loads(result.stdout)
+        meta = info['metadata']
+        if (info.get('kind') != attempt['kind'] or meta.get('name') != attempt['name']
+                or meta.get('namespace') != self.namespace or not meta.get('uid')
+                or not meta.get('resourceVersion')
+                or meta.get('labels', {}).get('rcoder.io/lock-test-run')
+                != self.run_id):
+            raise RuntimeError('created resource identity is unavailable')
+        if info['kind'] == 'Pod':
+            self.pods[meta['name']] = {'uid': meta['uid'],
+                                      'resource_version': meta['resourceVersion']}
+            self.report['pods'][meta['name']] = {
+                'uid': meta['uid'], 'creation_resource_version': meta['resourceVersion']}
+        elif info['kind'] == 'PersistentVolumeClaim':
+            self.volumes[meta['name']] = {'uid': meta['uid']}
+        self.unconfirmed_creations.remove(attempt)
+        return info
 
-    def wait_ready(pod, budget=180):
-        deadline = time.monotonic() + budget
-        while time.monotonic() < deadline:
-            out = kubectl('get', 'pod', pod, '-o', 'json', check=False).stdout
+    def get(self, kind, name, absent_ok=False):
+        argv = ['get', kind, name, '-o', 'json']
+        if absent_ok:
+            argv.append('--ignore-not-found=true')
+        out = self.kubectl(*argv)
+        if out.stdout.strip():
+            return json.loads(out.stdout)
+        if absent_ok:
+            return None
+        raise RuntimeError(f'{kind} {name} observation returned no object')
+
+    def delete_pod(self, name, budget=180):
+        captured = self.pods.get(name)
+        if captured is None:
+            raise RuntimeError(f'cannot delete uncaptured Pod: {name}')
+        current = self.get('pod', name, absent_ok=True)
+        if current is None:
+            self.report['deleted_pods'].append({'name': name, 'uid': captured['uid'],
+                                               'already_absent': True})
+            self.pods.pop(name)
+            return
+        meta = current['metadata']
+        if (meta['uid'] != captured['uid']
+                or meta.get('labels', {}).get('rcoder.io/lock-test-run')
+                != self.run_id):
+            raise RuntimeError(f'Pod identity changed; retained without deletion: {name}')
+        # kubectl 的普通 delete 不带版本保护；raw DELETE 支持 stdin 请求体。
+        # 仅使用当前已核验 UID 的最新 RV，不用 --force、selector 或 namespace 删除。
+        options = {'apiVersion': 'v1', 'kind': 'DeleteOptions',
+                   'preconditions': {'uid': captured['uid'],
+                                     'resourceVersion': meta['resourceVersion']}}
+        path = f'/api/v1/namespaces/{quote(self.namespace)}/pods/{quote(name)}'
+        self.kubectl('delete', '--raw', path, '-f', '-',
+                     input_text=json.dumps(options))
+        deadline = self.clock() + budget
+        while self.clock() < deadline:
+            observed = self.get('pod', name, absent_ok=True)
+            if observed is None:
+                self.report['deleted_pods'].append({'name': name, 'uid': captured['uid'],
+                    'delete_resource_version': meta['resourceVersion'], 'confirmed_absent': True})
+                self.pods.pop(name)
+                return
+            if observed['metadata']['uid'] != captured['uid']:
+                raise RuntimeError(f'Pod replaced during deletion; retained: {name}')
+            self.sleep(1)
+        raise RuntimeError(f'captured Pod deletion unconfirmed: {name}')
+
+    def cleanup(self):
+        errors = [f'{item["kind"]} {item["name"]}: creation response unavailable; '
+                  'no captured UID, retained without deletion'
+                  for item in self.unconfirmed_creations]
+        self.report['unconfirmed_creations'] = list(self.unconfirmed_creations)
+        for name in list(self.pods):
             try:
-                info = json.loads(out)
-                statuses = [c.get('ready') for c in
-                            info['status'].get('containerStatuses', [])]
-                if statuses and all(statuses):
-                    return info
-            except (ValueError, KeyError):
-                pass
-            time.sleep(2)
-        raise RuntimeError(f'{pod} not ready')
+                self.delete_pod(name)
+            except Exception as error:
+                errors.append(f'Pod {name}: {self.error_text(error)}')
+        retained = []
+        for name, captured in self.volumes.items():
+            try:
+                info = self.get('pvc', name)
+                if info['metadata']['uid'] != captured['uid']:
+                    raise RuntimeError('PVC UID changed; preservation not confirmed')
+                if info['metadata'].get('deletionTimestamp'):
+                    raise RuntimeError('PVC is being deleted; preservation not confirmed')
+                retained.append(dict(captured, name=name,
+                    phase=info.get('status', {}).get('phase'),
+                    volume_name=info.get('spec', {}).get('volumeName')))
+            except Exception as error:
+                errors.append(f'PVC {name}: {self.error_text(error)}')
+                retained.append({'name': name, 'uid': captured['uid'],
+                                 'error': self.error_text(error)})
+        self.report['retained_volumes'] = retained
+        if self.namespace_uid:
+            try:
+                out = self.kubectl('get', 'namespace', self.namespace, '-o',
+                                   'json', cluster=True)
+                info = json.loads(out.stdout)
+                if info['metadata']['uid'] != self.namespace_uid:
+                    raise RuntimeError('namespace UID changed')
+                if (info['metadata'].get('deletionTimestamp')
+                        or info.get('status', {}).get('phase') != 'Active'):
+                    raise RuntimeError('namespace is not Active; preservation not confirmed')
+                self.report['retained_namespace'] = {
+                    'name': self.namespace, 'uid': self.namespace_uid,
+                    'phase': info.get('status', {}).get('phase')}
+            except Exception as error:
+                errors.append(f'namespace: {self.error_text(error)}')
+        self.report['cleanup_errors'] = errors
+        self.report['cleanup_ok'] = not errors
+        return not errors
 
-    def exec_in(pod, command, check=True, timeout=120):
-        return kubectl('exec', pod, '--', 'sh', '-ec', command,
-                       check=check, timeout=timeout)
+    @staticmethod
+    def error_text(error):
+        if isinstance(error, subprocess.CalledProcessError):
+            return f'kubectl exit {error.returncode}: {(error.stderr or "")[-1000:]}'
+        return str(error)
 
-    def pod_spec(name, node, command, pvc, binding=False):
+    def exec_in(self, pod, command, check=True, timeout=120):
+        return self.kubectl('exec', pod, '--', 'sh', '-ec', command,
+                            check=check, timeout=timeout)
+
+    def wait_ready(self, name, expected_node, pvc, budget=300):
+        deadline = self.clock() + budget
+        while self.clock() < deadline:
+            info = self.get('pod', name)
+            if info['metadata']['uid'] != self.pods[name]['uid']:
+                raise RuntimeError(f'Pod identity changed during startup: {name}')
+            statuses = info.get('status', {}).get('containerStatuses', [])
+            if statuses and all(c.get('ready') for c in statuses):
+                if info['spec'].get('nodeName') != expected_node:
+                    raise RuntimeError(f'Pod scheduled on unexpected node: {name}')
+                names = [v.get('persistentVolumeClaim', {}).get('claimName')
+                         for v in info['spec']['volumes']]
+                if pvc not in names:
+                    raise RuntimeError(f'Pod does not mount expected PVC: {name}')
+                volume = self.get('pvc', pvc)
+                if volume['metadata']['uid'] != self.volumes[pvc]['uid']:
+                    raise RuntimeError(f'PVC identity changed: {pvc}')
+                image_id = statuses[0].get('imageID', '')
+                digest = self.args.image.split('@')[1]
+                if not image_id.endswith(digest):
+                    raise RuntimeError(f'Pod imageID differs from receipt: {image_id}')
+                binary = self.exec_in(name, 'sha256sum "$(command -v app-cli)"').stdout
+                if binary.split()[0] != self.receipt['app_cli_sha256']:
+                    raise RuntimeError(f'Pod app-cli binary differs from receipt: {name}')
+                self.report['pods'][name] = {
+                    'uid': info['metadata']['uid'], 'node_name': expected_node,
+                    'container_id': statuses[0].get('containerID'),
+                    'image_id': image_id, 'pvc': pvc,
+                    'pvc_uid': volume['metadata']['uid'],
+                    'app_cli_sha256': binary.split()[0]}
+                return info
+            self.sleep(2)
+        raise RuntimeError(f'{name} not ready')
+
+    def pod_spec(self, name, node, command, pvc, binding=False):
         volumes = [{'name': 'shared',
                     'persistentVolumeClaim': {'claimName': pvc}}]
-        if binding:
-            volumes.append({
-                'name': 'rcoder-platform-binding',
-                'downwardAPI': {'items': [
-                    {'path': 'RCODER_PHYSICAL_POD_UID',
-                     'fieldRef': {'fieldPath': 'metadata.uid'}},
-                    {'path': 'execution-domain',
-                     'fieldRef': {'fieldPath':
-                                  "metadata.annotations['rcoder.io/execution-domain']"}},
-                ]}})
         mounts = [{'name': 'shared', 'mountPath': '/shared'}]
         if binding:
+            volumes.append({'name': 'rcoder-platform-binding', 'downwardAPI': {
+                'items': [{'path': 'RCODER_PHYSICAL_POD_UID', 'fieldRef': {
+                    'fieldPath': 'metadata.uid'}},
+                    {'path': 'execution-domain', 'fieldRef': {'fieldPath':
+                     "metadata.annotations['rcoder.io/execution-domain']"}}]}})
             mounts.append({'name': 'rcoder-platform-binding',
                            'mountPath': '/etc/rcoder/platform', 'readOnly': True})
         return {
             'apiVersion': 'v1', 'kind': 'Pod',
-            'metadata': {'name': name,
-                         'annotations': {'rcoder.io/execution-domain':
-                                         json.dumps({'authority': 'k8s-lock-test',
-                                                     'volume': f'pvc:{pvc}',
-                                                     'instance': '',
-                                                     'instance_source_env':
-                                                         'RCODER_PHYSICAL_POD_UID'})}},
+            'metadata': {'name': name, 'annotations': {
+                'rcoder.io/execution-domain': json.dumps({
+                    'authority': 'k8s-lock-test', 'volume': f'pvc:{pvc}',
+                    'instance': '', 'instance_source_env': 'RCODER_PHYSICAL_POD_UID'})}},
             'spec': {'nodeName': node, 'restartPolicy': 'Always',
-                     'volumes': volumes,
-                     'containers': [{
-                         'name': 'main', 'image': args.image,
-                         'imagePullPolicy': 'IfNotPresent',
-                         'command': command,
+                     'securityContext': {'fsGroup': 1000},
+                     'volumes': volumes, 'containers': [{
+                         'name': 'main', 'image': self.args.image,
+                         'imagePullPolicy': 'IfNotPresent', 'command': command,
+                         'env': [{'name': 'APP_CLI_STATE_ROOT', 'value': '/shared/state'}],
                          'volumeMounts': mounts}]},
         }
 
-    def serve_owner(pod, node, pvc, binding=False):
-        # serve 作为后台子进程、存活壳为 pid1：SIGKILL 持锁进程时容器不退出、
-        # 不自动复活 serve（successor 有获锁窗口）；pod 删除仍走正常终止。
-        return pod_spec(pod, node,
-                        ['/bin/sh', '-ec',
-                         'mkdir -p /shared/ws /shared/logs; '
-                         'app-cli serve --workspace /shared/ws '
-                         '--log-dir /shared/logs --admin-addr 0.0.0.0:3010 '
-                         '>/shared/logs/serve.out 2>&1 & '
-                         'echo $! > /shared/logs/serve.pid; '
-                         'wait $(cat /shared/logs/serve.pid) || true; '
-                         'sleep 3600'],
-                        pvc, binding=binding)
+    def serve_owner(self, name, node, pvc, binding=False):
+        # PID、输出文件按 Pod 分离；不能从共享文件误杀另一个 Pod 的同号 PID。
+        return self.pod_spec(name, node, ['/bin/sh', '-ec',
+            'mkdir -p /shared/ws /shared/logs; '
+            'app-cli serve --workspace /shared/ws --log-dir /shared/logs '
+            '--admin-addr 0.0.0.0:3010 > /shared/logs/' + name + '.out 2>&1 & '
+            'echo $! > /tmp/serve.pid; wait $(cat /tmp/serve.pid) || true; sleep 3600'],
+            pvc, binding)
 
-    def try_second_owner(pod, node, pvc, budget=180):
-        """A competing serve against a live owner: refused (lock held, no
-        second API) or transferred (dispatch to the running owner). Both prove
-        single-owner semantics; a second discovery must never appear."""
-        spec = pod_spec(pod, node,
-                        ['/bin/sh', '-ec',
-                         'mkdir -p /shared/logs; '
-                         'rc=0; timeout 90 app-cli serve --workspace /shared/ws '
-                         '--log-dir /shared/logs --admin-addr 0.0.0.0:3999 '
-                         '>/shared/logs/second.log 2>&1 || rc=$?; '
-                         'echo "second-rc=$rc"; '
-                         'sleep 3600'],
-                        pvc)
-        apply(pod, spec)
-        wait_ready(pod)
-        deadline = time.monotonic() + budget
-        detail = ''
-        while time.monotonic() < deadline:
-            detail = exec_in(pod, 'tail -c 900 /shared/logs/second.log',
-                             check=False).stdout or ''
-            if 'second-rc=' not in detail and 'unified' not in detail:
-                # serve still starting; keep waiting for its terminal line
-                pass
-            logs = kubectl('logs', pod, check=False, timeout=30).stdout or ''
+    def observe_owner(self, pod):
+        script = '''import json,os,urllib.request
+pid=int(open('/tmp/serve.pid').read())
+stat=open('/proc/%d/stat'%pid).read().rsplit(')',1)[1].split()
+if stat[0]=='Z': raise RuntimeError('captured owner is a zombie')
+cmd=open('/proc/%d/cmdline'%pid,'rb').read().replace(b'\\0',b' ').decode()
+if 'app-cli serve ' not in cmd: raise RuntimeError('captured PID is not serve')
+socket_inodes=[]
+for fd in os.listdir('/proc/%d/fd'%pid):
+ try:
+  target=os.readlink('/proc/%d/fd/%s'%(pid,fd))
+ except FileNotFoundError: continue
+ if target.startswith('socket:['): socket_inodes.append(target[8:-1])
+listener_inodes=[]
+for path in ('/proc/net/tcp','/proc/net/tcp6'):
+ for line in open(path).read().splitlines()[1:]:
+  fields=line.split()
+  if fields[3]=='0A' and int(fields[1].split(':')[1],16)==3010:
+   listener_inodes.append(fields[9])
+if len(listener_inodes)!=1 or listener_inodes[0] not in socket_inodes:
+ raise RuntimeError('captured owner does not own the management listener')
+with urllib.request.urlopen('http://127.0.0.1:3010/v1/runtime/identity',timeout=3) as r:
+ identity=json.load(r)['data']
+discovery=json.load(open('/shared/state/supervisor.json'))
+print(json.dumps({'pid':pid,'starttime':stat[19],'cmdline':cmd,
+ 'instance':discovery['instance'],'runtime_instance':identity['runtime_instance_id'],
+ 'management_socket':listener_inodes[0]}))'''
+        result = self.exec_in(pod, 'python3 -c ' + shlex.quote(script))
+        return json.loads(result.stdout)
+
+    def wait_owner(self, pod, previous=None, budget=120):
+        deadline = self.clock() + budget
+        error = None
+        while self.clock() < deadline:
+            try:
+                observed = self.observe_owner(pod)
+                if previous is None or observed['instance'] != previous['instance']:
+                    self.report['pods'][pod]['owner'] = observed
+                    return observed
+            except Exception as caught:
+                error = self.error_text(caught)
+            self.sleep(2)
+        raise RuntimeError(f'owner API not ready in {pod}: {error}')
+
+    def kill_exact_owner(self, pod, captured):
+        script = '''import json,os,select,signal
+expected=json.loads(%r)
+pid=expected['pid']; fd=os.pidfd_open(pid)
+stat=open('/proc/%%d/stat'%%pid).read().rsplit(')',1)[1].split()
+cmd=open('/proc/%%d/cmdline'%%pid,'rb').read().replace(b'\\0',b' ').decode()
+if stat[19]!=expected['starttime'] or cmd!=expected['cmdline']:
+ raise RuntimeError('captured owner PID identity changed; refusing signal')
+signal.pidfd_send_signal(fd,signal.SIGKILL)
+poller=select.poll(); poller.register(fd,select.POLLIN)
+if not poller.poll(10000): raise RuntimeError('captured owner physical exit unconfirmed')
+os.close(fd)''' % json.dumps(captured)
+        self.exec_in(pod, 'python3 -c ' + shlex.quote(script))
+
+    def no_management_listener(self, pod):
+        script = '''import json
+ports=[]
+for path in ('/proc/net/tcp','/proc/net/tcp6'):
+ for line in open(path).read().splitlines()[1:]:
+  fields=line.split()
+  if fields[3]=='0A' and int(fields[1].split(':')[1],16) in (3010,3999):
+   ports.append(int(fields[1].split(':')[1],16))
+print(json.dumps(ports))'''
+        return json.loads(self.exec_in(pod, 'python3 -c ' + shlex.quote(script)).stdout)
+
+    def compete(self, name, node, pvc):
+        command = ['/bin/sh', '-ec',
+            'mkdir -p /shared/logs; rc=0; timeout 90 app-cli serve '
+            '--workspace /shared/ws --log-dir /shared/logs '
+            '--admin-addr 0.0.0.0:3999 > /shared/logs/' + name + '.out 2>&1 || rc=$?; '
+            'echo "second-rc=$rc"; sleep 3600']
+        self.create(self.pod_spec(name, node, command, pvc))
+        self.wait_ready(name, node, pvc)
+        deadline = self.clock() + 120
+        while self.clock() < deadline:
+            listeners = self.no_management_listener(name)
+            if listeners:
+                raise RuntimeError(f'competing owner opened an independent management listener: '
+                                   f'{name} ports={listeners}')
+            logs = self.kubectl('logs', name).stdout
             if 'second-rc=' in logs:
-                detail = logs[-900:] + '\n---file---\n' + detail
-                break
-            time.sleep(3)
-        kubectl('delete', 'pod', pod, '--wait=true')
-        return detail
+                detail = self.exec_in(name, 'tail -c 900 /shared/logs/' + name + '.out').stdout
+                return logs[-900:] + '\n' + detail, self.no_management_listener(name)
+            self.sleep(2)
+        raise RuntimeError(f'competing serve did not finish: {name}')
 
-    def read_discovery(pod):
-        out = exec_in(pod,
-                      'find /shared -name supervisor.json -exec cat {} \\; 2>/dev/null',
-                      check=False).stdout
-        try:
-            return json.loads(out.strip().splitlines()[-1])['instance']
-        except (ValueError, IndexError, KeyError):
-            return None
+    @staticmethod
+    def converged(detail):
+        return ('owner lock is held' in detail
+                or 'refusing to start a competing orchestrator' in detail
+                or 'dispatch' in detail.lower() or 'second-rc=0' in detail)
 
-    def discovery_instance():
-        return read_discovery('lock-a')
+    def create_volume(self, name, storage, mode, label, scenario):
+        self.create({'apiVersion': 'v1', 'kind': 'PersistentVolumeClaim',
+            'metadata': {'name': name}, 'spec': {'accessModes': [mode],
+                'resources': {'requests': {'storage': '1Gi'}},
+                'storageClassName': storage}})
+        deadline = self.clock() + 180
+        while self.clock() < deadline:
+            info = self.get('pvc', name)
+            if info['metadata']['uid'] != self.volumes[name]['uid']:
+                raise RuntimeError('PVC identity changed before binding')
+            if info.get('status', {}).get('phase') == 'Bound':
+                volume_name = info['spec'].get('volumeName')
+                if not volume_name:
+                    raise RuntimeError('Bound PVC has no PV identity')
+                pv = json.loads(self.kubectl('get', 'pv', volume_name, '-o',
+                                            'json', cluster=True).stdout)
+                claim = pv['spec'].get('claimRef', {})
+                if (claim.get('uid') != self.volumes[name]['uid']
+                        or claim.get('namespace') != self.namespace
+                        or claim.get('name') != name):
+                    raise RuntimeError('PV does not bind the exact captured PVC')
+                driver = pv['spec'].get('csi', {}).get('driver', '')
+                if mode == 'ReadWriteMany' and 'cephfs' not in driver.lower():
+                    raise RuntimeError('CephFS scenario requires an actual CephFS CSI PV')
+                if mode == 'ReadWriteOnce' and 'rbd' not in driver.lower():
+                    raise RuntimeError('RBD scenario requires an actual RBD CSI PV')
+                self.volumes[name].update(pv_name=volume_name,
+                    pv_uid=pv['metadata']['uid'], csi_driver=driver)
+                self.check(label, True, {'uid': info['metadata']['uid'],
+                           'phase': 'Bound', 'pv_uid': pv['metadata']['uid'],
+                           'csi_driver': driver}, scenario)
+                return
+            self.sleep(2)
+        self.check(label, False, info.get('status'), scenario)
 
-    node_ssh = {}
-    for mapping in args.node_ssh:
-        node, _, rest = mapping.partition('=')
-        host, _, cred = rest.partition(':')
-        user, _, password = cred.partition(':')
-        node_ssh[node] = (host, user or 'soddy', password)
+    def run_cephfs(self, nodes):
+        pvc = f'app-cli-lockfs-{self.run_id}'
+        self.create_volume(pvc, self.args.cephfs_class, 'ReadWriteMany',
+                           CEPHFS_STEPS[0], 'T0-S-fs')
+        self.create(self.serve_owner('fs-a', nodes[0], pvc))
+        self.wait_ready('fs-a', nodes[0], pvc)
+        first = self.wait_owner('fs-a')
+        self.check(CEPHFS_STEPS[1], True, first, 'T0-S-fs')
+        self.exec_in('fs-a', 'echo first > /shared/sentinel')
+        detail, listeners = self.compete('fs-b', nodes[1], pvc)
+        a, b = self.report['pods']['fs-a'], self.report['pods']['fs-b']
+        self.check(CEPHFS_STEPS[2], a['node_name'] != b['node_name']
+                   and a['pvc_uid'] == b['pvc_uid'] == self.volumes[pvc]['uid'],
+                   {'holder': a, 'contender': b}, 'T0-S-fs')
+        self.check(CEPHFS_STEPS[3], self.converged(detail), detail, 'T0-S-fs')
+        self.check(CEPHFS_STEPS[4], self.observe_owner('fs-a') == first,
+                   first, 'T0-S-fs')
+        self.check(CEPHFS_STEPS[5], not listeners, listeners, 'T0-S-fs')
+        self.delete_pod('fs-b')
+        self.kill_exact_owner('fs-a', first)
+        self.create(self.serve_owner('fs-c', nodes[1], pvc))
+        self.wait_ready('fs-c', nodes[1], pvc)
+        second = self.wait_owner('fs-c', previous=first)
+        self.check(CEPHFS_STEPS[6], second['instance'] != first['instance']
+                   and second['runtime_instance'] != first['runtime_instance'],
+                   {'old': first, 'new': second}, 'T0-S-fs')
+        self.check(CEPHFS_STEPS[7], self.exec_in('fs-c', 'cat /shared/sentinel').stdout.strip()
+                   == 'first', None, 'T0-S-fs')
+        self.delete_pod('fs-a')
+        self.delete_pod('fs-c')
 
-    def ssh_node(node, command, timeout=120):
-        host, user, password = node_ssh.get(
-            node, (None, None, None))
-        if host is None:
-            raise RuntimeError(f'no --node-ssh mapping for node {node}')
-        remote = f"echo {password} | sudo -S sh -ec '{command}'"
-        return subprocess.run(['ssh', f'{user}@{host}', remote],
-                              capture_output=True, text=True, timeout=timeout)
+    def run_rbd(self, nodes):
+        pvc = f'app-cli-lock-{self.run_id}'
+        self.create_volume(pvc, self.args.storage_class, 'ReadWriteOnce',
+                           RBD_STEPS[0], 'T0-S')
+        self.create(self.serve_owner('lock-a', nodes[0], pvc))
+        self.wait_ready('lock-a', nodes[0], pvc)
+        first = self.wait_owner('lock-a')
+        self.check(RBD_STEPS[1], True, first, 'T0-S')
+        self.exec_in('lock-a', 'echo first > /shared/sentinel')
+        detail, listeners = self.compete('lock-b-contender', nodes[0], pvc)
+        self.check(RBD_STEPS[2], self.converged(detail), detail, 'T0-S')
+        count = self.exec_in('lock-a', 'find /shared -name supervisor.json | wc -l').stdout.strip()
+        self.check(RBD_STEPS[3], count == '1', count, 'T0-S')
+        self.check(RBD_STEPS[4], self.observe_owner('lock-a') == first, first, 'T0-S')
+        self.check(RBD_STEPS[5], not listeners, listeners, 'T0-S')
+        self.delete_pod('lock-b-contender')
+        self.kill_exact_owner('lock-a', first)
+        self.create(self.serve_owner('lock-b', nodes[0], pvc))
+        self.wait_ready('lock-b', nodes[0], pvc)
+        second = self.wait_owner('lock-b', previous=first)
+        self.check(RBD_STEPS[6], second['instance'] != first['instance'],
+                   {'old': first, 'new': second}, 'T0-S')
+        self.check(RBD_STEPS[7], self.exec_in('lock-b', 'cat /shared/sentinel').stdout.strip()
+                   == 'first', None, 'T0-S')
+        detail2, listeners2 = self.compete('lock-a-contender', nodes[0], pvc)
+        count2 = self.exec_in('lock-b', 'find /shared -name supervisor.json | wc -l').stdout.strip()
+        self.check(RBD_STEPS[8], self.converged(detail2) and count2 == '1', detail2, 'T0-S')
+        self.check(RBD_STEPS[9], self.observe_owner('lock-b') == second and not listeners2,
+                   listeners2, 'T0-S')
+        self.delete_pod('lock-a-contender')
+        self.delete_pod('lock-b')
+        self.delete_pod('lock-a')
+        self.create(self.serve_owner('lock-c', nodes[1], pvc))
+        self.wait_ready('lock-c', nodes[1], pvc)
+        third = self.wait_owner('lock-c', previous=second)
+        self.check(RBD_STEPS[10], third['instance'] not in (first['instance'], second['instance']),
+                   third, 'T0-S')
+        self.check(RBD_STEPS[11], self.exec_in('lock-c', 'cat /shared/sentinel').stdout.strip()
+                   == 'first', None, 'T0-S')
+        self.delete_pod('lock-c')
+        return pvc
 
-    def restart_container(node, pod):
-        # pid1 在自身 PID namespace 内不可被 SIGKILL（内核保护）；从节点
-        # runtime 侧 stop 容器 → kubelet 原地重启（restartCount+1，Pod 不变）。
-        # 容器名与 pod 名不同：按 pod.name 标签定位（crictl 单标签一次；
-        # namespace 由 run_id 唯一性保证不串）。
-        listing = ssh_node(
-            node,
-            f'k3s crictl ps --label io.kubernetes.pod.name={pod} -o json'
-            ' 2>/dev/null')
-        containers = json.loads(listing.stdout or '[]').get('containers', [])
-        target = next((c for c in containers
-                       if c.get('state') == 'CONTAINER_RUNNING'
-                       and (c.get('labels') or {}).get(
-                           'io.kubernetes.pod.namespace') == namespace), None)
-        if target is None:
-            raise RuntimeError(f'container for {pod} not found on {node}')
-        cid = target['id']
-        ssh_node(node, f'k3s crictl stop --timeout 5 {cid}')
-        return cid
+    def ssh_node(self, node, command):
+        mapping = next((m.partition('=')[2] for m in self.args.node_ssh
+                        if m.partition('=')[0] == node), None)
+        if mapping is None:
+            raise RuntimeError(f'no --node-ssh mapping for {node}')
+        host, _, rest = mapping.partition(':')
+        user, _, password = rest.partition(':')
+        if not re.fullmatch(r'[A-Za-z0-9._-]+', host):
+            raise ValueError('invalid SSH host')
+        user = user or 'soddy'
+        if not re.fullmatch(r'[A-Za-z0-9._-]+', user):
+            raise ValueError('invalid SSH user')
+        remote = 'sudo ' + ('-S' if password else '-n') + ' -- sh -ec ' + shlex.quote(command)
+        # 密码只从 stdin 进入 sudo，既不进命令行，也不写报告。
+        return self.runner(['ssh', '-o', 'BatchMode=yes', f'{user}@{host}', remote],
+                           capture_output=True, text=True, check=True, timeout=120,
+                           input=password + '\n' if password else None)
 
-    def owner_pid1_epoch(pod):
-        out = exec_in(pod,
-                      'b=$(cat /proc/sys/kernel/random/boot_id); '
-                      's=$(awk "{print \\$22}" /proc/1/stat); '
-                      'echo "$b:$s"').stdout.strip()
-        return out
+    def restart_container(self, node, pod):
+        out = self.ssh_node(node, 'k3s crictl ps --label io.kubernetes.pod.name='
+                             + shlex.quote(pod) + ' -o json')
+        containers = json.loads(out.stdout)['containers']
+        captured = self.pods[pod]['uid']
+        targets = [c for c in containers if c.get('state') == 'CONTAINER_RUNNING'
+                   and c.get('labels', {}).get('io.kubernetes.pod.namespace') == self.namespace
+                   and c.get('labels', {}).get('io.kubernetes.pod.uid') == captured]
+        if len(targets) != 1:
+            raise RuntimeError('exact captured runtime container is unavailable')
+        self.ssh_node(node, 'k3s crictl stop --timeout 5 ' + shlex.quote(targets[0]['id']))
 
-    nodes = [n['metadata']['name'] for n in json.loads(
-        kubectl_raw('get', 'nodes', '-o', 'json').stdout)['items']]
-    if len(nodes) < 2:
-        raise RuntimeError(f'need two nodes for cross-node handover, got {nodes}')
-    print('nodes:', nodes)
+    def pid1_epoch(self, pod):
+        script = "from pathlib import Path; print(Path('/proc/sys/kernel/random/boot_id').read_text().strip()+':'+Path('/proc/1/stat').read_text().rsplit(')',1)[1].split()[19])"
+        return self.exec_in(pod, 'python3 -c ' + shlex.quote(script)).stdout.strip()
 
-    pvc_name = f'app-cli-lock-{run_id}'
-    try:
-        kubectl_raw('create', 'namespace', namespace)
-        apply(pvc_name, {
-            'apiVersion': 'v1', 'kind': 'PersistentVolumeClaim',
-            'metadata': {'name': pvc_name},
-            'spec': {'accessModes': ['ReadWriteOnce'], 'resources': {
-                'requests': {'storage': '1Gi'}},
-                'storageClassName': args.storage_class}})
-        deadline = time.monotonic() + 120
-        while time.monotonic() < deadline:
-            phase = json.loads(kubectl('get', 'pvc', pvc_name, '-o',
-                                       'json').stdout)['status'].get('phase')
-            if phase == 'Bound':
-                break
-            time.sleep(2)
-        check('setup: RBD PVC bound', phase == 'Bound', phase, scenario='setup')
-
-        # ── T0-S：同节点双 Pod 经真实 owner 获取链争锁 ───────────────
-        apply('lock-a', serve_owner('lock-a', nodes[0], pvc_name))
-        wait_ready('lock-a')
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline and discovery_instance() is None:
-            time.sleep(2)
-        first = discovery_instance()
-        check('T0-S: first owner acquires on RBD volume', bool(first), first,
-              scenario='T0-S')
-        exec_in('lock-a', 'echo first > /shared/sentinel')
-
-        contender = try_second_owner('lock-b-contender', nodes[0], pvc_name)
-        refused = ('owner lock is held' in contender
-                   or 'refusing to start a competing orchestrator' in contender)
-        transferred = ('dispatch' in contender.lower()
-                       or 'second-rc=0' in contender)
-        check('T0-S: same-node competitor converges to the single owner',
-              refused or transferred, contender[-400:], scenario='T0-S')
-        discoveries = exec_in('lock-a',
-                              'find /shared -name supervisor.json | wc -l').stdout.strip()
-        check('T0-S: still exactly one discovery after contention',
-              discoveries == '1', discoveries, scenario='T0-S')
-
-        # SIGKILL 持锁进程（Pod 保留）：锁必须由 OS 释放，竞争者可获锁。
-        exec_in('lock-a', 'kill -9 "$(cat /shared/logs/serve.pid)"')
-        apply('lock-b', serve_owner('lock-b', nodes[0], pvc_name))
-        wait_ready('lock-b')
-        deadline = time.monotonic() + 120
-        second = None
-        while time.monotonic() < deadline:
-            second = read_discovery('lock-b')
-            if second and second != first:
-                break
-            time.sleep(3)
-        check('T0-S: SIGKILL releases lock; successor acquires',
-              bool(second) and second != first, f'{first} -> {second}',
-              scenario='T0-S')
-        check('T0-S: sentinel data preserved across owner change',
-              exec_in('lock-b', 'cat /shared/sentinel').stdout.strip() == 'first',
-              None, scenario='T0-S')
-
-        # 角色互换：B 持锁，A（已杀）重启后必须等待而不是双持。
-        contender2 = try_second_owner('lock-a-contender', nodes[0], pvc_name)
-        refused2 = ('owner lock is held' in contender2
-                    or 'refusing to start a competing orchestrator' in contender2)
-        transferred2 = ('dispatch' in contender2.lower()
-                        or 'second-rc=0' in contender2)
-        discoveries2 = exec_in('lock-b',
-                               'find /shared -name supervisor.json | wc -l').stdout.strip()
-        check('T0-S: role swap keeps single owner semantics',
-              (refused2 or transferred2) and discoveries2 == '1',
-              contender2[-300:] + f' discoveries={discoveries2}',
-              scenario='T0-S')
-
-        # ── T0-S：跨节点正常卸载/挂载交接 ────────────────────────────
-        kubectl('delete', 'pod', 'lock-b', '--wait=true')
-        kubectl('delete', 'pod', 'lock-a', '--wait=true')
-        # RWO：等待 volume detach 后另一节点才可 attach（正常路径，不强制双挂）。
-        time.sleep(10)
-        deadline = time.monotonic() + 300
-        third = None
-        apply('lock-c', serve_owner('lock-c', nodes[1], pvc_name))
-        while time.monotonic() < deadline:
-            info = json.loads(kubectl('get', 'pod', 'lock-c', '-o',
-                                      'json', check=False).stdout)
-            scheduled = info['spec'].get('nodeName') == nodes[1]
-            if scheduled:
-                third = read_discovery('lock-c')
-                if third:
-                    break
-            time.sleep(3)
-        check('T0-S: cross-node detach/attach handover',
-              bool(third) and third not in (first, second),
-              f'{second} -> {third}', scenario='T0-S')
-        check('T0-S: data intact after cross-node handover',
-              exec_in('lock-c', 'cat /shared/sentinel').stdout.strip() == 'first',
-              None, scenario='T0-S')
-
-        # ── T0-S：CephFS 跨节点独立客户端（RWX，两节点各自内核挂载）────
-        if args.cephfs_class:
-            fs_pvc = f'app-cli-lockfs-{run_id}'
-            apply(fs_pvc, {
-                'apiVersion': 'v1', 'kind': 'PersistentVolumeClaim',
-                'metadata': {'name': fs_pvc},
-                'spec': {'accessModes': ['ReadWriteMany'], 'resources': {
-                    'requests': {'storage': '1Gi'}},
-                    'storageClassName': args.cephfs_class}})
-            deadline = time.monotonic() + 120
-            fs_phase = None
-            while time.monotonic() < deadline:
-                fs_phase = json.loads(kubectl('get', 'pvc', fs_pvc, '-o',
-                                              'json').stdout)['status'].get('phase')
-                if fs_phase == 'Bound':
-                    break
-                time.sleep(2)
-            check('T0-S-fs: cephfs RWX PVC bound', fs_phase == 'Bound',
-                  fs_phase, scenario='T0-S-fs')
-            # 不同节点 = 独立 Ceph 内核客户端（各自 MDS 会话）。
-            apply('fs-a', serve_owner('fs-a', nodes[0], fs_pvc))
-            wait_ready('fs-a')
-            deadline = time.monotonic() + 60
-            while time.monotonic() < deadline and read_discovery('fs-a') is None:
-                time.sleep(2)
-            fs_first = read_discovery('fs-a')
-            check('T0-S-fs: owner acquires on cephfs', bool(fs_first),
-                  fs_first, scenario='T0-S-fs')
-            fs_contender = try_second_owner('fs-b', nodes[1], fs_pvc)
-            fs_refused = ('owner lock is held' in fs_contender
-                          or 'refusing to start a competing orchestrator'
-                          in fs_contender)
-            fs_transfer = ('dispatch' in fs_contender.lower()
-                           or 'second-rc=0' in fs_contender)
-            check('T0-S-fs: cross-client contender converges',
-                  fs_refused or fs_transfer, fs_contender[-300:],
-                  scenario='T0-S-fs')
-            exec_in('fs-a', 'kill -9 "$(cat /shared/logs/serve.pid)"', check=False)
-            apply('fs-c', serve_owner('fs-c', nodes[1], fs_pvc))
-            wait_ready('fs-c')
-            deadline = time.monotonic() + 120
-            fs_second = None
-            while time.monotonic() < deadline:
-                fs_second = read_discovery('fs-c')
-                if fs_second and fs_second != fs_first:
-                    break
-                time.sleep(3)
-            check('T0-S-fs: cross-client SIGKILL handover',
-                  bool(fs_second) and fs_second != fs_first,
-                  f'{fs_first} -> {fs_second}', scenario='T0-S-fs')
-            kubectl('delete', 'pod', 'fs-a', '--wait=true')
-            kubectl('delete', 'pod', 'fs-c', '--wait=true')
-
-        # ── K8s E：同 Pod 容器重启（builder 形态 Downward API 绑定）────
-        kubectl('delete', 'pod', 'lock-c', '--wait=true')
-        time.sleep(10)
-        apply('restart-pod', serve_owner('restart-pod', nodes[0], pvc_name,
-                                         binding=True))
-        wait_ready('restart-pod')
-        deadline = time.monotonic() + 90
-        before_instance = None
-        while time.monotonic() < deadline:
-            before_instance = read_discovery('restart-pod')
-            if before_instance:
-                break
-            time.sleep(3)
-        before = json.loads(kubectl('get', 'pod', 'restart-pod', '-o',
-                                    'json').stdout)
-        before_uid = before['metadata']['uid']
-        before_container = before['status']['containerStatuses'][0][
-            'containerID']
-        before_restarts = before['status']['containerStatuses'][0]['restartCount']
-        before_epoch = owner_pid1_epoch('restart-pod')
-        check('K8s-E: owner running with platform binding',
-              bool(before_instance), before_instance, scenario='K8s-E')
-        binding_read = exec_in(
-            'restart-pod',
-            'cat /etc/rcoder/platform/RCODER_PHYSICAL_POD_UID; echo; '
-            'head -c 120 /etc/rcoder/platform/execution-domain').stdout
-        check('K8s-E: downward API binding files present',
-              before_uid in binding_read and 'execution-domain' not in binding_read
-              and 'k8s-lock-test' in binding_read, binding_read, scenario='K8s-E')
-
-        # 同 Pod 容器原地重启：节点 runtime 侧 stop（pid1 内部不可杀）。
-        restart_container(nodes[0], 'restart-pod')
-        deadline = time.monotonic() + 180
+    def run_restart(self, nodes, pvc):
+        name = 'restart-pod'
+        self.create(self.serve_owner(name, nodes[0], pvc, binding=True))
+        before = self.wait_ready(name, nodes[0], pvc)
+        owner = self.wait_owner(name)
+        epoch = self.pid1_epoch(name)
+        self.check(RESTART_STEPS[0], True, owner, 'K8s-E')
+        binding = self.exec_in(name, 'cat /etc/rcoder/platform/RCODER_PHYSICAL_POD_UID; '
+                               'echo; cat /etc/rcoder/platform/execution-domain').stdout
+        self.check(RESTART_STEPS[1], before['metadata']['uid'] in binding
+                   and 'k8s-lock-test' in binding, binding, 'K8s-E')
+        self.restart_container(nodes[0], name)
+        deadline = self.clock() + 180
+        old_cs = before['status']['containerStatuses'][0]
         after = None
-        while time.monotonic() < deadline:
-            info = json.loads(kubectl('get', 'pod', 'restart-pod', '-o',
-                                      'json', check=False).stdout)
-            cs = info['status'].get('containerStatuses', [{}])[0]
-            if cs.get('containerID') != before_container and cs.get('ready'):
+        while self.clock() < deadline:
+            info = self.get('pod', name)
+            statuses = info.get('status', {}).get('containerStatuses', [])
+            if statuses and statuses[0].get('ready') and statuses[0].get('containerID') != old_cs['containerID']:
                 after = info
                 break
-            time.sleep(2)
-        check('K8s-E: container restarted in place', after is not None, None,
-              scenario='K8s-E')
-        after_cs = after['status']['containerStatuses'][0]
-        check('K8s-E: Pod UID unchanged',
-              after['metadata']['uid'] == before_uid,
-              f'{before_uid} vs {after["metadata"]["uid"]}', scenario='K8s-E')
-        check('K8s-E: container identity changed',
-              after_cs['containerID'] != before_container
-              and (after_cs['restartCount'] > before_restarts
-                   or after_cs.get('startedAt') != before['status']
-                   ['containerStatuses'][0].get('startedAt')),
-              f'{before_container} -> {after_cs["containerID"]}',
-              scenario='K8s-E')
-        after_epoch = owner_pid1_epoch('restart-pod')
-        check('K8s-E: pid1 epoch changed',
-              after_epoch != before_epoch,
-              f'{before_epoch} -> {after_epoch}', scenario='K8s-E')
-        deadline = time.monotonic() + 120
-        after_instance = None
-        while time.monotonic() < deadline:
-            after_instance = read_discovery('restart-pod')
-            if after_instance and after_instance != before_instance:
-                break
-            time.sleep(3)
-        check('K8s-E: new owner reconciles and serves after restart',
-              bool(after_instance) and after_instance != before_instance,
-              f'{before_instance} -> {after_instance}', scenario='K8s-E')
-        check('K8s-E: PVC sentinel preserved',
-              exec_in('restart-pod', 'cat /shared/sentinel').stdout.strip()
-              == 'first', None, scenario='K8s-E')
+            self.sleep(2)
+        self.check(RESTART_STEPS[2], after is not None, None, 'K8s-E')
+        cs = after['status']['containerStatuses'][0]
+        self.check(RESTART_STEPS[3], after['metadata']['uid'] == before['metadata']['uid'],
+                   {'before': before['metadata']['uid'], 'after': after['metadata']['uid']}, 'K8s-E')
+        self.check(RESTART_STEPS[4], cs['containerID'] != old_cs['containerID']
+                   and cs['restartCount'] > old_cs['restartCount'], cs['containerID'], 'K8s-E')
+        new_epoch = self.pid1_epoch(name)
+        self.check(RESTART_STEPS[5], new_epoch != epoch, {'old': epoch, 'new': new_epoch}, 'K8s-E')
+        self.wait_ready(name, nodes[0], pvc)
+        new_owner = self.wait_owner(name, previous=owner)
+        self.check(RESTART_STEPS[6], new_owner['instance'] != owner['instance'], new_owner, 'K8s-E')
+        self.check(RESTART_STEPS[7], self.exec_in(name, 'cat /shared/sentinel').stdout.strip()
+                   == 'first', None, 'K8s-E')
 
-        report['success'] = True
-    except (Exception, KeyboardInterrupt) as error:
-        report.update(success=False, error=str(error))
-        report['diagnostics'] = kubectl('get', 'pods', '-o', 'wide',
-                                        check=False).stdout
-        for pod in ('lock-a', 'lock-b', 'lock-c', 'restart-pod'):
-            logs = kubectl('exec', pod, '--', 'sh', '-ec',
-                           'tail -c 2000 /shared/logs/serve.out 2>/dev/null; '
-                           'echo ---; cat /shared/logs/serve.pid 2>/dev/null',
-                           check=False, timeout=60)
-            if logs.stdout.strip():
-                report[f'logs:{pod}'] = logs.stdout[-2000:]
-    finally:
-        kubectl_raw('delete', 'namespace', namespace,
-                    '--ignore-not-found=true', '--wait=true')
-        report['cleanup_ok'] = True
-        with open(args.report, 'w', encoding='utf-8') as handle:
-            json.dump(report, handle, ensure_ascii=False, indent=2)
-    return 0 if report.get('success') else 1
+    def diagnose(self):
+        try:
+            self.report['diagnostics'] = self.kubectl('get', 'pods', '-o', 'wide').stdout[-8000:]
+        except Exception as error:
+            self.report['diagnostic_error'] = self.error_text(error)
+
+    def run(self):
+        passed = False
+        try:
+            if self.args.cleanup_volume:
+                raise ValueError('--cleanup-volume is forbidden: namespace and PVC must be retained')
+            if not self.args.cephfs_class:
+                raise ValueError('CephFS is required; --cephfs-class must not be empty')
+            self.source_before = source_identity(self.source_dir)
+            self.report['source_before'] = self.source_before
+            self.receipt = load_build_receipt(self.args.build_receipt, self.args.image,
+                                              self.source_before)
+            self.report['build_receipt'] = self.receipt
+            nodes = select_nodes(json.loads(self.kubectl('get', 'nodes', '-o', 'json',
+                                                        cluster=True).stdout), self.args.node)
+            self.report['nodes'] = nodes
+            if self.args.scenario == 'all' and not any(m.startswith(nodes[0] + '=')
+                                                       for m in self.args.node_ssh):
+                raise ValueError('all requires --node-ssh for its first node (K8s-E)')
+            namespace = {'apiVersion': 'v1', 'kind': 'Namespace', 'metadata': {
+                'name': self.namespace, 'labels': {'rcoder.io/lock-test-run': self.run_id}}}
+            out = self.kubectl('create', '-f', '-', '-o', 'json', cluster=True,
+                               input_text=json.dumps(namespace))
+            info = json.loads(out.stdout)
+            self.namespace_uid = info['metadata']['uid']
+            if self.args.scenario == 'all':
+                pvc = self.run_rbd(nodes)
+                self.run_cephfs(nodes)
+                self.run_restart(nodes, pvc)
+            else:
+                self.run_cephfs(nodes)
+            passed = True
+        except (Exception, KeyboardInterrupt) as error:
+            self.report['error'] = self.error_text(error)
+            if self.namespace_uid:
+                self.diagnose()
+        finally:
+            try:
+                clean = self.cleanup()
+            except (Exception, KeyboardInterrupt) as error:
+                clean = False
+                self.report['cleanup_ok'] = False
+                self.report['cleanup_errors'] = [self.error_text(error)]
+            # 收尾清理同样属于本轮冻结观察窗；无论源码是否漂移都按捕获身份清理。
+            if self.source_before is not None:
+                try:
+                    after = source_identity(self.source_dir)
+                    self.report['source_after'] = after
+                    if self.receipt is not None:
+                        matched = (after == self.source_before
+                                   and self.receipt.get('source_commit') == after.get('origin_head')
+                                   and self.receipt.get('source_digest') == after.get('worktree_sha256'))
+                        self.check(SOURCE_STEP, matched,
+                                   {'before': self.source_before, 'after': after})
+                        require_build_source(self.receipt, after)
+                except (Exception, KeyboardInterrupt) as error:
+                    passed = False
+                    self.report['source_error'] = self.error_text(error)
+                    self.report.setdefault('error', self.error_text(error))
+            if passed:
+                try:
+                    validate_required_steps(self.report, self.args.scenario)
+                except Exception as error:
+                    passed = False
+                    self.report['error'] = self.error_text(error)
+            self.report['success'] = passed and clean
+            path = Path(self.args.report)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(self.report, ensure_ascii=False, indent=2) + '\n',
+                            encoding='utf-8')
+        return 0 if self.report['success'] else 1
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--context', required=True)
+    parser.add_argument('--image', required=True)
+    parser.add_argument('--build-receipt', required=True,
+                        help='JSON schema_version=1, image digest, app_cli_sha256, '
+                             'source_commit and source_digest; actual Pod binary must match')
+    parser.add_argument('--source-dir', default=os.environ.get(
+        'E2E_SOURCE_ROOT', str(Path(__file__).resolve().parents[2])),
+        help='frozen source root; uses E2E_INPUT_MANIFEST/E2E_ORIGIN_HEAD when present')
+    parser.add_argument('--scenario', choices=tuple(REQUIRED_STEPS), default='all')
+    parser.add_argument('--node', action='append', required=True,
+                        help='exactly two distinct Ready, schedulable node names')
+    parser.add_argument('--storage-class', default='ceph-rbd')
+    parser.add_argument('--cephfs-class', default='cephfs')
+    parser.add_argument('--report', required=True)
+    parser.add_argument('--cleanup-volume', action='store_true',
+                        help='rejected: namespace/PVC deletion is forbidden')
+    parser.add_argument('--node-ssh', action='append', default=[],
+                        help='node=host[:user[:password]], only all/K8s-E uses it; '
+                             'prefer passwordless sudo and never put real credentials in documents')
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    return ClusterExperiment(parse_args(argv)).run()
 
 
 if __name__ == '__main__':

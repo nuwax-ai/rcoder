@@ -84,3 +84,71 @@ fn run_contract(report: &JsonlReporter, engine: &str, script: &str, artifacts: &
         }
     }
 }
+
+/// Small real RCoder -> app-runtime A/B lifecycle, independent of chat/LLM.
+/// The isolated controller and paired build receipt are explicit prerequisites.
+#[tokio::test]
+async fn userapp_prod_readiness_contract() {
+    if !rcoder_e2e::common::require_context_or_skip() {
+        return;
+    }
+    let report = JsonlReporter::begin(
+        "userapp_prod_readiness_contract",
+        "compose",
+        serde_json::json!({"fixture": "isolated-loopback-prod", "llm": false}),
+    );
+    let result = (|| -> Result<(), String> {
+        let required = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| format!("missing required isolated fixture input: {name}"))
+        };
+        let directory =
+            std::path::PathBuf::from(required("E2E_REPORT_DIR")?).join("prod-readiness-contract");
+        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        let path = directory.join("assertions.json");
+        let status = std::process::Command::new("python3")
+            .arg(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tools/prod_readiness_contract.py"),
+            )
+            .arg("--build-receipt")
+            .arg(required("E2E_PROD_BUILD_RECEIPT")?)
+            .arg("--report")
+            .arg(&path)
+            .status()
+            .map_err(|error| format!("cannot launch prod fixture: {error}"))?;
+        report.assert_hard(
+            "prod contract process completed",
+            status.success(),
+            status.to_string(),
+        );
+        let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        let checks = value["checks"]
+            .as_array()
+            .ok_or("prod report checks missing")?;
+        for check in checks {
+            let name = check["name"].as_str().ok_or("prod check name missing")?;
+            report.assert_hard(name, check["ok"] == true, check["detail"].to_string());
+        }
+        report.assert_hard(
+            "prod contract reports full success",
+            value["success"] == true && value["full_owned_acceptance"] == true,
+            value["error"].to_string(),
+        );
+        report.assert_hard(
+            "prod cleanup confirms retained volumes",
+            value["cleanup"]["captured_containers_removed"] == true
+                && value["cleanup"]["volumes_removed"] == false,
+            value["cleanup"].to_string(),
+        );
+        Ok(())
+    })();
+    if let Err(error) = result {
+        report.assert_hard("prod contract evidence readable", false, error);
+    }
+    assert!(report.finish(), "prod readiness contract failed");
+}
