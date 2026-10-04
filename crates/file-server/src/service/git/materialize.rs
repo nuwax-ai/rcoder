@@ -86,6 +86,7 @@ pub(crate) fn plan_index_entry(
         )));
     };
     let dest = crate::path_safety::ensure_within_path(workdir, rel)?;
+    preflight_parent_chain(workdir, rel)?;
     Ok(PlannedEntry {
         rel: rel.to_path_buf(),
         dest,
@@ -113,14 +114,7 @@ pub(crate) fn plan_tree_entry(
         EntryKind::Executable => IndexMode::FILE_EXECUTABLE,
         EntryKind::Symlink => IndexMode::SYMLINK,
     };
-    let dest = crate::path_safety::ensure_within_path(workdir, rel)?;
-    Ok(PlannedEntry {
-        rel: rel.to_path_buf(),
-        dest,
-        kind,
-        blob_id: id.detach(),
-        mode,
-    })
+    plan_index_entry(workdir, rel, mode, id.detach())
 }
 
 /// 物化一个预检 entry：读取 blob 并按 mode 落盘。
@@ -149,60 +143,77 @@ pub(crate) fn materialize_bytes(
     kind: EntryKind,
     data: &[u8],
 ) -> AppResult<()> {
-    #[cfg(not(unix))]
-    if kind == EntryKind::Symlink {
-        // Reject before replacing any existing leaf on unsupported platforms.
-        return Err(AppError::business(
-            "symlink entries require a Unix filesystem",
-        ));
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let parent = crate::path_safety::ScopedParent::capture(workdir, rel, true)?
+            .ok_or_else(|| AppError::system("git parent remains missing after creation"))?;
+        let replace = kind == EntryKind::Symlink
+            || parent.is_symlink().map_err(|e| {
+                AppError::system(format!("inspect git leaf {}: {e}", dest.display()))
+            })?;
+        if replace {
+            match parent.remove_file() {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(AppError::system(format!(
+                        "replace git leaf {}: {error}",
+                        dest.display()
+                    )));
+                }
+            }
+        }
+        match kind {
+            EntryKind::Symlink => parent
+                .symlink(std::ffi::OsStr::from_bytes(data))
+                .map_err(|e| AppError::system(format!("create link {}: {e}", dest.display())))?,
+            EntryKind::File | EntryKind::Executable => {
+                let file = parent
+                    .open_write()
+                    .map_err(|e| AppError::system(format!("create {}: {e}", dest.display())))?;
+                write_opened_git_leaf(file, dest, data, kind)?;
+            }
+        }
     }
-    ensure_real_dir_chain(workdir, rel)?;
-    match std::fs::symlink_metadata(dest) {
-        Ok(meta)
-            if meta.file_type().is_symlink() || (kind == EntryKind::Symlink && meta.is_file()) =>
-        {
+    #[cfg(not(unix))]
+    {
+        // Windows retains ancestor preflight checks; no FD-relative guarantee
+        // or symlink materialization capability is claimed on this platform.
+        if kind == EntryKind::Symlink {
+            return Err(AppError::business(
+                "symlink entries require a Unix filesystem",
+            ));
+        }
+        inspect_real_dir_chain(workdir, rel, true)?;
+        if std::fs::symlink_metadata(dest).is_ok_and(|meta| meta.is_symlink()) {
             std::fs::remove_file(dest).map_err(|e| {
-                AppError::system(format!("replace existing git leaf {}: {e}", dest.display()))
+                AppError::system(format!("replace git leaf {}: {e}", dest.display()))
             })?;
         }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(AppError::system(format!(
-                "inspect {}: {error}",
-                dest.display()
-            )));
-        }
-    }
-    match kind {
-        EntryKind::Symlink => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::ffi::OsStrExt;
-                let target = <std::ffi::OsStr as OsStrExt>::from_bytes(data);
-                std::os::unix::fs::symlink(target, dest).map_err(|e| {
-                    AppError::system(format!("create link {}: {e}", dest.display()))
-                })?;
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = data;
-                return Err(AppError::business(
-                    "symlink entries require a Unix filesystem",
-                ));
-            }
-        }
-        EntryKind::File | EntryKind::Executable => {
-            write_leaf_nofollow(dest, data, kind)?;
-        }
+        crate::path_safety::write_file_nofollow_blocking(dest, data)
+            .map_err(|e| AppError::system(format!("create {}: {e}", dest.display())))?;
     }
     Ok(())
+}
+
+/// Check directory containment without creating directories or modifying leaves.
+pub(crate) fn preflight_parent_chain(workdir: &Path, rel: &Path) -> AppResult<()> {
+    #[cfg(unix)]
+    {
+        crate::path_safety::ScopedParent::capture(workdir, rel, false).map(|_| ())
+    }
+    #[cfg(not(unix))]
+    {
+        inspect_real_dir_chain(workdir, rel, false)
+    }
 }
 
 /// 逐级确保 `rel` 的中间目录段（不含 leaf）为真实目录或**界内**链接。
 /// 界内判定基准是 workdir 的 canonical 根；workdir 本身允许是调用方
 /// （resolver）选择的链接（与 path_safety 的根信任语义一致）。
-fn ensure_real_dir_chain(workdir: &Path, rel: &Path) -> AppResult<()> {
+#[cfg(not(unix))]
+fn inspect_real_dir_chain(workdir: &Path, rel: &Path, create_missing: bool) -> AppResult<()> {
     let Some(parent) = rel.parent() else {
         return Ok(());
     };
@@ -221,8 +232,7 @@ fn ensure_real_dir_chain(workdir: &Path, rel: &Path) -> AppResult<()> {
         };
         current.push(name);
         match std::fs::symlink_metadata(&current) {
-            Ok(meta) if meta.is_dir() => {}
-            Ok(meta) if meta.is_symlink() => {
+            Ok(meta) if meta.is_dir() || meta.is_symlink() => {
                 let resolved = std::fs::canonicalize(&current)
                     .map_err(|e| AppError::system(format!("resolve {}: {e}", current.display())))?;
                 if !resolved.starts_with(&root) {
@@ -242,6 +252,9 @@ fn ensure_real_dir_chain(workdir: &Path, rel: &Path) -> AppResult<()> {
                 )));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !create_missing {
+                    return Ok(());
+                }
                 std::fs::create_dir(&current).map_err(|e| {
                     AppError::system(format!("create dir {}: {e}", current.display()))
                 })?;
@@ -260,49 +273,34 @@ fn ensure_real_dir_chain(workdir: &Path, rel: &Path) -> AppResult<()> {
 /// leaf 写入：`O_NOFOLLOW` 创建/截断（Unix）。dest 若在预检后被换成链接，
 /// 这里得到 ELOOP 而不是跟随写出工作区。保留打开的 FD 来调整执行位，
 /// 避免写入后重新按路径 chmod 跟随新链接。
-fn write_leaf_nofollow(dest: &Path, data: &[u8], kind: EntryKind) -> AppResult<()> {
-    #[cfg(unix)]
-    {
-        use rustix::fs::{Mode, OFlags};
-        use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt;
-        // Keep the opened handle for permission changes: a replacement symlink
-        // after writing must never redirect chmod to an external file.
-        let fd = rustix::fs::openat(
-            rustix::fs::CWD,
-            dest,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
-        )
-        .map_err(|e| AppError::system(format!("create {}: {e}", dest.display())))?;
-        let mut file = std::fs::File::from(fd);
-        file.write_all(data)
-            .map_err(|e| AppError::system(format!("write {}: {e}", dest.display())))?;
-        let mode = file
-            .metadata()
-            .map_err(|e| {
-                AppError::system(format!("inspect opened git leaf {}: {e}", dest.display()))
-            })?
-            .permissions()
-            .mode();
-        // Git records only the executable distinction. Preserve read/write
-        // permissions (including the creating process's umask) in both cases.
-        let mode = if kind == EntryKind::Executable {
-            mode | 0o111
-        } else {
-            mode & !0o111
-        };
-        file.set_permissions(std::fs::Permissions::from_mode(mode))
-            .map_err(|e| AppError::system(format!("set git leaf mode {}: {e}", dest.display())))?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows has no executable permission bit.
-        let _ = kind;
-        crate::path_safety::write_file_nofollow_blocking(dest, data)
-            .map_err(|e| AppError::system(format!("create {}: {e}", dest.display())))
-    }
+#[cfg(unix)]
+fn write_opened_git_leaf(
+    mut file: std::fs::File,
+    dest: &Path,
+    data: &[u8],
+    kind: EntryKind,
+) -> AppResult<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    // Keep the opened handle for permission changes: a replacement symlink
+    // after writing must never redirect chmod to an external file.
+    file.write_all(data)
+        .map_err(|e| AppError::system(format!("write {}: {e}", dest.display())))?;
+    let mode = file
+        .metadata()
+        .map_err(|e| AppError::system(format!("inspect opened git leaf {}: {e}", dest.display())))?
+        .permissions()
+        .mode();
+    // Git records only the executable distinction. Preserve read/write
+    // permissions (including the creating process's umask) in both cases.
+    let mode = if kind == EntryKind::Executable {
+        mode | 0o111
+    } else {
+        mode & !0o111
+    };
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
+        .map_err(|e| AppError::system(format!("set git leaf mode {}: {e}", dest.display())))?;
+    Ok(())
 }
 
 #[cfg(test)]

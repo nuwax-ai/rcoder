@@ -18,6 +18,11 @@ use path_clean::PathClean;
 
 use crate::error::{AppError, AppResult};
 
+#[cfg(unix)]
+mod scoped_parent;
+#[cfg(unix)]
+pub use scoped_parent::ScopedParent;
+
 /// 业务文件路径校验: `relative` 解析后必须落在 `base` 下, 越界返回 `Err`。
 /// 对齐 nuwax `uploadSingleFile` (抛错风格)。
 pub fn ensure_within(base: &Path, relative: &str) -> AppResult<PathBuf> {

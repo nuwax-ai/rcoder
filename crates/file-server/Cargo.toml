@@ -135,3 +135,4 @@ pathdiff = { workspace = true }
 # Windows 目录 junction (无特权软链, 仅 Windows 编译时引入)
 [target.'cfg(windows)'.dependencies]
 junction = "2.0"
+winapi-util = "0.1.11"

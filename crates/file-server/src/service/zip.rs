@@ -60,8 +60,38 @@ fn extract_blocking_with_limits(
 ) -> AppResult<()> {
     let file = std::fs::File::open(zip_path)
         .map_err(|e| AppError::file(format!("zip open failed: {e}")))?;
+    extract_open_file_with_limits(file, dst, limits, true, false)
+}
+
+/// Extract an already captured snapshot; never reopen its original source path.
+pub(crate) fn extract_open_file(file: std::fs::File, dst: &Path) -> AppResult<()> {
+    extract_open_file_with_limits(file, dst, EXTRACTION_LIMITS, true, true)
+}
+
+/// Validate payload/CRC, limits and link topology with the same extraction loop.
+/// Placeholder files preserve topology without writing full payloads twice.
+pub(crate) fn validate_open_file(file: std::fs::File) -> AppResult<()> {
+    let check = tempfile::tempdir()
+        .map_err(|e| AppError::system(format!("create zip validation directory: {e}")))?;
+    extract_open_file_with_limits(file, check.path(), EXTRACTION_LIMITS, false, true)
+}
+
+fn zip_read_error(error: zip::result::ZipError, context: &str) -> AppError {
+    match error {
+        zip::result::ZipError::Io(error) => AppError::system(format!("{context}: {error}")),
+        other => AppError::file(format!("{context}: {other}")),
+    }
+}
+
+fn extract_open_file_with_limits(
+    file: std::fs::File,
+    dst: &Path,
+    limits: ExtractionLimits,
+    write_payload: bool,
+    strict_paths: bool,
+) -> AppResult<()> {
     let mut archive =
-        zip::ZipArchive::new(file).map_err(|e| AppError::file(format!("zip parse failed: {e}")))?;
+        zip::ZipArchive::new(file).map_err(|e| zip_read_error(e, "zip parse failed"))?;
     if archive.len() > limits.entry_count {
         return Err(AppError::validation(format!(
             "zip contains too many entries (max {})",
@@ -74,12 +104,12 @@ fn extract_blocking_with_limits(
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
-            .map_err(|e| AppError::file(format!("zip entry {i} read failed: {e}")))?;
+            .map_err(|e| zip_read_error(e, &format!("zip entry {i} read failed")))?;
         let name = entry.name().to_string();
         let target = match safe_zip_entry(dst, &name) {
             Ok(p) => p,
+            Err(error) if strict_paths => return Err(error),
             Err(_) => {
-                // 对齐 nuwax: 不安全 entry 警告后跳过, 不中止整批
                 tracing::warn!(entry = %name, "skip unsafe zip entry");
                 continue;
             }
@@ -93,7 +123,8 @@ fn extract_blocking_with_limits(
             let mut link = String::new();
             (&mut entry)
                 .take((shared_types::archive_links::MAX_ARCHIVE_LINK_BYTES + 1) as u64)
-                .read_to_string(&mut link)?;
+                .read_to_string(&mut link)
+                .map_err(payload_error)?;
             let size = link.len() as u64;
             extracted_bytes = extracted_bytes
                 .checked_add(size)
@@ -108,6 +139,16 @@ fn extract_blocking_with_limits(
         }
         if entry.is_dir() {
             std::fs::create_dir_all(&target)?;
+            let remaining = limits
+                .total_bytes
+                .saturating_sub(extracted_bytes)
+                .min(limits.file_bytes);
+            let copied = std::io::copy(&mut (&mut entry).take(remaining + 1), &mut std::io::sink())
+                .map_err(payload_error)?;
+            if copied > remaining {
+                return Err(AppError::validation("zip directory payload exceeds limit"));
+            }
+            extracted_bytes += copied;
         } else {
             if entry.size() > limits.file_bytes {
                 return Err(AppError::validation(format!(
@@ -135,7 +176,12 @@ fn extract_blocking_with_limits(
                 .min(limits.file_bytes)
                 .checked_add(1)
                 .ok_or_else(|| AppError::validation("zip extraction limit overflow"))?;
-            let copied = std::io::copy(&mut (&mut entry).take(copy_limit), &mut out)?;
+            let copied = if write_payload {
+                std::io::copy(&mut (&mut entry).take(copy_limit), &mut out)
+            } else {
+                std::io::copy(&mut (&mut entry).take(copy_limit), &mut std::io::sink())
+            }
+            .map_err(payload_error)?;
             if copied >= copy_limit {
                 return Err(AppError::validation(format!(
                     "zip entry {name} or extracted total exceeds size limit"
@@ -144,7 +190,7 @@ fn extract_blocking_with_limits(
             #[cfg(unix)]
             if let Some(mode) = entry.unix_mode() {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode & 0o777))?;
+                out.set_permissions(std::fs::Permissions::from_mode(mode & 0o777))?;
             }
             extracted_bytes = extracted_bytes
                 .checked_add(copied)
@@ -154,6 +200,55 @@ fn extract_blocking_with_limits(
     links
         .install(dst)
         .map_err(|e| AppError::validation(format!("archive links: {e}")))?;
+    Ok(())
+}
+
+fn payload_error(error: std::io::Error) -> AppError {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        AppError::file(format!("zip payload/CRC is corrupt: {error}"))
+    } else {
+        AppError::system(format!("read/write zip payload: {error}"))
+    }
+}
+
+/// Cooperative publishers are locked only during snapshot capture. Even a
+/// publisher bypassing that lock cannot replace the opened source object.
+pub(crate) fn capture_snapshot(source: &Path, snapshot: &mut std::fs::File) -> AppResult<()> {
+    use std::io::{Seek as _, SeekFrom};
+    let _guard = acquire_pack_lock(source)?;
+    #[cfg(unix)]
+    let mut input = std::fs::File::from(
+        rustix::fs::open(
+            source,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?,
+    );
+    #[cfg(not(unix))]
+    let mut input = std::fs::File::open(source)?;
+    let size = input.metadata()?.len();
+    // Expanded content already has a 4 GiB budget. Bound the source snapshot
+    // too, with an extra GiB for ZIP metadata/headers rather than unlimited I/O.
+    if size > MAX_EXTRACTED_TOTAL_BYTES + 1024 * 1024 * 1024 {
+        return Err(AppError::validation(
+            "restore source exceeds snapshot size limit",
+        ));
+    }
+    if !input.metadata()?.is_file() {
+        return Err(AppError::file("restore source is not a regular file"));
+    }
+    let copy_budget = size
+        .checked_add(1)
+        .ok_or_else(|| AppError::file("restore source size overflow"))?;
+    let copied = std::io::copy(&mut (&mut input).take(copy_budget), snapshot)?;
+    if copied != size || input.metadata()?.len() != size {
+        return Err(AppError::file(
+            "restore source changed during snapshot capture",
+        ));
+    }
+    snapshot.sync_all()?;
+    snapshot.seek(SeekFrom::Start(0))?;
     Ok(())
 }
 
@@ -200,16 +295,10 @@ pub(crate) fn acquire_pack_lock(zip_path: &Path) -> AppResult<PackTargetGuard> {
     std::fs::create_dir_all(parent)
         .map_err(|e| AppError::file(format!("create {}: {e}", parent.display())))?;
     let digest = sha2::Sha256::digest(zip_path.as_os_str().as_encoded_bytes());
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{byte:02x}");
-    }
-    // P2: 锁文件名只用 hex 的前 16 个字符——目标路径中含时间戳/随机后缀的
-    // 临时下载目标不再每个都产生永久 inode; 同目录下极小概率的截断碰撞
-    // 只导致不必要的互斥等待（flock 是共享语义屏障, 不是正确性边界——
-    // 原子发布本身保证完整性）, 不影响正确性。
-    let lock_path = parent.join(format!(".rcoder-zip-pack-{}.lock", &hex[..16]));
+    // A fixed bucket set bounds persistent lock inodes even for random download
+    // targets. Collisions serialize unrelated targets; locks are never unlinked.
+    let bucket = digest[0] % 16;
+    let lock_path = parent.join(format!(".rcoder-zip-pack-{bucket:02}.lock"));
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -227,7 +316,7 @@ pub(crate) fn acquire_pack_lock(_zip_path: &Path) -> AppResult<PackTargetGuard> 
         std::sync::LazyLock::new(std::sync::Mutex::default);
     let guard = PACK_SERIALIZE
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .map_err(|_| AppError::system("zip pack serialization mutex is poisoned"))?;
     Ok(PackTargetGuard { _global: guard })
 }
 
@@ -313,7 +402,7 @@ pub async fn pack_with_opts(src: PathBuf, zip_path: PathBuf, opts: PackOpts) -> 
     Ok(())
 }
 
-fn pack_blocking(src: &Path, zip_path: &Path, opts: &PackOpts) -> AppResult<()> {
+pub(crate) fn pack_blocking(src: &Path, zip_path: &Path, opts: &PackOpts) -> AppResult<()> {
     let src = src.to_path_buf();
     let opts = opts.clone();
     publish_zip_atomically(zip_path, move |zip| {
@@ -547,6 +636,29 @@ mod tests {
         let mut buf = Vec::new();
         Read::read_to_end(&mut entry, &mut buf).unwrap();
         buf
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pack_locks_use_a_bounded_number_of_persistent_inodes() {
+        let fixture = tempfile::tempdir().unwrap();
+        for index in 0..40 {
+            drop(acquire_pack_lock(&fixture.path().join(format!("download-{index}.zip"))).unwrap());
+        }
+        let locks = fs::read_dir(fixture.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".rcoder-zip-pack-")
+            })
+            .count();
+        assert!(
+            locks <= 16,
+            "random targets leaked {locks} permanent lock inodes"
+        );
     }
 
     #[test]

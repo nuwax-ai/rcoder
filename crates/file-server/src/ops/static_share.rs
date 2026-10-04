@@ -32,15 +32,16 @@ pub const COMPUTER_CORS: CorsConfig = CorsConfig {
 
 const ALLOW_METHODS: &str = "HEAD,GET,POST,PUT,DELETE,OPTIONS";
 
-/// 从 root + 剩余路径服务文件 (循环 decode + dotfiles allow + Range + CORS)。
+/// Serve a decoded, workspace-relative path. Axum's Path extractor already
+/// percent-decodes once; decoding again aliases literal `%23` and `#` filenames.
+/// Server-generated artifact paths are likewise passed as literal filenames.
 pub async fn serve_from_root(root: &Path, rest: &str, cors: &CorsConfig, req: Request) -> Response {
     let relative = rest.trim_start_matches('/');
-    let decoded = safe_decode_path(relative);
-    if decoded.is_empty() {
+    if relative.is_empty() {
         return cors_404(&req, cors);
     }
     // 路径安全: 仅防穿越 (dotfiles allow, 不拦隐藏名)
-    let full = match crate::path_safety::ensure_resolved_within(root, &decoded).await {
+    let full = match crate::path_safety::ensure_resolved_within(root, relative).await {
         Ok(p) => p,
         Err(_) => return cors_404(&req, cors),
     };
@@ -169,28 +170,60 @@ fn cors_404_static(origin: Option<&str>, cors: &CorsConfig) -> Response {
     )
 }
 
-/// 循环 percent-decode 直到稳定 (对齐 nuwax safeDecodePath); 上限 8 轮防恶意循环。
-fn safe_decode_path(s: &str) -> String {
-    let mut prev = s.to_string();
-    for _ in 0..8 {
-        let next = crate::service::code::decode_uri_component(&prev);
-        if next == prev {
-            break;
-        }
-        prev = next;
-    }
-    prev
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn safe_decode_path_loops_until_stable() {
-        assert_eq!(safe_decode_path("a%20b"), "a b");
-        assert_eq!(safe_decode_path("%E4%B8%AD"), "中");
-        assert_eq!(safe_decode_path("foo/bar.js"), "foo/bar.js");
+    #[tokio::test]
+    async fn generated_static_urls_preserve_literal_percent_names_after_axum_decode() {
+        use tower::ServiceExt as _;
+        let root = tempfile::tempdir().unwrap();
+        for (name, content) in [
+            ("name%23.txt", "PERCENT"),
+            ("name#.txt", "HASH"),
+            ("literal%2Fname.txt", "LITERAL-SLASH"),
+        ] {
+            std::fs::write(root.path().join(name), content).unwrap();
+        }
+        let entries = crate::service::tree::list_files(
+            root.path(),
+            &crate::Config::default(),
+            Some("/files"),
+        )
+        .await
+        .unwrap();
+        let selected_root = root.path().to_owned();
+        let router = axum::Router::new().route(
+            "/files/{*rest}",
+            axum::routing::get(
+                move |axum::extract::Path(rest): axum::extract::Path<String>, request: Request| {
+                    let root = selected_root.clone();
+                    async move { serve_from_root(&root, &rest, &PAGE_CORS, request).await }
+                },
+            ),
+        );
+        for (name, expected) in [
+            ("name%23.txt", "PERCENT"),
+            ("name#.txt", "HASH"),
+            ("literal%2Fname.txt", "LITERAL-SLASH"),
+        ] {
+            let entry = entries.iter().find(|entry| entry.name == name).unwrap();
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(entry.file_proxy_url.as_deref().expect("generated URL"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{name}");
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), expected.as_bytes(), "{name}");
+        }
     }
 
     #[test]

@@ -3577,6 +3577,7 @@ dependencies = [
  "utoipa-axum",
  "utoipa-swagger-ui",
  "uuid",
+ "winapi-util",
  "winnow 1.0.4",
  "zip",
 ]

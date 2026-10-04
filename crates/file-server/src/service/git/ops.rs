@@ -117,7 +117,7 @@ pub fn reset(
     // symlink 整批拒绝）必须发生在任何 HEAD/ref 副作用之前: 预检失败时 HEAD、
     // symbolic ref、index 与工作树均未发生预检前修改。
     if mode == ResetMode::Hard {
-        preflight_tree_materialization(repo, &target_tree_id)?;
+        preflight_tree_materialization(repo, &target_tree_id, Some(&old_head_tree))?;
     }
     move_branch_ref(repo, target_id, "reset", author_name, author_email)?;
 
@@ -314,7 +314,7 @@ pub fn switch_branch(repo: &Repository, name: &str) -> AppResult<()> {
         .ok_or_else(|| AppError::system("git repo has no workdir"))?;
 
     // P1-4: 同 reset——物化预检先于 set_head_symbolic 的任何副作用。
-    preflight_tree_materialization(repo, &target_tree_id)?;
+    preflight_tree_materialization(repo, &target_tree_id, Some(&old_head_tree))?;
     set_head_symbolic(repo, &branch_full)?;
     apply_tree_to_worktree(repo, workdir, &target_tree_id, Some(&old_head_tree))?;
     Ok(())
@@ -322,7 +322,11 @@ pub fn switch_branch(repo: &Repository, name: &str) -> AppResult<()> {
 
 /// 整批支持性预检: 对 tree 的全部 index entry 走 plan_index_entry（词法界内 +
 /// mode 支持; 非 Unix 的 symlink 在此整批拒绝）, 不产生任何文件系统副作用。
-fn preflight_tree_materialization(repo: &Repository, tree_id: &oid) -> AppResult<()> {
+fn preflight_tree_materialization(
+    repo: &Repository,
+    tree_id: &oid,
+    old_tree_id: Option<&oid>,
+) -> AppResult<()> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| AppError::system("git repo has no workdir"))?;
@@ -338,7 +342,65 @@ fn preflight_tree_materialization(repo: &Repository, tree_id: &oid) -> AppResult
             entry.id,
         )?;
     }
+    preflight_stale_files(repo, workdir, &index, old_tree_id)?;
     Ok(())
+}
+
+/// Plan removals before any ref/worktree mutation; an outside parent link is an
+/// error, not a warning that could leave a successful but unsafe reset.
+fn preflight_stale_files(
+    repo: &Repository,
+    workdir: &Path,
+    new_index: &gix::index::File,
+    old_tree_id: Option<&oid>,
+) -> AppResult<Vec<std::path::PathBuf>> {
+    let Some(old_id) = old_tree_id else {
+        return Ok(Vec::new());
+    };
+    let old_index = repo
+        .index_from_tree(old_id)
+        .map_err(|e| map_git_err(e, "git index_from_tree (old)"))?;
+    let old_backing = old_index.path_backing();
+    let mut removals = Vec::new();
+    for entry in old_index.entries() {
+        let path = entry.path_in(old_backing);
+        if new_index
+            .entry_by_path_and_stage(path, Stage::Unconflicted)
+            .is_none()
+        {
+            let relative = from_bstr(path).into_owned();
+            ensure_within_path(workdir, &relative)?;
+            super::materialize::preflight_parent_chain(workdir, &relative)?;
+            removals.push(relative);
+        }
+    }
+    Ok(removals)
+}
+
+fn remove_stale_file(workdir: &Path, relative: &Path) -> AppResult<()> {
+    // Re-resolve immediately before unlink. Unix captures the checked parent
+    // handle so a directory replacement cannot redirect the actual deletion.
+    #[cfg(unix)]
+    let result = {
+        let Some(parent) = crate::path_safety::ScopedParent::capture(workdir, relative, false)?
+        else {
+            return Ok(());
+        };
+        parent.remove_file()
+    };
+    #[cfg(not(unix))]
+    let result = {
+        super::materialize::preflight_parent_chain(workdir, relative)?;
+        std::fs::remove_file(ensure_within_path(workdir, relative)?)
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AppError::system(format!(
+            "remove stale git file {}: {error}",
+            relative.display()
+        ))),
+    }
 }
 
 // ── 共享 helper ─────────────────────────────────────────────────────────────────
@@ -435,30 +497,14 @@ fn apply_tree_to_worktree(
             entry.id,
         )?);
     }
+    let removals = preflight_stale_files(repo, workdir, &new_index, old_tree_id)?;
     // 写所有 target 文件到 worktree（共享安全物化器: 界内目录链 + leaf 不跟随 + mode）
     for entry in &planned {
         super::materialize::materialize_planned(repo, workdir, entry)?;
     }
     // 删除 old_tree 有但 target 没有的文件
-    if let Some(old_id) = old_tree_id {
-        let old_index = repo
-            .index_from_tree(old_id)
-            .map_err(|e| map_git_err(e, "git index_from_tree (old)"))?;
-        let old_backing = old_index.path_backing();
-        for entry in old_index.entries() {
-            let path = entry.path_in(old_backing);
-            if new_index
-                .entry_by_path_and_stage(path, Stage::Unconflicted)
-                .is_none()
-            {
-                // 防御：恶意 old-tree entry 含 `..` 时跳过删除（绝不删工作区外文件）
-                if let Ok(abs) = ensure_within_path(workdir, from_bstr(path))
-                    && let Err(e) = std::fs::remove_file(&abs)
-                {
-                    tracing::warn!(error = %e, "remove stale worktree file during checkout apply failed (skipping)");
-                }
-            }
-        }
+    for relative in &removals {
+        remove_stale_file(workdir, relative)?;
     }
     // 落 index = target tree
     new_index.remove_tree();
@@ -687,10 +733,17 @@ mod p14_preflight_tests {
             .expect("commit2")
             .to_string();
 
+        // The target must differ from HEAD, otherwise the old ordering moves
+        // the ref to its existing value and this assertion cannot expose it.
+        reset(&repo, &c1, ResetMode::Soft, "Test", "test@example.com").unwrap();
+
         let head_before = crate::service::git::read::resolve_rev(&repo, "HEAD")
             .expect("head")
             .map(|id| id.to_string())
             .expect("head exists");
+        assert_eq!(head_before, c1);
+        assert_ne!(head_before, c2);
+        let index_before = std::fs::read(repo.index_path()).unwrap();
         let branch_before = repo
             .find_reference("HEAD")
             .expect("head ref")
@@ -719,11 +772,128 @@ mod p14_preflight_tests {
             .map(|target| target.id().to_string())
             .expect("branch target");
         assert_eq!(branch_before, branch_after, "branch ref must not move");
+        assert_eq!(std::fs::read(repo.index_path()).unwrap(), index_before);
         assert_eq!(
             std::fs::read(dir.path().join("a.txt")).unwrap(),
             b"v1\n",
             "worktree untouched"
         );
+        assert!(!dir.path().join("vendor").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_hard_refuses_outward_parent_before_deleting_old_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().join("ws");
+        std::fs::create_dir(&workdir).unwrap();
+        init_repo(&workdir, "Test", "test@example.com").unwrap();
+        let repo = open(&workdir).unwrap();
+        std::fs::create_dir(workdir.join("sub")).unwrap();
+        std::fs::write(workdir.join("sub/secret"), b"tracked old content").unwrap();
+        std::fs::write(workdir.join("a.txt"), b"old").unwrap();
+        stage_path(&repo, "sub/secret").unwrap();
+        stage_path(&repo, "a.txt").unwrap();
+        let old = commit_indexed(&repo, "old", "Test", "test@example.com").unwrap();
+        std::fs::remove_file(workdir.join("sub/secret")).unwrap();
+        std::fs::write(workdir.join("a.txt"), b"new").unwrap();
+        stage_path(&repo, "sub/secret").unwrap();
+        stage_path(&repo, "a.txt").unwrap();
+        let target = commit_indexed(&repo, "target", "Test", "test@example.com").unwrap();
+        reset(&repo, &old, ResetMode::Hard, "Test", "test@example.com").unwrap();
+
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"external sentinel").unwrap();
+        std::fs::remove_dir_all(workdir.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&outside, workdir.join("sub")).unwrap();
+        let index_before = std::fs::read(repo.index_path()).unwrap();
+        assert_ne!(old, target);
+
+        let result = reset(&repo, &target, ResetMode::Hard, "Test", "test@example.com");
+        assert_eq!(
+            std::fs::read(outside.join("secret")).unwrap(),
+            b"external sentinel"
+        );
+        assert!(
+            matches!(result, Err(AppError::Validation(_, _))),
+            "{result:?}"
+        );
+        assert_eq!(head_id_required(&repo, "head").unwrap().to_string(), old);
+        assert_eq!(std::fs::read(repo.index_path()).unwrap(), index_before);
+        assert_eq!(std::fs::read(workdir.join("a.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read_link(workdir.join("sub")).unwrap(), outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_hard_refuses_outward_write_parent_before_head_or_worktree_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().join("ws");
+        std::fs::create_dir(&workdir).unwrap();
+        init_repo(&workdir, "Test", "test@example.com").unwrap();
+        let repo = open(&workdir).unwrap();
+        std::fs::write(workdir.join("a.txt"), b"old").unwrap();
+        stage_path(&repo, "a.txt").unwrap();
+        let old = commit_indexed(&repo, "old", "Test", "test@example.com").unwrap();
+        std::fs::write(workdir.join("a.txt"), b"new").unwrap();
+        std::fs::create_dir(workdir.join("sub")).unwrap();
+        std::fs::write(workdir.join("sub/file.txt"), b"new file").unwrap();
+        stage_path(&repo, "a.txt").unwrap();
+        stage_path(&repo, "sub/file.txt").unwrap();
+        let target = commit_indexed(&repo, "target", "Test", "test@example.com").unwrap();
+        reset(&repo, &old, ResetMode::Hard, "Test", "test@example.com").unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("sentinel"), b"external sentinel").unwrap();
+        std::fs::remove_dir_all(workdir.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&outside, workdir.join("sub")).unwrap();
+        let index_before = std::fs::read(repo.index_path()).unwrap();
+        assert_ne!(old, target);
+
+        let result = reset(&repo, &target, ResetMode::Hard, "Test", "test@example.com");
+        assert!(
+            matches!(result, Err(AppError::Validation(_, _))),
+            "{result:?}"
+        );
+        assert_eq!(head_id_required(&repo, "head").unwrap().to_string(), old);
+        assert_eq!(std::fs::read(repo.index_path()).unwrap(), index_before);
+        assert_eq!(std::fs::read(workdir.join("a.txt")).unwrap(), b"old");
+        assert!(!outside.join("file.txt").exists());
+        assert_eq!(
+            std::fs::read(outside.join("sentinel")).unwrap(),
+            b"external sentinel"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_hard_deletes_through_inside_parent_and_accepts_missing_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path(), "Test", "test@example.com").unwrap();
+        let repo = open(dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/file.txt"), b"old").unwrap();
+        stage_path(&repo, "sub/file.txt").unwrap();
+        let old = commit_indexed(&repo, "old", "Test", "test@example.com").unwrap();
+        std::fs::remove_file(dir.path().join("sub/file.txt")).unwrap();
+        stage_path(&repo, "sub/file.txt").unwrap();
+        let target = commit_indexed(&repo, "target", "Test", "test@example.com").unwrap();
+        reset(&repo, &old, ResetMode::Hard, "Test", "test@example.com").unwrap();
+        std::fs::rename(dir.path().join("sub"), dir.path().join("inside")).unwrap();
+        std::os::unix::fs::symlink("inside", dir.path().join("sub")).unwrap();
+
+        reset(&repo, &target, ResetMode::Hard, "Test", "test@example.com").unwrap();
+        assert!(!dir.path().join("inside/file.txt").exists());
+        assert!(
+            std::fs::symlink_metadata(dir.path().join("sub"))
+                .unwrap()
+                .is_symlink()
+        );
+        reset(&repo, &old, ResetMode::Hard, "Test", "test@example.com").unwrap();
+        std::fs::remove_file(dir.path().join("inside/file.txt")).unwrap();
+        reset(&repo, &target, ResetMode::Hard, "Test", "test@example.com").unwrap();
+        assert!(!dir.path().join("inside/file.txt").exists());
     }
 
     /// P1-4: checkout overlay 走共享物化器——工作区已有外向目录链接时, 目标

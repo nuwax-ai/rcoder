@@ -794,21 +794,51 @@ async fn project_content_preserves_posix_backslash_and_encodes_url() {
 
     // URL: 逐段编码——反斜杠、#、? 各自转义
     let with_proxy = list_files(root, &cfg, Some("/proxy")).await.unwrap();
-    for entry in &with_proxy {
-        if let Some(url) = &entry.file_proxy_url {
-            if entry.name == "a\\b.txt" {
-                assert!(
-                    url.contains("a%5Cb.txt"),
-                    "backslash must be percent-encoded: {url}"
-                );
-            }
-            if entry.name.starts_with("weird") {
-                assert!(
-                    url.contains("weird%23name%3Fx"),
-                    "# and ? must be encoded: {url}"
-                );
-            }
-        }
+    let selected_root = root.to_path_buf();
+    let router = axum::Router::new().route(
+        "/proxy/{*rest}",
+        axum::routing::get(
+            move |axum::extract::Path(rest): axum::extract::Path<String>,
+                  request: axum::extract::Request| {
+                let root = selected_root.clone();
+                async move {
+                    crate::ops::static_share::serve_from_root(
+                        &root,
+                        &rest,
+                        &crate::ops::static_share::PAGE_CORS,
+                        request,
+                    )
+                    .await
+                }
+            },
+        ),
+    );
+    use tower::ServiceExt as _;
+    for (name, url, expected) in [
+        ("a\\b.txt", "/proxy/a%5Cb.txt", "BACKSLASH-CONTENT"),
+        ("a/b.txt", "/proxy/a/b.txt", "SLASH-CONTENT"),
+        ("weird#name?x.txt", "/proxy/weird%23name%3Fx.txt", "WEIRD"),
+    ] {
+        let entry = with_proxy
+            .iter()
+            .find(|entry| entry.name == name)
+            .expect("proxy file entry");
+        assert_eq!(entry.file_proxy_url.as_deref(), Some(url));
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(entry.file_proxy_url.as_deref().unwrap())
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), expected.as_bytes());
     }
 
     // get_project_content: 同一清单语义（含内容读取路径不因反斜杠走错对象）

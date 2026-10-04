@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use crate::service::temp_file::{TemporaryFile, TemporaryFileWriter};
 
+#[derive(Clone)]
 pub struct SkillDownloader {
     client: Client,
     temp_dir: PathBuf,

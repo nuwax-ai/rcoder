@@ -6,7 +6,7 @@
 //! 复刻要点 (nuwax 用 `res.sendFile`/`send` 库):
 //! - 根目录: page = `PROJECT_SOURCE_DIR/{projectId}`; computer = `COMPUTER_WORKSPACE_DIR/{userId}/{cId}`
 //!   (或 `?customTargetDir=` 完全覆盖根)
-//! - 路径循环 `decodeURIComponent` 直到稳定 (safeDecodePath)
+//! - Axum Path在HTTP边界解码一次，后续按字面文件名读取，避免percent文件名串读
 //! - dotfiles: allow
 //! - CORS: 回显 Origin (无则 `*`), Origin 存在时附 Credentials+Vary; 两套路由 Allow/Expose 头不同
 //! - OPTIONS 预检 → 200 空 body
