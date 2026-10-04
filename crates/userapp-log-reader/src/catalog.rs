@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use workspace_manifest::{LogSource, ReleaseLock};
 
-use crate::sources::{LogLayout, inject_orchestrator_log_source, inject_runtime_log_sources};
+use crate::sources::{
+    LogLayout, MAX_PLATFORM_SOURCES, PlatformSourceKind, PlatformSources,
+    inject_orchestrator_log_source, inject_runtime_log_sources, source_key,
+};
 
 const MAX_CATALOG_BYTES: u64 = 1024 * 1024;
 
@@ -42,6 +45,8 @@ pub struct LogCatalog {
     pub version: String,
     pub release_id: String,
     pub builtin_orchestrator: bool,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub platform_sources: PlatformSources,
     pub services: Vec<ServiceLogs>,
 }
 
@@ -65,9 +70,9 @@ impl LogCatalog {
         let builtin_orchestrator = !release
             .services
             .iter()
-            .any(|service| service.service_id == "app-cli");
-        inject_runtime_log_sources(&mut release, layout);
-        inject_orchestrator_log_source(&mut release);
+            .any(|service| service.enabled && service.service_id == "app-cli");
+        let mut platform_sources = inject_runtime_log_sources(&mut release, layout);
+        platform_sources.extend(inject_orchestrator_log_source(&mut release));
         let release_id = release.release_id.clone();
         let services = release
             .services
@@ -87,6 +92,7 @@ impl LogCatalog {
             version: String::new(),
             release_id,
             builtin_orchestrator,
+            platform_sources,
             services,
         };
         catalog.version = catalog.fingerprint()?;
@@ -94,7 +100,7 @@ impl LogCatalog {
     }
 
     fn fingerprint(&self) -> Result<String> {
-        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&(
+        let descriptor = serde_json::to_vec(&(
             &self.app_id,
             &self.release_id,
             self.builtin_orchestrator,
@@ -102,6 +108,14 @@ impl LogCatalog {
             &self.log_root,
             self.layout,
             &self.services,
+        ))?;
+        // A catalog published before explicit provenance used this exact fingerprint.
+        if self.platform_sources.is_empty() {
+            return Ok(hex::encode(Sha256::digest(descriptor)));
+        }
+        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&(
+            descriptor,
+            &self.platform_sources,
         ))?)))
     }
 
@@ -124,12 +138,7 @@ impl LogCatalog {
             metadata.len() <= MAX_CATALOG_BYTES,
             "log catalog exceeds size limit"
         );
-        let file = std::fs::File::open(path).context("open log catalog")?;
-        ensure!(
-            crate::sources::file_identity(path, &metadata)
-                == crate::sources::file_identity(path, &file.metadata()?),
-            "log catalog changed while opening"
-        );
+        let file = crate::read::open_regular_file(path, &metadata).context("open log catalog")?;
         let mut bytes = Vec::new();
         file.take(MAX_CATALOG_BYTES + 1)
             .read_to_end(&mut bytes)
@@ -171,12 +180,81 @@ impl LogCatalog {
                 "log catalog builtin orchestrator is missing or duplicated"
             );
         }
+        ensure!(
+            catalog.platform_sources.len() <= MAX_PLATFORM_SOURCES,
+            "log catalog exceeds platform source limit"
+        );
+        for (key, kind) in &catalog.platform_sources {
+            let (service_id, source_id) = key
+                .split_once('/')
+                .ok_or_else(|| anyhow::anyhow!("invalid platform source key"))?;
+            let source = catalog
+                .services
+                .iter()
+                .find(|service| service.service_id == service_id)
+                .and_then(|service| service.sources.iter().find(|source| source.id == source_id))
+                .ok_or_else(|| anyhow::anyhow!("catalog platform source is missing: {key}"))?;
+            let valid = match kind {
+                PlatformSourceKind::Runtime => {
+                    source.format == workspace_manifest::LogFormat::Text
+                        && source.multiline_start_pattern.is_none()
+                        && source.glob
+                            == match catalog.layout {
+                                LogLayout::Builtin => "runtime.*.log".to_owned(),
+                                LogLayout::Supervisord => format!("{service_id}.log"),
+                            }
+                }
+                PlatformSourceKind::Orchestrator => {
+                    service_id == "app-cli"
+                        && source.format == workspace_manifest::LogFormat::Jsonl
+                        && source.glob == "app-cli.log.*"
+                        && source.multiline_start_pattern.is_none()
+                }
+                PlatformSourceKind::Build
+                | PlatformSourceKind::ManagementLaunch
+                | PlatformSourceKind::OwnerRecovery
+                | PlatformSourceKind::DevServer => false,
+            };
+            ensure!(
+                valid,
+                "catalog platform source description does not match its provenance: {key}"
+            );
+        }
         for service in &catalog.services {
             workspace_manifest::validate_service_id(&service.service_id)
                 .context("invalid catalog service id")?;
+        }
+        let mut platform_sources = catalog.platform_sources.clone();
+        if platform_sources.is_empty()
+            && catalog.builtin_orchestrator
+            && catalog.services.iter().any(|service| {
+                service.service_id == "app-cli"
+                    && service.sources.iter().any(|source| {
+                        source.id == "orchestrator"
+                            && source.glob == "app-cli.log.*"
+                            && source.format == workspace_manifest::LogFormat::Jsonl
+                            && source.multiline_start_pattern.is_none()
+                    })
+            })
+        {
+            platform_sources.insert(
+                source_key("app-cli", "orchestrator"),
+                PlatformSourceKind::Orchestrator,
+            );
+        }
+        // Catalogs describe all services. The global 128-source limit belongs
+        // to each query's selection, not publication or management startup.
+        for service in &catalog.services {
+            let user_sources = service
+                .sources
+                .iter()
+                .filter(|source| {
+                    !platform_sources.contains_key(&source_key(&service.service_id, &source.id))
+                })
+                .count();
             ensure!(
-                service.sources.len() <= shared_types::MAX_SOURCES,
-                "log catalog exceeds source limit"
+                user_sources <= shared_types::MAX_SOURCES,
+                "log catalog exceeds per-service business source limit"
             );
         }
         Ok(Some(catalog))
@@ -186,9 +264,30 @@ impl LogCatalog {
     pub fn publish(&self, state_root: &Path) -> Result<()> {
         let path = catalog_path(state_root);
         let bytes = serde_json::to_vec(self)?;
-        match std::fs::read(&path) {
-            Ok(previous) if previous == bytes => return Ok(()),
-            Ok(_) => {}
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_file() && !metadata.file_type().is_symlink(),
+                    "previous log catalog must be a real file"
+                );
+                ensure!(
+                    metadata.len() <= MAX_CATALOG_BYTES,
+                    "previous log catalog exceeds size limit"
+                );
+                let file = crate::read::open_regular_file(&path, &metadata)
+                    .context("open previous log catalog")?;
+                let mut previous = Vec::new();
+                file.take(MAX_CATALOG_BYTES + 1)
+                    .read_to_end(&mut previous)
+                    .context("read previous log catalog")?;
+                ensure!(
+                    previous.len() as u64 <= MAX_CATALOG_BYTES,
+                    "previous log catalog exceeds size limit"
+                );
+                if previous == bytes {
+                    return Ok(());
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("inspect previous log catalog"),
         }
@@ -336,6 +435,163 @@ mod tests {
                 &[root.path().join("other")]
             )
             .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn legacy_catalog_without_platform_metadata_keeps_its_fingerprint() {
+        let root = tempfile::tempdir().unwrap();
+        let mut legacy = catalog(root.path());
+        legacy.platform_sources.clear();
+        legacy.version = legacy.fingerprint().unwrap();
+        let serialized = serde_json::to_string(&legacy).unwrap();
+        assert!(!serialized.contains("platform_sources"));
+        legacy.publish(root.path()).unwrap();
+        let loaded = LogCatalog::read(
+            &catalog_path(root.path()),
+            "227",
+            &root.path().join("source"),
+            &[root.path().join("logs")],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(loaded.version, legacy.version);
+        assert!(loaded.platform_sources.is_empty());
+        let logs = crate::LogService::from_catalog(loaded);
+        let sources = logs
+            .sources(shared_types::LogQueryRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(sources.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn one_service_can_use_all_business_sources_plus_platform_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let mut catalog = catalog(root.path());
+        let user = catalog
+            .services
+            .iter_mut()
+            .find(|service| service.service_id == "api-0")
+            .unwrap();
+        let application = user
+            .sources
+            .iter()
+            .find(|source| source.id == "application")
+            .unwrap()
+            .clone();
+        user.sources.retain(|source| source.id == "runtime");
+        user.sources
+            .extend((0..shared_types::MAX_SOURCES).map(|index| {
+                let mut source = application.clone();
+                source.id = format!("application-{index}");
+                source
+            }));
+        catalog.version = catalog.fingerprint().unwrap();
+        catalog.publish(root.path()).unwrap();
+        let loaded = LogCatalog::read(
+            &catalog_path(root.path()),
+            "227",
+            &root.path().join("source"),
+            &[root.path().join("logs")],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            crate::LogService::from_catalog(loaded)
+                .sources(shared_types::LogQueryRequest::default())
+                .await
+                .unwrap()
+                .len(),
+            shared_types::MAX_SOURCES + 2
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn publish_rejects_fifo_instead_of_waiting_for_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let path = catalog_path(root.path());
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .expect("POSIX mkfifo is required by this Unix fixture")
+                .success()
+        );
+        let error = catalog(root.path()).publish(root.path()).unwrap_err();
+        assert!(error.to_string().contains("real file"), "{error:#}");
+        assert!(!std::fs::symlink_metadata(path).unwrap().is_file());
+    }
+    #[tokio::test]
+    async fn catalog_above_query_limit_still_supports_valid_source_subsets() {
+        let root = tempfile::tempdir().unwrap();
+        let mut service = crate::sources::orchestrator_service();
+        service.logs = (0..65)
+            .map(|index| LogSource {
+                id: format!("application-{index}"),
+                glob: format!("{index}.log"),
+                format: LogFormat::Text,
+                multiline_start_pattern: None,
+            })
+            .collect();
+        let release = ReleaseLock {
+            schema_version: 1,
+            release_id: "release".into(),
+            workspace_name: "test".into(),
+            minimum_app_cli_version: "0.3.13".into(),
+            runtime_image_digest: "runtime:test".into(),
+            pingap: LockedPingap {
+                mode: PingapMode::Managed,
+                version: "test".into(),
+                commit: "test".into(),
+                config: None,
+            },
+            services: (0..2)
+                .map(|index| {
+                    let mut service = service.clone();
+                    service.service_id = format!("api-{index}");
+                    service
+                })
+                .collect(),
+            bridge_service: None,
+        };
+        let catalog = LogCatalog::from_release(
+            "227".into(),
+            root.path().join("source"),
+            root.path().join("logs"),
+            release,
+            LogLayout::Builtin,
+        )
+        .expect("a query limit must not reject the complete release description");
+        catalog.publish(root.path()).unwrap();
+        let loaded = LogCatalog::read(
+            &catalog_path(root.path()),
+            "227",
+            &root.path().join("source"),
+            &[root.path().join("logs")],
+        )
+        .unwrap()
+        .unwrap();
+        let directory = root.path().join("logs/api-0");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("0.log"), "subset remains readable\n").unwrap();
+        let logs = crate::LogService::from_catalog(loaded);
+        let request = shared_types::LogQueryRequest {
+            selectors: vec![shared_types::LogSelector {
+                service_id: "api-0".into(),
+                source_ids: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(logs.sources(request.clone()).await.unwrap().len(), 66);
+        let response = logs.query(request).await.unwrap();
+        assert!(response.source_errors.is_empty());
+        assert_eq!(response.logs.len(), 1);
+        assert_eq!(response.logs[0].message, "subset remains readable");
+        assert!(
+            logs.query(shared_types::LogQueryRequest::default())
+                .await
+                .is_err(),
+            "selecting all 130 user sources must still exceed the 128-source query limit"
         );
     }
 }

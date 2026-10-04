@@ -5516,6 +5516,7 @@ dependencies = [
  "globset",
  "hex",
  "regex",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

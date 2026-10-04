@@ -13,19 +13,19 @@ use workspace_manifest::{LockedService, LogFormat, ReleaseLock};
 use super::filter::compare_timestamps;
 use super::model::{
     CursorState, FileCursor, LogQueryRequest, LogQueryResponse, LogRecord, LogSourceInfo,
-    MAX_CURSOR_BYTES, MAX_KEYWORD_BYTES, MAX_SERVICES, MAX_SOURCES, MAX_TAIL_PER_SOURCE,
-    SourceCursor, SourceError,
+    MAX_CURSOR_BYTES, MAX_KEYWORD_BYTES, MAX_SERVICES, MAX_TAIL_PER_SOURCE, SourceCursor,
+    SourceError,
 };
 use super::read::read_file;
 pub use super::sources::LogLayout;
 use super::sources::{
-    MatchedLogFile, ORCHESTRATOR_SERVICE_ID, SelectedSource, file_identity,
-    inject_orchestrator_log_source, inject_runtime_log_sources, orchestrator_service,
+    MAX_PLATFORM_SOURCES, MatchedLogFile, ORCHESTRATOR_SERVICE_ID, PlatformSourceKind,
+    PlatformSources, SelectedSource, available_platform_id, file_identity,
+    inject_orchestrator_log_source, inject_runtime_log_sources, orchestrator_service, source_key,
+    validate_source_budget,
 };
 
 const MAX_FILES_PER_SOURCE: usize = 128;
-// app-cli's virtual service: orchestrator, owner-recovery, management-launch, dev-server.
-const MAX_BUILTIN_SOURCES: usize = 4;
 #[derive(Clone)]
 pub struct LogService {
     /// enabled 服务集（已注入 runtime 日志源）。server 动态形态下每次查询按当前
@@ -36,7 +36,8 @@ pub struct LogService {
     layout: LogLayout,
     roots: BTreeMap<String, Vec<PathBuf>>,
     diagnostics: Vec<SourceError>,
-    builtin_orchestrator: bool,
+    platform_sources: PlatformSources,
+    business_services: BTreeSet<String>,
 }
 
 impl LogService {
@@ -45,12 +46,14 @@ impl LogService {
     }
 
     pub fn with_layout(mut release: ReleaseLock, log_root: PathBuf, layout: LogLayout) -> Self {
-        let builtin_orchestrator = !release
+        let business_services = release
             .services
             .iter()
-            .any(|service| service.service_id == ORCHESTRATOR_SERVICE_ID);
-        inject_runtime_log_sources(&mut release, layout);
-        inject_orchestrator_log_source(&mut release);
+            .filter(|service| service.enabled)
+            .map(|service| service.service_id.clone())
+            .collect();
+        let mut platform_sources = inject_runtime_log_sources(&mut release, layout);
+        platform_sources.extend(inject_orchestrator_log_source(&mut release));
         let descriptions = release
             .services
             .iter()
@@ -73,14 +76,19 @@ impl LogService {
             layout,
             roots: BTreeMap::new(),
             diagnostics: Vec::new(),
-            builtin_orchestrator,
+            platform_sources,
+            business_services,
         }
     }
 
     /// 未部署（idle）形态：空服务集，boot_id 固定 "idle"（无代际可言）。
     /// 编排器源仍注入——空容器/部署失败恰是最需要 app-cli 自身日志的场景。
     pub fn idle(log_root: PathBuf) -> Self {
-        let builtin_orchestrator = true;
+        let business_services = BTreeSet::new();
+        let platform_sources = PlatformSources::from([(
+            source_key(ORCHESTRATOR_SERVICE_ID, "orchestrator"),
+            PlatformSourceKind::Orchestrator,
+        )]);
         Self {
             services: vec![orchestrator_service()],
             log_root,
@@ -88,7 +96,8 @@ impl LogService {
             layout: LogLayout::Builtin,
             roots: BTreeMap::new(),
             diagnostics: Vec::new(),
-            builtin_orchestrator,
+            platform_sources,
+            business_services,
         }
     }
 
@@ -100,12 +109,14 @@ impl LogService {
         boot_id: String,
         layout: LogLayout,
     ) -> Self {
-        let builtin_orchestrator = !release
+        let business_services = release
             .services
             .iter()
-            .any(|service| service.service_id == ORCHESTRATOR_SERVICE_ID);
-        inject_runtime_log_sources(&mut release, layout);
-        inject_orchestrator_log_source(&mut release);
+            .filter(|service| service.enabled)
+            .map(|service| service.service_id.clone())
+            .collect();
+        let mut platform_sources = inject_runtime_log_sources(&mut release, layout);
+        platform_sources.extend(inject_orchestrator_log_source(&mut release));
         Self {
             services: release
                 .services
@@ -117,7 +128,8 @@ impl LogService {
             layout,
             roots: BTreeMap::new(),
             diagnostics: Vec::new(),
-            builtin_orchestrator,
+            platform_sources,
+            business_services,
         }
     }
 
@@ -169,7 +181,37 @@ impl LogService {
     }
 
     pub fn from_catalog(catalog: crate::catalog::LogCatalog) -> Self {
-        let builtin_orchestrator = catalog.builtin_orchestrator;
+        let business_services = catalog
+            .services
+            .iter()
+            .filter(|service| {
+                !(catalog.builtin_orchestrator && service.service_id == ORCHESTRATOR_SERVICE_ID)
+            })
+            .map(|service| service.service_id.clone())
+            .collect();
+        let mut platform_sources = catalog.platform_sources;
+        // Old catalogs carried only an explicit virtual-service flag. Never infer
+        // a user's runtime/orchestrator provenance from its name alone.
+        if platform_sources.is_empty()
+            && catalog.builtin_orchestrator
+            && let Some(source) = catalog
+                .services
+                .iter()
+                .find(|service| service.service_id == ORCHESTRATOR_SERVICE_ID)
+                .and_then(|service| {
+                    service.sources.iter().find(|source| {
+                        source.id == "orchestrator"
+                            && source.glob == "app-cli.log.*"
+                            && source.format == LogFormat::Jsonl
+                            && source.multiline_start_pattern.is_none()
+                    })
+                })
+        {
+            platform_sources.insert(
+                source_key(ORCHESTRATOR_SERVICE_ID, &source.id),
+                PlatformSourceKind::Orchestrator,
+            );
+        }
         let services = catalog
             .services
             .into_iter()
@@ -187,7 +229,8 @@ impl LogService {
             layout: catalog.layout,
             roots: BTreeMap::new(),
             diagnostics: Vec::new(),
-            builtin_orchestrator,
+            platform_sources,
+            business_services,
         }
     }
 
@@ -199,7 +242,24 @@ impl LogService {
         directory: PathBuf,
     ) -> Result<()> {
         workspace_manifest::validate_service_id(service_id).context("invalid log service id")?;
-        let key = format!("{service_id}/{}", source.id);
+        if let Some(existing) = self
+            .services
+            .iter()
+            .find(|service| service.service_id == service_id)
+            .and_then(|service| {
+                service
+                    .logs
+                    .iter()
+                    .find(|existing| existing.id == source.id)
+            })
+        {
+            anyhow::ensure!(
+                same_description(existing, &source),
+                "log source description changed for {service_id}/{}",
+                source.id
+            );
+        }
+        let key = source_key(service_id, &source.id);
         let roots = self.roots.entry(key).or_default();
         if !roots.contains(&directory) {
             roots.push(directory);
@@ -207,9 +267,9 @@ impl LogService {
         if let Some(service) = self
             .services
             .iter_mut()
-            .find(|s| s.service_id == service_id)
+            .find(|service| service.service_id == service_id)
         {
-            if !service.logs.iter().any(|s| s.id == source.id) {
+            if !service.logs.iter().any(|existing| existing.id == source.id) {
                 service.logs.push(source);
             }
         } else {
@@ -218,30 +278,94 @@ impl LogService {
             service.logs = vec![source];
             self.services.push(service);
         }
+        self.business_services.insert(service_id.to_owned());
         Ok(())
+    }
+
+    /// Register a platform-owned source without claiming a user's same-named source.
+    /// The stable assigned id is reused when another exact writer directory is added.
+    pub fn add_platform_directory(
+        &mut self,
+        service_id: &str,
+        kind: PlatformSourceKind,
+        mut source: workspace_manifest::LogSource,
+        directory: PathBuf,
+    ) -> Result<String> {
+        workspace_manifest::validate_service_id(service_id)
+            .context("invalid platform log service id")?;
+        let existing = self
+            .services
+            .iter()
+            .find(|service| service.service_id == service_id)
+            .and_then(|service| {
+                service.logs.iter().find(|candidate| {
+                    self.platform_sources
+                        .get(&source_key(service_id, &candidate.id))
+                        == Some(&kind)
+                        && same_pattern(candidate, &source)
+                })
+            });
+        if let Some(existing) = existing {
+            source.id = existing.id.clone();
+        } else if let Some(service) = self
+            .services
+            .iter()
+            .find(|service| service.service_id == service_id)
+        {
+            source.id = available_platform_id(&service.logs, &source.id);
+        }
+        let id = source.id.clone();
+        let key = source_key(service_id, &id);
+        let business_service = self.business_services.contains(service_id);
+        self.add_directory(service_id, source, directory)?;
+        if !business_service {
+            self.business_services.remove(service_id);
+        }
+        self.platform_sources.insert(key, kind);
+        Ok(id)
+    }
+
+    fn is_platform_service(&self, service_id: &str) -> bool {
+        !self.business_services.contains(service_id)
+            && self
+                .services
+                .iter()
+                .any(|service| service.service_id == service_id)
     }
 
     /// Existing per-source patterns apply to each known writer root.
     pub fn add_writer_root(&mut self, root: &Path) {
         for service in &self.services {
             for source in &service.logs {
-                if service.service_id == ORCHESTRATOR_SERVICE_ID && source.id == "orchestrator" {
+                if self
+                    .platform_sources
+                    .get(&source_key(&service.service_id, &source.id))
+                    == Some(&PlatformSourceKind::Orchestrator)
+                {
                     continue;
                 }
-                let directory = if source.id == "runtime" && self.layout == LogLayout::Supervisord {
+                let directory = if self
+                    .platform_sources
+                    .get(&source_key(&service.service_id, &source.id))
+                    == Some(&PlatformSourceKind::Runtime)
+                    && self.layout == LogLayout::Supervisord
+                {
                     root.join("services")
                 } else {
                     root.join(&service.service_id)
                 };
                 let key = format!("{}/{}", service.service_id, source.id);
                 let roots = self.roots.entry(key).or_insert_with(|| {
-                    vec![
-                        if source.id == "runtime" && self.layout == LogLayout::Supervisord {
-                            self.log_root.join("services")
-                        } else {
-                            self.log_root.join(&service.service_id)
-                        },
-                    ]
+                    vec![if self
+                        .platform_sources
+                        .get(&source_key(&service.service_id, &source.id))
+                        == Some(&PlatformSourceKind::Runtime)
+                        && self.layout == LogLayout::Supervisord
+                    {
+                        self.log_root.join("services")
+                    } else {
+                        self.log_root.join(&service.service_id)
+                    }]
                 });
                 if !roots.contains(&directory) {
                     roots.push(directory);
@@ -254,7 +378,10 @@ impl LogService {
     pub fn add_legacy_runtime_roots(&mut self, roots: &[PathBuf]) {
         for service in &mut self.services {
             for source in &mut service.logs {
-                if source.id != "runtime"
+                if self
+                    .platform_sources
+                    .get(&source_key(&service.service_id, &source.id))
+                    != Some(&PlatformSourceKind::Runtime)
                     || source.format != LogFormat::Text
                     || (source.glob != "runtime.*.log"
                         && source.glob != format!("{}.log", service.service_id))
@@ -277,12 +404,23 @@ impl LogService {
         }
     }
 
-    pub fn replace_pattern(&mut self, service_id: &str, source_id: &str, pattern: String) {
+    pub fn replace_platform_pattern(
+        &mut self,
+        service_id: &str,
+        kind: PlatformSourceKind,
+        pattern: String,
+    ) {
         if let Some(source) = self
             .services
             .iter_mut()
             .find(|s| s.service_id == service_id)
-            .and_then(|service| service.logs.iter_mut().find(|s| s.id == source_id))
+            .and_then(|service| {
+                service.logs.iter_mut().find(|source| {
+                    self.platform_sources
+                        .get(&source_key(service_id, &source.id))
+                        == Some(&kind)
+                })
+            })
         {
             source.glob = pattern;
         }
@@ -296,8 +434,8 @@ impl LogService {
             .map(|s| (&s.service_id, &s.logs))
             .collect::<Vec<_>>();
         hex::encode(Sha256::digest(format!(
-            "{}:{descriptions:?}:{:?}",
-            self.boot_id, self.roots
+            "{}:{descriptions:?}:{:?}:{:?}:{:?}",
+            self.boot_id, self.roots, self.platform_sources, self.business_services
         )))
     }
 
@@ -366,11 +504,9 @@ impl LogService {
         let business_selectors = request
             .selectors
             .iter()
-            .filter(|selector| {
-                !(self.builtin_orchestrator && selector.service_id == ORCHESTRATOR_SERVICE_ID)
-            })
+            .filter(|selector| !self.is_platform_service(&selector.service_id))
             .count();
-        if request.selectors.len() > MAX_SERVICES + usize::from(self.builtin_orchestrator)
+        if request.selectors.len() > MAX_SERVICES + MAX_PLATFORM_SOURCES
             || business_selectors > MAX_SERVICES
         {
             anyhow::bail!("selectors exceeds maximum of {MAX_SERVICES} services");
@@ -461,34 +597,32 @@ impl LogService {
         }
         let selected_service_count = selected
             .iter()
-            .filter(|source| {
-                !(self.builtin_orchestrator && source.service_id == ORCHESTRATOR_SERVICE_ID)
-            })
+            .filter(|source| self.business_services.contains(&source.service_id))
             .map(|source| source.service_id.as_str())
             .collect::<BTreeSet<_>>()
             .len();
         if selected_service_count > MAX_SERVICES {
             anyhow::bail!("selected services exceeds maximum of {MAX_SERVICES}");
         }
-        let builtin_sources = selected
-            .iter()
-            .filter(|source| {
-                self.builtin_orchestrator && source.service_id == ORCHESTRATOR_SERVICE_ID
-            })
-            .count();
-        if selected.len() - builtin_sources > MAX_SOURCES || builtin_sources > MAX_BUILTIN_SOURCES {
-            anyhow::bail!(
-                "selected sources exceeds maximum of {MAX_SOURCES} business sources and {MAX_BUILTIN_SOURCES} builtin sources"
-            );
-        }
+        validate_source_budget(
+            selected
+                .iter()
+                .map(|source| (source.service_id.as_str(), &source.source)),
+            &self.platform_sources,
+        )?;
         Ok(selected)
     }
 
     fn default_directory(&self, selected: &SelectedSource) -> PathBuf {
-        if selected.service_id == ORCHESTRATOR_SERVICE_ID && selected.source.id == "orchestrator" {
+        let kind = self
+            .platform_sources
+            .get(&source_key(&selected.service_id, &selected.source.id));
+        if kind == Some(&PlatformSourceKind::Orchestrator) {
             // 编排器源：app-cli 自身日志直接落在 log_root 根目录（非 {svc}/ 子目录）
             self.log_root.clone()
-        } else if self.layout == LogLayout::Supervisord && selected.source.id == "runtime" {
+        } else if self.layout == LogLayout::Supervisord
+            && kind == Some(&PlatformSourceKind::Runtime)
+        {
             self.log_root.join("services")
         } else {
             // 用户声明源（应用自写文件）两布局同目录：{log_root}/{svc}/
@@ -706,6 +840,22 @@ impl LogService {
         }
         Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
     }
+}
+
+fn same_description(
+    left: &workspace_manifest::LogSource,
+    right: &workspace_manifest::LogSource,
+) -> bool {
+    left.id == right.id && same_pattern(left, right)
+}
+
+fn same_pattern(
+    left: &workspace_manifest::LogSource,
+    right: &workspace_manifest::LogSource,
+) -> bool {
+    left.glob == right.glob
+        && left.format == right.format
+        && left.multiline_start_pattern == right.multiline_start_pattern
 }
 
 #[cfg(test)]

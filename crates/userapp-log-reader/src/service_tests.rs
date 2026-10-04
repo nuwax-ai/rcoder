@@ -1,7 +1,7 @@
 //! Bounded log reader contract tests, shared by both process entrypoints.
 use workspace_manifest::LogSource;
 
-use super::super::model::LogSelector;
+use super::super::model::{LogSelector, MAX_SOURCES};
 use super::super::read::MAX_LINE_BYTES;
 use super::*;
 
@@ -354,7 +354,15 @@ async fn runtime_log_source_is_injected_when_service_declares_no_logs() {
 }
 
 #[tokio::test]
-async fn existing_runtime_source_is_neither_duplicated_nor_overridden() {
+async fn declared_runtime_keeps_its_contract_alongside_platform_stdout() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("api")).unwrap();
+    std::fs::write(
+        root.path().join("api/custom-runtime.log"),
+        "{\"message\":\"user runtime source\"}\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("api/runtime.out.log"), "platform stdout\n").unwrap();
     let mut release = release_lock();
     release.services[0].logs = vec![LogSource {
         id: "runtime".into(),
@@ -362,15 +370,33 @@ async fn existing_runtime_source_is_neither_duplicated_nor_overridden() {
         format: LogFormat::Jsonl,
         multiline_start_pattern: None,
     }];
-    let service = LogService::new(release, PathBuf::from("/nonexistent-log-root"));
-    let sources = service
-        .sources(LogQueryRequest::default())
-        .await
-        .expect("sources query");
-    // api/runtime（用户声明）+ 内置 app-cli/orchestrator。
-    assert_eq!(sources.len(), 2);
-    // 用户已声明同 id source：不重复注入，且保留用户声明（jsonl 而非平台合成 text）。
-    assert_eq!(sources[0].format, "jsonl");
+    let service = LogService::new(release, root.path().to_path_buf());
+    let sources = service.sources(LogQueryRequest::default()).await.unwrap();
+    assert_eq!(sources.len(), 3);
+    assert!(sources.iter().any(|source| source.source_id == "runtime"
+        && source.format == "jsonl"
+        && source.matched_files == ["custom-runtime.log"]));
+    assert!(
+        sources
+            .iter()
+            .any(|source| source.source_id == "platform-runtime"
+                && source.format == "text"
+                && source.matched_files == ["runtime.out.log"])
+    );
+    let response = service.query(LogQueryRequest::default()).await.unwrap();
+    assert!(
+        response
+            .logs
+            .iter()
+            .any(|log| log.source_id == "runtime" && log.message == "user runtime source")
+    );
+    assert!(
+        response
+            .logs
+            .iter()
+            .any(|log| log.source_id == "platform-runtime" && log.message == "platform stdout")
+    );
+    assert!(response.source_errors.is_empty());
 }
 
 #[tokio::test]
@@ -466,23 +492,40 @@ async fn orchestrator_source_matches_root_directory_glob() {
     assert!(record.message.contains("🚀 start web"), "{record:?}");
 }
 
-/// 用户 manifest 占用 "app-cli" 服务名时不注入（用户声明优先），且其
-/// 日志目录解析不受编排器根目录特判影响。
+/// A user service named app-cli retains its directory and source contract.
 #[tokio::test]
-async fn orchestrator_source_skipped_when_service_id_taken() {
+async fn orchestrator_source_coexists_when_service_id_taken() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("app-cli")).unwrap();
+    std::fs::write(
+        root.path().join("app-cli/application.log"),
+        "{\"message\":\"user application\"}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("app-cli.log.2026-10-04"),
+        "{\"message\":\"platform orchestrator\"}\n",
+    )
+    .unwrap();
     let mut release = release_lock();
     release.services[0].service_id = "app-cli".into();
-    let service = LogService::new(release, PathBuf::from("/nonexistent-log-root"));
-    let sources = service
-        .sources(LogQueryRequest::default())
-        .await
-        .expect("sources query");
+    release.services[0].logs[0].id = "orchestrator".into();
+    let service = LogService::new(release, root.path().to_path_buf());
+    let response = service.query(LogQueryRequest::default()).await.unwrap();
     assert!(
-        !sources
+        response
+            .logs
             .iter()
-            .any(|source| source.source_id == "orchestrator"),
-        "{sources:?}"
+            .any(|log| log.source_id == "orchestrator" && log.message == "user application")
     );
+    assert!(
+        response
+            .logs
+            .iter()
+            .any(|log| log.source_id == "platform-orchestrator"
+                && log.message == "platform orchestrator")
+    );
+    assert!(response.source_errors.is_empty());
 }
 
 /// idle 形态（空容器/未部署）仍注入编排器源——部署失败排障恰需此源。
@@ -498,4 +541,113 @@ async fn idle_service_still_exposes_orchestrator_source() {
     assert_eq!(sources.len(), 1);
     assert_eq!(sources[0].service_id, "app-cli");
     assert_eq!(sources[0].source_id, "orchestrator");
+}
+
+#[tokio::test]
+async fn platform_registration_allocates_stable_suffix_and_keeps_user_bindings() {
+    use crate::sources::PlatformSourceKind;
+    let root = tempfile::tempdir().unwrap();
+    let mut release = release_lock();
+    release.services[0].logs = ["build", "platform-build"]
+        .into_iter()
+        .map(|id| LogSource {
+            id: id.into(),
+            glob: "application*.log".into(),
+            format: LogFormat::Jsonl,
+            multiline_start_pattern: None,
+        })
+        .collect();
+    let mut service = LogService::new(release, root.path().to_path_buf());
+    let source = LogSource {
+        id: "build".into(),
+        glob: "dev-*.log".into(),
+        format: LogFormat::Text,
+        multiline_start_pattern: None,
+    };
+    let id = service
+        .add_platform_directory(
+            "api",
+            PlatformSourceKind::Build,
+            source.clone(),
+            root.path().join("build-one"),
+        )
+        .unwrap();
+    assert_eq!(id, "platform-build-2");
+    assert_eq!(
+        service
+            .add_platform_directory(
+                "api",
+                PlatformSourceKind::Build,
+                source.clone(),
+                root.path().join("build-two")
+            )
+            .unwrap(),
+        id
+    );
+    let mut changed = source;
+    changed.glob = "different.log".into();
+    assert_eq!(
+        service
+            .add_platform_directory(
+                "api",
+                PlatformSourceKind::Build,
+                changed,
+                root.path().join("unrelated")
+            )
+            .unwrap(),
+        "platform-build-3"
+    );
+    let sources = service.sources(LogQueryRequest::default()).await.unwrap();
+    assert_eq!(
+        sources
+            .iter()
+            .filter(|source| source.source_id == "platform-build-2")
+            .count(),
+        1
+    );
+    assert_eq!(
+        sources
+            .iter()
+            .find(|source| source.source_id == "build")
+            .unwrap()
+            .format,
+        "jsonl"
+    );
+}
+
+#[tokio::test]
+async fn user_named_platform_sources_do_not_exempt_business_quota() {
+    let root = tempfile::tempdir().unwrap();
+    let mut release = release_lock();
+    release.services[0].service_id = "app-cli".into();
+    release.services[0].logs = (0..=MAX_SOURCES)
+        .map(|index| LogSource {
+            id: format!("platform-build-{index}"),
+            glob: "application*.log".into(),
+            format: LogFormat::Jsonl,
+            multiline_start_pattern: None,
+        })
+        .collect();
+    let service = LogService::new(release, root.path().to_path_buf());
+    assert!(service.sources(LogQueryRequest::default()).await.is_err());
+}
+
+#[tokio::test]
+async fn runtime_only_services_still_consume_business_service_quota() {
+    let root = tempfile::tempdir().unwrap();
+    let mut release = release_lock();
+    let mut template = release.services.remove(0);
+    template.logs.clear();
+    release.services = (0..=MAX_SERVICES)
+        .map(|index| {
+            let mut service = template.clone();
+            service.service_id = format!("api-{index}");
+            service
+        })
+        .collect();
+    let service = LogService::new(release, root.path().to_path_buf());
+    assert!(
+        service.sources(LogQueryRequest::default()).await.is_err(),
+        "platform stdout must not exempt business services from their original 64-service limit"
+    );
 }

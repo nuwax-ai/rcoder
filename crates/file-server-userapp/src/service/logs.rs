@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use futures_util::future::BoxFuture;
 use shared_types::{LogFormat, LogSource, SourceError};
+use userapp_log_reader::sources::PlatformSourceKind;
 use userapp_log_reader::{LogCatalog, LogLayout, LogProvider, LogService, catalog_path};
 
 #[derive(Clone)]
@@ -100,7 +101,9 @@ impl DevLogProvider {
                 None
             }
         };
-        let legacy = catalog.is_none();
+        let legacy = catalog
+            .as_ref()
+            .is_none_or(|catalog| catalog.platform_sources.is_empty());
         let mut logs = match catalog {
             Some(catalog) => LogService::from_catalog(catalog),
             None => match read_legacy_release(&self.source_root) {
@@ -125,13 +128,19 @@ impl DevLogProvider {
         }
         let orchestrator = log_source("orchestrator", "app-cli.log.*", LogFormat::Jsonl);
         for root in &roots {
-            logs.add_directory("app-cli", orchestrator.clone(), root.clone())?;
+            logs.add_platform_directory(
+                "app-cli",
+                PlatformSourceKind::Orchestrator,
+                orchestrator.clone(),
+                root.clone(),
+            )?;
         }
         // Supervisord captures wrapper/CLI failures before tracing is installed.
         // A global wrapper log is readable only by the app owning this process.
         if let Some(root) = &self.main_root {
-            logs.add_directory(
+            logs.add_platform_directory(
                 "app-cli",
+                PlatformSourceKind::ManagementLaunch,
                 log_source(
                     "management-launch",
                     "rcoder-app-runtime.log*",
@@ -140,14 +149,16 @@ impl DevLogProvider {
                 root.clone(),
             )?;
         }
-        logs.add_directory(
+        logs.add_platform_directory(
             "app-cli",
+            PlatformSourceKind::OwnerRecovery,
             log_source("owner-recovery", "owner-recovery.log", LogFormat::Text),
             fallback_root.clone(),
         )?;
         let dev_logs = file_server::service::dev_server::log::log_dir(&self.config, &self.app_id);
-        logs.add_directory(
+        logs.add_platform_directory(
             "app-cli",
+            PlatformSourceKind::DevServer,
             log_source("dev-server", "dev-*.log", LogFormat::Text),
             dev_logs,
         )?;
@@ -156,8 +167,9 @@ impl DevLogProvider {
         match read_build_directories(&self.source_root.join("logs")) {
             Ok(directories) => {
                 for (service_id, directory) in directories {
-                    logs.add_directory(
+                    logs.add_platform_directory(
                         &service_id,
+                        PlatformSourceKind::Build,
                         log_source("build", "dev-*.log", LogFormat::Text),
                         directory,
                     )?;
@@ -199,7 +211,7 @@ fn read_legacy_release(source: &Path) -> Result<Option<shared_types::ReleaseLock
     );
     use std::io::Read;
     let mut bytes = Vec::new();
-    std::fs::File::open(&path)
+    userapp_log_reader::read::open_regular_file(&path, &metadata)
         .context("open log service release description")?
         .take(1024 * 1024 + 1)
         .read_to_end(&mut bytes)
@@ -291,23 +303,36 @@ fn add_legacy_sources(
         let service_id = project.service_id();
         for declared in &project.manifest.logs.sources {
             for root in roots {
-                logs.add_directory(service_id, declared.clone(), root.join(service_id))?;
+                if let Err(error) =
+                    logs.add_directory(service_id, declared.clone(), root.join(service_id))
+                {
+                    diagnostics.push(SourceError {
+                        service_id: service_id.to_owned(),
+                        source_id: declared.id.clone(),
+                        code: "source_description_conflict".into(),
+                        message: format!("{error:#}"),
+                    });
+                    break;
+                }
             }
         }
-        if project.manifest.project.r#type != shared_types::ProjectType::Static
-            && !project
-                .manifest
-                .logs
-                .sources
-                .iter()
-                .any(|source| source.id == "runtime")
-        {
+        if project.manifest.project.r#type != shared_types::ProjectType::Static {
             let pattern = format!("{{runtime.*.log,{service_id}.log}}");
-            logs.replace_pattern(service_id, "runtime", pattern.clone());
+            logs.replace_platform_pattern(service_id, PlatformSourceKind::Runtime, pattern.clone());
             let runtime = log_source("runtime", &pattern, LogFormat::Text);
             for root in roots {
-                logs.add_directory(service_id, runtime.clone(), root.join(service_id))?;
-                logs.add_directory(service_id, runtime.clone(), root.join("services"))?;
+                logs.add_platform_directory(
+                    service_id,
+                    PlatformSourceKind::Runtime,
+                    runtime.clone(),
+                    root.join(service_id),
+                )?;
+                logs.add_platform_directory(
+                    service_id,
+                    PlatformSourceKind::Runtime,
+                    runtime.clone(),
+                    root.join("services"),
+                )?;
             }
         }
     }
@@ -468,5 +493,360 @@ mod tests {
             .unwrap();
         assert!(response.logs.is_empty());
         assert!(!root.path().join("state").exists());
+    }
+    #[tokio::test]
+    async fn platform_build_source_does_not_override_declared_build_source() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source/227");
+        let main_logs = root.path().join("current-app-logs");
+        std::fs::create_dir_all(source.join("logs/api")).unwrap();
+        std::fs::create_dir_all(main_logs.join("api")).unwrap();
+        std::fs::write(
+            source.join("logs/api/dev-task.log"),
+            "compiled successfully\n",
+        )
+        .unwrap();
+        std::fs::write(
+            main_logs.join("api/application.log"),
+            "{\"message\":\"application build source\"}\n",
+        )
+        .unwrap();
+        let release = maximum_release(1, 1);
+        std::fs::write(
+            source.join("release.lock.toml"),
+            toml::to_string(&release).unwrap(),
+        )
+        .unwrap();
+        let config = file_server::Config {
+            userapp_workspace_dir: root.path().join("source"),
+            log_base_dir: root.path().join("fallback"),
+            ..Default::default()
+        };
+        let provider = DevLogProvider::from_environment(
+            &config,
+            "227",
+            environment(root.path(), "user-app-builder"),
+        )
+        .unwrap();
+        let logs = provider.load().await.unwrap();
+        let response = logs.query(LogQueryRequest::default()).await.unwrap();
+        assert!(
+            response
+                .logs
+                .iter()
+                .any(|log| log.source_id == "build" && log.message == "application build source")
+        );
+        assert!(
+            response
+                .logs
+                .iter()
+                .any(|log| log.source_id == "platform-build"
+                    && log.message == "compiled successfully")
+        );
+        let sources = logs.sources(LogQueryRequest::default()).await.unwrap();
+        let keys = sources
+            .iter()
+            .map(|source| (&source.service_id, &source.source_id))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(keys.len(), sources.len());
+        assert!(sources.iter().any(|source| source.source_id == "build"
+            && source.format == "jsonl"
+            && source.matched_files == ["application.log"]));
+        assert!(
+            sources
+                .iter()
+                .any(|source| source.source_id == "platform-build"
+                    && source.format == "text"
+                    && source.matched_files == ["dev-task.log"])
+        );
+        let next = provider
+            .load()
+            .await
+            .unwrap()
+            .query(LogQueryRequest {
+                cursor: Some(response.cursor),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!next.cursor_reset);
+        assert!(next.logs.is_empty());
+    }
+
+    fn maximum_release(count: usize, sources_per_service: usize) -> shared_types::ReleaseLock {
+        use shared_types::{
+            HealthSection, LockedPingap, LockedService, PingapMode, ProjectKind, ProjectType,
+            ReleaseLock, RunSection,
+        };
+        let services = (0..count)
+            .map(|index| LockedService {
+                service_id: if count == 1 {
+                    "api".into()
+                } else {
+                    format!("api-{index}")
+                },
+                name: "API".into(),
+                dir: "api".into(),
+                r#type: ProjectType::Rust,
+                kind: ProjectKind::Web,
+                enabled: true,
+                port: 18080,
+                devbuild: None,
+                devrun: None,
+                run: RunSection {
+                    command: vec!["./api".into()],
+                    migrate: Vec::new(),
+                    depends_on: Vec::new(),
+                    shutdown_timeout_seconds: 3,
+                },
+                health: HealthSection::default(),
+                proxy: None,
+                logs: (0..sources_per_service)
+                    .map(|source| {
+                        log_source(
+                            if source == 0 { "build" } else { "application" },
+                            "application.log",
+                            LogFormat::Jsonl,
+                        )
+                    })
+                    .collect(),
+                env: Default::default(),
+                static_content_dir: None,
+            })
+            .collect();
+        ReleaseLock {
+            schema_version: 1,
+            release_id: "release".into(),
+            workspace_name: "test".into(),
+            minimum_app_cli_version: "0.3.13".into(),
+            runtime_image_digest: "runtime:test".into(),
+            pingap: LockedPingap {
+                mode: PingapMode::Managed,
+                version: "test".into(),
+                commit: "test".into(),
+                config: None,
+            },
+            services,
+            bridge_service: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn maximum_business_sources_allow_bounded_platform_logs() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source/227");
+        std::fs::create_dir_all(&source).unwrap();
+        let release = maximum_release(shared_types::MAX_SERVICES, 2);
+        for service in &release.services {
+            let project = source.join(&service.service_id);
+            std::fs::create_dir_all(&project).unwrap();
+            let manifest = shared_types::ProjectManifest {
+                schema_version: 1,
+                project: shared_types::ProjectMeta {
+                    service_id: service.service_id.clone(),
+                    name: service.name.clone(),
+                    r#type: service.r#type.clone(),
+                    kind: service.kind.clone(),
+                    enabled: service.enabled,
+                },
+                build: shared_types::BuildSection {
+                    command: vec!["true".into()],
+                    artifact: "artifact.zip".into(),
+                },
+                devbuild: None,
+                run: service.run.clone(),
+                devrun: None,
+                health: service.health.clone(),
+                proxy: service.proxy.clone(),
+                logs: shared_types::LogsSection {
+                    sources: service.logs.clone(),
+                },
+                env: service.env.clone(),
+            };
+            std::fs::write(
+                project.join("project.manifest.toml"),
+                toml::to_string(&manifest).unwrap(),
+            )
+            .unwrap();
+            let directory = source.join("logs").join(&service.service_id);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("dev-task.log"),
+                format!("built {}\n", service.service_id),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            source.join("release.lock.toml"),
+            toml::to_string(&release).unwrap(),
+        )
+        .unwrap();
+        let config = file_server::Config {
+            userapp_workspace_dir: root.path().join("source"),
+            log_base_dir: root.path().join("fallback"),
+            ..Default::default()
+        };
+        let provider = DevLogProvider::from_environment(
+            &config,
+            "227",
+            environment(root.path(), "user-app-builder"),
+        )
+        .unwrap();
+        let logs = provider.load().await.unwrap();
+        let response = logs.query(LogQueryRequest::default()).await.unwrap();
+        assert!(
+            response.source_errors.is_empty(),
+            "{:?}",
+            response.source_errors
+        );
+        assert_eq!(response.logs.len(), shared_types::MAX_SERVICES);
+        let sources = logs.sources(LogQueryRequest::default()).await.unwrap();
+        assert_eq!(sources.len(), shared_types::MAX_SERVICES * 4 + 4);
+        assert_eq!(
+            sources
+                .iter()
+                .filter(|s| s.source_id == "platform-build")
+                .count(),
+            shared_types::MAX_SERVICES
+        );
+        let mut illegal = release;
+        illegal.services[0]
+            .logs
+            .push(log_source("third", "third.log", LogFormat::Text));
+        let illegal_logs = LogService::new(illegal, root.path().join("current-app-logs"));
+        assert!(
+            illegal_logs
+                .sources(LogQueryRequest::default())
+                .await
+                .is_err(),
+            "129 declared sources must remain rejected"
+        );
+    }
+    #[tokio::test]
+    async fn legacy_catalog_preserves_user_runtime_and_adds_platform_stdout() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source/227");
+        let main_logs = root.path().join("current-app-logs");
+        let state = root.path().join("state/227");
+        for directory in [
+            source.join("api"),
+            main_logs.join("api"),
+            main_logs.join("services"),
+            state.clone(),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let mut release = maximum_release(1, 1);
+        release.services[0].logs = vec![log_source(
+            "runtime",
+            "custom-runtime.log",
+            LogFormat::Jsonl,
+        )];
+        let service = &release.services[0];
+        let manifest = shared_types::ProjectManifest {
+            schema_version: 1,
+            project: shared_types::ProjectMeta {
+                service_id: service.service_id.clone(),
+                name: service.name.clone(),
+                r#type: service.r#type.clone(),
+                kind: service.kind.clone(),
+                enabled: true,
+            },
+            build: shared_types::BuildSection {
+                command: vec!["true".into()],
+                artifact: "artifact.zip".into(),
+            },
+            devbuild: None,
+            run: service.run.clone(),
+            devrun: None,
+            health: service.health.clone(),
+            proxy: None,
+            logs: shared_types::LogsSection {
+                sources: service.logs.clone(),
+            },
+            env: Default::default(),
+        };
+        std::fs::write(
+            source.join("api/project.manifest.toml"),
+            toml::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            main_logs.join("api/custom-runtime.log"),
+            "{\"message\":\"user runtime source\"}\n",
+        )
+        .unwrap();
+        std::fs::write(main_logs.join("services/api.log"), "platform stdout\n").unwrap();
+        let mut catalog = LogCatalog::from_release(
+            "227".into(),
+            source.clone(),
+            main_logs.clone(),
+            release,
+            LogLayout::Supervisord,
+        )
+        .unwrap();
+        for service in &mut catalog.services {
+            service
+                .sources
+                .retain(|source| source.id != "platform-runtime");
+        }
+        catalog.platform_sources.clear();
+        // This is the exact old writer's fingerprint and payload, not a new-schema shortcut.
+        catalog.version = hex::encode(Sha256::digest(
+            serde_json::to_vec(&(
+                &catalog.app_id,
+                &catalog.release_id,
+                catalog.builtin_orchestrator,
+                &catalog.source_root,
+                &catalog.log_root,
+                catalog.layout,
+                &catalog.services,
+            ))
+            .unwrap(),
+        ));
+        let catalog_bytes = serde_json::to_vec(&catalog).unwrap();
+        assert!(!String::from_utf8_lossy(&catalog_bytes).contains("platform_sources"));
+        std::fs::write(catalog_path(&state), &catalog_bytes).unwrap();
+        let config = file_server::Config {
+            userapp_workspace_dir: root.path().join("source"),
+            log_base_dir: root.path().join("fallback"),
+            ..Default::default()
+        };
+        let provider = DevLogProvider::from_environment(
+            &config,
+            "227",
+            environment(root.path(), "user-app-builder"),
+        )
+        .unwrap();
+        let response = provider
+            .load()
+            .await
+            .unwrap()
+            .query(LogQueryRequest::default())
+            .await
+            .unwrap();
+        assert!(
+            response.source_errors.is_empty(),
+            "{:?}",
+            response.source_errors
+        );
+        assert!(
+            response
+                .logs
+                .iter()
+                .any(|log| log.source_id == "runtime" && log.message == "user runtime source")
+        );
+        assert!(
+            response
+                .logs
+                .iter()
+                .any(|log| log.source_id == "platform-runtime" && log.message == "platform stdout")
+        );
+        assert_eq!(
+            std::fs::read(catalog_path(&state)).unwrap(),
+            catalog_bytes,
+            "queries must never rewrite the old catalog"
+        );
     }
 }

@@ -22,7 +22,7 @@ pub const APP_CLI_ADMIN_PORT: u16 = 3010;
 
 /// 单 manifest 服务数上限（app-cli 侧校验口径）
 pub const MAX_SERVICES: usize = 64;
-/// 单服务日志源数上限
+/// 单服务声明源数及单次查询选中的用户声明源总数上限；平台源另行有界计数。
 pub const MAX_SOURCES: usize = 128;
 /// 单源尾部行数上限
 pub const MAX_TAIL_PER_SOURCE: usize = 10_000;
@@ -62,9 +62,9 @@ pub struct LogQueryRequest {
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LogSelector {
-    /// 服务 ID（manifest 中声明的 service 名，如 "api"、"web"）
+    /// 服务 ID（如 "api"、"web"，或源清单中的平台管理服务 "app-cli"）
     pub service_id: String,
-    /// 日志源 ID 列表（空 = 该服务全部源）
+    /// 源清单中的日志源 ID 列表（空 = 该服务全部源）；同名平台源可有 platform- 前缀。
     #[serde(default)]
     pub source_ids: Vec<String>,
 }
@@ -76,9 +76,9 @@ pub struct LogSourceInfo {
     pub service_id: String,
     /// 日志源 ID
     pub source_id: String,
-    /// 日志格式（text / json）
+    /// 日志格式（text / jsonl）
     pub format: String,
-    /// 该源匹配到的日志文件绝对路径列表（容器内路径视角）
+    /// 该源匹配到的日志文件名列表（不暴露容器绝对路径）
     pub matched_files: Vec<String>,
     /// 读取或目录描述错误；保留其他可读日志源，不将失败伪装为空。
     #[serde(skip_serializing_if = "Option::is_none")]
