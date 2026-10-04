@@ -20,6 +20,10 @@ pub(crate) type ProxyClient = hyper_util::client::legacy::Client<
     Incoming,
 >;
 
+/// The network and embedded upstreams share the existing response-header
+/// budget. Streaming bodies have their separate policy after headers arrive.
+const UPSTREAM_RESPONSE_HEADERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// 进程内直连通道（feature `embed-file-server`；npm/Electron 独立形态）。
 ///
 /// 设置后 rust 域请求不再经 loopback 转发 `127.0.0.1:{rust_upstream_port}`，
@@ -69,8 +73,6 @@ async fn call_in_process(
 ) -> hyper::Response<ProxyBody> {
     use tower::ServiceExt;
     match router.oneshot(req).await {
-        // 直连不经网络代理跳，hop-by-hop 头不做剥除（我们即服务器，与独立
-        // file-server bin 直连行为一致；hyper 连接层的 keep-alive 语义照常）
         Ok(resp) => resp.map(|body| Box::pin(body.map_err(std::io::Error::other)) as ProxyBody),
         Err(e) => {
             error!("file-server 分流代理直调内嵌 file-server 失败: {e}");
@@ -175,6 +177,10 @@ async fn proxy_request(
     }
 
     let path = parts.uri.path();
+    let path_query = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| path.to_owned(), |value| value.as_str().to_owned());
     // PX-06: 请求 Connection 头声明的动态 hop-by-hop token（可能多值、逗号分隔）
     let request_connection_tokens = connection_tokens(&parts.headers);
     let service_type = parts
@@ -187,7 +193,7 @@ async fn proxy_request(
             //（AllRust 全量、TsFirst 的 userapp 前缀或 x-service-type header）都过
             // 同一白名单; header 只选择实现, 不得把 /internal/* 等上游内部路由面
             //（/internal/pod/ensure 等）经文件入口触达。
-            if !all_rust_path_allowed(path) {
+            if !shared_types::file_entry_policy::allows(&parts.method, path) {
                 warn!("path rejected outside the Rust entry allowlist: {path}");
                 return Ok(not_found("path not served on this entry"));
             }
@@ -200,29 +206,32 @@ async fn proxy_request(
                 let (mut embed_parts, embed_body) =
                     hyper::Request::from_parts(parts, body).into_parts();
                 let mut filtered = hyper::HeaderMap::new();
-                for (name, value) in embed_parts.headers.drain() {
-                    if let Some(name) = name
-                        && should_forward_request_header(name.as_str(), &request_connection_tokens)
-                    {
-                        filtered.append(name, value);
+                // HeaderMap::drain uses None for subsequent values of the same
+                // name. Iteration retains every name/value pair instead.
+                for (name, value) in &embed_parts.headers {
+                    if should_forward_request_header(name.as_str(), &request_connection_tokens) {
+                        filtered.append(name.clone(), value.clone());
                     }
                 }
                 embed_parts.headers = filtered;
-                let response =
-                    call_in_process(router, hyper::Request::from_parts(embed_parts, embed_body))
-                        .await;
-                return Ok(apply_response_policy(response));
+                let response = match tokio::time::timeout(
+                    UPSTREAM_RESPONSE_HEADERS_TIMEOUT,
+                    call_in_process(router, hyper::Request::from_parts(embed_parts, embed_body)),
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(_) => {
+                        error!(path = %path_query, "embedded file-server response headers timed out");
+                        return Ok(bad_gateway("file-server upstream timeout"));
+                    }
+                };
+                return Ok(apply_response_policy(response, path_query));
             }
             port
         }
         Upstream::Ts(port) => port,
     };
-
-    let path_query = parts
-        .uri
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| parts.uri.path().to_string());
 
     let mut upstream = hyper::Request::builder()
         .method(parts.method.clone())
@@ -251,36 +260,29 @@ async fn proxy_request(
     };
 
     // 整请求 300s 超时（宽限大文件上传/慢接口; 防"上游接受连接后不响应"无限堆积）
-    const UPSTREAM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-    let upstream_result =
-        match tokio::time::timeout(UPSTREAM_REQUEST_TIMEOUT, client.request(upstream_req)).await {
-            Ok(result) => result,
-            Err(_elapsed) => {
-                error!(
-                    "file-server 分流代理上游 127.0.0.1:{port} 请求超时 \
-                     ({UPSTREAM_REQUEST_TIMEOUT:?}, path {path_query})"
-                );
-                return Ok(bad_gateway("file-server upstream timeout"));
-            }
-        };
+    let upstream_result = match tokio::time::timeout(
+        UPSTREAM_RESPONSE_HEADERS_TIMEOUT,
+        client.request(upstream_req),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            error!(
+                "file-server 分流代理上游 127.0.0.1:{port} 请求超时 \
+                     ({UPSTREAM_RESPONSE_HEADERS_TIMEOUT:?}, path {path_query})"
+            );
+            return Ok(bad_gateway("file-server upstream timeout"));
+        }
+    };
     match upstream_result {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
-            // PX-07/P1-5: 有限 body 在仍是 Incoming 时加空闲预算（SSE 豁免）;
-            // 头清理与 embed 路径共用 apply_response_policy。
-            let is_sse = parts
-                .headers
-                .get("content-type")
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
-            let body: ProxyBody = if is_sse {
-                Box::pin(body.map_err(std::io::Error::other))
-            } else {
-                body_with_idle_budget(body, path_query.clone(), RESPONSE_BODY_IDLE_BUDGET)
-            };
-            Ok(apply_response_policy(hyper::Response::from_parts(
-                parts, body,
-            )))
+            let body: ProxyBody = Box::pin(body.map_err(std::io::Error::other));
+            Ok(apply_response_policy(
+                hyper::Response::from_parts(parts, body),
+                path_query,
+            ))
         }
         Err(e) => {
             error!(
@@ -293,9 +295,19 @@ async fn proxy_request(
 }
 
 /// P1-5: 响应统一策略（转发与 embed 直连共用）——移除 Connection 动态 token
-/// 与固定 hop-by-hop 名单、剥除本跳凭据头。body 预算由调用方在包装前按各自
-/// body 类型处理（转发: Incoming→IdleBudgetBody; embed: 进程内 axum body）。
-fn apply_response_policy(mut response: hyper::Response<ProxyBody>) -> hyper::Response<ProxyBody> {
+/// 与固定 hop-by-hop 名单、剥除本跳凭据头，并对两种body共用空闲预算。
+fn apply_response_policy(
+    response: hyper::Response<ProxyBody>,
+    path_query: String,
+) -> hyper::Response<ProxyBody> {
+    apply_response_policy_with_budget(response, RESPONSE_BODY_IDLE_BUDGET, path_query)
+}
+
+fn apply_response_policy_with_budget(
+    mut response: hyper::Response<ProxyBody>,
+    idle: std::time::Duration,
+    path_query: String,
+) -> hyper::Response<ProxyBody> {
     let response_connection_tokens = connection_tokens(response.headers());
     for header in HOP_BY_HOP {
         response.headers_mut().remove(header);
@@ -304,7 +316,17 @@ fn apply_response_policy(mut response: hyper::Response<ProxyBody>) -> hyper::Res
         response.headers_mut().remove(token.as_str());
     }
     response.headers_mut().remove(PROXY_TOKEN_HEADER);
-    response
+    let is_sse = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"));
+    if is_sse {
+        response
+    } else {
+        response.map(|body| body_with_idle_budget(body, path_query, idle))
+    }
 }
 
 pub(crate) fn connection_tokens(headers: &hyper::HeaderMap) -> Vec<String> {
@@ -327,11 +349,14 @@ pub(crate) fn should_forward_request_header(name: &str, tokens: &[String]) -> bo
         && !name.eq_ignore_ascii_case(PROXY_TOKEN_HEADER)
 }
 
-/// hop-by-hop header 集合（RFC 7231 §6.1 / 2616 §13.5.1）。
-const HOP_BY_HOP: [&str; 7] = [
+/// 本跳连接与代理认证头；业务 Authorization/WWW-Authenticate 不在此名单中。
+const HOP_BY_HOP: [&str; 10] = [
     "connection",
     "keep-alive",
     "proxy-connection",
+    "proxy-authorization",
+    "proxy-authenticate",
+    "proxy-authentication-info",
     "transfer-encoding",
     "te",
     "trailer",
@@ -347,13 +372,11 @@ const PROXY_TOKEN_HEADER: &str = "x-proxy-token";
 /// 超过该窗口即终止 body（防"响应头已发后 body 永久挂起"）; SSE 长流豁免。
 const RESPONSE_BODY_IDLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// PX-07: 有限 body 加空闲预算——连续 `idle` 无数据字节则以 io 错误终止流
-/// （headers 已发, 只能终止/标记 body 并在日志诊断, 不伪造另一个 502）。
 /// PX-07: 有限 body 加空闲预算——连续 `idle` 无数据帧则以 io 错误终止流
 /// （headers 已发, 只能终止/标记 body 并在日志诊断, 不伪造另一个 502）。
 /// SSE（text/event-stream）长流豁免, 不经本包装。
 fn body_with_idle_budget(
-    body: Incoming,
+    body: ProxyBody,
     path_query: String,
     idle: std::time::Duration,
 ) -> ProxyBody {
@@ -362,6 +385,7 @@ fn body_with_idle_budget(
         sleep: None,
         idle,
         path_query,
+        ended: false,
     })
 }
 
@@ -369,10 +393,11 @@ fn body_with_idle_budget(
 /// Box 承担）。Pending 期间 arm 计时; 每个数据帧重置; 超窗以 TimedOut 错误
 /// 终止 body。
 struct IdleBudgetBody {
-    inner: Incoming,
+    inner: ProxyBody,
     sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     idle: std::time::Duration,
     path_query: String,
+    ended: bool,
 }
 
 impl http_body::Body for IdleBudgetBody {
@@ -384,27 +409,23 @@ impl http_body::Body for IdleBudgetBody {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
         let this = self.get_mut();
-        let mut inner = std::pin::pin!(&mut this.inner);
-        match inner.as_mut().poll_frame(cx) {
+        if this.ended {
+            return std::task::Poll::Ready(None);
+        }
+        match this.inner.as_mut().poll_frame(cx) {
             ready @ std::task::Poll::Ready(_) => {
-                if let std::task::Poll::Ready(Some(Ok(_))) = &ready {
-                    // 数据帧到达: 重置空闲窗口
-                    match &mut this.sleep {
-                        Some(sleep) => sleep
-                            .as_mut()
-                            .reset(tokio::time::Instant::now() + this.idle),
-                        None => {
-                            this.sleep = Some(Box::pin(tokio::time::sleep(this.idle)));
-                        }
-                    }
-                }
-                ready.map(|option| option.map(|result| result.map_err(std::io::Error::other)))
+                // A consumer that stops polling is applying backpressure, not
+                // observing an idle upstream. Arm only on Pending below.
+                this.sleep = None;
+                this.ended = matches!(ready, std::task::Poll::Ready(None | Some(Err(_))));
+                ready
             }
             std::task::Poll::Pending => {
                 let sleep = this
                     .sleep
                     .get_or_insert_with(|| Box::pin(tokio::time::sleep(this.idle)));
                 if sleep.as_mut().poll(cx).is_ready() {
+                    this.ended = true;
                     error!(
                         "file-server 分流代理响应 body 空闲超预算终止 \
                          (idle {:?}, path {})",
@@ -419,38 +440,21 @@ impl http_body::Body for IdleBudgetBody {
             }
         }
     }
+
+    fn is_end_stream(&self) -> bool {
+        self.ended || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
-/// P1-5: Rust 入口的**具体路径边界**（Spec §3.4——不再用 `/api/*` 宽泛匹配）。
-/// 白名单 = 60000 入口的真实承载面（file-server 域 nest + userapp 域 + 健康/文档）,
-/// 按上游路由的实际 nest 前缀列举; 逐端点方法级列举不可审计且与 nest 结构耦合,
-/// 域前缀与路由装配同源维护。
-///
-/// 明确**排除**的上游宿主面（修复前被 `/api/*` 宽匹配放行）:
-/// - `/api/system/file-server/*`（rcoder-engine 管理端点: 代理启停管理）
-/// - `/api/v1/admin/*`（UserApp 错误页管理端点）
-///   以及全部非 `/api` 宿主面（`/chat`、`/agent/*`、`/internal/*`、`/devcomputer/*`、
-///   `/computer/pod/ensure` 等——本入口不承载）。
+/// Tests can inspect the path boundary independently of HTTP methods. Runtime
+/// admission uses the same shared registry's method/path predicate above.
+#[cfg(test)]
 pub(crate) fn all_rust_path_allowed(path: &str) -> bool {
-    /// file-server 域 nest（crates/file-server/src/routes/mod.rs api_router 的
-    /// 五个 nest 前缀）+ userapp 域（userapp_top_router 全量在此前缀下）。
-    const FILE_ENTRY_DOMAIN_PREFIXES: [&str; 7] = [
-        "/api/project/",
-        "/api/git/",
-        "/api/build/",
-        "/api/computer/",
-        "/api/page/",
-        "/api/v1/userapp/",
-        "/api/version",
-    ];
-    // 域 nest 根本身（`/api/project` 无尾斜杠）也放行——与 nest 挂载语义一致。
-    let trimmed = path.trim_end_matches('/');
-    FILE_ENTRY_DOMAIN_PREFIXES
-        .iter()
-        .any(|prefix| path.starts_with(prefix) || trimmed == prefix.trim_end_matches('/'))
-        || path == "/health"
-        || path == "/"
-        || path.starts_with("/api-docs")
+    shared_types::file_entry_policy::contains_path(path)
 }
 
 pub(crate) fn is_hop_by_hop(name: &str) -> bool {
@@ -543,5 +547,98 @@ mod header_filter_tests {
             should_forward_request_header("x-local-v2", &tokens),
             "仅前缀相同的头不受影响"
         );
+    }
+}
+
+#[cfg(test)]
+mod response_policy_tests {
+    use super::*;
+
+    struct ControlledBody {
+        first: bool,
+    }
+
+    impl http_body::Body for ControlledBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+            if std::mem::take(&mut self.get_mut().first) {
+                std::task::Poll::Ready(Some(Ok(http_body::Frame::data(Bytes::from_static(
+                    b"data",
+                )))))
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_policy_arms_idle_budget_for_boxed_embed_body() {
+        let body: ProxyBody = Box::pin(ControlledBody { first: false });
+        let response = apply_response_policy_with_budget(
+            hyper::Response::new(body),
+            std::time::Duration::from_millis(10),
+            "test".into(),
+        );
+        let mut body = response.into_body();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+            .await
+            .expect("the response policy must terminate a hung finite body")
+            .expect("a timeout must be represented as a body error")
+            .unwrap_err();
+        assert_eq!(frame.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn response_policy_does_not_count_downstream_pause_as_upstream_idle() {
+        let body: ProxyBody = Box::pin(ControlledBody { first: true });
+        let response = apply_response_policy_with_budget(
+            hyper::Response::new(body),
+            std::time::Duration::from_millis(10),
+            "test".into(),
+        );
+        let mut body = response.into_body();
+        assert!(body.frame().await.unwrap().is_ok());
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let frame =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(body.as_mut().poll_frame(cx))).await;
+        assert!(
+            frame.is_pending(),
+            "idle starts when the upstream is polled Pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_policy_sse_is_exempt_but_content_type_parameter_is_not() {
+        for (content_type, exempt) in [
+            ("text/event-stream; charset=utf-8", true),
+            ("application/json; note=\"text/event-stream\"", false),
+        ] {
+            let body: ProxyBody = Box::pin(ControlledBody { first: false });
+            let mut response = hyper::Response::new(body);
+            response
+                .headers_mut()
+                .insert("content-type", content_type.parse().unwrap());
+            let mut body = apply_response_policy_with_budget(
+                response,
+                std::time::Duration::from_millis(10),
+                "test".into(),
+            )
+            .into_body();
+            let frame =
+                tokio::time::timeout(std::time::Duration::from_millis(100), body.frame()).await;
+            if exempt {
+                assert!(frame.is_err(), "legal SSE must remain open");
+            } else {
+                assert_eq!(
+                    frame.unwrap().unwrap().unwrap_err().kind(),
+                    std::io::ErrorKind::TimedOut
+                );
+            }
+        }
     }
 }

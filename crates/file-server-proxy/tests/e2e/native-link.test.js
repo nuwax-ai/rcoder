@@ -8,6 +8,8 @@ const { readFileSync, existsSync, mkdtempSync, rmSync } = require("node:fs");
 const { join } = require("node:path");
 const { tmpdir } = require("node:os");
 const assert = require("node:assert/strict");
+const net = require("node:net");
+const { verifyBuild } = require("./userapp-container-fixture.cjs");
 
 const BIN = process.env.FILE_SERVER_PROXY_E2E_BINARY;
 const NPM_BIN = join(__dirname, "..", "..", "npm", "bin", "file-server-proxy.js");
@@ -21,17 +23,64 @@ function npm(args, env) {
   return out.stdout.trim();
 }
 
-(async () => {
+async function cleanupState(stateDir, owned, stop, confirmExited) {
+  if (!owned) throw new Error(`cleanup unknown: no captured owner identity; state preserved at ${stateDir}`);
+  try {
+    await stop(owned);
+    await confirmExited(owned);
+    rmSync(stateDir, { recursive: true });
+  } catch (error) {
+    throw new Error(`cleanup unknown: ${error.message}; state preserved at ${stateDir}`, { cause: error });
+  }
+}
+
+function controlPortClosed(address) {
+  const endpoint = new URL(`tcp://${address}`);
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host: endpoint.hostname, port: Number(endpoint.port) });
+    socket.setTimeout(1000);
+    socket.on("connect", () => { socket.destroy(); resolve(false); });
+    socket.on("timeout", () => { socket.destroy(); reject(new Error("control observation timed out")); });
+    socket.on("error", error => {
+      if (error.code === "ECONNREFUSED") resolve(true);
+      else reject(error);
+    });
+  });
+}
+
+async function confirmExited(stateDir, owned, env) {
+  const deadline = Date.now() + 10000;
+  let last;
+  while (Date.now() < deadline) {
+    const discovery = JSON.parse(readFileSync(join(stateDir, "native-3132372e302e302e31-0", "supervisor.json"), "utf8"));
+    assert.equal(discovery.instance, owned.supervisor_id, "cleanup must not follow a replacement supervisor");
+    assert.equal(discovery.snapshot.generation, owned.instance_id, "cleanup must not follow a replacement generation");
+    try {
+      // After the captured control listener closes, this native status query
+      // must take the physical owner lock to read its offline Stopped result.
+      if (await controlPortClosed(discovery.address)) {
+        const status = JSON.parse(npm(["status", "--port", "0", "--instance-id", owned.instance_id, "--supervisor-id", owned.supervisor_id], env));
+        if (status.phase === "Stopped" && status.supervisor_id === owned.supervisor_id) return;
+      }
+    } catch (error) { last = error; }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw new Error(`captured owner exit unconfirmed: ${last?.message || "deadline"}`);
+}
+
+async function main() {
   assert(BIN, "FILE_SERVER_PROXY_E2E_BINARY must point at the binary under test");
+  verifyBuild({ "file-server-proxy": BIN });
   const stateDir = mkdtempSync(join(tmpdir(), "fs-proxy-e2e-"));
-  const env = { FILE_SERVER_PROXY_STATE_DIR: stateDir };
-  let ownedInstanceId = null;
+  const env = { FILE_SERVER_PROXY_STATE_DIR: stateDir, FILE_SERVER_PROXY_HOST: "127.0.0.1", FILE_SERVER_PROXY_TOKEN: "", FILE_SERVER_PROXY_PUBLIC_BIND: "" };
+  let owned = null;
   try {
     // 1) 首次 start: native profile + 动态端口
     const first = JSON.parse(npm(["start", "--port", "0", "--native", "--policy", "all_rust", "--detached"], env));
     assert.equal(first.launch, "created", JSON.stringify(first));
     assert.match(first.address, /^127\.0\.0\.1:\d+$/, `loopback dynamic address: ${first.address}`);
-    ownedInstanceId = first.instance_id;
+    assert.ok(first.instance_id && first.supervisor_id, "capture complete owner identity");
+    owned = { instance_id: first.instance_id, supervisor_id: first.supervisor_id };
     // credentials 在独立 state dir 下
     const credPath = join(stateDir, "native-3132372e302e302e31-0", "credentials.json");
     if (!existsSync(credPath)) {
@@ -67,14 +116,16 @@ function npm(args, env) {
       encoding: "utf8", timeout: 90000, env: { ...process.env, FILE_SERVER_PROXY_BINARY: BIN, ...env },
     });
     assert.notEqual(wrongId.status, 0, "foreign instance id must be rejected");
-    const stopped = JSON.parse(npm(["stop", "--port", "0", "--instance-id", ownedInstanceId], env));
+    const stopped = JSON.parse(npm(["stop", "--port", "0", "--instance-id", owned.instance_id, "--supervisor-id", owned.supervisor_id], env));
     assert.equal(stopped.phase, "Stopped");
-    ownedInstanceId = null;
-    console.log("E2E_NATIVE_LINK_OK");
   } finally {
-    if (ownedInstanceId) {
-      try { npm(["stop", "--port", "0", "--instance-id", ownedInstanceId], env); } catch {}
-    }
-    try { rmSync(stateDir, { recursive: true, force: true }); } catch {}
+    await cleanupState(stateDir, owned, target => {
+      const stopped = JSON.parse(npm(["stop", "--port", "0", "--instance-id", target.instance_id, "--supervisor-id", target.supervisor_id], env));
+      assert.equal(stopped.phase, "Stopped");
+    }, target => confirmExited(stateDir, target, env));
   }
-})().catch(error => { console.error("E2E_NATIVE_LINK_FAIL:", error.message); process.exit(1); });
+  console.log("E2E_NATIVE_LINK_OK");
+}
+
+module.exports = { cleanupState };
+if (require.main === module) main().catch(error => { console.error("E2E_NATIVE_LINK_FAIL:", error.message); process.exit(1); });

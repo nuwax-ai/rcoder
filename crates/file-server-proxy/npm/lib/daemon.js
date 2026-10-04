@@ -4,14 +4,17 @@
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 const execute = promisify(execFile);
+const CONTROL_TIMEOUT_MS = 65000;
 // PX-01/P1-1: control carries an explicit per-call budget. The default 65s
 // matches the native stop budget; readiness loops pass their REMAINING
 // deadline so a stuck status call can never outlive the wrapper's own budget.
 async function control(binary, action, args = [], env = process.env, expectedInstance, options = {}) {
-  const timeoutMs = options.timeoutMs ?? 65000;
+  const timeoutMs = options.timeoutMs ?? CONTROL_TIMEOUT_MS;
   const requestId = options.requestId;
+  const supervisorId = options.supervisorId;
   const cli = [action, "--native-owner",
     ...(expectedInstance ? ["--instance-id", expectedInstance] : []),
+    ...(supervisorId ? ["--supervisor-id", supervisorId] : []),
     ...(requestId ? ["--request-id", requestId] : []),
     ...args];
   const { stdout } = await execute(binary, cli, {
@@ -19,6 +22,31 @@ async function control(binary, action, args = [], env = process.env, expectedIns
     killSignal: "SIGKILL",
   });
   return JSON.parse(stdout);
+}
+
+// A cancel operation keeps its identity and absolute deadline across retry.
+// Timeout never grants permission to stop an unverified or replacement owner.
+async function stopOwned(binary, args, env, target, requestId, deadline) {
+  const expectedInstance = target?.instance_id;
+  const supervisorId = target?.supervisor_id;
+  if (typeof expectedInstance !== "string" || !expectedInstance || typeof supervisorId !== "string" || !supervisorId) {
+    throw new Error("cancel target identity is incomplete; outcome unknown, receipt preserved");
+  }
+  let firstError;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    try {
+      const stopped = await control(binary, "stop", args, env, expectedInstance, {
+        requestId, supervisorId, timeoutMs: remaining,
+      });
+      if (stopped.phase !== "Stopped") throw new Error("owned stop completion is unconfirmed");
+      return stopped;
+    } catch (error) {
+      firstError ||= error;
+    }
+  }
+  throw new Error(`cancel outcome unknown: ${firstError?.message || "deadline exceeded"}; receipt preserved`);
 }
 // PX-01: readiness is tied to the REAL supervisor/owner identity published by
 // the status receipt (instance_id), never to this wrapper's launch UUID. The
@@ -43,6 +71,7 @@ async function waitRunning(binary, args, env, child, timeoutMs = 15000) {
       });
       if (status.phase === "Running") {
         if (launchId && status.launch_request_id === launchId) {
+          if (typeof status.instance_id !== "string" || !status.instance_id || typeof status.supervisor_id !== "string" || !status.supervisor_id) throw new Error("created launch lacks captured supervisor/generation; ownership is unknown");
           return { ...status, launch: "created" };
         }
         return { ...status, launch: "reused" };
@@ -54,4 +83,4 @@ async function waitRunning(binary, args, env, child, timeoutMs = 15000) {
   }
   throw new Error(`native owner readiness unknown; receipt preserved: ${error?.message || "deadline"}`);
 }
-module.exports = { control, waitRunning };
+module.exports = { control, waitRunning, stopOwned, CONTROL_TIMEOUT_MS };

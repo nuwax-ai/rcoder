@@ -3,7 +3,7 @@
 const { randomUUID } = require("node:crypto");
 const { spawn } = require("node:child_process");
 const { ensureBinary } = require("../lib/index");
-const { control, waitRunning } = require("../lib/daemon");
+const { control, waitRunning, stopOwned, CONTROL_TIMEOUT_MS } = require("../lib/daemon");
 const { compatibilityArgs } = require("../lib/orchestrate");
 
 async function main(argv) {
@@ -28,9 +28,9 @@ async function main(argv) {
   const scope = [], forwarded = [];
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i];
-    if (flag === "--instance-id") {
+    if (["--instance-id", "--supervisor-id", "--request-id"].includes(flag)) {
       const value = argv[++i];
-      if (!value) throw new Error("missing --instance-id");
+      if (!value) throw new Error(`missing ${flag}`);
       scope.push(flag, value); continue;
     }
     if (flag === "--detached") { detached = true; continue; }
@@ -53,9 +53,12 @@ async function main(argv) {
   }
   if (action === "restart") await control(binary, "stop", scope, env);
   env.FILE_SERVER_PROXY_LAUNCH_ID = randomUUID();
-  const launchId = env.FILE_SERVER_PROXY_LAUNCH_ID;
   const args = ["start", "--native-owner", "--embed", "--policy", policy, ...forwarded, ...compatibilityArgs(policy, tsPort, env)];
-  const child = spawn(binary, args, { env, detached, windowsHide: true, stdio: detached ? "ignore" : "inherit" });
+  const child = spawn(binary, args, { env, detached, windowsHide: true, stdio: detached ? "ignore" : ["inherit", "pipe", "pipe"] });
+  if (!detached) {
+    child.stdout.pipe(process.stdout, { end: false });
+    child.stderr.pipe(process.stderr, { end: false });
+  }
   let spawnError;
   child.on("error", error => { spawnError = error; });
 
@@ -69,55 +72,67 @@ async function main(argv) {
   //     未知    → 报告启动结果未知（receipt preserved）, 不伪报 Stopped。
   // - 重复信号幂等（同一意图）; 所有退出路径统一回收监听器。
   let cancelled = false;
+  let cancelDeadline;
+  let resolveCancel;
+  const cancellation = new Promise(resolve => { resolveCancel = resolve; });
+  const childExit = new Promise(resolve => {
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+    child.once("error", error => resolve({ error }));
+  });
   const cancelRequestId = randomUUID();
-  const onSignal = () => { cancelled = true; };
+  const onSignal = () => {
+    if (!cancelled) {
+      cancelled = true;
+      cancelDeadline = Date.now() + CONTROL_TIMEOUT_MS;
+      resolveCancel();
+    }
+  };
   const listeners = detached ? [] : [["SIGINT", onSignal], ["SIGTERM", onSignal]];
   for (const [signal, handler] of listeners) process.on(signal, handler);
-  let cancelledOutcome = null;
   try {
     const status = await waitRunning(binary, scope, env, child);
     if (spawnError) throw spawnError;
-    if (cancelled) {
-      if (status.launch === "created") {
-        let stopped = null;
-        try {
-          stopped = await control(binary, "stop", scope, env, status.instance_id, { requestId: cancelRequestId });
-        } catch (first) {
-          // 回复可能丢失于持久受理之后: 同一 request_id 重试一次（同一操作身份）。
-          stopped = await control(binary, "stop", scope, env, status.instance_id, { requestId: cancelRequestId })
-            .catch(error => { throw new Error(`cancel accepted but outcome unknown (${first.message}; ${error.message}); receipt preserved`); });
-        }
-        cancelledOutcome = `cancelled; stopped owned instance ${status.instance_id}: ${JSON.stringify(stopped)}`;
-      } else {
-        cancelledOutcome = "cancelled; owner belongs to another launch (reused) and stays running";
-        if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
-      }
-    } else {
+    if (!cancelled) {
       console.log(JSON.stringify(status));
+      if (detached) return;
+      const outcome = await Promise.race([
+        childExit.then(exit => ({ exit })),
+        cancellation.then(() => ({ cancelled: true })),
+      ]);
+      if (outcome.exit) {
+        if (outcome.exit.error) throw outcome.exit.error;
+        process.exitCode = outcome.exit.code ?? 1;
+        return;
+      }
     }
+    if (status.launch === "created") {
+      const stopped = await stopOwned(binary, scope, env, status, cancelRequestId, cancelDeadline);
+      console.error(`file-server-proxy: cancelled; stopped owned instance ${status.instance_id}: ${JSON.stringify(stopped)}`);
+    } else {
+      console.error("file-server-proxy: cancelled; owner belongs to another launch (reused) and stays running");
+    }
+    process.exitCode = 1;
   } catch (error) {
     if (cancelled) {
-      // 归属未能在预算内明确（generation 未发布/未 Ready/换代）: 结果未知, 不伪报。
-      cancelledOutcome = `cancelled before ownership resolved: ${error.message}`;
-      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
-    } else {
-      throw error;
+      console.error(`file-server-proxy: cancelled; ${error.message}; receipt preserved`);
+      process.exitCode = 1;
+      return;
     }
+    throw error;
   } finally {
     for (const [signal, handler] of listeners) process.removeListener(signal, handler);
-    if (detached) child.unref();
-  }
-  if (cancelledOutcome !== null) {
-    console.error(`file-server-proxy: ${cancelledOutcome}`);
-    process.exitCode = 1;
-    return;
-  }
-  if (!detached) {
-    const code = await new Promise(resolve => {
-      if (child.exitCode !== null || child.signalCode !== null) resolve(child.exitCode ?? 1);
-      else child.once("exit", code => resolve(code ?? 1));
-    });
-    process.exitCode = code;
+    // Detachment must close the wrapper's output pipes as well as its process
+    // reference. Otherwise an execFile caller waits forever for EOF from a
+    // surviving launcher. Closing these pipes is not a business Stop receipt.
+    if (!detached) {
+      child.stdout.unpipe(process.stdout);
+      child.stderr.unpipe(process.stderr);
+      child.stdout.destroy();
+      child.stderr.destroy();
+    }
+    // Unknown startup keeps its state and launcher; it must not keep this CLI
+    // alive forever or authorize an unbound Stop against the current root.
+    child.unref();
   }
 }
 main(process.argv.slice(2)).catch(error => { console.error(`file-server-proxy: ${error.message}`); process.exitCode = 1; });

@@ -46,13 +46,13 @@ pub enum UserAppDiagnosticScope {
 /// Messages never contain complete configuration files or environment maps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UserAppDiagnostic {
-    /// Stable machine-readable reason; never inferred from localized text.
+    /// Stable reason: workspace_empty / workspace_root_mismatch / workspace_manifest_missing / workspace_io / no_services / manifest_parse / manifest_validation / owner_preflight / task_capacity / worker_admission / build_failed / start_failed. Never inferred from localized text.
     pub code: UserAppDiagnosticCode,
-    /// Phase where the failure occurred, distinct from overall task kind.
+    /// Failure phase: precheck / owner_preflight / admission / build / start; distinct from overall task kind.
     pub phase: UserAppDiagnosticPhase,
-    /// Whether the next repair belongs to project source/configuration or platform/runtime.
+    /// Repair target: project = source/configuration, platform = runtime/platform configuration.
     pub repair_target: UserAppRepairTarget,
-    /// Task failures use the existing `workspace` log selector; service failures use their real service ID.
+    /// Diagnostic scope: task = existing `workspace` log selector, service = actual service ID.
     pub scope: UserAppDiagnosticScope,
     /// Configured platform source workspace, when resolution succeeded. This is diagnostic information, not an execution lease.
     pub workspace_root: Option<String>,
@@ -84,7 +84,7 @@ pub enum UserAppDiagnosticTaskStatus {
 pub struct UserAppTaskFailureData {
     /// Real retained task ID for GET/SSE; null when task retention capacity is exhausted.
     pub task_id: Option<String>,
-    /// Failed, or Cancelled if an explicit stop/cancel already committed on the original task.
+    /// Task status: failed, or cancelled if an explicit stop/cancel already committed on the original task.
     pub status: UserAppDiagnosticTaskStatus,
     /// At most 32 structured diagnostics; also retained by task snapshots.
     pub diagnostics: Vec<UserAppDiagnostic>,

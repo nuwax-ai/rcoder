@@ -19,7 +19,9 @@ def source_snapshot(repo):
     for path in sorted(paths):
         if not (path.startswith('crates/') or path in ('Cargo.toml', 'Cargo.lock')):
             continue
-        if Path(path).suffix not in ('.rs', '.toml', '.lock', '.proto', '.yml', '.json'):
+        # The native entry includes the npm launcher and control client, so a
+        # Rust-only fingerprint cannot prove which foreground/signal logic ran.
+        if Path(path).suffix not in ('.rs', '.toml', '.lock', '.proto', '.yml', '.json', '.js', '.cjs', '.mjs'):
             continue
         absolute = repo / path
         if absolute.is_file():

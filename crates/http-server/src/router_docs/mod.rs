@@ -116,6 +116,14 @@ fn primary_document() -> utoipa::openapi::OpenApi {
     let mut doc = ApiDoc::openapi();
     let mut userapp = file_server_userapp::document();
     strip_internal_userapp_paths(&mut userapp);
+    // app_manager owns the public stage-aware log API. Concrete dev paths are
+    // its container implementation targets and remain in file-server.json.
+    for suffix in ["sources/query", "query", "stream"] {
+        userapp
+            .paths
+            .paths
+            .remove(&format!("/api/v1/userapp/{{app_id}}/dev/logs/{suffix}"));
+    }
     doc.merge(userapp);
     prune_empty_tags(&mut doc);
     doc

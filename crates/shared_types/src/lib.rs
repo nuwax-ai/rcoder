@@ -1,6 +1,7 @@
 mod agent;
 pub mod app_cli_evt;
 pub mod archive_links;
+pub mod file_entry_policy;
 pub use app_cli_evt::{
     APP_CLI_EVT_PREFIX, AppCliEvtDecodeError, AppCliFailedService, AppCliOrchestrationEvent,
 };

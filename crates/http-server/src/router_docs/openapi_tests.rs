@@ -535,6 +535,32 @@ fn primary_userapp_paths_are_fully_handled_by_route_tables() {
     }
 }
 
+#[test]
+fn primary_log_contract_uses_stage_facade_and_file_server_keeps_dev_targets() {
+    let primary = primary_document();
+    let container = file_server_document();
+    for suffix in ["sources/query", "query", "stream"] {
+        let public = format!("/api/v1/userapp/{{app_id}}/{{app_stage}}/logs/{suffix}");
+        let implementation = format!("/api/v1/userapp/{{app_id}}/dev/logs/{suffix}");
+        assert!(
+            primary.paths.paths.contains_key(&public),
+            "public log facade missing: {public}"
+        );
+        assert!(
+            !primary.paths.paths.contains_key(&implementation),
+            "container target duplicated in public contract: {implementation}"
+        );
+        assert!(
+            container.paths.paths.contains_key(&implementation),
+            "file-server log target missing: {implementation}"
+        );
+        let route = &primary.paths.paths[&public];
+        let implementation_route = &container.paths.paths[&implementation];
+        assert!(route.post.is_some() && implementation_route.post.is_some());
+        assert!(route.get.is_none() && implementation_route.get.is_none());
+    }
+}
+
 /// 运行日志 SSE 契约锚点：事件清单必须出现在 description 里（同事按 swagger
 /// 直读对接，描述被精简回一句话在此报红——对齐 file-server-userapp 同款测试）。
 #[test]

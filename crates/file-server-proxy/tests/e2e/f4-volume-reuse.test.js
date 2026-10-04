@@ -1,115 +1,45 @@
 #!/usr/bin/env node
-// F4: 闲置回收原卷重建模拟——同 Docker 卷跨两个容器实例的数据保留。
-// 模拟 K8s builder STS 被回收后同 PVC 重建: 容器 1 写入工作区+哨兵 →
-// 容器 1 销毁 → 容器 2 用同一卷启动 → 验证哨兵/工作区完整 + app 可再启动。
 "use strict";
-const { spawnSync, spawn } = require("node:child_process");
+// Real build/HTTP/Stop against two different containers sharing one owned
+// volume. This is a local container contract, not RCoder recycle-controller E2E.
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
-const os = require("node:os");
-
-const APP_CLI = process.argv[2];
-const PROXY = process.argv[3];
-const IMAGE = process.argv[4] || "debian:bookworm-slim";
-const VOLUME = `fs-f4-vol-${Date.now()}`;
-
-function docker(args, opts = {}) {
-  const out = spawnSync("docker", args, { encoding: "utf8", timeout: 120000, ...opts });
-  if (out.status !== 0) throw new Error(`docker ${args.join(" ")}: ${out.stderr}${out.stdout}`);
-  return out.stdout.trim();
-}
+const { UserappFixture } = require("./userapp-container-fixture.cjs");
 
 async function main() {
-  assert(APP_CLI && PROXY, "usage: node f4-volume-reuse.test.js <app-cli> <proxy> [image]");
-  // Setup: create volume + copy binaries
-  docker(["volume", "create", VOLUME]);
-  const hostTmp = fs.mkdtempSync(path.join(os.tmpdir(), "f4-"));
-  fs.copyFileSync(APP_CLI, path.join(hostTmp, "app-cli"));
-  fs.chmodSync(path.join(hostTmp, "app-cli"), 0o755);
-  fs.copyFileSync(PROXY, path.join(hostTmp, "file-server-proxy"));
-  fs.chmodSync(path.join(hostTmp, "file-server-proxy"), 0o755);
-
-  const workdir = "/vol/workspace";
-  const sentinel = `${workdir}/.f4-sentinel`;
-  const stateRoot = "/vol/state";
-
+  const fixture = new UserappFixture("f4", process.argv[2], process.argv[3], process.argv[4]);
+  let failure;
   try {
-    // ===== Phase 1: Container 1 — build workspace + write sentinel =====
-    let sentinelV1 = '';
-    const c1 = `f4-c1-${Date.now()}`;
-    docker(["run", "-d", "--name", c1,
-      "-v", `${VOLUME}:/vol`,
-      "-v", `${hostTmp}:/tools:ro`,
-      IMAGE, "sleep", "600"]);
-    try {
-      // Create workspace structure + sentinel
-      docker(["exec", c1, "sh", "-c",
-        `mkdir -p ${workdir}/src ${stateRoot} && echo "F4-SENTINEL-$(date +%s)" > ${sentinel} && echo '{"name":"test"}' > ${workdir}/workspace.manifest.toml`]);
-      // Record sentinel content for cross-container verification
-      sentinelV1 = docker(["exec", c1, "cat", sentinel]);
-      console.log(`phase1 sentinel: ${sentinelV1}`);
-
-      // Verify workspace structure exists in container 1
-      const manifest = docker(["exec", c1, "cat", `${workdir}/workspace.manifest.toml`]);
-      assert(manifest.includes("test"), "manifest readable in container 1");
-
-      // Destroy container 1 (simulates idle reclaim)
-      docker(["rm", "-f", c1]);
-      console.log("phase1: container 1 destroyed (simulating idle reclaim)");
-    } finally {
-      try { docker(["rm", "-f", c1]); } catch {}
-    }
-
-    // ===== Phase 2: Container 2 — same volume, verify data retention + restart capability =====
-    const c2 = `f4-c2-${Date.now()}`;
-    docker(["run", "-d", "--name", c2,
-      "-v", `${VOLUME}:/vol`,
-      "-v", `${hostTmp}:/tools:ro`,
-      IMAGE, "sleep", "600"]);
-    try {
-      // Sentinel retained
-      const sentinelV2 = docker(["exec", c2, "cat", sentinel]);
-      assert(sentinelV2 === sentinelV1, `sentinel preserved across container rebuild: ${sentinelV2} vs ${sentinelV1}`);
-      console.log("sentinel retained across container rebuild PASS");
-
-      // Workspace manifest retained
-      const manifestV2 = docker(["exec", c2, "cat", `${workdir}/workspace.manifest.toml`]);
-      assert(manifestV2.includes("test"), "manifest preserved");
-      console.log("workspace manifest retained PASS");
-
-      // Directory structure retained
-      const srcExists = docker(["exec", c2, "sh", "-c", `test -d ${workdir}/src && echo OK`]);
-      assert(srcExists === "OK", "src directory preserved");
-      console.log("directory structure retained PASS");
-
-      // App-cli binary is executable in container 2 (restart capability)
-      const versionOut = docker(["exec", c2, "/tools/app-cli", "--version"]);
-      assert(versionOut.includes("app-cli"), `app-cli binary works in rebuilt container: ${versionOut}`);
-      console.log("app-cli executable in rebuilt container PASS");
-
-      // file-server-proxy binary is executable
-      const proxyVersion = docker(["exec", c2, "/tools/file-server-proxy", "--version"]);
-      assert(proxyVersion.includes("file-server-proxy"), `proxy binary works: ${proxyVersion}`);
-      console.log("proxy executable in rebuilt container PASS");
-
-      // State root directory exists (for owner lock / receipts)
-      const stateExists = docker(["exec", c2, "sh", "-c", `test -d ${stateRoot} && echo OK`]);
-      assert(stateExists === "OK", "state root preserved");
-      console.log("state root preserved PASS");
-
-      // Volume is the same (not a new empty volume)
-      const volumeInfo = docker(["volume", "inspect", VOLUME, "--format", "{{.CreatedAt}}"]);
-      assert(volumeInfo.length > 0, "volume still exists with original creation time");
-      console.log("volume identity confirmed PASS");
-    } finally {
-      try { docker(["rm", "-f", c2]); } catch {}
-    }
-
-    console.log("F4_VOLUME_REUSE_OK");
-  } finally {
-    try { docker(["volume", "rm", "-f", VOLUME]); } catch {}
-    try { fs.rmSync(hostTmp, { recursive: true, force: true }); } catch {}
-  }
+    const firstDomain = await fixture.create();
+    fixture.prepare("f4-before-recycle");
+    await fixture.boot();
+    await fixture.start("start", "f4-before-recycle");
+    const firstId = fixture.cid;
+    const buildsBefore = fixture.read(fixture.workspace + "/web/builds.log").trim().split("\n").length;
+    const firstDiscovery = JSON.parse(fixture.read(fixture.state + "/supervisor.json"));
+    const oldGeneration = firstDiscovery.snapshot.generation;
+    assert(oldGeneration, "first real running generation required");
+    const oldRecord = fixture.read(fixture.state + "/work/" + oldGeneration + "/generation.json");
+    assert.equal(JSON.parse(oldRecord).phase, "Running");
+    fixture.removeCurrent();
+    const secondDomain = await fixture.create();
+    fixture.check("replacement container identity differs", firstId !== fixture.cid);
+    fixture.check("replacement physical domain differs", firstDomain.instance !== secondDomain.instance);
+    fixture.check("same volume preserves original sentinel", fixture.read(fixture.workspace + "/sentinel") === fixture.id);
+    fixture.check("old Running generation was retained on volume", fixture.read(fixture.state + "/work/" + oldGeneration + "/generation.json") === oldRecord);
+    fixture.marker("f4-after-recycle");
+    await fixture.boot();
+    await fixture.start("restart", "f4-after-recycle");
+    const buildsAfter = fixture.read(fixture.workspace + "/web/builds.log").trim().split("\n").length;
+    fixture.check("replacement actually recompiles", buildsAfter > buildsBefore, { buildsBefore, buildsAfter });
+    const retained = JSON.parse(fixture.read(fixture.state + "/work/" + oldGeneration + "/generation.json"));
+    fixture.check("old running execution remains history rather than forged success", retained.phase === "Running" && retained.physical_domain.instance === firstDomain.instance);
+    await fixture.stop();
+    fixture.marker("f4-start-after-stop");
+    await fixture.start("start", "f4-start-after-stop");
+    fixture.check("final sentinel intact", fixture.read(fixture.workspace + "/sentinel") === fixture.id);
+    await fixture.stop();
+  } catch (error) { failure = error; }
+  await fixture.finish(failure);
+  console.log("F4_VOLUME_REUSE_OK");
 }
-main().catch(e => { console.error("F4_VOLUME_REUSE_FAIL:", e.message); process.exit(1); });
+main().catch(error => { console.error("F4_VOLUME_REUSE_FAIL:", error.message); process.exitCode = 1; });

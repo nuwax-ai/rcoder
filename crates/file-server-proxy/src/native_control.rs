@@ -89,8 +89,9 @@ async fn supervised_control(
     action: &str,
     expected: Option<&str>,
     request_id: Option<&str>,
+    expected_supervisor: Option<&str>,
 ) -> Result<String, String> {
-    use runtime_supervisor::{Action, Request, control as request};
+    use runtime_supervisor::{Action, Request};
     let action = match action {
         "status" => Action::Status,
         "stop" | "retire" => Action::Shutdown,
@@ -102,7 +103,7 @@ async fn supervised_control(
         command.request_id = id.into();
     }
     command.expected_generation = expected.map(str::to_owned);
-    let accepted = match request(root, command.clone()).await {
+    let accepted = match dispatch_supervised(root, command.clone(), expected_supervisor).await {
         Ok(value) => value,
         Err(error) => {
             let Some(owner) =
@@ -110,6 +111,9 @@ async fn supervised_control(
             else {
                 return Err(format!("{error:#}"));
             };
+            // The physical owner lock is now held. Recheck the captured
+            // supervisor before an offline stop can update durable intent.
+            verify_supervisor(root, expected_supervisor)?;
             if action == Action::Shutdown {
                 return supervisor_reply(
                     owner
@@ -151,9 +155,12 @@ async fn supervised_control(
     let previous = accepted.generation.clone();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let current = match request(root, command.clone()).await {
+        let current = match dispatch_supervised(root, command.clone(), expected_supervisor).await {
             Ok(value) => value,
-            Err(_) => runtime_supervisor::last_snapshot(root).map_err(|e| format!("{e:#}"))?,
+            Err(_) => {
+                verify_supervisor(root, expected_supervisor)?;
+                runtime_supervisor::last_snapshot(root).map_err(|e| format!("{e:#}"))?
+            }
         };
         if current.supervisor_id != accepted.supervisor_id {
             return Err("supervisor changed while control was pending".into());
@@ -181,6 +188,28 @@ async fn supervised_control(
         }
         tokio::time::sleep(CONTROL_POLL_INTERVAL_MS).await;
     }
+}
+
+async fn dispatch_supervised(
+    root: &Path,
+    request: runtime_supervisor::Request,
+    expected_supervisor: Option<&str>,
+) -> anyhow::Result<runtime_supervisor::Snapshot> {
+    match expected_supervisor {
+        Some(supervisor) => runtime_supervisor::control_verified(root, request, supervisor).await,
+        None => runtime_supervisor::control(root, request).await,
+    }
+}
+
+fn verify_supervisor(root: &Path, expected: Option<&str>) -> Result<(), String> {
+    if let Some(expected) = expected {
+        let snapshot =
+            runtime_supervisor::last_snapshot(root).map_err(|error| format!("{error:#}"))?;
+        if snapshot.supervisor_id != expected {
+            return Err("captured supervisor changed; refusing stale control".into());
+        }
+    }
+    Ok(())
 }
 impl Owner {
     pub async fn acquire(root: PathBuf) -> Result<Self, String> {
@@ -729,7 +758,7 @@ pub async fn control(
     action: &str,
     expected_instance: Option<&str>,
 ) -> Result<String, String> {
-    control_with_request(root, action, expected_instance, None).await
+    control_with_request(root, action, expected_instance, None, None).await
 }
 
 pub async fn control_with_request(
@@ -737,16 +766,29 @@ pub async fn control_with_request(
     action: &str,
     expected_instance: Option<&str>,
     request_id: Option<&str>,
+    expected_supervisor: Option<&str>,
 ) -> Result<String, String> {
     if root
         .join("supervisor.json")
         .try_exists()
         .map_err(|e| e.to_string())?
     {
-        return supervised_control(root, action, expected_instance, request_id).await;
+        return supervised_control(
+            root,
+            action,
+            expected_instance,
+            request_id,
+            expected_supervisor,
+        )
+        .await;
     }
     if request_id.is_some() {
         return Err("request identity requires the supervised owner protocol".into());
+    }
+    if expected_supervisor.is_some() {
+        return Err(
+            "captured supervisor cannot be verified by the legacy direct owner protocol".into(),
+        );
     }
     if action == "recover" {
         return recover(root, expected_instance);
@@ -832,6 +874,150 @@ pub async fn control_with_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn captured_supervisor_refuses_same_generation_successor_before_delivery() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let _owner = runtime_supervisor::Owner::try_acquire(root.path())
+            .unwrap()
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let previous = uuid::Uuid::new_v4().to_string();
+        let successor = uuid::Uuid::new_v4().to_string();
+        let generation = uuid::Uuid::new_v4().to_string();
+        let snapshot = runtime_supervisor::Snapshot {
+            version: 1,
+            binding: runtime_supervisor::Binding {
+                component: "file-server-proxy".into(),
+                resource: root.path().into(),
+            },
+            supervisor_id: successor.clone(),
+            generation: Some(generation.clone()),
+            phase: runtime_supervisor::Phase::Reconciling,
+            intent: runtime_supervisor::Intent::Run,
+            operation_id: None,
+            error: None,
+            problem: None,
+        };
+        std::fs::write(root.path().join("supervisor.json"), serde_json::to_vec(&serde_json::json!({
+            "version":2,"instance":successor,"address":listener.local_addr().unwrap().to_string(),
+            "token":"test-supervisor-token-at-least-32-bytes","snapshot":snapshot,"requests":[]
+        })).unwrap()).unwrap();
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let observed = deliveries.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                BufReader::new(&mut stream)
+                    .read_until(b'\n', &mut bytes)
+                    .await
+                    .unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let error = if request["request"]["action"] == "shutdown" {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Some(
+                        serde_json::json!({"code":"identity_changed","message":"shutdown was incorrectly delivered to successor"}),
+                    )
+                } else {
+                    None
+                };
+                send(&mut stream, &serde_json::json!({"instance":snapshot.supervisor_id,"snapshot":snapshot,"error":error})).await.unwrap();
+            }
+        });
+        let result = control_with_request(
+            root.path(),
+            "stop",
+            Some(&generation),
+            Some("captured-stop-request"),
+            Some(&previous),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "captured supervisor differs even though generation is unchanged"
+        );
+        assert_eq!(
+            deliveries.load(Ordering::SeqCst),
+            0,
+            "late Shutdown must not reach the successor"
+        );
+        let status: serde_json::Value =
+            serde_json::from_str(&control(root.path(), "status", None).await.unwrap()).unwrap();
+        assert_eq!(status["supervisor_id"], successor);
+        assert_eq!(status["stage"], "reconciling");
+        assert!(
+            runtime_supervisor::Owner::try_acquire(root.path())
+                .unwrap()
+                .is_none()
+        );
+        server.abort();
+        let _closed = server.await;
+    }
+
+    #[tokio::test]
+    async fn captured_supervisor_refuses_offline_successor_before_intent_write() {
+        let root = tempfile::tempdir().unwrap();
+        let previous = uuid::Uuid::new_v4().to_string();
+        let successor = uuid::Uuid::new_v4().to_string();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "version":2,"instance":successor,"address":"127.0.0.1:1",
+            "token":"test-offline-supervisor-token-at-least-32-bytes",
+            "snapshot":{"version":1,"binding":{"component":"file-server-proxy","resource":root.path()},
+                "supervisor_id":successor,"generation":null,"phase":"reconciling","intent":"run",
+                "operation_id":null,"error":null,"problem":null},"requests":[]
+        })).unwrap();
+        std::fs::write(root.path().join("supervisor.json"), &bytes).unwrap();
+        let result = control_with_request(
+            root.path(),
+            "stop",
+            Some(""),
+            Some("captured-idle-request"),
+            Some(&previous),
+        )
+        .await;
+        assert!(result.unwrap_err().contains("captured supervisor changed"));
+        assert_eq!(
+            std::fs::read(root.path().join("supervisor.json")).unwrap(),
+            bytes,
+            "offline recovery cannot write successor intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_direct_receipt_remains_queryable_without_supervisor_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let mut owner = Owner::acquire(root.path().into()).await.unwrap();
+        owner.receipt.supervisor_id = None;
+        owner.receipt.launch_request_id = None;
+        owner.started("127.0.0.1:12345".into()).unwrap();
+        let mut legacy = serde_json::to_value(&owner.receipt).unwrap();
+        legacy.as_object_mut().unwrap().remove("supervisor_id");
+        legacy.as_object_mut().unwrap().remove("launch_request_id");
+        std::fs::write(
+            root.path().join("owner.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let running = tokio::spawn(owner.run(CancellationToken::new()));
+        let status: serde_json::Value =
+            serde_json::from_str(&control(root.path(), "status", None).await.unwrap()).unwrap();
+        assert_eq!(status["version"], 1);
+        assert_eq!(status["phase"], "Running");
+        assert_eq!(status["address"], "127.0.0.1:12345");
+        assert!(
+            control_with_request(root.path(), "stop", None, None, Some("unproven-supervisor"))
+                .await
+                .is_err()
+        );
+        assert_eq!(read(root.path()).unwrap().unwrap().phase, "Running");
+        control(root.path(), "stop", None).await.unwrap();
+        running.await.unwrap().unwrap();
+    }
 
     /// PX-01/P4.2 接线闭环（直连 owner 形态）: status 回执发布同代 bound address
     /// 与本次 launch 关联——npm 侧 created/reused 核验与 --port 0 的真实地址

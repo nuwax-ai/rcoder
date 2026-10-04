@@ -265,6 +265,16 @@ async fn run() {
     } else {
         None
     };
+    let expected_supervisor =
+        if let Some(index) = args.iter().position(|arg| arg == "--supervisor-id") {
+            args.remove(index);
+            if index >= args.len() {
+                fail("missing --supervisor-id value".into());
+            }
+            Some(args.remove(index))
+        } else {
+            None
+        };
     let expected_instance = if let Some(index) = args.iter().position(|arg| arg == "--instance-id")
     {
         args.remove(index);
@@ -325,6 +335,7 @@ async fn run() {
             },
             expected_instance.as_deref(),
             request_id.as_deref(),
+            expected_supervisor.as_deref(),
         )
         .await
         {

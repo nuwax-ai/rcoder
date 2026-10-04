@@ -93,7 +93,7 @@ async fn service_type_header_decides_upstream_and_lifecycle() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // ── 分流: 同一路径, header 决定归属 ──
-    let path = "/api/computer/create-workspace";
+    let path = "/api/computer/get-file-list";
     let no_header = http_get(path, &[]).await;
     assert!(
         no_header.contains("upstream-ts"),
@@ -113,7 +113,7 @@ async fn service_type_header_decides_upstream_and_lifecycle() {
     );
 
     // path 判据（Java 未接 header 期的兜底）：/api/v1/userapp/* 无 header 也走 Rust
-    let by_path = http_get("/api/v1/userapp/dev/start", &[]).await;
+    let by_path = http_get("/api/v1/userapp/dev/list", &[]).await;
     assert!(
         by_path.contains("upstream-rust"),
         "/api/v1/userapp/* 前缀应走 Rust: {by_path}"

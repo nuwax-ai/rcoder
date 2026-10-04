@@ -205,7 +205,9 @@ pub enum UserAppContainerStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct UserAppContainerOperation {
     pub operation_id: String,
+    /// Physical control action: stop / restart.
     pub action: ComputeControlAction,
+    /// Control state: pending / running / recovery_required / succeeded / failed / superseded.
     pub state: ComputeControlState,
     pub stage: String,
     pub revision: i64,
@@ -229,6 +231,7 @@ impl From<&ComputeControlRecord> for UserAppContainerOperation {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct UserAppContainerReadiness {
+    /// Physical container state: missing / starting / restarting / stopping / running / stopped / failed / recovery_required / unknown.
     pub status: UserAppContainerStatus,
     /// Current intent's operation, including its terminal outcome. None does
     /// not mean a previously accepted operation succeeded; query its ID.
