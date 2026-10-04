@@ -9,4 +9,5 @@ description = "运行态状态根解析契约（R09：app-cli 与平台消费者
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+shared_types = { workspace = true }
 tempfile = { workspace = true }

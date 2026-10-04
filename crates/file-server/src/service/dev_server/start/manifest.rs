@@ -441,14 +441,10 @@ pub(super) fn append_managed_launch_env(
     if let Some(managed) =
         runtime_state_layout::ManagedWorkspace::from_values(workspace, state_root, lookup)?
     {
-        env_extra.extend([
-            ("SERVICE_TYPE".into(), "userapp-builder".into()),
-            ("APP_CLI_MANAGED".into(), "1".into()),
-            (
-                "APP_CLI_RUNTIME_WORKSPACE".into(),
-                managed.source_root.to_string_lossy().into_owned(),
-            ),
-        ]);
+        for (key, value) in managed.launch_environment()? {
+            env_extra.retain(|(existing, _)| existing != &key);
+            env_extra.push((key, value));
+        }
     }
     Ok(())
 }

@@ -165,6 +165,7 @@ impl AgentContainerRuntime for FenceRuntime {
             workload: None,
             pod: None,
             restart_image: None,
+            restart_runtime_workspace: None,
         })
     }
     async fn capture_builder_control(
@@ -183,6 +184,7 @@ impl AgentContainerRuntime for FenceRuntime {
             }),
             pod: None,
             restart_image: None,
+            restart_runtime_workspace: None,
         })
     }
 }

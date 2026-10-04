@@ -43,6 +43,7 @@ pub struct ServerState {
     pub(super) cancel: RwLock<CancellationToken>,
     /// 日志布局（跟随服务托管引擎；serve 探测后设置，legacy 默认 Builtin）。
     pub(super) log_layout: RwLock<LogLayout>,
+    pub(super) log_catalog_context: RwLock<Option<userapp_log_reader::catalog::CatalogLocation>>,
     /// 运行操作内核槽位（阶段二：serve 在 ownership 认领后注入；legacy 形态
     /// 恒 None——api 层 /v1/runtime/* 相应 503）。
     pub(super) runtime_kernel: std::sync::OnceLock<Arc<crate::runtime_kernel::RuntimeKernel>>,

@@ -110,6 +110,7 @@ impl KubernetesRuntime {
         // The requested rollout image belongs to the operation checkpoint, not
         // to the live controller being captured for its private restart archive.
         after.restart_image = target.restart_image.clone();
+        after.restart_runtime_workspace = target.restart_runtime_workspace.clone();
         if &after != target {
             return Err(Error::Conflict(
                 "Builder changed during template capture".into(),

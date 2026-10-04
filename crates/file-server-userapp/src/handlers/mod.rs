@@ -12,3 +12,8 @@ pub mod userapp_files;
 
 #[cfg(test)]
 mod task_diagnostics_tests;
+
+pub mod userapp_logs;
+
+#[cfg(test)]
+mod stopped_logs_tests;

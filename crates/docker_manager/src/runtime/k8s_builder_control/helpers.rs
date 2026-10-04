@@ -66,10 +66,11 @@ pub(super) fn ready_builder_info(
 /// 双流分类闭包：Err = 身份/配置冲突（Fatal 快速失败）；Ok(Pending) 继续
 /// 观察；Ok(Complete) 给出完成候选（仍需调用方 GET 复核）。
 #[derive(Clone, Copy)]
-pub(super) struct BuilderVerdictMode {
+pub(super) struct BuilderVerdictMode<'a> {
     pub(super) restart: bool,
     pub(super) only_start: bool,
     pub(super) require_ready: bool,
+    pub(super) expected_workspace: Option<&'a str>,
 }
 
 pub(super) fn builder_verdict(
@@ -79,7 +80,7 @@ pub(super) fn builder_verdict(
     binding: Option<&shared_types::UserAppResourceBinding>,
     captured_pod: Option<&BuilderPodIdentity>,
     expected_image: Option<&str>,
-    mode: BuilderVerdictMode,
+    mode: BuilderVerdictMode<'_>,
 ) -> std::result::Result<crate::runtime::k8s_observation::Verdict<BuilderObservation>, String> {
     match event {
         crate::runtime::k8s_observation::BuilderWatchEvent::Sts(current) => {
@@ -122,6 +123,7 @@ pub(super) fn builder_verdict(
                 }
                 if pod.metadata.deletion_timestamp.is_none()
                     && pod_agent_image_matches(pod, expected_image)
+                    && pod_agent_workspace_matches(pod, mode.expected_workspace)
                     && (if mode.require_ready {
                         pod.status
                             .as_ref()
@@ -248,9 +250,11 @@ pub(super) fn stop_patch(workload: &AppResourceIdentity) -> serde_json::Value {
 /// and keeps the StatefulSet/PVC identities unchanged.
 pub(super) fn builder_compute_start_patch(
     workload: &AppResourceIdentity,
+    current: &StatefulSet,
     receipt: &str,
     image: Option<&str>,
-) -> serde_json::Value {
+    runtime_workspace: Option<&str>,
+) -> Result<serde_json::Value> {
     let mut patch = serde_json::json!({
         "metadata": {
             "uid": workload.uid,
@@ -259,12 +263,87 @@ pub(super) fn builder_compute_start_patch(
         },
         "spec": {"replicas": 1}
     });
-    if let Some(image) = image {
+    if image.is_some() || runtime_workspace.is_some() {
+        let mut agent = serde_json::json!({"name": "agent"});
+        if let Some(image) = image {
+            agent["image"] = serde_json::json!(image);
+        }
+        if let Some(root) = runtime_workspace {
+            let current_agent = current
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.template.spec.as_ref())
+                .and_then(|spec| {
+                    spec.containers
+                        .iter()
+                        .find(|container| container.name == "agent")
+                })
+                .ok_or_else(|| {
+                    rejected_before_write("Builder agent container is missing".into())
+                })?;
+            // Replace only the env list under the UID/RV precondition. Keeping
+            // every other entry verbatim preserves tokens/valueFrom while
+            // eliminating duplicate root keys and any previous valueFrom.
+            let mut env = vec![serde_json::json!({"$patch": "replace"})];
+            for value in current_agent.env.as_deref().unwrap_or_default() {
+                if value.name != "APP_CLI_RUNTIME_WORKSPACE" {
+                    env.push(serde_json::to_value(value).map_err(|error| {
+                        Error::ConfigurationError(format!("Encode builder environment: {error}"))
+                    })?);
+                }
+            }
+            env.push(serde_json::json!({"name": "APP_CLI_RUNTIME_WORKSPACE", "value": root}));
+            agent["env"] = serde_json::Value::Array(env);
+        }
         patch["spec"]["template"] = serde_json::json!({
-            "spec": {"containers": [{"name": "agent", "image": image}]}
+            "spec": {"containers": [agent]}
         });
     }
-    patch
+    Ok(patch)
+}
+
+fn agent_workspace_matches(
+    containers: &[k8s_openapi::api::core::v1::Container],
+    expected: Option<&str>,
+) -> bool {
+    expected.is_none_or(|root| {
+        let Some(agent) = containers
+            .iter()
+            .find(|container| container.name == "agent")
+        else {
+            return false;
+        };
+        let mut roots = agent
+            .env
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|entry| entry.name == "APP_CLI_RUNTIME_WORKSPACE");
+        let matches = roots.next().is_some_and(|entry| {
+            entry.value.as_deref() == Some(root) && entry.value_from.is_none()
+        });
+        matches && roots.next().is_none()
+    })
+}
+
+pub(super) fn statefulset_agent_workspace_matches(
+    sts: &StatefulSet,
+    expected: Option<&str>,
+) -> bool {
+    expected.is_none()
+        || sts
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.spec.as_ref())
+            .is_some_and(|spec| agent_workspace_matches(&spec.containers, expected))
+}
+
+pub(super) fn pod_agent_workspace_matches(pod: &Pod, expected: Option<&str>) -> bool {
+    expected.is_none()
+        || pod
+            .spec
+            .as_ref()
+            .is_some_and(|spec| agent_workspace_matches(&spec.containers, expected))
 }
 
 pub(super) fn statefulset_agent_image_matches(sts: &StatefulSet, expected: Option<&str>) -> bool {

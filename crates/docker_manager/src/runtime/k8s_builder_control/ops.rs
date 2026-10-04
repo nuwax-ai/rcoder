@@ -145,6 +145,7 @@ impl KubernetesRuntime {
         }
         let mut fresh = fresh;
         fresh.restart_image = target.restart_image.clone();
+        fresh.restart_runtime_workspace = target.restart_runtime_workspace.clone();
         Ok(Some(fresh))
     }
 
@@ -246,6 +247,10 @@ impl KubernetesRuntime {
         if receipt.as_ref() != Some(&target.context)
             || current.metadata.deletion_timestamp.is_some()
             || !statefulset_agent_image_matches(&current, target.restart_image.as_deref())
+            || !statefulset_agent_workspace_matches(
+                &current,
+                target.restart_runtime_workspace.as_deref(),
+            )
         {
             return Ok(None);
         }
@@ -261,6 +266,7 @@ impl KubernetesRuntime {
         if pod.metadata.deletion_timestamp.is_some()
             || !builder_agent_running(&pod)
             || !pod_agent_image_matches(&pod, target.restart_image.as_deref())
+            || !pod_agent_workspace_matches(&pod, target.restart_runtime_workspace.as_deref())
         {
             return Ok(None);
         }
@@ -327,7 +333,12 @@ impl KubernetesRuntime {
             || after_receipt.as_ref() != Some(&target.context)
             || after.spec.as_ref().and_then(|spec| spec.replicas) != Some(1)
             || !statefulset_agent_image_matches(&after, target.restart_image.as_deref())
+            || !statefulset_agent_workspace_matches(
+                &after,
+                target.restart_runtime_workspace.as_deref(),
+            )
             || !pod_agent_image_matches(&after_pod, target.restart_image.as_deref())
+            || !pod_agent_workspace_matches(&after_pod, target.restart_runtime_workspace.as_deref())
         {
             return Ok(None);
         }
@@ -624,6 +635,7 @@ impl KubernetesRuntime {
                     workload: None,
                     pod: None,
                     restart_image: None,
+                    restart_runtime_workspace: None,
                 });
             }
             Err(error) => return Err(api_error("Capture builder workload", error)),
@@ -642,6 +654,7 @@ impl KubernetesRuntime {
             workload: Some(workload),
             pod,
             restart_image: None,
+            restart_runtime_workspace: None,
         })
     }
 
@@ -988,15 +1001,34 @@ impl KubernetesRuntime {
                 ));
             }
             if replicas == 0 {
+                let pod_name =
+                    self.agent_pod_name(&target.context.app_id, &ServiceType::UserappBuilder)?;
+                if target.restart_runtime_workspace.is_some()
+                    && pods
+                        .get_opt(&pod_name)
+                        .await
+                        .map_err(|error| {
+                            rejected_before_write(format!(
+                                "Verify stopped builder Pod before wake: {error}"
+                            ))
+                        })?
+                        .is_some()
+                {
+                    return Err(rejected_before_write(
+                        "Builder Pod still exists before wake".into(),
+                    ));
+                }
                 let receipt = serde_json::to_string(&target.context).map_err(|error| {
                     Error::ConfigurationError(format!("Encode builder start receipt: {error}"))
                 })?;
                 let patch = builder_compute_start_patch(
                     workload,
+                    &current,
                     &receipt,
                     target.restart_image.as_deref(),
-                );
-                if target.restart_image.is_some() {
+                    target.restart_runtime_workspace.as_deref(),
+                )?;
+                if target.restart_image.is_some() || target.restart_runtime_workspace.is_some() {
                     sts_api
                         .patch(
                             &workload.name,
@@ -1086,6 +1118,7 @@ impl KubernetesRuntime {
                     let binding = target.resource_binding.clone();
                     let captured_pod = target.pod.clone();
                     let expected_image = target.restart_image.clone();
+                    let expected_workspace = target.restart_runtime_workspace.clone();
                     match crate::runtime::k8s_observation::await_builder_verdict(
                         &sts_api,
                         &sts_name,
@@ -1105,6 +1138,7 @@ impl KubernetesRuntime {
                                     restart,
                                     only_start,
                                     require_ready,
+                                    expected_workspace: expected_workspace.as_deref(),
                                 },
                             )
                         },
@@ -1205,7 +1239,12 @@ impl KubernetesRuntime {
                                 "Builder pod changed between observation and verification".into(),
                             ));
                         }
-                        if !pod_agent_image_matches(&pod, target.restart_image.as_deref()) {
+                        if !pod_agent_image_matches(&pod, target.restart_image.as_deref())
+                            || !pod_agent_workspace_matches(
+                                &pod,
+                                target.restart_runtime_workspace.as_deref(),
+                            )
+                        {
                             continue;
                         }
                         // 复核②：STS 身份未替换（wake 还须 replicas 保持 1）。
@@ -1232,6 +1271,9 @@ impl KubernetesRuntime {
                         if !statefulset_agent_image_matches(
                             &current,
                             target.restart_image.as_deref(),
+                        ) || !statefulset_agent_workspace_matches(
+                            &current,
+                            target.restart_runtime_workspace.as_deref(),
                         ) {
                             continue;
                         }

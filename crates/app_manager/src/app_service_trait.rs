@@ -301,8 +301,8 @@ pub trait AppServiceTrait: Send + Sync {
         None
     }
 
-    /// 日志/管理面转发基址（app-cli :3010）：prod=运行实例 IP；dev=开发容器 host
-    /// 解析重拼。logs 三接口的透明转发源
+    /// 日志转发基址：prod=app-cli 管理面；dev=已有容器 file-server。
+    /// dev 查询不创建/唤醒计算，也不要求业务或 owner 运行。
     async fn log_api_base(
         &self,
         app_stage: shared_types::UserappStage,

@@ -426,6 +426,7 @@ mod builder_retry_tests {
                             resource_binding: None,
                             pod: None,
                             restart_image: None,
+                            restart_runtime_workspace: None,
                             workload: Some(shared_types::AppResourceIdentity {
                                 kind: shared_types::AppResourceKind::Container,
                                 name: "builder".into(),

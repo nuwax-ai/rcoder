@@ -138,6 +138,18 @@ pub(super) async fn advance(
         )
         .map_err(|error| invalid(error.message()))?;
     }
+    if record.scope == UserAppOperationScope::Dev
+        && record.action == ComputeControlAction::Restart
+        && record.checkpoint.get("context").is_some()
+    {
+        let original: BuilderControlTarget =
+            serde_json::from_value(record.checkpoint.clone()).map_err(storage)?;
+        let next: BuilderControlTarget =
+            serde_json::from_value(progress.checkpoint.clone()).map_err(storage)?;
+        if original.restart_runtime_workspace != next.restart_runtime_workspace {
+            return Err(invalid("Builder restart workspace intent is immutable"));
+        }
+    }
     let now = chrono::Utc::now().timestamp_micros();
     let terminal = if progress.state.is_terminal() {
         Some(now)
@@ -730,6 +742,8 @@ pub(super) async fn resume_builder_restart(
         || original.kind != workload.kind
         || (original.uid != workload.uid && !restored)
         || original.name != workload.name
+        || target.restart_image != old.restart_image
+        || target.restart_runtime_workspace != old.restart_runtime_workspace
         || target.pod.is_some()
         || (old.resource_binding != target.resource_binding && !restored)
     {
@@ -756,6 +770,9 @@ pub(super) async fn resume_builder_restart(
     }
     if let Some(volumes) = snapshot.checkpoint.get("builder_volumes") {
         checkpoint["builder_volumes"] = volumes.clone();
+    }
+    if let Some(template) = snapshot.checkpoint.get("builder_restart_template") {
+        checkpoint["builder_restart_template"] = template.clone();
     }
     let changed = toasty::sql::statement(repo::sql(backend,
         "UPDATE userapp_compute_controls SET state='running',stage='starting',checkpoint_json=$4,error_code=NULL,error_message=NULL,revision=$3 WHERE operation_id=$1 AND revision=$2"))

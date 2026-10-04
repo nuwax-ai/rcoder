@@ -6,13 +6,19 @@
 
 普通 CLI 按 `--workspace`、`APP_CLI_WORKSPACE`、启动时工作目录的顺序选择工作区。例如在项目根运行 `app-cli serve`，或通过 `app-cli serve --workspace /path/to/project` 显式指定。平台调用始终传入原始源码根，不随 agent 后续切换目录改变。
 
-UserApp dev builder 的 `APP_CLI_RUNTIME_WORKSPACE` 为 `/home/user/{app_id}`，启动包装器将它传给 `serve --workspace`；状态根继续为该源码根下的 `state/{app_id}`。prod 使用独立的部署目录配置。
+UserApp dev builder 的源码根与文件、构建接口同源：通常为 `USERAPP_WORKSPACE_DIR/{PROJECT_ID}`；已有单应用模式的 `USERAPP_SINGLE_APP_ID` 启用时，该环境变量直接表示完整源码根。状态根继续为源码根下的 `state/{PROJECT_ID}`。服务类型通过共享枚举解析，平台实际的 `user-app-builder` 与已支持的 `userapp-builder` 都能进入托管恢复。
+
+`APP_CLI_RUNTIME_WORKSPACE` 表示启动位置，不再决定源码归属。正常值为 `/home/user/{app_id}`；存量错误值恰为同应用的 `source/code` 时，管理入口在获取所有权前归一为源码根并记录日志。合法 `.run` 或有来源证明的制品目录保持执行语义；其他应用和未经证明的目录不会通过删除后缀获得权限。prod 的 `code/` 使用独立部署契约，普通 CLI 的目录优先级保持。
 
 平台托管的同应用登记若仍指向源码根内的旧子目录，会先按原实例与代次核验清理。活 owner 使用精确 Shutdown 释放所有权；旧 owner 已退出时，由新管理进程完成原代次恢复。确认清理后才发布正确根，继续当前请求。这个流程保留原记录与业务文件，不搬迁项目，也不重放结果未知的迁移。其他应用、越界目录、未确认的清理或无法核验的身份仍返回具体原因。
 
 源码模式的启动与重启会先按当前 manifest 和运行元数据核验派生的 `release.lock.toml`，再检查 owner 能力及启停服务。损坏或输入已变化的锁文件自动原子重建；有效且内容一致时保留原字节与 release ID，不因重复请求改变迁移身份。新的配置无效或 owner 不支持新能力时，在停止旧服务之前报错。制品模式继续验证指定制品中的锁文件，不用源码重建绕过制品校验。
 
-配套升级需更新 RCoder 与 builder 内的 app-cli，并使存量 builder 使用新的启动目录环境。修改模板提示词、升级 npm 包或只更换主服务，均不代表存量容器已使用新目录和二进制。
+配套升级需更新 RCoder 与 builder 内的 agent_runner/file-server 和 app-cli。新的 K8s dev 容器 Restart 在原操作内冻结正确源码根，停止旧 Pod 后通过同一次 UID/resourceVersion 条件写入更新目录、可选镜像和副本数；完成时核对 StatefulSet 与新 Pod。只更新平台目录变量，保留其他环境、token、StatefulSet 和 PVC；不搬迁业务文件。
+
+旧计算 checkpoint 缺少 `restart_runtime_workspace` 时继续原操作语义；新字段仅由新受理的 K8s dev Restart 写入。没有数据库表迁移。含新字段的 checkpoint 不能由旧控制器消费，受理这类新操作前应完成所有 RCoder 副本升级；不能携带此类在途记录回滚旧控制器。
+
+停服时可通过[独立日志查询](userapp-stopped-logs.md)检查管理启动、构建及业务错误，不需要先启动业务。
 
 ## 恢复行为
 

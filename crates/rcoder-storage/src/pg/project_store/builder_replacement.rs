@@ -571,6 +571,7 @@ mod tests {
                     resource_version: "1".into(),
                 }),
                 restart_image: None,
+                restart_runtime_workspace: None,
             };
             let pod_before = format!("before{}", uuid::Uuid::new_v4().simple());
             let pod_after = format!("after{}", uuid::Uuid::new_v4().simple());

@@ -1,7 +1,7 @@
-//! 应用日志 handler（sources/query/stream，转发到 app 容器内 app-cli :3010）。
+//! 应用日志 handler：prod 转发 app-cli，dev 转发只读 file-server 日志。
 //!
 //! 三条接口支持 `{app_stage}` 显式环境分派（prod=运行容器实例 IP / dev=开发容器
-//! host 重拼 :3010，见 `AppService::log_api_base`）。
+//! file-server，见 `AppService::log_api_base`）。
 //!
 //! JSON 转发（sources/query、query）是**透明代理**：
 //! 响应体——app-cli 侧统一 `HttpResult` 信封（`{code,message,data,tid,success}`），
@@ -33,7 +33,7 @@ use super::AppManagerState;
 #[derive(Debug, Deserialize, utoipa::IntoParams, garde::Validate)]
 #[into_params(parameter_in = Query)]
 pub struct LogsAccessParams {
-    /// 归属用户 ID（必填，白名单校验；dev 容器懒创建时宿主树
+    /// 归属用户 ID（必填，白名单校验；宿主树
     /// `dev/{user_id}/{app_id}` 分区依据）
     #[garde(pattern(shared_types::IDENTIFIER_RE))]
     pub user_id: String,
@@ -55,7 +55,7 @@ pub struct LogsAccessParams {
 （LogQueryRequest：selectors / levels / keyword / since / until / tail / cursor）。
 
 查询应用声明的日志源及匹配到的日志文件清单（选日志面板"源选择器"用）。
-`app_stage` 决定目标容器：dev=开发容器的实时源 / prod=运行容器的应用日志源；
+`app_stage` 决定目标容器：dev=已有开发容器文件日志（服务未启动、失败或停止仍可查询） / prod=运行容器的应用日志源；
 请求体 selectors 支持 per-service 过滤（空 = 全量声明面）。
 
 内置源：编排器（app-cli 自身）日志以 `service_id=app-cli` / `source_id=orchestrator`
@@ -81,7 +81,8 @@ pub async fn query_app_log_sources(
         .validate()
         .map_err(shared_types::garde_err_to_app_error)?;
     let base = state.app_service.log_api_base(app_stage, &app_id).await?;
-    forward_json(&state, base.clone(), "/v1/logs/sources/query", request).await
+    let path = log_path(app_stage, &app_id, LogOperation::Sources);
+    forward_json(&state, base, &path, request).await
 }
 
 /// 查询应用日志快照
@@ -125,7 +126,8 @@ pub async fn query_app_logs(
         .validate()
         .map_err(shared_types::garde_err_to_app_error)?;
     let base = state.app_service.log_api_base(app_stage, &app_id).await?;
-    forward_json(&state, base, "/v1/logs/query", request).await
+    let path = log_path(app_stage, &app_id, LogOperation::Query);
+    forward_json(&state, base, &path, request).await
 }
 
 /// 实时日志 SSE 流
@@ -169,23 +171,24 @@ pub async fn stream_app_logs_v1(
         .validate()
         .map_err(shared_types::garde_err_to_app_error)?;
     let base = state.app_service.log_api_base(app_stage, &app_id).await?;
+    let path = log_path(app_stage, &app_id, LogOperation::Stream);
     let response = state
         .http_client
-        .post(format!("{base}/v1/logs/stream"))
+        .post(format!("{base}{path}"))
         .json(&request)
         .send()
         .await
-        .map_err(|error| backend(format!("connect to app-cli log stream: {error}")))?;
+        .map_err(|error| backend(format!("connect to runtime log stream: {error}")))?;
     if !response.status().is_success() {
         let status = response.status();
         let message = response.text().await.unwrap_or_default();
         if status.is_client_error() {
             return Err(AppOperationError::Validation(format!(
-                "app-cli rejected log stream ({status}): {message}"
+                "runtime rejected log stream ({status}): {message}"
             ))
             .into());
         }
-        return Err(backend(format!("app-cli log stream failed ({status}): {message}")).into());
+        return Err(backend(format!("runtime log stream failed ({status}): {message}")).into());
     }
     let stream = response.bytes_stream().map_err(std::io::Error::other);
     Response::builder()
@@ -212,14 +215,14 @@ async fn forward_json(
         .send()
         .await
         .map_err(|error| {
-            AppError::from(backend(format!("connect to app-cli logs API: {error}")))
+            AppError::from(backend(format!("connect to runtime logs API: {error}")))
         })?;
     let status = response.status();
     let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
     let body = response
         .bytes()
         .await
-        .map_err(|error| AppError::from(backend(format!("read app-cli logs response: {error}"))))?;
+        .map_err(|error| AppError::from(backend(format!("read runtime logs response: {error}"))))?;
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = content_type {
         builder = builder.header(header::CONTENT_TYPE, content_type);
@@ -229,6 +232,28 @@ async fn forward_json(
         .map_err(|error| AppError::from(backend(format!("build forwarded log response: {error}"))))
 }
 
+#[derive(Clone, Copy)]
+enum LogOperation {
+    Sources,
+    Query,
+    Stream,
+}
+
+fn log_path(stage: shared_types::UserappStage, app_id: &str, operation: LogOperation) -> String {
+    let suffix = match operation {
+        LogOperation::Sources => "sources/query",
+        LogOperation::Query => "query",
+        LogOperation::Stream => "stream",
+    };
+    match stage {
+        shared_types::UserappStage::Dev => format!("/api/v1/userapp/{app_id}/dev/logs/{suffix}"),
+        shared_types::UserappStage::Prod => format!("/v1/logs/{suffix}"),
+    }
+}
+
 fn backend(message: String) -> AppOperationError {
     AppOperationError::Backend(message)
 }
+
+#[cfg(test)]
+mod tests;

@@ -576,6 +576,7 @@ mod tests {
                 }),
                 pod: None,
                 restart_image: None,
+                restart_runtime_workspace: None,
             })
         }
         async fn capture_bound_builder_control(
@@ -598,6 +599,7 @@ mod tests {
                 }),
                 pod: None,
                 restart_image: None,
+                restart_runtime_workspace: None,
             })
         }
         async fn apply_builder_control(

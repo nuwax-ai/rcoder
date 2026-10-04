@@ -246,6 +246,7 @@ mod tests {
             application_id: "application".into(),
             source_root: source.clone(),
             state_root: state,
+            single_application: false,
         };
         for binding in [
             json!({"component":"app-cli", "resource":123}),

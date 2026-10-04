@@ -255,6 +255,7 @@ impl DockerRuntime {
             workload,
             pod: None,
             restart_image: None,
+            restart_runtime_workspace: None,
         })
     }
 
@@ -718,6 +719,7 @@ mod tests {
                 }),
                 pod: None,
                 restart_image: None,
+                restart_runtime_workspace: None,
             };
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 let result = runtime

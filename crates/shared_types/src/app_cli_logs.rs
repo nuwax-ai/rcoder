@@ -80,6 +80,9 @@ pub struct LogSourceInfo {
     pub format: String,
     /// 该源匹配到的日志文件绝对路径列表（容器内路径视角）
     pub matched_files: Vec<String>,
+    /// 读取或目录描述错误；保留其他可读日志源，不将失败伪装为空。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<SourceError>,
 }
 
 /// 单条日志记录（logs/query 响应 data.logs 元素；SSE `log` 事件同构）

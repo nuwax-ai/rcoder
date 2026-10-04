@@ -2,7 +2,6 @@
 
 use std::collections::VecDeque;
 use std::io::{BufRead, Read, Seek};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
@@ -10,7 +9,7 @@ use workspace_manifest::LogFormat;
 
 use super::filter::push_record;
 use super::model::{LogQueryRequest, LogRecord};
-use super::sources::SelectedSource;
+use super::sources::{MatchedLogFile, SelectedSource};
 
 pub(super) const MAX_LINE_BYTES: usize = 1024 * 1024;
 
@@ -24,7 +23,7 @@ pub(super) struct ReadOutcome {
 }
 
 pub(super) fn read_file(
-    path: &Path,
+    matched: &MatchedLogFile,
     start: u64,
     selected: &SelectedSource,
     request: &LogQueryRequest,
@@ -32,8 +31,21 @@ pub(super) fn read_file(
     record_limit: Option<usize>,
     cancelled: &AtomicBool,
 ) -> Result<ReadOutcome> {
+    let path = &matched.path;
+    let expected_identity = matched.identity.as_str();
+    let before = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        before.is_file() && !before.file_type().is_symlink(),
+        "log file must be a real file"
+    );
     let mut file = std::fs::File::open(path)?;
-    let length = file.metadata()?.len();
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        super::sources::file_identity(path, &before) == expected_identity
+            && super::sources::file_identity(path, &metadata) == expected_identity,
+        "log file changed while opening; retry query"
+    );
+    let length = metadata.len();
     let safe_start = if start > length { 0 } else { start };
     file.seek(std::io::SeekFrom::Start(safe_start))?;
     let mut reader = std::io::BufReader::new(file);
@@ -74,6 +86,9 @@ pub(super) fn read_file(
             // （否则会把下一行误吞进截断记录）。
             if !line.ends_with(b"\n") {
                 loop {
+                    if cancelled.load(Ordering::Relaxed) {
+                        anyhow::bail!("log query cancelled");
+                    }
                     let mut chunk = Vec::new();
                     let n = reader
                         .by_ref()

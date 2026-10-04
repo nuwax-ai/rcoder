@@ -57,6 +57,7 @@ impl ServerState {
             deploy_rx: tokio::sync::Mutex::new(deploy_rx),
             cancel: RwLock::new(CancellationToken::new()),
             log_layout: RwLock::new(LogLayout::Builtin),
+            log_catalog_context: RwLock::new(None),
             deploy_inputs_eligible: std::sync::atomic::AtomicBool::new(true),
             business_relaunch: std::sync::OnceLock::new(),
             business_recovery_active: std::sync::atomic::AtomicBool::new(false),
@@ -788,6 +789,141 @@ impl ServerState {
         {
             op.artifact_release_id = Some(rid);
         }
+        drop(status);
+        self.publish_log_catalog();
+    }
+
+    pub(crate) fn configure_log_catalog(
+        &self,
+        source: &std::path::Path,
+        log_dir: &std::path::Path,
+    ) {
+        let source = match runtime_state_layout::resolve_project_origin(source) {
+            Ok(source) => source,
+            Err(error) => {
+                tracing::error!(error = %error, "resolve log catalog origin failed");
+                return;
+            }
+        };
+        let app_id = std::env::var("PROJECT_ID")
+            .ok()
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| {
+                source
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+        match runtime_state_layout::resolve_state_root(
+            &source,
+            std::env::var_os("APP_CLI_STATE_ROOT").as_deref(),
+            std::env::var_os("PROJECT_ID").as_deref(),
+        ) {
+            Ok(Some(root)) => {
+                *self
+                    .log_catalog_context
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(userapp_log_reader::catalog::CatalogLocation {
+                        app_id,
+                        source_root: source,
+                        log_root: log_dir.to_path_buf(),
+                        state_root: root,
+                    });
+                self.publish_log_catalog();
+            }
+            Ok(None) => {}
+            Err(error) => tracing::error!(error = %error, "resolve log catalog state failed"),
+        }
+    }
+
+    fn publish_log_catalog(&self) {
+        let context = self
+            .log_catalog_context
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let (
+            Some(userapp_log_reader::catalog::CatalogLocation {
+                app_id,
+                source_root: source,
+                log_root,
+                state_root,
+            }),
+            Some(release),
+        ) = (context, self.release())
+        {
+            let result = userapp_log_reader::LogCatalog::from_release(
+                app_id,
+                source,
+                log_root,
+                release,
+                self.log_layout(),
+            )
+            .and_then(|catalog| catalog.publish(&state_root));
+            if let Err(error) = result {
+                tracing::error!(error = %error, "publish log catalog failed; business ownership is unchanged");
+            }
+        }
+    }
+
+    pub(crate) fn observed_log_service(
+        &self,
+        log_dir: &std::path::Path,
+    ) -> userapp_log_reader::LogService {
+        let context = self
+            .log_catalog_context
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(userapp_log_reader::catalog::CatalogLocation {
+            app_id,
+            source_root: source,
+            log_root,
+            state_root,
+        }) = context
+        {
+            let result = if let Some(release) = self.release() {
+                userapp_log_reader::LogCatalog::from_release(
+                    app_id,
+                    source,
+                    log_root,
+                    release,
+                    self.log_layout(),
+                )
+                .map(Some)
+            } else {
+                userapp_log_reader::LogCatalog::read(
+                    &userapp_log_reader::catalog_path(&state_root),
+                    &app_id,
+                    &source,
+                    &[log_root],
+                )
+            };
+            match result {
+                Ok(Some(catalog)) => return userapp_log_reader::LogService::from_catalog(catalog),
+                Ok(None) => {}
+                Err(error) => {
+                    let mut service = userapp_log_reader::LogService::idle(log_dir.to_path_buf());
+                    service.add_diagnostic(shared_types::SourceError {
+                        service_id: "workspace".into(),
+                        source_id: "catalog".into(),
+                        code: "catalog_invalid".into(),
+                        message: format!("{error:#}"),
+                    });
+                    return service;
+                }
+            }
+        }
+        match self.release() {
+            Some(release) => userapp_log_reader::LogService::with_boot_id(
+                release,
+                log_dir.to_path_buf(),
+                self.boot_id(),
+                self.log_layout(),
+            ),
+            None => userapp_log_reader::LogService::idle(log_dir.to_path_buf()),
+        }
     }
 
     pub(super) fn shutdown_budget(&self, supervised: bool) -> std::time::Duration {
@@ -1388,5 +1524,6 @@ impl ServerState {
             .log_layout
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = layout;
+        self.publish_log_catalog();
     }
 }

@@ -8,9 +8,13 @@ fn managed_launch_context_is_complete_and_scoped_to_the_platform_source() {
     let state = source.join("state/11");
     std::fs::create_dir_all(&state).unwrap();
     let environment = [
-        ("SERVICE_TYPE", std::ffi::OsString::from("userapp-builder")),
+        ("SERVICE_TYPE", std::ffi::OsString::from("user-app-builder")),
         ("APP_CLI_MANAGED", "1".into()),
         ("PROJECT_ID", "11".into()),
+        (
+            "USERAPP_WORKSPACE_DIR",
+            source.parent().unwrap().as_os_str().to_owned(),
+        ),
         ("APP_CLI_RUNTIME_WORKSPACE", source.clone().into_os_string()),
         ("APP_CLI_STATE_ROOT", state.clone().into_os_string()),
     ];
@@ -42,6 +46,35 @@ fn managed_launch_context_is_complete_and_scoped_to_the_platform_source() {
     let mut standalone = Vec::new();
     append_managed_launch_env(&source, &state, &mut standalone, |_| None).unwrap();
     assert!(standalone.is_empty());
+
+    let mut stale = vec![
+        ("SERVICE_TYPE".into(), "userapp-builder".into()),
+        (
+            "APP_CLI_RUNTIME_WORKSPACE".into(),
+            source.join("code").display().to_string(),
+        ),
+    ];
+    append_managed_launch_env(&source, &state, &mut stale, |key| {
+        if key == "APP_CLI_RUNTIME_WORKSPACE" {
+            Some(source.join("code").into_os_string())
+        } else {
+            lookup(key)
+        }
+    })
+    .unwrap();
+    for (name, _) in &environment {
+        assert_eq!(
+            stale.iter().filter(|(key, _)| key == name).count(),
+            1,
+            "managed child authority must not include duplicate keys: {name}"
+        );
+    }
+    assert!(
+        stale
+            .iter()
+            .any(|(key, value)| key == "APP_CLI_RUNTIME_WORKSPACE"
+                && value == &source.display().to_string())
+    );
 }
 
 // These two environment-injection tests execute a POSIX shell fixture.

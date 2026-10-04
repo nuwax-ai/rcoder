@@ -92,7 +92,8 @@ pub(super) fn orchestrator_service() -> LockedService {
 }
 
 /// runtime 日志源（服务 stdout/stderr 落盘）的目录布局。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LogLayout {
     /// builtin 引擎：app-cli 亲自 pipe 服务 stdout → `{log_root}/{svc}/runtime.*.log`。
     #[default]

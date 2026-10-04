@@ -262,6 +262,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "userapp-log-reader",
  "utoipa",
  "uuid",
  "workspace-manifest",
@@ -3990,6 +3991,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "shared_types",
  "tempfile",
 ]
 
@@ -5500,6 +5502,27 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_derive",
+]
+
+[[package]]
+name = "userapp-log-reader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "base64 0.23.1",
+ "chrono",
+ "futures-util",
+ "globset",
+ "hex",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shared_types",
+ "tempfile",
+ "tokio",
+ "workspace-manifest",
 ]
 
 [[package]]

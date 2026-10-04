@@ -131,6 +131,7 @@ async fn run(command: app_cli::config::Command) -> anyhow::Result<()> {
         }
         app_cli::config::Command::Run(args) => app_cli::RuntimeArgs::from(args),
     };
+    let args = args.for_management()?;
     // tracing 先于监督（同 Serve 分支注释）：run 的 owner 围栏/清理阶段
     // 同样需要早期日志。
     let _guard = init_tracing(&args.log_dir);

@@ -13,6 +13,7 @@ fn fixture() -> (tempfile::TempDir, ManagedWorkspace, RuntimeIdentityView) {
         application_id: "11".into(),
         source_root: source_root.clone(),
         state_root,
+        single_application: false,
     };
     let identity = RuntimeIdentityView {
         application_id: "11".into(),

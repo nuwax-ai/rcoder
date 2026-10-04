@@ -374,6 +374,7 @@ impl DockerRuntime {
             )
             .await?;
         after.restart_image = target.restart_image.clone();
+        after.restart_runtime_workspace = target.restart_runtime_workspace.clone();
         if after != *target {
             return Err(conflict("Builder changed during template capture"));
         }

@@ -9,22 +9,20 @@
 //! （`/v1/logs/stream`）、kubelet 探针（`/health`、`/ready`）、TOML 文本
 //! （`/v1/proxy/effective-config`）。
 
-use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 use axum::Json;
 use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use futures::Stream;
+use futures::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -33,6 +31,7 @@ use utoipa::OpenApi;
 use crate::log::model::{LogQueryRequest, LogQueryResponse, LogSourceInfo};
 use crate::log::service::LogService;
 use crate::server::{DeployRequest, ServerState};
+use userapp_log_reader::{CancelOnDrop, LogProvider};
 
 mod envelope;
 mod proxy;
@@ -102,17 +101,9 @@ pub(super) struct AppState {
 }
 
 impl AppState {
-    /// 按当前 release/部署代/引擎布局构造日志服务（idle → 空服务集）。
+    /// Same persistent source description remains available after business Stop.
     fn logs(&self) -> LogService {
-        match self.server.release() {
-            Some(release) => LogService::with_boot_id(
-                release,
-                self.log_dir.clone(),
-                self.server.boot_id(),
-                self.server.log_layout(),
-            ),
-            None => LogService::idle(self.log_dir.clone()),
-        }
+        self.server.observed_log_service(&self.log_dir)
     }
 }
 
@@ -147,6 +138,7 @@ pub(crate) fn bound_router(
 ) -> Router {
     // Legacy run captures its startup profile here; serve replaces it when
     // an operation selects the actual execution workspace/profile.
+    server.configure_log_catalog(&workspace, &log_dir);
     server.set_proxy_context(workspace, crate::supervisor::dev_run_profile());
     let state = AppState {
         server: server.clone(),
@@ -573,94 +565,28 @@ async fn query_logs(
 )]
 async fn stream_logs(
     State(state): State<AppState>,
-    ApiJson(mut request): ApiJson<LogQueryRequest>,
+    ApiJson(request): ApiJson<LogQueryRequest>,
 ) -> Response {
     // 参数错在建流前 → 信封 400（流本身是 SSE，豁免信封）
     if let Err(error) = state.logs().sources(request.clone()).await {
         return bad_request(error);
     }
-    // 注意：流生命周期内用同一份 LogService 快照（游标/源清单不因并发部署换代
-    // 而漂移；换代后 cursor boot_id 不匹配 → cursor_reset 事件，客户端自然重放）
-    let logs = state.logs();
-    let stream = async_stream::stream! {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let _cancel_on_drop = CancelOnDrop(cancelled.clone());
-        let mut first = true;
-        let mut last_checkpoint: Option<String> = None;
-        let mut failed_sources: BTreeSet<(String, String)> = BTreeSet::new();
-        loop {
-            if !first {
-                request.tail = None;
-            }
-            match logs.query_with_cancel(request.clone(), cancelled.clone()).await {
-                Ok(response) => {
-                    if response.cursor_reset {
-                        yield Ok(Event::default()
-                            .event("cursor_reset")
-                            .data(json!({"message": "cursor belongs to a previous deploy generation"}).to_string()));
-                    }
-                    for record in response.logs {
-                        if let Ok(data) = serde_json::to_string(&record) {
-                            yield Ok(Event::default().event("log").data(data));
-                        }
-                    }
-                    let mut current_failures = BTreeSet::new();
-                    for error in response.source_errors {
-                        let key = (error.service_id.clone(), error.source_id.clone());
-                        current_failures.insert(key.clone());
-                        if !failed_sources.contains(&key)
-                            && let Ok(data) = serde_json::to_string(&error)
-                        {
-                            yield Ok(Event::default().event("source_error").data(data));
-                        }
-                    }
-                    for (service_id, source_id) in failed_sources.difference(&current_failures) {
-                        yield Ok(Event::default().event("source_recovered").data(
-                            json!({
-                                "service_id": service_id,
-                                "source_id": source_id,
-                            })
-                            .to_string(),
-                        ));
-                    }
-                    failed_sources = current_failures;
-                    request.cursor = Some(response.cursor.clone());
-                    if last_checkpoint.as_deref() != Some(response.cursor.as_str()) {
-                        last_checkpoint = Some(response.cursor.clone());
-                        yield Ok(Event::default().event("checkpoint").data(response.cursor));
-                    }
-                }
-                Err(error) => {
-                    yield Ok(Event::default()
-                        .event("cursor_reset")
-                        .data(json!({"message": error.to_string()}).to_string()));
-                    request.cursor = None;
-                    last_checkpoint = None;
-                }
-            }
-            first = false;
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    };
-    // handler 返回 Response 后，async_stream yield 的 Result 错误类型失去
-    // 签名锚点（改造前由 `Result<Sse<impl Stream<..>>, _>` 签名推断），此处
-    // 显式固定。
-    let stream: std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
-        Box::pin(stream);
-    Sse::new(stream)
-        .keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(15))
-                .event(Event::default().event("heartbeat").data("{}")),
-        )
-        .into_response()
+    let provider: Arc<dyn LogProvider> = Arc::new(state);
+    let stream = userapp_log_reader::stream(provider, request).map(|event| {
+        let name = event.name();
+        let data = match event.data() {
+            Ok(data) => data,
+            Err(error) => return Ok::<Event, Infallible>(Event::default().event("source_error")
+                .data(json!({"service_id": "workspace", "source_id": "stream", "code": "serialization_failed", "message": error.to_string()}).to_string())),
+        };
+        Ok::<Event, Infallible>(Event::default().event(name).data(data))
+    });
+    Sse::new(stream).into_response()
 }
 
-struct CancelOnDrop(Arc<AtomicBool>);
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
+impl LogProvider for AppState {
+    fn load(&self) -> futures::future::BoxFuture<'_, Result<LogService>> {
+        Box::pin(async move { Ok(self.logs()) })
     }
 }
 

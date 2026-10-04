@@ -8,12 +8,16 @@ use utoipa_axum::routes;
 use crate::UserAppState;
 use crate::handlers::{
     static_files, userapp, userapp_app_files, userapp_dev, userapp_dev_server, userapp_files,
+    userapp_logs,
 };
 
 /// `/api/v1/userapp` 路由（workspace 多项目打包 + 文件操作镜像族 + 取整体包）。
 fn userapp_router() -> OpenApiRouter<UserAppState> {
     OpenApiRouter::new()
         .routes(routes!(userapp::build_workspace))
+        .routes(routes!(userapp_logs::query_sources))
+        .routes(routes!(userapp_logs::query_logs))
+        .routes(routes!(userapp_logs::stream_logs))
         .routes(routes!(userapp::get_task))
         .routes(routes!(userapp::stream_task_logs))
         .routes(routes!(userapp::cancel_task))
@@ -71,6 +75,7 @@ pub(crate) fn userapp_top_router() -> OpenApiRouter<UserAppState> {
     tags(
         (name = "Userapp · dev · 构建任务", description = "dev 专属（目标容器恒为 UserappBuilder 开发容器）：构建触发、任务查询/取消与进度 SSE、制品包下载"),
         (name = "Userapp · dev · 工作区与工具链", description = "dev 专属（目标容器 UserappBuilder 开发容器）：workspace 创建、命令执行、打包下载、模板与技能安装、项目类型探测确认"),
+        (name = "Userapp · dev · 日志查询", description = "只读磁盘日志；业务和管理服务未运行时仍可查询"),
         (name = "Userapp · dev · 进程管理", description = "dev 专属（目标容器 UserappBuilder 开发容器，路径自带 dev）：dev server 进程启停/列表/日志"),
         (name = "Userapp · 双态 · 文件镜像", description = "dev/prod 双态（X-App-Stage header 分派，缺省 dev）：TS 老接口族文件操作（wire 键已随 userApp 域 snake 统一）"),
         (name = "Userapp · 双态 · 文件与存储", description = "dev/prod 双态（路径 {app_id}/{app_stage} 段分派）：文件上传/管理与存储卷查询/清理/销毁")
@@ -108,6 +113,9 @@ mod tests {
         let document = document();
         for path in [
             "/api/v1/userapp/build",
+            "/api/v1/userapp/{app_id}/dev/logs/sources/query",
+            "/api/v1/userapp/{app_id}/dev/logs/query",
+            "/api/v1/userapp/{app_id}/dev/logs/stream",
             "/api/v1/userapp/tasks/{task_id}",
             "/api/v1/userapp/tasks/{task_id}/logs/stream",
             "/api/v1/userapp/tasks/{task_id}/cancel",
@@ -149,7 +157,7 @@ mod tests {
                 "userapp path missing: {path}"
             );
         }
-        assert_eq!(document.paths.paths.len(), 36);
+        assert_eq!(document.paths.paths.len(), 39);
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
     }
 

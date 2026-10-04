@@ -217,6 +217,22 @@ pub struct RuntimeArgs {
     pub control_only: bool,
 }
 
+impl RuntimeArgs {
+    /// Management bootstrap shares the platform source contract. Build and
+    /// validation use their explicitly requested directory without rewriting.
+    pub fn for_management(&self) -> anyhow::Result<Self> {
+        let workspace = runtime_state_layout::normalize_management_workspace(&self.workspace)?;
+        if workspace != self.workspace {
+            tracing::info!(requested = %self.workspace.display(), source = %workspace.display(),
+                "normalized platform management workspace before acquiring ownership");
+        }
+        Ok(Self {
+            workspace,
+            ..self.clone()
+        })
+    }
+}
+
 impl From<RunArgs> for RuntimeArgs {
     fn from(args: RunArgs) -> Self {
         Self {

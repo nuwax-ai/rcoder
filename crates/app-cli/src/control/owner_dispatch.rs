@@ -194,6 +194,8 @@ pub async fn reuse_management_owner(
     state_root: &std::path::Path,
     application_id: &str,
 ) -> Result<ManagementReuse> {
+    let normalized = runtime_state_layout::normalize_management_workspace(workspace)?;
+    let workspace = normalized.as_path();
     tokio::time::timeout(std::time::Duration::from_secs(45), async {
         let (address, identity) =
             discover_owner(admin_addr, state_root, std::time::Duration::from_secs(10))
@@ -322,6 +324,8 @@ pub async fn dispatch_to_owner(
     state_root: &std::path::Path,
     application_id: &str,
 ) -> Result<OwnerDispatch> {
+    let normalized = runtime_state_layout::normalize_management_workspace(workspace)?;
+    let workspace = normalized.as_path();
     dispatch_to_owner_inner(admin_addr, workspace, state_root, application_id, true).await
 }
 

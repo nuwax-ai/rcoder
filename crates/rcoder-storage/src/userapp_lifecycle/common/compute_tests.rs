@@ -1246,6 +1246,8 @@ async fn stopped_restart_replacement_uid_requires_witness_and_single_cas_winner(
             workload: Some(resource),
             pod: None,
             restart_image: Some("imagev2".into()),
+            restart_runtime_workspace: (kind == AppResourceKind::StatefulSet)
+                .then(|| paths::userapp_dev_workspace(&app.app_id)),
         };
         let mut new_builder = builder.clone();
         new_builder.workload.as_mut().unwrap().uid = "newphysical".into();
@@ -1268,6 +1270,10 @@ async fn stopped_restart_replacement_uid_requires_witness_and_single_cas_winner(
             value
         } else {
             let mut value = serde_json::to_value(&builder).unwrap();
+            if kind == AppResourceKind::StatefulSet {
+                value["builder_compute_single_write"] = serde_json::json!(true);
+                value["builder_volumes"] = serde_json::json!([volume.clone()]);
+            }
             value["builder_restart_template"] = serde_json::to_value(BuilderRestartTemplate {
                 source: builder.clone(),
                 archive,
@@ -1280,6 +1286,17 @@ async fn stopped_restart_replacement_uid_requires_witness_and_single_cas_winner(
             let mut progress = compute_progress(&record, stage);
             progress.checkpoint = checkpoint.clone();
             record = store.advance_compute_control(&progress).await.unwrap();
+            if scope == UserAppOperationScope::Dev && kind == AppResourceKind::StatefulSet {
+                let persisted = store
+                    .get_compute_control(&app.app_id, &record.operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    persisted.checkpoint["restart_runtime_workspace"],
+                    paths::userapp_dev_workspace(&app.app_id)
+                );
+            }
         }
         let mut missing = record.clone();
         if scope == UserAppOperationScope::Prod {
@@ -1314,6 +1331,32 @@ async fn stopped_restart_replacement_uid_requires_witness_and_single_cas_winner(
                     .is_err()
             );
         } else {
+            if kind == AppResourceKind::StatefulSet {
+                let mut changed_intent = new_builder.clone();
+                changed_intent.restart_runtime_workspace = None;
+                assert!(
+                    store
+                        .resume_builder_restart_start(&record, &changed_intent)
+                        .await
+                        .is_err(),
+                    "recovery cannot drop frozen directory intent"
+                );
+                let mut late = compute_progress(&record, ComputeControlStage::Starting);
+                late.checkpoint = serde_json::to_value(&changed_intent).unwrap();
+                assert!(
+                    store.advance_compute_control(&late).await.is_err(),
+                    "normal progress cannot drop frozen directory intent"
+                );
+            }
+            let mut changed_image = new_builder.clone();
+            changed_image.restart_image = Some("later-platform-version".into());
+            assert!(
+                store
+                    .resume_builder_restart_start(&record, &changed_image)
+                    .await
+                    .is_err(),
+                "recovery cannot switch frozen image"
+            );
             assert!(
                 store
                     .resume_builder_restart_start(&missing, &new_builder)
@@ -1325,12 +1368,41 @@ async fn stopped_restart_replacement_uid_requires_witness_and_single_cas_winner(
                 .await
                 .unwrap();
             assert_eq!(claimed.checkpoint["workload"]["uid"], "newphysical");
+            assert_eq!(
+                claimed.checkpoint["restart_runtime_workspace"],
+                record.checkpoint["restart_runtime_workspace"]
+            );
+            assert_eq!(
+                claimed.checkpoint["builder_restart_template"],
+                record.checkpoint["builder_restart_template"]
+            );
             assert!(
                 store
                     .resume_builder_restart_start(&record, &new_builder)
                     .await
                     .is_err()
             );
+            if kind == AppResourceKind::StatefulSet {
+                let mut interrupted = compute_progress(&claimed, ComputeControlStage::Starting);
+                interrupted.state = ComputeControlState::RecoveryRequired;
+                interrupted.checkpoint = claimed.checkpoint.clone();
+                interrupted.error_code = Some("ERR_BACKEND_ERROR".into());
+                interrupted.error_message = Some("startup write response lost".into());
+                let interrupted = store.advance_compute_control(&interrupted).await.unwrap();
+                let continued = store
+                    .resume_builder_restart_start(&interrupted, &new_builder)
+                    .await
+                    .unwrap();
+                assert_eq!(continued.operation_id, record.operation_id);
+                assert_eq!(
+                    continued.checkpoint["restart_runtime_workspace"],
+                    record.checkpoint["restart_runtime_workspace"]
+                );
+                assert_eq!(
+                    continued.checkpoint["builder_restart_template"],
+                    record.checkpoint["builder_restart_template"]
+                );
+            }
         }
     }
     store.shutdown().await.unwrap();

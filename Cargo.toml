@@ -245,6 +245,7 @@ node-semver = "2.2"
 shellexpand = "3.1"
 winnow = "1.0.4"
 workspace-manifest = { path = "crates/workspace-manifest" }
+userapp-log-reader = { path = "crates/userapp-log-reader" }
 shlex = "2.0"
 smallvec = "1.16"
 

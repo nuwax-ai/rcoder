@@ -23,7 +23,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 mod managed;
-pub use managed::ManagedWorkspace;
+pub use managed::{
+    ManagedWorkspace, normalize_management_workspace, normalize_management_workspace_from_values,
+};
 
 /// 状态目录名（与 app-cli `STATE_DIR_NAME` 同值，单一契约）。
 pub const STATE_DIR_NAME: &str = ".app-cli-state";

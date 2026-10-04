@@ -5,6 +5,8 @@ use super::*;
 /// `--attach` 标志启用附着模式：已有实例占用端口时核验身份并等待退出，
 /// 然后重新执行本二进制成为新 owner。无 `--attach` 时端口冲突立即 fail-fast。
 pub async fn serve(args: &RuntimeArgs) -> Result<()> {
+    let normalized = args.for_management()?;
+    let args = &normalized;
     if args.attach && std::env::var_os(runtime_supervisor::WORKER_ENV).is_none() {
         return attach_to_existing_owner(args).await;
     }

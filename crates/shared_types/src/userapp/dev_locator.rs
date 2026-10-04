@@ -23,6 +23,15 @@ pub trait UserappDevLocator: Send + Sync {
     /// 应用共享：按 app_id 定位唯一 dev 容器（无用户维度）。
     async fn dev_file_server_addr(&self, app_id: &str) -> Result<String, String>;
 
+    /// Locate an already running development container for read-only logs.
+    /// Never create or wake compute, refresh activity, or recover its owner.
+    /// Unsupported implementations report an error instead of calling ensure.
+    async fn dev_logs_file_server_addr(&self, app_id: &str) -> Result<String, String> {
+        Err(format!(
+            "Read-only development log location is unavailable for app {app_id}"
+        ))
+    }
+
     /// 开发容器是否在（dev 卷 orphan 判定用；不 ensure）。`Err` = 探测失败
     /// （调用方保守判非 orphan，与 prod 侧 `is_storage_orphan` 的保守语义对齐）。
     async fn dev_container_alive(&self, app_id: &str) -> Result<bool, String>;

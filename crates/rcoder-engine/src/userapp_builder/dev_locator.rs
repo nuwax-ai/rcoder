@@ -41,6 +41,37 @@ impl shared_types::UserappDevLocator for UserappDevLocator {
         dev_file_server_addr(&state, &info).map_err(|error| error.to_string())
     }
 
+    async fn dev_logs_file_server_addr(&self, app_id: &str) -> Result<String, String> {
+        let state = self.state()?;
+        let actual = state
+            .runtime()
+            .find_container(app_id, &ServiceType::UserappBuilder)
+            .await
+            .map_err(|error| format!("observe development log container: {error}"))?
+            .ok_or_else(|| format!("Development container for app {app_id} does not exist; its file logs are currently unavailable"))?;
+        super::validate_builder_identity(app_id, &actual).map_err(|error| error.to_string())?;
+        if actual.status != container_runtime_api::ContainerRuntimeStatus::Running {
+            return Err(format!(
+                "Development container for app {app_id} is not running; its file logs are currently unavailable"
+            ));
+        }
+        super::adoption::verify_live_builder(&state, app_id, app_id, &actual.container_id)
+            .await
+            .map_err(|error| format!("verify development log container identity: {error:#}"))?;
+        let info = state
+            .runtime()
+            .get_container_info_by_identifier(app_id, &ServiceType::UserappBuilder)
+            .await
+            .map_err(|error| format!("observe development file-server address: {error}"))?
+            .ok_or_else(|| format!("Development file-server for app {app_id} is unavailable"))?;
+        if info.container_id != actual.container_id || info.workload_uid != actual.workload_uid {
+            return Err(
+                "Development container changed while locating logs; retry the query".into(),
+            );
+        }
+        dev_file_server_addr(&state, &info).map_err(|error| error.to_string())
+    }
+
     async fn dev_container_alive(&self, app_id: &str) -> Result<bool, String> {
         let state = self.state()?;
         state

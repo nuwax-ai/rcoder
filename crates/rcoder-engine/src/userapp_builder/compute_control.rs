@@ -892,6 +892,7 @@ async fn execute_claimed(
         {
             captured.restart_image = state.runtime().current_builder_image().await?;
         }
+        freeze_builder_restart_workspace(&mut captured, record.action);
         builder_compute_checkpoint(
             state,
             &captured,
@@ -974,6 +975,7 @@ async fn execute_claimed(
             let old: BuilderControlTarget = serde_json::from_value(target.clone())?;
             let mut fresh = super::adoption::capture_bound_target(state, &context).await?;
             fresh.restart_image = old.restart_image.clone();
+            fresh.restart_runtime_workspace = old.restart_runtime_workspace.clone();
             if old.workload.as_ref().map(|r| &r.uid) != fresh.workload.as_ref().map(|r| &r.uid)
                 || state
                     .runtime()
@@ -991,13 +993,17 @@ async fn execute_claimed(
                 *settled = false;
                 fresh = state.runtime().restore_builder_restart(&template).await?;
                 fresh.restart_image = old.restart_image.clone();
+                fresh.restart_runtime_workspace = old.restart_runtime_workspace.clone();
                 *settled = true;
             }
             ensure!(
                 fresh.workload.is_some(),
                 "Restart cannot create an absent builder"
             );
-            let prepared = builder_compute_checkpoint(state, &fresh, true).await?;
+            let mut prepared = builder_compute_checkpoint(state, &fresh, true).await?;
+            if let Some(template) = target.get("builder_restart_template") {
+                prepared["builder_restart_template"] = template.clone();
+            }
             verify_builder_volume_witness(&target, &prepared)?;
             prepared
         } else {
@@ -1587,6 +1593,7 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
     } else {
         let mut fresh = super::adoption::capture_bound_target(state, &context).await?;
         fresh.restart_image = old.restart_image.clone();
+        fresh.restart_runtime_workspace = old.restart_runtime_workspace.clone();
         if fresh.workload.as_ref().map(|r| &r.uid) != old.workload.as_ref().map(|r| &r.uid)
             || state
                 .runtime()
@@ -1606,6 +1613,7 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
             // before any new business instance can start.
             let mut restored = state.runtime().restore_builder_restart(&template).await?;
             restored.restart_image = old.restart_image.clone();
+            restored.restart_runtime_workspace = old.restart_runtime_workspace.clone();
             restored
         } else {
             ensure!(
@@ -1637,6 +1645,23 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
         .resume_builder_restart_start(snapshot, &target)
         .await?;
     run_restart_continuation(state, record, RestartContinuation::Dev(target)).await
+}
+
+/// Only a captured Kubernetes dev workload receives directory convergence.
+/// Called before the first Stopping checkpoint; retries copy the frozen value.
+fn freeze_builder_restart_workspace(
+    target: &mut BuilderControlTarget,
+    action: ComputeControlAction,
+) {
+    if action == ComputeControlAction::Restart
+        && target
+            .workload
+            .as_ref()
+            .is_some_and(|workload| workload.kind == AppResourceKind::StatefulSet)
+    {
+        target.restart_runtime_workspace =
+            Some(paths::userapp_dev_workspace(&target.context.app_id));
+    }
 }
 
 async fn builder_compute_checkpoint(
@@ -1791,5 +1816,45 @@ mod restart_resolution_tests {
             .is_err()
         );
         assert_eq!(runtime.restores.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod restart_workspace_tests {
+    use super::*;
+
+    #[test]
+    fn only_new_kubernetes_dev_restart_freezes_source_directory() {
+        let mut target = BuilderControlTarget {
+            context: UserAppExecutionContext {
+                app_id: "228".into(),
+                lifecycle_id: "life".into(),
+                operation_id: "restart".into(),
+                executor_id: "worker".into(),
+                request_fingerprint: "a".repeat(64),
+            },
+            resource_binding: None,
+            workload: Some(AppResourceIdentity {
+                kind: AppResourceKind::StatefulSet,
+                name: "builder".into(),
+                uid: "physical".into(),
+                resource_version: Some("1".into()),
+            }),
+            pod: None,
+            restart_image: None,
+            restart_runtime_workspace: None,
+        };
+        freeze_builder_restart_workspace(&mut target, ComputeControlAction::Stop);
+        assert_eq!(target.restart_runtime_workspace, None);
+        freeze_builder_restart_workspace(&mut target, ComputeControlAction::Restart);
+        assert_eq!(
+            target.restart_runtime_workspace.as_deref(),
+            Some("/home/user/228")
+        );
+        let mut docker = target.clone();
+        docker.restart_runtime_workspace = None;
+        docker.workload.as_mut().unwrap().kind = AppResourceKind::Container;
+        freeze_builder_restart_workspace(&mut docker, ComputeControlAction::Restart);
+        assert_eq!(docker.restart_runtime_workspace, None);
     }
 }

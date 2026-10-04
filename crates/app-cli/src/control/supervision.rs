@@ -127,6 +127,8 @@ pub async fn supervise(
     args: &crate::RuntimeArgs,
     restart_on_exit: bool,
 ) -> Result<SupervisionOutcome> {
+    let normalized = args.for_management()?;
+    let args = &normalized;
     if args.attach {
         return Ok(SupervisionOutcome::Legacy);
     }

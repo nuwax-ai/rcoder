@@ -19,6 +19,7 @@ struct ContractScenario {
     restart: bool,
     wake: bool,
     image_roll: Option<String>,
+    runtime_workspace: Option<String>,
     replaced: bool,
     patched: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     recorder: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
@@ -36,6 +37,13 @@ impl ContractScenario {
         if let Some(image) = &self.image_roll {
             observed["spec"]["template"]["spec"]["containers"][0]["image"] =
                 serde_json::json!(image);
+        }
+        if let Some(root) = &self.runtime_workspace {
+            observed["spec"]["template"]["spec"]["containers"][0]["env"] = serde_json::json!([
+                {"name":"USER_ID","value":"owner"},
+                {"name":"TOKEN","valueFrom":{"secretKeyRef":{"name":"credentials","key":"token"}}},
+                {"name":"APP_CLI_RUNTIME_WORKSPACE","value":root}
+            ]);
         }
         observed
     }
@@ -201,6 +209,11 @@ async fn handle_contract_connection(mut stream: tokio::net::TcpStream, scenario:
         old["metadata"]["uid"] = serde_json::json!("pod-original");
         old["metadata"]["resourceVersion"] = serde_json::json!("9");
         (200, old)
+    } else if single_pod && scenario.wake && scenario.runtime_workspace.is_some() && !patched {
+        (
+            404,
+            serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","code":404}),
+        )
     } else if single_pod {
         if scenario.restart || scenario.wake {
             (200, scenario.ready_pod.clone())
@@ -341,6 +354,27 @@ async fn stop_api_contract_with_image(
     replaced: bool,
     image_roll: Option<&str>,
 ) {
+    stop_api_contract_with_workspace(
+        reject_patch,
+        restart,
+        wake,
+        replaced,
+        image_roll,
+        None,
+        false,
+    )
+    .await;
+}
+
+async fn stop_api_contract_with_workspace(
+    reject_patch: bool,
+    restart: bool,
+    wake: bool,
+    replaced: bool,
+    image_roll: Option<&str>,
+    runtime_workspace: Option<&str>,
+    changed_version: bool,
+) {
     let context = UserAppExecutionContext {
         app_id: "app".into(),
         lifecycle_id: "life".into(),
@@ -355,10 +389,21 @@ async fn stop_api_contract_with_image(
     let mut ready_pod = serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"rcoder-app-builder-app-0","uid":"ready-pod","resourceVersion":"10","creationTimestamp":"2026-01-01T00:00:00Z","labels":{"rcoder.io/service-type":ServiceType::UserappBuilder.to_string(),"rcoder.io/identifier":"app"},"annotations":context.resource_metadata(),"ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"builder","uid":"sts-original","controller":true}]},"status":{"phase":"Running","podIP":"10.0.0.9","conditions":[{"type":"Ready","status":"True"}],"containerStatuses":[{"name":"agent","ready":true,"restartCount":0,"image":"agent:latest","imageID":"image-id","containerID":"container-id","state":{"running":{"startedAt":"2026-01-01T00:00:01Z"}}}]}});
     if wake {
         object["metadata"]["annotations"] = serde_json::json!({});
-        object["spec"]["template"]["spec"]["containers"] =
-            serde_json::json!([{"name":"agent","env":[{"name":"USER_ID","value":"owner"}]}]);
+        object["spec"]["template"]["spec"]["containers"] = serde_json::json!([{"name":"agent","image":"agent:latest","env":[{"name":"USER_ID","value":"owner"}]}]);
         ready_pod["metadata"]["annotations"] = serde_json::json!({});
         ready_pod["spec"] = serde_json::json!({"containers":[{"name":"agent","env":[{"name":"USER_ID","value":"owner"}]}]});
+    }
+    if let Some(root) = runtime_workspace {
+        object["spec"]["template"]["spec"]["containers"][0]["env"] = serde_json::json!([
+            {"name":"APP_CLI_RUNTIME_WORKSPACE","value":"/home/user/app/code"},
+            {"name":"USER_ID","value":"owner"},
+            {"name":"APP_CLI_RUNTIME_WORKSPACE","valueFrom":{"configMapKeyRef":{"name":"obsolete","key":"root"}}},
+            {"name":"TOKEN","valueFrom":{"secretKeyRef":{"name":"credentials","key":"token"}}}
+        ]);
+        ready_pod["spec"]["containers"][0]["env"]
+            .as_array_mut()
+            .expect("pod env")
+            .push(serde_json::json!({"name":"APP_CLI_RUNTIME_WORKSPACE","value":root}));
     }
     if let Some(image) = image_roll {
         ready_pod["spec"]["containers"][0]["image"] = serde_json::json!(image);
@@ -370,6 +415,9 @@ async fn stop_api_contract_with_image(
         wake,
     )
     .expect("identity");
+    if changed_version {
+        object["metadata"]["resourceVersion"] = serde_json::json!("other-rv");
+    }
     if replaced {
         object["metadata"]["uid"] = serde_json::json!("replacement-sts");
     }
@@ -386,6 +434,7 @@ async fn stop_api_contract_with_image(
         restart,
         wake,
         image_roll: image_roll.map(str::to_string),
+        runtime_workspace: runtime_workspace.map(str::to_string),
         replaced,
         patched: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         recorder: recorded.clone(),
@@ -449,12 +498,13 @@ async fn stop_api_contract_with_image(
             resource_version: "9".into(),
         }),
         restart_image: image_roll.map(str::to_string),
+        restart_runtime_workspace: runtime_workspace.map(str::to_string),
     };
     tokio::time::timeout(Duration::from_secs(5), async {
         let outcome = runtime
             .apply_builder_compute_mode(&target, restart || wake, wake)
             .await;
-        if reject_patch || replaced {
+        if reject_patch || replaced || changed_version {
             assert!(
                 matches!(outcome, Err(Error::RequestRejected(_))),
                 "expected rejection, got: {outcome:?}"
@@ -498,7 +548,7 @@ async fn stop_api_contract_with_image(
                 pod_delete = Some(request.clone());
             }
         }
-        if replaced {
+        if replaced || changed_version {
             // 替换的 STS 在任何写之前被拒——绝无写操作
             assert!(
                 sts_patch.is_none() && pod_delete.is_none(),
@@ -523,6 +573,18 @@ async fn stop_api_contract_with_image(
                 !body.contains("volumes") && !body.contains("persistentVolumeClaim"),
                 "patch must not touch storage: {body}"
             );
+            if image_roll.is_some() || runtime_workspace.is_some() {
+                assert!(headers.to_ascii_lowercase().contains("application/strategic-merge-patch+json"));
+            }
+            if let Some(root) = runtime_workspace {
+                let patch: serde_json::Value = serde_json::from_str(&body).expect("patch json");
+                let env = patch["spec"]["template"]["spec"]["containers"][0]["env"].as_array().expect("env list");
+                assert_eq!(env[0], serde_json::json!({"$patch":"replace"}));
+                assert_eq!(env.iter().filter(|entry| entry["name"] == "APP_CLI_RUNTIME_WORKSPACE").count(),1);
+                assert!(env.iter().any(|entry| entry == &serde_json::json!({"name":"APP_CLI_RUNTIME_WORKSPACE","value":root})));
+                assert!(env.iter().any(|entry| entry == &serde_json::json!({"name":"TOKEN","valueFrom":{"secretKeyRef":{"name":"credentials","key":"token"}}})));
+                assert!(env.iter().any(|entry| entry == &serde_json::json!({"name":"USER_ID","value":"owner"})));
+            }
             if let Some(image) = image_roll {
                 assert!(
                     headers
@@ -612,4 +674,91 @@ fn stop_and_restart_requests_carry_physical_preconditions() {
     let preconditions = params.preconditions.expect("preconditions");
     assert_eq!(preconditions.uid.as_deref(), Some("original-pod"));
     assert_eq!(preconditions.resource_version.as_deref(), Some("24"));
+}
+
+#[tokio::test]
+async fn bound_start_converges_legacy_workspace_even_with_latest_image() {
+    for image in [None, Some("agent:latest")] {
+        stop_api_contract_with_workspace(
+            false,
+            false,
+            true,
+            false,
+            image,
+            Some("/home/user/app"),
+            false,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn bound_workspace_restart_rejects_replaced_uid_or_version_before_writes() {
+    stop_api_contract_with_workspace(
+        false,
+        false,
+        true,
+        true,
+        None,
+        Some("/home/user/app"),
+        false,
+    )
+    .await;
+    stop_api_contract_with_workspace(
+        false,
+        false,
+        true,
+        false,
+        None,
+        Some("/home/user/app"),
+        true,
+    )
+    .await;
+}
+
+#[test]
+fn restart_confirmation_requires_unique_literal_workspace_on_sts_and_actual_pod() {
+    let pod = |env: serde_json::Value| {
+        serde_json::from_value::<Pod>(
+            serde_json::json!({"spec":{"containers":[{"name":"agent","env":env}]}}),
+        )
+        .unwrap()
+    };
+    let correct =
+        pod(serde_json::json!([{"name":"APP_CLI_RUNTIME_WORKSPACE","value":"/home/user/app"}]));
+    let old = pod(
+        serde_json::json!([{"name":"APP_CLI_RUNTIME_WORKSPACE","value":"/home/user/app/code"}]),
+    );
+    let duplicate = pod(serde_json::json!([
+        {"name":"APP_CLI_RUNTIME_WORKSPACE","value":"/home/user/app"},
+        {"name":"APP_CLI_RUNTIME_WORKSPACE","value":"/home/user/app/code"}
+    ]));
+    let indirect = pod(
+        serde_json::json!([{"name":"APP_CLI_RUNTIME_WORKSPACE","valueFrom":{"configMapKeyRef":{"name":"config","key":"root"}}}]),
+    );
+    let mut sts: StatefulSet = serde_json::from_value(serde_json::json!({"spec":{"serviceName":"builder","selector":{"matchLabels":{}},"template":{"spec":{"containers":[{"name":"agent"}]}}}})).unwrap();
+    sts.spec.as_mut().unwrap().template.spec = correct.spec.clone();
+    assert!(statefulset_agent_workspace_matches(
+        &sts,
+        Some("/home/user/app")
+    ));
+    assert!(pod_agent_workspace_matches(
+        &correct,
+        Some("/home/user/app")
+    ));
+    for invalid in [&old, &duplicate, &indirect] {
+        assert!(!pod_agent_workspace_matches(
+            invalid,
+            Some("/home/user/app")
+        ));
+        sts.spec.as_mut().unwrap().template.spec = invalid.spec.clone();
+        assert!(!statefulset_agent_workspace_matches(
+            &sts,
+            Some("/home/user/app")
+        ));
+    }
+    assert!(
+        pod_agent_workspace_matches(&old, None),
+        "legacy intent retains old behavior"
+    );
 }

@@ -197,6 +197,18 @@ impl DevServerManager {
             .stdin(std::process::Stdio::null())
             .stdout(output.try_clone()?)
             .stderr(output);
+        let state_root = runtime_state_layout::ensure_state_root(
+            workspace,
+            std::env::var_os("APP_CLI_STATE_ROOT").as_deref(),
+            std::env::var_os("PROJECT_ID").as_deref(),
+        )?;
+        if let Some(managed) =
+            runtime_state_layout::ManagedWorkspace::from_env(workspace, &state_root)?
+        {
+            command
+                .env_remove("USERAPP_SINGLE_APP_ID")
+                .envs(managed.launch_environment()?);
+        }
         process_utils::command_authority::detach_command(&mut command);
         #[cfg(unix)]
         command.process_group(0);

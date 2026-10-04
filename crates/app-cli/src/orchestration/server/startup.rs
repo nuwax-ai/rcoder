@@ -81,6 +81,8 @@ pub async fn owner_serve(
     session: std::sync::Arc<runtime_supervisor::OwnerSession>,
     run_mode: bool,
 ) -> Result<()> {
+    let normalized = args.for_management()?;
+    let args = &normalized;
     let _ = application_id;
     let api_listener = crate::api::bind_listener(&args.admin_addr).await?;
     let ready = RuntimeStatusService::default();

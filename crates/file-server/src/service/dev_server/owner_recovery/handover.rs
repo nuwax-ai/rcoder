@@ -15,9 +15,7 @@ impl DevServerManager {
         // Start and Stop have different standalone identity rules: Stop may
         // retire a contained manual deploy directory with no origin marker.
         // Preserve those existing callers' checks outside the managed builder.
-        if std::env::var("SERVICE_TYPE").ok().as_deref() != Some("userapp-builder")
-            || std::env::var("APP_CLI_MANAGED").ok().as_deref() != Some("1")
-        {
+        if !ManagedWorkspace::enabled_from_values(|key| std::env::var_os(key)) {
             return Ok(identity);
         }
         let root = runtime_state_layout::resolve_state_root(

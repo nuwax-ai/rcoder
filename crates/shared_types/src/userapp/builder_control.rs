@@ -59,6 +59,10 @@ pub struct BuilderControlTarget {
     /// recovery never picks a different platform release after a rollout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_image: Option<String>,
+    /// Platform-owned source directory frozen before a Kubernetes dev restart.
+    /// Missing in old checkpoints; recovery must never invent a new intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_runtime_workspace: Option<String>,
 }
 
 // The compute ledger adds protocol and volume witnesses alongside the target.
@@ -76,6 +80,8 @@ impl<'de> Deserialize<'de> for BuilderControlTarget {
             #[serde(default)]
             restart_image: Option<String>,
             #[serde(default)]
+            restart_runtime_workspace: Option<String>,
+            #[serde(default)]
             #[allow(dead_code)]
             builder_compute_single_write: bool,
             #[serde(default)]
@@ -92,6 +98,7 @@ impl<'de> Deserialize<'de> for BuilderControlTarget {
             workload: wire.workload,
             pod: wire.pod,
             restart_image: wire.restart_image,
+            restart_runtime_workspace: wire.restart_runtime_workspace,
         })
     }
 }
@@ -105,6 +112,18 @@ impl BuilderControlTarget {
             .is_some_and(|image| image.trim().is_empty())
         {
             return Err("Builder restart image is empty".into());
+        }
+        if let Some(root) = self.restart_runtime_workspace.as_deref()
+            && (root != crate::paths::userapp_dev_workspace(&self.context.app_id)
+                || self
+                    .workload
+                    .as_ref()
+                    .is_none_or(|workload| workload.kind != crate::AppResourceKind::StatefulSet))
+        {
+            return Err(
+                "Builder restart workspace requires the captured dev StatefulSet source root"
+                    .into(),
+            );
         }
         if let Some(workload) = &self.workload {
             if workload.name.is_empty() || workload.uid.is_empty() {
@@ -153,6 +172,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn restart_workspace_wire_is_additive_and_rejects_foreign_root() {
+        let legacy = serde_json::json!({
+            "resource_binding":null,
+            "context":{"app_id":"228","lifecycle_id":"life","operation_id":"restart","executor_id":"worker","request_fingerprint":"a".repeat(64)},
+            "workload":{"kind":"stateful_set","name":"builder","uid":"sts","resource_version":"1"},
+            "pod":null
+        });
+        // Serialize the identity using its enum representation rather than
+        // coupling the fixture to the storage spelling of resource kinds.
+        let mut legacy = legacy;
+        legacy["workload"] = serde_json::to_value(crate::AppResourceIdentity {
+            kind: crate::AppResourceKind::StatefulSet,
+            name: "builder".into(),
+            uid: "sts".into(),
+            resource_version: Some("1".into()),
+        })
+        .unwrap();
+        let mut target: BuilderControlTarget = serde_json::from_value(legacy).unwrap();
+        assert_eq!(target.restart_runtime_workspace, None);
+        assert!(
+            serde_json::to_value(&target)
+                .unwrap()
+                .get("restart_runtime_workspace")
+                .is_none()
+        );
+        target.restart_runtime_workspace = Some("/home/user/228".into());
+        target.validate().unwrap();
+        let value = serde_json::to_value(&target).unwrap();
+        assert_eq!(
+            serde_json::from_value::<BuilderControlTarget>(value).unwrap(),
+            target
+        );
+        target.restart_runtime_workspace = Some("/home/user/other".into());
+        assert!(target.validate().is_err());
+        target.restart_runtime_workspace = Some("/home/user/228".into());
+        target.workload.as_mut().unwrap().kind = crate::AppResourceKind::Container;
+        assert!(target.validate().is_err());
+    }
+
+    #[test]
     fn compute_control_never_accepts_storage_or_incomplete_pod_receipts() {
         let context = crate::UserAppExecutionContext {
             app_id: "app".into(),
@@ -167,6 +226,7 @@ mod tests {
             workload: None,
             pod: None,
             restart_image: None,
+            restart_runtime_workspace: None,
         };
         target.validate().expect("authoritative compute absence");
         for kind in [

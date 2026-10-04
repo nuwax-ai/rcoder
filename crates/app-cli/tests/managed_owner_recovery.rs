@@ -36,6 +36,7 @@ fn spawn(workspace: &Path, source: &Path, state: &Path, managed: bool) -> Proces
         .env_remove("SERVICE_TYPE")
         .env_remove("APP_CLI_MANAGED")
         .env_remove("APP_CLI_RUNTIME_WORKSPACE")
+        .env_remove("USERAPP_WORKSPACE_DIR")
         .env(
             "RCODER_EXECUTION_DOMAIN",
             json!({
@@ -51,9 +52,10 @@ fn spawn(workspace: &Path, source: &Path, state: &Path, managed: bool) -> Proces
                 .unwrap(),
         ));
     if managed {
-        cmd.env("SERVICE_TYPE", "userapp-builder")
+        cmd.env("SERVICE_TYPE", "user-app-builder")
             .env("APP_CLI_MANAGED", "1")
-            .env("APP_CLI_RUNTIME_WORKSPACE", source);
+            .env("USERAPP_WORKSPACE_DIR", source.parent().unwrap())
+            .env("APP_CLI_RUNTIME_WORKSPACE", source.join("code"));
     }
     Process(cmd.spawn().unwrap())
 }
@@ -154,7 +156,7 @@ async fn operation(
 async fn recover(live: bool, corrupt_identity: bool, moved_source: bool) {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().canonicalize().unwrap().join("managed-test");
-    let wrong = source.join("misplaced-project");
+    let wrong = source.join("code");
     let state = source.join("state/managed-test");
     std::fs::create_dir_all(&wrong).unwrap();
     std::fs::write(wrong.join("source-sentinel.txt"), "preserve source").unwrap();
@@ -173,6 +175,17 @@ async fn recover(live: bool, corrupt_identity: bool, moved_source: bool) {
     let generation = captured.generation.clone().unwrap();
     let operation_bytes = std::fs::read(state.join("operations/original-stop.json")).unwrap();
     if !live {
+        let captured_record: Value = serde_json::from_slice(
+            &std::fs::read(state.join("work").join(&generation).join("generation.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            captured_record["process_epoch"]
+                .as_str()
+                .is_some_and(|epoch| !epoch.is_empty()),
+            "dead-owner recovery fixture requires the real OS process epoch; \
+             on macOS run outside a sandbox that denies kern.bootsessionuuid: {captured_record}"
+        );
         old.0.kill().unwrap();
         old.0.wait().unwrap();
         let receipt: Value = serde_json::from_slice(
@@ -196,7 +209,10 @@ async fn recover(live: bool, corrupt_identity: bool, moved_source: bool) {
     } else {
         wrong.clone()
     };
-    let mut replacement = spawn(&source, &source, &state, true);
+    // The current container still advertises and launches the old code root.
+    // Bootstrap must correct it before binding, not reject the source request.
+    std::fs::create_dir_all(&wrong).unwrap();
+    let mut replacement = spawn(&wrong, &source, &state, true);
     let (new_base, identity) = ready(&mut replacement, &client, &state, &source).await;
     assert_ne!(
         identity["runtime_instance_id"],
