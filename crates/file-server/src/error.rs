@@ -39,6 +39,14 @@ pub enum AppError {
     Network(String),
     /// SYSTEM_ERROR (500)
     System(String),
+    /// SYSTEM_ERROR (500) — 命令执行失败的结构化形态（UA-06）：`output_tail`
+    /// 是机器可读的本次运行输出尾段（原始行, 未拼接展示标记）; 错误分类
+    /// （如 pnpm 缺 lockfile 自愈）走字段, 不再解析 Display 文本——另一处
+    /// 改动错误包裹/展示/截断格式时, 机器分类不受影响。Display 仍为人读全文。
+    CommandExecution {
+        message: String,
+        output_tail: Option<String>,
+    },
     /// FILE_ERROR (500)
     File(String),
     /// PROCESS_ERROR (500)
@@ -50,6 +58,24 @@ pub enum AppError {
 }
 
 impl AppError {
+    /// 前缀包装并**保留** [`AppError::CommandExecution`] 的结构化输出尾段
+    /// （UA-06）：展示层加前缀不得抹掉机器分类字段——此前 `system(format!(
+    /// "{prefix}: {e}"))` 会把结构化错误降级回纯文本, 使依赖 Display 文本
+    /// 约定的分类（pnpm 缺 lockfile 自愈）在包装层碎裂。其余变体维持原有
+    /// System 包装语义。
+    pub fn prefixed(self, prefix: &str) -> Self {
+        match self {
+            Self::CommandExecution {
+                message,
+                output_tail,
+            } => Self::CommandExecution {
+                message: format!("{prefix}: {message}"),
+                output_tail,
+            },
+            other => Self::system(format!("{prefix}: {other}")),
+        }
+    }
+
     pub(crate) fn owner_error(context: &str, error: anyhow::Error) -> Self {
         if let Some(recovery) = error.downcast_ref::<runtime_supervisor::RecoveryError>() {
             return Self::RuntimeRecovery(
@@ -118,7 +144,7 @@ impl AppError {
             AppError::Permission(_) => "PERMISSION_ERROR",
             AppError::Resource(_) => "RESOURCE_ERROR",
             AppError::Network(_) => "NETWORK_ERROR",
-            AppError::System(_) => "SYSTEM_ERROR",
+            AppError::System(_) | AppError::CommandExecution { .. } => "SYSTEM_ERROR",
             AppError::File(_) => "FILE_ERROR",
             AppError::Process(_) | AppError::ProcessPortInUse { .. } => "PROCESS_ERROR",
         }
@@ -147,7 +173,7 @@ impl AppError {
             AppError::Permission(m) => m,
             AppError::Resource(m) => m,
             AppError::Network(m) => m,
-            AppError::System(m) => m,
+            AppError::System(m) | AppError::CommandExecution { message: m, .. } => m,
             AppError::File(m) => m,
             AppError::Process(m) => m,
             AppError::ProcessPortInUse { detail, .. } => detail,

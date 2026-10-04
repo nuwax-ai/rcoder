@@ -427,8 +427,8 @@ async fn remove_node_modules(project_path: &Path) {
 
 // ── export-project (zip 文件流) ─────────────────────────────────────────────────
 
-/// 导出项目 zip: exportType=LATEST 或 zip 不存在时重打; 可选写 cpage_config.json (打包后删)。
-/// 返回 zip 路径, 由 handler 流式响应。
+/// 导出项目 zip: exportType=LATEST 或 zip 不存在时重打; 可选 cpage_config 作为
+/// zip 显式 entry (不动真实项目文件)。返回 zip 路径, 由 handler 流式响应。
 pub async fn export_project(
     resolver: &dyn WorkspaceResolver,
     config: &Config,
@@ -458,31 +458,31 @@ pub async fn export_project(
         }
         return Ok(zip_path);
     }
-    // LATEST 重打: 写 cpage_config.json (打包后删除, 避免污染项目目录)
-    let config_path = project_path.join("cpage_config.json");
-    let config_written = if let Some(cfg) = cpage_config {
-        let bytes = serde_json::to_vec(cfg)
-            .map_err(|error| AppError::system(format!("serialize cpage_config.json: {error}")))?;
-        fs::write(&config_path, bytes).await.map_err(|error| {
-            AppError::system(format!("write {}: {error}", config_path.display()))
-        })?;
-        Some(config_path.clone())
-    } else {
-        None
+    // LATEST 重打: 导出配置作为 zip 显式 entry (源内同名文件被替代), 不再
+    // 写/删真实项目文件——已有配置（含外向链接）原样保留 (FS-02)。
+    let explicit_entry = match cpage_config {
+        Some(cfg) => {
+            let bytes = serde_json::to_vec(cfg).map_err(|error| {
+                AppError::system(format!("serialize cpage_config.json: {error}"))
+            })?;
+            Some(crate::service::zip::ExplicitEntry {
+                name: "cpage_config.json".to_string(),
+                bytes,
+            })
+        }
+        None => None,
     };
-    let repack_result = crate::service::zip::pack_dir(
+    crate::service::zip::pack_with_opts(
         project_path.clone(),
         zip_path.clone(),
-        config.traverse_exclude_dirs.clone(),
-        config.backup_traverse_exclude_files.clone(),
+        crate::service::zip::PackOpts {
+            exclude_dirs: config.traverse_exclude_dirs.clone(),
+            exclude_files: config.backup_traverse_exclude_files.clone(),
+            explicit_entry,
+            ..Default::default()
+        },
     )
-    .await;
-    if let Some(p) = &config_written
-        && let Err(cleanup_err) = fs::remove_file(p).await
-    {
-        tracing::warn!(error = %cleanup_err, "cleanup temp config file after export failed (skipping)");
-    }
-    repack_result?;
+    .await?;
     if !try_exists(&zip_path).await? {
         return Err(AppError::system("Exported zip file does not exist"));
     }
@@ -534,6 +534,119 @@ mod tests {
             space_id: None,
             isolation_type: None,
         }
+    }
+
+    /// FS-02 反例: LATEST 导出的 cpage_config 只能作为 zip 显式 entry, 不得把
+    /// 真实项目文件当临时文件（覆盖后删除）。修复前真实文件被改写并删除。
+    #[tokio::test]
+    async fn export_latest_config_entry_only_real_file_untouched() {
+        use std::io::Read;
+        let root = tempfile::tempdir().expect("tempdir");
+        let resolver =
+            LocalWorkspaceResolver::new(root.path().join("ws"), root.path().join("computer"));
+        let config = Config {
+            upload_project_dir: root.path().join("uploads"),
+            ..Config::default()
+        };
+        let project_dir = root.path().join("ws/p1");
+        fs::create_dir_all(&project_dir).await.expect("project dir");
+        fs::write(project_dir.join("index.html"), b"<html>")
+            .await
+            .expect("page");
+        fs::write(project_dir.join("cpage_config.json"), br#"{"user":true}"#)
+            .await
+            .expect("real config");
+
+        let export_cfg = serde_json::json!({"export": true});
+        let zip_path = export_project(
+            &resolver,
+            &config,
+            &ctx("p1"),
+            "3",
+            Some("LATEST"),
+            Some(&export_cfg),
+        )
+        .await
+        .expect("export");
+
+        let real = fs::read_to_string(project_dir.join("cpage_config.json"))
+            .await
+            .expect("real config must survive export");
+        assert_eq!(real, r#"{"user":true}"#);
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut z = zip::ZipArchive::new(file).unwrap();
+        let mut matches = 0;
+        for i in 0..z.len() {
+            let mut entry = z.by_index(i).unwrap();
+            if entry.name() == "cpage_config.json" {
+                matches += 1;
+                let mut buf = String::new();
+                Read::read_to_string(&mut entry, &mut buf).unwrap();
+                assert_eq!(buf, r#"{"export":true}"#);
+            }
+        }
+        assert_eq!(
+            matches, 1,
+            "zip must contain exactly one explicit cpage_config.json entry"
+        );
+        assert!(z.by_name("index.html").is_ok());
+    }
+
+    /// FS-02 反例（symlink 变体）: 已有 cpage_config.json 是外向链接时, 导出不得
+    /// 跟随链接改写外部目标。修复前 `fs::write` 跟随链接覆盖外部文件。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn export_latest_follows_no_outward_config_link() {
+        use std::io::Read;
+        let root = tempfile::tempdir().expect("tempdir");
+        let resolver =
+            LocalWorkspaceResolver::new(root.path().join("ws"), root.path().join("computer"));
+        let config = Config {
+            upload_project_dir: root.path().join("uploads"),
+            ..Config::default()
+        };
+        let project_dir = root.path().join("ws/p1");
+        fs::create_dir_all(&project_dir).await.expect("project dir");
+        fs::write(project_dir.join("index.html"), b"x")
+            .await
+            .expect("page");
+        let external = root.path().join("external-config.json");
+        fs::write(&external, b"external-original")
+            .await
+            .expect("external");
+        std::os::unix::fs::symlink(&external, project_dir.join("cpage_config.json")).expect("link");
+
+        let export_cfg = serde_json::json!({"export": true});
+        let zip_path = export_project(
+            &resolver,
+            &config,
+            &ctx("p1"),
+            "2",
+            Some("LATEST"),
+            Some(&export_cfg),
+        )
+        .await
+        .expect("export");
+
+        let external_now = fs::read_to_string(&external)
+            .await
+            .expect("external survives");
+        assert_eq!(
+            external_now, "external-original",
+            "outward link target must not be followed or rewritten"
+        );
+        let link_meta = fs::symlink_metadata(project_dir.join("cpage_config.json"))
+            .await
+            .expect("link kept in place");
+        assert!(link_meta.file_type().is_symlink());
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut z = zip::ZipArchive::new(file).unwrap();
+        let mut entry = z.by_name("cpage_config.json").expect("explicit entry");
+        let mut buf = String::new();
+        Read::read_to_string(&mut entry, &mut buf).unwrap();
+        assert_eq!(buf, r#"{"export":true}"#);
     }
 
     #[tokio::test]

@@ -118,7 +118,7 @@ fn resolve_file_path_within_workspace(root: &Path, file_path: &str) -> Option<Re
     }
     let name = abs_path
         .strip_prefix(&normalized_root)
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .map(|p| crate::path_safety::host_relative_to_wire(&p.to_string_lossy()))
         .unwrap_or_default();
     if name.is_empty() || name.starts_with("..") {
         return None;
@@ -129,6 +129,22 @@ fn resolve_file_path_within_workspace(root: &Path, file_path: &str) -> Option<Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FS-08 反例: Linux 下 `a\b.txt` 是单个文件名——resolve 返回的 wire 名必须
+    /// 原样保留（修复前被替换为 `a/b.txt`, URL 指向不存在的路径）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_preserves_posix_backslash_filename() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let root = fixture.path().join("root");
+        fs::create_dir_all(&root).await.expect("root");
+        fs::write(root.join("a\\b.txt"), b"x").await.expect("file");
+        let resolved = resolve_existing_file(&root, "a\\b.txt", Some("/proxy"))
+            .await
+            .expect("resolve")
+            .expect("backslash filename resolves");
+        assert_eq!(resolved.name, "a\\b.txt");
+    }
 
     #[test]
     fn resolve_file_path_within_workspace_logic() {

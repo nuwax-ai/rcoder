@@ -38,6 +38,7 @@ struct CliOverrides {
     ts_upstream_port: Option<u16>,
     policy: Option<RoutePolicy>,
     embed: Option<bool>,
+    native: Option<bool>,
 }
 
 /// 启动设置（CLI > env > 默认 归一后的终值）。
@@ -49,6 +50,9 @@ struct Settings {
     policy: RoutePolicy,
     /// true = 装配进程内直连（feature 编译 + 显式启用）；false = 纯转发。
     embed: bool,
+    /// PX-03: 原生桌面/宿主形态——缺省 loopback + 自动文件 API 凭据（与
+    /// 受管容器公开缺省分开; 显式来源 CLI/env, 不按 OS/目录猜）。
+    native_profile: bool,
 }
 
 fn usage() -> String {
@@ -106,6 +110,8 @@ fn parse_cli_args(args: &[String]) -> Result<CliOverrides, String> {
             }
             "--embed" => out.embed = Some(true),
             "--no-embed" => out.embed = Some(false),
+            "--native" => out.native = Some(true),
+            "--no-native" => out.native = Some(false),
             other => return Err(format!("unknown argument {other:?}\n\n{}", usage())),
         }
     }
@@ -153,7 +159,9 @@ fn env_policy() -> Result<RoutePolicy, String> {
     }
 }
 
-/// 归一：CLI > env > 默认。
+/// 归一：CLI > env > 默认。全部惰性求值——CLI 显式提供时**不读**对应 env
+/// （PX-05: 合法 `--policy all_rust`/`--embed` 不得被遗留的非法 ROUTE_POLICY/
+/// EMBED_FILE_SERVER 拒启; `unwrap_or`/`Option::or` 是急切求值, 曾经违反此序）。
 fn resolve_settings(cli: CliOverrides) -> Result<Settings, String> {
     Ok(Settings {
         listen_port: match cli.listen_port {
@@ -168,12 +176,20 @@ fn resolve_settings(cli: CliOverrides) -> Result<Settings, String> {
             Some(port) => port,
             None => env_port("TS_UPSTREAM_PORT", NUWAX_FILE_SERVER_INTERNAL_PORT)?,
         },
-        policy: cli.policy.unwrap_or(env_policy()?),
+        policy: match cli.policy {
+            Some(policy) => policy,
+            None => env_policy()?,
+        },
         // 未显式指定（CLI/env 都没给）= 纯转发：容器形态安全缺省
-        embed: cli
-            .embed
-            .or(env_bool("EMBED_FILE_SERVER")?)
-            .unwrap_or(false),
+        embed: match cli.embed {
+            Some(embed) => embed,
+            None => env_bool("EMBED_FILE_SERVER")?.unwrap_or(false),
+        },
+        // PX-03: CLI > env 惰性（同 PX-05 求值序）, 未设 = 受管缺省。
+        native_profile: match cli.native {
+            Some(native) => native,
+            None => env_bool("FILE_SERVER_PROXY_NATIVE_PROFILE")?.unwrap_or(false),
+        },
     })
 }
 
@@ -185,6 +201,45 @@ fn init_tracing_plain() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+}
+
+/// 监督器进程日志（PX-09）：console（前台形态）+ owner root 下 `supervisor.log`
+/// 追加（detached stdio=ignore 时围栏/恢复/限频事件仍可按 root 找到）。
+/// worker 是监督器派生的子进程, 自己初始化业务日志, 与本层互不覆盖。
+fn init_supervisor_tracing(root: &std::path::Path) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join("supervisor.log"));
+    match file {
+        Ok(log) => {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer())
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(std::sync::Arc::new(log)),
+                )
+                .init();
+        }
+        Err(error) => {
+            eprintln!(
+                "警告: 无法打开监督器日志 {} ({error}); 仅 console 输出",
+                root.join("supervisor.log").display()
+            );
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .init();
+        }
+    }
 }
 
 fn main() {
@@ -245,6 +300,9 @@ async fn run() {
         Ok(settings) => settings,
         Err(e) => fail(e),
     };
+    // owner root 目录名是稳定作用域键——不随 native/managed 的监听缺省漂移
+    // （否则 start 与 status/stop 会落进不同 root）; PX-03 的 loopback 只作用于
+    // 实际监听 host（run() 内独立推导）。
     let host = std::env::var("FILE_SERVER_PROXY_HOST")
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -282,12 +340,16 @@ async fn run() {
     if let Some(root) = &owner_root
         && std::env::var_os(runtime_supervisor::WORKER_ENV).is_none()
     {
+        // PX-09: 监督器进程先于 worker 有自己的日志——围栏/恢复/限频事件不再
+        // 丢失; detached（stdio=ignore）形态经 owner root 下 supervisor.log
+        // 仍可追踪, console 层服务前台形态。
+        init_supervisor_tracing(root);
         match native_supervisor::run(root, &args).await {
             Ok(code) => std::process::exit(code),
             Err(error) => fail(error),
         }
     }
-    let mut owner = if let Some(root) = owner_root {
+    let mut owner = if let Some(root) = owner_root.clone() {
         Some(
             native_control::Owner::acquire(root)
                 .await
@@ -361,26 +423,55 @@ async fn run() {
         }
     }
 
+    // PX-03: native 形态的缺省绑定与凭据——与受管容器公开缺省分开。
+    // - 缺省 host: 受管 0.0.0.0 / native 127.0.0.1（显式 FILE_SERVER_PROXY_HOST 均可覆盖;
+    //   非 loopback 监听仍需令牌, 由既有 start 侧 fail-fast 校验兜底）。
+    // - 凭据: env 未提供且 native 时自动生成文件 API 令牌并落盘 owner root 下
+    //   credentials.json(0600), 供宿主 helper 读取; 令牌不进日志/stdout/回执/argv。
+    let listen_host = std::env::var("FILE_SERVER_PROXY_HOST")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            if settings.native_profile {
+                "127.0.0.1".to_string()
+            } else {
+                "0.0.0.0".to_string()
+            }
+        });
+    let auth_token = std::env::var("FILE_SERVER_PROXY_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            if !settings.native_profile {
+                return None;
+            }
+            let token = format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+            if let Some(root) = &owner_root
+                && let Err(error) = file_server_proxy::write_native_credentials(root, &token)
+            {
+                fail(format!("persist native file-api credentials: {error}"));
+            }
+            Some(token)
+        });
     file_server_proxy::init(FileServerProxyConfig {
-        listen_host: std::env::var("FILE_SERVER_PROXY_HOST")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "0.0.0.0".to_string()),
-        // N07：令牌 env（非 loopback 监听必需——start 侧 fail-fast 校验）；
-        // 受管声明 env（容器 supervisor 配置显式注入——公开绑定无令牌合法）
-        auth_token: std::env::var("FILE_SERVER_PROXY_TOKEN")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
+        listen_host,
+        auth_token,
         // N07（修订）：env 优先三态（1/true 放行、0/false 收紧）、未设默认
         // 受管放行 true（本服务部署形态以容器/supervisor 为主流，09-19 前
         // "默认严格+各处声明"的门只挡自己人）。独立进程形态无 config.yml
         // 载体，env 是唯一显式收紧通道；亦可用 HOST=127.0.0.1+令牌双保险。
+        // PX-10: 非法显式值（flase/yes/…）直接拒启, 不静默落回公开缺省。
         public_bind_declared: FileServerProxyConfig::env_public_bind_setting(
             std::env::var("FILE_SERVER_PROXY_PUBLIC_BIND")
                 .ok()
                 .as_deref(),
         )
+        .unwrap_or_else(|reason| fail(format!("invalid FILE_SERVER_PROXY_PUBLIC_BIND: {reason}")))
         .unwrap_or(true),
         listen_port: settings.listen_port,
         rust_upstream_port: settings.rust_upstream_port,
@@ -563,6 +654,78 @@ fn prepare_embed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// env 变更测试串行锁（env 是进程全局——避免并行测试互踩）。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 测试专用 env 写入：Rust 2024 将 set_var/remove_var 标记 unsafe。
+    /// 仅在串行锁内使用——豁免通道仅限测试模块（workspace lint 注释明示;
+    /// 生产代码保持 deny unsafe）。
+    #[allow(unsafe_code)]
+    fn set_test_env(key: &str, value: Option<&str>) {
+        // SAFETY: ENV_LOCK 保证同一时刻仅一个测试线程操作 env;
+        // 被测函数在此期间同步读取, 无并发读者窗口。
+        match value {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    /// PX-05 反例: 合法 CLI 显式值必须短路对应 env——遗留的非法 ROUTE_POLICY/
+    /// EMBED_FILE_SERVER 不得把带着 `--policy all_rust`/`--embed` 的合法启动
+    /// 拒之门外。修复前 `unwrap_or(env_policy()?)`/`Option::or(env_bool(..)?)`
+    /// 急切求值违反 CLI > env。
+    #[test]
+    fn cli_explicit_values_short_circuit_invalid_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        set_test_env("ROUTE_POLICY", Some("bogus"));
+        set_test_env("EMBED_FILE_SERVER", Some("bogus"));
+        let settings = resolve_settings(CliOverrides {
+            policy: Some(RoutePolicy::AllRust),
+            embed: Some(true),
+            ..CliOverrides::default()
+        })
+        .expect("legal CLI values must win over invalid env");
+        assert_eq!(settings.policy, RoutePolicy::AllRust);
+        assert!(settings.embed);
+        set_test_env("ROUTE_POLICY", None);
+        set_test_env("EMBED_FILE_SERVER", None);
+    }
+
+    /// PX-05: 无 CLI 时非法 env 仍按 fail-fast 拒启（不因惰性化放松校验）。
+    #[test]
+    fn invalid_env_without_cli_still_rejects_startup() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        set_test_env("ROUTE_POLICY", Some("bogus"));
+        let error = resolve_settings(CliOverrides::default())
+            .expect_err("invalid ROUTE_POLICY without CLI must reject");
+        assert!(error.contains("ROUTE_POLICY"), "unexpected: {error}");
+        set_test_env("ROUTE_POLICY", None);
+    }
+
+    /// PX-10: 非法显式 PUBLIC_BIND 词（flase/yes）解析为 Err 而非缺省——
+    /// run 层对 Err 走 fail()（拒启）, 不再静默采用公开缺省 true。
+    #[test]
+    fn invalid_public_bind_words_are_errors_not_unset() {
+        for invalid in ["flase", "yes", "on"] {
+            assert!(
+                FileServerProxyConfig::env_public_bind_setting(Some(invalid)).is_err(),
+                "invalid word {invalid:?} must be an explicit error"
+            );
+        }
+        assert_eq!(
+            FileServerProxyConfig::env_public_bind_setting(Some("")),
+            Ok(None)
+        );
+        assert_eq!(
+            FileServerProxyConfig::env_public_bind_setting(None),
+            Ok(None)
+        );
+        assert_eq!(
+            FileServerProxyConfig::env_public_bind_setting(Some("false")),
+            Ok(Some(false))
+        );
+    }
 
     fn arg(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

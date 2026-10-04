@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 #[derive(Serialize, Deserialize)]
@@ -92,7 +91,7 @@ pub async fn run(root: &Path, args: &[String]) -> Result<i32, String> {
         component: "file-server-proxy".into(),
         resource: std::fs::canonicalize(root).map_err(|e| e.to_string())?,
     });
-    options.policy.graceful_stop = Duration::from_secs(30);
+    options.policy.graceful_stop = file_server_proxy::GRACEFUL_STOP_BUDGET;
     let cancellation = options.shutdown.clone();
     let signal = tokio::spawn(async move {
         if let Err(error) = crate::shutdown_signal().await {

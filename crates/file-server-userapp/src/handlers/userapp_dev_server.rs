@@ -59,43 +59,41 @@ enum StartupCompletion {
 
 use crate::service::userapp::start_events::{StartEvent as EvtOutcome, StartEventPipe};
 
-/// app-cli EVT JSON → 进度事件/终局（跨进程 wire 契约；与 app-cli
-/// `orchestration_events` 的 serde 形态一致——两端测试锁同一组字符串）。
-/// 解析失败/未知事件返回 None（调用方 warn 丢弃，不影响编排）。
+/// app-cli EVT JSON → 进度事件/终局（UA-07: typed 解码走
+/// `shared_types::app_cli_evt` 唯一契约; 未知扩展与已知事件损坏分开留痕,
+/// 两者都不影响编排——尽力而为的观测通道）。返回 None = 调用方丢弃。
 fn map_app_cli_evt(json: &str) -> Option<EvtOutcome> {
-    let value: serde_json::Value = serde_json::from_str(json).ok()?;
-    let event = value.get("event")?.as_str()?;
-    match event {
-        "service_starting" => Some(EvtOutcome::Event(
-            shared_types::BuildProgressEvent::ServiceStarting {
-                service: value.get("service")?.as_str()?.to_string(),
-            },
+    use shared_types::{AppCliEvtDecodeError as DecodeError, AppCliOrchestrationEvent as Evt};
+    match Evt::decode(json) {
+        Ok(Evt::ServiceStarting { service }) => Some(EvtOutcome::Event(
+            shared_types::BuildProgressEvent::ServiceStarting { service },
         )),
-        "service_start_ok" => Some(EvtOutcome::Event(
-            shared_types::BuildProgressEvent::ServiceStartOk {
-                service: value.get("service")?.as_str()?.to_string(),
-            },
+        Ok(Evt::ServiceStartOk { service }) => Some(EvtOutcome::Event(
+            shared_types::BuildProgressEvent::ServiceStartOk { service },
         )),
-        "service_start_fail" => Some(EvtOutcome::Event(
-            shared_types::BuildProgressEvent::ServiceStartFail {
-                service: value.get("service")?.as_str()?.to_string(),
-                error: value.get("error")?.as_str()?.to_string(),
-            },
+        Ok(Evt::ServiceStartFail { service, error }) => Some(EvtOutcome::Event(
+            shared_types::BuildProgressEvent::ServiceStartFail { service, error },
         )),
-        "orchestration_done" => {
-            let failed = value
-                .get("failed")?
-                .as_array()?
-                .iter()
-                .map(|item| {
-                    let service = item.get("service")?.as_str()?.to_string();
-                    let error = item.get("error")?.as_str()?.to_string();
-                    Some((service, error))
-                })
-                .collect::<Option<Vec<_>>>()?;
-            Some(EvtOutcome::Done { failed })
+        Ok(Evt::OrchestrationDone { failed }) => Some(EvtOutcome::Done {
+            failed: failed
+                .into_iter()
+                .map(|item| (item.service, item.error))
+                .collect(),
+        }),
+        // 前向扩展: 契约外新事件, 旧消费端按能力忽略（debug 留痕, 不是故障）
+        Err(DecodeError::UnknownEvent { event }) => {
+            tracing::debug!(event = %event, "ignoring unknown app-cli EVT extension");
+            None
         }
-        _ => None,
+        // 契约内损坏: warn（与旧行为一致的可观测丢弃, 但现在可与未知扩展区分）
+        Err(
+            error @ (DecodeError::InvalidJson(_)
+            | DecodeError::MissingEventTag
+            | DecodeError::MalformedKnownEvent { .. }),
+        ) => {
+            tracing::warn!(error = ?error, line = %json, "dropping malformed app-cli EVT line");
+            None
+        }
     }
 }
 

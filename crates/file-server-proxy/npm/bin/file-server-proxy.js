@@ -31,6 +31,7 @@ async function main(argv) {
       scope.push(flag, value); continue;
     }
     if (flag === "--detached") { detached = true; continue; }
+    if (flag === "--native" || flag === "--no-native") { forwarded.push(flag); continue; }
     if (flag === "--all") throw new Error("--all cannot authorize stopping external TS instances; stop targets only this Rust owner");
     if (!["--port", "--rust-port", "--ts-port", "--policy"].includes(flag)) throw new Error(`unknown argument ${flag}`);
     const value = argv[++i];
@@ -53,14 +54,19 @@ async function main(argv) {
   const child = spawn(binary, args, { env, detached, windowsHide: true, stdio: detached ? "ignore" : "inherit" });
   let spawnError;
   child.on("error", error => { spawnError = error; });
-  // Native foreground exit/OS signal uses the same drain path. This wrapper's
-  // signal handlers request identity-checked control, never process.kill(PID).
+  // PX-01: stop targets the VERIFIED real instance published by the receipt
+  // (instance_id), never the wrapper's launch UUID. Before verification the
+  // fallback launch id only matches an owner this launch actually created;
+  // identity-checked control refuses everything else, so an early signal can
+  // never stop someone else's (reused) owner.
+  let verifiedInstance = null;
   const launchId = env.FILE_SERVER_PROXY_LAUNCH_ID;
-  const onSignal = () => { control(binary, "stop", scope, env, launchId).catch(error => { console.error(error.message); process.exitCode = 1; }); };
+  const onSignal = () => { control(binary, "stop", scope, env, verifiedInstance || launchId).catch(error => { console.error(error.message); process.exitCode = 1; }); };
   if (!detached) { process.on("SIGINT", onSignal); process.on("SIGTERM", onSignal); }
   try {
     const status = await waitRunning(binary, scope, env, child);
     if (spawnError) throw spawnError;
+    verifiedInstance = status.instance_id;
     console.log(JSON.stringify(status));
   } finally {
     if (detached) child.unref();

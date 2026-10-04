@@ -57,16 +57,16 @@ const MAX_LOG_EVENT_LINE_BYTES: usize = 16 * 1024;
 
 /// pnpm "缺 lockfile" 机器码——构建自愈的精确触发信号。
 const PNPM_NO_LOCKFILE_TOKEN: &str = "ERR_PNPM_NO_LOCKFILE";
-/// `run_command_to_log` 错误 Display 的输出尾部标记：token 只在此后匹配，
-/// 防止用户源码文本提前出现同词误报（对齐 classify.rs"机器码整 token 才参与
-/// 分类"的哲学）。
-const BUILD_OUTPUT_TAIL_MARKER: &str = "--- output tail (";
 
-/// 构建失败是否为 pnpm 缺 lockfile：错误 Display 按尾部标记切分，只在
-/// 输出尾段做整 token 等值匹配。
+/// 构建失败是否为 pnpm 缺 lockfile（UA-06: 机器分类走 [`AppError::CommandExecution`]
+/// 的 `output_tail` 结构化字段——另一处改动错误包裹/展示/截断格式不再影响
+/// 自愈触发; 整 token 等值匹配防止用户源码文本提前出现同词误报）。
 pub(super) fn is_pnpm_no_lockfile_failure(error: &AppError) -> bool {
-    let text = error.to_string();
-    let Some((_, tail)) = text.split_once(BUILD_OUTPUT_TAIL_MARKER) else {
+    let AppError::CommandExecution {
+        output_tail: Some(tail),
+        ..
+    } = error
+    else {
         return false;
     };
     tail.split_whitespace().any(|token| {
@@ -203,6 +203,10 @@ pub struct WorkspaceBuildArtifact {
 struct BuiltProject {
     path: String,
     artifact: PathBuf,
+    /// manifest `[build].artifact` 的完整相对路径（UA-03: 组包静态目录时必须
+    /// 保留全部层级——`dist/web` 只取 file_name 会丢成 `web`, 与 release lock
+    /// 及 app-cli 静态内容根 `{workspace}/{dir}/{artifact}` 不一致）。
+    artifact_rel: String,
 }
 
 /// workspace 多项目打包主流程。
@@ -368,7 +372,7 @@ pub async fn build_workspace_package_with_guard(
             Err(e) => {
                 // service_id 前缀：多服务 workspace 串行构建，快照 error 必须自明是
                 // 哪个服务挂的（源错误已嵌该服务构建输出的尾部日志）。
-                let wrapped = AppError::system(format!("{} build failed: {e}", proj.service_id()));
+                let wrapped = e.prefixed(&format!("{} build failed", proj.service_id()));
                 // cancel(kill 进程组)导致的失败不 emit（终态 Cancelled 由 cancel handler 置）；
                 // 否则 emit 服务级 BuildFail（任务级 Failed 由顶层 start_*_task 统一 emit）。
                 if let Some(p) = &progress
@@ -426,6 +430,7 @@ pub async fn build_workspace_package_with_guard(
         built.push(BuiltProject {
             path: proj.dir.clone(),
             artifact,
+            artifact_rel: proj.manifest.build.artifact.clone(),
         });
     }
 
@@ -1184,14 +1189,16 @@ mod no_lockfile_heal_tests {
         AppError::system(message.into())
     }
 
-    /// 检测矩阵:token 只在输出尾段计;用户源码文本提前出现同词不算;
-    /// 其他码/无尾段不算。
+    /// 检测矩阵: 机器分类只读结构化 `output_tail` 字段（UA-06）——整 token
+    /// 等值匹配; 相邻码/前缀相同的长 token/无结构化尾段（含 Display 正文里
+    /// 出现 token 的拼接文本）一律不命中。
     #[test]
     fn no_lockfile_detection_is_tail_scoped_and_token_exact() {
-        let tail = |body: &str| {
-            app_error(format!(
+        let tail = |body: &str| AppError::CommandExecution {
+            message: format!(
                 "command exited non-zero: exit status: 1\n--- output tail (dev-temp-1.log, last 3 lines) ---\n{body}"
-            ))
+            ),
+            output_tail: Some(body.to_string()),
         };
         assert!(is_pnpm_no_lockfile_failure(&tail(
             "ERR_PNPM_NO_LOCKFILE Cannot install with frozen-lockfile"
@@ -1211,11 +1218,18 @@ mod no_lockfile_heal_tests {
             !is_pnpm_no_lockfile_failure(&app_error(
                 "echo ERR_PNPM_NO_LOCKFILE && exit 1\n--- output tail (x.log, last 1 lines) ---\nplain failure"
             )),
-            "token 只出现在尾段标记之前(用户输出正文)不得命中"
+            "非结构化错误（token 只在 Display 正文）不得命中——分类不解析文本"
         );
         assert!(!is_pnpm_no_lockfile_failure(&app_error(
             "command timed out after 30s"
         )));
+        assert!(
+            !is_pnpm_no_lockfile_failure(&AppError::CommandExecution {
+                message: "command timed out".into(),
+                output_tail: None,
+            }),
+            "结构化但无尾段不得命中"
+        );
     }
 
     fn pnpm_on_path() -> bool {

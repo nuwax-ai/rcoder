@@ -53,10 +53,13 @@ pub async fn ensure_pnpm_install_config(project_dir: &Path) {
 
 // ── createPnpmNpmrc ─────────────────────────────────────────────────────────────
 
-/// 写 `.npmrc` 模板 (对齐 nuwax createPnpmNpmrc): 已最优 (package-import-method=copy
-/// 且 store-dir 匹配) 则跳过, 否则整体覆盖为模板内容。
+/// 写/维护 `.npmrc`（D1, FS-10）: **增量维护明确平台优化键**
+/// (`package-import-method=copy`、env 提供时的 `store-dir`), 已有文件的
+/// registry/scope/auth、未识别键、注释与行序原样保留; 文件不存在时才写平台
+/// 缺省模板（含 registry=npmmirror, 一次写入后续不覆盖）。
+/// TS v1.5.8 原版为整段覆盖（用户私有配置丢失）——数据保护不回退对齐,
+/// 行为差异单独归因（见 verification）。
 pub(crate) async fn create_pnpm_npmrc(project_dir: &Path) -> AppResult<()> {
-    let npmrc_path = project_dir.join(".npmrc");
     let store_dir = std::env::var("npm_config_store_dir")
         .ok()
         .filter(|s| !s.is_empty())
@@ -65,17 +68,72 @@ pub(crate) async fn create_pnpm_npmrc(project_dir: &Path) -> AppResult<()> {
                 .ok()
                 .filter(|s| !s.is_empty())
         });
-    // 已存在且最优 → 跳过 (对齐 nuwax: method=copy 且 store-dir 匹配)
-    if let Some(existing) = read_optional_text(&npmrc_path).await?
-        && npmrc_optimal(&existing, store_dir.as_deref())
-    {
-        return Ok(());
+    create_pnpm_npmrc_with_store(project_dir, store_dir.as_deref()).await
+}
+
+async fn create_pnpm_npmrc_with_store(
+    project_dir: &Path,
+    store_dir: Option<&str>,
+) -> AppResult<()> {
+    let npmrc_path = project_dir.join(".npmrc");
+    match read_optional_text(&npmrc_path).await? {
+        None => {
+            let content = render_npmrc_template(store_dir);
+            fs::write(&npmrc_path, content).await.map_err(|e| {
+                AppError::system(format!("write .npmrc {}: {e}", npmrc_path.display()))
+            })?;
+            Ok(())
+        }
+        Some(existing) => {
+            if npmrc_optimal(&existing, store_dir) {
+                return Ok(());
+            }
+            let updated = upsert_config_line(&existing, "package-import-method", "copy");
+            let updated = match store_dir {
+                Some(dir) => upsert_config_line(&updated, "store-dir", dir),
+                None => updated,
+            };
+            fs::write(&npmrc_path, updated).await.map_err(|e| {
+                AppError::system(format!("write .npmrc {}: {e}", npmrc_path.display()))
+            })?;
+            Ok(())
+        }
     }
-    let content = render_npmrc_template(store_dir.as_deref());
-    fs::write(&npmrc_path, content)
-        .await
-        .map_err(|e| AppError::system(format!("write .npmrc {}: {e}", npmrc_path.display())))?;
-    Ok(())
+}
+
+/// 行级 upsert: 首个非注释 `key=` 行替换为 `key=value`; 无则追加到末尾。
+/// 其余行（注释/顺序/未识别键）原样保留。
+fn upsert_config_line(content: &str, key: &str, value: &str) -> String {
+    let target = format!("{key}={value}");
+    let mut replaced = false;
+    let lines: Vec<String> = content
+        .split('\n')
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if !replaced
+                && !trimmed.starts_with('#')
+                && trimmed
+                    .split_once('=')
+                    .is_some_and(|(candidate, _)| candidate.trim() == key)
+            {
+                replaced = true;
+                target.clone()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    if !replaced {
+        let mut joined = lines.join("\n");
+        if !joined.is_empty() && !joined.ends_with('\n') {
+            joined.push('\n');
+        }
+        joined.push_str(&target);
+        joined.push('\n');
+        joined
+    } else {
+        lines.join("\n")
+    }
 }
 
 /// 渲染 .npmrc 模板 (对齐 nuwax; 注释含生成时间 + 文件系统类型)。
@@ -169,24 +227,74 @@ async fn sanitize_package_json_built_deps(project_dir: &Path) -> AppResult<()> {
     Ok(())
 }
 
-/// 从 pnpm-workspace.yaml 行级移除顶层互斥键及其块值。
-/// 匹配顶层 `key:\s*(.*)`；值为空 / `|` / `>` 时连同其后更深缩进行一并删除。
-/// pnpm 的这些配置只允许位于文档顶层，限制缩进可避免误删嵌套对象中的同名业务键。
+/// 清理 pnpm-workspace.yaml 顶层互斥键（FS-07: 结构层判定 + 解析器验证）:
+/// 1. 原文必须能被 YAML 解析——非法源**不写回**（保留原文件, 只记录）;
+/// 2. 结构层确认顶层存在目标键才动手（quoted key / flow 值 / anchor 一致覆盖）;
+/// 3. 优先采用行级删除结果（保留注释与格式）, 但必须通过解析器语义等价验证,
+///    否则回退为结构化重写——indentless sequence、行内注释等行级算法处理不了
+///    的形态不再留下孤立列表项。
 async fn sanitize_pnpm_workspace_built_deps(project_dir: &Path) -> AppResult<()> {
     let yaml_path = project_dir.join("pnpm-workspace.yaml");
     let Some(content) = read_optional_text(&yaml_path).await? else {
         return Ok(());
     };
+    let Ok(original) = serde_yaml::from_str::<serde_yaml::Value>(&content) else {
+        tracing::warn!(
+            path = %yaml_path.display(),
+            "pnpm-workspace.yaml is not valid YAML; skip sanitize (source untouched)"
+        );
+        return Ok(());
+    };
+    // 结构层: 顶层 mapping 中移除目标键, 得到期望语义与"是否存在目标键"判定。
+    let Some(expected) = mapping_without_built_deps(&original) else {
+        return Ok(()); // 顶层无目标键（含非 mapping 文档）→ no-op
+    };
+    // 行级删除优先（保注释）; 结果必须解析成功且与期望语义等价才采用。
+    let adopted = {
+        let line_removed = remove_built_deps_lines(&content);
+        match serde_yaml::from_str::<serde_yaml::Value>(&line_removed) {
+            Ok(parsed) if parsed == expected => line_removed,
+            _ => serde_yaml::to_string(&expected)
+                .map_err(|e| AppError::system(format!("serialize pnpm-workspace.yaml: {e}")))?,
+        }
+    };
+    fs::write(&yaml_path, adopted).await.map_err(|e| {
+        AppError::system(format!(
+            "write pnpm-workspace.yaml {}: {e}",
+            yaml_path.display()
+        ))
+    })?;
+    tracing::info!(path = %yaml_path.display(), "removed conflicting pnpm built-deps from pnpm-workspace.yaml");
+    Ok(())
+}
+
+/// 顶层 mapping 拷贝并移除目标键; 顶层无目标键或文档非 mapping → None。
+fn mapping_without_built_deps(original: &serde_yaml::Value) -> Option<serde_yaml::Value> {
+    let mapping = original.as_mapping()?;
+    let targets: Vec<serde_yaml::Value> = BUILT_DEPS_PACKAGE_JSON_KEYS
+        .iter()
+        .map(|key| serde_yaml::Value::String((*key).to_string()))
+        .collect();
+    if !targets.iter().any(|key| mapping.contains_key(key)) {
+        return None;
+    }
+    let mut stripped = mapping.clone();
+    for key in targets {
+        stripped.remove(&key);
+    }
+    Some(serde_yaml::Value::Mapping(stripped))
+}
+
+/// 行级删除顶层互斥键及其块值（保注释的尽力路径; 正确性由上层解析器验证兜底）。
+fn remove_built_deps_lines(content: &str) -> String {
     let mut result: Vec<&str> = Vec::new();
     let mut skip_until_indent: Option<usize> = None;
-    let mut removed: Vec<&str> = Vec::new();
     for line in content.split('\n') {
         let trimmed = line.trim_start();
         let indent = line.len() - trimmed.len();
         if indent == 0
             && let Some(key) = match_built_deps_key(trimmed)
         {
-            removed.push(key);
             let inline = trimmed[key.len() + 1..].trim();
             if inline.is_empty() || inline == "|" || inline == ">" {
                 skip_until_indent = Some(indent);
@@ -201,19 +309,7 @@ async fn sanitize_pnpm_workspace_built_deps(project_dir: &Path) -> AppResult<()>
         }
         result.push(line);
     }
-    if removed.is_empty() {
-        return Ok(());
-    }
-    fs::write(&yaml_path, result.join("\n"))
-        .await
-        .map_err(|e| {
-            AppError::system(format!(
-                "write pnpm-workspace.yaml {}: {e}",
-                yaml_path.display()
-            ))
-        })?;
-    tracing::info!(path = %yaml_path.display(), ?removed, "removed conflicting pnpm built-deps from pnpm-workspace.yaml");
-    Ok(())
+    result.join("\n")
 }
 
 /// 行首是否匹配某 built-deps 键 (形如 `key:`), 返回该键。
@@ -342,6 +438,86 @@ fn cst_datetime_string() -> String {
 mod tests {
     use super::*;
 
+    /// FS-10 反例 (D1): 已有 .npmrc 的 registry/scope/auth 及未识别键必须原样
+    /// 保留, 只增量维护平台优化键。修复前整段模板覆盖把私有配置全部丢失
+    /// （TS v1.5.8 原版同病, 数据保护不回退对齐——差异单独归因）。
+    #[tokio::test]
+    async fn existing_user_npmrc_settings_survive_optimization() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let npmrc = dir.path().join(".npmrc");
+        let original = "# my company registry\n\
+             registry=https://npm.company.internal/\n\
+             @corp:registry=https://npm.company.internal/\n\
+             //npm.company.internal/:_authToken=secret-token\n\
+             fund=false\n\
+             package-import-method=hardlink\n";
+        fs::write(&npmrc, original).await.expect("write user npmrc");
+
+        create_pnpm_npmrc_with_store(dir.path(), None)
+            .await
+            .expect("optimize npmrc");
+
+        let updated = fs::read_to_string(&npmrc).await.expect("read back");
+        assert!(
+            updated.contains("registry=https://npm.company.internal/"),
+            "user registry must survive: {updated}"
+        );
+        assert!(
+            updated.contains("@corp:registry=https://npm.company.internal/"),
+            "scoped registry must survive: {updated}"
+        );
+        assert!(
+            updated.contains("//npm.company.internal/:_authToken=secret-token"),
+            "auth token must survive: {updated}"
+        );
+        assert!(
+            updated.contains("fund=false"),
+            "unmanaged keys must survive"
+        );
+        assert!(
+            updated.contains("# my company registry"),
+            "user comments must survive"
+        );
+        assert!(
+            updated.contains("package-import-method=copy"),
+            "platform optimization key must be enforced"
+        );
+        assert!(
+            !updated.contains("registry=https://registry.npmmirror.com"),
+            "platform default registry must not override a user value"
+        );
+    }
+
+    /// FS-10: store-dir 只更新自身行; 用户其余内容不动。
+    #[tokio::test]
+    async fn store_dir_from_env_updates_single_line_only() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let npmrc = dir.path().join(".npmrc");
+        fs::write(
+            &npmrc,
+            "registry=https://npm.company.internal/\npackage-import-method=copy\nstore-dir=/old-store\n",
+        )
+        .await
+        .expect("write");
+
+        create_pnpm_npmrc_with_store(dir.path(), Some("/new-store"))
+            .await
+            .expect("optimize");
+
+        let updated = fs::read_to_string(&npmrc).await.expect("read back");
+        assert!(updated.contains("store-dir=/new-store"));
+        assert!(!updated.contains("/old-store"));
+        assert!(
+            updated.contains("registry=https://npm.company.internal/"),
+            "registry untouched: {updated}"
+        );
+        assert_eq!(
+            updated.lines().count(),
+            3,
+            "no extra lines beyond the single-key update: {updated}"
+        );
+    }
+
     #[test]
     fn package_json_round_trip_preserves_insertion_order() {
         // serde_json preserve_order 特性的行为锁：sanitize_pnpm_built_deps 对
@@ -440,6 +616,118 @@ mod tests {
             "dangerously-allow-all-builds"
         ));
         assert!(!contains_config_key("registry=https://x\n", "production"));
+    }
+
+    /// FS-07 反例: indentless sequence 与行内注释形态的顶层键, 行级删除后
+    /// 必须仍是 pnpm 可解析的合法 YAML。修复前留下孤立列表项。
+    #[tokio::test]
+    async fn workspace_sanitize_handles_indentless_and_inline_comment() {
+        for (label, content) in [
+            (
+                "indentless sequence",
+                "packages:\n  - apps/*\nonlyBuiltDependencies:\n- esbuild\n",
+            ),
+            (
+                "inline comment",
+                "packages:\n  - apps/*\nonlyBuiltDependencies: # keep list\n  - esbuild\n",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("fixture");
+            let path = dir.path().join("pnpm-workspace.yaml");
+            fs::write(&path, content).await.expect("write");
+
+            sanitize_pnpm_workspace_built_deps(dir.path())
+                .await
+                .expect("sanitize");
+
+            let output = fs::read_to_string(&path).await.expect("read");
+            let parsed: serde_yaml::Value = serde_yaml::from_str(&output).unwrap_or_else(|error| {
+                panic!("{label}: result must stay valid YAML, got {error}\n{output}")
+            });
+            let keys = parsed.as_mapping().expect("top-level mapping");
+            assert!(
+                !keys.contains_key(serde_yaml::Value::String("onlyBuiltDependencies".into())),
+                "{label}: target key must be gone:\n{output}"
+            );
+            assert!(
+                !output.contains("- esbuild"),
+                "{label}: list items must not be orphaned:\n{output}"
+            );
+            assert!(
+                keys.contains_key(serde_yaml::Value::String("packages".into())),
+                "{label}: unrelated keys must survive:\n{output}"
+            );
+        }
+    }
+
+    /// FS-07: quoted key 与 flow 值形态的目标键也要被删除（结构层判定）。
+    #[tokio::test]
+    async fn workspace_sanitize_handles_quoted_and_flow_keys() {
+        for (label, content) in [
+            (
+                "quoted key",
+                "packages:\n  - apps/*\n\"onlyBuiltDependencies\":\n  - esbuild\n",
+            ),
+            (
+                "flow value",
+                "packages:\n  - apps/*\nneverBuiltDependencies: [sharp, esbuild]\n",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("fixture");
+            let path = dir.path().join("pnpm-workspace.yaml");
+            fs::write(&path, content).await.expect("write");
+
+            sanitize_pnpm_workspace_built_deps(dir.path())
+                .await
+                .expect("sanitize");
+
+            let output = fs::read_to_string(&path).await.expect("read");
+            let parsed: serde_yaml::Value = serde_yaml::from_str(&output)
+                .unwrap_or_else(|error| panic!("{label}: valid YAML, got {error}"));
+            let keys = parsed.as_mapping().expect("mapping");
+            for key in BUILT_DEPS_PACKAGE_JSON_KEYS {
+                assert!(
+                    !keys.contains_key(serde_yaml::Value::String(key.to_string())),
+                    "{label}: {key} must be gone:\n{output}"
+                );
+            }
+            assert!(output.contains("packages"), "{label}: unrelated intact");
+        }
+    }
+
+    /// FS-07: 标准缩进块删除保留注释（行级路径优先）; 非法源不写回。
+    #[tokio::test]
+    async fn workspace_sanitize_preserves_comments_and_never_rewrites_invalid_source() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let path = dir.path().join("pnpm-workspace.yaml");
+        fs::write(
+            &path,
+            "# workspace comment\npackages:\n  - apps/*\n# keep this\nignoredBuiltDependencies:\n  - sharp\n",
+        )
+        .await
+        .expect("write");
+        sanitize_pnpm_workspace_built_deps(dir.path())
+            .await
+            .expect("sanitize");
+        let output = fs::read_to_string(&path).await.expect("read");
+        assert!(output.contains("# workspace comment"), "{output}");
+        assert!(output.contains("# keep this"), "{output}");
+        assert!(!output.contains("ignoredBuiltDependencies"), "{output}");
+
+        let invalid = tempfile::tempdir().expect("fixture");
+        let invalid_path = invalid.path().join("pnpm-workspace.yaml");
+        let broken = "packages: [unclosed\n  - : :\nnot: valid: yaml:\n";
+        fs::write(&invalid_path, broken)
+            .await
+            .expect("write broken");
+        sanitize_pnpm_workspace_built_deps(invalid.path())
+            .await
+            .expect("sanitize skips invalid source");
+        assert_eq!(
+            fs::read_to_string(&invalid_path).await.expect("untouched"),
+            broken,
+            "invalid source must not be rewritten"
+        );
     }
 
     #[tokio::test]

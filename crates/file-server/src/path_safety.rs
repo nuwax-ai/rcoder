@@ -145,10 +145,94 @@ async fn resolve_existing_ancestor(path: &Path) -> AppResult<PathBuf> {
     }
 }
 
+/// 宿主相对路径 → wire 名（FS-08 唯一转换点）：仅 Windows 把 `\` 归一为 `/`
+/// （宿主路径分隔符）; POSIX 下反斜杠是合法文件名字符, **原样保留**——无条件
+/// 替换曾把 Linux 的 `a\b.txt` 回传成 `a/b.txt`（URL 指向错误路径、与真实
+/// `a/b.txt` 归档同名碰撞）。
+pub fn host_relative_to_wire(relative: &str) -> String {
+    if cfg!(windows) {
+        relative.replace('\\', "/")
+    } else {
+        relative.to_string()
+    }
+}
+
+/// no-follow leaf 写入（Unix `O_NOFOLLOW`）：目标已是符号链接时得到 ELOOP，
+/// 不会跟随写出所选根。供 Git 物化与 UserApp 上传等落盘路径共用。
+pub fn write_file_nofollow_blocking(dest: &Path, data: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode as RawMode, OFlags};
+        use std::io::Write as _;
+        let fd = rustix::fs::openat(
+            rustix::fs::CWD,
+            dest,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            RawMode::RUSR
+                | RawMode::WUSR
+                | RawMode::RGRP
+                | RawMode::WGRP
+                | RawMode::ROTH
+                | RawMode::WOTH,
+        )?;
+        let mut file = std::fs::File::from(fd);
+        file.write_all(data)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(dest, data)
+    }
+}
+
+/// 流式 no-follow 拷贝（`src` 已落盘文件 → `dest` leaf）：dest 为符号链接时
+/// 失败而非跟随。Unix 用 `O_NOFOLLOW`; 非 Unix 退化为普通拷贝（词法与祖先
+/// 预检仍生效, 如实声明）。
+pub fn copy_file_nofollow_blocking(src: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode as RawMode, OFlags};
+        let mut input = std::fs::File::open(src)?;
+        let fd = rustix::fs::openat(
+            rustix::fs::CWD,
+            dest,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            RawMode::RUSR
+                | RawMode::WUSR
+                | RawMode::RGRP
+                | RawMode::WGRP
+                | RawMode::ROTH
+                | RawMode::WOTH,
+        )?;
+        let mut output = std::fs::File::from(fd);
+        std::io::copy(&mut input, &mut output)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::copy(src, dest).map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// FS-08: 宿主→wire 转换的单一语义——POSIX 保留反斜杠文件名, 仅 Windows
+    /// 归一宿主分隔符。
+    #[test]
+    fn host_relative_to_wire_preserves_posix_backslash() {
+        #[cfg(unix)]
+        {
+            assert_eq!(host_relative_to_wire(r"a\b.txt"), r"a\b.txt");
+            assert_eq!(host_relative_to_wire("sub/a\\b.txt"), "sub/a\\b.txt");
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(host_relative_to_wire(r"a\b.txt"), "a/b.txt");
+        }
+    }
 
     #[test]
     fn ensure_within_accepts_nested() {

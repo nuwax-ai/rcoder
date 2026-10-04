@@ -438,11 +438,17 @@ async fn append_run_log_tail(err: AppError, temp_log: &Path) -> AppError {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("temp.log");
-    AppError::system(format!(
-        "{err}\n--- output tail ({name}, last {} lines) ---\n{}",
+    // UA-06: tail 同时进入结构化字段（机器分类用）与拼接文本（人读/SSE 展示
+    // 不变）; 消费方（pnpm 自愈等）从 output_tail 字段分类, 不再解析 Display。
+    let tail = lines.join("\n");
+    let message = format!(
+        "{err}\n--- output tail ({name}, last {} lines) ---\n{tail}",
         lines.len(),
-        lines.join("\n")
-    ))
+    );
+    AppError::CommandExecution {
+        message,
+        output_tail: Some(tail),
+    }
 }
 
 /// 等待 stdout/stderr 日志管道 task 结束,确保 child 退出后尾部日志写完(#17)。

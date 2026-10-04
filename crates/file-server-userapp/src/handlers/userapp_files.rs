@@ -8,9 +8,14 @@
 
 use axum::extract::State;
 use garde::Validate;
-use serde_json::{Value, json};
 
 use crate::UserAppState;
+use crate::models::response::{
+    UserappBatchUploadItem, UserappFileListReply, UserappFileMetaEntry, UserappFileMetaReply,
+    UserappFilesUpdateReply, UserappGenerateFileReply, UserappImportProjectReply,
+    UserappResolveFileReply, UserappSearchFilesReply, UserappUploadFileReply,
+    UserappUploadFilesReply,
+};
 use crate::models::{
     UserappFileEntry, UserappFileListQuery, UserappFileMetaBody, UserappFilesUpdateBody,
     UserappGenerateFileBody, UserappImportProjectForm, UserappResolveFileQuery,
@@ -50,7 +55,7 @@ use file_server::workspace::resolve_userapp_dev;
 pub(crate) async fn get_file_list(
     State(state): State<UserAppState>,
     Query(q): Query<UserappFileListQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<UserappFileListReply>, AppError> {
     q.validate().map_err(file_server::error::from_garde)?;
     let path = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.fs.config)?;
     let result = get_file_list_core(
@@ -69,14 +74,14 @@ pub(crate) async fn get_file_list(
     .await?;
     let mut files: Vec<UserappFileEntry> = result.files.into_iter().map(Into::into).collect();
     append_proxy_url_suffix(&mut files, q.custom_target_dir.as_deref());
-    Ok(Json(json!({
-        "success": true,
-        "files": files,
-        "recursive": result.recursive,
-        "depth": result.depth,
-        "type": result.file_type.as_str(),
-        "limit": result.limit,
-    })))
+    Ok(Json(UserappFileListReply {
+        success: true,
+        files,
+        recursive: result.recursive,
+        depth: result.depth,
+        file_type: result.file_type.as_str().to_string(),
+        limit: result.limit,
+    }))
 }
 
 // ── resolve-file ────────────────────────────────────────────────────────────────
@@ -98,12 +103,17 @@ pub(crate) async fn get_file_list(
 pub(crate) async fn resolve_file(
     State(state): State<UserAppState>,
     Query(q): Query<UserappResolveFileQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<UserappResolveFileReply>, AppError> {
     q.validate().map_err(file_server::error::from_garde)?;
     let path = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.fs.config)?;
     let mut r = match resolve_file_core(path, q.file_path.trim(), q.proxy_path.as_deref()).await? {
         Some(r) => r,
-        None => return Ok(Json(json!({ "success": true, "exists": false }))),
+        None => {
+            return Ok(Json(UserappResolveFileReply::Missing {
+                success: true,
+                exists: false,
+            }));
+        }
     };
     // file_proxy_url 追加 ?custom_target_dir=（语义同 computer 域 customTargetDir 后缀）
     if let (Some(ct), Some(url)) = (
@@ -113,12 +123,12 @@ pub(crate) async fn resolve_file(
         url.push_str("?custom_target_dir=");
         url.push_str(&code_service::encode_uri_component(ct));
     }
-    Ok(Json(json!({
-        "success": true,
-        "exists": true,
-        "name": r.name,
-        "file_proxy_url": r.file_proxy_url,
-    })))
+    Ok(Json(UserappResolveFileReply::Found {
+        success: true,
+        exists: true,
+        name: r.name,
+        file_proxy_url: r.file_proxy_url,
+    }))
 }
 
 // ── search-files ────────────────────────────────────────────────────────────────
@@ -140,7 +150,7 @@ pub(crate) async fn resolve_file(
 pub(crate) async fn search_files(
     State(state): State<UserAppState>,
     Query(q): Query<UserappSearchFilesQuery>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<UserappSearchFilesReply>, AppError> {
     q.validate().map_err(file_server::error::from_garde)?;
     let path = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.fs.config)?;
     let r = search_files_core(
@@ -160,12 +170,12 @@ pub(crate) async fn search_files(
     .await?;
     let mut files: Vec<UserappFileEntry> = r.files.into_iter().map(Into::into).collect();
     append_proxy_url_suffix(&mut files, q.custom_target_dir.as_deref());
-    Ok(Json(json!({
-        "success": true,
-        "files": files,
-        "truncated": r.truncated,
-        "visited": r.visited,
-    })))
+    Ok(Json(UserappSearchFilesReply {
+        success: true,
+        files,
+        truncated: r.truncated,
+        visited: r.visited,
+    }))
 }
 
 // ── get-file-meta ───────────────────────────────────────────────────────────────
@@ -190,7 +200,7 @@ pub(crate) async fn search_files(
 pub(crate) async fn get_file_meta(
     State(state): State<UserAppState>,
     Json(body): Json<UserappFileMetaBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<UserappFileMetaReply>, AppError> {
     body.validate().map_err(file_server::error::from_garde)?;
     // 非空与上限联合校验 (对齐 computer 域同款位置与消息)
     if body.file_paths.is_empty() {
@@ -209,27 +219,25 @@ pub(crate) async fn get_file_meta(
         &state.fs.config,
     )?;
     let metas = get_file_meta_core(&state.fs, &path, &body.file_paths).await?;
-    let metas: Vec<Value> = metas
+    let metas: Vec<UserappFileMetaEntry> = metas
         .iter()
-        .map(|m| {
-            let mut obj = json!({
-                "path": m.path,
-                "is_dir": m.is_dir,
-                "is_link": m.is_link,
-                "size": m.size,
-                "mtime_ms": m.mtime_ms,
-                "extension": m.extension,
-                "mime_type": m.mime_type,
-                "link_target": m.link_target,
-                "child_count": m.child_count,
-            });
-            if let Some(error) = &m.error {
-                obj["error"] = json!(error);
-            }
-            obj
+        .map(|m| UserappFileMetaEntry {
+            path: m.path.clone(),
+            is_dir: m.is_dir,
+            is_link: m.is_link,
+            size: m.size,
+            mtime_ms: m.mtime_ms,
+            extension: m.extension.clone(),
+            mime_type: m.mime_type.clone(),
+            link_target: m.link_target.clone(),
+            child_count: m.child_count,
+            error: m.error.clone(),
         })
         .collect();
-    Ok(Json(json!({ "success": true, "metas": metas })))
+    Ok(Json(UserappFileMetaReply {
+        success: true,
+        metas,
+    }))
 }
 
 // ── files-update ────────────────────────────────────────────────────────────────
@@ -245,7 +253,7 @@ pub(crate) async fn get_file_meta(
 pub(crate) async fn files_update(
     State(state): State<UserAppState>,
     Json(body): Json<UserappFilesUpdateBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<UserappFilesUpdateReply>, AppError> {
     let _workspace_activity = state
         .build_tasks
         .workspace_activity(&body.app_id)
@@ -259,12 +267,12 @@ pub(crate) async fn files_update(
     )?;
     let files: Vec<_> = body.files.into_iter().map(Into::into).collect();
     let count = files_update_core(&path, files).await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "User files updated successfully",
-        "app_id": body.app_id,
-        "files_count": count,
-    })))
+    Ok(Json(UserappFilesUpdateReply {
+        success: true,
+        message: "User files updated successfully".into(),
+        app_id: body.app_id,
+        files_count: count,
+    }))
 }
 
 // ── upload-file / upload-files ──────────────────────────────────────────────────
@@ -278,7 +286,7 @@ pub(crate) async fn files_update(
 pub(crate) async fn upload_file(
     State(state): State<UserAppState>,
     mut multipart: Multipart,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<UserappUploadFileReply>, AppError> {
     let mut app_id = None;
     let mut user_id = None;
     let mut file_path = None;
@@ -320,11 +328,11 @@ pub(crate) async fn upload_file(
     tracing::debug!(app_id = %app_id, user_id = %user_id, "userapp upload-file");
     let ws = resolve_userapp_dev(&app_id, custom_target_dir.as_deref(), &state.fs.config)?;
     let r = upload_file_core(&ws, &file_path, data).await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "File uploaded successfully",
-        "file_size": r.file_size,
-    })))
+    Ok(Json(UserappUploadFileReply {
+        success: true,
+        message: "File uploaded successfully".into(),
+        file_size: r.file_size,
+    }))
 }
 
 /// 多文件上传（单文件错误隔离）
@@ -335,7 +343,7 @@ pub(crate) async fn upload_file(
 pub(crate) async fn upload_files(
     State(state): State<UserAppState>,
     mut multipart: Multipart,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<UserappUploadFilesReply>, AppError> {
     let mut app_id = None;
     let mut user_id = None;
     let mut custom_target_dir = None;
@@ -380,7 +388,7 @@ pub(crate) async fn upload_files(
     }
     let ws = resolve_userapp_dev(&app_id, custom_target_dir.as_deref(), &state.fs.config)?;
     let r = upload_files_core(&ws, &file_paths, &files_vec).await?;
-    let results: Vec<Value> = r
+    let results: Vec<UserappBatchUploadItem> = r
         .results
         .into_iter()
         .map(|item| match item {
@@ -388,33 +396,33 @@ pub(crate) async fn upload_files(
                 file_path,
                 original,
                 file_size,
-            } => json!({
-                "success": true,
-                "file_path": file_path,
-                "originalname": original,
-                "message": "File uploaded successfully",
-                "file_size": file_size,
-            }),
+            } => UserappBatchUploadItem::Ok {
+                success: true,
+                file_path,
+                originalname: original,
+                message: "File uploaded successfully".into(),
+                file_size,
+            },
             BatchUploadItem::Err {
                 file_path,
                 original,
                 error,
-            } => json!({
-                "success": false,
-                "file_path": file_path,
-                "originalname": original,
-                "error": error,
-            }),
+            } => UserappBatchUploadItem::Err {
+                success: false,
+                file_path,
+                originalname: original,
+                error,
+            },
         })
         .collect();
-    Ok(Json(json!({
-        "success": true,
-        "message": "Batch upload completed",
-        "total_count": r.total,
-        "success_count": r.success_count,
-        "fail_count": r.total - r.success_count,
-        "results": results,
-    })))
+    Ok(Json(UserappUploadFilesReply {
+        success: true,
+        message: "Batch upload completed".into(),
+        total_count: r.total,
+        success_count: r.success_count,
+        fail_count: r.total - r.success_count,
+        results,
+    }))
 }
 
 // ── generate-file ───────────────────────────────────────────────────────────────
@@ -434,7 +442,7 @@ pub(crate) async fn upload_files(
 pub(crate) async fn generate_file(
     State(state): State<UserAppState>,
     Json(body): Json<UserappGenerateFileBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<UserappGenerateFileReply>, AppError> {
     body.validate().map_err(file_server::error::from_garde)?;
     let _workspace_activity = state
         .build_tasks
@@ -448,12 +456,12 @@ pub(crate) async fn generate_file(
         &state.fs.config,
     )?;
     let r = generate_file_core(ws, body.file_name.trim(), body.content.unwrap_or_default()).await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "File generated successfully",
-        "file_name": r.file_name,
-        "file_size": r.file_size,
-    })))
+    Ok(Json(UserappGenerateFileReply {
+        success: true,
+        message: "File generated successfully".into(),
+        file_name: r.file_name,
+        file_size: r.file_size,
+    }))
 }
 
 // ── import-project ──────────────────────────────────────────────────────────────
@@ -466,7 +474,7 @@ pub(crate) async fn generate_file(
 pub(crate) async fn import_project(
     State(state): State<UserAppState>,
     mut multipart: Multipart,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<UserappImportProjectReply>, AppError> {
     let mut app_id = None;
     let mut user_id = None;
     let mut custom_target_dir = None;
@@ -507,13 +515,13 @@ pub(crate) async fn import_project(
     validate_zip_ext(file_name.as_deref())?;
     let ws = resolve_userapp_dev(&app_id, custom_target_dir.as_deref(), &state.fs.config)?;
     let target = import_project_core(ws, data).await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Project imported successfully",
-        "user_id": user_id,
-        "app_id": app_id,
-        "target_dir": target,
-    })))
+    Ok(Json(UserappImportProjectReply {
+        success: true,
+        message: "Project imported successfully".into(),
+        user_id,
+        app_id,
+        target_dir: target,
+    }))
 }
 
 /// 预览 URL 追加 custom_target_dir 后缀（list/search 条目统一处理）。
@@ -591,10 +599,16 @@ pub(crate) mod tests_support {
 mod tests {
     use super::*;
     use axum::extract::Path;
+    use serde_json::{Value, json};
 
     use crate::extract::AppJson;
 
     use super::tests_support::make_state;
+
+    /// typed 回复 → wire JSON（测试断言锁 wire 形态, 与序列化产物一致）。
+    fn wire<T: serde::Serialize>(reply: &T) -> Value {
+        serde_json::to_value(reply).expect("serialize reply")
+    }
 
     /// 经公共 Writer API 构造 TemporaryFile (与 multipart file_field 同路径), 内容为单层 zip。
     async fn make_temp_zip(entries: &[(&str, &str)], parent: &std::path::Path) -> TemporaryFile {
@@ -657,15 +671,16 @@ mod tests {
         let res = get_file_list(State(state.clone()), q)
             .await
             .expect("list ok");
-        let names: Vec<&str> = res.0["files"]
+        let payload = wire(&res.0);
+        let names: Vec<&str> = payload["files"]
             .as_array()
             .unwrap()
             .iter()
             .map(|f| f["name"].as_str().unwrap())
             .collect();
         assert!(names.contains(&"demo-app"), "names={names:?}");
-        assert_eq!(res.0["type"], "dir");
-        assert_eq!(res.0["limit"], 1);
+        assert_eq!(wire(&res.0)["type"], "dir");
+        assert_eq!(wire(&res.0)["limit"], 1);
 
         // 3. detect_project ({app_id}/{app_stage} 新形态) 应在开发卷里找到项目
         let reply = super::super::userapp::detect_project(
@@ -715,8 +730,8 @@ mod tests {
         )
         .await
         .expect("resolve ok");
-        assert_eq!(res.0["exists"], serde_json::json!(true));
-        assert_eq!(res.0["file_proxy_url"], "/proxy/src/a.txt");
+        assert_eq!(wire(&res.0)["exists"], serde_json::json!(true));
+        assert_eq!(wire(&res.0)["file_proxy_url"], "/proxy/src/a.txt");
     }
 
     /// files-update (Json 壳) 写入开发卷 + 响应回显 appId。
@@ -740,8 +755,8 @@ mod tests {
         )
         .await
         .expect("update ok");
-        assert_eq!(res.0["success"], serde_json::json!(true));
-        assert_eq!(res.0["app_id"], "app-3");
+        assert_eq!(wire(&res.0)["success"], serde_json::json!(true));
+        assert_eq!(wire(&res.0)["app_id"], "app-3");
         assert_eq!(
             std::fs::read(tmp.path().join("app-3").join("pkg.json")).unwrap(),
             b"{}"
@@ -863,7 +878,7 @@ mod tests {
         )
         .await
         .expect("meta ok");
-        let val = res.0;
+        let val = wire(&res.0);
         assert_eq!(val["success"], json!(true));
         // 常规文件: snake 键 is_dir/size/extension/mime_type, 无 error 键
         let f = snake_meta_of(&val, "a.txt");
@@ -902,7 +917,8 @@ mod tests {
         )
         .await
         .expect("meta ok");
-        let l = snake_meta_of(&res.0, "link");
+        let payload = wire(&res.0);
+        let l = snake_meta_of(&payload, "link");
         assert_eq!(l["is_link"], json!(true));
         assert_eq!(l["link_target"], json!("a.txt"));
     }

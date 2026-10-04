@@ -10,15 +10,28 @@ async function control(binary, action, args = [], env = process.env, expectedIns
   });
   return JSON.parse(stdout);
 }
+// PX-01: readiness is tied to the REAL supervisor/owner identity published by
+// the status receipt (instance_id), never to this wrapper's launch UUID. The
+// launch id is only a request correlation: when the receipt carries it this
+// launch created the owner; when a different owner is already Running the
+// start is a verified reuse and the wrapper child exiting is NOT a readiness
+// failure (and must never stop the reused owner).
 async function waitRunning(binary, args, env, child, timeoutMs = 15000) {
+  const launchId = env.FILE_SERVER_PROXY_LAUNCH_ID;
   const deadline = Date.now() + timeoutMs;
   let error;
   while (Date.now() < deadline) {
-    if (child.exitCode !== null || child.signalCode !== null) throw new Error("native owner exited before readiness");
     try {
-      const status = await control(binary, "status", args, env, env.FILE_SERVER_PROXY_LAUNCH_ID);
-      if (status.phase === "Running" && status.instance_id === env.FILE_SERVER_PROXY_LAUNCH_ID) return status;
+      const status = await control(binary, "status", args, env);
+      if (status.phase === "Running") {
+        if (launchId && status.launch_request_id === launchId) {
+          return { ...status, launch: "created" };
+        }
+        return { ...status, launch: "reused" };
+      }
     } catch (cause) { error = cause; }
+    // The wrapper child may exit right after printing a reuse status; keep
+    // polling — the real owner runs under the supervisor, not under this child.
     await new Promise(resolve => setTimeout(resolve, 100));
   }
   throw new Error(`native owner readiness unknown; receipt preserved: ${error?.message || "deadline"}`);

@@ -1,5 +1,9 @@
 mod agent;
+pub mod app_cli_evt;
 pub mod archive_links;
+pub use app_cli_evt::{
+    APP_CLI_EVT_PREFIX, AppCliEvtDecodeError, AppCliFailedService, AppCliOrchestrationEvent,
+};
 mod container;
 mod model;
 mod runtime_config;

@@ -391,13 +391,14 @@ pub fn discard_files(repo: &Repository, files: &[String]) -> AppResult<DiscardBu
         {
             Some(entry) => {
                 // tracked (modified/deleted): 恢复 worktree 到 HEAD 内容 + 同步 index
-                let blob = repo
-                    .find_blob(entry.id())
-                    .map_err(|e| map_git_err(e, "git find_blob"))?;
-                if let Some(p) = abs.parent() {
-                    std::fs::create_dir_all(p)?;
-                }
-                std::fs::write(&abs, &blob.data)?;
+                // （共享安全物化器: 界内目录链 + leaf 不跟随 + mode 如实恢复, FS-03/06）
+                let planned = super::materialize::plan_tree_entry(
+                    workdir,
+                    Path::new(f),
+                    entry.mode(),
+                    entry.id(),
+                )?;
+                super::materialize::materialize_planned(repo, workdir, &planned)?;
                 stage_path(repo, f)?;
                 buckets.tracked_files.push(f.clone());
             }

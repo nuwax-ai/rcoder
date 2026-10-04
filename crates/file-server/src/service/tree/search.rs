@@ -389,11 +389,7 @@ fn make_relative_posix(root: &Path, entry: &dua_core::Entry) -> String {
     } else {
         format!("{rel}/{name}")
     };
-    if joined.contains('\\') {
-        joined.replace('\\', "/")
-    } else {
-        joined
-    }
+    crate::path_safety::host_relative_to_wire(&joined)
 }
 
 /// 大小写不敏感子串匹配 (kw 须已转小写, 由调用方保证; 空串恒 false)。

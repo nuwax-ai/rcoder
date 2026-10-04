@@ -316,6 +316,27 @@ impl WorkspaceResolver for SubvolumeWorkspaceResolver {
 mod tests {
     use super::*;
 
+    /// FS-01 消费层验收: 单 app 归属（文件声明、env 未清除）必须实际生效——
+    /// 不匹配 appId 拒绝、customTargetDir 拒绝、匹配 appId 返回卷根。
+    #[test]
+    fn single_app_mode_enforces_ownership_and_rejects_custom_target() {
+        let config = crate::Config {
+            userapp_workspace_dir: PathBuf::from("/data/userapp"),
+            userapp_single_app_id: Some("app-9".to_string()),
+            ..crate::Config::default()
+        };
+        assert_eq!(
+            resolve_userapp_dev("app-9", None, &config).expect("own app resolves"),
+            PathBuf::from("/data/userapp")
+        );
+        let mismatch =
+            resolve_userapp_dev("app-8", None, &config).expect_err("foreign app must be rejected");
+        assert!(matches!(mismatch, AppError::Validation(..)), "{mismatch:?}");
+        let custom = resolve_userapp_dev("app-9", Some("/elsewhere"), &config)
+            .expect_err("customTargetDir must be rejected in single-app mode");
+        assert!(matches!(custom, AppError::Validation(..)), "{custom:?}");
+    }
+
     fn resolver() -> LocalWorkspaceResolver {
         LocalWorkspaceResolver::new(
             PathBuf::from(WORKSPACE_ROOT),

@@ -47,11 +47,42 @@ mod config;
 mod instance;
 mod proxy;
 
+/// PX-08: 停止链共享总预算——supervisor `graceful_stop` 与 `ProxyControl::
+/// shutdown_grace` 同源; `stop()` 各阶段（proxy 排水 → embedded 关闭 → TS
+/// 树停止）从同一绝对 deadline 取剩余, 不逐段重新计时（修复前串行最坏
+/// 10+30+3 秒互相矛盾）。
+pub const GRACEFUL_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub use config::{
     AGENT_FILE_SERVER_PORT, FileServerProxyConfig, NUWAX_FILE_SERVER_INTERNAL_PORT, RoutePolicy,
     SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP, USERAPP_PATH_PREFIX, Upstream, parse_route_policy,
 };
 pub use instance::{init, status, stop, try_start};
+
+/// PX-03: native 形态文件 API 凭据落盘——与控制通道凭据（receipt token）分离;
+/// `credentials.json` 权限 0600, 只供宿主 helper 在 owner root 下读取。
+/// 令牌不进日志/stdout/回执/argv; 写失败由调用方 fail-fast。
+pub fn write_native_credentials(root: &std::path::Path, token: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = root.join("credentials.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({ "file_api_token": token }).to_string(),
+        )?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: ACL 收敛属 F8/实机验证范围; 先以默认权限落盘并如实声明。
+        std::fs::write(
+            root.join("credentials.json"),
+            serde_json::json!({ "file_api_token": token }).to_string(),
+        )
+    }
+}
 pub use proxy::ProxyBody;
 #[cfg(feature = "embed-file-server")]
 pub use proxy::{clear_in_process_router, set_in_process_router};

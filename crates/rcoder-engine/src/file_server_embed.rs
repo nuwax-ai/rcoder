@@ -263,7 +263,7 @@ pub fn embedded_proxy_config(
     section: Option<file_server_proxy::FileServerProxyConfig>,
     preview_enabled: bool,
     rcoder_port: u16,
-) -> file_server_proxy::FileServerProxyConfig {
+) -> Result<file_server_proxy::FileServerProxyConfig, String> {
     let mut config = section
         .map(|mut c| {
             if preview_enabled {
@@ -276,8 +276,9 @@ pub fn embedded_proxy_config(
             coordinated_dev_lifecycle: preview_enabled,
             ..file_server_proxy::FileServerProxyConfig::default()
         });
-    config.apply_public_bind_env();
-    config
+    // PX-10: 非法显式 env 值向调用方传播（fail-fast）, 不静默落回公开缺省。
+    config.apply_public_bind_env()?;
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -305,7 +306,7 @@ mod embedded_config_tests {
     fn embedded_config_env_channel_declares_public_bind() {
         let guard = ENV_LOCK.lock().unwrap();
         set_env(Some("1"));
-        let config = embedded_proxy_config(None, false, 8086);
+        let config = embedded_proxy_config(None, false, 8086).expect("embedded config");
         assert!(
             config.public_bind_declared,
             "env FILE_SERVER_PROXY_PUBLIC_BIND=1 必须对内嵌形态生效（修复前只有独立进程形态消费）"
@@ -320,7 +321,7 @@ mod embedded_config_tests {
     fn embedded_config_defaults_to_managed_public_bind() {
         let guard = ENV_LOCK.lock().unwrap();
         set_env(None);
-        let config = embedded_proxy_config(None, false, 8086);
+        let config = embedded_proxy_config(None, false, 8086).expect("embedded config");
         assert!(
             config.public_bind_declared,
             "无显式配置时默认受管放行（使用方收紧需显式 false）"
@@ -339,7 +340,7 @@ mod embedded_config_tests {
             public_bind_declared: false,
             ..file_server_proxy::FileServerProxyConfig::default()
         };
-        let config = embedded_proxy_config(Some(section), false, 8086);
+        let config = embedded_proxy_config(Some(section), false, 8086).expect("embedded config");
         assert!(
             !config.public_bind_declared,
             "config 显式 false 是使用方收紧指令，默认值不得翻转"
@@ -357,26 +358,26 @@ mod embedded_config_tests {
             public_bind_declared: true,
             ..file_server_proxy::FileServerProxyConfig::default()
         };
-        let config = embedded_proxy_config(Some(section), false, 8086);
+        let config = embedded_proxy_config(Some(section), false, 8086).expect("embedded config");
         assert!(config.public_bind_declared);
         drop(config);
         drop(guard);
     }
 
     /// env 三态词表边界："true"/"1" → Some(true)；"0"/"false" → Some(false)
-    /// （显式收紧通道）；空串/其它/未设 → None（用形态默认 true）。
+    /// （显式收紧通道）；空串/未设 → Ok(None)（用形态默认 true）；
+    /// PX-10: 非法显式值（yes/flase/…）→ Err, 不再与未设置合并。
     #[test]
     fn embedded_config_env_word_list_boundaries() {
         for (value, expect) in [
-            ("1", Some(true)),
-            ("true", Some(true)),
-            ("TRUE", Some(true)),
-            (" 1 ", Some(true)),
-            ("0", Some(false)),
-            ("false", Some(false)),
-            ("FALSE", Some(false)),
-            ("", None),
-            ("yes", None),
+            ("1", Ok(Some(true))),
+            ("true", Ok(Some(true))),
+            ("TRUE", Ok(Some(true))),
+            (" 1 ", Ok(Some(true))),
+            ("0", Ok(Some(false))),
+            ("false", Ok(Some(false))),
+            ("FALSE", Ok(Some(false))),
+            ("", Ok(None)),
         ] {
             assert_eq!(
                 file_server_proxy::FileServerProxyConfig::env_public_bind_setting(Some(value)),
@@ -386,8 +387,16 @@ mod embedded_config_tests {
         }
         assert_eq!(
             file_server_proxy::FileServerProxyConfig::env_public_bind_setting(None),
-            None
+            Ok(None)
         );
+        // PX-10 反例: 非法显式词此前被解析为 None 并静默采用公开缺省 true。
+        for invalid in ["yes", "flase", "on", "public"] {
+            assert!(
+                file_server_proxy::FileServerProxyConfig::env_public_bind_setting(Some(invalid))
+                    .is_err(),
+                "invalid explicit value {invalid:?} must be rejected, not treated as unset"
+            );
+        }
     }
 
     /// env 显式收紧（优先级最高）：config 默认 true + env=false → false。
@@ -395,7 +404,7 @@ mod embedded_config_tests {
     fn embedded_config_env_false_overrides_default() {
         let guard = ENV_LOCK.lock().unwrap();
         set_env(Some("false"));
-        let config = embedded_proxy_config(None, false, 8086);
+        let config = embedded_proxy_config(None, false, 8086).expect("embedded config");
         assert!(
             !config.public_bind_declared,
             "env 显式 false 是使用方收紧指令，优先于默认 true"

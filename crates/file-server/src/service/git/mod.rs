@@ -4,6 +4,7 @@
 //! gix 同步库且 `Repository` `!Send`, 函数均同步; axum handler 经 `spawn_blocking` 调用。
 
 pub mod diff;
+pub(crate) mod materialize;
 pub mod ops;
 pub mod read;
 pub mod refs;

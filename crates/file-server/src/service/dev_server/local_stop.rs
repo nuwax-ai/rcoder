@@ -296,10 +296,8 @@ impl DevServerManager {
         let mut killed: Vec<KilledPid> = Vec::new();
         if let Some(supervised) = supervised {
             let pid = supervised.pid();
-            let drain_timeout = Duration::from_secs(
-                self.config.dev_stop_max_attempts as u64 * self.config.dev_stop_check_interval_ms
-                    / 1000,
-            );
+            // FS-09: 统一毫秒精度预算（200ms 不再截断为 0 秒）; 排空与退出等待共用同一 deadline。
+            let drain_timeout = self.config.dev_stop_drain_budget();
             let terminated = self.terminate_pid_group(pid).await;
             killed.push(KilledPid {
                 pid,

@@ -88,6 +88,7 @@ pub async fn zip_workspace_impl(
         skip_dot_segments: false,
         skip_hardlinks: false,
         path_prefix: None,
+        explicit_entry: None,
     };
     zip::pack_with_opts(src, tmp.path().to_path_buf(), opts).await?;
     zip_response(&filename, tmp).await

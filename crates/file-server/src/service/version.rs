@@ -26,6 +26,15 @@ pub fn version_zip_path(config: &Config, project_id: &str, version: u64) -> Path
         .join(format!("{project_id}-v{version}.zip"))
 }
 
+/// 版本包是否为可解析的完整 zip (FS-04 消费侧区分: "存在"不等于"可恢复来源")。
+/// 只探测中央目录, 不解压内容。
+fn zip_usable(zip_path: &Path) -> bool {
+    std::fs::File::open(zip_path)
+        .ok()
+        .and_then(|file| zip::ZipArchive::new(file).ok())
+        .is_some()
+}
+
 /// 备份项目到版本 zip (非 GIT 模式); `GIT_ENABLED` 时跳过返回 `None`。
 pub async fn backup_project(
     config: &Config,
@@ -163,9 +172,14 @@ pub async fn rollback_version(
             "Rollback version v{to} zip not found"
         )));
     }
-    // 当前版本若未备份, 先备份 (避免覆盖已有备份)
+    if !zip_usable(&target_zip) {
+        return Err(AppError::resource(format!(
+            "Rollback version v{to} zip is corrupt and cannot be restored"
+        )));
+    }
+    // 当前版本包缺失或损坏时重新备份 (原子发布保证重打不破坏旧文件)
     let cur_zip = version_zip_path(config, project_id, cur);
-    if !crate::service::fs_util::path_exists(&cur_zip).await? {
+    if !zip_usable(&cur_zip) {
         backup_project(config, project_id, &project_path, code_version).await?;
     }
     // 从目标版本恢复; 失败则尝试从刚才备份的当前版本恢复 (对齐 nuwax rollbackVersion catch)
@@ -177,7 +191,8 @@ pub async fn rollback_version(
     )
     .await
     {
-        if crate::service::fs_util::path_exists(&cur_zip).await? {
+        // 回退来源必须是可解析的完整包, 不把"文件存在"当恢复能力 (FS-04)
+        if zip_usable(&cur_zip) {
             tracing::warn!(error = %e, "rollback restore failed, restoring current version backup");
             if let Err(restore_error) = restore_from_zip(
                 &project_path,

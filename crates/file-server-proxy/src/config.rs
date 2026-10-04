@@ -172,30 +172,39 @@ pub fn is_coordinated_dev_path(path: &str) -> bool {
 
 impl FileServerProxyConfig {
     /// N07（修订）受管声明 env **三态**解析（独立进程形态与 rcoder 内嵌
-    /// 形态共用）：`"1"`/`"true"`（trim、大小写不敏感）→ `Some(true)` 放行；
-    /// `"0"`/`"false"` → `Some(false)` 显式收紧；未设/空串/其它值 → `None`
+    /// 形态共用）：`"1"`/`"true"`（trim、大小写不敏感）→ `Ok(Some(true))` 放行；
+    /// `"0"`/`"false"` → `Ok(Some(false))` 显式收紧；未设/空串 → `Ok(None)`
     /// （用形态默认——受管放行 true）。
-    pub fn env_public_bind_setting(value: Option<&str>) -> Option<bool> {
-        let raw = value?.trim();
+    ///
+    /// PX-10: 其它**显式**值（`flase`/`yes`/非规范词）一律 `Err`——非法显式
+    /// 设置与未设置必须区分, 调用方 fail-fast, 不得静默落回公开缺省。
+    pub fn env_public_bind_setting(value: Option<&str>) -> Result<Option<bool>, String> {
+        let Some(raw) = value.map(str::trim) else {
+            return Ok(None);
+        };
+        if raw.is_empty() {
+            return Ok(None);
+        }
         if raw == "1" || raw.eq_ignore_ascii_case("true") {
-            Some(true)
+            Ok(Some(true))
         } else if raw == "0" || raw.eq_ignore_ascii_case("false") {
-            Some(false)
+            Ok(Some(false))
         } else {
-            None
+            Err(format!(
+                "invalid explicit value {raw:?} (expected 1/true/0/false; empty or unset selects the managed default)"
+            ))
         }
     }
 
     /// 叠加 env 声明（env 优先）：`FILE_SERVER_PROXY_PUBLIC_BIND` 显式值
-    /// （true/false）覆盖 config 值；未设保持 config 值不变（含默认 true）。
-    pub fn apply_public_bind_env(&mut self) {
-        if let Some(declared) = Self::env_public_bind_setting(
-            std::env::var("FILE_SERVER_PROXY_PUBLIC_BIND")
-                .ok()
-                .as_deref(),
-        ) {
+    /// （true/false）覆盖 config 值；未设保持 config 值不变（含默认 true）；
+    /// 非法显式值返回 Err（PX-10: 调用方必须让错误生效, 不得静默公开）。
+    pub fn apply_public_bind_env(&mut self) -> Result<(), String> {
+        let raw = std::env::var("FILE_SERVER_PROXY_PUBLIC_BIND").ok();
+        if let Some(declared) = Self::env_public_bind_setting(raw.as_deref())? {
             self.public_bind_declared = declared;
         }
+        Ok(())
     }
 
     /// 分流规则纯函数（按 [`RoutePolicy`] 分派）：

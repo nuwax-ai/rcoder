@@ -79,6 +79,33 @@ pub struct BuildTask {
     commit: Mutex<()>,
 }
 
+/// [`BuildTask::from_initial_state`] 的显式差异参数（WIP-01）：执行工厂走
+/// `Default`（Pending 起步、terminal_at=0 非终态哨兵）; 终态诊断工厂预填
+/// Failed 状态、诊断 history 与 terminal_at。
+struct InitialTaskState {
+    status: BuildTaskStatus,
+    stage: Option<String>,
+    current_service: Option<String>,
+    error: Option<String>,
+    diagnostics: Vec<shared_types::UserAppDiagnostic>,
+    history: VecDeque<(u64, BuildProgressEvent)>,
+    terminal_at: i64,
+}
+
+impl Default for InitialTaskState {
+    fn default() -> Self {
+        Self {
+            status: BuildTaskStatus::Pending,
+            stage: None,
+            current_service: None,
+            error: None,
+            diagnostics: Vec::new(),
+            history: VecDeque::with_capacity(RING_CAP),
+            terminal_at: 0,
+        }
+    }
+}
+
 impl BuildTask {
     #[cfg(test)]
     fn new(app_id: String, kind: BuildTaskKind) -> Arc<Self> {
@@ -95,8 +122,37 @@ impl BuildTask {
         cancellation: tokio_util::sync::CancellationToken,
         cleanup_pending: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Arc<Self> {
+        Self::from_initial_state(
+            app_id,
+            kind,
+            cancellation,
+            cleanup_pending,
+            InitialTaskState::default(),
+        )
+    }
+
+    /// 公共任务构造器（WIP-01 收口）：执行工厂与终态诊断工厂共用同一字段
+    /// 装配, 差异只经 [`InitialTaskState`] 显式表达——Pending 起步（执行）或
+    /// 直接终态 Failed 带诊断 history（诊断回执）。诊断任务同样**不占执行
+    /// slot/lease/worker**（调用方直接登记进 store, 不经过 BuildGuard）。
+    fn from_initial_state(
+        app_id: String,
+        kind: BuildTaskKind,
+        cancellation: tokio_util::sync::CancellationToken,
+        cleanup_pending: Arc<std::sync::atomic::AtomicUsize>,
+        initial: InitialTaskState,
+    ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(BROADCAST_CAP);
         let now = Utc::now().timestamp();
+        let InitialTaskState {
+            status,
+            stage,
+            current_service,
+            error,
+            diagnostics,
+            history,
+            terminal_at,
+        } = initial;
         Arc::new(Self {
             id: Uuid::now_v7().simple().to_string(),
             app_id: app_id.clone(),
@@ -104,26 +160,26 @@ impl BuildTask {
             state: Mutex::new(TaskState {
                 app_id,
                 kind,
-                status: BuildTaskStatus::Pending,
-                stage: None,
-                current_service: None,
+                status,
+                stage,
+                current_service,
                 release_id: None,
                 sha256: None,
                 size_bytes: None,
                 file_name: None,
                 artifact_path: None,
-                error: None,
-                diagnostics: Vec::new(),
+                error,
+                diagnostics,
                 workspace_root: None,
-                seq: 0,
-                history: VecDeque::with_capacity(RING_CAP),
+                seq: history.len() as u64,
+                history,
                 updated_at: now,
             }),
             tx,
             cancelled: AtomicBool::new(false),
             cancellation,
             cleanup_pending,
-            terminal_at: AtomicI64::new(0),
+            terminal_at: AtomicI64::new(terminal_at),
             created_at: now,
             pid: AtomicU32::new(0),
             commit: Mutex::new(()),
@@ -745,7 +801,6 @@ impl BuildTaskStore {
         diagnostics: Vec<shared_types::UserAppDiagnostic>,
     ) -> Result<Arc<BuildTask>, BuildTaskStoreError> {
         let now = Utc::now().timestamp();
-        let (tx, _) = broadcast::channel(BROADCAST_CAP);
         let mut diagnostics: Vec<_> = diagnostics
             .into_iter()
             .take(super::diagnostics::MAX_DIAGNOSTICS)
@@ -787,37 +842,23 @@ impl BuildTaskStore {
                 error: error.clone(),
             },
         ));
-        let task = Arc::new(BuildTask {
-            id: Uuid::now_v7().simple().to_string(),
-            app_id: app_id.clone(),
+        // WIP-01: 与执行工厂共用同一构造器; 差异全部在 InitialTaskState 里
+        // 显式表达（终态 Failed + 诊断 history + terminal_at）。
+        let task = BuildTask::from_initial_state(
+            app_id,
             kind,
-            state: Mutex::new(TaskState {
-                app_id,
-                kind,
+            tokio_util::sync::CancellationToken::new(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            InitialTaskState {
                 status: BuildTaskStatus::Failed,
                 stage: Some(stage.into()),
                 current_service,
-                release_id: None,
-                sha256: None,
-                size_bytes: None,
-                file_name: None,
-                artifact_path: None,
                 error: Some(error),
-                workspace_root: None,
-                seq: history.len() as u64,
-                history,
                 diagnostics,
-                updated_at: now,
-            }),
-            tx,
-            cancelled: AtomicBool::new(false),
-            cancellation: tokio_util::sync::CancellationToken::new(),
-            cleanup_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            terminal_at: AtomicI64::new(now),
-            created_at: now,
-            pid: AtomicU32::new(0),
-            commit: Mutex::new(()),
-        });
+                history,
+                terminal_at: now,
+            },
+        );
         let mut map = self.map.lock().await;
         reserve_capacity(&mut map, self.max_retained_tasks)?;
         map.insert(task.id.clone(), task.clone());
@@ -831,6 +872,14 @@ impl BuildTaskStore {
 
     pub async fn get(&self, id: &str) -> Option<Arc<BuildTask>> {
         self.map.lock().await.get(id).cloned()
+    }
+
+    /// UA-04: 按 app 归属取任务——格式合法的 task_id 不等于资源归属。
+    /// 归属不匹配与"不存在"同形返回 None（不向跨 app 调用方泄露其他 app
+    /// 任务的存在性）; 快照/SSE/取消/诊断回查统一走本入口。
+    pub async fn get_scoped(&self, app_id: &str, task_id: &str) -> Option<Arc<BuildTask>> {
+        let task = self.get(task_id).await?;
+        (task.app_id == app_id).then_some(task)
     }
 
     /// 该 app 的在途（非终态）任务列表——dev_stop 联动取消用：不取消的话，

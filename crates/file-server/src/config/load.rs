@@ -94,7 +94,10 @@ impl Config {
         self.project_source_dir_explicit = env_opt_string("PROJECT_SOURCE_DIR")?.is_some();
         path!(computer_workspace_dir, "COMPUTER_WORKSPACE_DIR");
         path!(userapp_workspace_dir, "USERAPP_WORKSPACE_DIR");
-        self.userapp_single_app_id = env_opt_string("USERAPP_SINGLE_APP_ID")?;
+        // FS-01: 环境只覆盖实际提供的值——env 缺失时保留配置文件值
+        // （单 app 归属/自定义 CLI 路径/探测地址此前在 env 缺失时被静默清除）。
+        self.userapp_single_app_id =
+            env_opt_string("USERAPP_SINGLE_APP_ID")?.or(self.userapp_single_app_id.take());
         path!(service_log_dir, "FILE_SERVER_LOG_DIR");
         parse!(service_log_retention_days, "FILE_SERVER_LOG_RETENTION_DAYS");
         parse!(
@@ -176,9 +179,9 @@ impl Config {
             userapp_build_wait_timeout_secs,
             "USERAPP_BUILD_WAIT_TIMEOUT_SECS"
         );
-        self.app_cli_bin = env_opt_string("FILE_SERVER_APP_CLI_BIN")?;
+        self.app_cli_bin = env_opt_string("FILE_SERVER_APP_CLI_BIN")?.or(self.app_cli_bin.take());
         self.app_cli_admin_probe_addr = env_opt_string("FILE_SERVER_APP_CLI_ADMIN_PROBE_ADDR")?
-            .unwrap_or_else(|| "127.0.0.1:3010".to_string());
+            .unwrap_or_else(|| self.app_cli_admin_probe_addr.clone());
         self.validate()?;
         Ok(self)
     }
@@ -425,6 +428,15 @@ impl Config {
         if self.dev_stop_max_attempts == 0 {
             return Err(anyhow!("DEV_STOP_MAX_ATTEMPTS must be greater than zero"));
         }
+        // FS-09: 停止预算乘积在加载时前置拒绝溢出, 而不是在清理路径上回绕。
+        if u64::from(self.dev_stop_max_attempts)
+            .checked_mul(self.dev_stop_check_interval_ms)
+            .is_none()
+        {
+            return Err(anyhow!(
+                "DEV_STOP_MAX_ATTEMPTS * DEV_STOP_CHECK_INTERVAL_MS overflows the budget"
+            ));
+        }
         Ok(())
     }
 }
@@ -433,6 +445,71 @@ impl Config {
 mod tests {
     use super::super::env::MAX_UPLOAD_FILE_SIZE_BYTES;
     use super::Config;
+
+    /// FS-09: 停止预算保持毫秒精度——修复前 `attempts × interval / 1000` 整除
+    /// 把 200ms 截断为 0 秒（既有 975707f77 基线清理时序失败的根因）。
+    #[test]
+    fn dev_stop_drain_budget_keeps_millisecond_precision() {
+        let config = Config {
+            dev_stop_check_interval_ms: 200,
+            dev_stop_max_attempts: 1,
+            ..Config::default()
+        };
+        assert_eq!(
+            config.dev_stop_drain_budget(),
+            std::time::Duration::from_millis(200),
+            "200ms must stay 200ms, not truncate to 0 seconds"
+        );
+        let tripled = Config {
+            dev_stop_check_interval_ms: 200,
+            dev_stop_max_attempts: 3,
+            ..Config::default()
+        };
+        assert_eq!(
+            tripled.dev_stop_drain_budget(),
+            std::time::Duration::from_millis(600)
+        );
+    }
+
+    /// FS-09: 预算乘积溢出在配置校验时显式拒绝（fail fast）, 不在清理路径回绕。
+    #[test]
+    fn dev_stop_budget_overflow_is_rejected_at_validation() {
+        let config = Config {
+            dev_stop_max_attempts: u32::MAX,
+            dev_stop_check_interval_ms: u64::MAX,
+            ..Config::default()
+        };
+        let error = config.validate().expect_err("budget overflow must fail");
+        assert!(
+            error.to_string().contains("overflows"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// FS-01 反例: 环境变量缺失时, 配置文件声明的单 app 归属/CLI 路径/探测地址
+    /// 必须保留（默认→文件→env 的叠加语义）。修复前 with_env_overrides 把三项
+    /// 静默清为 None/默认, 单 app 归属拒绝分支随之失效。
+    #[test]
+    fn env_absence_preserves_file_owned_settings() {
+        let file = tempfile::Builder::new()
+            .suffix(".yaml")
+            .tempfile()
+            .expect("config fixture");
+        std::fs::write(
+            file.path(),
+            "userapp_single_app_id: app-9\n\
+             app_cli_bin: /opt/custom/app-cli\n\
+             app_cli_admin_probe_addr: 127.0.0.1:3999\n",
+        )
+        .expect("write config fixture");
+        let config = Config::from_file(file.path())
+            .expect("load file config")
+            .with_env_overrides()
+            .expect("apply env layer");
+        assert_eq!(config.userapp_single_app_id.as_deref(), Some("app-9"));
+        assert_eq!(config.app_cli_bin.as_deref(), Some("/opt/custom/app-cli"));
+        assert_eq!(config.app_cli_admin_probe_addr, "127.0.0.1:3999");
+    }
 
     #[test]
     fn partial_yaml_config_uses_defaults() {

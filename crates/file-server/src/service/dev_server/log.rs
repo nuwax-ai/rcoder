@@ -153,7 +153,7 @@ where
 
 /// app-cli 编排事件行前缀（跨进程 stdout 行协议；与 app-cli
 /// `orchestration_events::EVT_PREFIX` 同字符串——两端契约测试锁同一字面量）。
-pub const APP_CLI_EVT_PREFIX: &str = "APP-CLI-EVT ";
+pub use shared_types::APP_CLI_EVT_PREFIX;
 
 /// 同 [`spawn_log_pipe`], 额外识别 app-cli 编排事件行：行首
 /// [`APP_CLI_EVT_PREFIX`] 匹配 → 去前缀的 JSON 部分回调 `hooks.on_line`

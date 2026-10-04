@@ -45,6 +45,7 @@ pub(crate) fn app_error_code(error: &AppError) -> &'static str {
         AppError::Network(_) => ec::ERR_SERVICE_UNAVAILABLE,
         AppError::Permission(_)
         | AppError::System(_)
+        | AppError::CommandExecution { .. }
         | AppError::File(_)
         | AppError::Process(_)
         | AppError::ProcessPortInUse { .. } => ec::ERR_INTERNAL_SERVER_ERROR,

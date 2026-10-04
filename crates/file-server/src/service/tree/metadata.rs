@@ -89,14 +89,11 @@ pub async fn list_files_meta_filtered(
 }
 
 /// computer 列表使用宿主路径语义：POSIX 的反斜杠属于文件名，仅 Windows
-/// 将其归一为路径分隔符。project 内容遍历保留既有的 `make_relative_path` 口径。
+/// 将其归一为路径分隔符（统一经 [`crate::path_safety::host_relative_to_wire`]）。
+/// project 内容遍历保留既有的 `make_relative_path` 口径。
 fn make_list_relative_path(root: &Path, path: &Path) -> String {
     let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
-    if cfg!(windows) {
-        relative.replace('\\', "/")
-    } else {
-        relative.into_owned()
-    }
+    crate::path_safety::host_relative_to_wire(&relative)
 }
 
 /// 单层/受限层级遍历 (对齐 nuwax computer `listDirectoryLevel`): `levels_left=1`

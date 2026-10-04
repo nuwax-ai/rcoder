@@ -51,8 +51,15 @@ pub async fn create_workspace(
     fs::create_dir_all(&skills_dir).await?;
     fs::create_dir_all(&agents_dir).await?;
 
-    // 还原保留 skills
+    // 还原保留 skills; 失败时唯一副本留在保留区（见 preserve/restore 的诊断路径）
     restore_locked_skills(&preserved, &skills_dir).await?;
+
+    // 全部恢复确认后清理保留区; 清理失败只告警（技能已安全, 残留目录无害）
+    if let Some(preserve) = preserved.0
+        && let Err(error) = preserve.confirmed_cleanup().await
+    {
+        tracing::warn!(%error, "cleaning confirmed preserve directory failed (skills already restored)");
+    }
 
     // workspace 创建保持 nuwax 的 best-effort 语义，但明确记录 Hook 配置错误。
     if let Err(error) = crate::service::agent_hooks::write_agent_hook_configs(
@@ -313,12 +320,37 @@ async fn remove_dir_all_if_exists(path: &Path) -> AppResult<()> {
     }
 }
 
-/// 把含 `.dynamic_add.lock` 的 skill 子目录移到临时区保留 (对齐 nuwax hasDynamicAddLock)。
-/// 返回 (临时目录, 保留的 skill 名列表)。
+/// 保留区句柄: 恢复**确认**前不自动清理 (FS-05)。
+/// 没有 Drop 删除——guard 被 drop（上层错误/取消）时目录与内容原地保留,
+/// 路径已写入诊断日志; 只有 [`PreservedSkills::confirmed_cleanup`] 在全部
+/// 技能成功回到 skills/ 后显式移除保留区。
+pub(crate) struct PreservedSkills {
+    dir: PathBuf,
+}
+
+impl PreservedSkills {
+    pub(crate) fn path(&self) -> &Path {
+        &self.dir
+    }
+
+    /// 全部恢复确认后调用; 清理失败只告警（数据已安全, 残留目录无害）。
+    pub(crate) async fn confirmed_cleanup(self) -> AppResult<()> {
+        fs::remove_dir_all(&self.dir).await.map_err(|error| {
+            crate::error::AppError::system(format!(
+                "remove preserve directory {}: {error}",
+                self.dir.display()
+            ))
+        })
+    }
+}
+
+/// 把含 `.dynamic_add.lock` 的 skill 子目录移到保留区 (对齐 nuwax hasDynamicAddLock)。
+/// 返回 (保留区句柄, 保留的 skill 名列表)。保留区是普通目录而非 TempDir:
+/// 中途失败/上层错误/取消时已移入的唯一副本原地保留 (FS-05)。
 async fn preserve_locked_skills(
     skills_dir: &Path,
     workspace: &Path,
-) -> AppResult<(Option<tempfile::TempDir>, Vec<String>)> {
+) -> AppResult<(Option<PreservedSkills>, Vec<String>)> {
     let preserved: Vec<String> = Vec::new();
     if !fs::try_exists(skills_dir).await? {
         return Ok((None, preserved));
@@ -340,21 +372,35 @@ async fn preserve_locked_skills(
         return Ok((None, Vec::new()));
     }
     let parent = workspace.parent().unwrap_or(workspace).to_path_buf();
-    let guard = crate::service::temp_file::tempdir_in(parent, ".preserved-skills-").await?;
-    let temp = guard.path();
+    let dir = parent.join(format!(
+        ".preserved-skills-{}",
+        uuid::Uuid::now_v7().simple()
+    ));
+    fs::create_dir_all(&dir).await?;
     for name in &to_preserve {
-        move_dir(&skills_dir.join(name), &temp.join(name)).await?;
+        if let Err(error) = move_dir(&skills_dir.join(name), &dir.join(name)).await {
+            tracing::error!(
+                %error,
+                preserve_dir = %dir.display(),
+                skill = %name,
+                "preserving locked skill failed; already-moved copies stay in the preserve directory"
+            );
+            return Err(crate::error::AppError::system(format!(
+                "preserve locked skill '{name}' failed: {error}; moved copies stay at {}",
+                dir.display()
+            )));
+        }
     }
-    Ok((Some(guard), to_preserve))
+    Ok((Some(PreservedSkills { dir }), to_preserve))
 }
 
-/// 还原保留的 skill 子目录。
+/// 还原保留的 skill 子目录。失败时数据留在保留区（不清理）, 错误携带保留区路径。
 async fn restore_locked_skills(
-    preserved: &(Option<tempfile::TempDir>, Vec<String>),
+    preserved: &(Option<PreservedSkills>, Vec<String>),
     skills_dir: &Path,
 ) -> AppResult<()> {
-    let (guard, names) = preserved;
-    let Some(temp) = guard.as_ref().map(tempfile::TempDir::path) else {
+    let (holder, names) = preserved;
+    let Some(preserve) = holder.as_ref() else {
         return Ok(());
     };
     if names.is_empty() {
@@ -362,7 +408,20 @@ async fn restore_locked_skills(
     }
     fs::create_dir_all(skills_dir).await?;
     for name in names {
-        move_dir(&temp.join(name), &skills_dir.join(name)).await?;
+        move_dir(&preserve.path().join(name), &skills_dir.join(name))
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    %error,
+                    preserve_dir = %preserve.path().display(),
+                    skill = %name,
+                    "restoring locked skill failed; data stays in the preserve directory"
+                );
+                crate::error::AppError::system(format!(
+                    "restore locked skill '{name}' failed: {error}; preserved copy stays at {}",
+                    preserve.path().display()
+                ))
+            })?;
     }
     Ok(())
 }
@@ -372,6 +431,56 @@ async fn restore_locked_skills(
 mod tests {
     use super::super::helpers::now_nanos;
     use super::*;
+
+    /// FS-05 反例: restore 失败（或上层错误导致保留区 guard drop）时, 被 move
+    /// 进临时区的技能是唯一副本, 不得被自动清理。修复前 TempDir drop 删除数据。
+    #[tokio::test]
+    async fn locked_skills_survive_failed_restore() {
+        let parent = tempfile::tempdir().expect("parent");
+        let workspace = parent.path().join("ws");
+        let skills_dir = workspace.join(".agents").join("skills");
+        fs::create_dir_all(&skills_dir).await.expect("skills dir");
+        for name in ["skill-a", "skill-b"] {
+            let dir = skills_dir.join(name);
+            fs::create_dir_all(&dir).await.expect("skill dir");
+            fs::write(dir.join(DYNAMIC_ADD_LOCK), b"")
+                .await
+                .expect("lock");
+            fs::write(dir.join("SKILL.md"), format!("# {name}"))
+                .await
+                .expect("content");
+        }
+
+        let preserved = preserve_locked_skills(&skills_dir, &workspace)
+            .await
+            .expect("preserve");
+        let (Some(guard), names) = (&preserved.0, &preserved.1) else {
+            panic!("two locked skills must be preserved");
+        };
+        assert_eq!(names.len(), 2);
+        let preserve_dir = guard.path().to_path_buf();
+        assert!(preserve_dir.join("skill-a/SKILL.md").is_file());
+
+        // 破坏 restore: skill-a 的目标位置被普通文件占用 → move_dir 失败
+        // （preserve 已把源移走, 直接在空位放占位文件）
+        fs::write(skills_dir.join("skill-a"), b"placeholder")
+            .await
+            .expect("placeholder");
+        let result = restore_locked_skills(&preserved, &skills_dir).await;
+        assert!(result.is_err(), "restore must fail on occupied target");
+
+        // 模拟上层错误路径: 保留区 guard 被 drop
+        drop(preserved);
+        assert!(
+            preserve_dir.join("skill-b/SKILL.md").is_file(),
+            "the only surviving copy must stay in the preserve directory"
+        );
+        assert!(
+            preserve_dir.join("skill-a/SKILL.md").is_file(),
+            "already-moved skill must stay in the preserve directory"
+        );
+        drop(fs::remove_dir_all(&preserve_dir).await);
+    }
 
     #[tokio::test]
     async fn create_workspace_writes_agents_skills() {

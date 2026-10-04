@@ -313,4 +313,14 @@ impl Config {
     pub fn upload_temp_dir(&self) -> PathBuf {
         self.upload_project_dir.join("temp")
     }
+
+    /// dev 停止排空/等待预算（FS-09 统一换算）：`attempts × interval` 以毫秒
+    /// 精度计算（200ms 不再截断为 0 秒）, 溢出由 `validate()` 在配置加载时
+    /// 前置拒绝, 此处 saturating 仅作防御。stdout 排空与进程退出等待共用
+    /// 同一个 deadline。
+    pub fn dev_stop_drain_budget(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            u64::from(self.dev_stop_max_attempts).saturating_mul(self.dev_stop_check_interval_ms),
+        )
+    }
 }

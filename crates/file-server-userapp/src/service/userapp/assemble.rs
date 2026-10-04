@@ -53,15 +53,12 @@ pub(super) async fn assemble_workspace_package(
             // 流量恒 404 等待）
             for proj in &built_for_task {
                 if proj.artifact.is_dir() {
-                    let artifact_name = proj
-                        .artifact
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or_default();
+                    // UA-03: 保留 artifact 完整相对层级（`dist/web` ≠ `web`）——
+                    // app-cli 静态内容根按 release lock 的 [build].artifact 定位。
                     add_dir_entries(
                         &mut zw,
                         &proj.artifact,
-                        &format!("{}/{}", proj.path, artifact_name),
+                        &format!("{}/{}", proj.path, proj.artifact_rel),
                     )?;
                 } else {
                     merge_artifact_with_prefix(&mut zw, &proj.artifact, &proj.path)?;
@@ -330,10 +327,12 @@ mod tests {
             BuiltProject {
                 path: "userapp-frontend".into(),
                 artifact: fe_zip,
+                artifact_rel: "x.zip".into(),
             },
             BuiltProject {
                 path: "userapp-backend".into(),
                 artifact: be_zip,
+                artifact_rel: "x.zip".into(),
             },
         ];
 
@@ -410,6 +409,7 @@ mod tests {
         let built = vec![BuiltProject {
             path: "userapp-frontend".into(),
             artifact: fe_zip,
+            artifact_rel: "userapp-frontend.zip".into(),
         }];
 
         let out = assemble_workspace_package(&ws_path, &built, &test_lock(), TEST_PACKAGE_REL)
@@ -439,6 +439,7 @@ mod tests {
         let built = vec![BuiltProject {
             path: "bad".into(),
             artifact: bad_zip,
+            artifact_rel: "bad/bad.zip".into(),
         }];
 
         let result =
@@ -457,6 +458,45 @@ mod tests {
     /// [build].artifact 目录定位（`{workspace}/{dir}/{artifact}`），平铺会让
     /// content dir 永远缺失（流量恒 404 等待）。zip 产物走 raw copy 的既有
     /// 分支不变。
+    /// UA-03 反例: 多层 artifact（`dist/web`）必须保留全部层级——修复前
+    /// `file_name()` 截断成 `web`, 组包内容根与 release lock/app-cli 静态根
+    /// （`{workspace}/{dir}/{artifact}`）不一致, 构建成功但内容 404。
+    #[tokio::test]
+    async fn assemble_preserves_nested_static_artifact_levels() {
+        let ws = tempfile::tempdir().expect("ws tempdir");
+        let ws_path = ws.path().to_path_buf();
+        std::fs::write(
+            ws_path.join("workspace.manifest.toml"),
+            "schema_version=1\n[workspace]\nname=\"x\"\n[pingap]\nmode=\"managed\"\n",
+        )
+        .unwrap();
+        let dist_web = ws_path.join("frontend/dist/web");
+        std::fs::create_dir_all(&dist_web).expect("dist/web");
+        std::fs::write(dist_web.join("index.html"), "<html>nested</html>").expect("page");
+
+        let built = vec![BuiltProject {
+            path: "frontend".into(),
+            artifact: dist_web,
+            artifact_rel: "dist/web".into(),
+        }];
+        let out = assemble_workspace_package(&ws_path, &built, &test_lock(), TEST_PACKAGE_REL)
+            .await
+            .expect("assemble");
+        let extract_dst = tempfile::tempdir().expect("extract");
+        zip::extract_to(out, extract_dst.path().to_path_buf())
+            .await
+            .expect("extract");
+        let root = extract_dst.path();
+        assert!(
+            root.join("frontend/dist/web/index.html").is_file(),
+            "full artifact levels must be preserved (dist/web, not just web)"
+        );
+        assert!(
+            !root.join("frontend/web/index.html").exists(),
+            "truncated artifact path must not exist"
+        );
+    }
+
     #[tokio::test]
     async fn assemble_packs_static_directory_artifacts() {
         let ws = tempfile::tempdir().expect("ws tempdir");
@@ -475,6 +515,7 @@ mod tests {
         let built = vec![BuiltProject {
             path: "frontend".into(),
             artifact: dist,
+            artifact_rel: "dist".into(),
         }];
         let out = assemble_workspace_package(&ws_path, &built, &test_lock(), TEST_PACKAGE_REL)
             .await

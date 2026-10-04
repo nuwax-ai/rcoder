@@ -226,3 +226,195 @@ pub enum DevAdmissionData {
     Accepted(UserappDevTaskCreated),
     Failed(shared_types::UserAppTaskFailureData),
 }
+
+// ── UA-08: 文件镜像族成功载荷 DTO（snake_case 裸对象, 非 HttpResult 信封;
+// 与 computer 域 camelCase 平行——逐路径协议保持差异）────────────────────────
+
+/// GET get-file-list 成功载荷。
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct UserappFileListReply {
+    /// 恒为 true；失败走错误响应
+    pub success: bool,
+    /// 条目列表（目录不存在时为空数组）
+    pub files: Vec<UserappFileEntry>,
+    /// 是否递归列出
+    pub recursive: bool,
+    /// 生效的受限展开层级（仅单层模式非空；递归模式恒 null）
+    pub depth: Option<usize>,
+    /// 生效的过滤类型（all/file/dir）
+    #[serde(rename = "type")]
+    pub file_type: String,
+    /// 生效的条数上限（未限制时为 null）
+    pub limit: Option<usize>,
+}
+
+/// GET resolve-file 成功载荷（按存在性多态: 未命中只有 success/exists）。
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(untagged)]
+pub enum UserappResolveFileReply {
+    /// 未命中（不存在 / 根目录缺失）
+    Missing {
+        /// 恒为 true
+        success: bool,
+        /// 文件是否存在
+        exists: bool,
+    },
+    /// 命中
+    Found {
+        /// 恒为 true
+        success: bool,
+        /// 文件是否存在
+        exists: bool,
+        /// 命中文件名
+        name: String,
+        /// 预览代理 URL（无 proxy_path 时为 null）
+        file_proxy_url: Option<String>,
+    },
+}
+
+/// GET search-files 成功载荷。
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct UserappSearchFilesReply {
+    /// 恒为 true；失败走错误响应
+    pub success: bool,
+    /// 命中条目（有界实时搜索）
+    pub files: Vec<UserappFileEntry>,
+    /// 是否因 limit/预算/超时截断
+    pub truncated: bool,
+    /// 实际遍历的目录数
+    pub visited: usize,
+}
+
+/// POST get-file-meta 单条元数据（基础键恒存在, 无值为 null; error 仅失败条目携带）。
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct UserappFileMetaEntry {
+    /// 请求的文件路径（原样回显）
+    pub path: String,
+    /// 是否目录
+    pub is_dir: Option<bool>,
+    /// 是否符号链接
+    pub is_link: Option<bool>,
+    /// 文件字节数（目录为 null）
+    pub size: Option<u64>,
+    /// 修改时间（epoch 毫秒）
+    pub mtime_ms: Option<f64>,
+    /// 扩展名（不含点；无扩展为 null）
+    pub extension: Option<String>,
+    /// MIME 类型
+    pub mime_type: Option<String>,
+    /// 符号链接目标（非链接为 null）
+    pub link_target: Option<String>,
+    /// 目录直接子项数（文件为 null）
+    pub child_count: Option<u64>,
+    /// 单条失败原因（仅失败条目存在该键）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// POST get-file-meta 成功载荷。
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct UserappFileMetaReply {
+    /// 恒为 true
+    pub success: bool,
+    /// 与请求同序的元数据条目
+    pub metas: Vec<UserappFileMetaEntry>,
+}
+
+/// POST files-update 成功载荷。
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct UserappFilesUpdateReply {
+    /// 恒为 true
+    pub success: bool,
+    /// 固定文案
+    pub message: String,
+    /// 回显请求的应用 ID
+    pub app_id: String,
+    /// 本次生效的文件操作数
+    pub files_count: usize,
+}
+
+/// POST upload-file 成功载荷。
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct UserappUploadFileReply {
+    /// 恒为 true
+    pub success: bool,
+    /// 固定文案
+    pub message: String,
+    /// 落盘字节数
+    pub file_size: u64,
+}
+
+/// POST upload-files 批量结果条目（单文件错误隔离; 成功/失败形态不同字段）。
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(untagged)]
+pub enum UserappBatchUploadItem {
+    /// 单条成功
+    Ok {
+        /// 本条成功
+        success: bool,
+        /// 落盘相对路径
+        file_path: String,
+        /// 上传原始文件名（multipart 未提供时为 null）
+        originalname: Option<String>,
+        /// 固定文案
+        message: String,
+        /// 落盘字节数
+        file_size: u64,
+    },
+    /// 单条失败（不影响其余条目）
+    Err {
+        /// 本条失败
+        success: bool,
+        /// 目标相对路径
+        file_path: String,
+        /// 上传原始文件名（multipart 未提供时为 null）
+        originalname: Option<String>,
+        /// 失败原因
+        error: String,
+    },
+}
+
+/// POST upload-files 成功载荷（部分失败语义: success 恒 true, 逐条看 results）。
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct UserappUploadFilesReply {
+    /// 恒为 true（批次完成; 单条失败看 results）
+    pub success: bool,
+    /// 固定文案
+    pub message: String,
+    /// 提交条目总数
+    pub total_count: usize,
+    /// 成功条目数
+    pub success_count: usize,
+    /// 失败条目数
+    pub fail_count: usize,
+    /// 与请求同序的逐条结果
+    pub results: Vec<UserappBatchUploadItem>,
+}
+
+/// POST generate-file 成功载荷。
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct UserappGenerateFileReply {
+    /// 恒为 true
+    pub success: bool,
+    /// 固定文案
+    pub message: String,
+    /// 生成的文件名（剥前导斜杠后）
+    pub file_name: String,
+    /// 写入字节数
+    pub file_size: usize,
+}
+
+/// POST import-project 成功载荷。
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct UserappImportProjectReply {
+    /// 恒为 true
+    pub success: bool,
+    /// 固定文案
+    pub message: String,
+    /// 回显请求的用户 ID
+    pub user_id: String,
+    /// 回显请求的应用 ID
+    pub app_id: String,
+    /// 导入落盘的目标目录
+    pub target_dir: String,
+}

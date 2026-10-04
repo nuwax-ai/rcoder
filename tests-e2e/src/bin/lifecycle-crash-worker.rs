@@ -103,6 +103,7 @@ async fn execute(root: &Path, store: &TursoUserAppStore) -> Result<()> {
             app_id: intent.app_id,
             operation_id: operation.operation_id.clone(),
             resources: vec![],
+            directories: None,
         },
         development: None,
     };

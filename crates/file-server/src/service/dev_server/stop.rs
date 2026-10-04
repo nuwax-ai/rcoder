@@ -74,10 +74,8 @@ impl DevServerManager {
         }
         // stdout 管道有界排空（进程组已停；后代持有写端时窗口到期放弃）。
         if let Some(supervised) = supervised {
-            let drain_timeout = std::time::Duration::from_secs(
-                self.config.dev_stop_max_attempts as u64 * self.config.dev_stop_check_interval_ms
-                    / 1000,
-            );
+            // FS-09: 统一毫秒精度预算（200ms 不再截断为 0 秒）; 排空与退出等待共用同一 deadline。
+            let drain_timeout = self.config.dev_stop_drain_budget();
             supervised.drain_stdout(drain_timeout).await;
             // P1-05：记录 cleanup_status。即使进程已退出，仍可能有子进程继承 stdout
             // 导致 EOF 未到达——在 wait_exit 结束前标记 Cleaning，完成后再标 Cleaned。

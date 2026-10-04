@@ -604,41 +604,51 @@ pub(super) async fn drain_operation_events(
     Ok(last)
 }
 
-/// RuntimeEventRecord → 旧 EVT 行（map_app_cli_evt 消费的同构 JSON）。
-/// - 服务级事件（service_starting 等）原样透传；
+/// RuntimeEventRecord → 旧 EVT 行（map_app_cli_evt 消费的同构 JSON;
+/// UA-07: typed 构造走 `shared_types::app_cli_evt` 唯一契约）。
+/// - 服务级事件（service_starting 等）typed 透传；
 /// - 操作终态（Completed/Failed）映射为平台的 `orchestration_done` 终局
 ///   （R06：真实 owner 成功也必须产生平台所需 Done，Failed 携带错误明细）；
-/// - 无 event_name 的纯 stage 记录跳过（旧管道无对应消费者）。
+/// - 契约外 event_name → None（旧管道消费者按未知扩展忽略）。
 pub(super) fn to_legacy_evt(record: &shared_types::RuntimeEventRecord) -> Option<String> {
+    use shared_types::{AppCliFailedService, AppCliOrchestrationEvent as Evt};
     let name = record.event_name.as_deref()?;
-    if name == "Completed" || name == "Failed" {
-        let failed = if name == "Failed" {
+    let event = match name {
+        "Completed" => Evt::OrchestrationDone { failed: Vec::new() },
+        "Failed" => {
             let error = record
                 .payload
                 .as_ref()
                 .and_then(|payload| payload.get("error"))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("runtime operation failed");
-            vec![serde_json::json!({"service": "orchestrator", "error": error})]
-        } else {
-            Vec::new()
-        };
-        return Some(
-            serde_json::json!({"event": "orchestration_done", "failed": failed}).to_string(),
-        );
-    }
-    let mut value = serde_json::json!({"event": name});
-    if let Some(service) = &record.service {
-        value["service"] = serde_json::Value::String(service.clone());
-    }
-    if let Some(payload) = &record.payload
-        && let Some(object) = payload.as_object()
-    {
-        for (key, item) in object {
-            value[key] = item.clone();
+            Evt::OrchestrationDone {
+                failed: vec![AppCliFailedService {
+                    service: "orchestrator".into(),
+                    error: error.into(),
+                }],
+            }
         }
-    }
-    Some(value.to_string())
+        "service_starting" => Evt::ServiceStarting {
+            service: record.service.clone()?,
+        },
+        "service_start_ok" => Evt::ServiceStartOk {
+            service: record.service.clone()?,
+        },
+        "service_start_fail" => Evt::ServiceStartFail {
+            service: record.service.clone()?,
+            error: record
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("service failed")
+                .into(),
+        },
+        // 契约外 stage/扩展记录: 无对应消费者, 跳过
+        _ => return None,
+    };
+    Some(event.encode())
 }
 
 #[cfg(test)]

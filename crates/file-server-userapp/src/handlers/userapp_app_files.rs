@@ -92,6 +92,7 @@ pub(crate) async fn upload(
     })))
 }
 
+#[derive(Debug)]
 struct UploadOutcome {
     file_path: String,
     file_size: u64,
@@ -110,15 +111,23 @@ async fn upload_impl(
 ) -> AppResult<UploadOutcome> {
     validate_target(target)?;
     let uploaded_at = chrono::Utc::now().to_rfc3339();
+    // 与 delete 一致: 以 canonical 根为界, 避免 /var → /private/var 类宿主前缀
+    // 规范化差异造成误判。
+    let canonical_root = tokio::fs::canonicalize(root)
+        .await
+        .map_err(|e| AppError::system(format!("resolve app root {}: {e}", root.display())))?;
     let file_type = detect_file_type_from_path(archive_path)
         .map_err(|e| AppError::validation(format!("detect archive type: {e}")))?;
     match file_type {
         "zip" | "tar.gz" => {
+            // 副作用前核验（UA-02）: 经链接解析出所选根的祖先在创建任何目录前
+            // 拒绝; 缺失后缀允许（新建目录合法）。
+            file_server::path_safety::ensure_resolved_within(&canonical_root, target).await?;
             let dest = root.join(target.trim_end_matches('/'));
             tokio::fs::create_dir_all(&dest)
                 .await
                 .map_err(|e| AppError::system(format!("create extraction dir: {e}")))?;
-            ensure_within_root(&dest, root).await?;
+            ensure_within_root(&dest, &canonical_root).await?;
             let count = tokio::task::spawn_blocking({
                 let dest = dest.clone();
                 let archive = archive_path.to_path_buf();
@@ -149,15 +158,38 @@ async fn upload_impl(
         _ => {
             // 单文件：target = 文件路径（app 根相对）
             let file_path = root.join(target);
+            // 副作用前核验（UA-02）: 父链经外向链接逃出根时, 在创建任何目录前拒绝。
+            file_server::path_safety::ensure_resolved_within(&canonical_root, target).await?;
             if let Some(parent) = file_path.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
                     .map_err(|e| AppError::system(format!("create parent dir: {e}")))?;
-                ensure_within_root(parent, root).await?;
             }
-            tokio::fs::copy(archive_path, &file_path)
-                .await
-                .map_err(|e| AppError::system(format!("write file: {e}")))?;
+            // 最终目标不得是符号链接: 拒绝跟随覆盖（用户可显式删除链接后上传）。
+            match tokio::fs::symlink_metadata(&file_path).await {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(AppError::validation(format!(
+                        "upload target '{target}' is a symbolic link; refusing to follow or overwrite it"
+                    )));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(AppError::system(format!(
+                        "inspect {}: {e}",
+                        file_path.display()
+                    )));
+                }
+            }
+            // no-follow 落盘: 预检与写入之间被替换的链接得到 ELOOP, 不跟随写出根。
+            let src = archive_path.to_path_buf();
+            let dst = file_path.clone();
+            tokio::task::spawn_blocking(move || {
+                file_server::path_safety::copy_file_nofollow_blocking(&src, &dst)
+            })
+            .await
+            .map_err(|e| AppError::system(format!("copy task: {e}")))?
+            .map_err(|e| AppError::system(format!("write file: {e}")))?;
             Ok(UploadOutcome {
                 file_path: target.to_string(),
                 file_size,
@@ -344,6 +376,13 @@ pub(crate) async fn delete(
         .await
         .map_err(|e| AppError::system(format!("resolve app root: {e}")))?;
     let canonical = ensure_within_root(&full, &canonical_root).await?;
+    // UA-01: 空/`.`/`frontend/..` 等解析回根的 path 一律拒绝——本接口只删除根下
+    // 具体条目; 全量清理走受实例核验与取消排空保护的 storage/clear 流程。
+    if canonical == canonical_root {
+        return Err(AppError::validation(
+            "delete path resolves to the app root; use the protected storage clear flow to reset the workspace",
+        ));
+    }
     if tokio::fs::metadata(&canonical)
         .await
         .map(|m| m.is_dir())
@@ -532,6 +571,190 @@ async fn ensure_within_root(
 
 fn map_archive_error(e: download_utils::ArchiveError) -> AppError {
     AppError::validation(format!("archive error: {e}"))
+}
+
+#[cfg(test)]
+mod upload_link_guard_tests {
+    use super::*;
+
+    fn temp_archive(content: &[u8]) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "ua_upload_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().expect("clock")
+        ));
+        std::fs::write(&path, content).expect("archive fixture");
+        path
+    }
+
+    /// UA-02 反例: 目标位置已是外向文件链接时, 单文件上传不得跟随链接改写
+    /// 根外对象。修复前 `fs::copy` 跟随链接写外部文件。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_rejects_outward_leaf_link() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let root = fixture.path().join("app-1");
+        tokio::fs::create_dir_all(&root).await.expect("root");
+        let external = fixture.path().join("external-config.txt");
+        tokio::fs::write(&external, b"external-original")
+            .await
+            .expect("external");
+        std::os::unix::fs::symlink(&external, root.join("config.txt")).expect("leaf link");
+
+        let archive = temp_archive(b"uploaded-bytes");
+        let error = upload_impl(&root, "config.txt", false, &archive, 14)
+            .await
+            .expect_err("outward leaf link must be rejected");
+        assert!(
+            matches!(error, AppError::Validation(..)),
+            "expected validation, got: {error:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(&external).await.expect("external intact"),
+            b"external-original"
+        );
+        drop(tokio::fs::remove_file(&archive).await);
+    }
+
+    /// UA-02 反例: 父链上的外向目录链接不得被用于创建目录或落盘——检查必须
+    /// 先于任何副作用。修复前 `create_dir_all` 先在外部创建了目录。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_rejects_outward_parent_link_before_any_side_effect() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let root = fixture.path().join("app-1");
+        tokio::fs::create_dir_all(&root).await.expect("root");
+        let external = fixture.path().join("outside");
+        tokio::fs::create_dir_all(&external).await.expect("outside");
+
+        // 单文件: parent 链经外向链接
+        std::os::unix::fs::symlink(&external, root.join("conf.d")).expect("parent link");
+        let archive = temp_archive(b"data");
+        let error = upload_impl(&root, "conf.d/new/file.txt", false, &archive, 4)
+            .await
+            .expect_err("outward parent link must be rejected");
+        assert!(matches!(error, AppError::Validation(..)), "{error:?}");
+        assert!(
+            !external.join("new").exists(),
+            "no directory may be created outside the app root"
+        );
+        drop(tokio::fs::remove_file(&archive).await);
+
+        // 归档解压: dest 目录链经外向链接
+        let archive = temp_archive(b"data");
+        let error = upload_impl(&root, "conf.d/pkg/", true, &archive, 4)
+            .await
+            .expect_err("outward parent link must be rejected for archives");
+        assert!(matches!(error, AppError::Validation(..)), "{error:?}");
+        assert!(
+            !external.join("pkg").exists(),
+            "no extraction directory may be created outside the app root"
+        );
+        drop(tokio::fs::remove_file(&archive).await);
+    }
+}
+
+#[cfg(test)]
+mod delete_root_guard_tests {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt as _;
+
+    async fn delete(
+        router: &axum::Router,
+        app_id: &str,
+        path: &str,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            router.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/userapp/app-files/delete")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "app_id": app_id,
+                            "path": path,
+                        }))
+                        .expect("delete JSON"),
+                    ))
+                    .expect("delete request"),
+            ),
+        )
+        .await
+        .expect("delete deadline")
+        .expect("delete response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("delete body");
+        (
+            status,
+            serde_json::from_slice(&bytes).expect("delete envelope"),
+        )
+    }
+
+    /// UA-01 反例: 空/`.`/解析回根的 path 不得删除应用根。修复前根被
+    /// remove_dir_all 清空并返回 success=true。
+    #[tokio::test]
+    async fn delete_rejects_paths_resolving_to_app_root_and_keeps_files() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let state = super::super::userapp_files::tests_support::make_state(directory.path().into());
+        let workspace = directory.path().join("app-1");
+        tokio::fs::create_dir_all(workspace.join("frontend"))
+            .await
+            .expect("dirs");
+        tokio::fs::write(workspace.join("frontend/index.html"), b"x")
+            .await
+            .expect("page");
+        tokio::fs::write(workspace.join("keep.txt"), b"keep")
+            .await
+            .expect("keep");
+        let (router, _) = crate::routes::userapp_top_router().split_for_parts();
+        let router = router.with_state(state);
+
+        for path in [".", "", "frontend/.."] {
+            let (status, envelope) = delete(&router, "app-1", path).await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+            assert_eq!(
+                envelope["success"],
+                serde_json::json!(false),
+                "path {path:?} must be rejected without touching the app root"
+            );
+            assert_eq!(
+                envelope["error"]["type"], "VALIDATION_ERROR",
+                "path {path:?} rejection must carry the validation error type"
+            );
+        }
+
+        // 根与内容原样保留——全量清理只属于受实例核验保护的 clear 流程
+        assert!(
+            tokio::fs::try_exists(workspace.join("keep.txt"))
+                .await
+                .expect("keep exists")
+        );
+        assert!(
+            tokio::fs::try_exists(workspace.join("frontend/index.html"))
+                .await
+                .expect("page exists")
+        );
+
+        // 合法子项删除能力保持
+        let (status, envelope) = delete(&router, "app-1", "frontend").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(envelope["success"], serde_json::json!(true));
+        assert!(
+            !tokio::fs::try_exists(workspace.join("frontend"))
+                .await
+                .expect("frontend gone")
+        );
+        assert!(
+            tokio::fs::try_exists(workspace.join("keep.txt"))
+                .await
+                .expect("keep still exists")
+        );
+    }
 }
 
 #[cfg(test)]

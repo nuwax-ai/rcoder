@@ -386,17 +386,21 @@ fn apply_tree_to_worktree(
         .index_from_tree(tree_id)
         .map_err(|e| map_git_err(e, "git index_from_tree"))?;
     let new_backing = new_index.path_backing();
-    // 写所有 target 文件到 worktree
+    // 整批预检（FS-03/06）: 词法界内 + mode 支持全部通过后才产生任何写副作用;
+    // gitlink 等未承诺对象在这里整批拒绝, 不留半写工作树。
+    let mut planned = Vec::with_capacity(new_index.entries().len());
     for entry in new_index.entries() {
         let path = entry.path_in(new_backing);
-        let blob = repo
-            .find_blob(entry.id)
-            .map_err(|e| map_git_err(e, "git find_blob (checkout)"))?;
-        let dest = ensure_within_path(workdir, from_bstr(path))?;
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&dest, &blob.data)?;
+        planned.push(super::materialize::plan_index_entry(
+            workdir,
+            &from_bstr(path),
+            entry.mode,
+            entry.id,
+        )?);
+    }
+    // 写所有 target 文件到 worktree（共享安全物化器: 界内目录链 + leaf 不跟随 + mode）
+    for entry in &planned {
+        super::materialize::materialize_planned(repo, workdir, entry)?;
     }
     // 删除 old_tree 有但 target 没有的文件
     if let Some(old_id) = old_tree_id {

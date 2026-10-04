@@ -8,31 +8,10 @@
 //! stdout 无 tracing 噪声（日志只配 stderr + 文件层），EVT 行不混杂；
 //! 生产 supervisord 引擎不输出（无 stdout 消费者，启动判定语义另有约定）。
 
-use serde::Serialize;
-
-/// EVT 行前缀（file-server 管道按行首匹配识别）。
-pub const EVT_PREFIX: &str = "APP-CLI-EVT ";
-
-/// 启动失败服务条目（orchestration_done 汇总）。
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct FailedService {
-    pub service: String,
-    pub error: String,
-}
-
-/// builtin 启动编排事件（wire tag 与 BuildProgressEvent 的 service_* 变体一致）。
-#[derive(Debug, Serialize, PartialEq, Eq)]
-#[serde(tag = "event", rename_all = "snake_case")]
-pub enum OrchestrationEvent {
-    /// 开始启动某服务（spawn 前）。
-    ServiceStarting { service: String },
-    /// 某服务启动成功（readiness 探测通过）。
-    ServiceStartOk { service: String },
-    /// 某服务启动失败（spawn io 错误 / migrate 失败 / 探测超时）——不阻塞其余服务。
-    ServiceStartFail { service: String, error: String },
-    /// 启动编排终局（pingap 就绪确认后）：`failed` 为失败清单（空 = 全部成功）。
-    OrchestrationDone { failed: Vec<FailedService> },
-}
+/// EVT 行前缀（唯一事实源在 `shared_types::app_cli_evt`, 生产/转发/消费三方共用）。
+pub use shared_types::APP_CLI_EVT_PREFIX as EVT_PREFIX;
+pub use shared_types::AppCliFailedService as FailedService;
+pub use shared_types::AppCliOrchestrationEvent as OrchestrationEvent;
 
 /// 输出一条 EVT 行到 stdout（单行 + 立即 flush 保证行完整性；写失败静默——
 /// 事件是尽力而为的观测通道，不得影响编排主流程）。

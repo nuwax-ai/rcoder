@@ -361,7 +361,7 @@ pub(crate) async fn get_task(
 ) -> UserAppReply<BuildTaskSnapshot> {
     let result = async {
         validate_task_scope(&scope, &task_id)?;
-        let task = match state.build_tasks.get(&task_id).await {
+        let task = match state.build_tasks.get_scoped(&scope.app_id, &task_id).await {
             Some(task) => task,
             None => {
                 if let Some(operation) = state.fs.dev_server.external_operation_for_task(
@@ -419,7 +419,7 @@ pub(crate) async fn stream_task_logs(
     ) {
         return UserAppReply::<()>::Err(e).into_response();
     }
-    let Some(task) = state.build_tasks.get(&task_id).await else {
+    let Some(task) = state.build_tasks.get_scoped(&q.app_id, &task_id).await else {
         return UserAppReply::<()>::Err(AppError::resource(format!(
             "build task not found: {task_id}"
         )))
@@ -496,7 +496,7 @@ pub(crate) async fn cancel_task(
         validate_task_scope(&scope, &task_id)?;
         let task = state
             .build_tasks
-            .get(&task_id)
+            .get_scoped(&scope.app_id, &task_id)
             .await
             .ok_or_else(|| AppError::resource(format!("build task not found: {task_id}")))?;
         if task.is_terminal().await {
@@ -630,6 +630,90 @@ fn is_terminal_event(ev: &BuildProgressEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::resolve_from_seq;
+
+    /// UA-04 反例: 快照/SSE/取消必须核对不可变 task.app_id——格式合法的
+    /// task_id 配上别的 app_id 不得访问到该任务。修复前 validate_task_scope
+    /// 只做格式校验, app B 可直接读/取消 app A 的任务。
+    #[tokio::test]
+    async fn task_endpoints_reject_cross_app_task_ids() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt as _;
+
+        let directory = tempfile::tempdir().expect("fixture");
+        let state = super::super::userapp_files::tests_support::make_state(directory.path().into());
+        let task = state
+            .build_tasks
+            .create_failed_diagnostic(
+                "app-a".to_string(),
+                crate::models::task::BuildTaskKind::Build,
+                "boom".to_string(),
+                Vec::new(),
+            )
+            .await
+            .expect("terminal diagnostic task");
+        let (router, _) = crate::routes::userapp_top_router().split_for_parts();
+        let router = router.with_state(state);
+
+        let call = |method: &str, uri: String| {
+            let router = router.clone();
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request");
+            async move {
+                let response = router.oneshot(request).await.expect("response");
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .expect("body");
+                (status, bytes)
+            }
+        };
+
+        // 跨 app 访问: 三入口均按"不存在"拒绝（本域错误协议 = HTTP 200 +
+        // ERR_NOT_FOUND 信封, 与 app-files 的 400 不同——按路径保留）, 不泄露任务存在性
+        for (method, uri) in [
+            (
+                "GET",
+                format!("/api/v1/userapp/tasks/{}?app_id=app-b", task.id),
+            ),
+            (
+                "GET",
+                format!("/api/v1/userapp/tasks/{}/logs/stream?app_id=app-b", task.id),
+            ),
+            (
+                "POST",
+                format!("/api/v1/userapp/tasks/{}/cancel?app_id=app-b", task.id),
+            ),
+        ] {
+            let (status, body) = call(method, uri).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::OK,
+                "{method} userapp envelope is HTTP 200"
+            );
+            let envelope: serde_json::Value = serde_json::from_slice(&body).expect("envelope");
+            assert_eq!(
+                envelope["code"], "ERR_NOT_FOUND",
+                "{method} cross-app must be not-found: {envelope}"
+            );
+        }
+
+        // 归属正确: 快照可读（终态诊断任务）
+        let (status, body) = call(
+            "GET",
+            format!("/api/v1/userapp/tasks/{}?app_id=app-a", task.id),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "owning app reads its task"
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&body).expect("envelope");
+        assert_eq!(envelope["code"], "0000", "{envelope}");
+    }
 
     #[test]
     fn resolve_from_seq_prefers_last_event_id_header_with_plus_one() {

@@ -201,7 +201,7 @@ async fn run_devbuild_once(
     }
     result
         .map(|_| ())
-        .map_err(|e| AppError::system(format!("{service_id} dev build failed: {e}")))
+        .map_err(|e| e.prefixed(&format!("{service_id} dev build failed")))
 }
 
 /// dev 构建 + 缺 lockfile 自愈（app-171 事故，与发布编译链

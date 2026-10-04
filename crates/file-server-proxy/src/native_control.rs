@@ -1,5 +1,9 @@
 //! Standalone owner protocol. PID is never an authorization credential.
-use serde::{Deserialize, Serialize};
+#[path = "native_receipt.rs"]
+mod native_receipt;
+pub(crate) use native_receipt::directory;
+use native_receipt::{Receipt, Reply, Request, VERSION, read, supervisor_reply, write};
+use serde::Serialize;
 use std::{
     fs::File,
     path::{Path, PathBuf},
@@ -8,7 +12,6 @@ use std::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
-const VERSION: u32 = 1;
 const MAX_FRAME: u64 = 8192;
 // —— 时长常量（语义命名，替代散落的魔法值）——
 /// supervised control 提交后等待快照收敛的轮询间隔。
@@ -23,95 +26,6 @@ const TS_PROBE_RETRY_MS: Duration = Duration::from_millis(100);
 const OWNER_EXIT_POLL_INTERVAL_MS: Duration = Duration::from_millis(100);
 /// owner 控制响应总超时（stop 可含完整代理排水预算）。
 const OWNER_RESPONSE_TIMEOUT_SECS: Duration = Duration::from_secs(60);
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Receipt {
-    version: u32,
-    instance_id: String,
-    token: String,
-    control_address: String,
-    pub address: String,
-    pub phase: String,
-    #[serde(default)]
-    supervisor_id: Option<String>,
-    #[serde(default)]
-    retirement_requested: bool,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Request {
-    version: u32,
-    instance_id: String,
-    token: String,
-    action: String,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Reply {
-    version: u32,
-    instance_id: String,
-    phase: String,
-    address: String,
-    error: Option<String>,
-}
-
-pub fn directory(host: &str, port: u16) -> Result<PathBuf, String> {
-    let root = std::env::var_os("FILE_SERVER_PROXY_STATE_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .filter(|v| !v.is_empty())
-                .map(|p| PathBuf::from(p).join(".file-server-proxy"))
-        })
-        .ok_or("native control requires a stable state directory")?;
-    let host_key: String = host.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-    Ok(root.join(format!("native-{host_key}-{port}")))
-}
-fn read(root: &Path) -> Result<Option<Receipt>, String> {
-    let bytes = match std::fs::read(root.join("owner.json")) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("read owner receipt: {error}")),
-    };
-    let receipt: Receipt = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("invalid owner receipt (preserved): {e}"))?;
-    if receipt.version != VERSION
-        || receipt.instance_id.is_empty()
-        || receipt.token.len() < 32
-        || !matches!(
-            receipt.phase.as_str(),
-            "Starting" | "Running" | "Stopping" | "Stopped"
-        )
-    {
-        return Err("incompatible owner receipt (preserved)".into());
-    }
-    let address: std::net::SocketAddr = receipt
-        .control_address
-        .parse()
-        .map_err(|_| "invalid owner control address")?;
-    if !address.ip().is_loopback() {
-        return Err("owner control address is not loopback".into());
-    }
-    Ok(Some(receipt))
-}
-fn write(root: &Path, receipt: &Receipt) -> Result<(), String> {
-    use std::io::Write;
-    let mut file =
-        tempfile::NamedTempFile::new_in(root).map_err(|e| format!("create owner receipt: {e}"))?;
-    serde_json::to_writer(&mut file, receipt).map_err(|e| format!("encode owner receipt: {e}"))?;
-    file.flush()
-        .and_then(|()| file.as_file().sync_all())
-        .map_err(|e| format!("sync owner receipt: {e}"))?;
-    process_utils::atomic_file::persist(file, &root.join("owner.json"))
-        .map_err(|e| format!("publish owner receipt: {e}"))?;
-    #[cfg(unix)]
-    File::open(root)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| format!("sync owner directory: {e}"))?;
-    Ok(())
-}
 async fn frame(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>, String> {
     use tokio::io::AsyncReadExt;
     let mut bytes = Vec::new();
@@ -162,6 +76,12 @@ impl runtime_supervisor::WorkerControl for ProxyControl {
         self.shutdown.cancel();
         Ok(())
     }
+
+    /// PX-08: 声明真实停止预算（与 supervisor `graceful_stop` 同源
+    /// [`file_server_proxy::GRACEFUL_STOP_BUDGET`]）, 不再用 trait 默认 10 秒。
+    fn shutdown_grace(&self) -> Duration {
+        file_server_proxy::GRACEFUL_STOP_BUDGET
+    }
 }
 
 async fn supervised_control(
@@ -203,6 +123,7 @@ async fn supervised_control(
                         )
                         .await
                         .map_err(|e| format!("{e:#}"))?,
+                    root,
                 );
             }
             if action == Action::Status {
@@ -215,7 +136,7 @@ async fn supervised_control(
                             .into(),
                     );
                 }
-                return supervisor_reply(value);
+                return supervisor_reply(value, root);
             }
             return Err(format!(
                 "supervisor is offline; run start to recover management: {error:#}"
@@ -225,7 +146,7 @@ async fn supervised_control(
     if action == Action::Status
         || (action == Action::Recover && accepted.phase == runtime_supervisor::Phase::Ready)
     {
-        return supervisor_reply(accepted);
+        return supervisor_reply(accepted, root);
     }
     let previous = accepted.generation.clone();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -242,13 +163,13 @@ async fn supervised_control(
                 runtime_supervisor::verify_quiescent(root, generation)
                     .map_err(|e| format!("{e:#}"))?;
             }
-            return supervisor_reply(current);
+            return supervisor_reply(current, root);
         }
         if action == Action::Recover
             && current.phase == runtime_supervisor::Phase::Ready
             && current.generation != previous
         {
-            return supervisor_reply(current);
+            return supervisor_reply(current, root);
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!(
@@ -260,23 +181,6 @@ async fn supervised_control(
         }
         tokio::time::sleep(CONTROL_POLL_INTERVAL_MS).await;
     }
-}
-fn supervisor_reply(snapshot: runtime_supervisor::Snapshot) -> Result<String, String> {
-    let phase = match snapshot.phase {
-        runtime_supervisor::Phase::Ready => "Running",
-        runtime_supervisor::Phase::Stopped => "Stopped",
-        runtime_supervisor::Phase::Starting => "Starting",
-        runtime_supervisor::Phase::Stopping | runtime_supervisor::Phase::CleanupPending => {
-            "Stopping"
-        }
-        _ => "RecoveryRequired",
-    };
-    serde_json::to_string(
-        &serde_json::json!({"version":2,"instance_id":snapshot.generation,
-        "supervisor_id":snapshot.supervisor_id,"phase":phase,"stage":snapshot.phase,
-        "operation_id":snapshot.operation_id,"error":snapshot.error,"problem":snapshot.problem}),
-    )
-    .map_err(|e| e.to_string())
 }
 impl Owner {
     pub async fn acquire(root: PathBuf) -> Result<Self, String> {
@@ -340,6 +244,7 @@ impl Owner {
                 .map(|w| w.supervisor_id().to_owned())
                 .or_else(|| std::env::var("FILE_SERVER_PROXY_OWNER_SUPERVISOR").ok()),
             retirement_requested: false,
+            launch_request_id: std::env::var("FILE_SERVER_PROXY_LAUNCH_ID").ok(),
         };
         if let Some(id) = &receipt.supervisor_id {
             if let Some(worker) = &worker {
@@ -531,7 +436,8 @@ impl Owner {
                     let stopped = request.action == "stop" && result.is_ok();
                     let retiring = request.action == "retire" && result.is_ok();
                     let reply = Reply { version: VERSION, instance_id: self.receipt.instance_id.clone(),
-                        phase: if retiring { "RetirementAccepted".into() } else { self.receipt.phase.clone() }, address: self.receipt.address.clone(), error: result.err() };
+                        phase: if retiring { "RetirementAccepted".into() } else { self.receipt.phase.clone() }, address: self.receipt.address.clone(), error: result.err(),
+                        launch_request_id: self.receipt.launch_request_id.clone() };
                     // A lost response does not undo the durable completion receipt.
                     let _delivery = send(&mut stream, &reply).await;
                     if retiring {
@@ -562,6 +468,8 @@ impl Owner {
     }
 
     pub async fn stop(&mut self) -> Result<(), String> {
+        // PX-08: 全链共享一个绝对 deadline（drain → embedded → TS 依次取剩余）。
+        let deadline = tokio::time::Instant::now() + file_server_proxy::GRACEFUL_STOP_BUDGET;
         self.receipt.phase = "Stopping".into();
         let persistence = write(&self.root, &self.receipt);
         #[cfg(feature = "embed-file-server")]
@@ -582,25 +490,31 @@ impl Owner {
             (Err(a), Err(b)) => Err(format!("{a}; {b}")),
             (Err(error), _) | (_, Err(error)) => Err(error),
         };
-        self.finish_stop(result).await
+        self.finish_stop(result, deadline).await
     }
 
-    async fn finish_stop(&mut self, proxy_result: Result<(), String>) -> Result<(), String> {
+    async fn finish_stop(
+        &mut self,
+        proxy_result: Result<(), String>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
         let mut errors = Vec::new();
         if let Err(error) = proxy_result {
             errors.push(error);
         }
         #[cfg(feature = "embed-file-server")]
         if let Some(handle) = &self.embedded
-            && let Err(error) = handle
-                .shutdown(tokio::time::Instant::now() + Duration::from_secs(30))
-                .await
+            && let Err(error) = handle.shutdown(deadline).await
         {
             errors.push(error);
         }
         if let Some(child) = &mut self.ts_child {
+            // TS 树停止保留 3 秒优雅宽限, 但不越过链共享 deadline 的剩余。
+            let budget = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(Duration::from_secs(3));
             if matches!(
-                child.stop(Duration::from_secs(3)).await,
+                child.stop(budget).await,
                 process_utils::managed_tree::StopOutcome::Unconfirmed
             ) {
                 errors.push("owned TS process tree shutdown unconfirmed".into());
@@ -677,6 +591,7 @@ fn recover_under_owner_lock(
             phase: receipt.phase,
             address: receipt.address,
             error: None,
+            launch_request_id: None,
         })
         .map_err(|e| e.to_string());
     }
@@ -735,6 +650,7 @@ fn recover_under_owner_lock(
         phase: receipt.phase,
         address: receipt.address,
         error: None,
+        launch_request_id: None,
     })
     .map_err(|e| e.to_string())
 }
@@ -803,6 +719,7 @@ async fn retire_control(root: &Path, expected: Option<&str>) -> Result<String, S
         phase: "OwnerExited".into(),
         address: original.address,
         error: None,
+        launch_request_id: None,
     })
     .map_err(|e| e.to_string())
 }
@@ -863,6 +780,7 @@ pub async fn control_with_request(
             phase: receipt.phase,
             address: receipt.address,
             error: None,
+            launch_request_id: None,
         })
         .map_err(|e| e.to_string());
     }
@@ -914,6 +832,39 @@ pub async fn control_with_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PX-01/P4.2 接线闭环（直连 owner 形态）: status 回执发布同代 bound address
+    /// 与本次 launch 关联——npm 侧 created/reused 核验与 --port 0 的真实地址
+    /// 发现都依赖这两个字段; 停止后凭据路径不含令牌、回执进入 Stopped。
+    #[tokio::test]
+    async fn owner_status_publishes_bound_address_and_launch_correlation() {
+        #[allow(unsafe_code)]
+        fn set_launch_env(value: Option<&str>) {
+            // SAFETY: 测试串行段内独占设置进程 env; 被测构造同步读取。
+            match value {
+                Some(v) => unsafe { std::env::set_var("FILE_SERVER_PROXY_LAUNCH_ID", v) },
+                None => unsafe { std::env::remove_var("FILE_SERVER_PROXY_LAUNCH_ID") },
+            }
+        }
+        let launch_id = uuid::Uuid::new_v4().to_string();
+        set_launch_env(Some(&launch_id));
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let mut owner = Owner::acquire(state.clone()).await.unwrap();
+        owner.started("127.0.0.1:60001".into()).unwrap();
+        let task = tokio::spawn(owner.run(CancellationToken::new()));
+        let reply = control(&state, "status", None).await.unwrap();
+        set_launch_env(None);
+        assert!(reply.contains("\"address\":\"127.0.0.1:60001\""), "{reply}");
+        assert!(
+            reply.contains(&format!("\"launch_request_id\":\"{launch_id}\"")),
+            "launch correlation must be published: {reply}"
+        );
+        let stopped = control(&state, "stop", None).await.unwrap();
+        assert!(stopped.contains("\"phase\":\"Stopped\""), "{stopped}");
+        let owner_task = task.await;
+        assert!(owner_task.is_ok(), "owner run completes after stop: {owner_task:?}");
+    }
 
     #[tokio::test]
     async fn held_owner_and_unconfirmed_dead_owner_cannot_be_replaced() {
@@ -1067,7 +1018,10 @@ http.createServer((req,res)=>{res.writeHead(200);res.end('ok');})
         // Inject the exact result boundary of a failed proxy drain. The same
         // production cleanup must still reap this owned TS root and descendant.
         let error = owner
-            .finish_stop(Err("injected proxy drain failure".into()))
+            .finish_stop(
+                Err("injected proxy drain failure".into()),
+                tokio::time::Instant::now() + file_server_proxy::GRACEFUL_STOP_BUDGET,
+            )
             .await
             .unwrap_err();
         assert!(error.contains("proxy drain failure"));

@@ -13,8 +13,11 @@ test("external TS selection requires an explicit valid port without PID adoption
     assert.throws(() => compatibilityArgs("all_ts", port), /invalid external/);
   }
 });
-test("exited launch cannot be mistaken for another listener's readiness", async () => {
-  await assert.rejects(daemon.waitRunning("unused", [], {}, { exitCode: 1, signalCode: null }, 100), /exited before readiness/);
+test("exited wrapper child does not fail reuse readiness; unknown stays unknown", async () => {
+  // PX-01: 复用形态下包装子进程正常退出（打印 status 后离开）, 就绪由
+  // status 回执的真实身份判定; status 不可达（binary 缺失）时到 deadline
+  // 报 readiness unknown——不把子进程退出误报为就绪失败, 也不误报成功。
+  await assert.rejects(daemon.waitRunning("unused", [], {}, { exitCode: 0, signalCode: null }, 120), /readiness unknown/);
 });
 test("control cannot turn an unavailable executable into successful stop", async () => {
   await assert.rejects(daemon.control("/definitely-missing-native-owner-control", "stop"), /ENOENT/);

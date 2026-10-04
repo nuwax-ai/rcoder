@@ -258,12 +258,23 @@ pub async fn assemble(
     // 构造路径此前都不读 FILE_SERVER_PROXY_PUBLIC_BIND——env 只对独立进程
     // 形态生效，内嵌形态"env 设了却没用"。此处收口统一叠加（OR 语义，
     // 与独立进程形态同词表"1"/"true"）。
-    file_server_proxy::init(file_server_embed::embedded_proxy_config(
+    // PX-10: 非法显式 env（如 flase）不得静默落回公开缺省——跳过代理装配并
+    // 显式报错, 主服务其余装配不受影响。
+    let proxy_registered = match file_server_embed::embedded_proxy_config(
         bootstrap_result.config.file_server_proxy.clone(),
         preview_enabled,
         bootstrap_result.config.port,
-    ));
-    if bootstrap_result.config.file_server_proxy.is_some() {
+    ) {
+        Ok(config) => {
+            file_server_proxy::init(config);
+            true
+        }
+        Err(reason) => {
+            error!("file-server 分流代理装配跳过（FILE_SERVER_PROXY_PUBLIC_BIND 非法）: {reason}");
+            false
+        }
+    };
+    if proxy_registered && bootstrap_result.config.file_server_proxy.is_some() {
         // 同步 bind 语义：启动失败（如端口被占）此刻即报，不留到首个请求
         if let Err(e) = file_server_proxy::try_start().await {
             error!("file-server 分流代理启动失败: {e}");
