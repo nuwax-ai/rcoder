@@ -863,7 +863,10 @@ mod tests {
         let stopped = control(&state, "stop", None).await.unwrap();
         assert!(stopped.contains("\"phase\":\"Stopped\""), "{stopped}");
         let owner_task = task.await;
-        assert!(owner_task.is_ok(), "owner run completes after stop: {owner_task:?}");
+        assert!(
+            owner_task.is_ok(),
+            "owner run completes after stop: {owner_task:?}"
+        );
     }
 
     #[tokio::test]
