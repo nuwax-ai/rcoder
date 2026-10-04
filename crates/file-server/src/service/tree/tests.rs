@@ -756,3 +756,77 @@ fn resolve_subdir_keeps_edge_whitespace_in_segments() {
         PathBuf::from("/app/ws/ lead/file.txt")
     );
 }
+
+/// P2/FS-08 反例: POSIX 下 `a\b.txt`（单文件名）与 `a/b.txt`（子目录文件）是两个
+/// 不同对象——project 内容入口此前无条件替换反斜杠使两者同名碰撞; 修复后各自无损,
+/// URL 逐段编码后可分别访问（`#`/`?` 不再变成 query/fragment）。
+#[cfg(unix)]
+#[tokio::test]
+async fn project_content_preserves_posix_backslash_and_encodes_url() {
+    use super::content::{get_project_content, list_files};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("a")).unwrap();
+    std::fs::write(root.join("a\\b.txt"), "BACKSLASH-CONTENT").unwrap();
+    std::fs::write(root.join("a/b.txt"), "SLASH-CONTENT").unwrap();
+    // 带 URL 敏感字符的文件名
+    std::fs::write(root.join("weird#name?x.txt"), "WEIRD").unwrap();
+    let cfg = Config::default();
+
+    let files = list_files(root, &cfg, None).await.unwrap();
+    let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+    assert!(
+        names.contains(&"a\\b.txt"),
+        "backslash filename must stay verbatim: {names:?}"
+    );
+    assert!(
+        names.contains(&"a/b.txt"),
+        "slash path must be intact: {names:?}"
+    );
+    assert_eq!(
+        names
+            .iter()
+            .filter(|n| **n == "a/b.txt" || **n == "a\\b.txt")
+            .count(),
+        2,
+        "two distinct objects must not collide into one name"
+    );
+
+    // URL: 逐段编码——反斜杠、#、? 各自转义
+    let with_proxy = list_files(root, &cfg, Some("/proxy")).await.unwrap();
+    for entry in &with_proxy {
+        if let Some(url) = &entry.file_proxy_url {
+            if entry.name == "a\\b.txt" {
+                assert!(
+                    url.contains("a%5Cb.txt"),
+                    "backslash must be percent-encoded: {url}"
+                );
+            }
+            if entry.name.starts_with("weird") {
+                assert!(
+                    url.contains("weird%23name%3Fx"),
+                    "# and ? must be encoded: {url}"
+                );
+            }
+        }
+    }
+
+    // get_project_content: 同一清单语义（含内容读取路径不因反斜杠走错对象）
+    let content = get_project_content(root, &cfg, None, None).await.unwrap();
+    let backslash = content
+        .files
+        .iter()
+        .find(|f| f.name == "a\\b.txt")
+        .expect("backslash entry");
+    assert_eq!(
+        backslash.contents.as_deref(),
+        Some("BACKSLASH-CONTENT"),
+        "content must belong to the actual backslash-named file"
+    );
+    let slash = content
+        .files
+        .iter()
+        .find(|f| f.name == "a/b.txt")
+        .expect("slash entry");
+    assert_eq!(slash.contents.as_deref(), Some("SLASH-CONTENT"));
+}

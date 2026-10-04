@@ -191,11 +191,27 @@ async fn proxy_request(
                 warn!("path rejected outside the Rust entry allowlist: {path}");
                 return Ok(not_found("path not served on this entry"));
             }
-            // 进程内直连（embed 形态装配后）：原请求重组后直接 oneshot 进
-            // file-server 的 axum Router，不经 loopback 转发
+            // 进程内直连（embed 形态装配后）：与转发路径共用同一请求策略——
+            // P1-5: hop-by-hop/Connection 动态 token/本跳凭据同样滤除后再进
+            // Router（我们即服务器, 但 X-Proxy-Token 是本跳准入凭据, 不得进
+            // 业务 handler）; 响应 body 同样走空闲预算（SSE 豁免）。
             #[cfg(feature = "embed-file-server")]
             if let Some(router) = in_process::take() {
-                return Ok(call_in_process(router, hyper::Request::from_parts(parts, body)).await);
+                let (mut embed_parts, embed_body) =
+                    hyper::Request::from_parts(parts, body).into_parts();
+                let mut filtered = hyper::HeaderMap::new();
+                for (name, value) in embed_parts.headers.drain() {
+                    if let Some(name) = name
+                        && should_forward_request_header(name.as_str(), &request_connection_tokens)
+                    {
+                        filtered.append(name, value);
+                    }
+                }
+                embed_parts.headers = filtered;
+                let response =
+                    call_in_process(router, hyper::Request::from_parts(embed_parts, embed_body))
+                        .await;
+                return Ok(apply_response_policy(response));
             }
             port
         }
@@ -249,33 +265,24 @@ async fn proxy_request(
         };
     match upstream_result {
         Ok(resp) => {
-            let (mut parts, body) = resp.into_parts();
-            // PX-06（响应方向）: 响应 Connection 声明的动态 token 与固定名单一并移除
-            let response_connection_tokens = connection_tokens(&parts.headers);
-            for h in HOP_BY_HOP {
-                parts.headers.remove(h);
-            }
-            for token in &response_connection_tokens {
-                parts.headers.remove(token.as_str());
-            }
-            parts.headers.remove(PROXY_TOKEN_HEADER);
-            // PX-07: 有限响应 body 的空闲预算——SSE（text/event-stream）是合法
-            // 长流豁免; 其余 body 空闲超预算以 io 错误终止（headers 已发,
-            // 不伪造另一个错误状态码; 上游/路径在日志留痕）。
+            let (parts, body) = resp.into_parts();
+            // PX-07/P1-5: 有限 body 在仍是 Incoming 时加空闲预算（SSE 豁免）;
+            // 头清理与 embed 路径共用 apply_response_policy。
             let is_sse = parts
                 .headers
                 .get("content-type")
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
-            let body = if is_sse {
+            let body: ProxyBody = if is_sse {
                 Box::pin(body.map_err(std::io::Error::other))
             } else {
-                body_with_idle_budget(body, path_query, RESPONSE_BODY_IDLE_BUDGET)
+                body_with_idle_budget(body, path_query.clone(), RESPONSE_BODY_IDLE_BUDGET)
             };
-            Ok(hyper::Response::from_parts(parts, body))
+            Ok(apply_response_policy(hyper::Response::from_parts(
+                parts, body,
+            )))
         }
         Err(e) => {
-            // 对外文案不泄露内部拓扑, 详情在日志
             error!(
                 "file-server 分流代理上游 127.0.0.1:{port} 请求失败 \
                  (path {path_query}, service_type={service_type:?}): {e}"
@@ -285,7 +292,21 @@ async fn proxy_request(
     }
 }
 
-/// PX-06: 解析 `Connection` 头声明的动态 hop-by-hop token（可多值、逗号分隔）。
+/// P1-5: 响应统一策略（转发与 embed 直连共用）——移除 Connection 动态 token
+/// 与固定 hop-by-hop 名单、剥除本跳凭据头。body 预算由调用方在包装前按各自
+/// body 类型处理（转发: Incoming→IdleBudgetBody; embed: 进程内 axum body）。
+fn apply_response_policy(mut response: hyper::Response<ProxyBody>) -> hyper::Response<ProxyBody> {
+    let response_connection_tokens = connection_tokens(response.headers());
+    for header in HOP_BY_HOP {
+        response.headers_mut().remove(header);
+    }
+    for token in &response_connection_tokens {
+        response.headers_mut().remove(token.as_str());
+    }
+    response.headers_mut().remove(PROXY_TOKEN_HEADER);
+    response
+}
+
 pub(crate) fn connection_tokens(headers: &hyper::HeaderMap) -> Vec<String> {
     headers
         .get_all("connection")
@@ -400,10 +421,36 @@ impl http_body::Body for IdleBudgetBody {
     }
 }
 
-/// AllRust 模式的 60000 入口白名单：file-server 语义路径（`/api/*`、`/health`、`/`、
-/// swagger `/api-docs*`）。TsFirst 的 rust 分支无需白名单——其判据本身已窄面。
+/// P1-5: Rust 入口的**具体路径边界**（Spec §3.4——不再用 `/api/*` 宽泛匹配）。
+/// 白名单 = 60000 入口的真实承载面（file-server 域 nest + userapp 域 + 健康/文档）,
+/// 按上游路由的实际 nest 前缀列举; 逐端点方法级列举不可审计且与 nest 结构耦合,
+/// 域前缀与路由装配同源维护。
+///
+/// 明确**排除**的上游宿主面（修复前被 `/api/*` 宽匹配放行）:
+/// - `/api/system/file-server/*`（rcoder-engine 管理端点: 代理启停管理）
+/// - `/api/v1/admin/*`（UserApp 错误页管理端点）
+///   以及全部非 `/api` 宿主面（`/chat`、`/agent/*`、`/internal/*`、`/devcomputer/*`、
+///   `/computer/pod/ensure` 等——本入口不承载）。
 pub(crate) fn all_rust_path_allowed(path: &str) -> bool {
-    path == "/health" || path == "/" || path.starts_with("/api/") || path.starts_with("/api-docs")
+    /// file-server 域 nest（crates/file-server/src/routes/mod.rs api_router 的
+    /// 五个 nest 前缀）+ userapp 域（userapp_top_router 全量在此前缀下）。
+    const FILE_ENTRY_DOMAIN_PREFIXES: [&str; 7] = [
+        "/api/project/",
+        "/api/git/",
+        "/api/build/",
+        "/api/computer/",
+        "/api/page/",
+        "/api/v1/userapp/",
+        "/api/version",
+    ];
+    // 域 nest 根本身（`/api/project` 无尾斜杠）也放行——与 nest 挂载语义一致。
+    let trimmed = path.trim_end_matches('/');
+    FILE_ENTRY_DOMAIN_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix) || trimmed == prefix.trim_end_matches('/'))
+        || path == "/health"
+        || path == "/"
+        || path.starts_with("/api-docs")
 }
 
 pub(crate) fn is_hop_by_hop(name: &str) -> bool {

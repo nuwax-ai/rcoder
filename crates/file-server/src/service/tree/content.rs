@@ -57,11 +57,12 @@ pub async fn list_files(
     Ok(files)
 }
 
-/// 计算相对 `root` 的 POSIX 风格路径。
+/// 计算相对 `root` 的宿主路径——P2/FS-08: 与 metadata/search/resolve/ZIP 统一走
+/// [`crate::path_safety::host_relative_to_wire`]（仅 Windows 归一分隔符; POSIX
+/// 反斜杠是文件名字符, 无条件替换会让 `a\b.txt` 与 `a/b.txt` 同名碰撞）。
 fn make_relative_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"))
+    let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
+    crate::path_safety::host_relative_to_wire(&relative)
 }
 
 async fn traverse(
@@ -134,7 +135,7 @@ async fn build_file_entry(
         binary,
         size_exceeded: Some(size_exceeded),
         contents,
-        file_proxy_url: proxy_path.map(|p| format!("{p}/{relative}")),
+        file_proxy_url: super::build_file_proxy_url(proxy_path, relative),
         is_link: None,
     })
 }

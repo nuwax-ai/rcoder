@@ -4,10 +4,9 @@
 //! 公开路径与 wire 不因搬移改变。
 
 use serde::{Deserialize, Serialize};
-use std::{
-    fs::File,
-    path::{Path, PathBuf},
-};
+#[cfg(unix)]
+use std::fs::File;
+use std::path::{Path, PathBuf};
 
 pub(super) const VERSION: u32 = 1;
 
@@ -123,18 +122,37 @@ pub(super) fn supervisor_reply(
         }
         _ => "RecoveryRequired",
     };
-    // PX-04: 同代核验后的 bound address——receipt 只在与 snapshot 同代且 Running
-    // 时提供（旧 owner 残留 receipt 不与新 snapshot 拼接）; --port 0 的真实
-    // 文件 API 地址经结构化 status 发布, 不依赖日志/PID。
-    let (bound_address, launch_request_id) = read(root)
-        .ok()
-        .flatten()
-        .filter(|receipt| {
-            snapshot.generation.as_deref() == Some(receipt.instance_id.as_str())
-                && receipt.phase == "Running"
-        })
-        .map(|receipt| (receipt.address, receipt.launch_request_id))
-        .unwrap_or((String::new(), None));
+    // Ready requires matching worker evidence and a real bound address. A
+    // missing, damaged, or foreign receipt must not become successful Running
+    // with an empty endpoint. Other management phases, especially Stopped,
+    // remain queryable without consuming a damaged business receipt.
+    let (bound_address, launch_request_id) = if snapshot.phase == runtime_supervisor::Phase::Ready {
+        let receipt =
+            read(root)?.ok_or("ready owner receipt is unavailable; readiness is unconfirmed")?;
+        if snapshot.generation.as_deref() != Some(receipt.instance_id.as_str())
+            || receipt.supervisor_id.as_deref() != Some(snapshot.supervisor_id.as_str())
+        {
+            return Err(
+                "ready owner receipt identity differs from supervisor; readiness is unconfirmed"
+                    .into(),
+            );
+        }
+        if receipt.phase != "Running" {
+            return Err(format!(
+                "ready owner receipt is {}; readiness is unconfirmed",
+                receipt.phase
+            ));
+        }
+        let address: std::net::SocketAddr = receipt.address.parse().map_err(
+            |_| "ready owner receipt has no valid bound address; readiness is unconfirmed",
+        )?;
+        if address.port() == 0 {
+            return Err("ready owner receipt address is unbound; readiness is unconfirmed".into());
+        }
+        (receipt.address, receipt.launch_request_id)
+    } else {
+        (String::new(), None)
+    };
     serde_json::to_string(
         &serde_json::json!({"version":2,"instance_id":snapshot.generation,
         "supervisor_id":snapshot.supervisor_id,"phase":phase,"stage":snapshot.phase,
@@ -142,4 +160,92 @@ pub(super) fn supervisor_reply(
         "address":bound_address,"launch_request_id":launch_request_id}),
     )
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ready_snapshot(root: &Path) -> runtime_supervisor::Snapshot {
+        runtime_supervisor::Snapshot {
+            version: 1,
+            binding: runtime_supervisor::Binding {
+                component: "file-server-proxy".into(),
+                resource: root.to_owned(),
+            },
+            supervisor_id: uuid::Uuid::new_v4().to_string(),
+            generation: Some(uuid::Uuid::new_v4().to_string()),
+            phase: runtime_supervisor::Phase::Ready,
+            intent: runtime_supervisor::Intent::Run,
+            operation_id: None,
+            error: None,
+            problem: None,
+        }
+    }
+
+    fn matching_receipt(snapshot: &runtime_supervisor::Snapshot) -> Receipt {
+        Receipt {
+            version: VERSION,
+            instance_id: snapshot.generation.clone().unwrap(),
+            token: "private-control-token-at-least-32-bytes".into(),
+            control_address: "127.0.0.1:12345".into(),
+            address: "127.0.0.1:54321".into(),
+            phase: "Running".into(),
+            supervisor_id: Some(snapshot.supervisor_id.clone()),
+            retirement_requested: false,
+            launch_request_id: Some(uuid::Uuid::new_v4().to_string()),
+        }
+    }
+
+    #[test]
+    fn ready_status_rejects_missing_corrupt_foreign_or_unbound_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let snapshot = ready_snapshot(root.path());
+        assert!(
+            supervisor_reply(snapshot.clone(), root.path()).is_err(),
+            "missing receipt cannot establish Running"
+        );
+        std::fs::write(root.path().join("owner.json"), b"{bad json").unwrap();
+        assert!(
+            supervisor_reply(snapshot.clone(), root.path()).is_err(),
+            "damaged receipt must be reported"
+        );
+        for case in ["generation", "supervisor", "phase", "address"] {
+            let mut receipt = matching_receipt(&snapshot);
+            match case {
+                "generation" => receipt.instance_id = uuid::Uuid::new_v4().to_string(),
+                "supervisor" => receipt.supervisor_id = Some(uuid::Uuid::new_v4().to_string()),
+                "phase" => receipt.phase = "Starting".into(),
+                "address" => receipt.address.clear(),
+                _ => unreachable!(),
+            }
+            write(root.path(), &receipt).unwrap();
+            assert!(
+                supervisor_reply(snapshot.clone(), root.path()).is_err(),
+                "invalid {case} cannot establish Running"
+            );
+        }
+        let receipt = matching_receipt(&snapshot);
+        write(root.path(), &receipt).unwrap();
+        let reply: serde_json::Value =
+            serde_json::from_str(&supervisor_reply(snapshot, root.path()).unwrap()).unwrap();
+        assert_eq!(reply["phase"], "Running");
+        assert_eq!(reply["address"], "127.0.0.1:54321");
+        assert_eq!(
+            reply["launch_request_id"],
+            receipt.launch_request_id.unwrap()
+        );
+    }
+
+    #[test]
+    fn stopped_status_remains_available_with_damaged_worker_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let mut snapshot = ready_snapshot(root.path());
+        snapshot.phase = runtime_supervisor::Phase::Stopped;
+        std::fs::write(root.path().join("owner.json"), b"{bad json").unwrap();
+        let reply: serde_json::Value =
+            serde_json::from_str(&supervisor_reply(snapshot, root.path()).unwrap()).unwrap();
+        assert_eq!(reply["phase"], "Stopped");
+        assert_eq!(reply["address"], "");
+    }
 }

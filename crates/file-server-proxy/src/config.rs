@@ -196,12 +196,26 @@ impl FileServerProxyConfig {
         }
     }
 
+    /// Read explicit settings without treating invalid UTF-8 as an unset value.
+    pub fn public_bind_env_setting() -> Result<Option<bool>, String> {
+        Self::public_bind_os_setting(std::env::var_os("FILE_SERVER_PROXY_PUBLIC_BIND"))
+    }
+
+    fn public_bind_os_setting(value: Option<std::ffi::OsString>) -> Result<Option<bool>, String> {
+        let raw = value
+            .map(|raw| {
+                raw.into_string()
+                    .map_err(|_| "FILE_SERVER_PROXY_PUBLIC_BIND must be valid UTF-8".to_owned())
+            })
+            .transpose()?;
+        Self::env_public_bind_setting(raw.as_deref())
+    }
+
     /// 叠加 env 声明（env 优先）：`FILE_SERVER_PROXY_PUBLIC_BIND` 显式值
     /// （true/false）覆盖 config 值；未设保持 config 值不变（含默认 true）；
     /// 非法显式值返回 Err（PX-10: 调用方必须让错误生效, 不得静默公开）。
     pub fn apply_public_bind_env(&mut self) -> Result<(), String> {
-        let raw = std::env::var("FILE_SERVER_PROXY_PUBLIC_BIND").ok();
-        if let Some(declared) = Self::env_public_bind_setting(raw.as_deref())? {
+        if let Some(declared) = Self::public_bind_env_setting()? {
             self.public_bind_declared = declared;
         }
         Ok(())
@@ -238,6 +252,26 @@ impl FileServerProxyConfig {
 #[cfg(test)]
 mod coordinated_dev_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_public_bind_is_not_an_unset_setting() {
+        use std::os::unix::ffi::OsStringExt as _;
+        assert!(
+            FileServerProxyConfig::public_bind_os_setting(Some(std::ffi::OsString::from_vec(
+                vec![0xff]
+            )))
+            .is_err()
+        );
+        assert_eq!(
+            FileServerProxyConfig::public_bind_os_setting(None).unwrap(),
+            None
+        );
+        assert_eq!(
+            FileServerProxyConfig::public_bind_os_setting(Some("false".into())).unwrap(),
+            Some(false)
+        );
+    }
 
     fn config(policy: RoutePolicy, coordinated: bool) -> FileServerProxyConfig {
         FileServerProxyConfig {

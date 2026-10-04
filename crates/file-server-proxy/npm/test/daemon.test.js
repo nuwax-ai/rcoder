@@ -47,3 +47,40 @@ test("explicit TS toolchain is preserved and partial configuration rejected", ()
 test("Electron executable is never silently used as Node", () => {
  assert.throws(() => compatibilityArgs("all_ts", undefined, {}, () => "/unused", {versions:{electron:"1"},execPath:"/Electron"}), /standalone Node/);
 });
+
+test("P1-1: control passes identity, request id and per-call budget to the CLI", async () => {
+  const fs = require("node:fs"), os = require("node:os"), path = require("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-ctl-"));
+  const fake = path.join(dir, "fake-control");
+  fs.writeFileSync(fake, `#!/usr/bin/env node
+process.stdout.write(JSON.stringify(process.argv.slice(2)));
+`);
+  fs.chmodSync(fake, 0o755);
+  try {
+    const out = await daemon.control(fake, "stop", ["--port", "0"], { PATH: process.env.PATH }, "inst-1", { requestId: "req-9", timeoutMs: 5000 });
+    assert.deepEqual(out, ["stop", "--native-owner", "--instance-id", "inst-1", "--request-id", "req-9", "--port", "0"]);
+    const minimal = await daemon.control(fake, "status", [], { PATH: process.env.PATH });
+    assert.deepEqual(minimal, ["status", "--native-owner"]);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("P1-1: waitRunning enforces the nominal budget across a slow status call", async () => {
+  const fs = require("node:fs"), os = require("node:os"), path = require("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-slow-"));
+  // A status that always hangs longer than the per-call cap: if waitRunning
+  // used the raw 65s default per call, a 1s budget would still block ~5s+.
+  const fake = path.join(dir, "fake-control");
+  fs.writeFileSync(fake, `#!/bin/sh
+sleep 30
+`);
+  fs.chmodSync(fake, 0o755);
+  const start = Date.now();
+  try {
+    await assert.rejects(
+      daemon.waitRunning(fake, [], { FILE_SERVER_PROXY_LAUNCH_ID: "x" }, { exitCode: null, signalCode: null }, 1000),
+      /readiness unknown/,
+    );
+    const elapsed = Date.now() - start;
+    assert.ok(elapsed < 15000, `budget must bound hung status calls (took ${elapsed}ms)`);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

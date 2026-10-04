@@ -10,6 +10,7 @@ use std::path::Path;
 use gix::Repository;
 use gix::actor::Signature;
 use gix::bstr::BString;
+
 use gix::date::{Time, parse::TimeBuf};
 use gix::hash::{ObjectId, oid};
 use gix::index::{entry::Stage, write::Options as IndexWriteOptions};
@@ -112,6 +113,12 @@ pub fn reset(
         .map_err(|e| map_git_err(e, "git head_tree_id_or_empty"))?
         .detach();
 
+    // P1-4: Hard 模式会写工作区——支持性预检（词法界内 + mode 支持, 含非 Unix
+    // symlink 整批拒绝）必须发生在任何 HEAD/ref 副作用之前: 预检失败时 HEAD、
+    // symbolic ref、index 与工作树均未发生预检前修改。
+    if mode == ResetMode::Hard {
+        preflight_tree_materialization(repo, &target_tree_id)?;
+    }
     move_branch_ref(repo, target_id, "reset", author_name, author_email)?;
 
     match mode {
@@ -182,22 +189,29 @@ fn overlay_tree_on_worktree_and_index(
         .open_index()
         .map_err(|e| map_git_err(e, "git open_index (checkout overlay)"))?;
 
+    // P1-4: overlay 逐条目也走共享安全物化器（整批预检 + 界内目录链 + leaf
+    // 不跟随 + mode 如实分派）——不再 raw create_dir_all/fs::write。
+    // overlay 语义保持: 不删除 target 之外的 index entry 与工作区文件。
+    let mut planned = Vec::new();
     for entry in target_index.entries() {
         if entry.stage() != Stage::Unconflicted {
             continue;
         }
         let path = entry.path_in(target_backing);
-        let blob = repo
-            .find_blob(entry.id)
-            .map_err(|e| map_git_err(e, "git find_blob (checkout overlay)"))?;
-        let dest = ensure_within_path(workdir, from_bstr(path))?;
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&dest, &blob.data)?;
-
+        let plan =
+            super::materialize::plan_index_entry(workdir, &from_bstr(path), entry.mode, entry.id)?;
+        planned.push((plan, entry.stat, entry.flags, path.to_owned()));
+    }
+    for (plan, stat, flags, path) in &planned {
+        super::materialize::materialize_planned(repo, workdir, plan)?;
         current_index.remove_entries(|_, candidate, _| candidate == path);
-        current_index.dangerously_push_entry(entry.stat, entry.id, entry.flags, entry.mode, path);
+        current_index.dangerously_push_entry(
+            *stat,
+            plan.blob_id,
+            *flags,
+            plan.index_mode(),
+            path.as_ref(),
+        );
     }
     current_index.sort_entries();
     current_index.remove_tree();
@@ -299,8 +313,31 @@ pub fn switch_branch(repo: &Repository, name: &str) -> AppResult<()> {
         .workdir()
         .ok_or_else(|| AppError::system("git repo has no workdir"))?;
 
+    // P1-4: 同 reset——物化预检先于 set_head_symbolic 的任何副作用。
+    preflight_tree_materialization(repo, &target_tree_id)?;
     set_head_symbolic(repo, &branch_full)?;
     apply_tree_to_worktree(repo, workdir, &target_tree_id, Some(&old_head_tree))?;
+    Ok(())
+}
+
+/// 整批支持性预检: 对 tree 的全部 index entry 走 plan_index_entry（词法界内 +
+/// mode 支持; 非 Unix 的 symlink 在此整批拒绝）, 不产生任何文件系统副作用。
+fn preflight_tree_materialization(repo: &Repository, tree_id: &oid) -> AppResult<()> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| AppError::system("git repo has no workdir"))?;
+    let index = repo
+        .index_from_tree(tree_id)
+        .map_err(|e| map_git_err(e, "git index_from_tree (preflight)"))?;
+    let backing = index.path_backing();
+    for entry in index.entries() {
+        super::materialize::plan_index_entry(
+            workdir,
+            &from_bstr(entry.path_in(backing)),
+            entry.mode,
+            entry.id,
+        )?;
+    }
     Ok(())
 }
 
@@ -454,6 +491,7 @@ mod tests {
     use super::*;
     use crate::error::AppError;
     use crate::service::git::{commit_indexed, init_repo, stage_path};
+
     use gix::open;
 
     fn fixture() -> (tempfile::TempDir, Repository, String, String) {
@@ -584,5 +622,154 @@ mod tests {
                 && status.conflicted.is_empty(),
             "worktree must stay clean after revert, got {status:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod p14_preflight_tests {
+    use super::*;
+    use crate::service::git::{commit_indexed, init_repo, stage_path};
+    use gix::bstr::BString;
+    use gix::open;
+
+    /// P1-4 反例(预检先于 HEAD 副作用): 目标 tree 含 gitlink(子模块) entry 时,
+    /// reset --hard 必须在移动分支 ref/HEAD **之前**整批拒绝——修复前
+    /// move_branch_ref 先执行, 预检失败后 HEAD 已指向新 target 而工作区未动。
+    #[test]
+    fn reset_hard_rejects_gitlink_before_any_head_mutation() {
+        let dir = tempfile::tempdir().expect("dir");
+        init_repo(dir.path(), "Test", "test@example.com").expect("init");
+        let repo = open(dir.path()).expect("open");
+        std::fs::write(dir.path().join("a.txt"), "v1\n").expect("file");
+        stage_path(&repo, "a.txt").expect("stage");
+        let c1 = commit_indexed(&repo, "c1", "Test", "test@example.com").expect("commit");
+
+        // 在 index 不变的情况下构造含 gitlink 的 commit（借底层 tree editor）。
+        let index = repo.open_index().expect("index");
+        let mut editor = repo.edit_tree(repo.empty_tree().id()).expect("editor");
+        let backing = index.path_backing();
+        for entry in index.entries() {
+            editor
+                .upsert(
+                    entry.path_in(backing).to_owned(),
+                    gix::objs::tree::EntryKind::Blob,
+                    entry.id,
+                )
+                .expect("upsert blob");
+        }
+        let base = ObjectId::from_hex(c1.as_bytes()).expect("c1 oid");
+        editor
+            .upsert(
+                BString::from("vendor/lib"),
+                gix::objs::tree::EntryKind::Commit,
+                base,
+            )
+            .expect("upsert gitlink");
+        let tree2 = editor.write().expect("tree2");
+        let head = repo.head().expect("head");
+        let parent = head.into_peeled_id().expect("parent").detach();
+        let sig = Signature {
+            name: BString::from("Test"),
+            email: BString::from("t@e.com"),
+            time: Time::now_local_or_utc(),
+        };
+        let mut buf_c = TimeBuf::default();
+        let mut buf_a = TimeBuf::default();
+        let c2 = repo
+            .commit_as(
+                sig.to_ref(&mut buf_c),
+                sig.to_ref(&mut buf_a),
+                "HEAD",
+                "c2 gitlink",
+                tree2,
+                std::iter::once(parent),
+            )
+            .expect("commit2")
+            .to_string();
+
+        let head_before = crate::service::git::read::resolve_rev(&repo, "HEAD")
+            .expect("head")
+            .map(|id| id.to_string())
+            .expect("head exists");
+        let branch_before = repo
+            .find_reference("HEAD")
+            .expect("head ref")
+            .follow()
+            .expect("follow")
+            .map(|target| target.id().to_string())
+            .expect("branch target");
+
+        let error = reset(&repo, &c2, ResetMode::Hard, "Test", "test@example.com")
+            .expect_err("gitlink target must be rejected");
+
+        assert!(matches!(error, AppError::Business(_)), "{error:?}");
+        let head_after = crate::service::git::read::resolve_rev(&repo, "HEAD")
+            .expect("head")
+            .map(|id| id.to_string())
+            .expect("head exists");
+        assert_eq!(
+            head_before, head_after,
+            "HEAD must not move when preflight rejects"
+        );
+        let branch_after = repo
+            .find_reference("HEAD")
+            .expect("head ref")
+            .follow()
+            .expect("follow")
+            .map(|target| target.id().to_string())
+            .expect("branch target");
+        assert_eq!(branch_before, branch_after, "branch ref must not move");
+        assert_eq!(
+            std::fs::read(dir.path().join("a.txt")).unwrap(),
+            b"v1\n",
+            "worktree untouched"
+        );
+    }
+
+    /// P1-4: checkout overlay 走共享物化器——工作区已有外向目录链接时, 目标
+    /// tree 中该前缀下的文件必须被拒绝, 不再沿链接写出界。
+    #[cfg(unix)]
+    #[test]
+    fn checkout_overlay_rejects_outward_directory_link_via_shared_materializer() {
+        let dir = tempfile::tempdir().expect("dir");
+        let workdir = dir.path().join("ws");
+        std::fs::create_dir_all(&workdir).expect("ws");
+        init_repo(&workdir, "Test", "test@example.com").expect("init");
+        let repo = open(&workdir).expect("open");
+        std::fs::write(workdir.join("a.txt"), "v1\n").expect("file");
+        stage_path(&repo, "a.txt").expect("stage");
+        let c1 = commit_indexed(&repo, "c1", "Test", "test@example.com").expect("commit");
+        // 第二个提交在 sub/ 下放文件（overlay 目标）。
+        std::fs::create_dir_all(workdir.join("sub")).expect("sub");
+        std::fs::write(workdir.join("sub/file.txt"), "v2\n").expect("sub file");
+        stage_path(&repo, "sub/file.txt").expect("stage sub");
+        let c2 = commit_indexed(&repo, "c2", "Test", "test@example.com").expect("commit2");
+        // 把 sub 变成指向工作区外的目录链接（工作区父目录 = 真正外向）。
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("sentinel"), b"KEEP").expect("sentinel");
+        std::fs::remove_dir_all(workdir.join("sub")).expect("remove sub");
+        std::os::unix::fs::symlink(&outside, workdir.join("sub")).expect("outward link");
+
+        let error = checkout_tree(&repo, &c2).expect_err("overlay must refuse the link path");
+        assert!(
+            matches!(error, AppError::Validation(..)),
+            "expected validation, got: {error:?}"
+        );
+        assert!(
+            !outside.join("file.txt").exists(),
+            "no file may be written through the link"
+        );
+        assert_eq!(
+            std::fs::read(outside.join("sentinel")).unwrap(),
+            b"KEEP",
+            "outside content intact"
+        );
+        // 非 sub 前缀的条目照常物化（overlay 语义保持）。
+        assert_eq!(
+            std::fs::read_to_string(workdir.join("a.txt")).unwrap(),
+            "v1\n"
+        );
+        drop(c1);
     }
 }

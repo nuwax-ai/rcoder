@@ -57,30 +57,86 @@ pub use config::{
     AGENT_FILE_SERVER_PORT, FileServerProxyConfig, NUWAX_FILE_SERVER_INTERNAL_PORT, RoutePolicy,
     SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP, USERAPP_PATH_PREFIX, Upstream, parse_route_policy,
 };
-pub use instance::{init, status, stop, try_start};
+pub use instance::{init, init_result, status, stop, try_start};
 
 /// PX-03: native 形态文件 API 凭据落盘——与控制通道凭据（receipt token）分离;
 /// `credentials.json` 权限 0600, 只供宿主 helper 在 owner root 下读取。
 /// 令牌不进日志/stdout/回执/argv; 写失败由调用方 fail-fast。
 pub fn write_native_credentials(root: &std::path::Path, token: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = tempfile::NamedTempFile::new_in(root)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let path = root.join("credentials.json");
-        std::fs::write(
-            &path,
-            serde_json::json!({ "file_api_token": token }).to_string(),
-        )?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(())
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    #[cfg(not(unix))]
+    // Write only to the private temporary handle: the published path may still
+    // be a stale file or symlink, and must never be opened or truncated here.
+    serde_json::to_writer(&mut file, &serde_json::json!({ "file_api_token": token }))
+        .map_err(std::io::Error::other)?;
+    file.flush()?;
+    file.as_file().sync_all()?;
+    process_utils::atomic_file::persist(file, &root.join("credentials.json"))?;
+    #[cfg(unix)]
     {
-        // Windows: ACL 收敛属 F8/实机验证范围; 先以默认权限落盘并如实声明。
-        std::fs::write(
-            root.join("credentials.json"),
-            serde_json::json!({ "file_api_token": token }).to_string(),
-        )
+        std::fs::File::open(root)?.sync_all()?;
+    }
+    // Windows inherits the state directory ACL; explicit ACL validation is
+    // still a separate native-platform acceptance requirement.
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod credential_tests {
+    use super::write_native_credentials;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn credential_publication_replaces_symlink_without_modifying_target() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("unrelated.json");
+        std::fs::write(&target, b"keep original bytes").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let credentials = root.path().join("credentials.json");
+        symlink(&target, &credentials).unwrap();
+
+        write_native_credentials(root.path(), "first-private-token").unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep original bytes");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert!(
+            !std::fs::symlink_metadata(&credentials)
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::metadata(&credentials)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let first: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&credentials).unwrap()).unwrap();
+        assert_eq!(first["file_api_token"], "first-private-token");
+
+        write_native_credentials(root.path(), "second-private-token").unwrap();
+        let second: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&credentials).unwrap()).unwrap();
+        assert_eq!(second["file_api_token"], "second-private-token");
+        assert_eq!(
+            std::fs::metadata(&credentials)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 }
 pub use proxy::ProxyBody;

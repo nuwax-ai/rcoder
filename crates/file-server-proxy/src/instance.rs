@@ -19,7 +19,7 @@ struct RunningInstance {
 }
 
 /// 配置注册（main 无条件调用，段缺失时用 Default——本地 dev 也可经 admin API 拉起）。
-static CONFIG: OnceLock<FileServerProxyConfig> = OnceLock::new();
+static CONFIG: OnceLock<Result<FileServerProxyConfig, String>> = OnceLock::new();
 
 /// 当前实例（None = 未运行，60000 未被本代理占用）。
 static INSTANCE: tokio::sync::Mutex<Option<RunningInstance>> = tokio::sync::Mutex::const_new(None);
@@ -29,6 +29,12 @@ static INSTANCE: tokio::sync::Mutex<Option<RunningInstance>> = tokio::sync::Mute
 /// main 启动时调用；config.yml 无 `file_server_proxy` 段时传
 /// [`FileServerProxyConfig::default`]（不自动启动，仅让运行时 `start` 可用）。
 pub fn init(config: FileServerProxyConfig) {
+    init_result(Ok(config));
+}
+
+/// Register the assembly result, including a rejected configuration. Admin
+/// start/restart must not turn a startup validation error into public defaults.
+pub fn init_result(config: Result<FileServerProxyConfig, String>) {
     if CONFIG.set(config).is_err() {
         tracing::debug!("file-server-proxy config already registered, keep first");
     }
@@ -132,10 +138,10 @@ pub async fn try_start() -> Result<String, String> {
     // 锁文件随进程退出释放（std 文件锁）。JS 启动器的 PID 文件只是
     // 观察线索，不再是归属权威——锁竞争方在此处决出唯一胜者。
     // 配置只读一次（锁域与后续 bind 共用同一份，避免两次读取间被 init 的窗口）。
-    let config = CONFIG.get().cloned().unwrap_or_else(|| {
-        warn!("file-server-proxy 配置未 init, 回落默认端口 (60000 → 8086/60001)");
-        FileServerProxyConfig::default()
-    });
+    let config = CONFIG
+        .get()
+        .ok_or("file-server proxy configuration has not been initialized")?
+        .clone()?;
     let lock_file = instance_lock_path(&config)?;
 
     // N07（修订）：非 loopback + 无令牌 + **显式 public_bind_declared:false**

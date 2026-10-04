@@ -183,7 +183,7 @@ pub struct ExplicitEntry {
 /// 同一打包目标的串行守卫: 持有期间从生成临时文件到发布 rename 全程独占。
 /// Unix 用目标父目录下的 flock 哨兵文件 (与 storage_contents 的 retirement
 /// lock 同模式, 跨进程一致); 非 Unix 退化为进程内全局串行。
-struct PackTargetGuard {
+pub(crate) struct PackTargetGuard {
     #[cfg(unix)]
     _flock: std::fs::File,
     #[cfg(not(unix))]
@@ -191,7 +191,7 @@ struct PackTargetGuard {
 }
 
 #[cfg(unix)]
-fn acquire_pack_lock(zip_path: &Path) -> AppResult<PackTargetGuard> {
+pub(crate) fn acquire_pack_lock(zip_path: &Path) -> AppResult<PackTargetGuard> {
     use rustix::fs::{FlockOperation, flock};
     use sha2::Digest as _;
     let parent = zip_path
@@ -205,7 +205,11 @@ fn acquire_pack_lock(zip_path: &Path) -> AppResult<PackTargetGuard> {
         use std::fmt::Write as _;
         let _ = write!(hex, "{byte:02x}");
     }
-    let lock_path = parent.join(format!(".rcoder-zip-pack-{hex}.lock"));
+    // P2: 锁文件名只用 hex 的前 16 个字符——目标路径中含时间戳/随机后缀的
+    // 临时下载目标不再每个都产生永久 inode; 同目录下极小概率的截断碰撞
+    // 只导致不必要的互斥等待（flock 是共享语义屏障, 不是正确性边界——
+    // 原子发布本身保证完整性）, 不影响正确性。
+    let lock_path = parent.join(format!(".rcoder-zip-pack-{}.lock", &hex[..16]));
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -218,7 +222,7 @@ fn acquire_pack_lock(zip_path: &Path) -> AppResult<PackTargetGuard> {
 }
 
 #[cfg(not(unix))]
-fn acquire_pack_lock(_zip_path: &Path) -> AppResult<PackTargetGuard> {
+pub(crate) fn acquire_pack_lock(_zip_path: &Path) -> AppResult<PackTargetGuard> {
     static PACK_SERIALIZE: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(std::sync::Mutex::default);
     let guard = PACK_SERIALIZE
@@ -396,14 +400,6 @@ fn walk_and_add<W: std::io::Write + std::io::Seek>(
             if opts.skip_hardlinks && hardlinked(&meta) {
                 continue;
             }
-            // 显式导出 entry 替代源内同名文件: 归档内恰一个该 entry (FS-02)。
-            if opts
-                .explicit_entry
-                .as_ref()
-                .is_some_and(|explicit| explicit.name == name)
-            {
-                continue;
-            }
             let rel = crate::path_safety::host_relative_to_wire(
                 &path
                     .strip_prefix(root)
@@ -415,6 +411,15 @@ fn walk_and_add<W: std::io::Write + std::io::Seek>(
                 Some(p) => format!("{p}{rel}"),
                 None => rel,
             };
+            // Replace the exact archive entry, preserving nested files that
+            // happen to share its basename.
+            if opts
+                .explicit_entry
+                .as_ref()
+                .is_some_and(|explicit| explicit.name == entry_name)
+            {
+                continue;
+            }
             let opts_zip = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             zip.start_file(&entry_name, opts_zip)
@@ -542,6 +547,56 @@ mod tests {
         let mut buf = Vec::new();
         Read::read_to_end(&mut entry, &mut buf).unwrap();
         buf
+    }
+
+    #[test]
+    fn explicit_entry_preserves_nested_same_basename() {
+        let fixture = tempfile::tempdir().unwrap();
+        let src = fixture.path().join("src");
+        fs::create_dir_all(src.join("nested")).unwrap();
+        fs::write(src.join("cpage_config.json"), b"original root").unwrap();
+        fs::write(
+            src.join("nested/cpage_config.json"),
+            b"nested business data",
+        )
+        .unwrap();
+        let target = fixture.path().join("export.zip");
+        pack_blocking(
+            &src,
+            &target,
+            &PackOpts {
+                explicit_entry: Some(ExplicitEntry {
+                    name: "cpage_config.json".into(),
+                    bytes: b"export metadata".to_vec(),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let names = entry_names(&target);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == "cpage_config.json")
+                .count(),
+            1
+        );
+        assert!(
+            names.contains(&"nested/cpage_config.json".into()),
+            "{names:?}"
+        );
+        assert_eq!(
+            entry_content(&target, "cpage_config.json"),
+            b"export metadata"
+        );
+        assert_eq!(
+            entry_content(&target, "nested/cpage_config.json"),
+            b"nested business data"
+        );
+        assert_eq!(
+            fs::read(src.join("cpage_config.json")).unwrap(),
+            b"original root"
+        );
     }
 
     /// FS-08 反例: POSIX 文件名中的反斜杠是名字的一部分——打包 entry 名必须

@@ -611,7 +611,9 @@ pub(super) async fn drain_operation_events(
 ///   （R06：真实 owner 成功也必须产生平台所需 Done，Failed 携带错误明细）；
 /// - 契约外 event_name → None（旧管道消费者按未知扩展忽略）。
 pub(super) fn to_legacy_evt(record: &shared_types::RuntimeEventRecord) -> Option<String> {
-    use shared_types::{AppCliFailedService, AppCliOrchestrationEvent as Evt};
+    use shared_types::{
+        AppCliEvtDecodeError, AppCliFailedService, AppCliOrchestrationEvent as Evt,
+    };
     let name = record.event_name.as_deref()?;
     let event = match name {
         "Completed" => Evt::OrchestrationDone { failed: Vec::new() },
@@ -629,22 +631,34 @@ pub(super) fn to_legacy_evt(record: &shared_types::RuntimeEventRecord) -> Option
                 }],
             }
         }
-        "service_starting" => Evt::ServiceStarting {
-            service: record.service.clone()?,
-        },
-        "service_start_ok" => Evt::ServiceStartOk {
-            service: record.service.clone()?,
-        },
-        "service_start_fail" => Evt::ServiceStartFail {
-            service: record.service.clone()?,
-            error: record
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.get("error"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("service failed")
-                .into(),
-        },
+        "service_starting" | "service_start_ok" | "service_start_fail" | "orchestration_done" => {
+            let mut value = serde_json::json!({"event": name});
+            if let Some(service) = &record.service {
+                value["service"] = serde_json::Value::String(service.clone());
+            }
+            let payload_key = match name {
+                "orchestration_done" => Some("failed"),
+                "service_start_fail" => Some("error"),
+                _ => None,
+            };
+            if let Some(key) = payload_key
+                && let Some(field) = record.payload.as_ref().and_then(|payload| payload.get(key))
+            {
+                value[key] = field.clone();
+            }
+            let line = value.to_string();
+            match Evt::decode(&line) {
+                Ok(event) => event,
+                // Keep known malformed events visible to the downstream
+                // decoder. Missing/wrong fields must not become a fabricated
+                // default error or disappear as an unknown extension.
+                Err(AppCliEvtDecodeError::MalformedKnownEvent { .. }) => return Some(line),
+                Err(error) => {
+                    tracing::warn!(?error, "owner event adapter could not decode a known event");
+                    return None;
+                }
+            }
+        }
         // 契约外 stage/扩展记录: 无对应消费者, 跳过
         _ => return None,
     };
@@ -654,6 +668,63 @@ pub(super) fn to_legacy_evt(record: &shared_types::RuntimeEventRecord) -> Option
 #[cfg(test)]
 mod r09_tests {
     use super::*;
+
+    fn runtime_event(
+        name: &str,
+        payload: Option<serde_json::Value>,
+    ) -> shared_types::RuntimeEventRecord {
+        shared_types::RuntimeEventRecord {
+            operation_id: "operation".into(),
+            sequence: 1,
+            runtime_instance_id: "instance".into(),
+            stage: "orchestration".into(),
+            service: None,
+            event_name: Some(name.into()),
+            payload,
+        }
+    }
+
+    #[test]
+    fn runtime_orchestration_done_preserves_failed_services() {
+        let record = runtime_event(
+            "orchestration_done",
+            Some(
+                serde_json::json!({"failed": [{"service": "api", "error": "readiness timed out"}]}),
+            ),
+        );
+        let line = to_legacy_evt(&record).expect("known terminal summary must be forwarded");
+        assert_eq!(
+            shared_types::AppCliOrchestrationEvent::decode(&line).unwrap(),
+            shared_types::AppCliOrchestrationEvent::OrchestrationDone {
+                failed: vec![shared_types::AppCliFailedService {
+                    service: "api".into(),
+                    error: "readiness timed out".into(),
+                }],
+            },
+        );
+    }
+
+    #[test]
+    fn known_malformed_runtime_event_remains_distinct_from_unknown_extension() {
+        let mut wrong_error =
+            runtime_event("service_start_fail", Some(serde_json::json!({"error": 42})));
+        wrong_error.service = Some("api".into());
+        let mut missing_error = runtime_event("service_start_fail", None);
+        missing_error.service = Some("api".into());
+        for record in [
+            runtime_event("orchestration_done", None),
+            runtime_event("service_start_ok", None),
+            wrong_error,
+            missing_error,
+        ] {
+            let line = to_legacy_evt(&record).expect("known damaged event remains observable");
+            assert!(matches!(
+                shared_types::AppCliOrchestrationEvent::decode(&line),
+                Err(shared_types::AppCliEvtDecodeError::MalformedKnownEvent { .. }),
+            ));
+        }
+        assert!(to_legacy_evt(&runtime_event("future_extension", None)).is_none());
+    }
 
     #[test]
     fn identity_uses_canonical_project_not_workspace_leaf() {

@@ -16,10 +16,11 @@ function loadCredential(ownerRoot) {
 }
 
 function authorizedFetch(token) {
-  return (url, init = {}) => fetch(url, {
-    ...init,
-    headers: { ...(init.headers || {}), "X-Proxy-Token": token },
-  });
+  return (url, init = {}) => {
+    const headers = new Headers(init.headers);
+    headers.set("X-Proxy-Token", token);
+    return fetch(url, { ...init, headers });
+  };
 }
 
 // Long-lived SSE: headers arrive, then events stream indefinitely. The helper

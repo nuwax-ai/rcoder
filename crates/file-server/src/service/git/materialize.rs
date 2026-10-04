@@ -53,6 +53,14 @@ pub(crate) struct PlannedEntry {
     pub dest: PathBuf,
     pub kind: EntryKind,
     pub blob_id: gix::ObjectId,
+    mode: IndexMode,
+}
+
+impl PlannedEntry {
+    /// 原 entry 的 index mode（overlay 回填 index 时复用）。
+    pub(crate) fn index_mode(&self) -> IndexMode {
+        self.mode
+    }
 }
 
 /// 词法预检 index entry：路径界内 + mode 支持。gitlink 等未承诺对象在此
@@ -63,6 +71,14 @@ pub(crate) fn plan_index_entry(
     mode: IndexMode,
     blob_id: gix::ObjectId,
 ) -> AppResult<PlannedEntry> {
+    #[cfg(not(unix))]
+    if mode == IndexMode::SYMLINK {
+        // P1-4: 不支持的对象在整批 plan 阶段拒绝——不能先写前面的文件再失败。
+        return Err(AppError::business(format!(
+            "git entry '{}' is a symlink, which requires a Unix filesystem; refusing partial materialization",
+            rel.display()
+        )));
+    }
     let Some(kind) = EntryKind::from_index_mode(mode) else {
         return Err(AppError::business(format!(
             "git entry '{}' has unsupported mode {mode:?} (gitlink/submodule entries are not supported); refusing partial materialization",
@@ -75,6 +91,7 @@ pub(crate) fn plan_index_entry(
         dest,
         kind,
         blob_id,
+        mode,
     })
 }
 
@@ -91,12 +108,18 @@ pub(crate) fn plan_tree_entry(
             rel.display()
         )));
     };
+    let mode = match kind {
+        EntryKind::File => IndexMode::FILE,
+        EntryKind::Executable => IndexMode::FILE_EXECUTABLE,
+        EntryKind::Symlink => IndexMode::SYMLINK,
+    };
     let dest = crate::path_safety::ensure_within_path(workdir, rel)?;
     Ok(PlannedEntry {
         rel: rel.to_path_buf(),
         dest,
         kind,
         blob_id: id.detach(),
+        mode,
     })
 }
 
@@ -126,11 +149,20 @@ pub(crate) fn materialize_bytes(
     kind: EntryKind,
     data: &[u8],
 ) -> AppResult<()> {
+    #[cfg(not(unix))]
+    if kind == EntryKind::Symlink {
+        // Reject before replacing any existing leaf on unsupported platforms.
+        return Err(AppError::business(
+            "symlink entries require a Unix filesystem",
+        ));
+    }
     ensure_real_dir_chain(workdir, rel)?;
     match std::fs::symlink_metadata(dest) {
-        Ok(meta) if meta.file_type().is_symlink() => {
+        Ok(meta)
+            if meta.file_type().is_symlink() || (kind == EntryKind::Symlink && meta.is_file()) =>
+        {
             std::fs::remove_file(dest).map_err(|e| {
-                AppError::system(format!("remove existing link {}: {e}", dest.display()))
+                AppError::system(format!("replace existing git leaf {}: {e}", dest.display()))
             })?;
         }
         Ok(_) => {}
@@ -161,21 +193,7 @@ pub(crate) fn materialize_bytes(
             }
         }
         EntryKind::File | EntryKind::Executable => {
-            write_leaf_nofollow(dest, data)?;
-            if kind == EntryKind::Executable {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))
-                        .map_err(|e| {
-                            AppError::system(format!("set executable bit {}: {e}", dest.display()))
-                        })?;
-                }
-                #[cfg(not(unix))]
-                {
-                    // Windows 无执行位概念: 按普通文件物化（如实声明, 不伪造）。
-                }
-            }
+            write_leaf_nofollow(dest, data, kind)?;
         }
     }
     Ok(())
@@ -240,15 +258,129 @@ fn ensure_real_dir_chain(workdir: &Path, rel: &Path) -> AppResult<()> {
 }
 
 /// leaf 写入：`O_NOFOLLOW` 创建/截断（Unix）。dest 若在预检后被换成链接，
-/// 这里得到 ELOOP 而不是跟随写出工作区。与 UserApp 上传共用同一原语。
-fn write_leaf_nofollow(dest: &Path, data: &[u8]) -> AppResult<()> {
-    crate::path_safety::write_file_nofollow_blocking(dest, data)
-        .map_err(|e| AppError::system(format!("create {}: {e}", dest.display())))
+/// 这里得到 ELOOP 而不是跟随写出工作区。保留打开的 FD 来调整执行位，
+/// 避免写入后重新按路径 chmod 跟随新链接。
+fn write_leaf_nofollow(dest: &Path, data: &[u8], kind: EntryKind) -> AppResult<()> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags};
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        // Keep the opened handle for permission changes: a replacement symlink
+        // after writing must never redirect chmod to an external file.
+        let fd = rustix::fs::openat(
+            rustix::fs::CWD,
+            dest,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+        )
+        .map_err(|e| AppError::system(format!("create {}: {e}", dest.display())))?;
+        let mut file = std::fs::File::from(fd);
+        file.write_all(data)
+            .map_err(|e| AppError::system(format!("write {}: {e}", dest.display())))?;
+        let mode = file
+            .metadata()
+            .map_err(|e| {
+                AppError::system(format!("inspect opened git leaf {}: {e}", dest.display()))
+            })?
+            .permissions()
+            .mode();
+        // Git records only the executable distinction. Preserve read/write
+        // permissions (including the creating process's umask) in both cases.
+        let mode = if kind == EntryKind::Executable {
+            mode | 0o111
+        } else {
+            mode & !0o111
+        };
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+            .map_err(|e| AppError::system(format!("set git leaf mode {}: {e}", dest.display())))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no executable permission bit.
+        let _ = kind;
+        crate::path_safety::write_file_nofollow_blocking(dest, data)
+            .map_err(|e| AppError::system(format!("create {}: {e}", dest.display())))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn commit_fixture_path(repo: &gix::Repository, path: &str, message: &str) -> String {
+        super::super::stage_path(repo, path).expect("stage fixture");
+        super::super::commit_indexed(repo, message, "Test", "test@example.com")
+            .expect("commit fixture")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_reset_restores_file_and_symlink_transitions() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        super::super::init_repo(fixture.path(), "Test", "test@example.com").expect("init");
+        let repo = gix::open(fixture.path()).expect("open repository");
+        let path = fixture.path().join("entry");
+        std::os::unix::fs::symlink("target.txt", &path).expect("fixture link");
+        let link_commit = commit_fixture_path(&repo, "entry", "link");
+        std::fs::remove_file(&path).expect("remove fixture link");
+        std::fs::write(&path, b"regular contents").expect("fixture file");
+        let file_commit = commit_fixture_path(&repo, "entry", "file");
+
+        super::super::ops::reset(
+            &repo,
+            &link_commit,
+            super::super::ops::ResetMode::Hard,
+            "Test",
+            "test@example.com",
+        )
+        .expect("replace a regular file with the committed link");
+        assert_eq!(std::fs::read_link(&path).unwrap(), Path::new("target.txt"));
+        assert!(super::super::get_status(&repo).unwrap().modified.is_empty());
+
+        super::super::ops::reset(
+            &repo,
+            &file_commit,
+            super::super::ops::ResetMode::Hard,
+            "Test",
+            "test@example.com",
+        )
+        .expect("replace a link with the committed regular file");
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+        assert_eq!(std::fs::read(&path).unwrap(), b"regular contents");
+        assert!(super::super::get_status(&repo).unwrap().modified.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_reset_clears_executable_mode_for_plain_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().expect("fixture");
+        super::super::init_repo(fixture.path(), "Test", "test@example.com").expect("init");
+        let repo = gix::open(fixture.path()).expect("open repository");
+        let path = fixture.path().join("entry.sh");
+        std::fs::write(&path, b"#!/bin/sh\n").expect("fixture file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let plain_commit = commit_fixture_path(&repo, "entry.sh", "plain");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        commit_fixture_path(&repo, "entry.sh", "executable");
+
+        super::super::ops::reset(
+            &repo,
+            &plain_commit,
+            super::super::ops::ResetMode::Hard,
+            "Test",
+            "test@example.com",
+        )
+        .expect("restore non-executable commit");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o111,
+            0
+        );
+        assert!(super::super::get_status(&repo).unwrap().modified.is_empty());
+    }
 
     /// FS-03 反例: 工作区已有外向目录链接时, 物化不得沿链接写出界。
     /// 修复前 `create_dir_all` + `fs::write` 跟随链接写外部文件。

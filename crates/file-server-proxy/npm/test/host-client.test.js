@@ -24,19 +24,44 @@ test("loadCredential rejects credentials without a token", () => {
 });
 
 test("authorizedFetch injects the token as a hop header without leaking into URLs", async () => {
+  const originalFetch = globalThis.fetch;
   const call = hostClient.authorizedFetch("tok-1");
   let captured;
   globalThis.fetch = async (url, init) => { captured = { url: String(url), init }; return new Response("{}"); };
   try {
     await call("http://127.0.0.1:60000/api/v1/userapp/get-file-list?app_id=a");
-    assert.equal(captured.init.headers["X-Proxy-Token"], "tok-1");
+    assert.equal(new Headers(captured.init.headers).get("X-Proxy-Token"), "tok-1");
     assert.ok(!captured.url.includes("tok-1"), "token must never appear in the URL");
   } finally {
-    delete globalThis.fetch;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("authorizedFetch preserves standard Headers and replaces token case-insensitively", async () => {
+  const originalFetch = globalThis.fetch;
+  let captured;
+  globalThis.fetch = async (_url, init) => {
+    captured = new Headers(init.headers);
+    return new Response("{}");
+  };
+  try {
+    for (const headers of [
+      new Headers({ "content-type": "application/json", "x-proxy-token": "old-token" }),
+      { "Content-Type": "application/json", "x-proxy-token": "old-token" },
+      [["Content-Type", "application/json"], ["X-Proxy-Token", "old-token"]],
+    ]) {
+      await hostClient.authorizedFetch("new-token")("http://127.0.0.1:60000/api/version", { headers });
+      assert.equal(captured.get("content-type"), "application/json");
+      assert.equal(captured.get("x-proxy-token"), "new-token");
+      assert.equal(new Headers(headers).get("x-proxy-token"), "old-token", "caller headers are unchanged");
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 
 test("readEventSource parses SSE events and keeps the stream open-ended", async () => {
+  const originalFetch = globalThis.fetch;
   const events = [];
   const encoder = new TextEncoder();
   const body = (async function* () {
@@ -51,6 +76,6 @@ test("readEventSource parses SSE events and keeps the stream open-ended", async 
       { event: "message", data: "{\"line\":\"two\"}" },
     ]);
   } finally {
-    delete globalThis.fetch;
+    globalThis.fetch = originalFetch;
   }
 });

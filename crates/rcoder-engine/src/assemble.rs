@@ -254,12 +254,8 @@ pub async fn assemble(
     // 则不监听 60000）。运行时启停经
     // /api/system/file-server/*（`rcoder file-server {start,stop,restart,status}`）。
     // 预览协调启用时：dev 生命周期 7 端点在所有策略下改路 Rust 上游（coordinated_dev_lifecycle）。
-    // N07 内嵌形态 env 通道（2026-09-19 线上事故治本）：config.yml 两条
-    // 构造路径此前都不读 FILE_SERVER_PROXY_PUBLIC_BIND——env 只对独立进程
-    // 形态生效，内嵌形态"env 设了却没用"。此处收口统一叠加（OR 语义，
-    // 与独立进程形态同词表"1"/"true"）。
-    // PX-10: 非法显式 env（如 flase）不得静默落回公开缺省——跳过代理装配并
-    // 显式报错, 主服务其余装配不受影响。
+    // env 显式值优先于 config。拒绝结果也注册到代理，确保之后的管理
+    // start/restart 返回同一配置错误，不旁路成默认公开监听。
     let proxy_registered = match file_server_embed::embedded_proxy_config(
         bootstrap_result.config.file_server_proxy.clone(),
         preview_enabled,
@@ -271,6 +267,7 @@ pub async fn assemble(
         }
         Err(reason) => {
             error!("file-server 分流代理装配跳过（FILE_SERVER_PROXY_PUBLIC_BIND 非法）: {reason}");
+            file_server_proxy::init_result(Err(reason));
             false
         }
     };

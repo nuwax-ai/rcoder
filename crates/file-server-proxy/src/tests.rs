@@ -233,6 +233,10 @@ fn all_rust_whitelist_gates_rust_upstream_surface() {
         "/api/version",
         "/api/computer/create-workspace",
         "/api/v1/userapp/dev/start",
+        "/api/project/get-file-list",
+        "/api/git/status",
+        "/api/build/start-dev",
+        "/api/page/",
         "/health",
         "/",
         "/api-docs/openapi.json",
@@ -246,6 +250,12 @@ fn all_rust_whitelist_gates_rust_upstream_surface() {
         "/agent-mgmt/agents/install-from-url",
         "/ready",
         "/proxy/3000/x",
+        // P1-5: 上游宿主的 /api/* 管理面不得经文件入口暴露
+        "/api/system/file-server/stop",
+        "/api/system/file-server/status",
+        "/api/v1/admin/userapp/error-page",
+        // 未列出的域前缀不放行
+        "/api/unknown-domain/action",
     ] {
         assert!(!all_rust_path_allowed(path), "{path} 应拒绝(白名单外)");
     }

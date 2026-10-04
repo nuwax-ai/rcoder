@@ -466,13 +466,11 @@ async fn run() {
         // "默认严格+各处声明"的门只挡自己人）。独立进程形态无 config.yml
         // 载体，env 是唯一显式收紧通道；亦可用 HOST=127.0.0.1+令牌双保险。
         // PX-10: 非法显式值（flase/yes/…）直接拒启, 不静默落回公开缺省。
-        public_bind_declared: FileServerProxyConfig::env_public_bind_setting(
-            std::env::var("FILE_SERVER_PROXY_PUBLIC_BIND")
-                .ok()
-                .as_deref(),
-        )
-        .unwrap_or_else(|reason| fail(format!("invalid FILE_SERVER_PROXY_PUBLIC_BIND: {reason}")))
-        .unwrap_or(true),
+        public_bind_declared: FileServerProxyConfig::public_bind_env_setting()
+            .unwrap_or_else(|reason| {
+                fail(format!("invalid FILE_SERVER_PROXY_PUBLIC_BIND: {reason}"))
+            })
+            .unwrap_or(true),
         listen_port: settings.listen_port,
         rust_upstream_port: settings.rust_upstream_port,
         ts_upstream_port: settings.ts_upstream_port,
