@@ -1,123 +1,47 @@
-# rcoder-e2e：Rust 黑盒 e2e 集成测试
+# RCoder E2E 测试导航
 
-对 `/computer/chat` + `/computer/progress/{session_id}`（SSE）核心链路的黑盒集成测试。
-SSE 事件用 `shared_types` 类型消费——协议字段变更时测试**编译期报红**（契约守护）。
+`rcoder-e2e` 覆盖 UserApp 生命周期、构建部署、文件/代理、chat/SSE、持久化和故障恢复。它包含真实平台场景、组件契约和专项故障实验，不能用一类通过代替全部验收。
 
-## 运行
+- [测试逻辑与验收流程](architecture.md)：入口、分组、固定登记、执行、报告和清理。
+- [场景运行与前置说明](tools/README.md)：核心聚焦、配对镜像、Python缓存、CephFS、存储和真实agent。
+- [远端K8s配置示例](../tools/remote_k8s/env.example)与[Make入口](../make/remote-k8s.mk)：个人环境同步、构建、部署和验收。
+
+## 常用命令
+
+从仓库根执行。保留已有`.env.local`，按配置示例补缺项，不覆盖凭据或无关配置。
 
 ```bash
-# 配置：cp .env.local.example .env.local 后按需填写（LLM/K8s/入口 IP 全走配置，代码零硬编码）
-cp .env.local.example .env.local
+# 查看场景、最近结果；检查三份固定登记。
+make test-e2e-list
+make test-e2e-check
 
-# compose 环境（本地 docker compose，前置 make dev-up + .env.local 的 LLM 配置）
+# 精确运行一条核心链。
+CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_dev E2E_FILTER=userapp_dev_idle_recycle_owner_recovery
+
+# UserApp默认组，含需要LLM的真实agent/chat场景。
+make test-e2e
+
+# chat/SSE/session/预览及部分UserApp。
 make test-e2e-compose
 
-# compose userApp 部署全链（7 服务模板→构建→部署→七路流量；~8-15 分钟，独立 target 不拖慢常规回归）
+# 七服务模板完整构建部署。
 make test-e2e-compose-deploy
-
-# K8s 专项（个人测试机 20 / 229 单节点；19 机有生产环境禁用）
-# 负载均衡场景默认 ignore（此前已验证通过），确认后 RUN_LB=1 显式开启
-make test-e2e-k8s
-make test-e2e-k8s RUN_LB=1        # 开启 lb 场景（等价 cargo test -- --ignored）
-
-# 单场景过滤
-make test-e2e-compose E2E_SUITE=compose_sse E2E_FILTER=reconnect
 ```
 
-环境门控（双层）：
+`E2E_SUITE`覆盖默认套件清单，支持逗号分隔；`E2E_FILTER`按名称子串筛选，不是正则。未命中、缺前置、skip、aborted、缺报告/必测步骤或清理失败均不能通过严格入口。
 
-1. 本 crate 不在 workspace `default-members`：裸 `cargo test` / `cargo build` 不碰它
-2. `cargo test --workspace` 和直接 `cargo test -p rcoder-e2e` 缺少完整 launcher 上下文时，
-   在读取 `.env.local`、创建 HTTP client 或执行任何外部 I/O 前明确跳过，即使本地服务健康也不会创建未登记资源。
-3. 显式 make 入口提供 `E2E_RUN_ID`、`E2E_CASE_ID`、`E2E_REPORT_DIR`、`E2E_TEST_NAME`；
-   `E2E_STRICT=1` 下任一字段缺失或为空立即失败。后续环境缺失、skip、aborted 仍不能通过严格验收。
-   PG、Compose 和 K8s 入口使用同一上下文门控。不要用手填部分环境变量替代 make 选择入口。
+真实集群和宿主机入口单独选择，目标从配置读取并先确认授权。`make test-e2e-k8s`是旧LB专项，实际运行忽略场景需显式`RUN_LB=1`，不是UserApp部署全链。日常K8s优先使用项目远端工作流。
 
-配置读取：环境变量 > 仓库根 `.env.local`（模板 `.env.local.example`）> 默认值。
-关键项：`RCODER_URL`（默认 `http://127.0.0.1:8090`）、`LLM_API_KEY` / `LLM_BASE_URL` /
-`LLM_MODEL`（chat 场景必需）、`LLM_MODEL_PRO`（切模型场景）、`LLM_BASE_URL_ANTHROPIC`
-（acp-ts 后端）、`TEST_K8S_SSH` / `TEST_K8S_NS` / `LB_ENTRY_HOSTS` / `LB_NODEPORT`（K8s 专项；
-单节点配一个入口 IP，入口轮换退化为同入口，SSE 语义断言仍有效）。
+## 验证边界
 
-## JSONL 报告（供 agent 追溯排查）
+- 普通Rust测试使用nextest；严格E2E使用专用Python启动器，逐例执行冻结的libtest二进制。
+- 直接`cargo test -p rcoder-e2e`缺上下文时在外部I/O前跳过，不能算E2E通过。
+- 工具单测、测试目标编译和登记检查不证明真实场景已执行。
+- 测试二进制冻结不等于产品镜像冻结；RCoder/app-cli镜像还须有本轮构建身份。
+- 新增用例同步套件成员、报告身份和必测断言，执行`make test-e2e-check`。
 
-每场景一个 `reports/<run_tag>_<pid>/<scenario>__<backend>.jsonl`，事件**实时逐行落盘**
-（测试中途挂掉/被 kill，已收事件全部保留）。行类型：
+## 查结果
 
-| kind | 说明 |
-|---|---|
-| `scenario_begin` | 场景与环境信息 |
-| `chat_request` | chat 留痕（请求脱敏——api_key 永不落盘；响应全量） |
-| `subscribe_begin` / `subscribe_end` | SSE 订阅窗口与汇总（seqs/type_counts/拼接全文/结束原因） |
-| `sse_event` | **连续的 SSE 消息流**（seq/event/data 原始 JSON/相对毫秒） |
-| `assert` | `level=hard`（可穷举不变量，fail 即场景红）或 `level=diagnostic`（特征指标，不判死——缺失/重复的复杂形态由 agent 看报告判定，新异常模式沉淀为新 hard 断言） |
-| `scenario_end` | verdict（pass/fail/skip/aborted）+ 断言计数 |
+默认报告为`tests-e2e/reports/<run-id>/`。先读`summary.json`，再看`<suite>/<case>/process.log`、JSONL断言与`resources/`清理证据。完整布局见[报告与排错](architecture.md#报告与排错)。
 
-入口文件 `summary.json`（run 级）：全部场景 verdict + jsonl 路径 + 失败断言列表。
-
-## 服务端日志/trace 联动
-
-e2e 注入 W3C traceparent（rcoder 侧 `make_span_with_trace_parent` 提取继承），
-`scenario_begin` 行的 `environment.trace_id` 是本场景的 trace id；`session_id` 见
-chat_request 响应。排查链：
-
-```bash
-# ① jsonl 拿 trace_id / session_id
-head -1 tests-e2e/reports/<run>/<scenario>.jsonl | jq .environment.trace_id
-# ② 服务端日志（compose 挂载 ./logs/，按天滚动 JSON）按 session_id 检索
-grep 'ses_xxx' logs/rcoder.$(date +%Y-%m-%d) | jq .
-# ③ OTLP 开启的环境（K8s），trace_id 可在 Jaeger/Tempo 查全链路
-#    （e2e → rcoder → agent_runner 同一 trace；HttpResult.tid 即它）
-```
-
-agent 排查示例：
-
-```bash
-# 先读 summary 定位失败场景
-cat tests-e2e/reports/<run>/summary.json
-# 看失败断言明细
-grep '"level":"hard","ok":false' tests-e2e/reports/<run>/<scenario>.jsonl
-# 逐条追 SSE 消息流（或按 seq 区间过滤）
-grep '"kind":"sse_event"' tests-e2e/reports/<run>/<scenario>.jsonl | jq -c '{seq, event, t_ms}'
-# 看订阅窗口汇总（拼接全文/seq 列表/结束原因）
-grep '"kind":"subscribe_end"' tests-e2e/reports/<run>/<scenario>.jsonl | jq .
-```
-
-## 场景清单
-
-**compose_sse**（语义与 Python 套件 tests/sse_e2e 逐一对齐）：
-
-- `full_turn_openai / full_turn_anthropic`：chat 后立刻连 SSE——完整轮 + seq 单调
-- `after_terminal_*`：turn 结束后连 SSE——0 消息事件（终端即清）
-- `two_turn_isolation_*`：第二轮 seq 全 > 第一轮（轮次隔离）
-- `reconnect_with_cursor`：断开带 Last-Event-ID 重连——只收增量
-- `reconnect_no_cursor`：无游标重连——纯实时，零已收消息重放（红线）
-- `model_switch`：同 session 切模型——零历史重放 + 上下文延续（需 LLM_MODEL_PRO）
-- `concurrent_subscribers`：双客户端并发订阅——seq 交集 + 双端完整
-
-**compose_userapp**：tasks/query 分页、publish 标识校验快速失败、publish 有限时间达终态
-（activate 死锁修复行为面）、无 release lock 创建拦截。
-
-**compose_userapp_deploy**（userApp 部署主流程全链，~15-25 分钟）：template-cli 全量模板
-初始化（7 服务）→ build 到 completed（release_id/sha256 快照）→ static 取包 sha256 校验 →
-start(url) 部署 → pingora 七路流量（`/`、`/react`、`/vue`、四后端 readiness）→ prod
-delete purge。镜像前置不满足时 verdict=skip（dev-app-runtime:latest 存在 +
-dev-rcoder-agent-runner:latest 含 template-cli——`make docker-build-app-runtime` /
-`make docker-build-agent-runner` 重建）。构建依赖外网（npm/maven/pypi/goproxy/crates）。
-
-**k8s_lb**（lb_test.py 完整移植）：入口轮换 4 轮、跨入口游标续传、新会话跨入口
-（durable+回源 1s 验收窗口）。清理走 ssh kubectl（ns 硬限定 + user 前缀严格匹配）。
-
-## 与 Python 套件的关系
-
-双轨并存：Python（tests/sse_e2e）保留做快速迭代与临时排查；Rust 版定位 CI 门禁 +
-协议契约守护。行为差异时以两者交叉验证为准。
-
-## 布局
-
-```
-src/common/        # lib 目标（多测试目标共享编译一次）：env/gate/chat、SSE 客户端、
-                   #   JSONL 报告器、场景编排件（collect_reported/spawn_chat）
-tests/compose_sse.rs / compose_userapp*.rs / k8s_lb.rs   # 测试目标
-reports/           # .gitignore；JSONL 报告与 summary.json
-```
+`src/common/`提供环境、HTTP/SSE、报告器、资源身份和共享计算流程；`tests/`放Rust场景；`tools/`放启动器与专项工具。完整场景清单以源码、固定登记和`make test-e2e-list`为准，不手工维护第二份清单。

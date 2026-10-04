@@ -1,7 +1,7 @@
 //! Custom Page（WebAgentRunner 开发阶段 Vite 预览）协调链 Compose E2E。
 //!
-//! 运行: `make test-e2e-compose E2E_SUITE=custom_page_preview` 或
-//! `cargo test -p rcoder-e2e --test custom_page_preview -- --test-threads=1`
+//! 严格运行: `make test-e2e-compose E2E_SUITE=custom_page_preview`。
+//! 直接 cargo 缺少启动器上下文时会提前跳过，不构成 E2E 验收。
 //!
 //! 前置（docker compose dev 环境，preview_coordinator.enabled=true）：
 //! 真实 vite 项目上传 → 协调受理 → pnpm 安装 → vite 起动 → `/proxy/{port}`

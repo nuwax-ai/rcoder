@@ -1,5 +1,7 @@
 # 严格 userApp 回归入口
 
+整体入口、分组、验收与清理逻辑见 [测试逻辑与验收流程](../architecture.md)；本页维护场景命令和前置条件。
+
 owner 丢失的容器内专项回归使用 `owner_recovery.py`，入口与验收边界见 [开发环境 owner 恢复](../../docs/userapp-dev-owner-recovery.md)。它不替代下列完整 Compose/K8s 套件。
 
 ## UserApp 核心场景聚焦回归
