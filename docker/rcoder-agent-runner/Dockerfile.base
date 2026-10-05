@@ -45,6 +45,14 @@ RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
     --clean-cache true \
     --ignore-backup-tips
 
+# 钉死 postgres uid/gid=111:121（=bookworm 时代值），必须在任何 apt 包安装之前：
+# Debian 系统用户 uid 按包安装顺序动态分配，包集/基底变化即漂移——trixie 0.1.253 中
+# postgres 漂成 110:116；基底更新后 chrony 又动态分到 111，使文件后部 useradd 报
+# "UID 111 is not unique"。持久卷上旧 PGDATA 属主依赖 111:121，对不上则 postgres
+# FATAL "Permission denied"。此处 uid/gid 必然空闲；postgresql-common 检测到用户已
+# 存在会直接复用；后续动态 uid 顺延，均为镜像内部用户、无持久数据。
+RUN groupadd -g 121 postgres && \
+    useradd -r -u 111 -g 121 -d /var/lib/postgresql -s /bin/bash postgres
 
 # 复制 npmrc 配置镜像（使用国内镜像加速）
 COPY .npmrc /root/.npmrc
@@ -226,11 +234,15 @@ RUN echo "noVNC cache bust: ${CACHEBUST_NOVNC}" && \
 # This allows:
 #   - Fast build with pre-downloaded files (avoid slow external download)
 #   - Fallback to online download if local file is missing
+#
+# 只 COPY LibreOffice_* 而非整个 downloads/：downloads/ 还住着 pingap/dbx 等
+# 最终镜像的预下载件（与 base 无关），整目录 COPY 会把它们拖进 base 镜像层，
+# 且其版本升级会使本层缓存失效 → 无关变更触发 agent-base 全量重建。
 # ============================================================================
 ARG LIBREOFFICE_FILE
 ARG TARGETARCH
 
-COPY downloads /tmp/downloads
+COPY downloads/LibreOffice_* /tmp/downloads/
 
 # Determine URL based on architecture
 RUN echo "Installing LibreOffice..." && \
@@ -847,7 +859,12 @@ ENV PNPM_HOME="/home/user/.local/share/pnpm" \
 # ============================================================================
 # 安装 pcmflux Python 包（需要 root，用于编译 C++ 扩展）
 # 使用 --break-system-packages 绕过 Debian 12 的 PEP 668 限制
-RUN pip3 install --no-cache-dir --break-system-packages websockets && \
+# cmake: pcmflux 依赖 opusic-sys 需用 cmake 从源码编译 libopus；pcmflux 以
+# 不锁版本 git HEAD 安装，上游构建要求变化时缺 cmake 会直接 wheel 构建失败
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
+    apt-get install -y --no-install-recommends cmake && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip3 install --no-cache-dir --break-system-packages websockets && \
     if [ "${USE_GITHUB_MIRROR}" = "true" ]; then \
         pip3 install --no-cache-dir --break-system-packages git+${GITHUB_MIRROR_URL}linuxserver/pcmflux.git; \
     else \
@@ -958,18 +975,12 @@ RUN mkdir -p /usr/local/share/ttyd
 # 开发完打包发布到 UserApp（app-runtime 镜像自带 PG）。
 # （pgweb 已退役删除——数据库 Web 控制台由 dbx 承担，AI 侧走 dbx MCP。）
 # ============================================================================
-# PostgreSQL 16（PGDG repo for trixie）
+# PGDG repo for trixie（postgres uid/gid=111:121 已在文件头部预创建钉死，见该处注释）
 RUN install -d /etc/apt/keyrings && \
     curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
         -o /etc/apt/keyrings/postgresql.asc && \
     echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] http://apt.postgresql.org/pub/repos/apt trixie-pgdg main" \
         > /etc/apt/sources.list.d/pgdg.list && \
-    # 钉死 postgres uid/gid=111:121（=bookworm 时代值）：Debian 系统用户 uid 按包安装顺序
-    # 动态分配，包集变化即漂移（trixie 0.1.253 中 postgres 漂成 110:116），持久卷上旧
-    # PGDATA 文件属主对不上 → postgres FATAL "Permission denied"。预创建后 postgresql-common
-    # 检测到用户已存在会直接复用，不再重新分配；后续动态 uid 顺延一位，均镜像内部用户无持久数据。
-    groupadd -g 121 postgres && \
-    useradd -r -u 111 -g 121 -d /var/lib/postgresql -s /bin/bash postgres && \
     apt-get update && \
     apt-get install -y postgresql-16 && \
     rm -rf /var/lib/apt/lists/*
