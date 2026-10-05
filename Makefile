@@ -25,6 +25,8 @@
 # 包含子 Makefile
 include make/docker.mk
 include make/libreoffice.mk
+include make/dbx.mk
+include make/app-runtime-downloads.mk
 include make/dev.mk
 include make/devspace.mk
 include make/k8s.mk

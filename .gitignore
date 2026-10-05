@@ -14,6 +14,8 @@ __pycache__/
 /target-console
 /target-unstable
 docker/app-runtime-base/downloads/
+docker/app-runtime-base/cache/
+/.cache/
 
 .classpath
 project_workspace

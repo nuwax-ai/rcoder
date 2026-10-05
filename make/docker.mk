@@ -13,6 +13,11 @@ PUSH_IMAGE ?= false
 # 用法: make dev-restart BUILDX_BUILDER=nuwax-clusters
 BUILDX_BUILDER ?=
 
+# pingap 版本（单一事实源 = app-cli devtool.rs DEFAULT_PINGAP_VERSION/COMMIT；
+# k8s/scripts/pingap_version_gate.py 强制本文件与 build-app-runtime.py/生产仓一致）
+PINGAP_VERSION ?= 0.14.3
+PINGAP_COMMIT ?= cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8
+
 # Docker 镜像构建（仅构建镜像，不编译）
 # 串行构建镜像，避免资源竞争
 docker-build:
@@ -135,10 +140,52 @@ CARGO_FEATURES ?= --features otel,debug,hotpath,dial9
 # Explicitly bump to refresh external agent tools; routine Rust builds reuse them.
 AGENT_TOOLS_CACHE_KEY ?= 1
 
+# ============================================================================
+# pingap release 预下载（对齐生产仓 16-app-runtime.mk 的 download-pingap-cache）
+# 下载双架构 full tarball 到 .cache/pingap（已 gitignore），分发到 agent-runner
+# downloads/ 与 app-runtime-base cache/。⚠️ 分发前清同架构旧版 + prune 缓存内
+# 非当前版本：消费方 Dockerfile 通配 COPY (pingap-v*-linux-gnu-*-full.tar.gz)
+# 会把旧包拖进构建上下文/镜像层。
+# ============================================================================
+PINGAP_DL_VERSION ?= $(PINGAP_VERSION)
+PINGAP_CACHE_DIR := .cache/pingap
+.PHONY: download-pingap-cache
+download-pingap-cache:
+	@mkdir -p $(PINGAP_CACHE_DIR) docker/rcoder-agent-runner/downloads
+	@for pair in "amd64 x86" "arm64 aarch64"; do \
+		set -- $$pair; \
+		PLATFORM_ARCH=$$1; ASSET_ARCH=$$2; \
+		ASSET="pingap-linux-gnu-$$ASSET_ARCH-full.tar.gz"; \
+		FILE="$(PINGAP_CACHE_DIR)/pingap-v$(PINGAP_DL_VERSION)-linux-gnu-$$ASSET_ARCH-full.tar.gz"; \
+		TMP_FILE="$$FILE.tmp"; \
+		if [ -f "$$FILE" ] && tar -tzf "$$FILE" >/dev/null 2>&1; then \
+			echo "✓ Pingap $(PINGAP_DL_VERSION) $$PLATFORM_ARCH 已缓存"; \
+		else \
+			rm -f "$$FILE" "$$TMP_FILE"; \
+			echo "↓ 下载 Pingap $(PINGAP_DL_VERSION) $$PLATFORM_ARCH release..."; \
+			URL="https://github.com/vicanso/pingap/releases/download/v$(PINGAP_DL_VERSION)/$$ASSET"; \
+			curl -fsSL --retry 3 --retry-delay 5 -o "$$TMP_FILE" "$$URL" \
+				|| curl -fsSL --retry 3 --retry-delay 5 -o "$$TMP_FILE" "https://ghproxy.net/$$URL" \
+				|| { echo "❌ 下载 Pingap $$PLATFORM_ARCH 失败"; rm -f "$$TMP_FILE"; exit 1; }; \
+			tar -tzf "$$TMP_FILE" >/dev/null 2>&1 \
+				|| { echo "❌ Pingap $$PLATFORM_ARCH 缓存包损坏"; rm -f "$$TMP_FILE"; exit 1; }; \
+			mv "$$TMP_FILE" "$$FILE"; \
+			echo "✓ Pingap $(PINGAP_DL_VERSION) $$PLATFORM_ARCH 已缓存"; \
+		fi; \
+		rm -f docker/rcoder-agent-runner/downloads/pingap-v*-linux-gnu-$$ASSET_ARCH-full.tar.gz; \
+		cp "$$FILE" docker/rcoder-agent-runner/downloads/; \
+		mkdir -p docker/app-runtime-base/cache; \
+		rm -f docker/app-runtime-base/cache/pingap-v*-linux-gnu-$$ASSET_ARCH-full.tar.gz; \
+		cp "$$FILE" docker/app-runtime-base/cache/; \
+	done
+	@find $(PINGAP_CACHE_DIR) -maxdepth 1 -name 'pingap-*' \
+		! -name 'pingap-v$(PINGAP_DL_VERSION)-*' -delete
+	@echo "✅ Pingap $(PINGAP_DL_VERSION) 已分发到 agent-runner/downloads 与 app-runtime-base/cache（旧版已清）"
+
 # 构建 agent-runner 镜像（基于基础镜像，快速构建）
 # pingap 版本说明（构建注入，单一来源 = app-cli devtool.rs DEFAULT_PINGAP_VERSION/COMMIT，
 # 与生产 build_config 16-app-runtime.mk 同值；三处同步改）
-docker-build-agent-runner:
+docker-build-agent-runner: build-dbx-fork download-pingap-cache
 	@echo "🐳 构建 rcoder-agent-runner 镜像（本地开发用 dev-rcoder-agent-runner）..."
 	@echo "📍 镜像名称: dev-rcoder-agent-runner:latest"
 	@# Compare the production source before building; never overwrite this worktree.
@@ -196,7 +243,7 @@ docker-build-agent-runner:
 		INSTALL_EBPF="false"; \
 		echo "🔒 跳过 eBPF 工具安装（生产模式）"; \
 	fi; \
-	PINGAP_VERSION=0.14.3 PINGAP_COMMIT=cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8; \
+	PINGAP_VERSION=$(PINGAP_VERSION) PINGAP_COMMIT=$(PINGAP_COMMIT); \
 	cd docker/rcoder-agent-runner && \
 		if [ -n "$(BUILDX_BUILDER)" ]; then \
 			docker buildx build --builder $(BUILDX_BUILDER) --platform linux/$(DOCKER_HOST_ARCH) --load \
@@ -239,7 +286,7 @@ docker-build-agent-production:
 APP_RUNTIME_DIR := docker/app-runtime-base
 
 # 构建 dev-app-runtime-base（基础设施 + 语言运行时层: Rust/PG/dbx/ttyd/supervisor + Node/Python/Java/Go/Deno）
-docker-build-app-runtime-base:
+docker-build-app-runtime-base: build-dbx-fork download-pingap-cache download-ttyd download-node download-go-cache download-deno
 	@echo "🐳 构建 dev-app-runtime-base:latest ..."
 	@python3 docker/build-app-runtime.py $(APP_RUNTIME_DIR)
 	@echo "✅ dev-app-runtime-base:latest 构建完成"
