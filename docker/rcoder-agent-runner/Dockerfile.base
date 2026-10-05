@@ -767,7 +767,7 @@ RUN npm install -g --prefix=/usr/local --registry=https://registry.npmmirror.com
 # 安装全局 npm 包（需要 root，因为安装到 /usr/lib/node_modules）
 RUN npm install -g @zed-industries/claude-code-acp@latest && \
     npm install -g @anthropic-ai/claude-code@latest && \
-    npm install -g chrome-devtools-mcp@latest && \
+    npm install -g @nuwax-ai/chrome-devtools-mcp@latest && \
     # 安装 pptxgenjs 和 sharp（全局安装，不受 /home/user 挂载影响）
     npm install -g pptxgenjs sharp && \
     # Clean up npm cache
