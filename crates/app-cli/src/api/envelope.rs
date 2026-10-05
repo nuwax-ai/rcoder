@@ -3,7 +3,7 @@
 //! wire 形态与主 workspace `shared_types::HttpResult` 逐字段对齐：
 //! `{code, message, data, tid, success}` 恒 5 键（失败 `data` 恒 `null`；
 //! `success` 由 `code == "0000"` 推导）。app-cli 是独立 workspace（root exclude，
-//! 锁解耦设计，无 shared_types 依赖），故本地复制——**改字段必须两处同步**，
+//! 锁解耦设计）；信封保留本地实现以维持下述 HTTP 语义——**改字段必须两处同步**，
 //! 本文件 mod tests 的 wire 锁快照负责锚定漂移。
 //!
 //! 与 shared_types 版的两处有意差异：
@@ -21,8 +21,8 @@ use axum::response::{IntoResponse, Response};
 
 /// 成功业务码（对齐 shared_types::error_codes::SUCCESS）。
 const SUCCESS_CODE: &str = "0000";
-/// 成功 message。shared_types 走 i18n（缺省英文文案）；app-cli 无 i18n，
-/// 固定 "success"——消费方不应依赖该文案，只看 code/success/data。
+/// 成功 message 固定 "success"。恢复诊断单独按请求语言翻译；消费方
+/// 不应依赖成功文案，只看 code/success/data。
 const SUCCESS_MESSAGE: &str = "success";
 
 /// 管理 API 统一响应信封。

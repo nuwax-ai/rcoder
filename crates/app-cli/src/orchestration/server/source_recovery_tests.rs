@@ -281,7 +281,7 @@ async fn source_recovery_keeps_missing_credentials_and_pending_migrations_explic
             .credential_recovery(None, CredentialRecoveryPurpose::StartCurrentSource)
             .unwrap_err()
             .to_string()
-            .contains("数据库运行凭据")
+            .contains("database runtime credentials")
     );
     let receipts = args.workspace.parent().unwrap().join("migration-receipts");
     std::fs::create_dir(&receipts).unwrap();
@@ -545,7 +545,7 @@ async fn rejected_before_dispatch_is_failed_and_a_new_valid_source_can_retry() {
             .error_message
             .as_deref()
             .unwrap()
-            .contains("数据库运行凭据")
+            .contains("database runtime credentials")
     );
     assert!(!kernel.status().await.unwrap().recovery_protection);
     assert!(state.control_rx.lock().await.try_recv().is_err());
@@ -569,4 +569,62 @@ async fn rejected_before_dispatch_is_failed_and_a_new_valid_source_can_retry() {
         panic!("Source expected")
     };
     assert_eq!(operation_id, "valid-retry");
+}
+
+#[tokio::test]
+async fn recovery_api_selects_request_language_and_defaults_to_english() {
+    use http_body_util::BodyExt as _;
+    let (_dir, args, state) = fixture(ExecutionTarget::Source).await;
+    let kernel = state.runtime_kernel().unwrap();
+    let identity = kernel.identity();
+    let router =
+        crate::api::bound_router(args.workspace, args.log_dir, args.pingap_bin, state.clone());
+    for (number, language, expected) in [
+        (0, None, "database runtime credentials"),
+        (1, Some("zh-CN"), "数据库运行凭据"),
+        (2, Some("zh-TW"), "資料庫執行憑證"),
+        (3, Some("fr-FR"), "database runtime credentials"),
+    ] {
+        let request = shared_types::RuntimeOperationRequest {
+            operation_id: format!("language-{number}"),
+            expected_runtime_instance_id: identity.runtime_instance_id.clone(),
+            expected_revision: kernel.status().await.unwrap().revision,
+            workspace_id: identity.workspace_id.clone(),
+            kind: shared_types::RuntimeOperationKind::Restart,
+            profile: shared_types::RunProfileInput::Source {
+                workspace_id: identity.workspace_id.clone(),
+            },
+            run_config: None,
+            request_context: None,
+        };
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v1/runtime/operations")
+            .header("content-type", "application/json")
+            .header("x-deploy-token", state.control_token().unwrap());
+        if let Some(language) = language {
+            builder = builder.header("accept-language", language);
+        }
+        let response = router
+            .clone()
+            .oneshot(
+                builder
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: shared_types::HttpResult<serde_json::Value> =
+            serde_json::from_slice(&bytes).unwrap();
+        assert!(!body.success);
+        assert_eq!(body.code, shared_types::ERR_RECOVERY_REQUIRED);
+        assert!(body.message.contains(expected), "{}", body.message);
+        assert!(
+            kernel.get(&request.operation_id).await.unwrap().is_none(),
+            "localization must not admit work"
+        );
+    }
+    assert!(state.runtime_recovery_hold_active());
 }

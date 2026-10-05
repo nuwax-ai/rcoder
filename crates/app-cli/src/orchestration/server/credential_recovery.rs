@@ -23,22 +23,84 @@ pub(super) enum SourceHistoryProblem {
 
 impl std::fmt::Display for SourceHistoryProblem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::MissingArtifact => "历史制品目录已不存在；等待新的源码启动或明确部署请求",
-            Self::AmbiguousArtifact => {
-                "历史制品目录无法唯一定位；新的源码请求仍可使用当前授权源码根"
-            }
-            Self::DeploymentGenerationChanged => {
-                "历史部署代次与当前管理实例不匹配；等待新的源码启动或明确部署请求"
-            }
-            Self::InconsistentDeploymentIdentity => {
-                "历史部署身份字段不一致；保留原记录，等待新的源码启动或明确部署请求"
-            }
-        })
+        f.write_str(&self.message(shared_types::DEFAULT_LOCALE))
+    }
+}
+
+impl SourceHistoryProblem {
+    fn message(&self, locale: &str) -> String {
+        shared_types::t(
+            match self {
+                Self::MissingArtifact => "error.source_history.missing_artifact",
+                Self::AmbiguousArtifact => "error.source_history.ambiguous_artifact",
+                Self::DeploymentGenerationChanged => "error.source_history.generation_changed",
+                Self::InconsistentDeploymentIdentity => {
+                    "error.source_history.inconsistent_identity"
+                }
+            },
+            locale,
+        )
     }
 }
 
 impl std::error::Error for SourceHistoryProblem {}
+
+/// Diagnostics remain English in receipts/logs; only the HTTP boundary chooses
+/// a request language. No process-global locale is changed.
+#[derive(Debug)]
+enum RecoveryPrerequisite {
+    UnconfirmedOutcome,
+    CleanupUnconfirmed,
+    MissingCredentials,
+    SourceWorkspaceUnbound,
+    ArtifactHistoryUnavailable,
+    ArtifactIdentityMismatch,
+    ArtifactTargetMissing,
+    ArtifactReleaseChanged,
+}
+
+impl RecoveryPrerequisite {
+    fn message(&self, locale: &str) -> String {
+        shared_types::t(
+            match self {
+                Self::UnconfirmedOutcome => "error.source_recovery.unconfirmed_outcome",
+                Self::CleanupUnconfirmed => "error.source_recovery.cleanup_unconfirmed",
+                Self::MissingCredentials => "error.source_recovery.missing_credentials",
+                Self::SourceWorkspaceUnbound => "error.source_recovery.workspace_unbound",
+                Self::ArtifactHistoryUnavailable => {
+                    "error.source_recovery.artifact_history_unavailable"
+                }
+                Self::ArtifactIdentityMismatch => {
+                    "error.source_recovery.artifact_identity_mismatch"
+                }
+                Self::ArtifactTargetMissing => "error.source_recovery.artifact_target_missing",
+                Self::ArtifactReleaseChanged => "error.source_recovery.artifact_release_changed",
+            },
+            locale,
+        )
+    }
+}
+impl std::fmt::Display for RecoveryPrerequisite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message(shared_types::DEFAULT_LOCALE))
+    }
+}
+impl std::error::Error for RecoveryPrerequisite {}
+
+pub(crate) fn localized_recovery_error(error: &anyhow::Error, locale: &str) -> String {
+    if let Some(cause) = error.downcast_ref::<RecoveryPrerequisite>() {
+        return cause.message(locale);
+    }
+    if let Some(cause) = error.downcast_ref::<SourceHistoryProblem>() {
+        return cause.message(locale);
+    }
+    if let Some(cause) = error.downcast_ref::<shared_types::SourceRunCredentialError>() {
+        return cause.message(locale);
+    }
+    // Keep concrete I/O and third-party errors intact; never translate by
+    // matching English strings or replace them with a generic success/failure.
+    format!("{error:#}")
+}
 
 pub(super) fn redacted_run_credentials(receipt: &Receipt) -> bool {
     receipt
@@ -74,16 +136,16 @@ impl ServerState {
         }
         anyhow::ensure!(
             hold & !(CREDENTIALS_HOLD | SOURCE_HISTORY_HOLD) == 0,
-            "运行恢复仍有未确认的写入结果；请查询具体恢复状态后重试"
+            RecoveryPrerequisite::UnconfirmedOutcome
         );
         anyhow::ensure!(
             !self
                 .shutdown_unconfirmed
                 .load(std::sync::atomic::Ordering::Acquire),
-            "旧服务清理尚未确认；当前请求不能提前启动新服务"
+            RecoveryPrerequisite::CleanupUnconfirmed
         );
         if hold & CREDENTIALS_HOLD != 0 {
-            let pg = pg.context("平台未提供数据库运行凭据，业务暂未启动；请重试")?;
+            let pg = pg.ok_or(RecoveryPrerequisite::MissingCredentials)?;
             shared_types::resolve_source_run_pg(Some(pg))?;
         }
         match purpose {
@@ -91,7 +153,7 @@ impl ServerState {
                 let project = self
                     .execution_project
                     .get()
-                    .context("当前owner尚未绑定源码工作区")?;
+                    .ok_or(RecoveryPrerequisite::SourceWorkspaceUnbound)?;
                 let workspace =
                     resolved_execution_workspace(project, Some(ExecutionTarget::Source), self)?;
                 // begin() rechecks pending SQL under the migration lease before
@@ -102,7 +164,7 @@ impl ServerState {
             CredentialRecoveryPurpose::RestoreConfirmedArtifact => {
                 anyhow::ensure!(
                     hold == CREDENTIALS_HOLD,
-                    "历史制品目录缺失或身份不明；请使用新的源码启动或明确的新部署请求"
+                    RecoveryPrerequisite::ArtifactHistoryUnavailable
                 );
                 self.confirm_artifact_credentials_recovery()?;
                 Ok(CredentialRecovery::SupplyCurrentInput { hold })
@@ -125,7 +187,7 @@ impl ServerState {
             && receipt.operation.phase == AppCliDeployPhase::Failed);
         anyhow::ensure!(
             receipt.generation == self.generation_value() && boundary,
-            "原制品恢复的部署身份或确认阶段不匹配"
+            RecoveryPrerequisite::ArtifactIdentityMismatch
         );
         let active = receipt
             .active
@@ -146,7 +208,7 @@ impl ServerState {
                     request.local_path.is_none()
                         && (request.url.starts_with("https://")
                             || request.url.starts_with("http://")),
-                    "原本地制品缺少已确认的执行目录"
+                    RecoveryPrerequisite::ArtifactTargetMissing
                 );
                 self.owner_execution_workspace
                     .get()
@@ -158,8 +220,65 @@ impl ServerState {
         let release = crate::manifest::read_release_lock(&workspace)?;
         anyhow::ensure!(
             release.release_id == active.artifact_release_id,
-            "原制品恢复的release身份已变化；请使用明确的新部署请求"
+            RecoveryPrerequisite::ArtifactReleaseChanged
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod localization_tests {
+    use super::*;
+
+    #[test]
+    fn default_diagnostics_are_english_and_all_supported_catalogs_resolve() {
+        for problem in [
+            SourceHistoryProblem::MissingArtifact,
+            SourceHistoryProblem::AmbiguousArtifact,
+            SourceHistoryProblem::DeploymentGenerationChanged,
+            SourceHistoryProblem::InconsistentDeploymentIdentity,
+        ] {
+            let english = problem.to_string();
+            assert!(english.is_ascii() && english.starts_with("The previous"));
+            assert_eq!(problem.message("fr-FR"), english);
+            for locale in shared_types::SUPPORTED_LOCALES {
+                let message = problem.message(locale);
+                assert!(!message.starts_with("error."));
+                assert!(!message.is_empty());
+            }
+            assert!(problem.message("zh-CN").contains("历史"));
+            assert!(problem.message("zh-TW").contains("歷史"));
+        }
+        for problem in [
+            RecoveryPrerequisite::UnconfirmedOutcome,
+            RecoveryPrerequisite::CleanupUnconfirmed,
+            RecoveryPrerequisite::MissingCredentials,
+            RecoveryPrerequisite::SourceWorkspaceUnbound,
+            RecoveryPrerequisite::ArtifactHistoryUnavailable,
+            RecoveryPrerequisite::ArtifactIdentityMismatch,
+            RecoveryPrerequisite::ArtifactTargetMissing,
+            RecoveryPrerequisite::ArtifactReleaseChanged,
+        ] {
+            assert!(problem.to_string().is_ascii());
+            for locale in shared_types::SUPPORTED_LOCALES {
+                assert!(!problem.message(locale).starts_with("error."));
+            }
+        }
+    }
+
+    #[test]
+    fn typed_causes_localize_without_rewriting_unrecognized_contexts() {
+        let error =
+            anyhow::Error::new(SourceHistoryProblem::MissingArtifact).context("restore owner");
+        assert!(localized_recovery_error(&error, "zh-CN").contains("历史制品"));
+        assert!(format!("{error:#}").contains("restore owner: The previous"));
+        let input = anyhow::Error::new(shared_types::SourceRunCredentialError::InvalidPassword);
+        assert!(localized_recovery_error(&input, "zh-TW").contains("密碼"));
+        let io = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "source is unreadable",
+        ))
+        .context("read /workspace/source");
+        assert_eq!(localized_recovery_error(&io, "zh-CN"), format!("{io:#}"));
     }
 }

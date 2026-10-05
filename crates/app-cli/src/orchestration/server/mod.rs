@@ -27,7 +27,9 @@ use std::sync::{Arc, RwLock};
 use anyhow::{Context, Result};
 mod credential_recovery;
 mod deploy_replay;
-pub(crate) use credential_recovery::{CredentialRecovery, CredentialRecoveryPurpose};
+pub(crate) use credential_recovery::{
+    CredentialRecovery, CredentialRecoveryPurpose, localized_recovery_error,
+};
 pub mod journal;
 pub(crate) use deploy_replay::DeployAdmission;
 mod preparation;

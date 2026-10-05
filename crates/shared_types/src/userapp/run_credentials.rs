@@ -19,11 +19,20 @@ pub enum SourceRunCredentialError {
 
 impl std::fmt::Display for SourceRunCredentialError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::IncompleteEnvironment => "数据库运行配置需要同时提供 POSTGRES_USER 和 POSTGRES_PASSWORD；请检查平台配置后重试",
-            Self::InvalidAccount => "数据库运行账号格式无效；业务未启动",
-            Self::InvalidPassword => "数据库运行密码为空或格式无效；业务未启动",
-        })
+        f.write_str(&self.message(crate::DEFAULT_LOCALE))
+    }
+}
+
+impl SourceRunCredentialError {
+    pub fn message(self, locale: &str) -> String {
+        crate::t(
+            match self {
+                Self::IncompleteEnvironment => "error.source_credentials.incomplete_environment",
+                Self::InvalidAccount => "error.source_credentials.invalid_account",
+                Self::InvalidPassword => "error.source_credentials.invalid_password",
+            },
+            locale,
+        )
     }
 }
 
@@ -59,6 +68,32 @@ fn resolve_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn credential_messages_use_catalogs_with_english_default() {
+        for error in [
+            SourceRunCredentialError::IncompleteEnvironment,
+            SourceRunCredentialError::InvalidAccount,
+            SourceRunCredentialError::InvalidPassword,
+        ] {
+            let default = error.to_string();
+            assert!(default.is_ascii());
+            assert!(default.starts_with("Database") || default.starts_with("The database"));
+            assert_eq!(error.message("unsupported"), default);
+            for locale in crate::SUPPORTED_LOCALES {
+                assert!(!error.message(locale).starts_with("error."));
+            }
+        }
+        assert!(
+            SourceRunCredentialError::InvalidPassword
+                .message("zh-CN")
+                .contains("密码")
+        );
+        assert!(
+            SourceRunCredentialError::InvalidPassword
+                .message("zh-TW")
+                .contains("密碼")
+        );
+    }
     #[test]
     fn source_request_override_never_reads_bad_inherited_credentials() {
         let explicit = StartPgCredential {

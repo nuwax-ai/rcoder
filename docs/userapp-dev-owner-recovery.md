@@ -24,6 +24,8 @@ UserApp dev builder 的源码根与文件、构建接口同源：通常为 `USER
 
 失败详情沿原操作和构建任务输出，日志中的模块、阶段与具体原因用于排查。调用方需保留错误信封及任务 ID；不能把 `build_ok` 或管理端口可达当作业务启动成功。
 
+这组源码恢复与数据库凭据诊断复用统一翻译资源，支持 `en-US`、`zh-CN`、`zh-TW`。CLI、持久操作记录和后台日志默认使用英文；`POST /v1/runtime/operations` 的对应前置错误按本次请求的 `Accept-Language` 返回，未提供或不支持的语言使用英文。语言选择不修改全局状态、错误码或恢复规则。底层 I/O、第三方错误与已落盘的历史错误保留原信息；这不代表所有 app-cli 端点或日志都已国际化。
+
 配套升级需更新 RCoder 与 builder 内的 agent_runner/file-server 和 app-cli。新的 K8s dev 容器 Restart 在原操作内冻结正确源码根，停止旧 Pod 后通过同一次 UID/resourceVersion 条件写入更新目录、可选镜像和副本数；完成时核对 StatefulSet 与新 Pod。只更新平台目录变量，保留其他环境、token、StatefulSet 和 PVC；不搬迁业务文件。
 
 旧计算 checkpoint 缺少 `restart_runtime_workspace` 时继续原操作语义；新字段仅由新受理的 K8s dev Restart 写入。没有数据库表迁移。含新字段的 checkpoint 不能由旧控制器消费，受理这类新操作前应完成所有 RCoder 副本升级；不能携带此类在途记录回滚旧控制器。

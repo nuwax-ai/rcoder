@@ -184,3 +184,20 @@ error.userapp_wait_timeout: "應用容器啟動較慢，請稍後重試。"
 
 # 後端兜底（2026-09-22 app-105：此前該 code 缺條目洩漏為 "en-US.error.backend_error"）
 error.backend_error: "後端服務執行失敗；請查看操作訊息或服務日誌定位根因"
+
+# UserApp 原始碼恢復診斷
+error.source_history.missing_artifact: "歷史成品目錄已不存在；請提交新的原始碼啟動或明確部署請求。"
+error.source_history.ambiguous_artifact: "歷史成品目錄無法唯一定位；新的原始碼請求仍可使用目前授權的原始碼根目錄。"
+error.source_history.generation_changed: "歷史部署世代與目前管理執行個體不符；請提交新的原始碼啟動或明確部署請求。"
+error.source_history.inconsistent_identity: "歷史部署身分欄位不一致；原記錄已保留，請提交新的原始碼啟動或明確部署請求。"
+error.source_recovery.unconfirmed_outcome: "執行恢復仍有未確認的寫入結果；請查詢具體恢復狀態後重試。"
+error.source_recovery.cleanup_unconfirmed: "舊服務清理尚未確認；暫時不能啟動新服務。"
+error.source_recovery.missing_credentials: "平台未提供資料庫執行憑證，應用服務暫未啟動；請重試。"
+error.source_recovery.workspace_unbound: "目前管理程序尚未綁定原始碼工作區。"
+error.source_recovery.artifact_history_unavailable: "歷史成品目錄缺失或身分不明；請使用新的原始碼啟動或明確部署請求。"
+error.source_recovery.artifact_identity_mismatch: "恢復原成品時，部署身分或確認階段不符。"
+error.source_recovery.artifact_target_missing: "原本地成品缺少已確認的執行目錄。"
+error.source_recovery.artifact_release_changed: "原成品的發佈身分已變更；請使用明確的部署請求。"
+error.source_credentials.incomplete_environment: "資料庫執行設定需要同時提供 POSTGRES_USER 和 POSTGRES_PASSWORD；請檢查平台設定後重試。"
+error.source_credentials.invalid_account: "資料庫執行帳號格式無效；應用服務未啟動。"
+error.source_credentials.invalid_password: "資料庫執行密碼為空或格式無效；應用服務未啟動。"

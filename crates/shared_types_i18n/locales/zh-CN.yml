@@ -188,3 +188,20 @@ error.userapp_wait_timeout: "应用容器启动较慢，请稍后重试。"
 
 # 后端兜底（2026-09-22 app-105：此前该 code 缺条目泄漏为 "en-US.error.backend_error"）
 error.backend_error: "后端服务执行失败；请查看操作消息或服务日志定位根因"
+
+# UserApp 源码恢复诊断
+error.source_history.missing_artifact: "历史制品目录已不存在；请提交新的源码启动或明确部署请求。"
+error.source_history.ambiguous_artifact: "历史制品目录无法唯一定位；新的源码请求仍可使用当前授权源码根。"
+error.source_history.generation_changed: "历史部署代次与当前管理实例不匹配；请提交新的源码启动或明确部署请求。"
+error.source_history.inconsistent_identity: "历史部署身份字段不一致；原记录已保留，请提交新的源码启动或明确部署请求。"
+error.source_recovery.unconfirmed_outcome: "运行恢复仍有未确认的写入结果；请查询具体恢复状态后重试。"
+error.source_recovery.cleanup_unconfirmed: "旧服务清理尚未确认；暂时不能启动新服务。"
+error.source_recovery.missing_credentials: "平台未提供数据库运行凭据，应用服务暂未启动；请重试。"
+error.source_recovery.workspace_unbound: "当前管理进程尚未绑定源码工作区。"
+error.source_recovery.artifact_history_unavailable: "历史制品目录缺失或身份不明；请使用新的源码启动或明确部署请求。"
+error.source_recovery.artifact_identity_mismatch: "恢复原制品时，部署身份或确认阶段不匹配。"
+error.source_recovery.artifact_target_missing: "原本地制品缺少已确认的执行目录。"
+error.source_recovery.artifact_release_changed: "原制品的发布身份已变化；请使用明确的部署请求。"
+error.source_credentials.incomplete_environment: "数据库运行配置需要同时提供 POSTGRES_USER 和 POSTGRES_PASSWORD；请检查平台配置后重试。"
+error.source_credentials.invalid_account: "数据库运行账号格式无效；应用服务未启动。"
+error.source_credentials.invalid_password: "数据库运行密码为空或格式无效；应用服务未启动。"

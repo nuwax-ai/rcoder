@@ -188,3 +188,20 @@ error.userapp_wait_timeout: "The application container is taking longer to start
 
 # Backend fallback (2026-09-22 app-105: code previously leaked as "en-US.error.backend_error")
 error.backend_error: "Backend service failed; see the operation message or service logs for the underlying cause"
+
+# UserApp source recovery diagnostics (CLI/log default; HTTP selects locale)
+error.source_history.missing_artifact: "The previous artifact directory is missing; submit a new source start or an explicit deployment request."
+error.source_history.ambiguous_artifact: "The previous artifact directory cannot be identified uniquely; a new source request can use the currently authorized source root."
+error.source_history.generation_changed: "The previous deployment generation does not match the current owner; submit a new source start or an explicit deployment request."
+error.source_history.inconsistent_identity: "The previous deployment identity fields are inconsistent; the original record is preserved. Submit a new source start or an explicit deployment request."
+error.source_recovery.unconfirmed_outcome: "Runtime recovery still has an unconfirmed write outcome; inspect the recovery status before retrying."
+error.source_recovery.cleanup_unconfirmed: "Previous service cleanup is not confirmed; new services cannot start yet."
+error.source_recovery.missing_credentials: "The platform did not provide database runtime credentials; the application has not started. Please retry."
+error.source_recovery.workspace_unbound: "The current owner is not bound to a source workspace."
+error.source_recovery.artifact_history_unavailable: "The previous artifact directory is missing or its identity is unknown; use a new source start or an explicit deployment request."
+error.source_recovery.artifact_identity_mismatch: "The deployment identity or confirmed boundary does not match the artifact being restored."
+error.source_recovery.artifact_target_missing: "The previous local artifact has no confirmed execution directory."
+error.source_recovery.artifact_release_changed: "The original artifact release identity has changed; submit an explicit deployment request."
+error.source_credentials.incomplete_environment: "Database runtime configuration requires both POSTGRES_USER and POSTGRES_PASSWORD; check the platform configuration and retry."
+error.source_credentials.invalid_account: "The database runtime account format is invalid; the application has not started."
+error.source_credentials.invalid_password: "The database runtime password is empty or invalid; the application has not started."
