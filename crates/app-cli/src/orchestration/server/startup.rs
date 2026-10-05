@@ -734,7 +734,7 @@ async fn business_session_inner(
                         // this owner; preserve its original durable evidence.
                         state.begin_failure(
                             format!("startup recovery required: {error:#}"),
-                            !state.credentials_only_hold(),
+                            !state.source_replacement_hold_only(),
                         );
                     } else if let Err(persist_error) = state
                         .fail_operation(format!("deployment startup: {error:#}"), Boundary::Failed)
@@ -1314,7 +1314,7 @@ async fn serve_supervised_worker(
                 if state.runtime_recovery_hold_active() {
                     state.begin_failure(
                         format!("startup recovery required: {error:#}"),
-                        !state.credentials_only_hold(),
+                        !state.source_replacement_hold_only(),
                     );
                 } else if let Err(persist_error) =
                     state.fail_operation(format!("deployment startup: {error:#}"), Boundary::Failed)
@@ -1532,7 +1532,9 @@ pub(super) async fn assemble_runtime_kernel(
             restore_standalone_generation_before_identity(state, &args.workspace, &root)
     {
         tracing::error!(%error, "Standalone deployment identity could not be restored; management remains available with recovery protection");
-        state.begin_runtime_recovery_hold();
+        if !error.is::<credential_recovery::SourceHistoryProblem>() {
+            state.begin_runtime_recovery_hold();
+        }
     }
     let workspace_id = crate::control::managed_owner::workspace_id(
         &args.workspace,
@@ -1582,47 +1584,57 @@ pub(super) async fn assemble_runtime_kernel(
             return;
         }
         let credential_recovery = match &action {
-            DispatchAction::OrchestrateSource { pg, .. } => {
-                dispatch_state.can_supply_run_credentials(pg.as_ref(), true)
-            }
+            DispatchAction::OrchestrateSource { pg, .. } => dispatch_state
+                .credential_recovery(pg.as_ref(), CredentialRecoveryPurpose::StartCurrentSource),
             DispatchAction::DeployArtifact { pg, .. }
-            | DispatchAction::DeployLocalArtifact { pg, .. } => {
-                dispatch_state.can_supply_run_credentials(pg.as_ref(), false)
-            }
-            DispatchAction::StopBusiness { .. } => Ok(false),
+            | DispatchAction::DeployLocalArtifact { pg, .. } => dispatch_state.credential_recovery(
+                pg.as_ref(),
+                CredentialRecoveryPurpose::RestoreConfirmedArtifact,
+            ),
+            DispatchAction::StopBusiness { .. } => Ok(CredentialRecovery::NotRequired),
         };
-        let supplied_credentials = match credential_recovery {
-            Ok(allowed) => allowed,
+        let (evaluated_recovery, mut recovery_failure) = match credential_recovery {
+            Ok(allowed) => (allowed, None),
             Err(error) => {
                 tracing::warn!(%error, "Credential recovery validation failed at dispatch");
-                false
+                (
+                    CredentialRecovery::NotRequired,
+                    Some(format!("validate runtime recovery: {error:#}")),
+                )
             }
         };
-        if supplied_credentials && let Some(operation_id) = executing_id {
+        if evaluated_recovery.supplies_credentials()
+            && let Some(operation_id) = executing_id
+        {
             // Kernel admission checked instance/revision and its separate
             // recovery fence. Never clear a concurrent unknown-state hold.
-            if let Err(error) = dispatch_state.consume_credentials_hold(operation_id) {
-                dispatch_state.begin_runtime_recovery_hold();
+            if let Err(error) =
+                dispatch_state.consume_credentials_hold(operation_id, evaluated_recovery)
+            {
                 tracing::warn!(%error, "Credential recovery handoff failed");
+                recovery_failure = Some(format!("runtime recovery handoff: {error:#}"));
             }
         }
         if let Some(id) = executing_id
-            && dispatch_state.runtime_recovery_hold_active()
+            && (recovery_failure.is_some() || dispatch_state.runtime_recovery_hold_active())
         {
             // The loop remains alive for Stop, but must not turn missing
             // startup credentials or an uncertain journal into permission to
             // run a different request with environment defaults.
             let state = dispatch_state.clone();
             let id = id.clone();
+            let reason = recovery_failure.unwrap_or_else(|| {
+                "runtime recovery must be resolved before starting business".into()
+            });
             tokio::spawn(async move {
                 if let Err(error) = state
                     .finish_runtime_operation_by_id(
                         &id,
-                        shared_types::RuntimeOperationState::RecoveryRequired,
-                        Some((
-                            shared_types::ERR_RECOVERY_REQUIRED.into(),
-                            "runtime recovery must be resolved before starting business".into(),
-                        )),
+                        // No control signal or command was sent. Preserve the
+                        // real existing hold, but do not invent an unknown result
+                        // for this rejected request and permanently fence retry.
+                        shared_types::RuntimeOperationState::Failed,
+                        Some((shared_types::ERR_RECOVERY_REQUIRED.into(), reason)),
                     )
                     .await
                 {
@@ -1902,11 +1914,21 @@ fn restore_standalone_generation_before_identity(
     let mut journal = Journal::open_with_root(workspace, root.to_path_buf())?;
     journal.migrate_after_bind()?;
     if let Some(receipt) = journal.receipt.as_ref() {
-        anyhow::ensure!(
-            !receipt.generation.trim().is_empty()
-                && receipt.operation.deployment_generation_id == receipt.generation,
-            "standalone deployment journal identity is inconsistent"
-        );
+        if receipt.generation.trim().is_empty()
+            || receipt.operation.deployment_generation_id != receipt.generation
+        {
+            journal.preserve_source_history()?;
+            state.begin_source_history_hold();
+            if credential_recovery::redacted_run_credentials(receipt) {
+                state.begin_credentials_hold();
+            }
+            // Retain the original bytes and real journal lease. The new Source
+            // operation will publish its own identity after normal cleanup.
+            *slot = Some(journal);
+            return Err(
+                credential_recovery::SourceHistoryProblem::InconsistentDeploymentIdentity.into(),
+            );
+        }
         state.set_generation(receipt.generation.clone());
     }
     // Keep the real journal lease until the first native business session opens
@@ -2078,13 +2100,12 @@ pub(super) fn recover_legacy_execution_target(
         if release.release_id != active.artifact_release_id {
             continue;
         }
-        anyhow::ensure!(
-            selected.is_none(),
-            "multiple directories contain the legacy active artifact; explicit directory reconciliation required"
-        );
+        if selected.is_some() {
+            return Err(credential_recovery::SourceHistoryProblem::AmbiguousArtifact.into());
+        }
         selected = Some(target);
     }
-    let target = selected.context("legacy active artifact directory is missing")?;
+    let target = selected.ok_or(credential_recovery::SourceHistoryProblem::MissingArtifact)?;
     request.execution_target = Some(target);
     // Preparing/RestoredActive may point to a different failed attempt. Only
     // update its request when it is actually the same active request.
@@ -2110,7 +2131,26 @@ pub(super) fn restored_runtime_args_inner(
     require_run_credentials: bool,
 ) -> Result<RuntimeArgs> {
     if let Err(error) = recover_legacy_execution_target(&args.workspace, state) {
-        state.begin_runtime_recovery_hold();
+        if error.is::<credential_recovery::SourceHistoryProblem>() {
+            let guard = state
+                .journal
+                .lock()
+                .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?;
+            let journal = guard
+                .as_ref()
+                .context("historical deployment journal missing")?;
+            journal.preserve_source_history()?;
+            state.begin_source_history_hold();
+            let missing_credentials = journal
+                .receipt
+                .as_ref()
+                .is_some_and(credential_recovery::redacted_run_credentials);
+            if missing_credentials {
+                state.begin_credentials_hold();
+            }
+        } else {
+            state.begin_runtime_recovery_hold();
+        }
         return Err(error);
     }
     let receipt = state
@@ -2123,9 +2163,22 @@ pub(super) fn restored_runtime_args_inner(
     if let Some(receipt) = receipt {
         if receipt.generation != state.generation_value() {
             if !env_deploy_requested(state) {
-                state.begin_runtime_recovery_hold();
-                anyhow::bail!(
-                    "deployment journal generation does not match this owner; explicit deployment required"
+                // Automatic restoration cannot guess an older deployment, but
+                // this mismatch is not evidence of a live writer. Native cleanup
+                // and the kernel retain their independent execution protection.
+                state
+                    .journal
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
+                    .as_ref()
+                    .context("historical deployment journal missing")?
+                    .preserve_source_history()?;
+                state.begin_source_history_hold();
+                if credential_recovery::redacted_run_credentials(&receipt) {
+                    state.begin_credentials_hold();
+                }
+                return Err(
+                    credential_recovery::SourceHistoryProblem::DeploymentGenerationChanged.into(),
                 );
             }
             // Only an explicit new env deployment may replace a prior generation;

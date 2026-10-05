@@ -120,7 +120,7 @@ impl ServerState {
     /// V04：终态持久化失败（结果未知）——挂起 server 写入口与 ready。
     pub(crate) fn begin_runtime_recovery_hold(&self) {
         self.runtime_recovery_hold
-            .fetch_or(2, std::sync::atomic::Ordering::AcqRel);
+            .fetch_or(OUTCOME_HOLD, std::sync::atomic::Ordering::AcqRel);
         self.ready.set_ready(false);
     }
 
@@ -130,37 +130,55 @@ impl ServerState {
             != 0
     }
 
-    pub(super) fn credentials_only_hold(&self) -> bool {
-        self.runtime_recovery_hold
-            .load(std::sync::atomic::Ordering::Acquire)
-            == 1
+    pub(super) fn source_replacement_hold_only(&self) -> bool {
+        let held = self
+            .runtime_recovery_hold
+            .load(std::sync::atomic::Ordering::Acquire);
+        held != 0 && held & !(CREDENTIALS_HOLD | SOURCE_HISTORY_HOLD) == 0
     }
 
     pub(super) fn begin_credentials_hold(&self) {
         self.runtime_recovery_hold
-            .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
+            .fetch_or(CREDENTIALS_HOLD, std::sync::atomic::Ordering::AcqRel);
         self.ready.set_ready(false);
     }
 
-    pub(super) fn consume_credentials_hold(&self, operation_id: &str) -> Result<()> {
-        let mut owner = self
-            .credential_recovery_operation
-            .lock()
-            .map_err(|_| anyhow::anyhow!("credential recovery identity lock poisoned"))?;
+    pub(super) fn consume_credentials_hold(
+        &self,
+        operation_id: &str,
+        evaluated: CredentialRecovery,
+    ) -> Result<()> {
+        let mut owner = self.credential_recovery_operation.lock().map_err(|_| {
+            self.begin_runtime_recovery_hold();
+            anyhow::anyhow!("credential recovery identity lock poisoned")
+        })?;
         anyhow::ensure!(owner.is_none(), "credential recovery is already executing");
+        let CredentialRecovery::SupplyCurrentInput {
+            hold: previous_hold,
+        } = evaluated
+        else {
+            anyhow::bail!("credential recovery handoff was not authorized");
+        };
+        anyhow::ensure!(
+            previous_hold != 0 && previous_hold & !(CREDENTIALS_HOLD | SOURCE_HISTORY_HOLD) == 0,
+            "runtime recovery has an unconfirmed writer or data outcome"
+        );
         self.runtime_recovery_hold
             .compare_exchange(
-                1,
+                previous_hold,
                 0,
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
             )
             .map_err(|_| anyhow::anyhow!("runtime recovery changed during credential admission"))?;
-        *owner = Some(operation_id.to_owned());
+        *owner = Some(RecoveryExecution {
+            operation_id: operation_id.to_owned(),
+            previous_hold,
+        });
         Ok(())
     }
 
-    /// A failure restores only this request's credential fence. Stop and late
+    /// A failure restores only this request's original safe hold mask. Stop and
     /// callbacks belonging to other operations cannot consume its identity.
     pub(super) fn settle_credential_recovery(&self, operation_id: &str, running: bool) {
         let Ok(mut owner) = self.credential_recovery_operation.lock() else {
@@ -168,9 +186,13 @@ impl ServerState {
             tracing::error!("credential recovery identity lock poisoned");
             return;
         };
-        if owner.as_deref() == Some(operation_id) {
-            if !running {
-                self.begin_credentials_hold();
+        if owner
+            .as_ref()
+            .is_some_and(|execution| execution.operation_id == operation_id)
+        {
+            if !running && let Some(execution) = owner.as_ref() {
+                self.runtime_recovery_hold
+                    .fetch_or(execution.previous_hold, std::sync::atomic::Ordering::AcqRel);
             }
             *owner = None;
         }
@@ -184,73 +206,16 @@ impl ServerState {
             tracing::error!("credential recovery identity lock poisoned during stop");
             return;
         };
-        if owner.take().is_some() {
-            self.begin_credentials_hold();
+        if let Some(execution) = owner.take() {
+            self.runtime_recovery_hold
+                .fetch_or(execution.previous_hold, std::sync::atomic::Ordering::AcqRel);
         }
     }
 
-    /// A fresh explicit operation may supply missing startup credentials
-    /// only after verifying the previously confirmed artifact. This is not reconciliation
-    /// of an interrupted operation (the kernel retains that separate fence).
-    pub(crate) fn can_supply_run_credentials(
-        &self,
-        pg: Option<&shared_types::StartPgCredential>,
-        source_only: bool,
-    ) -> Result<bool> {
-        if !self.credentials_only_hold()
-            || self
-                .shutdown_unconfirmed
-                .load(std::sync::atomic::Ordering::Acquire)
-            || !pg.is_some_and(|pg| !pg.username.trim().is_empty() && !pg.password.is_empty())
-        {
-            return Ok(false);
-        }
-        let receipt = self
-            .journal
-            .lock()
-            .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
-            .as_ref()
-            .and_then(|journal| journal.receipt.clone())
-            .context("confirmed deployment journal missing")?;
-        let confirmed_boundary = matches!(
-            receipt.boundary,
-            Boundary::Active | Boundary::RestoredActive | Boundary::StartupFailed
-        ) || (receipt.boundary == Boundary::Preparing
-            && receipt.operation.phase == AppCliDeployPhase::Failed);
-        if receipt.generation != self.generation_value() || !confirmed_boundary {
-            return Ok(false);
-        }
-        let active = receipt
-            .active
-            .context("confirmed active artifact missing")?;
-        let Some(request) = active.request.as_ref() else {
-            return Ok(false);
-        };
-        if source_only && request.execution_target != Some(ExecutionTarget::Source) {
-            return Ok(false);
-        }
-        let workspace = if let Some(target) = request.execution_target {
-            let project = self
-                .execution_project
-                .get()
-                .context("owner project missing")?;
-            resolved_execution_workspace(project, Some(target), self)?
-        } else {
-            // Legacy URL deployment used the owner's configured directory.
-            // Never infer missing local-artifact provenance from this fallback.
-            if request.local_path.is_some()
-                || !(request.url.starts_with("https://") || request.url.starts_with("http://"))
-            {
-                return Ok(false);
-            }
-            self.owner_execution_workspace
-                .get()
-                .context("owner execution workspace missing")?
-                .clone()
-        };
-        crate::migration_journal::require_confirmed_migrations(&workspace)?;
-        let release = crate::manifest::read_release_lock(&workspace)?;
-        Ok(release.release_id == active.artifact_release_id)
+    pub(super) fn begin_source_history_hold(&self) {
+        self.runtime_recovery_hold
+            .fetch_or(SOURCE_HISTORY_HOLD, std::sync::atomic::Ordering::AcqRel);
+        self.ready.set_ready(false);
     }
 
     pub(crate) async fn recovery_view(&self) -> Result<shared_types::RuntimeRecoveryView> {
@@ -1022,11 +987,15 @@ impl ServerState {
                 "server is shutting down; deployment was not accepted".into(),
             ));
         }
-        let supplying_credentials = self
-            .can_supply_run_credentials(req.run_pg.as_ref(), false)
+        let evaluated_recovery = self
+            .credential_recovery(
+                req.run_pg.as_ref(),
+                CredentialRecoveryPurpose::RestoreConfirmedArtifact,
+            )
             .map_err(|error| {
                 AdmissionError::Busy(format!("verify deployment credential recovery: {error:#}"))
             })?;
+        let supplying_credentials = evaluated_recovery.supplies_credentials();
         // B05：恢复保护约束**所有**写入口——旧部署链不得绕过（启动序列已
         // 自动收敛未终态操作并隔离损坏记录；到达此门说明存储级故障仍在，
         // 旧链与显式部署同样拒绝，直至存储恢复并重启）。
@@ -1068,7 +1037,7 @@ impl ServerState {
         // dispatch. Only the exact credentials-only state can be consumed;
         // a concurrent uncertain writer must continue to block admission.
         if supplying_credentials {
-            self.consume_credentials_hold(&operation_id)
+            self.consume_credentials_hold(&operation_id, evaluated_recovery)
                 .map_err(|error| AdmissionError::Busy(format!("{error:#}")))?;
         }
         let mut credentials = CredentialAdmission {

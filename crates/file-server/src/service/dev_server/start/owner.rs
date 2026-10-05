@@ -85,6 +85,14 @@ impl DevServerManager {
             &app_id,
         )
         .map_err(|error| AppError::business(format!("owner identity rejected: {error:#}")))?;
+        // Match Source spawn semantics at the caller boundary. Reusing an owner
+        // must not silently retain its older environment or omit current PG input.
+        let current_pg = match artifact_release_id {
+            None => shared_types::resolve_source_run_pg(pg)
+                .map_err(|error| AppError::business(error.to_string()))?,
+            Some(_) => pg.cloned(),
+        };
+        let pg = current_pg.as_ref();
         let expected_ws = identity.workspace_id.clone();
         crate::service::dev_server::startup_contract::require_owner_support(
             project_path,

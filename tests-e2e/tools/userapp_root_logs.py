@@ -40,10 +40,21 @@ def main():
     parser.add_argument('--source-dir', default='.', type=Path)
     parser.add_argument('--build-source', type=Path)
     parser.add_argument('--write-build-source', type=Path, help='Save source fingerprint before compiling the test binaries')
+    parser.add_argument('--register-binaries', action='store_true', help='Bind compiled binary SHA256 values to an unchanged build source receipt')
     args = parser.parse_args()
     if args.write_build_source:
         args.write_build_source.parent.mkdir(parents=True, exist_ok=True)
         args.write_build_source.write_text(json.dumps(source_snapshot(args.source_dir.resolve()), indent=2) + '\n')
+        return 0
+    if args.register_binaries:
+        if not all([args.app_cli, args.file_server_proxy, args.build_source]):
+            parser.error('--register-binaries requires --app-cli, --file-server-proxy and --build-source')
+        record = json.loads(args.build_source.read_text())
+        if record['source_inputs_sha256'] != source_snapshot(args.source_dir.resolve())['source_inputs_sha256']:
+            raise RuntimeError('source changed during binary build; rebuild before registering')
+        record['binaries'] = {name: hashlib.sha256(file.read_bytes()).hexdigest()
+                              for name, file in [('app-cli', args.app_cli), ('file-server-proxy', args.file_server_proxy)]}
+        args.build_source.write_text(json.dumps(record, indent=2) + '\n')
         return 0
     if not all([args.app_cli, args.file_server_proxy, args.report, args.build_source]):
         parser.error('--app-cli, --file-server-proxy, --report and --build-source are required for verification')

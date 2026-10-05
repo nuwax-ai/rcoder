@@ -21,7 +21,10 @@ pub use control::{
 };
 pub use monitor::{Options, Owner, Policy};
 pub use owner_handover::{completed_shutdown_for, shutdown_captured_owner};
-pub use record::{Intent, Quiescence, verify_live, verify_local_quiescent, verify_quiescent};
+pub use record::{
+    Intent, Quiescence, verify_live, verify_local_quiescent, verify_local_quiescent_for_supervisor,
+    verify_quiescent,
+};
 pub use recovery::{
     StopMode, StopRefused, StopWorkAttempt, continue_stop_work, continue_stop_work_with_checkpoint,
     continue_stop_work_with_cleanup, is_stop_refused, prepare_stop_work, stop_work,

@@ -304,6 +304,8 @@ pub struct RuntimeRecoveryView {
     pub generation_matches: Option<bool>,
     /// The confirmed active request requires credentials that were redacted.
     /// This flag alone does not prove that supplying credentials is sufficient.
+    /// A fresh Source operation may supply current credentials without keeping
+    /// the historical artifact; cleanup and migration protection still apply.
     pub credentials_required: bool,
     /// Observation only; execution must recheck under migration ownership.
     #[serde(default)]

@@ -65,6 +65,7 @@ pub use userapp::forward_contract::{
     is_userapp_service_type_value, normalize_computer_service_type,
 };
 pub use userapp::metadata::AppMetadataRecord;
+pub use userapp::run_credentials::{SourceRunCredentialError, resolve_source_run_pg};
 pub use userapp::runtime_configuration::*;
 pub use userapp::runtime_control::{
     ArtifactInput, DesiredState, ERR_INTERRUPTED_OWNER_EXIT, ERR_OPERATION_ID_CONFLICT,

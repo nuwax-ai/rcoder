@@ -4,6 +4,8 @@
 
 owner 丢失的容器内专项回归使用 `owner_recovery.py`，入口与验收边界见 [开发环境 owner 恢复](../../docs/userapp-dev-owner-recovery.md)。它不替代下列完整 Compose/K8s 套件。
 
+Source 凭据恢复专项使用 `make test-e2e-source-credential-recovery`，先串行构建当前 Linux app-cli/file-server-proxy 并绑定源码、二进制 SHA256，再验证真实 PostgreSQL 凭据、脱敏回执、同卷容器替换、新 Source 版本、失败日志、Stop/Start 和迁移去重。它只清理自己创建的容器、保留工作卷；缺工具、源码漂移、业务失败或缺断言均为失败。报告默认为 `tests-e2e/reports/source-credential-recovery-*.json`，不代表 RCoder/Java 或远端 K8s 验收。
+
 ## UserApp 核心场景聚焦回归
 
 这些场景均无 LLM，已加入固定套件、报告身份与必测步骤登记。可以分别运行，不必每次执行完整 E2E：

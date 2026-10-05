@@ -588,10 +588,12 @@ pub(super) async fn server_loop(
         match restored_runtime_args_inner(owner_args, state, false) {
             Ok(args) => args,
             Err(error) => {
-                state.begin_runtime_recovery_hold();
+                if !state.source_replacement_hold_only() {
+                    state.begin_runtime_recovery_hold();
+                }
                 state.begin_failure(
                     format!("runtime execution target recovery failed: {error:#}"),
-                    true,
+                    !state.source_replacement_hold_only(),
                 );
                 // Keep consuming Stop and explicit replacement requests even when
                 // automatic restoration cannot choose the old execution directory.

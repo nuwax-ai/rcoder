@@ -145,6 +145,21 @@ test-e2e-userapp-root-logs:
 	  --file-server-proxy tests-e2e/reports/_bin/file-server-proxy-linux \
 	  --build-source "$(USERAPP_ROOT_LOGS_BUILD_SOURCE)" --report "$(USERAPP_ROOT_LOGS_REPORT)"
 
+# 显式PG源启动→回执脱敏→原卷换容器→新源码lock→同入口restart/stop/start。
+SOURCE_CREDENTIAL_REPORT ?= tests-e2e/reports/source-credential-recovery-$(shell date +%Y%m%d-%H%M%S).json
+SOURCE_CREDENTIAL_BUILD_SOURCE ?= tests-e2e/reports/source-credential-build-source.json
+.PHONY: test-e2e-source-credential-recovery
+test-e2e-source-credential-recovery:
+	python3 tests-e2e/tools/userapp_root_logs.py --write-build-source "$(SOURCE_CREDENTIAL_BUILD_SOURCE)"
+	$(MAKE) test-e2e-app-cli-recovery-build
+	python3 tests-e2e/tools/userapp_root_logs.py --register-binaries \
+	  --app-cli tests-e2e/reports/_bin/app-cli-linux \
+	  --file-server-proxy tests-e2e/reports/_bin/file-server-proxy-linux \
+	  --build-source "$(SOURCE_CREDENTIAL_BUILD_SOURCE)"
+	USERAPP_E2E_BUILD_SOURCE="$(SOURCE_CREDENTIAL_BUILD_SOURCE)" USERAPP_E2E_REPORT="$(SOURCE_CREDENTIAL_REPORT)" \
+	  node crates/file-server-proxy/tests/e2e/source-credential-recovery.test.js \
+	  tests-e2e/reports/_bin/app-cli-linux tests-e2e/reports/_bin/file-server-proxy-linux dev-rcoder-agent-runner:latest
+
 test-e2e-app-cli-recovery: test-e2e-app-cli-recovery-build
 	python3 tests-e2e/tools/app_cli_recovery.py \
 	  --app-cli tests-e2e/reports/_bin/app-cli-linux \

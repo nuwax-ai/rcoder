@@ -25,7 +25,9 @@
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
+mod credential_recovery;
 mod deploy_replay;
+pub(crate) use credential_recovery::{CredentialRecovery, CredentialRecoveryPurpose};
 pub mod journal;
 pub(crate) use deploy_replay::DeployAdmission;
 mod preparation;
@@ -49,6 +51,8 @@ const DEPLOY_PROTOCOL: u32 = shared_types::app_cli_deploy::APP_CLI_OPERATION_ID_
 
 mod run_loop;
 mod serve;
+#[cfg(test)]
+mod source_recovery_tests;
 mod startup;
 mod state;
 mod state_impl;

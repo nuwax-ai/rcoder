@@ -485,7 +485,9 @@ async fn dispatch_to_owner_inner(
         profile: RunProfileInput::Source {
             workspace_id: expected_ws.clone(),
         },
-        run_config: None,
+        run_config: shared_types::resolve_source_run_pg(None)
+            .context("capture current Source operation runtime credentials")?
+            .map(|pg| shared_types::OperationRunConfig { pg: Some(pg) }),
         request_context: None,
     };
     let submit_url = format!("http://{admin_addr}/v1/runtime/operations");

@@ -14,6 +14,16 @@ UserApp dev builder 的源码根与文件、构建接口同源：通常为 `USER
 
 源码模式的启动与重启会先按当前 manifest 和运行元数据核验派生的 `release.lock.toml`，再检查 owner 能力及启停服务。损坏或输入已变化的锁文件自动原子重建；有效且内容一致时保留原字节与 release ID，不因重复请求改变迁移身份。新的配置无效或 owner 不支持新能力时，在停止旧服务之前报错。制品模式继续验证指定制品中的锁文件，不用源码重建绕过制品校验。
 
+### 修正源码后重新启动
+
+新的 Source Start/Restart 使用当前授权源码根和本次运行配置。旧版本的 release ID、已丢失的 ZIP 或 `.run` 目录，不作为新源码启动的必要条件；它们仍用于历史诊断和原执行清理。恢复原制品时，继续核验原制品、执行目录和部署身份。
+
+部署回执不会保存 PostgreSQL 密码，所以管理进程重建后可能暂不自动启动旧业务。新的显式源码请求可以提供当前数据库凭据；file-server 和复用 owner 的 CLI 在发起端捕获已有 `POSTGRES_USER`/`POSTGRES_PASSWORD`，请求中显式提供的凭据优先。环境只提供其中一个字段或输入无效时，返回具体配置错误，不选择默认密码、不修改数据库账号。
+
+恢复资格判断不清除保护。仅在新操作通过实例、revision 和停止屏障检查并被派发时，按该操作身份交接可恢复的凭据或历史制品保护；失败后恢复原保护，后续显式请求可重试。未确认的进程清理、真实存储故障和未知 SQL 结果仍须核验；Source 与 `.run` 的既有迁移回执位置都参加核验，不能通过切换运行档位绕过它们。Stop 保持可用，迟到的旧请求不能作用于新实例。
+
+失败详情沿原操作和构建任务输出，日志中的模块、阶段与具体原因用于排查。调用方需保留错误信封及任务 ID；不能把 `build_ok` 或管理端口可达当作业务启动成功。
+
 配套升级需更新 RCoder 与 builder 内的 agent_runner/file-server 和 app-cli。新的 K8s dev 容器 Restart 在原操作内冻结正确源码根，停止旧 Pod 后通过同一次 UID/resourceVersion 条件写入更新目录、可选镜像和副本数；完成时核对 StatefulSet 与新 Pod。只更新平台目录变量，保留其他环境、token、StatefulSet 和 PVC；不搬迁业务文件。
 
 旧计算 checkpoint 缺少 `restart_runtime_workspace` 时继续原操作语义；新字段仅由新受理的 K8s dev Restart 写入。没有数据库表迁移。含新字段的 checkpoint 不能由旧控制器消费，受理这类新操作前应完成所有 RCoder 副本升级；不能携带此类在途记录回滚旧控制器。
@@ -63,6 +73,14 @@ python3 tests-e2e/tools/owner_recovery.py \
 ```
 
 该场景运行真实 supervisord、Pingap 和 HTTP 应用，覆盖 owner 强杀、重复停止、再次启动、同卷容器重建与产物态部署。只清理自己创建的容器，保留测试数据卷，报告包含镜像和容器 ID。它验证容器内管理链，不替代 RCoder/Java 全链路或远端 K8s 部署验收。
+
+“显式 PG 源码启动 → 脱敏回执 → 同卷容器替换 → 新源码版本 → 错误凭据失败 → 有效凭据重启 → Stop/Start”的专项入口为：
+
+```bash
+make test-e2e-source-credential-recovery
+```
+
+该入口先构建并核对当前源码的 Linux 二进制，再在本地隔离容器中执行真实 HTTP 与 PostgreSQL 检查，验证日志终态、数据保留和同一版本的迁移去重。结果以本轮报告为准；不运行完整 test-e2e，不操作共享 K8s 环境。
 
 完整的闲置回收链使用 `make test-e2e E2E_SUITE=compose_userapp_dev E2E_FILTER=userapp_dev_idle_recycle_owner_recovery`。它让隔离 RCoder 的真实清理器销毁 builder，保留旧 owner/journal 后再通过 RCoder ensure、Stop、构建 Start、重复 Stop、构建 Restart，并核验 HTTP 新内容和构建计数。配置与镜像前置见 [E2E 场景说明](../tests-e2e/tools/README.md#闲置回收后的-owner-恢复与重新构建)。该命令是验收入口，实际通过情况以对应报告为准。
 

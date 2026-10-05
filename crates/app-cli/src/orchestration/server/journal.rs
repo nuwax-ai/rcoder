@@ -10,6 +10,7 @@ use std::{
 };
 
 mod generation_compat;
+mod source_history;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]

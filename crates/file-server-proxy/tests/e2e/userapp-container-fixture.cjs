@@ -95,21 +95,27 @@ class UserappFixture {
     fs.writeFileSync(path.join(platformDir, "execution-domain"), JSON.stringify(domain));
     const conf = path.join(this.host, "supervisor-" + this.containers.length + ".conf");
     fs.writeFileSync(conf, `[unix_http_server]\nfile=/var/run/supervisor.sock\n[supervisord]\nnodaemon=true\nlogfile=/tmp/fixture-supervisor.log\npidfile=/var/run/supervisord.pid\n[rpcinterface:supervisor]\nsupervisor.rpcinterface_factory=supervisor.rpcinterface:make_main_rpcinterface\n[supervisorctl]\nserverurl=unix:///var/run/supervisor.sock\n[include]\nfiles=/etc/supervisor/conf.d/*.conf\n`);
+    // This private container needs the same real PG program as a builder. Do
+    // not skip readiness or rotate credentials to make a runtime test pass.
+    fs.copyFileSync(path.join(repo, "docker/rcoder-agent-runner/supervisor/conf.d/postgres.conf"), path.join(confDir, "postgres.conf"));
     const prefix = this.kind === "f6" ? "env -u RCODER_EXECUTION_DOMAIN " : "";
     fs.writeFileSync(path.join(confDir, "fixture.conf"), `[program:app-cli]\ncommand=${prefix}/usr/local/bin/app-cli serve --control-only --workspace ${this.workspace}\ndirectory=${this.workspace}\nautostart=false\nautorestart=false\nstartsecs=0\nstopasgroup=true\nkillasgroup=true\nstopwaitsecs=3\nstdout_logfile=/home/user/owner.log\nredirect_stderr=true\n[program:file-server-proxy]\ncommand=${prefix}/usr/local/bin/file-server-proxy --embed --policy all_rust --port 60000\nautostart=false\nautorestart=false\nstartsecs=0\nstdout_logfile=/home/user/proxy.log\nredirect_stderr=true\n`);
-    const env = { PROJECT_ID: this.app, SERVICE_TYPE: "user-app-builder", USERAPP_SINGLE_APP_ID: this.app,
+    const env = { PROJECT_ID: this.app, APP_ID: this.app, RCODER_RUNTIME_IMAGE_DIGEST: this.image,
+      SERVICE_TYPE: "user-app-builder", USERAPP_SINGLE_APP_ID: this.app,
       USERAPP_WORKSPACE_DIR: this.workspace, APP_CLI_RUNTIME_WORKSPACE: this.workspace, APP_CLI_STATE_ROOT: this.state,
-      APP_CLI_MANAGED: "1", APP_CLI_DEPLOY_TOKEN: this.app + "-fixture-token", FILE_SERVER_APP_CLI_BIN: "/usr/local/bin/app-cli",
+      APP_CLI_MANAGED: "1", APP_CLI_REQUIRE_PG: "1", APP_CLI_DEPLOY_TOKEN: this.app + "-fixture-token", FILE_SERVER_APP_CLI_BIN: "/usr/local/bin/app-cli",
       FILE_SERVER_PROXY_STATE_DIR: this.workspace + "/proxy-state", FILE_SERVER_PROXY_PUBLIC_BIND: "true", FILE_SERVER_LOG_DIR: "/home/user/proxy-logs",
       RCODER_PLATFORM_BINDING_DIR: "/etc/rcoder/fixture-platform" };
     if (this.kind === "f4") env.RCODER_EXECUTION_DOMAIN = JSON.stringify(domain);
     this.cid = this.docker(["create", "--name", "rcoder-" + this.kind + "-" + randomUUID(), "--label", "rcoder.e2e.owner=" + this.id, "--user", "0",
       "--mount", `type=volume,src=${this.volume},dst=/home/user,volume-nocopy`,
-      "--mount", `type=bind,src=${confDir},dst=/etc/supervisor/conf.d,readonly`,
+      // app-cli publishes/removes 50-app-services.conf through captured engine
+      // ownership. A read-only directory makes its initial drain fail forever.
+      "--mount", `type=bind,src=${confDir},dst=/etc/supervisor/conf.d`,
       "--mount", `type=bind,src=${conf},dst=/etc/supervisor/supervisord.conf,readonly`,
       "--mount", `type=bind,src=${platformDir},dst=/etc/rcoder/fixture-platform,readonly`,
       ...Object.entries(env).flatMap(([key, value]) => ["-e", key + "=" + value]),
-      "--entrypoint", "sh", this.image, "-ec", `mkdir -p ${this.workspace} /home/user/proxy-logs; exec supervisord -n -c /etc/supervisor/supervisord.conf`]).stdout.trim();
+      "--entrypoint", "sh", this.image, "-ec", `install -d -o postgres -g postgres "\${PGDATA:-/home/user/.pgdata}"; mkdir -p ${this.workspace} /home/user/proxy-logs /app/logs; exec supervisord -n -c /etc/supervisor/supervisord.conf`]).stdout.trim();
     this.containers.push(this.cid);
     this.report.containers.push({ id: this.cid, domain_instance: domain.instance });
     for (const [name, binary] of Object.entries(this.binaries)) this.docker(["cp", binary, this.cid + ":/usr/local/bin/" + name]);
@@ -117,6 +123,11 @@ class UserappFixture {
     await waitFor("private supervisord", () => this.exec(["test", "-S", "/var/run/supervisor.sock"], false).status === 0);
     for (const tool of ["python3", "curl", "pingap"]) this.exec([tool, "--version"]);
     for (const [name] of Object.entries(this.binaries)) this.check(name + " matches container copy", this.exec(["sha256sum", "/usr/local/bin/" + name]).stdout.startsWith(this.report.binaries[name].sha256));
+    await waitFor("fixture PostgreSQL TCP login", () => {
+      const result = this.exec(["sh", "-ec", 'PGPASSWORD="$POSTGRES_PASSWORD" PGCONNECT_TIMEOUT=2 psql -X -w -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -qAt -c "SELECT 1"'], false);
+      return result.status === 0 && result.stdout.trim() === "1";
+    });
+    this.check("fixture PostgreSQL accepts the runtime credentials", true);
     return domain;
   }
   prepare(marker) {
@@ -152,7 +163,10 @@ class UserappFixture {
     assert(accepted.task_id, "real build task id required");
     await waitFor("build task completion", () => {
       const task = this.request(`/api/v1/userapp/tasks/${accepted.task_id}?app_id=${this.app}`);
-      if (["failed", "cancelled"].includes(task.status)) throw Object.assign(new Error(`task ${task.status}: ${task.error_message || "see task logs"}`), { taskFailed: true });
+      if (["failed", "cancelled"].includes(task.status)) {
+        this.report.failed_task = task;
+        throw Object.assign(new Error(`task ${task.status}: ${task.error || task.error_message || "see task logs"}`), { taskFailed: true });
+      }
       return task.status === "completed";
     }, 150000);
     await waitFor("business HTTP", () => this.content().stdout === expected);

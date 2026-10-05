@@ -25,6 +25,7 @@ pub mod dev_cleanup;
 pub mod dev_locator;
 pub mod forward_contract;
 pub mod metadata;
+pub mod run_credentials;
 
 pub mod lifecycle;
 pub mod workspace_clear;

@@ -191,6 +191,43 @@ pub fn verify_local_quiescent(scope: &Path, id: &str) -> Result<Option<Quiescenc
     verify_quiescent(scope, id).map(Some)
 }
 
+/// The captured supervisor must match even when the generation belongs to a
+/// previous container. `None` is foreign history, never an exit receipt.
+pub fn verify_local_quiescent_for_supervisor(
+    scope: &Path,
+    id: &str,
+    supervisor: &str,
+) -> Result<Option<Quiescence>> {
+    verify_local_quiescent_for_supervisor_with(
+        scope,
+        id,
+        supervisor,
+        crate::domain::PhysicalDomain::from_env()?.as_ref(),
+    )
+}
+
+fn verify_local_quiescent_for_supervisor_with(
+    scope: &Path,
+    id: &str,
+    supervisor: &str,
+    current: Option<&crate::domain::PhysicalDomain>,
+) -> Result<Option<Quiescence>> {
+    let value = generation(&work_root(scope, id)?)?;
+    ensure!(
+        value.supervisor == supervisor,
+        "captured supervisor identity mismatch"
+    );
+    if previous_container(&value, current) {
+        return Ok(None);
+    }
+    let receipt = verify_quiescent(scope, id)?;
+    ensure!(
+        receipt.supervisor_id == supervisor,
+        "cleanup supervisor identity mismatch"
+    );
+    Ok(Some(receipt))
+}
+
 pub(crate) fn belongs_to_previous_container(scope: &Path, id: &str) -> Result<bool> {
     let value = generation(&work_root(scope, id)?)?;
     Ok(previous_container(
@@ -720,6 +757,65 @@ mod tests {
             instance: instance.into(),
             volume: "workspace-pvc".into(),
         }
+    }
+
+    #[test]
+    fn foreign_quiescence_classification_preserves_exact_supervisor_and_history() {
+        let (scope, id) = stuck_scope(Some(domain_fixture("old-container")), None);
+        let root = work_root(scope.path(), &id).unwrap();
+        let original = std::fs::read(root.join("generation.json")).unwrap();
+        let new = domain_fixture("new-container");
+        assert!(
+            verify_local_quiescent_for_supervisor_with(
+                scope.path(),
+                &id,
+                "gone-supervisor",
+                Some(&new)
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            verify_local_quiescent_for_supervisor_with(
+                scope.path(),
+                &id,
+                "different-supervisor",
+                Some(&new)
+            )
+            .is_err()
+        );
+        assert!(
+            verify_local_quiescent_for_supervisor_with(
+                scope.path(),
+                &id,
+                "gone-supervisor",
+                Some(&domain_fixture("old-container"))
+            )
+            .is_err()
+        );
+        assert!(
+            verify_local_quiescent_for_supervisor_with(scope.path(), &id, "gone-supervisor", None)
+                .is_err()
+        );
+        let mut other_volume = new;
+        other_volume.volume = "other-volume".into();
+        assert!(
+            verify_local_quiescent_for_supervisor_with(
+                scope.path(),
+                &id,
+                "gone-supervisor",
+                Some(&other_volume)
+            )
+            .is_err()
+        );
+        assert!(
+            verify_quiescent(scope.path(), &id).is_err(),
+            "foreign history is not exit proof"
+        );
+        assert_eq!(
+            std::fs::read(root.join("generation.json")).unwrap(),
+            original
+        );
     }
 
     #[cfg(unix)]

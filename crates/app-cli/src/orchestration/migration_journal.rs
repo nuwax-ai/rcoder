@@ -52,9 +52,10 @@ fn receipt_roots(
             .context("workspace has no state root")?
             .join("migration-receipts"),
     );
-    // Artifact runs use .run; their source-mode history used the stable
-    // project's parent. Observe both without copying unrelated identities.
+    // Source and .run must observe the same legacy receipt locations in both
+    // directions, even when the previous artifact directory no longer exists.
     let origin = runtime_state_layout::resolve_project_origin(workspace)?;
+    roots.push(origin.join("migration-receipts"));
     roots.push(
         origin
             .parent()

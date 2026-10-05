@@ -55,10 +55,11 @@ pub struct ServerState {
     /// 挂起：保留执行身份、关闭部署受理、压低 ready，直至进程重启由内核
     /// 恢复裁决。未知结果标记只升不降；缺少脱敏凭据的独立标记可经
     /// 已确认 Source 操作的显式凭据受理清除。
-    // Bit 0: missing redacted credentials; bit 1: other uncertain state.
+    // Bit 0: missing redacted credentials; bit 1: uncertain writer/data outcome;
+    // bit 2: unavailable legacy artifact metadata, replaceable by fresh Source.
     pub(super) runtime_recovery_hold: std::sync::atomic::AtomicU8,
-    /// Identity of the request temporarily consuming a credentials-only hold.
-    pub(super) credential_recovery_operation: std::sync::Mutex<Option<String>>,
+    /// Request and original safe hold mask captured for recovery handoff.
+    pub(super) credential_recovery_operation: std::sync::Mutex<Option<RecoveryExecution>>,
     /// R08：当前运行操作的 dev profile（None = 操作未指定，legacy 直跑/
     /// env 兜底）。编排生效命令选择的显式依据。
     pub(super) pending_dev_profile: std::sync::Mutex<Option<bool>>,
@@ -91,6 +92,15 @@ pub struct ServerState {
 pub(crate) struct AuxiliaryWriter<'a> {
     pub(super) state: &'a ServerState,
     pub(super) confirmed: bool,
+}
+
+pub(super) const CREDENTIALS_HOLD: u8 = 1;
+pub(super) const OUTCOME_HOLD: u8 = 2;
+pub(super) const SOURCE_HISTORY_HOLD: u8 = 4;
+
+pub(super) struct RecoveryExecution {
+    pub(super) operation_id: String,
+    pub(super) previous_hold: u8,
 }
 
 /// Restores the credential fence unless a replacement request was handed to

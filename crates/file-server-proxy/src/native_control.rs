@@ -1,4 +1,6 @@
 //! Standalone owner protocol. PID is never an authorization credential.
+#[path = "native_previous.rs"]
+mod native_previous;
 #[path = "native_receipt.rs"]
 mod native_receipt;
 pub(crate) use native_receipt::directory;
@@ -236,7 +238,7 @@ impl Owner {
         };
         if let Some(previous) = read(&root)?.filter(|r| r.phase != "Stopped") {
             if worker.is_some() {
-                recover_under_owner_lock(&root, Some(&previous.instance_id))?;
+                native_previous::reconcile(&root, &previous)?;
             } else {
                 return Err("previous owner outcome unknown; receipt preserved, explicit reconciliation required".into());
             }
