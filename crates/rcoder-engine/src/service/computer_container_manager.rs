@@ -15,14 +15,16 @@
 
 use crate::AppError;
 use crate::utils::{COMPUTER_WORKSPACE_ROOT, user_dir};
-use container_runtime_api::{ContainerCreateParams, ContainerRuntime};
+use container_runtime_api::{
+    ContainerCreateParams, ContainerRuntime, RuntimeErrorContext, runtime_app_error,
+};
 use docker_manager::ContainerBasicInfo;
-use shared_types::error_codes::{ERR_CONTAINER_ERROR, ERR_WORKSPACE_ERROR};
+use shared_types::error_codes::{ERR_CONTAINER_ADDRESS_NOT_READY, ERR_WORKSPACE_ERROR};
 use shared_types::{ServiceResourceLimits, ServiceType};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// 容器创建参数
 ///
@@ -93,72 +95,45 @@ impl ComputerContainerManager {
             options.user_id, options.pod_id, container_identifier, options.service_type
         );
 
-        // 1. 尝试获取现有容器
-        // 使用 container_identifier 作为容器标识进行查询
-        if let Ok(Some(info)) = runtime
+        // Only an authoritative absence permits creation. An address is not
+        // physical liveness evidence and cannot authorize replacement.
+        if let Some(info) = runtime
             .get_container_info_by_identifier(container_identifier, &options.service_type)
             .await
+            .map_err(|error| {
+                runtime_app_error(&error, "container.query", RuntimeErrorContext::ReadOnly)
+            })?
         {
-            // ✅ 关键修复: 先验证 IP 是否有效，再检查容器运行状态
-            // 顺序很重要：IP 为空说明容器已异常（被 kill 后网络已销毁），
-            // 此时不应再调用 is_container_running_by_identifier（可能因缓存返回错误结果）
-            if info.container_ip.trim().is_empty() {
-                warn!(
-                    "⚠️ [COMPUTER_CONTAINER] Container has empty IP (likely killed externally), will recreate: container_identifier={}, container_id={}",
-                    container_identifier, info.container_id
-                );
-                // 尝试清理已失效的容器
-                if let Err(e) = runtime
-                    .stop_container_by_identifier(container_identifier, &options.service_type)
-                    .await
-                {
-                    warn!(
-                        "⚠️ [COMPUTER_CONTAINER] Failed to cleanup broken container (will create new anyway): {}",
-                        e
-                    );
+            let running = runtime
+                .is_container_running_by_identifier(container_identifier, &options.service_type)
+                .await
+                .map_err(|error| {
+                    runtime_app_error(&error, "container.status", RuntimeErrorContext::ReadOnly)
+                })?;
+            if running {
+                if info.container_ip.trim().is_empty() {
+                    let detail = shared_types::ErrorDetail::new(
+                        ERR_CONTAINER_ADDRESS_NOT_READY,
+                        "container.address",
+                        "Owned container is running but its address is not available yet",
+                    )
+                    .with_retryable(true);
+                    return Err(AppError::with_message(
+                        ERR_CONTAINER_ADDRESS_NOT_READY,
+                        detail.detail.clone(),
+                    )
+                    .with_error_detail(detail));
                 }
-                // 继续创建新容器
-            } else {
-                // IP 非空，进一步验证容器是否真的在运行
-                match runtime
-                    .is_container_running_by_identifier(container_identifier, &options.service_type)
-                    .await
-                {
-                    Ok(true) => {
-                        info!(
-                            "✅ [COMPUTER_CONTAINER] User container already exists and running: container_identifier={}, container_id={}, ip={}",
-                            container_identifier, info.container_id, info.container_ip
-                        );
-                        return Ok(info);
-                    }
-                    Ok(false) => {
-                        warn!(
-                            "⚠️ [COMPUTER_CONTAINER] User container exists but stopped: container_identifier={}, container_id={}, will delete and recreate",
-                            container_identifier, info.container_id
-                        );
-                        if let Err(e) = runtime
-                            .stop_container_by_identifier(
-                                container_identifier,
-                                &options.service_type,
-                            )
-                            .await
-                        {
-                            warn!(
-                                "⚠️ [COMPUTER_CONTAINER] Failed to delete old container (will create new container anyway): {}",
-                                e
-                            );
-                        }
-                        // 继续创建新容器
-                    }
-                    Err(e) => {
-                        warn!(
-                            "⚠️ [COMPUTER_CONTAINER] Failed to check container status: container_identifier={}, error={}, will try creating new container",
-                            container_identifier, e
-                        );
-                        // 继续创建新容器
-                    }
-                }
+                return Ok(info);
             }
+            // Cleanup must acknowledge completion before a new container is
+            // requested; a lost reply protects the affected execution.
+            runtime
+                .stop_container_by_identifier(container_identifier, &options.service_type)
+                .await
+                .map_err(|error| {
+                    runtime_app_error(&error, "container.stop", RuntimeErrorContext::Mutation)
+                })?;
         }
 
         // 2. 容器不存在或已停止，创建新容器
@@ -302,10 +277,7 @@ impl ComputerContainerManager {
                 error_msg
             );
 
-            AppError::with_message(
-                ERR_CONTAINER_ERROR,
-                format!("Failed to start container: {}", error_msg),
-            )
+            runtime_app_error(&e, "container.create", RuntimeErrorContext::Mutation)
         })?;
 
         info!(
@@ -400,10 +372,7 @@ impl ComputerContainerManager {
             .await
             .map_err(|e| {
                 error!("[COMPUTER_CONTAINER] Failed to query container info: {}", e);
-                AppError::with_message(
-                    ERR_CONTAINER_ERROR,
-                    format!("Failed to query container info: {}", e),
-                )
+                runtime_app_error(&e, "container.query", RuntimeErrorContext::ReadOnly)
             })
     }
 

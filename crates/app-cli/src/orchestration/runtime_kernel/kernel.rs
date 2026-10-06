@@ -501,7 +501,8 @@ impl RuntimeKernel {
 
     /// Startup-only reconciliation after the previous owner was quiesced.
     /// Active/StartupFailed confirms the artifact, while the caller verifies
-    /// current process quiescence and migrations. An uncommitted terminal result
+    /// current process quiescence. Application migration history is diagnostic.
+    /// An uncommitted terminal result
     /// becomes Failed (or Cancelled), never an invented success.
     pub(crate) async fn reconcile_quiesced_operation(
         &self,
@@ -1662,24 +1663,29 @@ impl RuntimeKernel {
         true
     }
 
-    /// 追加服务级编排事件到**当前活跃操作**的 journal（R06 事件桥：owner 形态
+    /// 追加服务级编排事件到**调用方捕获的执行操作**的 journal（R06 事件桥：owner 形态
     /// 下平台经运行 API 读事件流，stdout EVT 只被本地 spawn 路径消费）。
-    /// 无活跃操作时 no-op（idle 期编排事件只有 stdout 消费者）。
+    /// 不读取异步准入锁：并发 stdout/stderr 与管理查询不能丢失日志事件。
     /// 返回是否已落盘（供桥接方观测丢弃）。
     pub fn append_orchestration_event(
         &self,
+        operation_id: &str,
         stage: &str,
         service: Option<String>,
         event_name: &str,
         payload: Option<serde_json::Value>,
     ) -> bool {
-        let Ok(guard) = self.admission.try_lock() else {
-            return false;
-        };
-        let Some(operation_id) = guard.active_operation_id.clone() else {
-            return false;
-        };
-        drop(guard);
-        self.emit_with_payload(&operation_id, 0, stage, service, Some(event_name), payload)
+        match self.store.load_operation(operation_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::error!(
+                    operation_id,
+                    "read orchestration event operation: {error:#}"
+                );
+                return false;
+            }
+        }
+        self.emit_with_payload(operation_id, 0, stage, service, Some(event_name), payload)
     }
 }

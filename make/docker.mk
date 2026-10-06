@@ -151,53 +151,27 @@ PINGAP_DL_VERSION ?= $(PINGAP_VERSION)
 PINGAP_CACHE_DIR := .cache/pingap
 .PHONY: download-pingap-cache
 download-pingap-cache:
-	@mkdir -p $(PINGAP_CACHE_DIR) docker/rcoder-agent-runner/downloads
-	@for pair in "amd64 x86" "arm64 aarch64"; do \
-		set -- $$pair; \
-		PLATFORM_ARCH=$$1; ASSET_ARCH=$$2; \
-		ASSET="pingap-linux-gnu-$$ASSET_ARCH-full.tar.gz"; \
-		FILE="$(PINGAP_CACHE_DIR)/pingap-v$(PINGAP_DL_VERSION)-linux-gnu-$$ASSET_ARCH-full.tar.gz"; \
-		TMP_FILE="$$FILE.tmp"; \
-		if [ -f "$$FILE" ] && tar -tzf "$$FILE" >/dev/null 2>&1; then \
-			echo "✓ Pingap $(PINGAP_DL_VERSION) $$PLATFORM_ARCH 已缓存"; \
-		else \
-			rm -f "$$FILE" "$$TMP_FILE"; \
-			echo "↓ 下载 Pingap $(PINGAP_DL_VERSION) $$PLATFORM_ARCH release..."; \
-			URL="https://github.com/vicanso/pingap/releases/download/v$(PINGAP_DL_VERSION)/$$ASSET"; \
-			curl -fsSL --retry 3 --retry-delay 5 -o "$$TMP_FILE" "$$URL" \
-				|| curl -fsSL --retry 3 --retry-delay 5 -o "$$TMP_FILE" "https://ghproxy.net/$$URL" \
-				|| { echo "❌ 下载 Pingap $$PLATFORM_ARCH 失败"; rm -f "$$TMP_FILE"; exit 1; }; \
-			tar -tzf "$$TMP_FILE" >/dev/null 2>&1 \
-				|| { echo "❌ Pingap $$PLATFORM_ARCH 缓存包损坏"; rm -f "$$TMP_FILE"; exit 1; }; \
-			mv "$$TMP_FILE" "$$FILE"; \
-			echo "✓ Pingap $(PINGAP_DL_VERSION) $$PLATFORM_ARCH 已缓存"; \
-		fi; \
-		rm -f docker/rcoder-agent-runner/downloads/pingap-v*-linux-gnu-$$ASSET_ARCH-full.tar.gz; \
-		cp "$$FILE" docker/rcoder-agent-runner/downloads/; \
-		mkdir -p docker/app-runtime-base/cache; \
-		rm -f docker/app-runtime-base/cache/pingap-v*-linux-gnu-$$ASSET_ARCH-full.tar.gz; \
-		cp "$$FILE" docker/app-runtime-base/cache/; \
-	done
-	@find $(PINGAP_CACHE_DIR) -maxdepth 1 -name 'pingap-*' \
-		! -name 'pingap-v$(PINGAP_DL_VERSION)-*' -delete
-	@echo "✅ Pingap $(PINGAP_DL_VERSION) 已分发到 agent-runner/downloads 与 app-runtime-base/cache（旧版已清）"
+	@python3 tools/build/runtime_assets.py pingap --version "$(PINGAP_DL_VERSION)" --cache "$(RUNTIME_ASSET_CACHE)" --context docker/app-runtime-base --download-context docker/rcoder-agent-runner --output-ref "$(ASSET_REF_DIR)/pingap.ref"
+
+.PHONY: asset-preflight docker-build-agent-assets docker-build-runtime-assets check-build-contracts
+asset-preflight:
+	@python3 k8s/scripts/pingap_version_gate.py --pingap-version "$(PINGAP_VERSION)" --pingap-commit "$(PINGAP_COMMIT)" --download-version "$(PINGAP_DL_VERSION)" --node-version "$(NODE_RUNTIME_VERSION)"
+
+check-build-contracts:
+	@python3 k8s/scripts/pingap_version_gate.py --cross-repo
+
+docker-build-agent-assets: asset-preflight
+	@$(MAKE) build-dbx-fork download-pingap-cache
+
+docker-build-runtime-assets: asset-preflight
+	@$(MAKE) build-dbx-fork download-pingap-cache download-ttyd download-node download-go-cache download-deno
 
 # 构建 agent-runner 镜像（基于基础镜像，快速构建）
 # pingap 版本说明（构建注入，单一来源 = app-cli devtool.rs DEFAULT_PINGAP_VERSION/COMMIT，
 # 与生产 build_config 16-app-runtime.mk 同值；三处同步改）
-docker-build-agent-runner: build-dbx-fork download-pingap-cache
+docker-build-agent-runner: docker-build-agent-assets
 	@echo "🐳 构建 rcoder-agent-runner 镜像（本地开发用 dev-rcoder-agent-runner）..."
 	@echo "📍 镜像名称: dev-rcoder-agent-runner:latest"
-	@# Compare the production source before building; never overwrite this worktree.
-	@BUILD_CONFIG_DIR=~/Documents/git-workspace/build-agent-docker/build_config/rcoder-agent-runner; \
-	if [ -d "$$BUILD_CONFIG_DIR" ]; then \
-		for f in start-up.sh start-up-common.sh start-up-docker-extra.sh start-up-k8s-extra.sh; do \
-			if [ ! -f "$$BUILD_CONFIG_DIR/$$f" ] || ! cmp -s "docker/rcoder-agent-runner/$$f" "$$BUILD_CONFIG_DIR/$$f"; then \
-				echo "Builder startup script differs or is missing: $$f. Review and reconcile both repositories before building." >&2; \
-				exit 1; \
-			fi; \
-		done; \
-	fi
 	@# 检查基础镜像是否存在
 	@if ! docker image inspect "$(AGENT_BASE_IMAGE)" >/dev/null 2>&1; then \
 		if [ "$(AGENT_BASE_IMAGE)" != "dev-rcoder-agent-base:latest" ]; then echo "Missing AGENT_BASE_IMAGE=$(AGENT_BASE_IMAGE)"; exit 1; fi; \
@@ -222,7 +196,7 @@ docker-build-agent-runner: build-dbx-fork download-pingap-cache
 	else \
 		DIAL9_RUSTFLAGS=""; \
 	fi; \
-	docker build --build-arg CRATES_HASH=$(CRATES_HASH) \
+	docker build --pull --build-arg CRATES_HASH=$(CRATES_HASH) \
 		--build-arg CARGO_FLAGS="$(CARGO_FEATURES)" \
 		--build-arg RUSTFLAGS="$$DIAL9_RUSTFLAGS" \
 		-f docker/rcoder-agent-runner/Dockerfile.build -t dev-rcoder-agent-runner-build .
@@ -244,23 +218,22 @@ docker-build-agent-runner: build-dbx-fork download-pingap-cache
 		echo "🔒 跳过 eBPF 工具安装（生产模式）"; \
 	fi; \
 	PINGAP_VERSION=$(PINGAP_VERSION) PINGAP_COMMIT=$(PINGAP_COMMIT); \
-	cd docker/rcoder-agent-runner && \
-		if [ -n "$(BUILDX_BUILDER)" ]; then \
-			docker buildx build --builder $(BUILDX_BUILDER) --platform linux/$(DOCKER_HOST_ARCH) --load \
+			if [ -n "$(BUILDX_BUILDER)" ]; then \
+			python3 tools/build/asset_context.py --source docker/rcoder-agent-runner --kind agent -- docker buildx build --builder $(BUILDX_BUILDER) --platform linux/$(DOCKER_HOST_ARCH) --load \
 				--build-arg BASE_IMAGE="$(AGENT_BASE_IMAGE)" \
 				--build-arg PINGAP_VERSION=$$PINGAP_VERSION \
 				--build-arg PINGAP_COMMIT=$$PINGAP_COMMIT \
 				--build-arg CACHEBUST=$(AGENT_TOOLS_CACHE_KEY) \
 				--build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
-				-f Dockerfile -t dev-rcoder-agent-runner:latest . ; \
+				-f "{dockerfile}" -t dev-rcoder-agent-runner:latest "{context}" ; \
 		else \
-			docker build \
+			python3 tools/build/asset_context.py --source docker/rcoder-agent-runner --kind agent -- docker build \
 				--build-arg BASE_IMAGE="$(AGENT_BASE_IMAGE)" \
 				--build-arg PINGAP_VERSION=$$PINGAP_VERSION \
 				--build-arg PINGAP_COMMIT=$$PINGAP_COMMIT \
 				--build-arg CACHEBUST=$(AGENT_TOOLS_CACHE_KEY) \
 				--build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
-				-f Dockerfile -t dev-rcoder-agent-runner:latest . ; \
+				-f "{dockerfile}" -t dev-rcoder-agent-runner:latest "{context}" ; \
 		fi;)
 	@echo "✅ dev-rcoder-agent-runner 镜像构建完成！"
 	@if [ "$(CARGO_FEATURES)" != "" ]; then \
@@ -286,7 +259,7 @@ docker-build-agent-production:
 APP_RUNTIME_DIR := docker/app-runtime-base
 
 # 构建 dev-app-runtime-base（基础设施 + 语言运行时层: Rust/PG/dbx/ttyd/supervisor + Node/Python/Java/Go/Deno）
-docker-build-app-runtime-base: build-dbx-fork download-pingap-cache download-ttyd download-node download-go-cache download-deno
+docker-build-app-runtime-base: docker-build-runtime-assets
 	@echo "🐳 构建 dev-app-runtime-base:latest ..."
 	@python3 docker/build-app-runtime.py $(APP_RUNTIME_DIR)
 	@echo "✅ dev-app-runtime-base:latest 构建完成"

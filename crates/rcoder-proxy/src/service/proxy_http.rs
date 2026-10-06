@@ -140,18 +140,23 @@ impl ProxyHttp for PortProxy {
                 let wake_pending = if wc.is_stopped(&app_id) {
                     true
                 } else {
-                    match tokio::time::timeout_at(deadline, wc.remote_wake_pending(&app_id)).await {
-                        Ok(pending) => pending,
+                    match tokio::time::timeout_at(deadline, wc.remote_wake_pending_result(&app_id))
+                        .await
+                    {
+                        Ok(Ok(pending)) => pending,
+                        Ok(Err(failure)) => {
+                            self.respond_wake_failure(session, ctx, failure).await;
+                            return Ok(true);
+                        }
                         Err(_) => {
-                            // 唤醒状态查询超时：503 + 友好表示（真实状态保留）
-                            self.respond_userapp_error(
+                            self.respond_wake_failure(
                                 session,
                                 ctx,
-                                503,
-                                crate::error_page::ErrorPageCause::Generic,
-                                "wake status check timed out",
-                                Some(15),
-                                "remote_wake_pending exceeded the wake deadline",
+                                shared_types::WakeFailure::timeout(
+                                    "wake_runtime_probe",
+                                    None,
+                                    true,
+                                ),
                             )
                             .await;
                             return Ok(true);
@@ -171,26 +176,32 @@ impl ProxyHttp for PortProxy {
                         shared_types::WakeOutcome::Ready
                         | shared_types::WakeOutcome::AlreadyRunning,
                     ) => {}
-                    Ok(
-                        shared_types::WakeOutcome::Timeout
-                        | shared_types::WakeOutcome::Failed(_)
-                        | shared_types::WakeOutcome::Blocked { .. },
-                    )
-                    | Err(_) => {
-                        // 未获得可用上游（包括操作占用）；返回 503，不宣称仍在启动。
-                        // 能走到这里必然 wake_pending（false 已在上方提前 return）。
-                        let detail = "wake ensure_running did not reach Ready before the deadline";
-                        self.respond_userapp_error(
-                            session,
-                            ctx,
-                            503,
-                            crate::error_page::ErrorPageCause::Generic,
-                            "wake did not produce a ready upstream",
-                            Some(15),
-                            detail,
-                        )
-                        .await;
-                        return Ok(true); // 已直接响应，跳过 upstream
+                    outcome => {
+                        let failure = match outcome {
+                            Ok(
+                                shared_types::WakeOutcome::Timeout(failure)
+                                | shared_types::WakeOutcome::Failed(failure),
+                            ) => failure,
+                            Ok(shared_types::WakeOutcome::Blocked { message, blocker }) => {
+                                shared_types::WakeFailure {
+                                    blocker: Some(Box::new(blocker)),
+                                    ..shared_types::WakeFailure::new(
+                                        shared_types::ERR_CONFLICT,
+                                        "wake_admission",
+                                        message,
+                                    )
+                                }
+                            }
+                            Err(_) => shared_types::WakeFailure::timeout("wake_wait", None, false),
+                            Ok(
+                                shared_types::WakeOutcome::Ready
+                                | shared_types::WakeOutcome::AlreadyRunning,
+                            ) => {
+                                return Ok(false);
+                            }
+                        };
+                        self.respond_wake_failure(session, ctx, failure).await;
+                        return Ok(true);
                     }
                 }
             }
@@ -732,6 +743,29 @@ impl PortProxy {
     ///
     /// 未装配错误页呈现器时保持旧的极简响应（header-only）——能力接入前
     /// 行为零回退。真实状态码保留；HEAD 无正文；写失败不二次发送。
+    async fn respond_wake_failure(
+        &self,
+        session: &mut Session,
+        ctx: &mut TrackingCtx,
+        failure: shared_types::WakeFailure,
+    ) {
+        let status = failure.clone().into_app_error().status_code().as_u16();
+        let code = failure.code.clone();
+        let detail = shared_types::sanitize_error_text(&failure.message);
+        let retry = failure.retryable.then_some(15);
+        ctx.wake_failure = Some(failure);
+        self.respond_userapp_error(
+            session,
+            ctx,
+            status,
+            crate::error_page::ErrorPageCause::Generic,
+            code.as_ref(),
+            retry,
+            &detail,
+        )
+        .await;
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn respond_userapp_error(
         &self,
@@ -782,6 +816,7 @@ impl PortProxy {
                 retry_after_secs,
                 &context,
                 detail,
+                ctx.wake_failure.as_ref(),
             )
             .await;
             return;
@@ -799,6 +834,19 @@ impl PortProxy {
         }
         let response = ResponseHeader::build(status, None).ok();
         if let Some(mut response) = response {
+            if let Some(failure) = &ctx.wake_failure {
+                if let Err(error) =
+                    response.insert_header("x-rcoder-error-code", failure.code.as_ref())
+                {
+                    tracing::warn!("insert wake error code header failed: {error}");
+                }
+                if let Some(operation_id) = &failure.operation_id
+                    && let Err(error) =
+                        response.insert_header("x-rcoder-operation-id", operation_id)
+                {
+                    tracing::warn!("insert wake operation header failed: {error}");
+                }
+            }
             if let Some(seconds) = retry_after_secs
                 && let Err(error) = response.insert_header("Retry-After", seconds.to_string())
             {

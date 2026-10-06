@@ -42,6 +42,13 @@ pub(crate) struct MockRuntime {
     pub restart_calls: AtomicUsize,
     pub restart_images: std::sync::Mutex<Vec<Option<String>>>,
     pub lease_held: Arc<AtomicBool>,
+    pub lease_acquire_calls: AtomicUsize,
+    pub lease_validation_fails: AtomicBool,
+    pub lease_validation_calls: AtomicUsize,
+    /// Pause only after the physical lease CAS succeeds, before its response.
+    /// Clone both barriers outside the mutex guards before awaiting them.
+    pub lease_acquire_started: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    pub lease_acquire_release: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
     pub env_commit_failure: AtomicUsize,
     pub patch_preparation_fails: AtomicBool,
     pub ensure_workspace_calls: AtomicUsize,
@@ -52,7 +59,14 @@ pub(crate) struct MockRuntime {
     pub create_calls: AtomicUsize,
     pub create_fails: AtomicBool,
     pub status_fails: AtomicUsize,
+    /// Inject a read failure only after a captured Stop has acknowledged its write.
+    pub post_stop_status_fails: AtomicUsize,
+    /// Post-acknowledgement reads fail, including the best-effort proxy refresh.
+    pub post_activation_status_fails: AtomicUsize,
     pub stop_failure_status: AtomicUsize,
+    /// Exercise the public typed boundary even if a peer labels an unsafe status
+    /// as RequestRejected; normal fixtures still use from_status classification.
+    pub stop_raw_rejection: AtomicBool,
     pub policy_calls: AtomicUsize,
     /// Deterministic read window for lifecycle query races; clone outside the
     /// mutex before awaiting either barrier phase.
@@ -377,6 +391,7 @@ impl UserAppDeploymentRuntime for MockRuntime {
         &self,
         _app_id: &str,
     ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        self.lease_acquire_calls.fetch_add(1, Ordering::SeqCst);
         if self
             .lease_held
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -392,11 +407,43 @@ impl UserAppDeploymentRuntime for MockRuntime {
                 },
             )));
         }
+        let started = self.lease_acquire_started.lock().unwrap().clone();
+        let release = self.lease_acquire_release.lock().unwrap().clone();
+        if let Some(started) = started {
+            started.wait().await;
+        }
+        if let Some(release) = release {
+            release.wait().await;
+        }
         Ok(Some(Box::new(MockOperationLease(
             self.lease_held.clone(),
             _app_id.into(),
             ServiceType::Userapp,
         ))))
+    }
+
+    async fn validate_app_operation_receipt(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<bool> {
+        self.lease_validation_calls.fetch_add(1, Ordering::SeqCst);
+        if self.lease_validation_fails.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::ConnectionError(
+                "occupied holder lease observation endpoint unavailable".into(),
+            ));
+        }
+        use shared_types::AppOperationLease as _;
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let family = *receipt.service_type();
+        if !matches!(family, ServiceType::Userapp | ServiceType::UserappBuilder) {
+            return Ok(false);
+        }
+        let expected =
+            MockOperationLease(self.lease_held.clone(), context.app_id.clone(), family).receipt();
+        Ok(self.lease_held.load(Ordering::SeqCst) && expected.as_ref() == Some(receipt))
     }
 
     async fn capture_app_deletion(
@@ -575,6 +622,10 @@ impl UserAppDeploymentRuntime for MockRuntime {
                 }
                 .into();
                 status.wake_on_traffic = Some(true);
+                self.status_fails.store(
+                    self.post_activation_status_fails.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
                 Ok(())
             }
             dashmap::mapref::entry::Entry::Vacant(_) => Err(ContainerRuntimeError::Conflict(
@@ -591,6 +642,14 @@ impl UserAppDeploymentRuntime for MockRuntime {
         self.scale_calls.fetch_add(1, Ordering::SeqCst);
         let failure = self.stop_failure_status.load(Ordering::SeqCst);
         if failure != 0 {
+            if self.stop_raw_rejection.load(Ordering::SeqCst) {
+                return Err(ContainerRuntimeError::RequestRejected(
+                    shared_types::RuntimeRequestRejection {
+                        status: failure as u16,
+                        message: "Injected unsafe stop rejection label".into(),
+                    },
+                ));
+            }
             if let Some(rejection) = shared_types::RuntimeRequestRejection::from_status(
                 failure as u16,
                 "Injected stop request rejection".into(),
@@ -614,6 +673,10 @@ impl UserAppDeploymentRuntime for MockRuntime {
                 status.ready_replicas = 0;
                 status.phase = "Stopped".into();
                 status.wake_on_traffic = Some(wake_on_traffic);
+                self.status_fails.store(
+                    self.post_stop_status_fails.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
                 Ok(())
             }
             dashmap::mapref::entry::Entry::Vacant(_) => Err(ContainerRuntimeError::Conflict(
@@ -771,6 +834,7 @@ pub(crate) async fn test_service_with_store(
     let store = Arc::new(store);
     let service = AppService {
         operation_flight: Arc::default(),
+        file_credentials: std::sync::OnceLock::new(),
         config,
         runtime: runtime as Arc<dyn UserAppRuntime>,
         activity: Arc::new(AppActivityRegistry::new(Duration::from_secs(300))),

@@ -4,4 +4,5 @@ pub mod deploy;
 pub mod devtool;
 pub mod inspection;
 pub mod manifest;
+pub(crate) mod source_lock;
 pub mod validate;

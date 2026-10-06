@@ -9,6 +9,7 @@ mod container;
 mod model;
 mod runtime_config;
 mod userapp;
+pub use model::{ApiBody, OperationInProgressData, OperationOutcomeUnknown};
 
 // 容器域类型（高内聚收拢于 container/ 模块）—— 条目/查找/清理/统计 + 服务与隔离枚举
 pub use container::{
@@ -25,7 +26,7 @@ pub use project_store::ProjectStore;
 // Userapp 域（高内聚收拢于 userapp/ 模块）—— 活动追踪/唤醒 + 业务元数据 + build 进度事件 + 开发资源回收契约
 pub use userapp::activity::{
     ActivityPersistence, ActivityRow, AppAccessTracker, AppWakeControl, RemoteWakeState,
-    WakeOutcome,
+    WakeFailure, WakeOutcome,
 };
 pub use userapp::app_stage::{UserappStage, invalid_app_stage_error};
 pub use userapp::build_event::BuildProgressEvent;
@@ -45,8 +46,8 @@ pub use userapp::db_admin::{
 };
 pub use userapp::db_align::{
     AlignCredentialsOutcome, AlignCredentialsRequest, AlignError, CommandOutcome,
-    CredentialMutationEvidence, PgCommandRunner, align_pg_credentials,
-    align_pg_credentials_with_admin,
+    CredentialMutationEvidence, PgCommandDiagnostic, PgCommandError, PgCommandEvidence,
+    PgCommandMode, PgCommandRunner, align_pg_credentials, align_pg_credentials_with_admin,
 };
 pub use userapp::db_password::*;
 pub use userapp::dbx_readiness::{
@@ -64,15 +65,16 @@ pub use userapp::forward_contract::{
     SERVICE_TYPE_TASK_AGENT, SERVICE_TYPE_USERAPP, WORKSPACE_PATH_HEADER, WORKSPACE_TYPE_HEADER,
     is_userapp_service_type_value, normalize_computer_service_type,
 };
+pub use userapp::http_credentials::{FileServerCredentialsProvider, FileServerRequestCredentials};
 pub use userapp::metadata::AppMetadataRecord;
 pub use userapp::run_credentials::{SourceRunCredentialError, resolve_source_run_pg};
 pub use userapp::runtime_configuration::*;
 pub use userapp::runtime_control::{
     ArtifactInput, DesiredState, ERR_INTERRUPTED_OWNER_EXIT, ERR_OPERATION_ID_CONFLICT,
-    ERR_OPERATION_IN_PROGRESS, ERR_PROTOCOL_UNSUPPORTED, ERR_RECOVERY_REQUIRED,
-    ERR_REVISION_MISMATCH, ERR_RUNTIME_INSTANCE_MISMATCH, ERR_STOP_PENDING, ERR_WORKSPACE_MISMATCH,
-    ObservedHealth, OperationRunConfig, RUNTIME_CONTROL_PROTOCOL_VERSION, RunProfileInput,
-    RuntimeEventRecord, RuntimeFailureDetail, RuntimeIdentityView, RuntimeMigrationRecoveryState,
+    ERR_PROTOCOL_UNSUPPORTED, ERR_RECOVERY_REQUIRED, ERR_REVISION_MISMATCH,
+    ERR_RUNTIME_INSTANCE_MISMATCH, ERR_STOP_PENDING, ERR_WORKSPACE_MISMATCH, ObservedHealth,
+    OperationRunConfig, RUNTIME_CONTROL_PROTOCOL_VERSION, RunProfileInput, RuntimeEventRecord,
+    RuntimeFailureDetail, RuntimeIdentityView, RuntimeMigrationRecoveryState,
     RuntimeOperationAccepted, RuntimeOperationKind, RuntimeOperationRequest, RuntimeOperationState,
     RuntimeOperationView, RuntimeRecoveryView, RuntimeStatusView, runtime_request_digest,
     validate_runtime_operation_request,
@@ -152,16 +154,21 @@ pub use shared_types_i18n::{
     ERR_AGENT_MGMT_UNINSTALL_FAILED, ERR_AGENT_MGMT_UNKNOWN_AGENT, ERR_AGENT_MGMT_UNSUPPORTED_TYPE,
     ERR_AGENT_NOT_FOUND, ERR_AGENT_RUNNER_UNAVAILABLE, ERR_API_KEY_AUTH_FAILED,
     ERR_APP_ALREADY_EXISTS, ERR_APP_NOT_FOUND, ERR_BACKEND_ERROR, ERR_CANCEL_FAILED, ERR_CONFLICT,
-    ERR_CONTAINER_ERROR, ERR_CONTAINER_NOT_FOUND, ERR_DEV_NOT_RUNNING, ERR_FILE_NOT_FOUND,
-    ERR_GRPC_ADDR_ERROR, ERR_GRPC_ERROR, ERR_HTTP_FALLBACK_FAILED, ERR_IMAGE_PULL_FAILED,
-    ERR_INTERNAL_SERVER_ERROR, ERR_INVALID_PARAMS, ERR_INVALID_RESOURCE_LIMITS, ERR_INVALID_STATE,
-    ERR_MODEL_UNAVAILABLE, ERR_NOT_FOUND, ERR_OPERATION_NOT_SUPPORTED, ERR_PERMISSION_EXPIRED,
-    ERR_PERMISSION_NOT_FOUND, ERR_PERMISSION_RESOLVE_FAILED, ERR_PROJECT_NOT_FOUND,
-    ERR_PROXY_DISABLED, ERR_PROXY_SERVICE_UNAVAILABLE, ERR_RESOURCE_EXHAUSTED, ERR_RESUME_FAILED,
-    ERR_RETRY_EXHAUSTED, ERR_SERVICE_UNAVAILABLE, ERR_SESSION_NOT_FOUND, ERR_STOP_FAILED,
-    ERR_TOO_MANY_REQUESTS, ERR_UNKNOWN, ERR_USERAPP_WAIT_TIMEOUT, ERR_VALIDATION,
-    ERR_WORKSPACE_ERROR, SUCCESS, error_codes, get_error_description, get_error_message,
-    get_i18n_message, get_i18n_message_default,
+    ERR_CONTAINER_ADDRESS_NOT_READY, ERR_CONTAINER_CREATE_FAILED, ERR_CONTAINER_ERROR,
+    ERR_CONTAINER_EXEC_FAILED, ERR_CONTAINER_NOT_FOUND, ERR_CONTAINER_START_FAILED,
+    ERR_CONTAINER_STOP_FAILED, ERR_DATABASE_COMMAND_FAILED, ERR_DATABASE_NOT_READY,
+    ERR_DEV_NOT_RUNNING, ERR_FILE_NOT_FOUND, ERR_GRPC_ADDR_ERROR, ERR_GRPC_ERROR,
+    ERR_HTTP_FALLBACK_FAILED, ERR_IMAGE_PULL_FAILED, ERR_INTERNAL_SERVER_ERROR, ERR_INVALID_PARAMS,
+    ERR_INVALID_RESOURCE_LIMITS, ERR_INVALID_STATE, ERR_MODEL_UNAVAILABLE, ERR_NOT_FOUND,
+    ERR_OPERATION_IN_PROGRESS, ERR_OPERATION_NOT_SUPPORTED, ERR_OPERATION_OUTCOME_UNKNOWN,
+    ERR_PERMISSION_EXPIRED, ERR_PERMISSION_NOT_FOUND, ERR_PERMISSION_RESOLVE_FAILED,
+    ERR_PROJECT_NOT_FOUND, ERR_PROXY_DISABLED, ERR_PROXY_SERVICE_UNAVAILABLE,
+    ERR_RESOURCE_EXHAUSTED, ERR_RESUME_FAILED, ERR_RETRY_EXHAUSTED, ERR_RUNTIME_CONFIGURATION,
+    ERR_RUNTIME_TIMEOUT, ERR_RUNTIME_UNAVAILABLE, ERR_SERVICE_UNAVAILABLE, ERR_SESSION_NOT_FOUND,
+    ERR_STOP_FAILED, ERR_TOO_MANY_REQUESTS, ERR_UNKNOWN, ERR_USERAPP_WAIT_TIMEOUT,
+    ERR_USERAPP_WAKE_FAILED, ERR_VALIDATION, ERR_WORKSPACE_ERROR, SUCCESS, error_codes,
+    get_error_description, get_error_hint, get_error_message, get_i18n_message,
+    get_i18n_message_default, get_operation_in_progress_message,
 };
 
 // Validation 模块
@@ -236,11 +243,13 @@ pub use model::{
     ChatResponse,
     ContainerBasicInfo,
     DocumentAttachment,
+    ErrorDetail,
     HealthCheckResponse,
     HealthResponse,
     HttpResult,
     ImageAttachment,
     ImageDimensions,
+    MAX_ERROR_DETAIL_CHARS,
     ModelApiProtocol,
     ModelProviderConfig,
     ModelProviderSafeInfo,
@@ -261,6 +270,9 @@ pub use model::{
     VersionResponse,
     VncStatusResponse,
     current_otel_trace_id,
+    error_status_from_code,
+    redact_error_text,
+    sanitize_error_text,
 };
 
 // 部署配置域（高内聚收拢于 runtime_config/ 模块）—— Docker/K8s 双运行时配置族 + Quantity 解析

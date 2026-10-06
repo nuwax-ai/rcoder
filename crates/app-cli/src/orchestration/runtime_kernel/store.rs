@@ -309,9 +309,19 @@ impl RuntimeStore {
             .map_err(|error| error.error)
             .context("publish owner credential file")?;
         #[cfg(unix)]
-        std::fs::File::open(&self.root)
-            .and_then(|directory| directory.sync_all())
-            .context("sync private credential directory")?;
+        {
+            let parent = destination
+                .parent()
+                .context("private record parent missing")?;
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .context("sync private record directory")?;
+            if parent != self.root.as_path() {
+                std::fs::File::open(&self.root)
+                    .and_then(|directory| directory.sync_all())
+                    .context("sync private temporary record directory")?;
+            }
+        }
         Ok(())
     }
 
@@ -411,18 +421,27 @@ impl RuntimeStore {
     }
 
     pub(crate) fn store_operation(&self, operation: &StoredOperation) -> Result<()> {
-        // R08：凭据不落盘——持久化副本对 run_config.pg 脱敏（重放只回终态
-        // 视图，恢复不重执行，脱敏不影响语义；诊断可见用户名）
-        let mut redacted = operation.clone();
-        if let Some(config) = redacted.request.run_config.as_mut()
-            && let Some(pg) = config.pg.as_mut()
-        {
-            pg.password = String::new();
+        // Internal input retains the actual dispatched credentials for audit.
+        // Protect the temporary file before writing, then publish atomically.
+        // HTTP/SSE expose only operation views and events, never this request.
+        let content = serde_json::to_vec_pretty(operation).context("encode operation record")?;
+        let name = format!("operations/{}.json", operation.view.operation_id);
+        let mut last_error = None;
+        for attempt in 0..5u32 {
+            match self.store_private_bytes(&name, &content) {
+                Ok(()) => return Ok(()),
+                Err(error) if is_transient_windows_lock(&error) => {
+                    tracing::warn!(attempt, error = %error, "private operation persist transiently locked; retrying");
+                    last_error = Some(error);
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        u64::from(attempt + 1) * 20,
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
         }
-        write_json(
-            &self.operation_path(&operation.view.operation_id),
-            &redacted,
-        )
+        Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("private operation persist retries exhausted")))
     }
 
     /// 追加事件（每操作单序列；先落盘再发布——spec §3.6）。

@@ -98,7 +98,8 @@ def frozen_template(root):
             "command": ["sh", "scripts/build-standalone.sh"], "artifact": "artifact.zip"}:
         raise ValueError("Python template build contract changed; adapt fixture explicitly")
     paths = ("workspace.manifest.toml", f"{SERVICE}/project.manifest.toml",
-             f"{SERVICE}/scripts/build-standalone.py", f"{SERVICE}/scripts/build-standalone.sh", "cli/package.json")
+             f"{SERVICE}/scripts/build-standalone.py", f"{SERVICE}/scripts/build-standalone.sh",
+             f"{SERVICE}/scripts/artifact_pack.py", "cli/package.json")
     data = {name: (root / name).read_bytes() for name in paths}
     version = json.loads(data["cli/package.json"])["version"]
     git = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
@@ -134,6 +135,7 @@ HTTPServer(('0.0.0.0',int(os.environ['PORT'])),H).serve_forever()
              f"{SERVICE}/project.manifest.toml": manifest.encode(),
              f"{SERVICE}/scripts/build-standalone.py": data[f"{SERVICE}/scripts/build-standalone.py"],
              f"{SERVICE}/scripts/build-standalone.sh": data[f"{SERVICE}/scripts/build-standalone.sh"],
+             f"{SERVICE}/scripts/artifact_pack.py": data[f"{SERVICE}/scripts/artifact_pack.py"],
              f"{SERVICE}/main.py": main.encode(), f"{SERVICE}/app/__init__.py": b"",
              f"{SERVICE}/requirements.lock": b"cache-probe==1.0\n", "cache-sentinel": marker.encode()}
     target = io.BytesIO()
@@ -333,7 +335,7 @@ class Contract:
         code = '''import hashlib,json,pathlib,sys,sysconfig
 r=pathlib.Path(sys.argv[1]);deps=r/'deps';stamp=(r/'.deps-stamp').read_bytes()
 files={str(p.relative_to(deps)):hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(deps.rglob('*')) if p.is_file() and '__pycache__' not in p.parts and p.suffix!='.pyc'}
-print(json.dumps({'stamp':json.loads(stamp),'stamp_sha256':hashlib.sha256(stamp).hexdigest(),'files':files,'dependency_mtime_ns':(deps/'cache_probe.py').stat().st_mtime_ns,'pip_cache_nonempty':any(p.is_file() for p in (r/'.pip-cache').rglob('*')),'interpreter':{'executable':sys.executable,'version':sys.version,'platform':sysconfig.get_platform()},'script_sha256':hashlib.sha256((r/'scripts/build-standalone.py').read_bytes()).hexdigest()}))
+print(json.dumps({'stamp':json.loads(stamp),'stamp_sha256':hashlib.sha256(stamp).hexdigest(),'files':files,'dependency_mtime_ns':(deps/'cache_probe.py').stat().st_mtime_ns,'pip_cache_nonempty':any(p.is_file() for p in (r/'.pip-cache').rglob('*')),'interpreter':{'executable':sys.executable,'version':sys.version,'platform':sysconfig.get_platform()},'script_sha256':hashlib.sha256((r/'scripts/build-standalone.py').read_bytes()).hexdigest(),'artifact_helper_sha256':hashlib.sha256((r/'scripts/artifact_pack.py').read_bytes()).hexdigest()}))
 '''
         return json.loads(self.execute("python3", "-c", code, self.workspace + "/" + SERVICE))
 
@@ -414,7 +416,8 @@ print(json.dumps({'stamp':json.loads(stamp),'stamp_sha256':hashlib.sha256(stamp)
         self.report["first_index_requests"] = requests
         self.check("Python cache first build installs real dependency", bool(requests) and any(path.endswith(".whl") for path in requests)
                    and first["files"] and first["stamp"]["files"].get("cache_probe.py", 0) > 0 and first["pip_cache_nonempty"]
-                   and first["script_sha256"] == identity["files_sha256"][f"{SERVICE}/scripts/build-standalone.py"], first)
+                   and first["script_sha256"] == identity["files_sha256"][f"{SERVICE}/scripts/build-standalone.py"]
+                   and first["artifact_helper_sha256"] == identity["files_sha256"][f"{SERVICE}/scripts/artifact_pack.py"], first)
         self.check("Python cache artifacts preserve deps and exclude caches", self.artifacts(task, "first")["raw_copy_verified"])
         self.task("build")
         second = self.snapshot()

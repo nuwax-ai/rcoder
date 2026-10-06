@@ -55,7 +55,7 @@ RCoder (转换为 SSE)
 
 | 组件类型 | 技术选型 | 说明 |
 |----------|---------|------|
-| **编程语言** | Rust 2024 Edition (1.85+) | MSRV 1.85（edition 2024 最低要求） |
+| **编程语言** | Rust 2024 Edition | 使用最新 Rust stable；构建记录实际工具链版本 |
 | **HTTP 框架** | Axum 0.8 + Tower | 高性能异步 Web 框架 |
 | **RPC 框架** | Tonic 0.14 | 高性能 gRPC 通信（全 rustls） |
 | **AI 协议** | agent-client-protocol v2 + MCP (rmcp) | ACP 官方 SDK，v1 wire 兼容 |
@@ -216,8 +216,8 @@ tests-e2e/                   # e2e 测试（Docker Compose 真实环境）
 
 ### 配置优先级
 
-1. **命令行参数** - 最高优先级
-2. **环境变量** - 中等优先级
+1. **环境变量** - 最高优先级
+2. **命令行参数** - 次高优先级
 3. **配置文件**（config.yml，自动生成/挂载）- 较低优先级
 4. **默认配置** - 最低优先级
 

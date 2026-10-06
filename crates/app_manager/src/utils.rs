@@ -1,8 +1,8 @@
 //! service 层工具函数（错误映射 / 校验 / 状态派生 / 类型映射）
 
 use container_runtime_api::{
-    ContainerFailureReason, ContainerRuntimeError, DeploymentStatus, ExposeType as RtExposeType,
-    HealthCheckType as RtHealthCheckType,
+    ContainerFailureReason, ContainerRuntimeError, CreationStage, DeploymentStatus,
+    ExposeType as RtExposeType, HealthCheckType as RtHealthCheckType,
 };
 use shared_types::ServiceType;
 
@@ -18,22 +18,69 @@ pub(super) fn map_runtime_error(ctx: &str, e: ContainerRuntimeError) -> AppOpera
             rejection.message = format!("{ctx}: {}", rejection.message);
             AppOperationError::RuntimeRejected(rejection)
         }
-        ContainerRuntimeError::Conflict(_) | ContainerRuntimeError::OperationInProgress(_) => {
-            AppOperationError::Conflict(format!("{ctx}: {e}"))
+        ContainerRuntimeError::Conflict(_) => AppOperationError::Conflict(format!("{ctx}: {e}")),
+        ContainerRuntimeError::OperationInProgress(operation) => {
+            tracing::debug!(%operation, context = ctx, "runtime occupied operation has no authoritative holder projection at this boundary");
+            AppOperationError::operation_in_progress(
+                None,
+                shared_types::OperationInProgressData::default(),
+            )
         }
-        // 容器/deployment 不存在 = app 不存在（404）
-        ContainerRuntimeError::ContainerNotFound(_) => {
-            AppOperationError::NotFound(format!("{ctx}: {e}"))
+        ContainerRuntimeError::CreationAborted { progress, source } => {
+            if progress.safe_finish_ok() {
+                return map_runtime_error(ctx, *source);
+            }
+            // Cumulative write evidence belongs to this creation, even when
+            // its last transport error looks like an ordinary read timeout.
+            let stage = match progress.failed_at {
+                CreationStage::Capture => "creation_capture",
+                CreationStage::PvcEnsure => "creation_pvc_ensure",
+                CreationStage::StorageClaim => "creation_storage_claim",
+                CreationStage::WriteGeneration => "creation_write_generation",
+                CreationStage::ApplyService => "creation_apply_service",
+            };
+            let mut failure = map_runtime_error(ctx, *source).wake_failure(stage);
+            failure.code = shared_types::ERR_OPERATION_OUTCOME_UNKNOWN.into();
+            failure.stage = stage.into();
+            failure.retryable = false;
+            AppOperationError::Diagnostic(failure)
         }
-        // 创建链中止：按内部原始错误映射（wire 保真——409 冲突仍是
-        // ERR_CONFLICT、结构化拒绝保持原语义）；「可安全结束」信号不进
-        // wire，由 execute_classification 层单独消费。
-        ContainerRuntimeError::CreationAborted { source, .. } => map_runtime_error(ctx, *source),
-        // 其余 8 类（Connection/Creation/Start/Stop/Configuration/Timeout/K8s/Docker）
-        // 都是后端运行时/基础设施问题，客户端不可恢复，归 Backend(500)。
-        // ConfigurationError 在 runtime 是内部前置条件（params 缺字段），非用户输入，
-        // 归 Backend 最保守，避免误判 400。
-        _ => AppOperationError::Backend(format!("{ctx}: {e}")),
+        // Runtime variants retain their specific diagnostic code. Mutation
+        // completion and durable recovery fences are decided by the caller.
+        _ => {
+            let (code, _) = container_runtime_api::runtime_error_code(&e);
+            AppOperationError::Diagnostic(shared_types::WakeFailure::new(
+                code,
+                "runtime",
+                format!("{ctx}: {e}"),
+            ))
+        }
+    }
+}
+
+/// Mapping for an actual runtime write, after the caller has captured its target.
+/// A lost reply retains the underlying cause and never authorizes a replay.
+pub(super) fn map_runtime_mutation_error(
+    stage: &'static str,
+    ctx: &str,
+    error: ContainerRuntimeError,
+) -> AppOperationError {
+    let unknown = container_runtime_api::runtime_mutation_outcome_unknown(&error);
+    let creation = matches!(&error, ContainerRuntimeError::CreationAborted { .. });
+    let mapped = map_runtime_error(ctx, error);
+    if unknown {
+        let mut failure = mapped.wake_failure(stage);
+        failure.code = shared_types::ERR_OPERATION_OUTCOME_UNKNOWN.into();
+        if !creation {
+            failure.stage = stage.into();
+        }
+        failure.retryable = false;
+        AppOperationError::Diagnostic(failure)
+    } else if let AppOperationError::Diagnostic(mut failure) = mapped {
+        failure.stage = stage.into();
+        AppOperationError::Diagnostic(failure)
+    } else {
+        mapped
     }
 }
 
@@ -468,5 +515,31 @@ mod tests {
             map_health_check_type(&HealthCheckType::None),
             RtHealthCheckType::None
         ));
+    }
+}
+
+#[cfg(test)]
+mod implementation_runtime_identity_tests {
+    use super::*;
+    #[test]
+    fn runtime_in_progress_does_not_promote_legacy_annotation_to_operation_identity() {
+        let error = map_runtime_error(
+            "wake status probe",
+            ContainerRuntimeError::OperationInProgress(Box::new(
+                shared_types::UserAppOperationInProgress {
+                    app_id: "app1".into(),
+                    service_type: ServiceType::Userapp,
+                    resource_name: "app1-operation".into(),
+                    operation_id: Some("original-runtime-op".into()),
+                },
+            )),
+        );
+        assert_eq!(error.code(), shared_types::ERR_OPERATION_IN_PROGRESS);
+        assert_eq!(error.operation_id(), None);
+        assert!(!error.message().contains("original-runtime-op"));
+        assert_eq!(
+            error.operation_in_progress_data(),
+            Some(shared_types::OperationInProgressData::default())
+        );
     }
 }

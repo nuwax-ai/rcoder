@@ -20,17 +20,21 @@ const ENV_ENABLED: &str = "RCODER_SKILL_SYNC_RECONCILE_ON_STARTUP";
 const MAX_SCAN_DEPTH: u32 = 4;
 
 /// 启动 skill sync reconciler 后台 task (不阻塞 rcoder 主流程)。
-pub fn spawn_skill_sync_reconciler() {
+pub fn spawn_skill_sync_reconciler(
+    stop: tokio_util::sync::CancellationToken,
+) -> Option<tokio::task::JoinHandle<Result<(), String>>> {
     if !enabled() {
         info!("[SKILL_SYNC] disabled by {ENV_ENABLED}, skip");
-        return;
+        return None;
     }
     info!("[SKILL_SYNC] starting skill sync reconciler (background)");
-    tokio::spawn(async move {
-        if let Err(e) = run_reconcile().await {
-            warn!("[SKILL_SYNC] reconciler failed: {e}");
+    Some(tokio::spawn(async move {
+        let result = run_reconcile(&stop).await;
+        if let Err(error) = &result {
+            warn!(%error, "Skill sync failed");
         }
-    });
+        result
+    }))
 }
 
 fn enabled() -> bool {
@@ -47,28 +51,43 @@ struct Stats {
     failed: u32,
 }
 
-async fn run_reconcile() -> Result<(), String> {
+async fn run_reconcile(stop: &tokio_util::sync::CancellationToken) -> Result<(), String> {
     let current = file_server::sync_target_version();
     let mut stats = Stats::default();
     for root in [WORKSPACE_ROOT, COMPUTER_WORKSPACE_ROOT] {
+        if stop.is_cancelled() {
+            break;
+        }
         let root = PathBuf::from(root);
         // 根不存在 (如本环境无 computer workspace) → 跳过, 不算错误
         if tokio::fs::metadata(&root).await.is_err() {
             continue;
         }
-        scan_and_reconcile(&root, 0, &current, &mut stats).await;
+        scan_and_reconcile(&root, 0, &current, &mut stats, stop).await;
     }
     info!(
         "[SKILL_SYNC] completed: synced={}, skipped={}, failed={}",
         stats.synced, stats.skipped, stats.failed
     );
+    if stats.failed > 0 {
+        return Err(format!(
+            "Skill sync failed for {} workspace(s)",
+            stats.failed
+        ));
+    }
     Ok(())
 }
 
 /// 递归扫描: 遇含 `.agents` 子目录的目录即当 workspace 处理 (不再下钻); 否则下钻子目录。
 /// 超过 `MAX_SCAN_DEPTH` 停止 (防失控 + 覆盖已知 workspace 层级即可)。
-async fn scan_and_reconcile(dir: &Path, depth: u32, current: &str, stats: &mut Stats) {
-    if depth > MAX_SCAN_DEPTH {
+async fn scan_and_reconcile(
+    dir: &Path,
+    depth: u32,
+    current: &str,
+    stats: &mut Stats,
+    stop: &tokio_util::sync::CancellationToken,
+) {
+    if stop.is_cancelled() || depth > MAX_SCAN_DEPTH {
         return;
     }
     let agents = dir.join(".agents");
@@ -80,9 +99,19 @@ async fn scan_and_reconcile(dir: &Path, depth: u32, current: &str, stats: &mut S
         return;
     };
     while let Ok(Some(entry)) = rd.next_entry().await {
+        if stop.is_cancelled() {
+            break;
+        }
         if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
             // async 递归需 Box::pin
-            Box::pin(scan_and_reconcile(&entry.path(), depth + 1, current, stats)).await;
+            Box::pin(scan_and_reconcile(
+                &entry.path(),
+                depth + 1,
+                current,
+                stats,
+                stop,
+            ))
+            .await;
         }
     }
 }
@@ -131,6 +160,38 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn skill_shutdown_before_scan_leaves_workspace_and_marker_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("app");
+        tokio::fs::create_dir_all(workspace.join(".agents/skills/one"))
+            .await
+            .unwrap();
+        tokio::fs::write(workspace.join(".agents/skills/one/SKILL.md"), "original")
+            .await
+            .unwrap();
+        let stop = tokio_util::sync::CancellationToken::new();
+        stop.cancel();
+        let mut stats = Stats::default();
+        scan_and_reconcile(
+            tmp.path(),
+            0,
+            &file_server::sync_target_version(),
+            &mut stats,
+            &stop,
+        )
+        .await;
+        assert_eq!(stats.synced + stats.skipped + stats.failed, 0);
+        assert!(!workspace.join(".agents/.sync_version").exists());
+        assert!(!workspace.join(".claude").exists());
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.join(".agents/skills/one/SKILL.md"))
+                .await
+                .unwrap(),
+            "original"
+        );
+    }
+
+    #[tokio::test]
     async fn reconcile_syncs_outdated_workspace_and_writes_marker() {
         let tmp = tempfile::tempdir().expect("tempdir");
         // 构造 workspace: .../user1/cid1/.agents/skills/sk1/SKILL.md (无 marker → 版本落后)
@@ -144,7 +205,14 @@ mod tests {
 
         let current = file_server::sync_target_version();
         let mut stats = Stats::default();
-        scan_and_reconcile(tmp.path(), 0, &current, &mut stats).await;
+        scan_and_reconcile(
+            tmp.path(),
+            0,
+            &current,
+            &mut stats,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
 
         assert_eq!(stats.synced, 1);
         assert_eq!(stats.skipped, 0);
@@ -174,7 +242,14 @@ mod tests {
             .unwrap();
 
         let mut stats = Stats::default();
-        scan_and_reconcile(tmp.path(), 0, &current, &mut stats).await;
+        scan_and_reconcile(
+            tmp.path(),
+            0,
+            &current,
+            &mut stats,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
 
         assert_eq!(stats.synced, 0);
         assert_eq!(stats.skipped, 1);
@@ -190,7 +265,14 @@ mod tests {
 
         let current = file_server::sync_target_version();
         let mut stats = Stats::default();
-        scan_and_reconcile(tmp.path(), 0, &current, &mut stats).await;
+        scan_and_reconcile(
+            tmp.path(),
+            0,
+            &current,
+            &mut stats,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
 
         assert_eq!(stats.synced, 0);
         assert_eq!(stats.skipped, 1);
@@ -206,7 +288,14 @@ mod tests {
             .unwrap();
 
         let mut stats = Stats::default();
-        scan_and_reconcile(tmp.path(), 0, "unused", &mut stats).await;
+        scan_and_reconcile(
+            tmp.path(),
+            0,
+            "unused",
+            &mut stats,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
 
         // 超深度 → 全不处理
         assert_eq!(stats.synced + stats.skipped + stats.failed, 0);

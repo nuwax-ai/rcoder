@@ -217,6 +217,8 @@ impl std::fmt::Debug for StartPgCredential {
         f.debug_struct("StartPgCredential")
             .field("username", &self.username)
             .field("password", &"[REDACTED]")
+            .field("password_provided", &!self.password.is_empty())
+            .field("password_length", &self.password.chars().count())
             .finish()
     }
 }
@@ -238,7 +240,14 @@ pub enum DbAdminError {
     /// 库已存在 → 409 语义
     AlreadyExists(String),
     /// 容器侧执行失败（通道断/PG 未就绪/SQL 失败）→ 500 语义
-    Command { stage: &'static str, detail: String },
+    Command {
+        stage: &'static str,
+        detail: String,
+        code: &'static str,
+        cause_code: &'static str,
+        evidence: super::db_align::PgCommandEvidence,
+        diagnostic: Option<Box<super::db_align::PgCommandDiagnostic>>,
+    },
 }
 
 impl std::fmt::Display for DbAdminError {
@@ -246,7 +255,7 @@ impl std::fmt::Display for DbAdminError {
         match self {
             Self::InvalidInput(m) => write!(f, "{m}"),
             Self::AlreadyExists(m) => write!(f, "{m}"),
-            Self::Command { stage, detail } => write!(f, "{stage}: {detail}"),
+            Self::Command { stage, detail, .. } => write!(f, "{stage}: {detail}"),
         }
     }
 }
@@ -261,26 +270,24 @@ pub async fn upsert_pg_user(
     username: &str,
     password: &str,
 ) -> Result<DbUserUpsertOutcome, DbAdminError> {
+    use super::db_align::{PgCommandEvidence, PgCommandMode};
     validate_pg_identifier(username).map_err(DbAdminError::InvalidInput)?;
     validate_password(password).map_err(DbAdminError::InvalidInput)?;
-
-    // 1. 角色存在检查（`-tAc`：命中输出 1、未命中输出空）
     let exists = runner
-        .run(&pg_role_exists_cmd(username))
+        .run(&pg_role_exists_cmd(username), PgCommandMode::ReadOnly)
         .await
-        .map_err(|e| DbAdminError::Command {
-            stage: "role-exists check",
-            detail: e,
-        })?;
+        .map_err(|error| command_error("role-exists check", error))?;
     if exists.exit_code != 0 {
         return Err(DbAdminError::Command {
             stage: "role-exists check",
-            detail: exists.stderr.trim().to_string(),
+            detail: crate::sanitize_error_text(exists.stderr.trim()),
+            code: crate::ERR_DATABASE_COMMAND_FAILED,
+            cause_code: crate::ERR_DATABASE_COMMAND_FAILED,
+            diagnostic: None,
+            evidence: PgCommandEvidence::DefinitivelyRejected,
         });
     }
-
-    // 2. 存在 → ALTER 改密；不存在 → CREATE ROLE 建号（LOGIN + 密码，最小权限）
-    let (cmd, outcome) = if exists.stdout.trim() == "1" {
+    let (command, outcome) = if exists.stdout.trim() == "1" {
         (
             pg_alter_password_cmd(username, password),
             DbUserUpsertOutcome::Reset,
@@ -291,45 +298,71 @@ pub async fn upsert_pg_user(
             DbUserUpsertOutcome::Created,
         )
     };
-    // A transport error or stderr can echo the SQL command and its password.
-    // Keep this diagnostic independent of remote output and credential escaping.
-    let applied = runner.run(&cmd).await.map_err(|_| DbAdminError::Command {
-        stage: "apply user upsert",
-        detail: "Command transport failed; password update outcome is unknown".into(),
-    })?;
+    let applied = runner
+        .run(&command, PgCommandMode::Write)
+        .await
+        .map_err(|error| {
+            // Redact both the summary and the retained peer carrier before it
+            // becomes a domain error; the typed write evidence stays intact.
+            command_error("apply user upsert", error.with_credential_summary(
+                "Password command transport failed; inspect the original operation before retrying",
+            ))
+        })?;
     if applied.exit_code != 0 {
+        let evidence = super::db_align::single_statement_write_evidence(applied.exit_code);
         return Err(DbAdminError::Command {
             stage: "apply user upsert",
-            detail: format!("Password command exited with status {}", applied.exit_code),
+            detail: format!(
+                "Password command exited with status {}; completion is unconfirmed",
+                applied.exit_code
+            ),
+            code: if evidence == PgCommandEvidence::DefinitivelyRejected {
+                crate::ERR_DATABASE_COMMAND_FAILED
+            } else {
+                crate::ERR_OPERATION_OUTCOME_UNKNOWN
+            },
+            cause_code: crate::ERR_DATABASE_COMMAND_FAILED,
+            diagnostic: None,
+            evidence,
         });
     }
     Ok(outcome)
 }
 
-/// 建库核心流程（check-then-act：先 `pg_database` 存在性判定，已存在报 409 语义；
-/// PG 不支持 CREATE DATABASE IF NOT EXISTS、也不能进事务/DO 块，故不靠失败后
-/// 解析 stderr 文本判定——它随 PG 版本/locale 变，不稳定）。
+fn command_error(stage: &'static str, error: super::db_align::PgCommandError) -> DbAdminError {
+    DbAdminError::Command {
+        stage,
+        code: error.code,
+        cause_code: error.cause_code,
+        evidence: error.evidence,
+        diagnostic: error.diagnostic,
+        detail: crate::sanitize_error_text(&error.detail),
+    }
+}
+
+/// A missing reply from CREATE is an unknown write, never an automatic retry.
 pub async fn create_pg_database(
     runner: &dyn super::db_align::PgCommandRunner,
     database: &str,
     owner: Option<&str>,
 ) -> Result<(), DbAdminError> {
+    use super::db_align::{PgCommandEvidence, PgCommandMode};
     validate_pg_identifier(database).map_err(DbAdminError::InvalidInput)?;
-    if let Some(o) = owner {
-        validate_pg_identifier(o).map_err(DbAdminError::InvalidInput)?;
+    if let Some(owner) = owner {
+        validate_pg_identifier(owner).map_err(DbAdminError::InvalidInput)?;
     }
-
     let exists = runner
-        .run(&pg_database_exists_cmd(database))
+        .run(&pg_database_exists_cmd(database), PgCommandMode::ReadOnly)
         .await
-        .map_err(|e| DbAdminError::Command {
-            stage: "database-exists check",
-            detail: e,
-        })?;
+        .map_err(|error| command_error("database-exists check", error))?;
     if exists.exit_code != 0 {
         return Err(DbAdminError::Command {
             stage: "database-exists check",
-            detail: exists.stderr.trim().to_string(),
+            detail: crate::sanitize_error_text(exists.stderr.trim()),
+            code: crate::ERR_DATABASE_COMMAND_FAILED,
+            cause_code: crate::ERR_DATABASE_COMMAND_FAILED,
+            diagnostic: None,
+            evidence: PgCommandEvidence::DefinitivelyRejected,
         });
     }
     if exists.stdout.trim() == "1" {
@@ -337,32 +370,45 @@ pub async fn create_pg_database(
             "database {database} already exists"
         )));
     }
-
     let created = runner
-        .run(&pg_create_database_cmd(database, owner))
+        .run(
+            &pg_create_database_cmd(database, owner),
+            PgCommandMode::Write,
+        )
         .await
-        .map_err(|e| DbAdminError::Command {
-            stage: "create database",
-            detail: e,
-        })?;
+        .map_err(|error| command_error("create database", error))?;
     if created.exit_code != 0 {
-        // 罕见竞态（检查时不存在、CREATE 时已被并发创建）：再查一次精确判定
-        let recheck = runner
-            .run(&pg_database_exists_cmd(database))
+        let evidence = super::db_align::single_statement_write_evidence(created.exit_code);
+        let original_error = DbAdminError::Command {
+            stage: "create database",
+            detail: crate::sanitize_error_text(created.stderr.trim()),
+            code: if evidence == PgCommandEvidence::DefinitivelyRejected {
+                crate::ERR_DATABASE_COMMAND_FAILED
+            } else {
+                crate::ERR_OPERATION_OUTCOME_UNKNOWN
+            },
+            cause_code: crate::ERR_DATABASE_COMMAND_FAILED,
+            diagnostic: None,
+            evidence,
+        };
+        if evidence == PgCommandEvidence::OutcomeUnknown {
+            // An existence observation cannot prove which CREATE committed.
+            // Preserve the original write outcome and do not reissue it.
+            return Err(original_error);
+        }
+        // A definite single-statement SQL rejection permits the existing
+        // read-only race check. Its failure never replaces the original SQL result.
+        if let Ok(recheck) = runner
+            .run(&pg_database_exists_cmd(database), PgCommandMode::ReadOnly)
             .await
-            .map_err(|e| DbAdminError::Command {
-                stage: "database-exists recheck",
-                detail: e,
-            })?;
-        if recheck.exit_code == 0 && recheck.stdout.trim() == "1" {
+            && recheck.exit_code == 0
+            && recheck.stdout.trim() == "1"
+        {
             return Err(DbAdminError::AlreadyExists(format!(
                 "database {database} already exists"
             )));
         }
-        return Err(DbAdminError::Command {
-            stage: "create database",
-            detail: created.stderr.trim().to_string(),
-        });
+        return Err(original_error);
     }
     Ok(())
 }
@@ -464,6 +510,106 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn lost_create_reply_does_not_reissue_or_report_absence() {
+        let runner = ScriptedRunner::new(vec![ok(0, ""), Err("CREATE reply lost".into())]);
+        let error = create_pg_database(&runner, "newdb", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DbAdminError::Command {
+                code: crate::ERR_OPERATION_OUTCOME_UNKNOWN,
+                cause_code: crate::ERR_CONTAINER_EXEC_FAILED,
+                evidence: super::super::db_align::PgCommandEvidence::OutcomeUnknown,
+                stage: "create database",
+                ..
+            }
+        ));
+        assert_eq!(
+            runner.seen.lock().unwrap().len(),
+            2,
+            "only existence read and one CREATE may dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_failure_never_dispatches_create_database() {
+        let runner = ScriptedRunner::new(vec![Err("existence read failed".into())]);
+        let error = create_pg_database(&runner, "newdb", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DbAdminError::Command {
+                stage: "database-exists check",
+                code: crate::ERR_CONTAINER_EXEC_FAILED,
+                ..
+            }
+        ));
+        assert_eq!(runner.seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sql_rejection_differs_from_lost_connection_write() {
+        for (status, code, evidence) in [
+            (
+                3,
+                crate::ERR_DATABASE_COMMAND_FAILED,
+                super::super::db_align::PgCommandEvidence::DefinitivelyRejected,
+            ),
+            (
+                2,
+                crate::ERR_OPERATION_OUTCOME_UNKNOWN,
+                super::super::db_align::PgCommandEvidence::OutcomeUnknown,
+            ),
+        ] {
+            let runner = ScriptedRunner::new(vec![ok(0, "1"), ok(status, "")]);
+            let error = upsert_pg_user(&runner, "biz", "secret").await.unwrap_err();
+            assert!(
+                matches!(error, DbAdminError::Command { code: actual_code, evidence: actual_evidence, .. } if actual_code == code && actual_evidence == evidence)
+            );
+            assert_eq!(runner.seen.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_create_connection_is_not_overwritten_by_exists_observation() {
+        let runner = ScriptedRunner::new(vec![ok(0, "0"), ok(2, ""), ok(0, "1")]);
+        let error = create_pg_database(&runner, "business", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DbAdminError::Command {
+                code: crate::ERR_OPERATION_OUTCOME_UNKNOWN,
+                evidence: super::super::db_align::PgCommandEvidence::OutcomeUnknown,
+                stage: "create database",
+                ..
+            }
+        ));
+        assert_eq!(runner.seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rejected_create_keeps_original_sql_failure_when_recheck_fails() {
+        let runner =
+            ScriptedRunner::new(vec![ok(0, "0"), ok(3, ""), Err("read unavailable".into())]);
+        let error = create_pg_database(&runner, "business", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DbAdminError::Command {
+                code: crate::ERR_DATABASE_COMMAND_FAILED,
+                evidence: super::super::db_align::PgCommandEvidence::DefinitivelyRejected,
+                stage: "create database",
+                ..
+            }
+        ));
+        assert_eq!(runner.seen.lock().unwrap().len(), 3);
+    }
+
     /// 脚本化 runner：按命令内容返回预设结果（与 db_align 的 ScriptedRunner 同款）。
     struct ScriptedRunner {
         results: Mutex<Vec<Result<CommandOutcome, String>>>,
@@ -497,9 +643,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl PgCommandRunner for ScriptedRunner {
-        async fn run(&self, command: &str) -> Result<CommandOutcome, String> {
+        async fn run(
+            &self,
+            command: &str,
+            mode: crate::PgCommandMode,
+        ) -> Result<CommandOutcome, crate::PgCommandError> {
             self.seen.lock().unwrap().push(command.to_string());
-            self.results.lock().unwrap().remove(0)
+            self.results.lock().unwrap().remove(0).map_err(|detail| {
+                crate::PgCommandError::transport(mode, crate::ERR_CONTAINER_EXEC_FAILED, detail)
+            })
         }
     }
 
@@ -584,10 +736,12 @@ mod tests {
 
     #[tokio::test]
     async fn create_database_race_recheck_reports_conflict() {
-        // CREATE 失败（exit 1）但复检发现已被并发创建 → 409 语义而非 500
-        let runner = ScriptedRunner::new(vec![ok(0, ""), ok(1, "already exists"), ok(0, "1")]);
+        // ON_ERROR_STOP 的明确 SQL 拒绝（exit 3），复检发现已被并发创建。
+        // exit 1/2 不能证明原写入结果，另由 Unknown 反例保护。
+        let runner = ScriptedRunner::new(vec![ok(0, ""), ok(3, "already exists"), ok(0, "1")]);
         let err = create_pg_database(&runner, "mydb", None).await.unwrap_err();
         assert!(matches!(err, DbAdminError::AlreadyExists(_)));
+        assert_eq!(runner.seen.lock().unwrap().len(), 3);
     }
     #[test]
     fn runtime_credentials_debug_is_redacted_through_nested_run_config() {
@@ -600,6 +754,15 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(!debug.contains("private-password-test-marker"));
         assert!(debug.contains("[REDACTED]"));
+        assert!(debug.contains("password_provided: true"));
+        assert!(debug.contains("password_length: 28"));
+        let missing = StartPgCredential {
+            username: "runtime".into(),
+            password: String::new(),
+        };
+        let debug = format!("{missing:?}");
+        assert!(debug.contains("password_provided: false"));
+        assert!(debug.contains("password_length: 0"));
         // Redaction changes only diagnostic formatting, not the private wire
         // used to transfer operation configuration to its execution owner.
         assert_eq!(

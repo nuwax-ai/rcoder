@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Pingap 版本一致性门禁（batch8-followup §5）。
 
-核对四个实际构建入口的 pingap 版本/commit 与 app-cli 单一事实源
+本地核对实际构建入口的 pingap 版本/commit 与 app-cli 单一事实源
 一致：
   1. crates/app-cli/src/ 递归查找（DEFAULT_PINGAP_VERSION/COMMIT；aa07e6108 起
      位于 src/build_deploy/devtool.rs，单一常量定义）
   2. make/docker.mk（dev agent-runner 镜像构建注入）
   3. docker/build-app-runtime.py（dev app-runtime 镜像 build-arg）
-  4. build-agent-docker makefiles/16-app-runtime.mk（生产镜像）
+  4. --cross-repo 时追加生产仓及启动脚本比较（默认不依赖另一仓）
 
 任一不一致即失败并列出全部实际值；显式允许的差异必须在此登记理由。
 用法：python3 k8s/scripts/pingap_version_gate.py [--repo-root DIR]
@@ -22,10 +22,10 @@ from pathlib import Path
 ALLOWED_DIVERGENCE: dict[str, str] = {}
 
 VERSION_RE = re.compile(
-    r'PINGAP_VERSION\s*[?:]?=\s*"?(\d+\.\d+\.\d+)"?'
+    r'PINGAP_VERSION\s*[?:]?=\s*[\"\']?(\d+\.\d+\.\d+)"?'
 )
 COMMIT_RE = re.compile(
-    r'PINGAP_COMMIT\s*[?:]?=\s*"?([0-9a-f]{40})"?'
+    r'PINGAP_COMMIT\s*[?:]?=\s*[\"\']?([0-9a-f]{40})"?'
 )
 DEVTOOL_VERSION_RE = re.compile(r'DEFAULT_PINGAP_VERSION:\s*&str\s*=\s*"(\d+\.\d+\.\d+)"')
 DEVTOOL_COMMIT_RE = re.compile(r'DEFAULT_PINGAP_COMMIT:\s*&str\s*=\s*"([0-9a-f]{40})"')
@@ -81,22 +81,30 @@ def main() -> int:
     parser.add_argument(
         "--build-agent-docker",
         type=Path,
-        default=Path(__file__).resolve().parents[3] / "build-agent-docker",
+        default=None,
         help="build-agent-docker 仓库根",
     )
+    parser.add_argument("--cross-repo", action="store_true", help="显式核对生产仓版本和启动脚本")
+    parser.add_argument("--pingap-version")
+    parser.add_argument("--pingap-commit")
+    parser.add_argument("--download-version")
+    parser.add_argument("--node-version")
     args = parser.parse_args()
     root: Path = args.repo_root
-    bad: Path = args.build_agent_docker
+    bad: Path = args.build_agent_docker or root.parent / "build-agent-docker"
+    if args.node_version and not re.fullmatch(r'22\.\d+\.\d+', args.node_version):
+        print(f"FAIL: Node 运行时必须保持 22，当前输入 {args.node_version}")
+        return 1
 
     sources: list[tuple[str, Path, list[re.Pattern]]] = [
         ("make/docker.mk（dev agent-runner 注入）", root / "make/docker.mk",
          [VERSION_RE, COMMIT_RE]),
         ("docker/build-app-runtime.py（dev app-runtime build-arg）", root / "docker/build-app-runtime.py",
          [VERSION_RE, COMMIT_RE]),
-        ("build-agent-docker 16-app-runtime.mk（生产）", bad / "makefiles/16-app-runtime.mk",
-         [VERSION_RE, COMMIT_RE]),
     ]
 
+    if args.cross_repo or args.build_agent_docker:
+        sources.append(("build-agent-docker versions.mk（生产）", bad / "versions.mk", [VERSION_RE, COMMIT_RE]))
     results: dict[str, tuple[str, str] | None] = {}
     for label, path, patterns in sources:
         if not path.exists():
@@ -111,6 +119,22 @@ def main() -> int:
     authority, authority_path = authority_found
 
     failures = []
+    cargo = root / 'crates/app-cli/Cargo.toml'
+    dependency = re.search(r'pingap-config\s*=\s*\{[^\n]*rev\s*=\s*"([0-9a-f]{40})"', read(cargo))
+    if not dependency or dependency.group(1) != authority[1]:
+        print('FAIL: app-cli 实际 pingap-config rev 与运行时常量不一致')
+        failures.append(('pingap-config rev', dependency.group(1) if dependency else None))
+    if args.pingap_version or args.pingap_commit:
+        results["当前请求 Pingap build args"] = (args.pingap_version, args.pingap_commit)
+    if args.download_version and args.download_version != authority[0]:
+        results["当前请求 Pingap 下载版本"] = (args.download_version, authority[1])
+    if args.cross_repo or args.build_agent_docker:
+        for name in ('start-up.sh', 'start-up-common.sh', 'start-up-docker-extra.sh', 'start-up-k8s-extra.sh'):
+            local = root / 'docker/rcoder-agent-runner' / name
+            production = bad / 'build_config/rcoder-agent-runner' / name
+            if not local.exists() or not production.exists() or local.read_bytes() != production.read_bytes():
+                print(f"FAIL: 构建仓启动契约不一致: {name}")
+                failures.append((name, None))
     print(f"单一事实源（{authority_path.relative_to(root)}）：pingap {authority[0]} @ {authority[1][:12]}")
     for label, value in results.items():
         if label in ALLOWED_DIVERGENCE:

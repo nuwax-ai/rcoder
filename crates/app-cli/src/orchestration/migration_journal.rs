@@ -1,5 +1,5 @@
-//! A command may commit SQL before its process or coordinator disappears.
-//! Persist intent before dispatch; only confirmed success permits automatic reuse.
+//! Application migration receipts are diagnostic history, never admission gates.
+//! Keep execution serialized and skip only a consistently confirmed identity.
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -73,6 +73,7 @@ fn inspect_confirmed(root: &Path) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
         Err(error) => return Err(error).context("read migration receipts"),
     };
+    let mut confirmed = true;
     for entry in entries {
         let path = entry?.path();
         if path
@@ -82,36 +83,22 @@ fn inspect_confirmed(root: &Path) -> Result<bool> {
             let receipt: Receipt = serde_json::from_slice(&std::fs::read(&path)?)
                 .context("decode migration receipt")?;
             if !receipt.completed {
-                return Ok(false);
+                confirmed = false;
             }
         }
     }
-    Ok(true)
+    Ok(confirmed)
 }
 
-fn require_confirmed(root: &Path) -> Result<()> {
-    ensure!(
-        inspect_confirmed(root)?,
-        "Migration outcome is unconfirmed; explicit database reconciliation is required"
-    );
-    Ok(())
-}
-
-/// Observation is not execution permission; begin() rechecks under its lease.
+/// Observation only: unconfirmed or unreadable history does not deny execution.
 pub(crate) fn inspect_migrations(workspace: &Path) -> Result<bool> {
+    let mut confirmed = true;
     for root in state_roots(workspace)? {
         if !inspect_confirmed(&root)? {
-            return Ok(false);
+            confirmed = false;
         }
     }
-    Ok(true)
-}
-
-pub(crate) fn require_confirmed_migrations(workspace: &Path) -> Result<()> {
-    for root in state_roots(workspace)? {
-        require_confirmed(&root)?;
-    }
-    Ok(())
+    Ok(confirmed)
 }
 
 impl MigrationJournal {
@@ -150,33 +137,44 @@ impl MigrationJournal {
             })?;
             leases.push(lease);
         }
-        for root in &canonical {
-            require_confirmed(root)?;
-        }
         let journal = Self {
             roots: canonical,
             identity,
             _leases: leases,
         };
-        let mut completed = false;
+        let mut known_completion = false;
+        let mut unconfirmed = false;
         for root in &journal.roots {
-            match std::fs::read(journal.path(root)) {
-                Ok(bytes) => {
-                    let receipt: Receipt = serde_json::from_slice(&bytes)?;
-                    ensure!(
-                        receipt.identity == journal.identity && receipt.completed,
-                        "Migration receipt identity or completion mismatch"
-                    );
-                    completed = true;
-                }
+            let path = journal.path(root);
+            match std::fs::read(&path) {
+                Ok(bytes) => match serde_json::from_slice::<Receipt>(&bytes) {
+                    Ok(receipt) if receipt.identity == journal.identity && receipt.completed => {
+                        known_completion = true;
+                    }
+                    Ok(_) => {
+                        unconfirmed = true;
+                        tracing::warn!(path = %path.display(), "application migration receipt is unconfirmed; execution may retry");
+                    }
+                    Err(error) => {
+                        unconfirmed = true;
+                        tracing::error!(path = %path.display(), %error, "application migration receipt is unreadable; execution may retry");
+                    }
+                },
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).context("read migration receipt"),
+                Err(error) => {
+                    unconfirmed = true;
+                    tracing::error!(path = %path.display(), %error, "read application migration receipt failed; execution may retry");
+                }
             }
         }
-        // Write only this immutable release/service identity, under every
-        // location's lock. A partial write leaves pending evidence and cannot
-        // authorize a rerun. Other applications' receipts are never copied.
-        journal.write(completed)?;
+        let completed = known_completion && !unconfirmed;
+        // Write only this immutable release/service identity under every lease.
+        // Mixed completion evidence requires real execution, not promotion of
+        // pending history. Unrelated receipt bytes remain untouched. Persistence
+        // failures stay visible, while the execution leases remain held.
+        if let Err(error) = journal.write(completed) {
+            tracing::error!(%error, "persist application migration diagnostic receipt failed");
+        }
         Ok(if completed { None } else { Some(journal) })
     }
 
@@ -221,6 +219,94 @@ pub(crate) fn identity(release: &crate::manifest::ReleaseLock, service_id: &str)
 mod tests {
     use super::*;
     #[test]
+    fn advisory_pending_and_corrupt_receipts_allow_a_new_execution() {
+        for (identity, previous) in [
+            (
+                "same",
+                br#"{"identity":"same","completed":false}"#.as_slice(),
+            ),
+            (
+                "new",
+                br#"{"identity":"same","completed":false}"#.as_slice(),
+            ),
+            ("same", b"invalid-receipt".as_slice()),
+            ("new", b"invalid-receipt".as_slice()),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("same.json"), previous).unwrap();
+            let journal = MigrationJournal::begin_at(root.path().into(), identity.into())
+                .expect("application migration history is advisory")
+                .expect("unconfirmed history must permit execution");
+            let current: Receipt = serde_json::from_slice(
+                &std::fs::read(root.path().join(format!("{identity}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(current.identity, identity);
+            assert!(
+                !current.completed,
+                "begin must never invent migration success"
+            );
+            if identity == "new" {
+                assert_eq!(
+                    std::fs::read(root.path().join("same.json")).unwrap(),
+                    previous
+                );
+            }
+            assert!(MigrationJournal::begin_at(root.path().into(), "contender".into()).is_err());
+            drop(journal);
+        }
+    }
+
+    #[test]
+    fn advisory_partial_completion_reexecutes_instead_of_promoting_pending_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let old = directory.path().join("old");
+        let new = directory.path().join("new");
+        for (root, completed) in [(&old, false), (&new, true)] {
+            std::fs::create_dir(root).unwrap();
+            std::fs::write(
+                root.join("release.json"),
+                serde_json::to_vec(&Receipt {
+                    identity: "release".into(),
+                    completed,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let journal =
+            MigrationJournal::begin_at_roots(vec![new.clone(), old.clone()], "release".into())
+                .expect("partial history is advisory")
+                .expect("pending history must be retried");
+        for root in [&old, &new] {
+            assert!(
+                !serde_json::from_slice::<Receipt>(
+                    &std::fs::read(root.join("release.json")).unwrap()
+                )
+                .unwrap()
+                .completed
+            );
+            assert!(MigrationJournal::begin_at(root.clone(), "contender".into()).is_err());
+        }
+        drop(journal);
+    }
+
+    #[test]
+    fn advisory_receipt_io_failure_keeps_execution_lease_without_inventing_completion() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("release.json")).unwrap();
+        let journal = MigrationJournal::begin_at(root.path().into(), "release".into())
+            .expect("diagnostic receipt read/write cannot prevent execution")
+            .expect("no confirmed completion exists");
+        assert!(MigrationJournal::begin_at(root.path().into(), "contender".into()).is_err());
+        assert!(
+            journal.complete().is_err(),
+            "failed receipt persistence remains diagnostic failure"
+        );
+        assert!(root.path().join("release.json").is_dir());
+    }
+
+    #[test]
     fn confirmed_completion_survives_reopen_and_skips_execution() {
         let root = tempfile::tempdir().unwrap();
         let receipt = MigrationJournal::begin_at(root.path().into(), "releaseone".into())
@@ -239,7 +325,7 @@ mod tests {
         );
     }
     #[test]
-    fn interruption_fences_same_and_new_release_without_rewriting_receipt() {
+    fn interruption_allows_same_and_new_release_after_execution_lease_is_released() {
         let root = tempfile::tempdir().unwrap();
         let receipt = MigrationJournal::begin_at(root.path().into(), "releaseone".into())
             .unwrap()
@@ -248,7 +334,17 @@ mod tests {
         drop(receipt);
         let before = std::fs::read(root.path().join("releaseone.json")).unwrap();
         for identity in ["releaseone", "releasetwo"] {
-            assert!(MigrationJournal::begin_at(root.path().into(), identity.into()).is_err());
+            let journal = MigrationJournal::begin_at(root.path().into(), identity.into())
+                .unwrap()
+                .expect("interrupted application migration can retry");
+            let receipt: Receipt = serde_json::from_slice(
+                &std::fs::read(root.path().join(format!("{identity}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(receipt.identity, identity);
+            assert!(!receipt.completed);
+            assert!(MigrationJournal::begin_at(root.path().into(), "contender".into()).is_err());
+            drop(journal);
         }
         assert_eq!(
             std::fs::read(root.path().join("releaseone.json")).unwrap(),
@@ -257,10 +353,19 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_receipt_is_not_treated_as_no_migration() {
+    fn corrupted_unrelated_receipt_stays_diagnostic_during_a_new_execution() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("old.json"), "broken").unwrap();
-        assert!(MigrationJournal::begin_at(root.path().into(), "newrelease".into()).is_err());
+        let journal = MigrationJournal::begin_at(root.path().into(), "newrelease".into())
+            .unwrap()
+            .expect("unreadable application migration history is advisory");
+        assert_eq!(
+            std::fs::read(root.path().join("old.json")).unwrap(),
+            b"broken"
+        );
+        assert!(inspect_confirmed(root.path()).is_err());
+        assert!(MigrationJournal::begin_at(root.path().into(), "contender".into()).is_err());
+        drop(journal);
     }
 
     #[test]
@@ -326,18 +431,26 @@ mod tests {
         journal.complete().unwrap();
         assert!(inspect_confirmed(&old).unwrap());
         assert!(inspect_confirmed(&new).unwrap());
-        // A partial completion or a conflicting old receipt must never be
-        // overwritten with success merely because another location is complete.
+        // Partial completion may retry, but begin cannot invent success from
+        // the other location's completed receipt.
         let pending = serde_json::to_vec(&Receipt {
             identity: "release".into(),
             completed: false,
         })
         .unwrap();
         std::fs::write(old.join("release.json"), &pending).unwrap();
-        assert!(
-            MigrationJournal::begin_at_roots(vec![new, old.clone()], "release".into()).is_err()
-        );
+        let journal =
+            MigrationJournal::begin_at_roots(vec![new.clone(), old.clone()], "release".into())
+                .unwrap()
+                .expect("pending diagnostic history permits a new execution");
         assert_eq!(std::fs::read(old.join("release.json")).unwrap(), pending);
+        assert!(!inspect_confirmed(&new).unwrap());
+        for root in [&old, &new] {
+            assert!(MigrationJournal::begin_at(root.clone(), "contender".into()).is_err());
+        }
+        journal.complete().unwrap();
+        assert!(inspect_confirmed(&old).unwrap());
+        assert!(inspect_confirmed(&new).unwrap());
     }
 
     #[test]

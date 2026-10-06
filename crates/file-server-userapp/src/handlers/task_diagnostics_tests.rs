@@ -1,4 +1,81 @@
 //! Admission failures must be observable over the same real router as executions.
+
+#[tokio::test]
+async fn workspace_submission_failure_keeps_real_failed_task_and_original_carrier() {
+    use axum::response::IntoResponse;
+    let directory = tempfile::tempdir().unwrap();
+    let state = state(directory.path());
+    let retained = state
+        .build_tasks
+        .create_failed_diagnostic(
+            "app123".into(),
+            BuildTaskKind::DevStart,
+            "workspace_ensure: reply lost".into(),
+            vec![],
+        )
+        .await
+        .unwrap();
+    let origin = shared_types::AppError::with_message(
+        shared_types::error_codes::ERR_OPERATION_OUTCOME_UNKNOWN,
+        "workspace_ensure: reply lost password=hidden-marker",
+    )
+    .with_operation_id("original-workspace-operation".into())
+    .with_error_detail(
+        shared_types::ErrorDetail::new(
+            shared_types::error_codes::ERR_RUNTIME_UNAVAILABLE,
+            "workspace_ensure",
+            "reply lost password=hidden-marker",
+        )
+        .with_task_id(retained.id.clone()),
+    );
+    let error = crate::service::userapp::diagnostics::TaskSubmissionError {
+        error: Box::new(file_server::error::AppError::runtime_diagnostic(origin)),
+        task_id: Some(retained.id.clone()),
+        diagnostics: vec![],
+    };
+    let response = super::userapp::submission_failure_reply::<()>(
+        &state,
+        "app123",
+        BuildTaskKind::DevStart,
+        error,
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["success"], false);
+    assert_eq!(
+        body["code"],
+        shared_types::error_codes::ERR_OPERATION_OUTCOME_UNKNOWN
+    );
+    assert_eq!(body["operation_id"], "original-workspace-operation");
+    assert_eq!(body["data"]["task_id"], retained.id);
+    assert_eq!(body["error_detail"]["task_id"], retained.id);
+    assert_eq!(body["error_detail"]["stage"], "workspace_ensure");
+    assert_eq!(body["error_detail"]["retryable"], false);
+    assert_eq!(
+        state
+            .build_tasks
+            .get(&retained.id)
+            .await
+            .unwrap()
+            .status()
+            .await,
+        BuildTaskStatus::Failed
+    );
+    let (_, sse) = request(
+        &router(state.clone()),
+        "GET",
+        &format!("/tasks/{}/logs/stream?app_id=app123", retained.id),
+        Value::Null,
+    )
+    .await;
+    assert!(sse.contains("event: failed"), "{sse}");
+    assert!(!body.to_string().contains("hidden-marker"));
+}
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;

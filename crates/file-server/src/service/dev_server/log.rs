@@ -360,6 +360,8 @@ mod evt_tests {
                 sink.lock().expect("lock").push(json.to_string());
             }) as crate::service::dev_server::process::OnLineCallback,
             on_end: None,
+            launch_deadline: None,
+            on_submitted: None,
         };
         let handle = spawn_log_pipe_with_events(reader, main.clone(), temp.clone(), hooks);
         use tokio::io::AsyncWriteExt as _;

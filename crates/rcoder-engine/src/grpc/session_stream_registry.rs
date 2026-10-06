@@ -17,7 +17,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use shared_types::grpc::ProgressEvent;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tonic::Code;
 use tracing::info;
@@ -40,6 +42,45 @@ struct ActiveStreamRegistration {
     token: std::sync::Weak<CancellationToken>,
 }
 
+#[derive(Default)]
+struct Admission {
+    closed: bool,
+    tasks: usize,
+}
+
+/// Captured before spawn and held until the forwarding task actually exits.
+pub(crate) struct StreamTaskGuard {
+    registry: Arc<SessionStreamRegistry>,
+    grpc_addr: String,
+    token: Arc<CancellationToken>,
+}
+
+impl StreamTaskGuard {
+    pub(crate) fn token(&self) -> Arc<CancellationToken> {
+        Arc::clone(&self.token)
+    }
+}
+
+impl Drop for StreamTaskGuard {
+    fn drop(&mut self) {
+        if let Some(mut entries) = self.registry.active.get_mut(&self.grpc_addr) {
+            entries.retain(|entry| {
+                entry
+                    .token
+                    .upgrade()
+                    .is_some_and(|token| !Arc::ptr_eq(&token, &self.token))
+            });
+        }
+        self.registry
+            .active
+            .remove_if(&self.grpc_addr, |_, entries| entries.is_empty());
+        // DashMap guards are released before taking admission: admit uses the
+        // opposite order and never awaits while holding either guard.
+        self.registry.admission.lock().tasks -= 1;
+        self.registry.task_exited.notify_waiters();
+    }
+}
+
 /// SSE 流注册表（rcoder 进程级单例，挂在 `AppState`）。
 pub struct SessionStreamRegistry {
     /// 已服务过客户端的 session（首连资格）：跨转发 task 生命周期——
@@ -48,6 +89,9 @@ pub struct SessionStreamRegistry {
     served_sessions: DashMap<String, ()>,
     /// grpc_addr → 活跃 per-client 转发 task（容器销毁按 addr 批量取消）
     active: DashMap<String, Vec<ActiveStreamRegistration>>,
+    admission: Mutex<Admission>,
+    shutdown: CancellationToken,
+    task_exited: Notify,
 }
 
 impl SessionStreamRegistry {
@@ -55,6 +99,63 @@ impl SessionStreamRegistry {
         Self {
             served_sessions: DashMap::new(),
             active: DashMap::new(),
+            admission: Mutex::new(Admission::default()),
+            shutdown: CancellationToken::new(),
+            task_exited: Notify::new(),
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.admission.lock().closed
+    }
+
+    /// Admission, ownership and cancellation registration precede spawn. A
+    /// concurrent close either rejects this task or owns its cancellation.
+    pub(crate) fn admit_stream(
+        self: &Arc<Self>,
+        grpc_addr: &str,
+        session_id: &str,
+    ) -> Option<StreamTaskGuard> {
+        let mut admission = self.admission.lock();
+        if admission.closed {
+            return None;
+        }
+        admission.tasks = admission.tasks.checked_add(1)?;
+        let token = Arc::new(self.shutdown.child_token());
+        self.register_stream(grpc_addr, session_id, &token);
+        Some(StreamTaskGuard {
+            registry: Arc::clone(self),
+            grpc_addr: grpc_addr.into(),
+            token,
+        })
+    }
+
+    /// Close admission before HTTP drain, then cancel all accepted reads.
+    pub fn close(&self) {
+        self.admission.lock().closed = true;
+        self.shutdown.cancel();
+        for entry in self.active.iter() {
+            for registration in entry.value() {
+                if let Some(token) = registration.token.upgrade() {
+                    token.cancel();
+                }
+            }
+        }
+    }
+
+    /// Removal from the discovery map is not task-exit evidence. Wait for the
+    /// guards of all accepted tasks before allowing storage shutdown.
+    pub async fn drain(&self, deadline: tokio::time::Instant) -> anyhow::Result<()> {
+        self.close();
+        loop {
+            let changed = self.task_exited.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.admission.lock().tasks == 0 {
+                return Ok(());
+            }
+            tokio::time::timeout_at(deadline, changed).await
+                .map_err(|_| anyhow::anyhow!("SSE drain timed out; forwarding task exit remains unconfirmed, storage remains owned"))?;
         }
     }
 
@@ -96,6 +197,9 @@ impl SessionStreamRegistry {
                     token: Arc::downgrade(token),
                 }]
             });
+        if self.shutdown.is_cancelled() {
+            token.cancel();
+        }
     }
 
     /// 强制关闭某 session 的所有客户端转发流（容器销毁/项目删除时调用）。
@@ -155,7 +259,7 @@ impl SessionStreamRegistry {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.active.is_empty()
+        self.len() == 0
     }
 }
 
@@ -215,55 +319,69 @@ pub(crate) fn make_prompt_end_event() -> ProgressEvent {
     }
 }
 
-/// agent_runner 流传输中出错（seq=0 合成消息）
-pub(crate) fn make_stream_error_event(code: Code, _message: &str) -> ProgressEvent {
+/// agent_runner stream failed; keep the captured failure and request identity.
+pub(crate) fn make_stream_error_event(code: Code, message: &str) -> ProgressEvent {
+    make_stream_error_event_with_identity(code, message, "en-US", "grpc_stream", None)
+}
+
+pub(crate) fn make_stream_error_event_with_identity(
+    code: Code,
+    message: &str,
+    locale: &str,
+    stage: &str,
+    request_id: Option<String>,
+) -> ProgressEvent {
     let error_code = map_tonic_code(code);
-    // 用 serde_json 构造,避免 format! 拼接产生非法 JSON。
+    let detail = shared_types::ErrorDetail::new(error_code, stage, message).localized(locale);
+    let base = shared_types::get_error_message(shared_types::ERR_GRPC_ERROR, locale);
     let payload = serde_json::json!({
         "code": error_code,
-        "message": "Agent execution error, please retry.",
+        "message": shared_types::sanitize_error_text(&format!("{base}: {}", detail.detail)),
+        "error_detail": detail,
     })
     .to_string();
     ProgressEvent {
         message_type: "SessionPromptEnd".to_string(),
         sub_type: "error".to_string(),
         payload,
-        request_id: None,
+        request_id,
         seq: 0,
         timestamp: now_millis(),
     }
 }
 
-/// gRPC 连接彻底失败(重试耗尽;seq=0 合成终态事件)。
-///
-/// 有 [`DiagCtx`] 时做一次**实时诊断**(OOM/CrashLoop/容器缺失/启动中),给精准
-/// 根因文案;无 DiagCtx(测试 / 无 runtime)→ 通用文案。
+/// Supplemental diagnosis never replaces the original transport failure. It is
+/// read only, bounded, and cancellation at the caller can interrupt it.
 pub(crate) async fn make_terminal_error_event(
     diag: Option<&Arc<crate::utils::DiagCtx>>,
     locale: &str,
+    code: Code,
+    message: &str,
+    stage: &str,
+    request_id: Option<String>,
 ) -> ProgressEvent {
-    use crate::utils::{diagnose, root_cause_message};
-    let code = shared_types::error_codes::ERR_AGENT_CONTAINER_UNAVAILABLE;
-    let message = match diag {
-        Some(ctx) => {
-            let d = diagnose(&ctx.runtime, &ctx.identifier, ctx.service_type).await;
-            root_cause_message(&d, locale)
+    let mut event = make_stream_error_event_with_identity(code, message, locale, stage, request_id);
+    if let Some(ctx) = diag {
+        let observation = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            ctx.runtime
+                .diagnose_agent_pod(&ctx.identifier, &ctx.service_type),
+        )
+        .await;
+        if let Ok(Ok(observed)) = observation
+            && (observed.has_root_cause() || observed.is_starting_up())
+        {
+            let observed_reason = crate::utils::root_cause_message(&observed, locale);
+            // The original code/message and request identity remain unchanged.
+            // Observations describe current container state, not the failed job.
+            if let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&event.payload) {
+                payload["observed_container_state"] =
+                    serde_json::Value::String(shared_types::sanitize_error_text(&observed_reason));
+                event.payload = payload.to_string();
+            }
         }
-        None => shared_types::error_codes::get_error_message(code, locale),
-    };
-    let payload = serde_json::json!({
-        "code": code,
-        "message": message,
-    })
-    .to_string();
-    ProgressEvent {
-        message_type: "SessionPromptEnd".to_string(),
-        sub_type: "error".to_string(),
-        payload,
-        request_id: None,
-        seq: 0,
-        timestamp: now_millis(),
     }
+    event
 }
 
 /// seq 回退（agent_runner 重启后新 epoch 从 1 重新计数）时的 cursor-reset 哨兵

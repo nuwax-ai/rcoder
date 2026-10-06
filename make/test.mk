@@ -120,18 +120,25 @@ test-e2e-prune:
 APP_CLI_RECOVERY_ARCH ?= $(shell uname -m | sed 's/arm64/aarch64/;s/x86_64/x86_64/')
 APP_CLI_RECOVERY_TARGET ?= $(APP_CLI_RECOVERY_ARCH)-unknown-linux-gnu.2.17
 APP_CLI_RECOVERY_REPORT ?= tests-e2e/reports/app-cli-recovery-$(shell date +%Y%m%d-%H%M%S).json
+APP_CLI_RECOVERY_BIN_DIR ?= tests-e2e/reports/_bin
 
 # Linux 二进制（zigbuild，glibc 2.17 兼容 agent-runner 镜像）。
+# 只取本次 Cargo JSON 指定的 executable，兼容 CARGO_TARGET_DIR / Cargo config。
+RECOVERY_CARGO_ARTIFACT_TOOL := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))../tools/build/cargo_build_artifact.py
 test-e2e-app-cli-recovery-build:
 	@set -eu; \
 	echo "🔨 构建 Linux app-cli / file-server-proxy ($(APP_CLI_RECOVERY_TARGET))"; \
-	mkdir -p tests-e2e/reports/_bin; \
-	cargo zigbuild --release --manifest-path crates/app-cli/Cargo.toml \
-	  --target $(APP_CLI_RECOVERY_TARGET) --bin app-cli; \
-	cargo zigbuild --release -p file-server-proxy \
-	  --target $(APP_CLI_RECOVERY_TARGET); \
-	cp crates/app-cli/target/$(APP_CLI_RECOVERY_ARCH)-unknown-linux-gnu/release/app-cli tests-e2e/reports/_bin/app-cli-linux; \
-	cp target/$(APP_CLI_RECOVERY_ARCH)-unknown-linux-gnu/release/file-server-proxy tests-e2e/reports/_bin/file-server-proxy-linux
+	python3 "$(RECOVERY_CARGO_ARTIFACT_TOOL)" \
+	  --manifest-path crates/app-cli/Cargo.toml --bin app-cli \
+	  --target "$(APP_CLI_RECOVERY_TARGET)" --output "$(APP_CLI_RECOVERY_BIN_DIR)/app-cli-linux" \
+	  -- cargo zigbuild --release --manifest-path crates/app-cli/Cargo.toml \
+	  --target "$(APP_CLI_RECOVERY_TARGET)" --bin app-cli --message-format=json; \
+	python3 "$(RECOVERY_CARGO_ARTIFACT_TOOL)" \
+	  --manifest-path crates/file-server-proxy/Cargo.toml --bin file-server-proxy \
+	  --target "$(APP_CLI_RECOVERY_TARGET)" --output "$(APP_CLI_RECOVERY_BIN_DIR)/file-server-proxy-linux" \
+	  -- cargo zigbuild --release -p file-server-proxy --bin file-server-proxy \
+	  --target "$(APP_CLI_RECOVERY_TARGET)" --message-format=json; \
+	echo "✅ 专项二进制构建完成"
 
 # 聚焦真实链：旧 code 管理目录、停服日志、同容器强杀恢复；不跑完整 E2E。
 USERAPP_ROOT_LOGS_REPORT ?= tests-e2e/reports/userapp-root-logs-$(shell date +%Y%m%d-%H%M%S).json
@@ -145,7 +152,7 @@ test-e2e-userapp-root-logs:
 	  --file-server-proxy tests-e2e/reports/_bin/file-server-proxy-linux \
 	  --build-source "$(USERAPP_ROOT_LOGS_BUILD_SOURCE)" --report "$(USERAPP_ROOT_LOGS_REPORT)"
 
-# 显式PG源启动→回执脱敏→原卷换容器→新源码lock→同入口restart/stop/start。
+# 显式PG源启动→私人回执持久化/公开脱敏→原卷换容器→同入口restart/stop/start。
 SOURCE_CREDENTIAL_REPORT ?= tests-e2e/reports/source-credential-recovery-$(shell date +%Y%m%d-%H%M%S).json
 SOURCE_CREDENTIAL_BUILD_SOURCE ?= tests-e2e/reports/source-credential-build-source.json
 .PHONY: test-e2e-source-credential-recovery
@@ -166,6 +173,27 @@ test-e2e-app-cli-recovery: test-e2e-app-cli-recovery-build
 	  --file-server-proxy tests-e2e/reports/_bin/file-server-proxy-linux \
 	  --report $(APP_CLI_RECOVERY_REPORT)
 	@echo "📋 报告: $(APP_CLI_RECOVERY_REPORT)"
+
+# 新迁移策略：本轮不可变二进制、真实300秒超时及Stop取消；保留私人卷。
+USERAPP_MIGRATION_VERIFY_DIR ?= tests-e2e/reports/migration-advisory-$(shell date +%Y%m%d-%H%M%S)
+USERAPP_MIGRATION_VERIFY_DIR := $(USERAPP_MIGRATION_VERIFY_DIR)
+USERAPP_MIGRATION_IMAGE ?= dev-rcoder-agent-runner:latest
+.PHONY: test-e2e-userapp-migration-advisory
+test-e2e-userapp-migration-advisory:
+	@test ! -e "$(USERAPP_MIGRATION_VERIFY_DIR)"
+	python3 tests-e2e/tools/userapp_root_logs.py --write-build-source "$(USERAPP_MIGRATION_VERIFY_DIR)/build-source.json"
+	$(MAKE) test-e2e-app-cli-recovery-build APP_CLI_RECOVERY_BIN_DIR="$(USERAPP_MIGRATION_VERIFY_DIR)/bin"
+	python3 tests-e2e/tools/userapp_root_logs.py --register-binaries \
+	  --app-cli "$(USERAPP_MIGRATION_VERIFY_DIR)/bin/app-cli-linux" \
+	  --file-server-proxy "$(USERAPP_MIGRATION_VERIFY_DIR)/bin/file-server-proxy-linux" \
+	  --build-source "$(USERAPP_MIGRATION_VERIFY_DIR)/build-source.json"
+	chmod a-w "$(USERAPP_MIGRATION_VERIFY_DIR)/bin/app-cli-linux" "$(USERAPP_MIGRATION_VERIFY_DIR)/bin/file-server-proxy-linux" "$(USERAPP_MIGRATION_VERIFY_DIR)/bin"
+	python3 tests-e2e/tools/userapp_migration_advisory.py \
+	  --image "$(USERAPP_MIGRATION_IMAGE)" \
+	  --app-cli "$(USERAPP_MIGRATION_VERIFY_DIR)/bin/app-cli-linux" \
+	  --file-server-proxy "$(USERAPP_MIGRATION_VERIFY_DIR)/bin/file-server-proxy-linux" \
+	  --build-source "$(USERAPP_MIGRATION_VERIFY_DIR)/build-source.json" \
+	  --report "$(USERAPP_MIGRATION_VERIFY_DIR)/result.json"
 
 # ============================================================================
 # app-cli K8s 实机恢复实验（recovery v2 plan §11.2/§11.3：RBD 锁链 + 同 Pod 重启）

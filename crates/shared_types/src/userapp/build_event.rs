@@ -29,7 +29,7 @@ pub enum BuildProgressEvent {
     /// dev 启动阶段：某服务启动成功（= readiness 探测通过，`[health].
     /// readiness_path` 窗口内 2xx；`service` 为 service_id）。
     ServiceStartOk { service: String },
-    /// dev 启动阶段：某服务启动失败（spawn io 错误 / migrate 失败 / 探测超时；
+    /// dev 启动阶段：某服务启动失败（服务 spawn io 错误 / 探测超时；
     /// `error` 含具体原因，`service` 为 service_id）。**不阻塞其余服务**——
     /// 调用方按事件自明各服务成败，任务终态 Failed 的 error 为逐服务汇总。
     ServiceStartFail { service: String, error: String },

@@ -53,9 +53,8 @@ pub struct ServerState {
     pub(super) kernel_required: std::sync::atomic::AtomicBool,
     /// V04：server 级恢复门禁——运行操作**终态持久化失败**（结果未知）时
     /// 挂起：保留执行身份、关闭部署受理、压低 ready，直至进程重启由内核
-    /// 恢复裁决。未知结果标记只升不降；缺少脱敏凭据的独立标记可经
-    /// 已确认 Source 操作的显式凭据受理清除。
-    // Bit 0: missing redacted credentials; bit 1: uncertain writer/data outcome;
+    /// 恢复裁决。未知结果标记只升不降；存量凭据脱敏仅作诊断，不建立保护。
+    // Bit 0: reserved legacy credential handoff; bit 1: uncertain writer/data outcome;
     // bit 2: unavailable legacy artifact metadata, replaceable by fresh Source.
     pub(super) runtime_recovery_hold: std::sync::atomic::AtomicU8,
     /// Request and original safe hold mask captured for recovery handoff.
@@ -375,22 +374,9 @@ pub struct DeployRequest {
     pub local_path: Option<std::path::PathBuf>,
     #[serde(default)]
     pub(crate) execution_target: Option<ExecutionTarget>,
-    #[serde(default, serialize_with = "serialize_redacted_run_pg")]
+    /// Internal durable input; public responses expose deployment views only.
+    #[serde(default)]
     pub(crate) run_pg: Option<shared_types::StartPgCredential>,
-}
-
-// Retain only the fact that explicit credentials were required. Recovery must
-// never confuse a redacted request with an environment-only request.
-pub(super) fn serialize_redacted_run_pg<S: serde::Serializer>(
-    pg: &Option<shared_types::StartPgCredential>,
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error> {
-    use serde::Serialize as _;
-    let redacted = pg.as_ref().map(|pg| shared_types::StartPgCredential {
-        username: pg.username.clone(),
-        password: String::new(),
-    });
-    redacted.serialize(serializer)
 }
 
 #[derive(Debug)]

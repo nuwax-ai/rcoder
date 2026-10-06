@@ -83,9 +83,9 @@ pub async fn start_app(
   （应用代理与 ttyd/dbx 工具族）会自动唤醒拉起，也可随时显式 `start`；
 - 需要"彻底销毁"走 delete → （可选）storage/clear | destroy。
 
-- If another operation holds the lock, this request is rejected without waiting
-  for that operation to finish and is not queued (envelope: HTTP 200 with
-  success=false and code ERR_CONFLICT). Retry later after checking application state.
+- 另一操作占用时立即拒绝，不等待或排队。业务信封保持 HTTP 200、success=false，
+  code=ERR_OPERATION_IN_PROGRESS，data 携带权威 holder 与重试提示；
+  holder 不明或需恢复时 retryable=false。生命周期/版本/请求指纹冲突仍为 ERR_CONFLICT。
 "#,
     responses(
         (status = 200, description = "停止成功", body = HttpResult<AppRuntimeInfo>)
@@ -139,9 +139,15 @@ pub async fn stop_app(
         description = "按 app_id 定位，不使用 user_id；其余可选——空对象 = 传统 rollout restart（同时滚动到平台默认运行时镜像）。带 url = 部署新版本（等待边界同 start：部署段完成 + SQL 执行，服务启动异步可见，成功 ≠ 立即接流量）；其余字段语义同 start"
     ),
     description = r#"
-- If another operation holds the lock, this request is rejected without waiting
-  for that operation to finish and is not queued (envelope: HTTP 200 with
-  success=false and code ERR_CONFLICT). Retry later after checking application state.
+- 受理前遇到可重试的正常流量唤醒、部署或重启占用时，共享一个总等待预算（默认 30 秒，
+  app_manager.restart_admission_wait_secs / RCODER_USERAPP_RESTART_ADMISSION_WAIT_SECS
+  可配置），每 200ms 重新核验 lifecycle、intent 和物理租约；带 url 的部署式重启同样适用。
+- 预算耗尽返回 HTTP 200、success=false、ERR_OPERATION_IN_PROGRESS；data 是原持有者的
+  operation/kind/state/step、traffic wake 与 retryable/retry_after_seconds。物理 Stop/Restart
+  控制、未知持有者、RecoveryRequired 或陈旧 Running 立即拒绝，不受理排队。
+- 等待期间断开可放弃；进入持久受理后原操作继续收敛。已成功 request_id 重放返回原结果。
+  等待预算不改变业务停止宽限或部署执行预算；客户端读超时需覆盖等待预算和执行时长。
+  lifecycle、版本、目标替换、request_id 指纹冲突仍返回 ERR_CONFLICT。
 "#,
     responses(
         (status = 200, description = "重启/部署成功（部署 = 制品已部署 + SQL 已执行，服务启动中）", body = HttpResult<StartAppResult>)
@@ -164,7 +170,13 @@ pub async fn restart_app(
         app_id,
         request.url.is_some()
     );
-    // The accepted coordinator owns its lease even when the HTTP client disconnects.
+    // Waiting restarts are abandoned with the receiver. Once durable admission
+    // begins, the owned coordinator must resolve its transaction and writes.
+    let admission = Arc::new(crate::service::restart_wait::RestartAdmission::default());
+    let _waiting_client = admission.client();
+    let response_wait = std::time::Duration::from_secs(
+        300_u64.saturating_add(state.app_service.restart_admission_wait_secs()),
+    );
     let request_id = request
         .request_id
         .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
@@ -173,8 +185,11 @@ pub async fn restart_app(
     let worker_app_id = app_id.clone();
     let service = state.app_service.clone();
     let result = await_deployment_response(
-        tokio::spawn(async move { service.restart_app_enhanced(&worker_app_id, request).await }),
-        std::time::Duration::from_secs(300),
+        tokio::spawn(
+            admission
+                .scope(async move { service.restart_app_enhanced(&worker_app_id, request).await }),
+        ),
+        response_wait,
     )
     .await;
     let result =

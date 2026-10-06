@@ -59,31 +59,25 @@ pub(crate) async fn create_workspace(
                 "[USERAPP_FORWARD] record dev registration failed: app_id={}: {e}",
                 body.app_id
             );
-            AppError::with_message(
-                shared_types::error_codes::ERR_INTERNAL_SERVER_ERROR,
-                format!("record dev registration failed: {e}"),
-            )
+            AppError::from(e)
         })?;
 
     // 2. ensure 开发容器（幂等；注册 state.projects）——应用共享按 app_id 定位
     let info = ensure_userapp_builder(&state, &body.app_id)
         .await
-        .map_err(|e| {
-            tracing::error!(
-                "[USERAPP_FORWARD] ensure dev container failed: app_id={}: {e:#}",
-                body.app_id
-            );
-            AppError::with_message(
-                shared_types::error_codes::ERR_CONTAINER_ERROR,
-                format!("ensure dev container failed: {e:#}"),
-            )
-        })?;
+        .map_err(|error| crate::userapp_builder::control_error(&error))?;
 
     // 3. 容器内建 workspace 目录（幂等）
     let addr = dev_file_server_addr(&state, &info)?;
-    super::ensure_workspace_via_dev(&addr, &body.app_id)
-        .await
-        .map_err(|e| AppError::with_message(shared_types::error_codes::ERR_CONTAINER_ERROR, e))?;
+    let credentials = super::file_credentials::credentials(
+        &state,
+        shared_types::UserappStage::Dev,
+        &body.app_id,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(150),
+    )
+    .await
+    .map_err(shared_types::WakeFailure::into_app_error)?;
+    super::ensure_workspace_via_dev(&addr, &body.app_id, &credentials).await?;
 
     info!(
         "[USERAPP_FORWARD] workspace created: app_id={}, container={}, ip={}",

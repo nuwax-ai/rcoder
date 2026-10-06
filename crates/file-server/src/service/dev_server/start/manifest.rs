@@ -17,12 +17,23 @@ impl DevServerManager {
         project_path: &Path,
         launch: super::super::DevLaunch<'_>,
     ) -> AppResult<StartedDev> {
-        let (hooks, pg, request_context, artifact_release_id) = (
+        let (mut hooks, pg, request_context, artifact_release_id) = (
             launch.hooks.clone(),
             launch.pg,
             launch.request_context,
             launch.artifact_release_id,
         );
+        let deadline = {
+            let hooks = hooks.get_or_insert_with(crate::service::dev_server::DevEventHooks::noop);
+            let deadline = hooks.launch_deadline.unwrap_or_else(|| {
+                tokio::time::Instant::now()
+                    + crate::service::dev_server::DevEventHooks::launch_budget(
+                        self.config.dev_command_timeout_secs,
+                    )
+            });
+            hooks.launch_deadline = Some(deadline);
+            deadline
+        };
         // 单一来源 shared_types::APP_ENTRY_PORT（release 流程、Pingora 免端口代理同值）
         const PINGAP_ENTRY_PORT: u16 = shared_types::APP_ENTRY_PORT;
         if let Some(process) = lock(&self.processes)?.get(project_id).cloned()
@@ -62,12 +73,12 @@ impl DevServerManager {
         // DEV-R1：serve 未复用后分类本地 run 目标——磁盘 phase 单独不是门禁：
         // 活 run 拒绝（短预算探测，非 Stopped 即活）；死记录（进程已退、
         // owner.lock 可取）就地离线收束后放行，用户无需删除状态文件。
-        self.ensure_no_local_execution(project_id, project_path)
-            .await?;
+        tokio::time::timeout_at(deadline, self.ensure_no_local_execution(project_id, project_path))
+            .await.map_err(|_| AppError::business("local startup launch deadline exceeded while observing original cleanup; no new execution submitted"))??;
 
         let ldir = log::log_dir(&self.config, project_id);
-        tokio::fs::create_dir_all(ldir.join("app-cli"))
-            .await
+        tokio::time::timeout_at(deadline, tokio::fs::create_dir_all(ldir.join("app-cli")))
+            .await.map_err(|_| AppError::business("local startup launch deadline expired while preparing logs; no new execution submitted"))?
             .map_err(|e| AppError::system(format!("create app-cli log dir: {e}")))?;
         let now = process::now_ms();
         let main_log = ldir.join(log::main_log_name());
@@ -120,6 +131,11 @@ impl DevServerManager {
             platform_state_root.as_deref(),
             &mut env_extra,
         )?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AppError::business(
+                "local startup launch deadline expired before submission; no new execution submitted",
+            ));
+        }
         let (child, stdout, stderr) = process::spawn_dev(
             program,
             &[
@@ -144,8 +160,9 @@ impl DevServerManager {
         if let Some(out) = stdout {
             // EVT 识别（hooks Some 时回调编排事件行；None 退化为 no-op 闭包，
             // 日志行为不变）；管道结束（EOF/读错）经 hooks.on_end 上报恰好一次。
-            let pipe_hooks =
-                hooks.unwrap_or_else(crate::service::dev_server::supervise::DevEventHooks::noop);
+            let pipe_hooks = hooks
+                .clone()
+                .unwrap_or_else(crate::service::dev_server::supervise::DevEventHooks::noop);
             let pipe = log::spawn_log_pipe_with_events(
                 out,
                 main_log.clone(),
@@ -196,11 +213,16 @@ impl DevServerManager {
             );
             supervised_map.insert(project_id.to_string(), supervised.clone());
         }
+        // Spawn alone is not submission proof. Publish the complete original
+        // launch first and release its table locks before notifying the caller.
+        if let Some(hooks) = &hooks {
+            hooks.submitted();
+        }
 
         // 早退检测 + 宽松就绪（pingap 按 [proxy] path 路由，根路径可能 404——
         // HTTP 判不通但进程存活即通过）
-        if let Err(error) = self
-            .poll_alive(
+        match self
+            .poll_alive_with_launch_deadline(
                 pid,
                 PINGAP_ENTRY_PORT,
                 None,
@@ -208,21 +230,28 @@ impl DevServerManager {
                 &|port, _base, timeout_ms| {
                     Box::pin(process::is_project_alive(port, Some("/"), timeout_ms))
                 },
+                Some(deadline),
             )
             .await
         {
-            // §3.1：探活失败清理自己刚创建的精确进程树与 Starting 登记
-            //（启动互斥锁在手，不存在更新的 launch 可被误伤）。
-            let _ = self.terminate_pid_group(pid).await;
-            {
-                let mut launches = lock(&self.launches)?;
-                let mut processes = lock(&self.processes)?;
-                let mut supervised_map = lock(&self.supervised)?;
-                launches.remove(project_id);
-                processes.remove(project_id);
-                supervised_map.remove(project_id);
+            Ok(LaunchObservation::Ready) => {}
+            Ok(LaunchObservation::DeadlineExpired) => {
+                return Err(AppError::business(format!(
+                    "local startup observation launch deadline exceeded (launch {launch_id}, pid {pid}); query this original execution before retrying"
+                )));
             }
-            return Err(error);
+            Err(error) => {
+                // Stop can already have collected this launch and published a
+                // successor while readiness was being observed. Capture the
+                // original identity again before signaling or retiring tables.
+                if let Err(cleanup) = self
+                    .close_local_registration(project_id, Some(&launch_id))
+                    .await
+                {
+                    tracing::warn!(%cleanup, launch_id, "original startup failure cleanup unconfirmed; retaining registration");
+                }
+                return Err(error);
+            }
         }
 
         Ok(StartedDev {

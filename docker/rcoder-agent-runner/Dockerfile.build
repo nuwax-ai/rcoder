@@ -1,12 +1,12 @@
 # 独立的构建 Dockerfile - 仅用于构建 agent_runner 二进制
-# 使用 debian:12 作为基础镜像，确保 GLIBC 版本与运行环境一致
+# rust:bookworm 跟随最新 stable，同时保留 Debian 12 的 GLIBC 基线。
 
-FROM debian:12 AS builder
+FROM rust:bookworm AS builder
 
 # 设置工作目录
 WORKDIR /build
 
-# 安装系统依赖和 Rust 工具链（这些层会被缓存）
+# 安装系统依赖；工具链由基础镜像提供。
 RUN apt-get update && apt-get install -y \
     curl \
     build-essential \
@@ -17,17 +17,11 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 安装 Rust 1.90（这一层会被缓存）
-# 安装后立即验证 cargo 可用，失败则中断构建，避免缓存不完整的层
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && . "$HOME/.cargo/env" \
-    && cargo --version \
-    && rustc --version
-ENV PATH="/root/.cargo/bin:${PATH}"
+RUN cargo --version && rustc --version
 
 # Rust cargo 国内镜像配置（与 rcoder-master/Dockerfile.base 同款 heredoc 内联；
-# 裸 debian 容器无镜像源，直连 static.crates.io DNS 解析失败）
-COPY <<'EOF_CARGO' /root/.cargo/config.toml
+# rust 镜像的 CARGO_HOME 为 /usr/local/cargo，配置必须写到实际读取位置）。
+COPY <<'EOF_CARGO' /usr/local/cargo/config.toml
 [source.crates-io]
 replace-with = 'rsproxy-sparse'
 

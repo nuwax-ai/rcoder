@@ -3,7 +3,7 @@ mod compute;
 mod discovery;
 use crate::app_state::AppState;
 use futures::{FutureExt as _, StreamExt as _, future::BoxFuture, stream::FuturesUnordered};
-use shared_types::{UserAppOperationKind, UserAppOperationState};
+use shared_types::{AppWakeControl as _, UserAppOperationKind, UserAppOperationState};
 use std::{
     collections::HashSet, future::Future, panic::AssertUnwindSafe, sync::Weak, time::Duration,
 };
@@ -279,6 +279,45 @@ async fn discover(
                 let state = state.clone();
                 tasks.push(operation.operation_id.clone(), async move {
                     state.app_service.resume_pending_control(&operation).await?;
+                    Ok(())
+                });
+                continue;
+            }
+            if operation.kind == UserAppOperationKind::Start
+                && operation.state == UserAppOperationState::Running
+                && operation.step == "traffic_wake_observing"
+            {
+                let state = state.clone();
+                tasks.push(operation.operation_id.clone(), async move {
+                    with_stall_budget("recover expired traffic wake observation", async {
+                        let Some(app) = state
+                            .userapp_store
+                            .get_application(&operation.app_id)
+                            .await?
+                        else {
+                            return Ok::<(), anyhow::Error>(());
+                        };
+                        if app.state != shared_types::UserAppLifecycleState::Active
+                            || app.lifecycle_id != operation.lifecycle_id
+                            || app.active_operations.prod.as_deref()
+                                != Some(operation.operation_id.as_str())
+                        {
+                            return Ok(());
+                        }
+                        // Idle policy cannot suppress durable wake recovery. The
+                        // shared helper rechecks the original acknowledged write,
+                        // deadline and full identity before its terminal CAS.
+                        crate::userapp_recycle::recover_expired_wake_observation(
+                            state.userapp_store.as_ref(),
+                            state.app_service.as_ref(),
+                            &app,
+                            chrono::Utc::now(),
+                            state.activity.wake_timeout(),
+                        )
+                        .await?;
+                        Ok(())
+                    })
+                    .await??;
                     Ok(())
                 });
                 continue;

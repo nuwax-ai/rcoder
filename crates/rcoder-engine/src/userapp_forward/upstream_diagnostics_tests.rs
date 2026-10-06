@@ -70,6 +70,7 @@ async fn forwarded(
             "diagnostic fixture",
             "forward-app",
             addr,
+            &shared_types::FileServerRequestCredentials::default(),
             request.body(body).unwrap(),
         )
         .await;

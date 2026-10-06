@@ -21,7 +21,11 @@ struct RuntimeExecRunner<'a> {
 
 #[async_trait]
 impl shared_types::PgCommandRunner for RuntimeExecRunner<'_> {
-    async fn run(&self, command: &str) -> Result<shared_types::CommandOutcome, String> {
+    async fn run(
+        &self,
+        command: &str,
+        mode: shared_types::PgCommandMode,
+    ) -> Result<shared_types::CommandOutcome, shared_types::PgCommandError> {
         let r = self
             .service
             .runtime
@@ -30,7 +34,7 @@ impl shared_types::PgCommandRunner for RuntimeExecRunner<'_> {
                 vec!["sh".to_string(), "-c".to_string(), command.to_string()],
             )
             .await
-            .map_err(|e| format!("exec failed: {e}"))?;
+            .map_err(|error| container_runtime_api::runtime_pg_command_error(&error, mode))?;
         Ok(shared_types::CommandOutcome {
             exit_code: r.exit_code,
             stdout: r.stdout,
@@ -87,18 +91,14 @@ impl AppService {
         use shared_types::PgCommandRunner as _;
         match self.activity.ensure_running(app_id).await {
             shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning => {}
-            shared_types::WakeOutcome::Timeout => {
-                return Err(AppOperationError::InvalidState(format!(
-                    "app {app_id} wake timeout (still starting in background), retry later"
-                )));
+            shared_types::WakeOutcome::Timeout(detail) => {
+                return Err(AppOperationError::Diagnostic(detail));
             }
             shared_types::WakeOutcome::Blocked { message, blocker } => {
                 return Err(AppOperationError::ConflictBlocked { message, blocker });
             }
-            shared_types::WakeOutcome::Failed(e) => {
-                return Err(AppOperationError::InvalidState(format!(
-                    "app {app_id} wake failed: {e}"
-                )));
+            shared_types::WakeOutcome::Failed(detail) => {
+                return Err(AppOperationError::Diagnostic(detail));
             }
         }
         self.get_app(app_id).await?;
@@ -109,14 +109,29 @@ impl AppService {
             app_id,
         };
         let wait = runner
-            .run(&shared_types::pg_utils::pg_wait_ready_cmd(60))
+            .run(
+                &shared_types::pg_utils::pg_wait_ready_cmd(60),
+                shared_types::PgCommandMode::ReadOnly,
+            )
             .await
-            .map_err(AppOperationError::Backend)?;
+            .map_err(|error| {
+                AppOperationError::Diagnostic(shared_types::WakeFailure::new(
+                    error.code,
+                    "database_readiness",
+                    error.detail,
+                ))
+            })?;
         if wait.exit_code != 0 {
-            return Err(AppOperationError::InvalidState(format!(
-                "app {app_id} postgres not ready after wake: {}",
-                wait.stderr.trim()
-            )));
+            return Err(AppOperationError::Diagnostic(
+                shared_types::WakeFailure::new(
+                    shared_types::ERR_DATABASE_NOT_READY,
+                    "database_readiness",
+                    format!(
+                        "app {app_id} PostgreSQL is not ready: {}",
+                        wait.stderr.trim()
+                    ),
+                ),
+            ));
         }
         Ok(())
     }
@@ -144,7 +159,10 @@ impl AppService {
         };
         use shared_types::PgCommandRunner as _;
         let pg_wait = runner
-            .run(&shared_types::pg_utils::pg_wait_ready_cmd(60))
+            .run(
+                &shared_types::pg_utils::pg_wait_ready_cmd(60),
+                shared_types::PgCommandMode::ReadOnly,
+            )
             .await;
         let not_ready = match &pg_wait {
             Err(e) => Some(format!("exec failed: {e}")),

@@ -957,3 +957,59 @@ async fn last_owner_drop_drains_admitted_job_and_releases() {
         "owner must release after last drop"
     );
 }
+
+/// The original transaction and every shutdown waiter retain unknown evidence.
+#[tokio::test]
+async fn unknown_execution_is_typed_and_replayed_to_concurrent_shutdown_waiters() {
+    let (owner, dropped) = owner_with_inflight(2).await;
+    let (entered, started) = oneshot::channel();
+    let (resume, resumed) = oneshot::channel::<()>();
+    let blocked = tokio::spawn({
+        let owner = owner.clone();
+        async move {
+            owner
+                .execute(move |_db| async move {
+                    entered.send(()).unwrap();
+                    resumed.await.unwrap();
+                    Ok(())
+                })
+                .await
+        }
+    });
+    started.await.unwrap();
+    let unknown = owner
+        .execute::<(), _, _>(|_db| async move { panic!("controlled lost result") })
+        .await
+        .unwrap_err();
+    let typed_transaction = unknown
+        .downcast_ref::<shared_types::OperationOutcomeUnknown>()
+        .is_some();
+    let shutdown = tokio::spawn({
+        let a = owner.clone();
+        let b = owner.clone();
+        async move { tokio::join!(a.shutdown(), b.shutdown()) }
+    });
+    // Admission closure is observable before releasing the in-flight job.
+    let mut close = Box::pin(owner.shutdown());
+    assert!(futures::poll!(&mut close).is_pending());
+    resume.send(()).unwrap();
+    blocked.await.unwrap().unwrap();
+    let (a, b) = tokio::time::timeout(Duration::from_secs(5), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        typed_transaction,
+        "original unknown result lost its structured type: {unknown:#}"
+    );
+    for result in [a, b, owner.shutdown().await] {
+        let error = result.expect_err("unrecovered failure cannot be successful shutdown");
+        assert!(
+            error
+                .downcast_ref::<shared_types::OperationOutcomeUnknown>()
+                .is_some(),
+            "shutdown lost unknown evidence: {error:#}"
+        );
+    }
+    assert!(dropped.load(Ordering::SeqCst));
+}

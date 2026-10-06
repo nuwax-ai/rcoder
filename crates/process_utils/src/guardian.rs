@@ -13,6 +13,9 @@ use std::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
+mod spawn_checked;
+pub use spawn_checked::{SpawnAttemptFailure, spawn_owned_checked};
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Spec {

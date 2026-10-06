@@ -122,9 +122,8 @@ pub(super) async fn settle_control_signal(
                 sha256: None,
                 local_path: None,
                 execution_target: Some(ExecutionTarget::Source),
-                // The journal redacts the password but must retain that this
-                // execution used explicit credentials. Otherwise owner recovery
-                // could silently restart it using stale process environment.
+                // Internal journal retains actual credentials for restart
+                // recovery; APIs expose typed views.
                 run_pg: pg.clone(),
             };
             if let Err(error) = state.record_runtime_deployment(&request) {
@@ -147,46 +146,13 @@ pub(super) async fn settle_stopped_startup(
     signal: ControlSignal,
     reason: String,
 ) -> InitialAction {
-    if let Err(error) = crate::migration_journal::require_confirmed_migrations(&args.workspace) {
-        // The process group is stopped, but the database outcome
-        // remains unknown. Preserve startup recovery independently
-        // of the Stop request, which can still confirm compute stop.
-        if let Err(cleanup) = crate::static_hosting::reconcile(&[], &args.workspace, false).await {
-            hold_unconfirmed(state, format!("startup static cleanup: {cleanup:#}")).await;
-            return InitialAction::Settled;
-        }
-        if let Err(persist) = state
-            .finish_current_runtime_operation(
-                shared_types::RuntimeOperationState::RecoveryRequired,
-                Some((
-                    shared_types::ERR_RECOVERY_REQUIRED.into(),
-                    format!("{reason}; migration: {error:#}"),
-                )),
-            )
-            .await
-        {
-            hold_unconfirmed(state, persist).await;
-            return InitialAction::Settled;
-        }
-        state.begin_runtime_recovery_hold();
-        if matches!(&signal, ControlSignal::OrchestrateSource { .. }) {
-            record_uncertain_control(
-                state,
-                &signal,
-                "Migration outcome requires recovery before startup",
-            )
-            .await;
-            return InitialAction::Settled;
-        }
-    } else {
-        finish_interrupted_activation(
-            args,
-            state,
-            reason,
-            shared_types::RuntimeOperationState::Cancelled,
-        )
-        .await;
-    }
+    finish_interrupted_activation(
+        args,
+        state,
+        reason,
+        shared_types::RuntimeOperationState::Cancelled,
+    )
+    .await;
     settle_control_signal(state, signal).await
 }
 
@@ -390,7 +356,7 @@ pub(super) async fn fail_activation(
 }
 
 /// The caller has joined the orchestration task and confirmed process cleanup.
-/// Unknown migration or cleanup evidence still takes the recovery branch below.
+/// Unknown physical cleanup or state persistence retains recovery protection.
 pub(super) async fn finish_interrupted_activation(
     args: &RuntimeArgs,
     state: &ServerState,
@@ -407,17 +373,6 @@ pub(super) async fn finish_interrupted_activation(
     }
     if let Err(stop_error) = crate::static_hosting::reconcile(&[], &args.workspace, false).await {
         hold_unconfirmed(state, format!("{error}; static shutdown: {stop_error:#}")).await;
-        return None;
-    }
-    if let Err(migration_error) =
-        crate::migration_journal::require_confirmed_migrations(&args.workspace)
-    {
-        state.begin_runtime_recovery_hold();
-        hold_unconfirmed(
-            state,
-            format!("{error}; migration outcome: {migration_error:#}"),
-        )
-        .await;
         return None;
     }
     let artifact = crate::manifest::read_release_lock(&args.workspace)
@@ -1343,12 +1298,16 @@ pub(super) fn bridge_event_fields(json: &str) -> Option<BridgeEvent> {
         .get("service")
         .and_then(|service| service.as_str())
         .map(str::to_string);
-    let stage = if event_name == "orchestration_done" {
-        "orchestration"
-    } else {
-        "service"
+    let stage = match event_name.as_str() {
+        "orchestration_done" => "orchestration",
+        "log" => "migration",
+        _ => "service",
     };
     let payload = match event_name.as_str() {
+        "log" => value
+            .get("line")
+            .cloned()
+            .map(|line| serde_json::json!({ "line": line })),
         "orchestration_done" => value
             .get("failed")
             .cloned()

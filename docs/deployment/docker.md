@@ -15,7 +15,7 @@ make dev-logs     # 日志
 make dev-down     # 停止
 ```
 
-Compose 定义在 `docker/docker-compose.yml`；配置经 `docker/config.yml` 挂载（配置优先级：CLI 参数 > 环境变量 > 配置文件 > 默认值）。
+Compose 定义在 `docker/docker-compose.yml`；配置经 `docker/config.yml` 挂载（配置优先级：环境变量 > CLI 参数 > 配置文件 > 默认值）。
 
 ## 组件拓扑
 

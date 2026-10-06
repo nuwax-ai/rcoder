@@ -449,26 +449,27 @@ async fn run() {
                 "0.0.0.0".to_string()
             }
         });
-    let auth_token = std::env::var("FILE_SERVER_PROXY_TOKEN")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            if !settings.native_profile {
-                return None;
-            }
-            let token = format!(
-                "{}{}",
-                uuid::Uuid::new_v4().simple(),
-                uuid::Uuid::new_v4().simple()
-            );
-            if let Some(root) = &owner_root
-                && let Err(error) = file_server_proxy::write_native_credentials(root, &token)
-            {
-                fail(format!("persist native file-api credentials: {error}"));
-            }
-            Some(token)
-        });
+    let auth_token = FileServerProxyConfig::resolve_auth_token(
+        None,
+        std::env::var_os("FILE_SERVER_PROXY_TOKEN"),
+    )
+    .unwrap_or_else(|reason| fail(reason))
+    .or_else(|| {
+        if !settings.native_profile {
+            return None;
+        }
+        let token = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        if let Some(root) = &owner_root
+            && let Err(error) = file_server_proxy::write_native_credentials(root, &token)
+        {
+            fail(format!("persist native file-api credentials: {error}"));
+        }
+        Some(token)
+    });
     file_server_proxy::init(FileServerProxyConfig {
         listen_host,
         auth_token,

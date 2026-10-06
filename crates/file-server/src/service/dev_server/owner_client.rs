@@ -422,17 +422,27 @@ impl OwnerClient {
         operation_id: &str,
         timeout: std::time::Duration,
     ) -> Result<RuntimeOperationView> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        self.wait_terminal_until(operation_id, tokio::time::Instant::now() + timeout)
+            .await
+    }
+
+    pub(super) async fn wait_terminal_until(
+        &self,
+        operation_id: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<RuntimeOperationView> {
         loop {
             // The operation was just submitted to this owner; its record may
             // not be visible on the very first polls (slow shared filesystem,
             // loaded machine). Absence before the deadline is "keep waiting",
             // not a failure — the deadline still bounds the total budget.
-            if let Some(view) = self.operation_if_exists(operation_id).await?
+            let observation = tokio::time::timeout_at(deadline, self.operation_if_exists(operation_id))
+                .await.with_context(|| format!("runtime operation {operation_id} observation exceeded launch deadline; query this original operation before retrying"))??;
+            if let Some(view) = observation
                 && (view.state.is_terminal()
                     // RecoveryRequired 是持久的可查询结论（结果未知→需显
                     // 式恢复），不会自行演进成其他状态——按终态返回，由
-                    // 调用方以 error_message 呈现具体原因（如未确认迁移），
+                    // 调用方呈现物理清理未确认或独立未知写入等具体原因，
                     // 不等满预算超时。
                     || view.state
                         == shared_types::RuntimeOperationState::RecoveryRequired)
@@ -441,9 +451,12 @@ impl OwnerClient {
             }
             anyhow::ensure!(
                 tokio::time::Instant::now() < deadline,
-                "runtime operation {operation_id} did not reach terminal state in {timeout:?}"
+                "runtime operation {operation_id} did not reach terminal before launch deadline; query this original operation before retrying"
             );
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(500)),
+            )
+            .await;
         }
     }
 }
@@ -550,12 +563,87 @@ pub(super) fn find_owner_token(
 /// （`wait_terminal`）；`cursor` 记录已消费 sequence（调用方终态后经
 /// [`drain_operation_events`] 按 cursor 排空剩余事件——终态事件在状态
 /// 可见后落 journal，盲目 abort 会丢终局）。
+/// One forwarder writes these markers after delivery. The caller joins that
+/// forwarder before reading them, so sequence and event kind form a stable
+/// snapshot without a lock or a full-history replay.
+pub(super) struct OwnerTerminalCursor {
+    operation_id: String,
+    runtime_instance_id: String,
+    sequence: std::sync::atomic::AtomicU64,
+    kind: std::sync::atomic::AtomicU8,
+}
+
+impl OwnerTerminalCursor {
+    pub(super) fn new(operation_id: &str, runtime_instance_id: &str) -> Self {
+        Self {
+            operation_id: operation_id.to_owned(),
+            runtime_instance_id: runtime_instance_id.to_owned(),
+            sequence: std::sync::atomic::AtomicU64::new(0),
+            kind: std::sync::atomic::AtomicU8::new(0),
+        }
+    }
+
+    fn verify_record(&self, record: &shared_types::RuntimeEventRecord) -> Result<()> {
+        ensure!(
+            record.operation_id == self.operation_id
+                && record.runtime_instance_id == self.runtime_instance_id
+                && record.sequence > 0,
+            "event replay identity or sequence changed for original operation {}; query this original operation before retrying",
+            self.operation_id
+        );
+        Ok(())
+    }
+
+    fn record_delivery(&self, record: &shared_types::RuntimeEventRecord) {
+        use std::sync::atomic::Ordering;
+        let kind = match (record.stage.as_str(), record.event_name.as_deref()) {
+            ("terminal", Some("Completed")) => 1,
+            ("terminal", Some("Failed")) => 2,
+            _ => return,
+        };
+        self.kind.store(kind, Ordering::SeqCst);
+        self.sequence.store(record.sequence, Ordering::SeqCst);
+    }
+
+    fn matches_view(&self, view: &RuntimeOperationView, consumed: u64) -> Result<bool> {
+        use std::sync::atomic::Ordering;
+        ensure!(
+            view.operation_id == self.operation_id
+                && view.runtime_instance_id == self.runtime_instance_id,
+            "terminal view changed original operation identity {}",
+            self.operation_id
+        );
+        let wanted = match view.state {
+            shared_types::RuntimeOperationState::Succeeded => 1,
+            shared_types::RuntimeOperationState::Failed
+            | shared_types::RuntimeOperationState::Cancelled
+            | shared_types::RuntimeOperationState::RecoveryRequired => 2,
+            _ => bail!(
+                "original operation {} has no terminal view",
+                self.operation_id
+            ),
+        };
+        let sequence = self.sequence.load(Ordering::SeqCst);
+        if sequence == 0 {
+            return Ok(false);
+        }
+        ensure!(
+            sequence <= consumed && self.kind.load(Ordering::SeqCst) == wanted,
+            "original operation {} terminal event disagrees with observed {:?}; query this original operation before retrying",
+            self.operation_id,
+            view.state
+        );
+        Ok(true)
+    }
+}
+
 pub(super) async fn forward_operation_events(
     client: &OwnerClient,
     operation_id: &str,
     mut on_line: impl FnMut(String) + Send,
     stop: &tokio_util::sync::CancellationToken,
     cursor: &std::sync::atomic::AtomicU64,
+    terminal: &OwnerTerminalCursor,
     poll_interval: std::time::Duration,
 ) {
     use std::sync::atomic::Ordering;
@@ -564,11 +652,21 @@ pub(super) async fn forward_operation_events(
         match client.events_after(operation_id, after_seq).await {
             Ok(records) => {
                 for record in &records {
-                    after_seq = after_seq.max(record.sequence);
-                    cursor.store(after_seq, Ordering::SeqCst);
+                    if let Err(error) = terminal.verify_record(record) {
+                        tracing::warn!(%error, "original owner event replay rejected");
+                        return;
+                    }
+                    if record.sequence <= after_seq {
+                        continue;
+                    }
                     if let Some(legacy) = to_legacy_evt(record) {
                         on_line(legacy);
                     }
+                    // Never mark a terminal or advance its sequence before
+                    // the original callback has actually accepted the record.
+                    terminal.record_delivery(record);
+                    after_seq = record.sequence;
+                    cursor.store(after_seq, Ordering::SeqCst);
                 }
             }
             // 轮询失败不终止转发（owner 短暂不可达时下一轮游标继续）；
@@ -585,23 +683,47 @@ pub(super) async fn forward_operation_events(
     }
 }
 
-/// 终态后的最后一轮排空（R06：终态事件按 sequence 全部送达后再完成；
-/// 至多重放一轮，坏记录不静默丢——解析失败记 warn 保留失败清单）。
+/// A terminal view can become visible before its final event is appended.
+/// Join the forwarder first, then continue its original incremental cursor
+/// until the matching durable terminal record is delivered within the same
+/// launch deadline. An already-delivered terminal still gets one tail replay.
 pub(super) async fn drain_operation_events(
     client: &OwnerClient,
-    operation_id: &str,
+    view: &RuntimeOperationView,
     after_seq: u64,
+    terminal: &OwnerTerminalCursor,
+    deadline: tokio::time::Instant,
     mut on_line: impl FnMut(String) + Send,
 ) -> Result<u64> {
-    let records = client.events_after(operation_id, after_seq).await?;
     let mut last = after_seq;
-    for record in &records {
-        last = last.max(record.sequence);
-        if let Some(legacy) = to_legacy_evt(record) {
-            on_line(legacy);
+    loop {
+        let records = tokio::time::timeout_at(deadline, client.events_after(&view.operation_id, last))
+            .await.with_context(|| format!("original operation {} {:?} terminal event observation exceeded launch deadline; query this original operation before retrying", view.operation_id, view.state))??;
+        for record in &records {
+            terminal.verify_record(record)?;
+            if record.sequence <= last {
+                continue;
+            }
+            if let Some(legacy) = to_legacy_evt(record) {
+                on_line(legacy);
+            }
+            terminal.record_delivery(record);
+            last = record.sequence;
         }
+        if terminal.matches_view(view, last)? {
+            return Ok(last);
+        }
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "original operation {} {:?} has no delivered terminal event before launch deadline; query this original operation before retrying",
+            view.operation_id,
+            view.state
+        );
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(50)),
+        )
+        .await;
     }
-    Ok(last)
 }
 
 /// RuntimeEventRecord → 旧 EVT 行（map_app_cli_evt 消费的同构 JSON;
@@ -631,12 +753,14 @@ pub(super) fn to_legacy_evt(record: &shared_types::RuntimeEventRecord) -> Option
                 }],
             }
         }
-        "service_starting" | "service_start_ok" | "service_start_fail" | "orchestration_done" => {
+        "log" | "service_starting" | "service_start_ok" | "service_start_fail"
+        | "orchestration_done" => {
             let mut value = serde_json::json!({"event": name});
             if let Some(service) = &record.service {
                 value["service"] = serde_json::Value::String(service.clone());
             }
             let payload_key = match name {
+                "log" => Some("line"),
                 "orchestration_done" => Some("failed"),
                 "service_start_fail" => Some("error"),
                 _ => None,
@@ -668,6 +792,25 @@ pub(super) fn to_legacy_evt(record: &shared_types::RuntimeEventRecord) -> Option
 #[cfg(test)]
 mod r09_tests {
     use super::*;
+
+    #[test]
+    fn migration_output_adapter_preserves_original_service_and_full_line() {
+        let line = format!("[migrate stderr] {} end-marker", "x".repeat(9000));
+        let mut record = runtime_event("log", Some(serde_json::json!({"line": line})));
+        record.service = Some("backend".into());
+        let json = to_legacy_evt(&record).unwrap();
+        assert_eq!(
+            shared_types::AppCliOrchestrationEvent::decode(&json).unwrap(),
+            shared_types::AppCliOrchestrationEvent::Log {
+                service: "backend".into(),
+                line
+            }
+        );
+        record.payload = Some(serde_json::json!({"line": 7}));
+        assert!(
+            matches!(shared_types::AppCliOrchestrationEvent::decode(&to_legacy_evt(&record).unwrap()), Err(shared_types::AppCliEvtDecodeError::MalformedKnownEvent { event, .. }) if event == "log")
+        );
+    }
 
     fn runtime_event(
         name: &str,

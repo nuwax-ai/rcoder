@@ -4,17 +4,19 @@
 //! 端口的孙进程**。停止必须收束整树——只杀直接 Child 或只发 TERM 都会让孙
 //! 进程继续占端口，下一轮同名服务 bind 冲突。
 //!
-//! 两个真实链路用例（legacy `run` 形态 = 生产 run_inner 同一函数）：
+//! 两个真实链路用例（常驻 `serve` owner 的真实业务编排）：
 //! 1. supervise 正常停机：SIGTERM → 宽限期 → 强杀整树（孙进程忽略 TERM，
 //!    只有组级 SIGKILL 能收束）→ 干净退出 + 端口全部释放。
 //! 2. 启动失败兜底：pingap 编译阶段失败 → shutdown_all 清理已启动的
-//!    子进程（含孙进程）→ 非零退出 + 端口全部释放 + 终局 Done 事件。
+//!    子进程（含孙进程）→ 端口全部释放 + 失败 Done，管理面仍在线。
+//!
+//! `run` 客户端保留管理 owner 的独立行为由 run_source_owner 覆盖。
 
 #![cfg(unix)]
 
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use std::net::TcpListener;
@@ -109,18 +111,6 @@ impl Drop for OwnedCli {
     }
 }
 
-impl OwnedCli {
-    /// 进程已退出后取走 Child 收集输出（仍在运行时 panic——防误用）。
-    fn into_exited(mut self) -> Child {
-        let mut child = self.0.take().expect("owned child");
-        assert!(
-            matches!(child.try_wait(), Ok(Some(_))),
-            "into_exited called before process exit"
-        );
-        child
-    }
-}
-
 fn spawn_cli(
     workspace: &Path,
     root: &Path,
@@ -131,7 +121,7 @@ fn spawn_cli(
     let mut command = Command::new(env!("CARGO_BIN_EXE_app-cli"));
     command
         .args([
-            "run",
+            "serve",
             "--workspace",
             workspace.to_str().expect("workspace path"),
             "--log-dir",
@@ -146,6 +136,11 @@ fn spawn_cli(
         .env_remove("APP_DEPLOY_OPERATION_ID")
         .env_remove("APP_DEPLOY_GENERATION_ID")
         .env("RUST_LOG", "app_cli=info")
+        .env_remove("APP_CLI_ATTACH")
+        .env("APP_CLI_STATE_ROOT", root.join("state"))
+        .env("APP_CLI_REQUIRE_PG", "0")
+        .env_remove("PGUSER")
+        .env_remove("PGPASSWORD")
         .env("APP_CLI_SKIP_PG_WAIT", "1");
     if skip_pingap_confirm {
         // fake pingap 无 admin 通道：跳过初始配置确认（配置正确性由 -t 兜底）
@@ -261,12 +256,6 @@ fn wait_exit(child: &mut Child, budget: Duration, what: &str) -> std::process::E
     }
 }
 
-fn collect_output(child: Child) -> Output {
-    let mut output = child.wait_with_output().expect("collect output");
-    output.stdout.extend_from_slice(&output.stderr);
-    output
-}
-
 /// R01 反例（正常停机）：孙进程忽略 TERM 且持端口，SIGTERM 停机后整树收束。
 #[test]
 fn supervised_stop_kills_term_ignoring_grandchild_and_releases_ports() {
@@ -332,7 +321,8 @@ fn supervised_stop_kills_term_ignoring_grandchild_and_releases_ports() {
     wait_port_released(gc_port, second_release, "second round grandchild holder");
 }
 
-/// R01 反例（失败兜底）：pingap 编译失败 → 已启动服务整树清理 → 非零退出。
+/// R01 反例（失败兜底）：pingap 编译失败 → 已启动服务整树清理，
+/// 失败事件保留且管理面常驻，最后向捕获的 owner 发 SIGTERM 正常退出。
 #[test]
 fn startup_failure_cleanup_converges_service_tree() {
     let root = tempfile::tempdir().expect("root tempdir");
@@ -358,38 +348,65 @@ fn startup_failure_cleanup_converges_service_tree() {
         Some(gc_port.to_string().as_str())
     );
 
-    // pingap -t 必然失败 → run_inner Err → shutdown_all(children) → 非零退出
-    let exit_deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if cli
-            .0
-            .as_mut()
-            .expect("owned child")
-            .try_wait()
-            .expect("try_wait")
-            .is_some()
-        {
-            break;
+    // Read the original failed Done from the real owner stream. The owner
+    // must survive the business error; an exited client cannot prove this.
+    use std::io::{BufRead, BufReader};
+    let stdout = cli.0.as_mut().unwrap().stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
         }
-        assert!(
-            Instant::now() < exit_deadline,
-            "app-cli did not exit after pingap failure"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let output = collect_output(cli.into_exited());
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let failure = loop {
+        let line = rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("original failed Done before deadline")
+            .expect("owner event line");
+        if line.contains("orchestration_done") {
+            break line;
+        }
+    };
     assert!(
-        !output.status.success(),
-        "pingap failure must exit non-zero"
+        failure.contains("orchestrator"),
+        "original startup error missing: {failure}"
     );
-    let combined = String::from_utf8_lossy(&output.stdout);
     assert!(
-        combined.contains("orchestration_done"),
-        "failure must emit terminal Done event, got:\n{combined}"
+        cli.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "business failure must preserve the real management owner"
+    );
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let snapshot = runtime
+        .block_on(runtime_supervisor::control(
+            &root.path().join("state"),
+            runtime_supervisor::Request::new(runtime_supervisor::Action::Status),
+        ))
+        .expect("management native status after business failure");
+    assert_eq!(snapshot.binding.component, "app-cli");
+    assert!(
+        port_connectable(admin_addr.rsplit(':').next().unwrap().parse().unwrap()),
+        "management HTTP listener must survive business failure"
     );
 
     // 兜底清理同样收束整树（孙进程忽略 TERM → 走强杀路径）
     let release = Instant::now() + Duration::from_secs(5);
     wait_port_released(gc_port, release, "grandchild holder after failure cleanup");
     wait_port_released(svc_port, release, "service root after failure cleanup");
+    let child = cli.0.as_mut().unwrap();
+    let signal = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(signal.success());
+    assert!(
+        wait_exit(
+            child,
+            Duration::from_secs(20),
+            "management shutdown after failed business"
+        )
+        .success()
+    );
 }

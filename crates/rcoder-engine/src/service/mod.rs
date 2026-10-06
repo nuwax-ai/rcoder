@@ -13,6 +13,9 @@ pub mod container_manager;
 pub mod container_status_checker;
 pub mod container_sync;
 
+#[cfg(test)]
+mod container_admission_tests;
+
 pub use computer_container_manager::ComputerContainerManager;
 // 以下 re-export 供 binary (main.rs) 使用；lib 内部不直接引用，故抑制 unused_imports
 #[allow(unused_imports)]

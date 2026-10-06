@@ -85,23 +85,44 @@ impl Drop for WakeGuard {
 }
 
 impl AppActivityRegistry {
-    async fn probe_remote_state(&self, app_id: &str) -> Result<RemoteState, String> {
+    async fn probe_remote_state(
+        &self,
+        app_id: &str,
+    ) -> Result<RemoteState, shared_types::WakeFailure> {
         if let Some(state) = self.remote_state.get(app_id) {
             return Ok(state);
         }
         self.probe_remote_state_fresh(app_id).await
     }
 
-    async fn probe_remote_state_fresh(&self, app_id: &str) -> Result<RemoteState, String> {
-        let runtime = self
-            .runtime
-            .get()
-            .ok_or_else(|| "Runtime is unavailable".to_owned())?;
+    async fn probe_remote_state_fresh(
+        &self,
+        app_id: &str,
+    ) -> Result<RemoteState, shared_types::WakeFailure> {
+        let runtime = self.runtime.get().ok_or_else(|| {
+            shared_types::WakeFailure::new(
+                shared_types::ERR_RUNTIME_UNAVAILABLE,
+                "wake_runtime_probe",
+                "Runtime is unavailable",
+            )
+        })?;
         let status = runtime
             .get_deployment_status(app_id)
             .await
-            .map_err(|error| format!("Read application runtime state: {error}"))?
-            .ok_or_else(|| format!("Application runtime not found: {app_id}"))?;
+            .map_err(|error| {
+                let mut failure =
+                    crate::utils::map_runtime_error("Read application runtime state", error)
+                        .wake_failure("wake_runtime_probe");
+                failure.stage = "wake_runtime_probe".into();
+                failure
+            })?
+            .ok_or_else(|| {
+                shared_types::WakeFailure::new(
+                    shared_types::ERR_CONTAINER_NOT_FOUND,
+                    "wake_runtime_probe",
+                    format!("Physical application runtime not found: {app_id}"),
+                )
+            })?;
         let state = if status.phase == "Error" {
             RemoteState::default()
         } else if status.replicas <= 0 {
@@ -161,14 +182,15 @@ impl AppActivityRegistry {
     /// wake policy are checked by the lifecycle coordinator under its operation lock.
     async fn wake_leader(&self, app_id: &str) -> WakeOutcome {
         let Some(service) = self.coordinator.get().and_then(std::sync::Weak::upgrade) else {
-            return WakeOutcome::Failed("Activity lifecycle coordinator is unavailable".into());
+            return WakeOutcome::Failed(shared_types::WakeFailure::new(
+                shared_types::ERR_RUNTIME_UNAVAILABLE,
+                "wake_coordinator",
+                "Activity lifecycle coordinator is unavailable",
+            ));
         };
         match service.wake_app_on_traffic(app_id, self.wake_timeout).await {
             Ok(outcome) => outcome,
-            Err(crate::models::AppOperationError::ConflictBlocked { message, blocker }) => {
-                WakeOutcome::Blocked { message, blocker }
-            }
-            Err(error) => WakeOutcome::Failed(error.to_string()),
+            Err(error) => WakeOutcome::Failed(error.wake_failure("wake")),
         }
     }
 
@@ -199,7 +221,11 @@ impl AppActivityRegistry {
                 .clone()
                 .unwrap_or(WakeOutcome::Failed("no outcome".into())),
             Ok(Err(_)) => WakeOutcome::Failed(WAKE_LEADER_ABORTED.into()),
-            Err(_) => WakeOutcome::Failed("wake join timeout".into()),
+            Err(_) => WakeOutcome::Timeout(shared_types::WakeFailure::timeout(
+                "wake_follower_wait",
+                None,
+                false,
+            )),
         }
     }
 }
@@ -223,6 +249,15 @@ impl AppWakeControl for AppActivityRegistry {
                 false
             }
         }
+    }
+
+    async fn remote_wake_pending_result(
+        &self,
+        app_id: &str,
+    ) -> Result<bool, shared_types::WakeFailure> {
+        self.probe_remote_state(app_id)
+            .await
+            .map(|state| self.backfill_remote_state(app_id, state) || state.starting)
     }
 
     async fn remote_wake_state_fresh(&self, app_id: &str) -> RemoteWakeState {

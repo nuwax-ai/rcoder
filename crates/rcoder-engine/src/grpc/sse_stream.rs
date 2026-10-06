@@ -19,6 +19,15 @@ use tracing::{Instrument, error, info, warn};
 // 本 crate cfg 手工切换（specs T2.1 裁定）。
 use hotpath::wrap::tokio::sync::mpsc as obs_mpsc;
 
+/// A failed read has its own captured origin. A later retry or diagnostic
+/// observation cannot replace its phase, cause or request identity.
+struct CapturedFailure {
+    code: tonic::Code,
+    cause: String,
+    stage: &'static str,
+    request_id: Option<String>,
+}
+
 /// 创建基于 gRPC 的 SSE 代理流
 ///
 /// 通过 gRPC `SubscribeProgress` 方法订阅 agent_runner 的进度事件，
@@ -76,194 +85,155 @@ pub async fn create_grpc_sse_stream(
         }
     }
 
-    // 每个 HTTP SSE 请求一条独立的 agent_runner SubscribeProgress 订阅（纯转发，
-    // agent_runner 唯一真源）：回放由订阅参数表达——带游标增量 / 首连全量兜
-    // chat→SSE 时间差 / 中间连接 live-only（不重放，防重复红线）。
-    // span 覆盖订阅任务整个生命周期（订阅 = 长等待，火焰图墙钟大头）。
-    let sse_span = tracing::info_span!(
-        "sse_subscribe",
-        session_id = %session_id,
-        addr = %grpc_addr
-    );
-    // panic 兜底备件：原体 move 走 tx/registry，panic 路径需要独立的
-    // 下发通道与资格归还句柄（Arc clone，廉价）
-    let panic_tx = tx.clone();
-    let panic_sid = session_id.clone();
-    let panic_registry = Arc::clone(&registry);
-    // 观测接入（dial9）：SSE 转发任务经 rcoder-obs 门面 spawn（feature 关=直通
-    // tokio::spawn）；span 覆盖订阅任务整个生命周期（订阅 = 长等待，火焰图墙钟大头）。
-    rcoder_obs::spawn(
-        async move {
-            // panic 兜底：转发 task panic 时 JoinHandle 已被丢弃（无人观察），
-            // tx drop → SSE 流无终态直接结束，EventSource 自动重连掩盖问题。
-            // 包 catch_unwind：合成错误终态下发 + 结构化日志留痕 + 资格归还。
-            let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                async move {
-                    let _subscription = SubscriptionGuard::new();
-                    let is_first_client = registry.claim_first_client(&session_id);
-        let mut client_last_seq = last_seq;
-        let initial_from = if last_seq > 0 {
-            last_seq
-        } else if is_first_client {
-            0
-        } else {
-            u64::MAX
-        };
-        info!(
-            "🔗 [gRPC_SSE] client stream started: session_id={}, last_seq={}, first_client={}, from_seq={}",
-            session_id, client_last_seq, is_first_client, initial_from
-        );
-
-        // 活跃登记：容器销毁路径（reaper/destroyer）按 addr/session 取消本 task
-        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
-        registry.register_stream(&grpc_addr, &session_id, &cancel);
-
-        let activity_secs = std::sync::atomic::AtomicI64::new(0);
-        let mut from_seq = initial_from;
-
-        for attempt in 1..=MAX_RETRIES {
-            if cancel.is_cancelled() {
-                info!(
-                    "[gRPC_SSE] cancelled (container shutdown): session_id={}",
-                    session_id
-                );
-                return;
-            }
-            let mut client = match pool.get_client(&grpc_addr).await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(
-                        "[gRPC_SSE] get_client failed (attempt {}/{}): session_id={}, {}",
-                        attempt, MAX_RETRIES, session_id, e
-                    );
-                    pool.remove(&grpc_addr).await;
-                    if attempt < MAX_RETRIES {
-                        continue;
-                    }
-                    let err_ev = make_terminal_error_event(diag_ctx.as_ref(), locale).await;
-                    let _ =
-                        forward_to_client(&tx, &err_ev, &session_id, &mut client_last_seq).await;
-                    registry.release_first_client_claim(&session_id);
+    // Register before spawning, so shutdown also owns a task not yet polled.
+    if let Some(task_guard) = registry.admit_stream(&grpc_addr, &session_id) {
+        let cancel = task_guard.token();
+        let sse_span =
+            tracing::info_span!("sse_subscribe", session_id = %session_id, addr = %grpc_addr);
+        let panic_tx = tx.clone();
+        let panic_sid = session_id.clone();
+        let panic_registry = Arc::clone(&registry);
+        rcoder_obs::spawn(async move {
+            // Guard covers the real task lifetime, including panic finalization.
+            let _task_guard = task_guard;
+            let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async move {
+                let _subscription = SubscriptionGuard::new();
+                // Connecting, subscribing, retry cache eviction and diagnosis
+                // are reads. All respond to shutdown or client disconnect.
+                macro_rules! cancellable_read {
+                    ($future:expr) => {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return,
+                            _ = tx.closed() => return,
+                            result = $future => result,
+                        }
+                    };
+                }
+                if cancel.is_cancelled() || tx.is_closed() {
                     return;
                 }
-            };
-
-            let req = crate::grpc::locale_metadata::new_request_with_locale(
-                shared_types::grpc::ProgressRequest {
-                    session_id: session_id.clone(),
-                    from_seq: Some(from_seq),
-                },
-                locale,
-            );
-            let mut stream = match client.subscribe_progress(req).await {
-                Ok(resp) => resp.into_inner(),
-                Err(e) => {
-                    warn!(
-                        "[gRPC_SSE] subscribe failed (attempt {}/{}): session_id={}, {}",
-                        attempt, MAX_RETRIES, session_id, e
+                let is_first_client = registry.claim_first_client(&session_id);
+                let mut client_last_seq = last_seq;
+                let initial_from = if last_seq > 0 { last_seq } else if is_first_client { 0 } else { u64::MAX };
+                info!(%session_id, client_last_seq, is_first_client, initial_from, "gRPC SSE client stream started");
+                let activity_secs = std::sync::atomic::AtomicI64::new(0);
+                let mut from_seq = initial_from;
+                // This identity belongs to the event observed on this stream;
+                // cancellation ends it, and no unrelated latest chat is queried.
+                let mut active_request_id = None;
+                let mut captured_failure: Option<CapturedFailure> = None;
+                for attempt in 1..=MAX_RETRIES {
+                    let mut client = match cancellable_read!(pool.get_client(&grpc_addr)) {
+                        Ok(client) => client,
+                        Err(error) => {
+                            let cause = shared_types::sanitize_error_text(&format!("{error:#}"));
+                            warn!(%session_id, attempt, %cause, "gRPC SSE connect failed");
+                            let captured = captured_failure.get_or_insert_with(|| CapturedFailure {
+                                code: tonic::Code::Unavailable, cause, stage: "grpc_connect",
+                                request_id: active_request_id.clone(),
+                            });
+                            cancellable_read!(pool.remove(&grpc_addr));
+                            if attempt < MAX_RETRIES { continue; }
+                            let event = cancellable_read!(make_terminal_error_event(
+                                diag_ctx.as_ref(), locale, captured.code, &captured.cause,
+                                captured.stage, captured.request_id.clone(),
+                            ));
+                            let _ = forward_to_client(&tx, &event, &session_id, &mut client_last_seq).await;
+                            registry.release_first_client_claim(&session_id);
+                            return;
+                        }
+                    };
+                    let request = crate::grpc::locale_metadata::new_request_with_locale(
+                        shared_types::grpc::ProgressRequest {
+                            session_id: session_id.clone(), from_seq: Some(from_seq),
+                        }, locale,
                     );
-                    if attempt < MAX_RETRIES {
-                        pool.remove(&grpc_addr).await;
-                        continue;
-                    }
-                    let err_ev = make_terminal_error_event(diag_ctx.as_ref(), locale).await;
-                    let _ =
-                        forward_to_client(&tx, &err_ev, &session_id, &mut client_last_seq).await;
-                    registry.release_first_client_claim(&session_id);
-                    return;
-                }
-            };
-            info!(
-                "[gRPC_SSE] SubscribeProgress established: session_id={}, from_seq={}",
-                session_id, from_seq
-            );
-
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        info!("[gRPC_SSE] cancelled (container shutdown): session_id={}", session_id);
-                        return;
-                    }
-                    _ = tx.closed() => {
-                        info!("🔌 [gRPC_SSE] client disconnected: session_id={}", session_id);
-                        return;
-                    }
-                    msg = stream.message() => match msg {
-                        Ok(Some(ev)) => {
-                            maybe_update_activity(
-                                &activity_updater,
-                                &session_id,
-                                &activity_secs,
-                            );
-                            // seq 回退检测（替代旧 GetStatus/epoch 轮询）：agent_runner
-                            // 重启后新 epoch 从 1 重新计数，旧游标会把新事件当重复丢弃——
-                            // 先发 cursor-reset 哨兵并清零本地游标
-                            if ev.seq != 0 && ev.seq <= client_last_seq {
-                                warn!(
-                                    "⚠️ [gRPC_SSE] seq regression (agent restarted?): session_id={}, seq={}, cursor={}, resetting",
-                                    session_id, ev.seq, client_last_seq
-                                );
-                                let reset = make_cursor_reset_event();
-                                if !forward_to_client(&tx, &reset, &session_id, &mut client_last_seq).await {
+                    let mut stream = match cancellable_read!(client.subscribe_progress(request)) {
+                        Ok(response) => response.into_inner(),
+                        Err(error) => {
+                            let cause = shared_types::sanitize_error_text(error.message());
+                            warn!(%session_id, attempt, %cause, "gRPC SSE subscribe failed");
+                            let captured = captured_failure.get_or_insert_with(|| CapturedFailure {
+                                code: error.code(), cause, stage: "grpc_subscribe",
+                                request_id: active_request_id.clone(),
+                            });
+                            if attempt < MAX_RETRIES {
+                                cancellable_read!(pool.remove(&grpc_addr));
+                                continue;
+                            }
+                            let event = cancellable_read!(make_terminal_error_event(
+                                diag_ctx.as_ref(), locale, captured.code, &captured.cause,
+                                captured.stage, captured.request_id.clone(),
+                            ));
+                            let _ = forward_to_client(&tx, &event, &session_id, &mut client_last_seq).await;
+                            registry.release_first_client_claim(&session_id);
+                            return;
+                        }
+                    };
+                    info!(%session_id, from_seq, "gRPC SSE SubscribeProgress established");
+                    captured_failure = None;
+                    loop {
+                        match cancellable_read!(stream.message()) {
+                            Ok(Some(event)) => {
+                                maybe_update_activity(&activity_updater, &session_id, &activity_secs);
+                                if let Some(request_id) = &event.request_id {
+                                    active_request_id = Some(request_id.clone());
+                                }
+                                if event.seq != 0 && event.seq <= client_last_seq {
+                                    warn!(%session_id, seq = event.seq, cursor = client_last_seq, "gRPC SSE sequence regressed; resetting cursor");
+                                    let reset = make_cursor_reset_event();
+                                    if !forward_to_client(&tx, &reset, &session_id, &mut client_last_seq).await { return; }
+                                }
+                                let keep_open = forward_to_client(&tx, &event, &session_id, &mut client_last_seq).await;
+                                if event.message_type == "SessionPromptEnd" && event.sub_type == "cancelled" {
+                                    active_request_id = None;
+                                }
+                                if !keep_open {
+                                    if is_turn_terminal(&event.message_type, &event.sub_type) {
+                                        registry.release_first_client_claim(&session_id);
+                                    }
                                     return;
                                 }
                             }
-                            if !forward_to_client(&tx, &ev, &session_id, &mut client_last_seq).await {
-                                // turn 终态（end_turn/error）→ 归还首连资格（新一轮 turn
-                                // 的首连重新可兜时间差）；客户端断开 → 直接退出
-                                if is_turn_terminal(
-                                    &ev.message_type, &ev.sub_type,
-                                ) {
-                                    registry.release_first_client_claim(&session_id);
+                            Ok(None) => {
+                                let mut event = make_prompt_end_event();
+                                event.request_id = active_request_id.clone();
+                                let _ = forward_to_client(&tx, &event, &session_id, &mut client_last_seq).await;
+                                registry.release_first_client_claim(&session_id);
+                                return;
+                            }
+                            Err(error) => {
+                                let cause = shared_types::sanitize_error_text(error.message());
+                                warn!(%session_id, code = %error.code(), %cause, "gRPC SSE stream failed");
+                                let captured = captured_failure.get_or_insert_with(|| CapturedFailure {
+                                    code: error.code(), cause, stage: "grpc_stream",
+                                    request_id: active_request_id.clone(),
+                                });
+                                if attempt < MAX_RETRIES {
+                                    cancellable_read!(pool.remove(&grpc_addr));
+                                    from_seq = client_last_seq;
+                                    break;
                                 }
+                                let event = super::session_stream_registry::make_stream_error_event_with_identity(
+                                    captured.code, &captured.cause, locale, captured.stage, captured.request_id.clone(),
+                                );
+                                let _ = forward_to_client(&tx, &event, &session_id, &mut client_last_seq).await;
+                                registry.release_first_client_claim(&session_id);
                                 return;
                             }
                         }
-                        Ok(None) => {
-                            // agent_runner 正常关流但未推终端（防御）：补终态避免客户端 hang
-                            let ev = make_prompt_end_event();
-                            let _ = forward_to_client(&tx, &ev, &session_id, &mut client_last_seq).await;
-                            registry.release_first_client_claim(&session_id);
-                            return;
-                        }
-                        Err(e) => {
-                            warn!(
-                                "[gRPC_SSE] stream error: session_id={}, code={}, msg={}",
-                                session_id, e.code(), e.message()
-                            );
-                            if attempt < MAX_RETRIES {
-                                pool.remove(&grpc_addr).await;
-                                from_seq = client_last_seq; // 增量重订
-                                break; // 内层退出，外层重试
-                            }
-                            let err_ev = make_stream_error_event(
-                                e.code(), e.message(),
-                            );
-                            let _ = forward_to_client(&tx, &err_ev, &session_id, &mut client_last_seq).await;
-                            registry.release_first_client_claim(&session_id);
-                            return;
-                        }
                     }
                 }
-            }
-            }
-            }
-            ))
-            .await;
+            })).await;
             if outcome.is_err() {
-                error!(
-                    "💥 [gRPC_SSE] forward task panicked: session_id={} (synthesizing terminal error)",
-                    panic_sid
-                );
-                let err_ev =
-                    make_stream_error_event(tonic::Code::Internal, "forward task panicked");
-                let sse_event = progress_event_to_sse(&err_ev, &panic_sid);
-                drop(panic_tx.try_send(Ok(sse_event)));
+                error!(%panic_sid, "gRPC SSE forwarding task panicked");
+                let event = make_stream_error_event(tonic::Code::Internal, "forward task panicked");
+                drop(panic_tx.try_send(Ok(progress_event_to_sse(&event, &panic_sid))));
                 panic_registry.release_first_client_claim(&panic_sid);
             }
-        }
-        .instrument(sse_span),
-    );
+        }.instrument(sse_span));
+    }
 
     // wrapper Receiver 非 tokio 原生类型，ReceiverStream 不再适用；poll_fn 薄适配
     // 逐次委托 poll_recv：队满背压、关闭（None 终态）、游标与 panic 语义与
@@ -311,8 +281,23 @@ fn progress_event_to_sse(
     session_id: &str,
 ) -> axum::response::sse::Event {
     // 解析 payload 为 data 字段
-    let data: serde_json::Value =
+    let mut data: serde_json::Value =
         serde_json::from_str(&event.payload).unwrap_or(serde_json::Value::Null);
+    // The proto identity is captured from the original event. Keep the existing
+    // data.request_id wire contract without fabricating a session/task identity.
+    if let Some(request_id) = &event.request_id
+        && let Some(object) = data.as_object_mut()
+    {
+        object.insert(
+            "request_id".into(),
+            serde_json::Value::String(request_id.clone()),
+        );
+    }
+    if is_turn_terminal(&event.message_type, &event.sub_type) && event.sub_type == "error" {
+        // Error fields may originate in ACP or gRPC. Do not alter normal agent
+        // output, but scrub diagnostic strings before emitting them publicly.
+        sanitize_diagnostic_fields(&mut data);
+    }
 
     // 将 gRPC 时间戳（毫秒）转换为 DateTime<Utc>
     let timestamp = match DateTime::<Utc>::from_timestamp_millis(event.timestamp) {
@@ -347,10 +332,11 @@ fn progress_event_to_sse(
                 session_id, event.message_type, e
             );
             // 返回包含 session_id 的最小可用结构
-            format!(
-                r#"{{"session_id":"{}","message_type":"Unknown","sub_type":"{}","data":null}}"#,
-                session_id, event.sub_type
-            )
+            serde_json::json!({
+                "sessionId": session_id, "messageType": "agentSessionUpdate",
+                "subType": event.sub_type, "data": null,
+            })
+            .to_string()
         }
     };
 
@@ -365,6 +351,23 @@ fn progress_event_to_sse(
         sse_event.id(event.seq.to_string())
     } else {
         sse_event
+    }
+}
+
+fn sanitize_diagnostic_fields(data: &mut serde_json::Value) {
+    if let serde_json::Value::Object(fields) = data {
+        for (key, value) in fields {
+            if matches!(
+                key.as_str(),
+                "message" | "error_message" | "detail" | "hint" | "observed_container_state"
+            ) {
+                if let Some(text) = value.as_str() {
+                    *value = serde_json::Value::String(shared_types::sanitize_error_text(text));
+                }
+            } else if key == "error_detail" {
+                sanitize_diagnostic_fields(value);
+            }
+        }
     }
 }
 
@@ -422,6 +425,69 @@ pub async fn get_container_grpc_addr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sse_shutdown_registers_subscription_before_spawn_is_polled() {
+        let registry = Arc::new(crate::grpc::SessionStreamRegistry::new());
+        let stream = create_grpc_sse_stream(
+            registry.clone(),
+            "127.0.0.1:1".into(),
+            "session-original".into(),
+            Arc::new(crate::grpc::GrpcChannelPool::new()),
+            "en-US",
+            Arc::new(|_| {}),
+            None,
+            0,
+        )
+        .await;
+        // No scheduler yield occurred: shutdown must already see the accepted
+        // task rather than rely on its first poll to register ownership.
+        assert_eq!(
+            registry.len(),
+            1,
+            "accepted SSE was invisible before spawn polling"
+        );
+        assert!(registry.shutdown_session("session-original"));
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn sse_shutdown_cancels_pending_grpc_initialization() {
+        use futures_util::StreamExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let registry = Arc::new(crate::grpc::SessionStreamRegistry::new());
+        let stream = create_grpc_sse_stream(
+            registry.clone(),
+            addr,
+            "session-original".into(),
+            Arc::new(crate::grpc::GrpcChannelPool::new()),
+            "en-US",
+            Arc::new(|_| {}),
+            None,
+            0,
+        )
+        .await;
+        // Controlled transport holds the connection without responding to H2
+        // or SubscribeProgress. Cancellation must interrupt initialization.
+        let (_held_connection, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(registry.shutdown_session("session-original"));
+        tokio::pin!(stream);
+        let ended =
+            tokio::time::timeout(std::time::Duration::from_millis(500), stream.next()).await;
+        assert!(
+            ended.is_ok(),
+            "SSE initialization ignored shutdown cancellation"
+        );
+        assert!(
+            ended.unwrap().is_none(),
+            "shutdown must close the response stream"
+        );
+    }
 
     fn make_event(message_type: &str, seq: u64) -> shared_types::grpc::ProgressEvent {
         make_prompt_end(message_type, "test", seq)
@@ -594,3 +660,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "sse_stream/protocol_tests.rs"]
+mod protocol_tests;

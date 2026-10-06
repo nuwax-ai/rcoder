@@ -788,3 +788,40 @@ fn deploy_preserves_internal_dependency_symlink() {
         "module.exports = 42"
     );
 }
+
+#[test]
+fn advisory_pending_and_corrupt_migrations_allow_previous_generation_restore() {
+    for bytes in [
+        br#"{"identity":"legacy","completed":false}"#.as_slice(),
+        b"corrupt-receipt".as_slice(),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("code");
+        let previous = root.path().join(PREVIOUS_DIR);
+        std::fs::create_dir(&previous).unwrap();
+        std::fs::write(previous.join("release.lock.toml"), MINIMAL_LOCK).unwrap();
+        std::fs::write(previous.join("application"), "confirmed previous artifact").unwrap();
+        let receipts = root.path().join("migration-receipts");
+        std::fs::create_dir(&receipts).unwrap();
+        let receipt = receipts.join("legacy.json");
+        std::fs::write(&receipt, bytes).unwrap();
+        restore_previous_generation(&workspace, "test-release-0001")
+            .expect("application migration history must not prevent directory recovery");
+        assert!(!previous.exists());
+        assert_eq!(
+            crate::manifest::read_release_lock(&workspace)
+                .unwrap()
+                .release_id,
+            "test-release-0001"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("application")).unwrap(),
+            "confirmed previous artifact"
+        );
+        assert_eq!(std::fs::read(&receipt).unwrap(), bytes);
+        assert!(
+            restore_previous_generation(&workspace, "test-release-0001").is_err(),
+            "existing destination cannot be replaced"
+        );
+    }
+}

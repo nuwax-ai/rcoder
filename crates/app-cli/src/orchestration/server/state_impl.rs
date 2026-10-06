@@ -137,6 +137,7 @@ impl ServerState {
         held != 0 && held & !(CREDENTIALS_HOLD | SOURCE_HISTORY_HOLD) == 0
     }
 
+    #[cfg(test)]
     pub(super) fn begin_credentials_hold(&self) {
         self.runtime_recovery_hold
             .fetch_or(CREDENTIALS_HOLD, std::sync::atomic::Ordering::AcqRel);
@@ -269,11 +270,11 @@ impl ServerState {
             boundary,
             generation_matches: receipt
                 .map(|receipt| receipt.generation == self.generation_value()),
-            credentials_required: receipt
-                .and_then(|receipt| receipt.active.as_ref())
-                .and_then(|active| active.request.as_ref())
-                .and_then(|request| request.run_pg.as_ref())
-                .is_some_and(|pg| pg.password.is_empty()),
+            credentials_required: self
+                .runtime_recovery_hold
+                .load(std::sync::atomic::Ordering::Acquire)
+                & CREDENTIALS_HOLD
+                != 0,
             migrations,
         })
     }
@@ -286,6 +287,11 @@ impl ServerState {
 
     pub(crate) fn runtime_kernel(&self) -> Option<Arc<crate::runtime_kernel::RuntimeKernel>> {
         self.runtime_kernel.get().cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pending_deploy_count(&self) -> usize {
+        self.deploy_rx.lock().await.len()
     }
 
     /// 注入运行操作内核（serve 在 ownership 认领后调用；幂等拒绝二次注入）。
@@ -950,11 +956,16 @@ impl ServerState {
             .map_err(|_| "deployment admission lock poisoned")?;
         let fingerprint = deploy_replay::fingerprint(&req)?;
         let (old_receipt, mut history) = self.deployment_replay_snapshot()?;
-        // Preserve old non-HTTP receipts too. Redacted credentials cannot be
-        // used to reconstruct an input hash; only that old ID needs inspection.
+        // Preserve old non-HTTP receipts too. Only historically redacted
+        // credentials cannot reconstruct the original input hash.
         if let Some(receipt) = old_receipt.as_ref() {
             if !history.contains_key(&receipt.operation.operation_id) {
-                let fingerprint = if receipt.request.run_pg.is_none() {
+                let fingerprint = if !receipt
+                    .request
+                    .run_pg
+                    .as_ref()
+                    .is_some_and(|pg| pg.password.is_empty())
+                {
                     Some(deploy_replay::fingerprint(&receipt.request)?)
                 } else {
                     None

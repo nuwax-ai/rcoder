@@ -80,6 +80,8 @@ jobs:
 
   build:
     needs: meta
+    env:
+      RUSTUP_TOOLCHAIN: stable
     strategy:
       fail-fast: false
       matrix:
@@ -95,13 +97,14 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      # 读 rust-toolchain.toml 安装工具链，并加 matrix 目标（app-cli 虽被 workspace
-      # exclude，子目录构建时 rustup 仍会沿目录树命中仓库 toolchain 文件）。
-      - name: Install Rust toolchain + target
+      # 显式选择并更新 stable；不依赖 runner 默认值或不存在的 toolchain 文件。
+      - name: Update and record Rust stable + target
         shell: bash
         run: |
-          rustup show
+          rustup update stable
           rustup target add ${{ matrix.target }}
+          rustc --version
+          cargo --version
 
       # protoc：pingap-config → etcd-client → tonic-prost → prost-build 构建期调用；
       # aws-lc-sys 需要 cmake（macos 镜像自带；ubuntu/windows 加装）+ nasm（windows，
@@ -186,6 +189,8 @@ jobs:
   # web UI 为占位页（app-cli 只消费 admin JSON API，不受影响）。
   build-pingap-windows:
     needs: meta
+    env:
+      RUSTUP_TOOLCHAIN: stable
     runs-on: windows-latest
     timeout-minutes: 75
     steps:
@@ -221,9 +226,13 @@ jobs:
           choco install protoc -y --no-progress
           echo 'C:\ProgramData\chocolatey\bin' >> "$GITHUB_PATH"
 
-      - name: Show Rust toolchain
+      # job 环境使上游 checkout 的 toolchain 配置不能覆盖本轮 stable。
+      - name: Update and record Rust stable
         shell: bash
-        run: rustup show
+        run: |
+          rustup update stable
+          rustc --version
+          cargo --version
 
       # 不加 full：官方 full 只多 tracing/imageoptim，app-cli 生成的配置用不到，
       # 省约一半编译时间。上游 profile lto=true + codegen-units=1，构建慢属预期。
@@ -253,6 +262,8 @@ jobs:
   # tls-rustls feature，版本断言。产物并入对应平台子包。
   build-pingap-unix:
     needs: meta
+    env:
+      RUSTUP_TOOLCHAIN: stable
     strategy:
       fail-fast: false
       matrix:
@@ -293,9 +304,13 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
-      - name: Show Rust toolchain
+      # job 环境使上游 checkout 的 toolchain 配置不能覆盖本轮 stable。
+      - name: Update and record Rust stable
         shell: bash
-        run: rustup show
+        run: |
+          rustup update stable
+          rustc --version
+          cargo --version
 
       # 随包 Pingap 与 app-cli 保持同一 Linux glibc 基线，不能由 Ubuntu
       # 原生链接器把 libc 2.38/2.39 的强符号带进 Debian 12 用户的包。

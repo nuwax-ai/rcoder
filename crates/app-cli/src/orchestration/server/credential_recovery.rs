@@ -111,6 +111,24 @@ pub(super) fn redacted_run_credentials(receipt: &Receipt) -> bool {
         .is_some_and(|pg| pg.password.is_empty())
 }
 
+/// Historical empty passwords are evidence of the former serializer, not a
+/// recoverable credential. Never inject that empty value or invent a password.
+pub(super) fn restored_run_pg(
+    stored: Option<&shared_types::StartPgCredential>,
+) -> Result<Option<shared_types::StartPgCredential>> {
+    let explicit = match stored {
+        Some(pg) if pg.password.is_empty() => {
+            tracing::warn!(
+                username = %pg.username,
+                "historical PostgreSQL input was redacted; restoring only current environment credentials or application configuration"
+            );
+            None
+        }
+        pg => pg,
+    };
+    shared_types::resolve_source_run_pg(explicit).map_err(Into::into)
+}
+
 impl CredentialRecovery {
     pub(crate) const fn supplies_credentials(self) -> bool {
         match self {
@@ -128,6 +146,11 @@ impl ServerState {
         pg: Option<&shared_types::StartPgCredential>,
         purpose: CredentialRecoveryPurpose,
     ) -> Result<CredentialRecovery> {
+        // New explicit input is always validated, even without any recovery
+        // hold. An empty new password must not be mistaken for legacy redaction.
+        if let Some(pg) = pg {
+            shared_types::resolve_source_run_pg(Some(pg))?;
+        }
         let hold = self
             .runtime_recovery_hold
             .load(std::sync::atomic::Ordering::Acquire);
@@ -154,11 +177,9 @@ impl ServerState {
                     .execution_project
                     .get()
                     .ok_or(RecoveryPrerequisite::SourceWorkspaceUnbound)?;
-                let workspace =
-                    resolved_execution_workspace(project, Some(ExecutionTarget::Source), self)?;
-                // begin() rechecks pending SQL under the migration lease before
-                // execution. This eligibility check never marks old SQL complete.
-                crate::migration_journal::require_confirmed_migrations(&workspace)?;
+                // Validate the source binding independently of diagnostic
+                // application migration history.
+                resolved_execution_workspace(project, Some(ExecutionTarget::Source), self)?;
                 Ok(CredentialRecovery::SupplyCurrentInput { hold })
             }
             CredentialRecoveryPurpose::RestoreConfirmedArtifact => {
@@ -216,7 +237,6 @@ impl ServerState {
                     .clone()
             }
         };
-        crate::migration_journal::require_confirmed_migrations(&workspace)?;
         let release = crate::manifest::read_release_lock(&workspace)?;
         anyhow::ensure!(
             release.release_id == active.artifact_release_id,

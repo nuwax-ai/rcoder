@@ -9,6 +9,8 @@ import time
 import uuid
 from pathlib import Path
 
+from isolated_docker import require_local_docker_endpoint
+
 
 def source_snapshot(repo):
     def git(*argv):
@@ -58,20 +60,25 @@ def main():
         return 0
     if not all([args.app_cli, args.file_server_proxy, args.report, args.build_source]):
         parser.error('--app-cli, --file-server-proxy, --report and --build-source are required for verification')
+    try:
+        docker_endpoint = require_local_docker_endpoint()
+    except RuntimeError as error:
+        parser.error(str(error))
     app = 'core' + uuid.uuid4().hex[:10]
     name = 'rcoder-root-logs-' + app
     volume = name + '-workspace'
     workspace = '/home/user/' + app
     state_root = workspace + '/state/' + app
     cid = None
-    report = {'app_id': app, 'volume': volume, 'checks': [], 'tasks': []}
+    report = {'app_id': app, 'volume': volume, 'checks': [], 'tasks': [],
+              'docker_endpoint': docker_endpoint}
 
     def run(argv, check=True, timeout=180):
         return subprocess.run(argv, capture_output=True, text=True,
                               check=check, timeout=timeout)
 
     def docker(*argv, check=True, timeout=180):
-        return run(['docker', *argv], check=check, timeout=timeout)
+        return run(['docker', '--host', docker_endpoint, *argv], check=check, timeout=timeout)
 
     def execute(command, *argv, check=True, timeout=60):
         return docker('exec', cid, 'sh', '-ec', command, '--', *argv,
@@ -449,7 +456,15 @@ strip_prefix=false
             report['failure_logs'] = docker('exec', cid, 'python3', '-c', code, check=False).stdout
     finally:
         if cid:
-            docker('rm', '-f', cid, check=False)
+            try:
+                cleanup = docker('rm', '-f', cid, check=False)
+                report['cleanup_ok'] = cleanup.returncode == 0
+                if not report['cleanup_ok']:
+                    report['cleanup_error'] = f'Owned container removal failed: exit {cleanup.returncode}'
+            except (Exception, KeyboardInterrupt) as error:
+                report['cleanup_ok'] = False
+                report['cleanup_error'] = f'Owned container removal unconfirmed: {type(error).__name__}'
+            report['success'] = report.get('success', False) and report['cleanup_ok']
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
         print('REPORT:', args.report, flush=True)

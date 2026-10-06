@@ -4,7 +4,9 @@
 
 owner 丢失的容器内专项回归使用 `owner_recovery.py`，入口与验收边界见 [开发环境 owner 恢复](../../docs/userapp-dev-owner-recovery.md)。它不替代下列完整 Compose/K8s 套件。
 
-Source 凭据恢复专项使用 `make test-e2e-source-credential-recovery`，先串行构建当前 Linux app-cli/file-server-proxy 并绑定源码、二进制 SHA256，再验证真实 PostgreSQL 凭据、脱敏回执、同卷容器替换、新 Source 版本、失败日志、Stop/Start 和迁移去重。它只清理自己创建的容器、保留工作卷；缺工具、源码漂移、业务失败或缺断言均为失败。报告默认为 `tests-e2e/reports/source-credential-recovery-*.json`，不代表 RCoder/Java 或远端 K8s 验收。
+Source 凭据恢复专项使用 `make test-e2e-source-credential-recovery`，先串行构建当前 Linux app-cli/file-server-proxy 并绑定源码、二进制 SHA256，再验证内部真实 PostgreSQL 输入的 0600 持久化、对外 HTTP/SSE 裁剪、同卷新 owner 无继承 PG 环境时的真实 TCP 登录与自动业务恢复、旧脱敏记录无永久 hold、新 Source 版本、错误当前凭据失败日志、Stop/Start 和迁移去重。密码只在私有容器内比较，公开报告保存身份、权限和布尔结果；只清理自己创建的容器、保留工作卷。缺工具、源码漂移、业务失败或缺断言均为失败。报告默认为 `tests-e2e/reports/source-credential-recovery-*.json`，不代表 RCoder/Java 或远端 K8s 验收。
+
+`make test-e2e-app-cli-recovery` 的 H 段按应用迁移告警策略 v2 验证：当前真实 identity 的 false/corrupt 回执允许新请求实际执行，旧无关字节保留；真实 migrate exit 1 的完整输出进入原任务 SSE，原操作成功且业务 HTTP 可用，迁移回执仍 false；原生 Stop 继续核对原请求、物理清理和锁；修正脚本后由真实执行确认并恢复去重。此段不手工翻 true，不改变平台 DBAdmin 未知结果保护，也不代替独立的真实 300 秒迁移超时验收。历史报告仍记录其原版本语义。
 
 ## UserApp 核心场景聚焦回归
 

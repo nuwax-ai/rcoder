@@ -1,7 +1,165 @@
 //! OpenAPI 聚合文档守卫测试（从 router_docs.rs 内联模块拆出）。
 
+#[test]
+fn workspace_runtime_diagnostic_schema_survives_formal_document_merges() {
+    for (label, document) in [
+        ("primary", primary_document()),
+        ("file-server", file_server_document()),
+    ] {
+        let value = serde_json::to_value(document).expect("formal merged OpenAPI");
+        let schemas = &value["components"]["schemas"];
+        let diagnostic = &schemas["ErrorDetail"]["properties"];
+        for field in ["reason_code", "stage", "detail", "hint", "retryable"] {
+            assert!(
+                !diagnostic[field].is_null(),
+                "{label}: shared diagnostic {field}"
+            );
+        }
+        assert!(
+            diagnostic["requestId"].is_null(),
+            "file body must not replace shared ErrorDetail"
+        );
+        if label == "primary" {
+            // 主文档只选择性合入 UserApp 域，普通 project 文件错误包装不在此。
+            // 检查真实 HttpResult 的共享诊断引用仍指向上面验证的 schema。
+            let envelopes = schemas
+                .as_object()
+                .expect("primary schemas")
+                .iter()
+                .filter(|(name, _)| name.starts_with("HttpResult"))
+                .collect::<Vec<_>>();
+            assert!(
+                !envelopes.is_empty(),
+                "primary must document actual HttpResult envelopes"
+            );
+            for (name, envelope) in envelopes {
+                let detail =
+                    serde_json::to_string(&envelope["properties"]["error_detail"]).unwrap();
+                assert!(
+                    detail.contains("#/components/schemas/ErrorDetail"),
+                    "primary {name}: shared diagnostic reference {detail}"
+                );
+            }
+            continue;
+        }
+        let file_error = &schemas["FileServerErrorBody"]["properties"];
+        for field in ["type", "message", "timestamp", "requestId"] {
+            assert!(
+                !file_error[field].is_null(),
+                "{label}: file wrapper {field}; actual_schema={}; schema_keys={:?}",
+                schemas["FileServerErrorBody"],
+                schemas
+                    .as_object()
+                    .expect("component schemas")
+                    .keys()
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(file_error["reason_code"].is_null());
+        let envelope = &schemas["ErrorResponse"]["properties"];
+        assert_eq!(
+            envelope["error"]["$ref"],
+            "#/components/schemas/FileServerErrorBody"
+        );
+        let detail = serde_json::to_string(&envelope["error_detail"]).unwrap();
+        assert!(
+            detail.contains("#/components/schemas/ErrorDetail"),
+            "{label}: {detail}"
+        );
+        for field in ["operation_id", "blocker", "tid"] {
+            assert!(!envelope[field].is_null(), "{label}: missing {field}");
+        }
+        let responses = &value["paths"]["/api/project/create-project"]["post"]["responses"];
+        for status in ["409", "500", "503", "504"] {
+            assert!(
+                !responses[status].is_null(),
+                "create-project must document {status}"
+            );
+        }
+    }
+}
+
 use super::*;
 use axum::Router;
+
+#[test]
+fn operation_in_progress_data_is_registered_in_actual_http_result_schema() {
+    let value = serde_json::to_value(primary_document()).unwrap();
+    let schemas = &value["components"]["schemas"];
+    let properties = &schemas["OperationInProgressData"]["properties"];
+    for field in [
+        "holder_operation_id",
+        "holder_kind",
+        "holder_traffic_wake",
+        "holder_state",
+        "holder_step",
+        "retryable",
+        "retry_after_seconds",
+    ] {
+        assert!(
+            !properties[field].is_null(),
+            "missing typed conflict field: {field}"
+        );
+    }
+    let restart = &value["paths"]["/api/v1/userapp/{app_id}/restart"]["post"]["responses"]["200"];
+    let reference = restart["content"]["application/json"]["schema"]["$ref"]
+        .as_str()
+        .expect("restart uses actual HttpResult schema");
+    let name = reference.strip_prefix("#/components/schemas/").unwrap();
+    let data = &schemas[name]["properties"]["data"];
+    let body = serde_json::to_string(data).unwrap();
+    if body.contains("OperationInProgressData") {
+        return;
+    }
+    // Generic alternatives are registered as a named ApiBody component.
+    let alternatives = schemas
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(name, _)| name.starts_with("ApiBody"))
+        .filter(|(name, _)| body.contains(name.as_str()))
+        .map(|(_, schema)| serde_json::to_string(schema).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        alternatives
+            .iter()
+            .any(|schema| schema.contains("OperationInProgressData") && schema.contains("anyOf")),
+        "actual restart data must expose business/conflict alternatives: {body}; {alternatives:?}"
+    );
+}
+
+#[test]
+fn opaque_http_result_data_schema_keeps_nonexclusive_holder_alternatives() {
+    let value = serde_json::to_value(primary_document()).unwrap();
+    let schemas = value["components"]["schemas"].as_object().unwrap();
+    let opaque = schemas
+        .get("ApiBody_Value")
+        .expect("actual Value envelopes register their generic data schema");
+    assert!(opaque.get("oneOf").is_none());
+    let alternatives = opaque["anyOf"]
+        .as_array()
+        .expect("opaque business data overlaps holder objects");
+    assert_eq!(alternatives.len(), 2);
+    assert!(
+        alternatives
+            .iter()
+            .any(|schema| schema["$ref"] == "#/components/schemas/OperationInProgressData")
+    );
+    let opaque_envelopes = schemas
+        .iter()
+        .filter(|(name, schema)| {
+            name.starts_with("HttpResult")
+                && serde_json::to_string(&schema["properties"]["data"])
+                    .unwrap()
+                    .contains("#/components/schemas/ApiBody_Value")
+        })
+        .count();
+    assert!(
+        opaque_envelopes > 0,
+        "must inspect actual HttpResult<Value> components"
+    );
+    assert!(schemas.contains_key("OperationInProgressData"));
+}
 
 #[test]
 fn computer_progress_and_vnc_documents_match_their_service_routes() {

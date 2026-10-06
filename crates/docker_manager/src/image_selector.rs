@@ -161,11 +161,21 @@ impl ImageSelector {
     async fn select_service_image(
         &self,
         service_type: &ServiceType,
-        _project_overrides: Option<&ProjectImageOverrides>,
+        project_overrides: Option<&ProjectImageOverrides>,
     ) -> DockerResult<String> {
+        // 平台禁用已在 select_image 核验；项目覆盖只选择镜像，不能启用服务。
+        if let Some(overrides) = project_overrides {
+            overrides
+                .validate()
+                .map_err(|error| DockerError::ConfigurationError(error.to_string()))?;
+            if let Some(image) = overrides.images.get(&service_type.to_string()) {
+                return Ok(image.clone());
+            }
+        }
+
         // 1. 优先使用服务特定配置（支持老配置兼容）
         if let Some(service_config) = self.find_service_config(service_type) {
-            // 服务级通用镜像（最高优先级）
+            // 服务级通用镜像（未显式覆盖时优先）
             if let Some(image) = &service_config.image {
                 debug!(" using image: {}", image);
                 return Ok(image.clone());
@@ -194,5 +204,45 @@ impl ImageSelector {
             "Service type '{}' has no available image config, please check the configuration file",
             service_type
         )))
+    }
+}
+
+#[cfg(test)]
+mod implementation_stage3_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn overrides() -> ProjectImageOverrides {
+        ProjectImageOverrides {
+            images: HashMap::from([("web-agent-runner".into(), "fixture/project:override".into())]),
+            enabled_services: vec!["web-agent-runner".into()],
+            environment: HashMap::new(),
+        }
+    }
+    #[tokio::test]
+    async fn project_image_override_beats_platform_image() {
+        let selector = ImageSelector::new(shared_types::create_default_multi_image_config());
+        let selected = selector
+            .select_image(&ServiceType::WebAgentRunner, Some(&overrides()))
+            .await
+            .expect("select image");
+        assert_eq!(
+            selected, "fixture/project:override",
+            "explicit project image must not be ignored"
+        );
+    }
+    #[tokio::test]
+    async fn project_override_cannot_enable_platform_disabled_service() {
+        let mut config = shared_types::create_default_multi_image_config();
+        config
+            .set_service_enabled(&ServiceType::WebAgentRunner, false)
+            .expect("service config");
+        let selector = ImageSelector::new(config);
+        assert!(
+            selector
+                .select_image(&ServiceType::WebAgentRunner, Some(&overrides()))
+                .await
+                .is_err()
+        );
     }
 }

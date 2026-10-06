@@ -26,7 +26,7 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
             "config file not found, created default config file: {}",
             config_path.display().to_string()
         );
-        let default_config = AppConfig::default();
+        let default_config = default_config_with_deploy_budget()?;
         create_default_config_file()?;
         default_config
     };
@@ -161,7 +161,7 @@ pub fn load_config_for_cli(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
         "{} 不存在, CLI 子命令使用内存默认配置（不写盘）",
         config_file_path().display()
     );
-    let mut config = AppConfig::default();
+    let mut config = default_config_with_deploy_budget()?;
     if let Some(port) = cli_args.port {
         config.port = port;
     }
@@ -176,17 +176,7 @@ fn load_config_from_file() -> anyhow::Result<AppConfig> {
     // 安全修复：移除完整配置内容的 debug 日志，避免泄露 API Key 等敏感信息
     tracing::debug!("config file loaded, size: {} bytes", config_content.len());
 
-    let config: AppConfig = serde_yaml::from_str(&config_content).map_err(|e| {
-        tracing::error!("[CONFIG] Failed to parse config file: {}", e);
-        // 打印配置文件的前 2000 个字符，帮助排查解析错误
-        let preview = if config_content.len() > 2000 {
-            format!("{}...(truncated)", &config_content[..2000])
-        } else {
-            config_content.clone()
-        };
-        tracing::error!("[CONFIG] Config file content preview:\n{}", preview);
-        anyhow::anyhow!("Failed to parse config file: {}", e)
-    })?;
+    let config = parse_config_with_deploy_budget(&config_content)?;
 
     // 调试：打印解析后的多镜像配置
     if let Some(ref docker_config) = config.docker_config {
@@ -225,6 +215,59 @@ fn load_config_from_file() -> anyhow::Result<AppConfig> {
         }
     }
 
+    Ok(config)
+}
+
+fn default_config_with_deploy_budget() -> anyhow::Result<AppConfig> {
+    let mut config = AppConfig::default();
+    if config.app_manager.enabled {
+        config.app_manager.deploy_budget = app_manager::config::deploy_budget_from_env()?;
+        config.app_manager.restart_admission_wait_secs =
+            app_manager::config::restart_admission_wait_from_env()?;
+    }
+    Ok(config)
+}
+
+/// An explicit YAML budget section owns all budget fields, including its own
+/// defaults. Resolve environment only when that section was not selected.
+fn parse_config_with_deploy_budget(content: &str) -> anyhow::Result<AppConfig> {
+    let parse_error = |error: serde_yaml::Error| {
+        let message =
+            shared_types::sanitize_error_text(&format!("Failed to parse config file: {error}"));
+        // Keep field/line diagnostics; never dump configuration (credentials)
+        // or cut a byte prefix through a Unicode character.
+        tracing::error!(%message, "Configuration parsing failed");
+        anyhow::Error::from(
+            shared_types::AppError::with_message(shared_types::ERR_RUNTIME_CONFIGURATION, &message)
+                .with_error_detail(shared_types::ErrorDetail::new(
+                    shared_types::ERR_RUNTIME_CONFIGURATION,
+                    "configuration_parse",
+                    message,
+                )),
+        )
+    };
+    let mut config: AppConfig = serde_yaml::from_str(content).map_err(parse_error)?;
+    let document: serde_yaml::Value = serde_yaml::from_str(content).map_err(parse_error)?;
+    let explicit_budget = document
+        .get("app_manager")
+        .and_then(|manager| manager.get("deploy_budget"))
+        .is_some();
+    if config.app_manager.enabled && !explicit_budget {
+        config.app_manager.deploy_budget = app_manager::config::deploy_budget_from_env()?;
+    }
+    let explicit_restart_wait = document
+        .get("app_manager")
+        .and_then(|manager| manager.get("restart_admission_wait_secs"))
+        .is_some();
+    if config.app_manager.enabled && !explicit_restart_wait {
+        config.app_manager.restart_admission_wait_secs =
+            app_manager::config::restart_admission_wait_from_env()?;
+    }
+    if config.app_manager.enabled {
+        app_manager::config::validate_restart_admission_wait_secs(
+            config.app_manager.restart_admission_wait_secs,
+        )?;
+    }
     Ok(config)
 }
 
@@ -473,3 +516,7 @@ mod tests {
         fs::remove_dir_all(path.parent().expect("parent")).ok();
     }
 }
+
+#[cfg(test)]
+#[path = "loader/budget_tests.rs"]
+mod budget_tests;

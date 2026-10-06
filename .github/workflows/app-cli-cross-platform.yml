@@ -12,18 +12,28 @@ on:
       - "crates/app-cli/**"
       - "crates/workspace-manifest/**"
       - "crates/process_utils/**"
+      - "crates/runtime-supervisor/**"
+      - "crates/userapp-log-reader/**"
+      - "crates/runtime-state-layout/**"
       - "crates/shared_types/**"
       - "crates/shared_types_grpc/**"
       - "crates/shared_types_i18n/**"
+      - "Cargo.toml"
+      - ".github/actions/install-protoc/**"
       - ".github/workflows/app-cli-cross-platform.yml"
   pull_request:
     paths:
       - "crates/app-cli/**"
       - "crates/workspace-manifest/**"
       - "crates/process_utils/**"
+      - "crates/runtime-supervisor/**"
+      - "crates/userapp-log-reader/**"
+      - "crates/runtime-state-layout/**"
       - "crates/shared_types/**"
       - "crates/shared_types_grpc/**"
       - "crates/shared_types_i18n/**"
+      - "Cargo.toml"
+      - ".github/actions/install-protoc/**"
       - ".github/workflows/app-cli-cross-platform.yml"
   workflow_dispatch:
 
@@ -58,6 +68,15 @@ jobs:
         with:
           workspaces: crates/app-cli
 
+      - name: Install protoc
+        if: runner.os != 'Windows'
+        uses: ./.github/actions/install-protoc
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
       - name: Format check
         run: cargo fmt --manifest-path crates/app-cli/Cargo.toml -- --check
 
@@ -68,4 +87,4 @@ jobs:
         # --all-features 全功能组合；Windows 上 Unix 专属集成测试
         # (bin_startup/serve_restart) 按文件级 #![cfg(unix)] 天然跳过，
         # win_lifecycle.rs 补 Windows 原生生命周期闭环
-        run: cargo test --manifest-path crates/app-cli/Cargo.toml --all-features
+        run: cargo nextest run --manifest-path crates/app-cli/Cargo.toml --no-fail-fast --all-features

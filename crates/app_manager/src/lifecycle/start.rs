@@ -28,7 +28,8 @@ impl AppService {
         app_id: &str,
         request: StartAppRequest,
     ) -> AppResult<StartAppResult> {
-        self.deploy_controlled(app_id, request, true).await
+        crate::service::restart_wait::with_context(self.deploy_controlled(app_id, request, true))
+            .await
     }
     pub(super) async fn validate_hot_env(
         &self,

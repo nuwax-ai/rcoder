@@ -30,6 +30,24 @@ fn main() {
             let gc_port: u16 = args[3].parse().expect("serve <svc_port> <gc_port>");
             serve_with_grandchild(svc_port, gc_port);
         }
+        Some("http") => {
+            let port: u16 = std::env::var("PORT")
+                .expect("runtime PORT")
+                .parse()
+                .expect("PORT number");
+            let marker = args.get(2).expect("http <marker>");
+            let listener = TcpListener::bind(("0.0.0.0", port)).expect("bind real HTTP fixture");
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{marker}",
+                    marker.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        }
         _ => {
             eprintln!(
                 "usage: tree-fixture hold <port> [--ignore-term] | serve <svc_port> <gc_port>"

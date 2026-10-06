@@ -6,7 +6,7 @@
 //! 此前缀转发任务 SSE（`/tasks/{id}/logs/stream`）。
 //!
 //! stdout 无 tracing 噪声（日志只配 stderr + 文件层），EVT 行不混杂；
-//! 生产 supervisord 引擎不输出（无 stdout 消费者，启动判定语义另有约定）。
+//! owner 下两种引擎都经事件桥转发迁移诊断，供原操作重放和任务日志流读取。
 
 /// EVT 行前缀（唯一事实源在 `shared_types::app_cli_evt`, 生产/转发/消费三方共用）。
 pub use shared_types::APP_CLI_EVT_PREFIX as EVT_PREFIX;

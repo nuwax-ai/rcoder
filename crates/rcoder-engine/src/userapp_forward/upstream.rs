@@ -223,7 +223,17 @@ async fn resolve_dev_addr_inner(
     let probe_fresh = cache
         .view(&probe_key, |_, t| t.elapsed() < PROBE_TTL)
         .unwrap_or(false);
-    if !probe_fresh && !probe_dev_container(&addr).await {
+    let credentials = super::file_credentials::credentials(
+        state,
+        shared_types::UserappStage::Dev,
+        app_id,
+        deadline,
+    )
+    .await
+    .map_err(|failure| {
+        HttpResultError::from_app_error(failure.into_app_error()).into_boxed_response()
+    })?;
+    if !probe_fresh && !probe_dev_container(&addr, &credentials).await {
         warn!(
             "[USERAPP_FORWARD] dev container probe failed (stale registry entry?), verifying container state: app_id={app_id}, addr={addr}"
         );
@@ -337,10 +347,16 @@ pub(crate) fn invalidate_probe_cache(key: &str) {
 }
 
 /// 开发容器 file-server 轻量探活（连接失败/非 2xx 均视为不可用）。
-async fn probe_dev_container(addr: &str) -> bool {
-    crate::http_client::forward_client()
-        .get(format!("{addr}/api/version"))
-        .timeout(std::time::Duration::from_secs(3))
+async fn probe_dev_container(
+    addr: &str,
+    credentials: &shared_types::FileServerRequestCredentials,
+) -> bool {
+    credentials
+        .apply(
+            crate::http_client::forward_client()
+                .get(format!("{addr}/api/version"))
+                .timeout(std::time::Duration::from_secs(3)),
+        )
         .send()
         .await
         .map(|r| r.status().is_success())
@@ -349,12 +365,21 @@ async fn probe_dev_container(addr: &str) -> bool {
 
 // Hotpath 埋点：userapp 反代完整往返（请求头透传 + 上游 send + 响应流组装；feature 关闭时 no-op）
 #[hotpath::measure]
-async fn forward_to_addr(target_label: &str, app_id: &str, addr: &str, req: Request) -> Response {
+async fn forward_to_addr(
+    target_label: &str,
+    app_id: &str,
+    addr: &str,
+    credentials: &shared_types::FileServerRequestCredentials,
+    req: Request,
+) -> Response {
     let target = format!("{addr}{}", req.uri());
 
     let (mut parts, body) = req.into_parts();
     // 旧用户定位 header 在转发边界按名称移除（spec §2.1：不读取值、不因值拒收）
     parts.headers.remove(LEGACY_USER_ID_HEADER);
+    // Control-plane and proxy-hop credentials belong to distinct peers.
+    parts.headers.remove("x-api-key");
+    parts.headers.remove("x-proxy-token");
     let listed = connection_listed_tokens(&parts.headers);
     // 循环外一次构造引用视图（原先每个 header 重建一次 Vec）
     let listed_refs: Vec<&str> = listed.iter().map(String::as_str).collect();
@@ -366,7 +391,7 @@ async fn forward_to_addr(target_label: &str, app_id: &str, addr: &str, req: Requ
         outbound = outbound.header(name, value);
     }
     let reqwest_body = reqwest::Body::wrap_stream(body.into_data_stream());
-    outbound = outbound.body(reqwest_body);
+    outbound = credentials.apply(outbound.body(reqwest_body));
 
     let upstream = match outbound.send().await {
         Ok(resp) => resp,
@@ -397,6 +422,26 @@ async fn forward_to_addr(target_label: &str, app_id: &str, addr: &str, req: Requ
     }
 }
 
+async fn forward_to_configured_addr(
+    state: &AppState,
+    stage: shared_types::UserappStage,
+    target_label: &str,
+    app_id: &str,
+    addr: &str,
+    req: Request,
+    deadline: tokio::time::Instant,
+) -> Response {
+    let credentials = match super::file_credentials::credentials(state, stage, app_id, deadline)
+        .await
+    {
+        Ok(credentials) => credentials,
+        Err(failure) => {
+            return super::error_body::reject(req, failure.into_app_error().into_response()).await;
+        }
+    };
+    forward_to_addr(target_label, app_id, addr, &credentials, req).await
+}
+
 /// 全量透传一个请求到该 app 开发容器的 file-server（同 path+query）。
 pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request) -> Response {
     if !matches!(
@@ -404,7 +449,21 @@ pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request)
         super::semantics::DevAbsentAction::Ensure
     ) {
         return match super::semantics::existing_dev_addr(state, app_id).await {
-            Ok(Some(addr)) => forward_to_addr("dev", app_id, &addr, req).await,
+            Ok(Some(addr)) => {
+                forward_to_configured_addr(
+                    state,
+                    shared_types::UserappStage::Dev,
+                    "dev",
+                    app_id,
+                    &addr,
+                    req,
+                    tokio::time::Instant::now()
+                        + std::time::Duration::from_secs(
+                            state.config.userapp_storage.ensure_timeout_seconds,
+                        ),
+                )
+                .await
+            }
             Ok(None) => {
                 super::error_body::reject(req, super::semantics::unavailable_response(app_id)).await
             }
@@ -417,7 +476,17 @@ pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request)
         Ok(addr) => addr,
         Err(resp) => return super::error_body::reject(req, *resp).await,
     };
-    forward_to_addr("dev", app_id, &addr, req).await
+    forward_to_configured_addr(
+        state,
+        shared_types::UserappStage::Dev,
+        "dev",
+        app_id,
+        &addr,
+        req,
+        tokio::time::Instant::now()
+            + std::time::Duration::from_secs(state.config.userapp_storage.ensure_timeout_seconds),
+    )
+    .await
 }
 
 /// 全量透传一个请求到该 app 生产运行容器的 file-server-proxy（同 path+query）。
@@ -443,7 +512,16 @@ pub(crate) async fn forward_to_prod(state: &AppState, app_id: &str, req: Request
     if let Err(error) = wait_for_prod_service(state, app_id, &addr, deadline).await {
         return super::error_body::reject(req, error.into_response()).await;
     }
-    forward_to_addr("prod runtime", app_id, &addr, req).await
+    forward_to_configured_addr(
+        state,
+        shared_types::UserappStage::Prod,
+        "prod runtime",
+        app_id,
+        &addr,
+        req,
+        deadline,
+    )
+    .await
 }
 
 /// The request body is a single-use stream. Check the real Service path before
@@ -500,10 +578,21 @@ async fn wait_for_prod_service(
                             shared_types::WakeOutcome::Ready
                             | shared_types::WakeOutcome::AlreadyRunning,
                         ) => {}
-                        _ => {
-                            return Err(HttpResultError::service_unavailable(
-                                format!("app {app_id} wake failed; retry later"),
-                                WAKE_503_RETRY_AFTER_SECS,
+                        Ok(
+                            shared_types::WakeOutcome::Failed(failure)
+                            | shared_types::WakeOutcome::Timeout(failure),
+                        ) => {
+                            return Err(HttpResultError::from_app_error(failure.into_app_error()));
+                        }
+                        Ok(shared_types::WakeOutcome::Blocked { message, blocker }) => {
+                            return Err(HttpResultError::from_app_error(
+                                shared_types::AppError::conflict(&message).with_blocker(blocker),
+                            ));
+                        }
+                        Err(_) => {
+                            return Err(HttpResultError::from_app_error(
+                                shared_types::WakeFailure::timeout("wake_wait", None, false)
+                                    .into_app_error(),
                             ));
                         }
                     }
@@ -534,9 +623,7 @@ async fn wait_for_prod_service(
 async fn resolve_prod_addr(state: &AppState, app_id: &str) -> Result<String, Box<Response>> {
     if let Err(e) = state.app_service.get_app(app_id).await {
         info!("[USERAPP_FORWARD] prod forward target check failed: app_id={app_id}: {e}");
-        return Err(Box::new(
-            shared_types::AppError::with_message(e.code(), e.message().to_owned()).into_response(),
-        ));
+        return Err(Box::new(shared_types::AppError::from(e).into_response()));
     }
     // 唤醒（stopped 或 starting 时触发——Running 高频文件操作零开销）。
     // is_stopped 为内存视图，远端状态查询兜底多副本/重启后的漂移。
@@ -544,34 +631,16 @@ async fn resolve_prod_addr(state: &AppState, app_id: &str) -> Result<String, Box
     if state.activity.is_stopped(app_id) || state.activity.remote_wake_pending(app_id).await {
         match state.activity.ensure_running(app_id).await {
             shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning => {}
-            shared_types::WakeOutcome::Timeout => {
-                warn!("[USERAPP_FORWARD] prod wake timeout: app_id={app_id}");
-                return Err(Box::new(
-                    HttpResultError::service_unavailable(
-                        format!("app {app_id} wake timed out; retry later"),
-                        WAKE_503_RETRY_AFTER_SECS,
-                    )
-                    .into_response(),
-                ));
+            shared_types::WakeOutcome::Timeout(failure)
+            | shared_types::WakeOutcome::Failed(failure) => {
+                warn!(%app_id, code = %failure.code, stage = %failure.stage, "Production wake failed");
+                return Err(Box::new(failure.into_app_error().into_response()));
             }
             shared_types::WakeOutcome::Blocked { message, blocker } => {
-                let mut error = shared_types::AppError::with_message(
-                    shared_types::error_codes::ERR_CONFLICT,
-                    message,
-                );
-                if !blocker.operation_id.is_empty() {
-                    error = error.with_operation_id(blocker.operation_id.clone());
-                }
-                return Err(Box::new(error.with_blocker(blocker).into_response()));
-            }
-            shared_types::WakeOutcome::Failed(e) => {
-                warn!("[USERAPP_FORWARD] prod wake failed: app_id={app_id}: {e}");
                 return Err(Box::new(
-                    HttpResultError::service_unavailable(
-                        format!("app {app_id} wake failed: {e}"),
-                        WAKE_503_RETRY_AFTER_SECS,
-                    )
-                    .into_response(),
+                    shared_types::AppError::conflict(&message)
+                        .with_blocker(blocker)
+                        .into_response(),
                 ));
             }
         }
@@ -587,10 +656,14 @@ async fn resolve_prod_addr(state: &AppState, app_id: &str) -> Result<String, Box
             .get_container_info_by_identifier(app_id, &shared_types::ServiceType::Userapp)
             .await
             .map_err(|error| {
-                HttpResultError::bad_gateway(format!(
-                    "Lookup production runtime address failed: {error}"
-                ))
-                .into_boxed_response()
+                Box::new(
+                    container_runtime_api::runtime_app_error(
+                        &error,
+                        "production_address_lookup",
+                        container_runtime_api::RuntimeErrorContext::ReadOnly,
+                    )
+                    .into_response(),
+                )
             })?
             .map(|info| info.container_ip)
             .filter(|ip| !ip.is_empty())
@@ -604,9 +677,17 @@ async fn resolve_prod_addr(state: &AppState, app_id: &str) -> Result<String, Box
             // 走到这里 = get_app 成功但容器定位失败（回收过渡态等）
             warn!("[USERAPP_FORWARD] prod runtime addr unavailable: app_id={app_id}");
             Err(Box::new(
-                HttpResultError::service_unavailable(
-                    format!("Runtime address for app {app_id} unavailable"),
-                    WAKE_503_RETRY_AFTER_SECS,
+                shared_types::AppError::with_message(
+                    shared_types::ERR_CONTAINER_ADDRESS_NOT_READY,
+                    format!("Runtime address for app {app_id} is not ready"),
+                )
+                .with_error_detail(
+                    shared_types::ErrorDetail::new(
+                        shared_types::ERR_CONTAINER_ADDRESS_NOT_READY,
+                        "production_address_lookup",
+                        "Container exists but no routable address is available",
+                    )
+                    .with_retryable(true),
                 )
                 .into_response(),
             ))
@@ -673,3 +754,51 @@ mod waitable_conflict_tests;
 #[cfg(test)]
 #[path = "upstream_diagnostics_tests.rs"]
 mod diagnostics_forward_tests;
+
+#[cfg(test)]
+mod implementation_file_boundary_baseline_tests {
+    use super::*;
+    use axum::{
+        Router,
+        body::Body,
+        http::{HeaderMap, StatusCode},
+        routing::get,
+    };
+    #[tokio::test]
+    async fn file_forward_does_not_leak_rcoder_control_key_to_file_peer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/api/v1/userapp/files",
+            get(|headers: HeaderMap| async move {
+                if headers.contains_key("x-api-key") {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::OK
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let request = Request::builder()
+            .uri("/api/v1/userapp/files")
+            .header("x-api-key", "configured-primary-control-key")
+            .body(Body::empty())
+            .unwrap();
+        let response = forward_to_addr(
+            "file peer",
+            "fixtureapp",
+            &format!("http://{address}"),
+            &shared_types::FileServerRequestCredentials::default(),
+            request,
+        )
+        .await;
+        server.abort();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the file peer must not receive the primary RCoder control key"
+        );
+    }
+}

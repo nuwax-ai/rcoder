@@ -8,6 +8,7 @@ pub async fn start_http_server(
     app: axum::Router,
     port: u16,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    sse_registry: std::sync::Arc<rcoder_engine::grpc::SessionStreamRegistry>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     // bind 地址：默认 0.0.0.0（容器形态）；deploy-host 宿主机形态默认收紧为
     // 127.0.0.1（docker.sock 等价 root 的安全边界），env RCODER_BIND_HOST 可覆盖。
@@ -25,7 +26,12 @@ pub async fn start_http_server(
 
     info!(" config HTTP max_buf_size = 128KB (to prevent HTTP 431 error)");
 
-    Ok(spawn_http_listener(listener, app, shutdown_tx.subscribe()))
+    Ok(spawn_http_listener(
+        listener,
+        app,
+        shutdown_tx.subscribe(),
+        Some(sse_registry),
+    ))
 }
 
 // 观测接入（dial9）：accept 外层任务与每连接任务均经 rcoder-obs 门面 spawn——
@@ -38,6 +44,7 @@ fn spawn_http_listener(
     listener: tokio::net::TcpListener,
     app: axum::Router,
     mut shutdown_rx_clone: tokio::sync::broadcast::Receiver<()>,
+    sse_registry: Option<std::sync::Arc<rcoder_engine::grpc::SessionStreamRegistry>>,
 ) -> tokio::task::JoinHandle<()> {
     let app = app.into_make_service();
     rcoder_obs::spawn(async move {
@@ -47,6 +54,11 @@ fn spawn_http_listener(
             tokio::select! {
                 biased;
                 _ = shutdown_rx_clone.recv() => {
+                    // Long-lived response bodies must be cancelled before
+                    // Hyper graceful drain waits for them to complete.
+                    if let Some(registry) = &sse_registry {
+                        registry.close();
+                    }
                     closing.cancel();
                     info!(" HTTP server closed");
                     break;
@@ -148,6 +160,111 @@ fn is_benign_client_disconnect(err: &(dyn std::error::Error + Send + Sync + 'sta
 mod tests {
     use super::is_benign_client_disconnect;
 
+    /// Real HTTP response + stalled gRPC transport: shutdown must close SSE
+    /// admission before Hyper drains response bodies and wait for task exit.
+    #[tokio::test]
+    async fn sse_shutdown_closes_admission_before_real_http_drain() {
+        use http_body_util::{BodyExt, Empty};
+        use std::{sync::Arc, time::Duration};
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap().to_string();
+        let registry = Arc::new(rcoder_engine::grpc::SessionStreamRegistry::new());
+        let route = axum::Router::new().route(
+            "/events",
+            axum::routing::get({
+                let registry = Arc::clone(&registry);
+                move || {
+                    let registry = Arc::clone(&registry);
+                    let address = upstream_address.clone();
+                    async move {
+                        axum::response::Sse::new(
+                            rcoder_engine::grpc::create_grpc_sse_stream(
+                                registry,
+                                address,
+                                "original-session".into(),
+                                Arc::new(rcoder_engine::grpc::GrpcChannelPool::new()),
+                                "en-US",
+                                Arc::new(|_| {}),
+                                None,
+                                0,
+                            )
+                            .await,
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, rx) = tokio::sync::broadcast::channel(1);
+        let server = super::spawn_http_listener(listener, route, rx, Some(Arc::clone(&registry)));
+        let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(socket))
+                .await
+                .unwrap();
+        let client = tokio::spawn(connection);
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            sender.send_request(
+                hyper::Request::builder()
+                    .uri("/events")
+                    .body(Empty::<bytes::Bytes>::new())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let (_held_grpc, _) = tokio::time::timeout(Duration::from_secs(2), upstream.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(registry.len(), 1);
+        shutdown.send(()).unwrap();
+        // Keep the HTTP client and stalled upstream alive. Their explicit drop
+        // cannot provide the exit evidence this assertion is testing.
+        let body = tokio::time::timeout(Duration::from_secs(2), response.into_body().collect())
+            .await
+            .expect("HTTP SSE response body must close on server shutdown")
+            .unwrap()
+            .to_bytes();
+        assert!(
+            body.is_empty(),
+            "cancellation must not fake a successful business result"
+        );
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("HTTP drain must not wait forever for SSE")
+            .unwrap();
+        registry
+            .drain(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(registry.is_closed());
+        assert!(
+            registry.is_empty(),
+            "actual forwarding task must have exited"
+        );
+        tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            sender
+                .send_request(
+                    hyper::Request::builder()
+                        .uri("/events")
+                        .body(Empty::<bytes::Bytes>::new())
+                        .unwrap()
+                )
+                .await
+                .is_err()
+        );
+    }
+
     /// 128KiB max_buf_size 的头部上下界（HTTP 431 边界）：
     /// - 约 96KiB 合法单 header：请求 200 且 handler 收到完整值；
     /// - 约 160KiB（高于 128KiB、低于 hyper 默认上限）：真实 431 响应、
@@ -182,7 +299,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (shutdown, rx) = tokio::sync::broadcast::channel(1);
-        let server = super::spawn_http_listener(listener, route, rx);
+        let server = super::spawn_http_listener(listener, route, rx, None);
 
         let connect = || async {
             let stream = tokio::net::TcpStream::connect(address).await.unwrap();
@@ -317,7 +434,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (shutdown, rx) = tokio::sync::broadcast::channel(1);
-        let mut server = super::spawn_http_listener(listener, route, rx);
+        let mut server = super::spawn_http_listener(listener, route, rx, None);
         let stream = tokio::net::TcpStream::connect(address).await.unwrap();
         let (mut sender, connection) =
             hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))

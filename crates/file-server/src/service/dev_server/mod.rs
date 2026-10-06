@@ -48,7 +48,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use support::lock;
 
 /// start_dev 的启动参数包（restart_dev_staged 使用；字段与 start_dev 一致）。
@@ -122,25 +122,47 @@ impl DevServerManager {
     where
         F: Future<Output = AppResult<PathBuf>>,
     {
-        if project_id.starts_with("userapp:") {
-            if let Some(started) = self
-                .reuse_or_refuse_owner(
-                    project_id,
-                    stop_workspace,
-                    launch.hooks.clone(),
-                    launch.pg,
-                    launch.artifact_release_id,
-                    launch.request_context,
-                )
-                .await?
-            {
-                return Ok(started);
-            }
-            self.stop_userapp_dev(project_id, stop_workspace).await?;
-        } else {
+        if !project_id.starts_with("userapp:") {
             self.stop_dev(project_id).await?;
+            let run_root = activate.await?;
+            return self.start_dev(project_id, &run_root, launch).await;
+        }
+        let mut launch = launch;
+        let deadline = {
+            let hooks = launch.hooks.get_or_insert_with(DevEventHooks::noop);
+            let deadline = hooks.launch_deadline.unwrap_or_else(|| {
+                tokio::time::Instant::now()
+                    + DevEventHooks::launch_budget(self.config.dev_command_timeout_secs)
+            });
+            hooks.launch_deadline = Some(deadline);
+            deadline
+        };
+        if let Some(started) = self
+            .reuse_or_refuse_owner(
+                project_id,
+                stop_workspace,
+                launch.hooks.clone(),
+                launch.pg,
+                launch.artifact_release_id,
+                launch.request_context,
+            )
+            .await?
+        {
+            return Ok(started);
+        }
+        tokio::time::timeout_at(deadline, self.stop_userapp_dev(project_id, stop_workspace))
+            .await.map_err(|_| AppError::business("restart launch deadline exceeded while observing original cleanup; retain its Stop identity before retrying"))??;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AppError::business(
+                "restart launch deadline expired before local activation or submission",
+            ));
         }
         let run_root = activate.await?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AppError::business(
+                "restart launch deadline expired after local activation; no new execution submitted",
+            ));
+        }
         self.start_dev(project_id, &run_root, launch).await
     }
 

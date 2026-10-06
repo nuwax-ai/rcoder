@@ -1,6 +1,6 @@
 # Uses the bundled BuildKit Dockerfile frontend; no extra frontend image pull.
 # Runtime images contain browsers/language tools; their resolved digests are in the receipt.
-ARG RUST_IMAGE=rust:1.95-trixie
+ARG RUST_IMAGE=rust:trixie
 ARG RCODER_BASE
 ARG COMPUTER_BASE
 ARG RUNTIME_BASE

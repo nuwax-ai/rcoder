@@ -14,6 +14,11 @@ use super::models::*;
 ///   业务元数据由调用方（Java）持久化。
 #[async_trait]
 pub trait AppServiceTrait: Send + Sync {
+    /// Response wait includes pre-admission restart waiting without changing
+    /// the deployment execution deadline itself.
+    fn restart_admission_wait_secs(&self) -> u64 {
+        30
+    }
     async fn verify_recovered_storage(
         &self,
         app_id: &str,
@@ -299,6 +304,17 @@ pub trait AppServiceTrait: Send + Sync {
     /// 只读观察器句柄（宿主注入后的回读；代理失败诊断顾问等消费）。
     fn readiness_reader(&self) -> Option<Arc<dyn shared_types::UserAppReadinessReader>> {
         None
+    }
+
+    /// Existing file-peer credentials; configuration reads never ensure compute.
+    /// Hosts without the optional provider retain the default disabled auth.
+    async fn file_request_credentials(
+        &self,
+        _stage: shared_types::UserappStage,
+        _app_id: &str,
+        _deadline: tokio::time::Instant,
+    ) -> AppResult<shared_types::FileServerRequestCredentials> {
+        Ok(shared_types::FileServerRequestCredentials::default())
     }
 
     /// 日志转发基址：prod=app-cli 管理面；dev=已有容器 file-server。

@@ -28,6 +28,7 @@ pub mod proxy_init;
 pub mod service;
 pub mod shutdown;
 pub mod skill_sync_reconciler;
+pub mod startup_tasks;
 pub mod storage;
 pub mod userapp_builder;
 pub mod userapp_dbx_probe;

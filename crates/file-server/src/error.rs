@@ -5,7 +5,8 @@
 //! { "success": false, "code": "UNKNOWN_ERROR",
 //!   "error": { "type": "<TYPE>", "message": "...", "timestamp": "<CST>", "requestId": "..."[, "details": {}] } }
 //! ```
-//! HTTP 状态码由错误类型决定 (见 `AppError::status_code`)。
+//! HTTP 状态码由错误类型决定 (见 `AppError::status_code`)；运行时诊断使用
+//! shared_types 的真实 code/status，同时保留现有 file 错误包装。
 
 use axum::Json;
 use axum::http::StatusCode;
@@ -39,6 +40,8 @@ pub enum AppError {
     Network(String),
     /// SYSTEM_ERROR (500)
     System(String),
+    /// 共享运行时诊断；保留原因、阶段、重试证据和原操作身份。
+    RuntimeDiagnostic(Box<shared_types::AppError>),
     /// SYSTEM_ERROR (500) — 命令执行失败的结构化形态（UA-06）：`output_tail`
     /// 是机器可读的本次运行输出尾段（原始行, 未拼接展示标记）; 错误分类
     /// （如 pnpm 缺 lockfile 自愈）走字段, 不再解析 Display 文本——另一处
@@ -61,8 +64,8 @@ impl AppError {
     /// 前缀包装并**保留** [`AppError::CommandExecution`] 的结构化输出尾段
     /// （UA-06）：展示层加前缀不得抹掉机器分类字段——此前 `system(format!(
     /// "{prefix}: {e}"))` 会把结构化错误降级回纯文本, 使依赖 Display 文本
-    /// 约定的分类（pnpm 缺 lockfile 自愈）在包装层碎裂。其余变体维持原有
-    /// System 包装语义。
+    /// 约定的分类（pnpm 缺 lockfile 自愈）在包装层碎裂。运行时诊断也保留
+    /// 结构化类型与身份，其余变体维持原有 System 包装语义。
     pub fn prefixed(self, prefix: &str) -> Self {
         match self {
             Self::CommandExecution {
@@ -72,6 +75,23 @@ impl AppError {
                 message: format!("{prefix}: {message}"),
                 output_tail,
             },
+            Self::RuntimeDiagnostic(error) => {
+                let message = shared_types::sanitize_error_text(&format!("{prefix}: {error}"));
+                let error = match *error {
+                    shared_types::AppError::Structured(mut detail) => {
+                        detail.internal_message = Some(message);
+                        if let Some(diagnostic) = &mut detail.error_detail {
+                            diagnostic.detail = shared_types::sanitize_error_text(&format!(
+                                "{prefix}: {}",
+                                diagnostic.detail
+                            ));
+                        }
+                        shared_types::AppError::Structured(detail)
+                    }
+                    _ => shared_types::AppError::generic(message),
+                };
+                Self::RuntimeDiagnostic(Box::new(error))
+            }
             other => Self::system(format!("{prefix}: {other}")),
         }
     }
@@ -129,6 +149,9 @@ impl AppError {
     pub fn system(msg: impl Into<String>) -> Self {
         AppError::System(msg.into())
     }
+    pub fn runtime_diagnostic(error: shared_types::AppError) -> Self {
+        AppError::RuntimeDiagnostic(Box::new(error))
+    }
     pub fn file(msg: impl Into<String>) -> Self {
         AppError::File(msg.into())
     }
@@ -144,7 +167,9 @@ impl AppError {
             AppError::Permission(_) => "PERMISSION_ERROR",
             AppError::Resource(_) => "RESOURCE_ERROR",
             AppError::Network(_) => "NETWORK_ERROR",
-            AppError::System(_) | AppError::CommandExecution { .. } => "SYSTEM_ERROR",
+            AppError::System(_)
+            | AppError::CommandExecution { .. }
+            | AppError::RuntimeDiagnostic(_) => "SYSTEM_ERROR",
             AppError::File(_) => "FILE_ERROR",
             AppError::Process(_) | AppError::ProcessPortInUse { .. } => "PROCESS_ERROR",
         }
@@ -152,6 +177,7 @@ impl AppError {
 
     fn status_code(&self) -> StatusCode {
         match self {
+            AppError::RuntimeDiagnostic(error) => error.status_code(),
             AppError::Validation(..) | AppError::ValidationI18n(..) | AppError::Business(_) => {
                 StatusCode::BAD_REQUEST
             }
@@ -174,6 +200,13 @@ impl AppError {
             AppError::Resource(m) => m,
             AppError::Network(m) => m,
             AppError::System(m) | AppError::CommandExecution { message: m, .. } => m,
+            AppError::RuntimeDiagnostic(error) => match error.as_ref() {
+                shared_types::AppError::Structured(detail) => detail
+                    .internal_message
+                    .as_deref()
+                    .unwrap_or("Runtime request failed"),
+                _ => "Runtime request failed",
+            },
             AppError::File(m) => m,
             AppError::Process(m) => m,
             AppError::ProcessPortInUse { detail, .. } => detail,
@@ -240,7 +273,11 @@ fn base36(mut n: u64) -> String {
 
 impl std::fmt::Display for AppError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.message())
+        if matches!(self, Self::RuntimeDiagnostic(_)) {
+            f.write_str(&shared_types::sanitize_error_text(self.message()))
+        } else {
+            f.write_str(self.message())
+        }
     }
 }
 
@@ -248,6 +285,32 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let typ = self.type_name();
+        if let AppError::RuntimeDiagnostic(origin) = self {
+            let result = origin.into_http_result::<()>(shared_types::current_request_locale());
+            let mut body = json!({
+                "success": false,
+                "code": result.code,
+                "error": {
+                    "type": typ,
+                    "message": result.message,
+                    "timestamp": now_cst_timestamp(),
+                    "requestId": current_request_id(),
+                },
+            });
+            if let Some(detail) = result.error_detail {
+                body["error_detail"] = json!(detail);
+            }
+            if let Some(id) = result.operation_id {
+                body["operation_id"] = json!(id);
+            }
+            if let Some(blocker) = result.blocker {
+                body["blocker"] = json!(blocker);
+            }
+            if let Some(tid) = result.tid {
+                body["tid"] = json!(tid);
+            }
+            return (status, Json(body)).into_response();
+        }
         // 对 ValidationI18n: 优先按请求 locale 翻译, 未命中则用 fallback。
         // shared_types::t 未命中归一为裸 key (旧形状 "{locale}.{key}" 一并兜底):
         // 以 key 结尾 (裸 key 即相等) 判定未命中。
@@ -402,5 +465,83 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["error"]["message"].as_str(), Some("my fallback msg"));
+    }
+
+    #[tokio::test]
+    async fn workspace_diagnostic_keeps_identity_locale_and_file_error_shape() {
+        let origin = shared_types::AppError::with_message(
+            shared_types::error_codes::ERR_RUNTIME_UNAVAILABLE,
+            "PV query failed password=controlled-secret",
+        )
+        .with_error_detail(
+            shared_types::ErrorDetail::new(
+                shared_types::error_codes::ERR_RUNTIME_UNAVAILABLE,
+                "workspace_resolve",
+                "PV query failed password=controlled-secret",
+            )
+            .with_task_id("real-task")
+            .with_retryable(true),
+        )
+        .with_operation_id("original-operation".into());
+        let response = REQUEST_ID
+            .scope("file-request".into(), async {
+                shared_types::scope_request_locale("zh-CN", async {
+                    AppError::runtime_diagnostic(origin)
+                        .prefixed("project lookup")
+                        .into_response()
+                })
+                .await
+            })
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["code"],
+            shared_types::error_codes::ERR_RUNTIME_UNAVAILABLE
+        );
+        assert_eq!(value["success"], false);
+        assert_eq!(value["error"]["type"], "SYSTEM_ERROR");
+        assert_eq!(value["error"]["requestId"], "file-request");
+        assert!(value["error"]["timestamp"].as_str().is_some());
+        assert_eq!(value["operation_id"], "original-operation");
+        assert_eq!(value["error_detail"]["task_id"], "real-task");
+        assert_eq!(value["error_detail"]["stage"], "workspace_resolve");
+        assert_eq!(value["error_detail"]["retryable"], true);
+        assert_eq!(
+            value["error_detail"]["hint"],
+            shared_types::error_codes::get_error_hint(
+                shared_types::error_codes::ERR_RUNTIME_UNAVAILABLE,
+                "zh-CN"
+            )
+        );
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("project lookup")
+        );
+        assert!(
+            !String::from_utf8(bytes.to_vec())
+                .unwrap()
+                .contains("controlled-secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_file_error_does_not_gain_runtime_fields_or_code() {
+        let response = AppError::system("ordinary file failure").into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["code"], "UNKNOWN_ERROR");
+        for field in ["error_detail", "operation_id", "blocker", "tid"] {
+            assert!(value.get(field).is_none(), "{value}");
+        }
+        assert_eq!(value["error"]["message"], "ordinary file failure");
     }
 }

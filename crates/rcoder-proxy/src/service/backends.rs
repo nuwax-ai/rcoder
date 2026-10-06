@@ -198,15 +198,29 @@ impl PingoraProxyService {
     }
 
     /// 启动健康检查循环
-    pub fn start_health_check_loop(&self, interval_secs: u64, timeout_ms: u64) {
+    pub fn start_health_check_loop(
+        &self,
+        interval_secs: u64,
+        timeout_ms: u64,
+        mut stop: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         let svc = self.clone();
         tokio::spawn(async move {
             let interval = Duration::from_secs(interval_secs);
             loop {
-                svc.update_health_once(timeout_ms).await;
-                tokio::time::sleep(interval).await;
+                if *stop.borrow_and_update() {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    _ = stop.changed() => break,
+                    _ = async {
+                        svc.update_health_once(timeout_ms).await;
+                        tokio::time::sleep(interval).await;
+                    } => {}
+                }
             }
-        });
+        })
     }
 
     /// 获取健康状态快照（兼容接口）
@@ -370,5 +384,23 @@ impl PingoraProxyService {
     /// 获取 API 密钥管理器的引用（用于共享）
     pub fn get_api_key_manager(&self) -> Arc<DashMap<String, ModelProviderConfig>> {
         self.api_key_manager.clone()
+    }
+}
+
+#[cfg(test)]
+mod supervised_health_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn health_check_shutdown_confirms_task_exit_without_waiting_for_next_interval() {
+        let service = PingoraProxyService::new(ProxyConfig::with_listen_port(0));
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let task = service.start_health_check_loop(3600, 100, stopped);
+        tokio::task::yield_now().await;
+        stop.send_replace(true);
+        timeout(Duration::from_millis(500), task)
+            .await
+            .expect("health loop ignored cancellation")
+            .expect("health loop panicked");
     }
 }

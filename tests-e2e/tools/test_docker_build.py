@@ -24,7 +24,13 @@ class DockerBuildTests(unittest.TestCase):
             )
             (root / 'Makefile').write_text(
                 'include ' + str(REPO / 'make/docker.mk') + '\n'
-                '.PHONY: docker-build-agent-runner docker-build-master\n'
+                '.PHONY: docker-build-agent-runner docker-build-master build-dbx-fork download-pingap-cache\n'
+                'build-dbx-fork:\n'
+                '\t@echo dbx >> "$(CALL_LOG)"\n'
+                '\t@test "$(FAIL_TARGET)" != dbx\n'
+                'download-pingap-cache:\n'
+                '\t@echo pingap >> "$(CALL_LOG)"\n'
+                '\t@test "$(FAIL_TARGET)" != pingap\n'
                 'docker-build-agent-runner:\n'
                 '\t@echo agent-start >> "$(CALL_LOG)"\n'
                 '\t@test "$(FAIL_TARGET)" != agent\n'
@@ -49,19 +55,35 @@ class DockerBuildTests(unittest.TestCase):
     def test_agent_failure_never_starts_master(self):
         result, calls = self.run_build('agent')
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(calls, ['gate', 'agent-start'])
+        self.assertEqual(calls[:2], ['gate', 'gate'])
+        self.assertCountEqual(calls[2:-1], ['dbx', 'pingap'])
+        self.assertEqual(calls[-1], 'agent-start')
         self.assertNotIn('所有 Docker 镜像构建完成', result.stdout)
 
     def test_master_failure_never_claims_success(self):
         result, calls = self.run_build('master')
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(calls, ['gate', 'agent-start', 'agent-complete', 'master-start'])
+        self.assertEqual(calls[:2], ['gate', 'gate'])
+        self.assertCountEqual(calls[2:4], ['dbx', 'pingap'])
+        self.assertEqual(calls[4:], ['agent-start', 'agent-complete', 'master-start'])
         self.assertNotIn('所有 Docker 镜像构建完成', result.stdout)
+
+    def test_asset_failure_prevents_both_builds(self):
+        for target in ('dbx', 'pingap'):
+            with self.subTest(target=target):
+                result, calls = self.run_build(target)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(calls[:2], ['gate', 'gate'])
+                self.assertNotIn('agent-start', calls)
+                self.assertNotIn('master-start', calls)
+                self.assertNotIn('所有 Docker 镜像构建完成', result.stdout)
 
     def test_parallel_make_still_completes_agent_before_master(self):
         result, calls = self.run_build()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(calls, ['gate', 'agent-start', 'agent-complete', 'master-start', 'master-complete'])
+        self.assertEqual(calls[:2], ['gate', 'gate'])
+        self.assertCountEqual(calls[2:4], ['dbx', 'pingap'])
+        self.assertEqual(calls[4:], ['agent-start', 'agent-complete', 'master-start', 'master-complete'])
         self.assertIn('dev-rcoder-agent-runner:latest', result.stdout)
         self.assertNotIn('dev-computer-agent-runner', result.stdout)
 

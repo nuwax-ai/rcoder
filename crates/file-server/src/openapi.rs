@@ -20,10 +20,19 @@ pub enum JsonApiResponses {
     Forbidden(ErrorResponse),
     #[response(status = 404, description = "Resource not found")]
     NotFound(ErrorResponse),
+    #[response(
+        status = 409,
+        description = "Conflicting operation or physical recovery required"
+    )]
+    Conflict(ErrorResponse),
     #[response(status = 500, description = "System, file, or process error")]
     InternalServerError(ErrorResponse),
     #[response(status = 502, description = "Network error")]
     BadGateway(ErrorResponse),
+    #[response(status = 503, description = "Runtime management or address not ready")]
+    ServiceUnavailable(ErrorResponse),
+    #[response(status = 504, description = "Runtime request timed out")]
+    GatewayTimeout(ErrorResponse),
 }
 
 /// 文件流接口只复用错误响应，成功媒体类型由 handler 单独声明。
@@ -35,10 +44,19 @@ pub enum ErrorApiResponses {
     Forbidden(ErrorResponse),
     #[response(status = 404, description = "Resource not found")]
     NotFound(ErrorResponse),
+    #[response(
+        status = 409,
+        description = "Conflicting operation or physical recovery required"
+    )]
+    Conflict(ErrorResponse),
     #[response(status = 500, description = "System, file, or process error")]
     InternalServerError(ErrorResponse),
     #[response(status = 502, description = "Network error")]
     BadGateway(ErrorResponse),
+    #[response(status = 503, description = "Runtime management or address not ready")]
+    ServiceUnavailable(ErrorResponse),
+    #[response(status = 504, description = "Runtime request timed out")]
+    GatewayTimeout(ErrorResponse),
 }
 
 #[derive(OpenApi)]
@@ -49,6 +67,8 @@ pub enum ErrorApiResponses {
         description = "Rust file-server API, compatible with nuwax-file-server."
     ),
     servers((url = "/", description = "Current file-server")),
+    // IntoResponses 不会自动收集其 body 的 schema；显式登记错误信封及嵌套模型。
+    components(schemas(ErrorResponse)),
     tags(
         (name = "System", description = "Service health"),
         (name = "Project", description = "Project lifecycle and content"),

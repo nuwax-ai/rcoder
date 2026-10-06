@@ -8,7 +8,7 @@ use tokio::time::{Duration, Instant, timeout_at};
 
 use crate::models::{AppOperationError, AppResult};
 use crate::service::{AppService, OwnedOperation};
-use crate::utils::map_runtime_error;
+use crate::utils::{map_runtime_error, map_runtime_mutation_error};
 
 impl AppService {
     /// Capture the prod mutation target, falling back to the durable physical
@@ -118,7 +118,10 @@ impl AppService {
         app_id: &str,
     ) -> AppResult<Option<shared_types::UserAppLifecycleRecord>> {
         crate::utils::validate_app_id(app_id)?;
-        let existing = self.metadata.store.get_application(app_id).await?;
+        let existing = crate::service::restart_wait::prepare(async {
+            Ok(self.metadata.store.get_application(app_id).await?)
+        })
+        .await?;
         if let Some(existing) = &existing {
             if existing.state != shared_types::UserAppLifecycleState::Active {
                 return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
@@ -130,11 +133,13 @@ impl AppService {
                 return Ok(Some(existing.clone()));
             }
         }
-        let found = self
-            .runtime
-            .discover_application_identity(app_id)
-            .await
-            .map_err(|e| map_runtime_error("Discover existing lifecycle", e))?;
+        let found = crate::service::restart_wait::prepare(async {
+            self.runtime
+                .discover_application_identity(app_id)
+                .await
+                .map_err(|e| map_runtime_error("Discover existing lifecycle", e))
+        })
+        .await?;
         let Some(found) = found else {
             return Ok(existing);
         };
@@ -145,22 +150,36 @@ impl AppService {
             return Ok(existing);
         }
         found.validate().map_err(AppOperationError::Validation)?;
-        let confirmed = self
-            .runtime
-            .discover_application_identity(app_id)
-            .await
-            .map_err(|e| map_runtime_error("Confirm existing lifecycle", e))?;
+        let confirmed = crate::service::restart_wait::prepare(async {
+            self.runtime
+                .discover_application_identity(app_id)
+                .await
+                .map_err(|e| map_runtime_error("Confirm existing lifecycle", e))
+        })
+        .await?;
         if confirmed.as_ref() != Some(&found) {
             return Err(AppOperationError::Conflict(
                 "Managed resource inventory changed during registration recovery".into(),
             ));
         }
-        Ok(Some(
-            self.metadata
-                .store
-                .restore_discovered_identity(&found)
-                .await?,
-        ))
+        // Registration is a control-root write. Claim ownership only after
+        // bounded discovery, then resolve the write even if the receiver goes
+        // away. A confirmed registration is not business admission: return to
+        // Waiting and honor a disconnect before taking an operation lease.
+        crate::service::restart_wait::begin_admission()?;
+        let restored = self
+            .metadata
+            .store
+            .restore_discovered_identity(&found)
+            .await
+            .map_err(AppOperationError::from);
+        if match &restored {
+            Ok(_) => true,
+            Err(error) => !error.requires_recovery(),
+        } {
+            crate::service::restart_wait::rejected_before_admission();
+        }
+        restored.map(Some)
     }
 
     /// Reconcile a hot failure by querying the exact owner recorded before the
@@ -229,7 +248,13 @@ impl AppService {
             self.runtime
                 .release_app_operation_receipt(&binding.context, &binding.receipt)
                 .await
-                .map_err(|error| map_runtime_error("Release confirmed hot failure lease", error))?;
+                .map_err(|error| {
+                    map_runtime_mutation_error(
+                        "runtime_lease_release",
+                        "Release confirmed hot failure lease",
+                        error,
+                    )
+                })?;
             self.metadata.store.forget_operation_lease(&binding).await?;
         }
         Ok(Some(terminal.into()))
@@ -411,7 +436,13 @@ impl AppService {
             self.runtime
                 .release_app_operation_receipt(&binding.context, &binding.receipt)
                 .await
-                .map_err(|error| map_runtime_error("Release confirmed hot success lease", error))?;
+                .map_err(|error| {
+                    map_runtime_mutation_error(
+                        "runtime_lease_release",
+                        "Release confirmed hot success lease",
+                        error,
+                    )
+                })?;
             self.metadata.store.forget_operation_lease(&binding).await?;
         }
         Ok(Some(terminal.into()))
@@ -464,7 +495,9 @@ impl AppService {
             .store
             .get_operation(app_id, operation_id)
             .await?
-            .ok_or_else(|| AppOperationError::NotFound("Application operation not found".into()))?;
+            .ok_or_else(|| {
+                AppOperationError::OperationNotFound("Application operation not found".into())
+            })?;
         if operation.lifecycle_id != request.lifecycle_id {
             return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
         }
@@ -491,7 +524,8 @@ impl AppService {
                 .get_control_operation(app_id, Some(operation_id))
                 .await?
                 .ok_or_else(|| {
-                    AppOperationError::NotFound("Deletion operation disappeared".into())
+                    AppOperationError::OperationNotFound("Deletion operation disappeared".into())
+                        .with_operation_id(operation.operation_id.clone())
                 });
         }
         if ((operation.state == UserAppOperationState::RecoveryRequired
@@ -592,7 +626,13 @@ impl AppService {
                 self.runtime
                     .release_app_operation_receipt(&binding.context, &binding.receipt)
                     .await
-                    .map_err(|error| map_runtime_error("Release confirmed wake lease", error))?;
+                    .map_err(|error| {
+                        map_runtime_mutation_error(
+                            "runtime_lease_release",
+                            "Release confirmed wake lease",
+                            error,
+                        )
+                    })?;
                 self.metadata.store.forget_operation_lease(&binding).await?;
             }
             return Ok(terminal.into());
@@ -609,7 +649,8 @@ impl AppService {
                 .get_control_operation(app_id, Some(operation_id))
                 .await?
                 .ok_or_else(|| {
-                    AppOperationError::NotFound("Management operation disappeared".into())
+                    AppOperationError::OperationNotFound("Management operation disappeared".into())
+                        .with_operation_id(operation.operation_id.clone())
                 });
         }
         let recoverable_final = matches!(
@@ -679,7 +720,10 @@ impl AppService {
         self.get_control_operation(app_id, Some(operation_id))
             .await?
             .ok_or_else(|| {
-                AppOperationError::NotFound("Application operation not found after retry".into())
+                AppOperationError::OperationNotFound(
+                    "Application operation not found after retry".into(),
+                )
+                .with_operation_id(operation.operation_id.clone())
             })
     }
 
@@ -833,7 +877,10 @@ impl AppService {
                 .get_operation(&snapshot.app_id, &snapshot.operation_id)
                 .await?
                 .ok_or_else(|| {
-                    AppOperationError::NotFound("Recovery operation no longer exists".into())
+                    AppOperationError::OperationNotFound(
+                        "Recovery operation no longer exists".into(),
+                    )
+                    .with_operation_id(snapshot.operation_id.clone())
                 })?;
             if current.state != UserAppOperationState::Pending
                 || current.revision != snapshot.revision
@@ -1060,7 +1107,11 @@ impl AppService {
                         guard.mark_rejected_before_mutation();
                     }
                     projected.map_err(|error| {
-                        map_runtime_error("Recover captured runtime policy", error)
+                        map_runtime_mutation_error(
+                            "runtime_policy_apply",
+                            "Recover captured runtime policy",
+                            error,
+                        )
                     })?;
                 }
                 Command::Stop { wake_on_traffic } => {
@@ -1076,7 +1127,11 @@ impl AppService {
                         .restart_app_target(&target, restart_image.as_deref())
                         .await
                         .map_err(|error| {
-                            map_runtime_error("Restart captured recovery target", error)
+                            map_runtime_mutation_error(
+                                "container_restart",
+                                "Restart captured recovery target",
+                                error,
+                            )
                         })?;
                     self.refresh_pingora_after_restart(&snapshot.app_id).await;
                 }
@@ -1094,7 +1149,11 @@ impl AppService {
                             .start_app_target_with_image(&target, image.as_deref())
                             .await
                             .map_err(|error| {
-                                map_runtime_error("Start captured recovery target", error)
+                                map_runtime_mutation_error(
+                                    "container_start",
+                                    "Start captured recovery target",
+                                    error,
+                                )
                             })?;
                     }
                     if *traffic {

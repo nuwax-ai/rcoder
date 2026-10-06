@@ -23,6 +23,7 @@
 	logs-help logs-up logs-down logs-query logs-fidelity
 
 # 包含子 Makefile
+include make/build-assets.mk
 include make/docker.mk
 include make/libreoffice.mk
 include make/dbx.mk

@@ -185,11 +185,15 @@ mod tests {
             "import subprocess,sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); raise SystemExit(0)",
         ] {
             let mut exiting = child(script);
-            let result = builtin(&spec, &mut exiting, true, Instant::now(), None).await;
+            let observed = Instant::now();
+            let result = builtin(&spec, &mut exiting, true, observed, None).await;
+            let root_after_probe = exiting.try_wait_root();
+            let root_pid = exiting.id();
             stop(&mut exiting).await;
             assert!(
-                format!("{:#}", result.unwrap_err()).contains("root exited"),
-                "{script}"
+                matches!(&result, Err(error) if format!("{error:#}").contains("root exited")),
+                "{script}: {result:?}; elapsed={:?}; root_after_probe={root_after_probe:?}; root_pid={root_pid:?}",
+                observed.elapsed()
             );
         }
         let mut cancelled = child("import time; time.sleep(30)");

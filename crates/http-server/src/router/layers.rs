@@ -24,8 +24,7 @@ async fn locale_context_middleware(mut req: Request<axum::body::Body>, next: Nex
 /// 业务面全局中间件链：body 限制 → Trace（traceparent 贯通）→ HTTP 指标 →
 /// API Key 鉴权（支持热更新）→ locale 注入。
 ///
-/// internal / file-server 两面在此链**之后** merge = 不受 API Key 约束
-/// （router.rs 既有语义，见 create_router 装配顺序）。
+/// internal / file-server 同用可选服务 key；预览对等接口保留自身 token。
 pub(super) fn apply_global_middleware(
     router: Router,
     api_key_config: Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>,

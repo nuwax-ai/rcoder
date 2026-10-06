@@ -185,6 +185,37 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         .await
     }
 
+    async fn get_compute_control_updated_at(
+        &self,
+        app_id: &str,
+        operation_id: &str,
+        expected_revision: i64,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, UserAppStoreError> {
+        let app_id = app_id.to_owned();
+        let operation_id = operation_id.to_owned();
+        self.run(true, move |tx, _| {
+            Box::pin(async move {
+                let row = crate::db::models::ComputeControl::filter_by_operation_id(&operation_id)
+                    .first()
+                    .exec(tx)
+                    .await
+                    .map_err(storage)?;
+                row.filter(|row| row.app_id == app_id && row.revision == expected_revision)
+                    .map(|row| {
+                        chrono::DateTime::from_timestamp_micros(row.updated_at_us).ok_or_else(
+                            || {
+                                UserAppStoreError::InvalidOperation(
+                                    "Invalid compute progress timestamp".into(),
+                                )
+                            },
+                        )
+                    })
+                    .transpose()
+            })
+        })
+        .await
+    }
+
     async fn read_compute_status(
         &self,
         app_id: &str,
@@ -966,6 +997,37 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         })
         .await
     }
+    async fn get_operation_updated_at(
+        &self,
+        app_id: &str,
+        operation_id: &str,
+        expected_revision: i64,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, UserAppStoreError> {
+        let app_id = app_id.to_owned();
+        let operation_id = operation_id.to_owned();
+        self.run(true, move |tx, _| {
+            Box::pin(async move {
+                let row = crate::db::models::Operation::filter_by_operation_id(&operation_id)
+                    .first()
+                    .exec(tx)
+                    .await
+                    .map_err(storage)?;
+                row.filter(|row| row.app_id == app_id && row.revision == expected_revision)
+                    .map(|row| {
+                        chrono::DateTime::from_timestamp_micros(row.updated_at_us).ok_or_else(
+                            || {
+                                UserAppStoreError::InvalidOperation(
+                                    "Invalid operation progress timestamp".into(),
+                                )
+                            },
+                        )
+                    })
+                    .transpose()
+            })
+        })
+        .await
+    }
+
     async fn unfinished_operations(
         &self,
         after_operation_id: Option<&str>,

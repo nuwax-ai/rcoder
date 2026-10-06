@@ -218,6 +218,11 @@ impl AppState {
         // userApp 文件/存储接口 env=dev 分支的开发容器定位回调（幂等 ensure +
         // 探活自愈 + file-server 地址解析）。Weak 挂接防
         // AppState → app_service → dev_locator → AppState 引用环。
+        app_service_arc.set_file_credentials_provider(Arc::new(
+            crate::userapp_forward::file_credentials::ConfiguredFileCredentials::new(
+                Arc::downgrade(&state),
+            ),
+        ))?;
         app_service_arc.set_dev_locator(Arc::new(
             crate::userapp_builder::UserappDevLocator::new(Arc::downgrade(&state)),
         ))?;

@@ -166,3 +166,149 @@ fn prod_log_routes_keep_the_existing_management_protocol() {
         "/v1/logs/stream"
     );
 }
+
+struct LogCredentials;
+#[async_trait::async_trait]
+impl shared_types::FileServerCredentialsProvider for LogCredentials {
+    async fn for_target(
+        &self,
+        stage: shared_types::UserappStage,
+        app_id: &str,
+        _: tokio::time::Instant,
+    ) -> Result<shared_types::FileServerRequestCredentials, shared_types::WakeFailure> {
+        assert_eq!(stage, shared_types::UserappStage::Dev);
+        assert_eq!(app_id, "app1");
+        Ok(shared_types::FileServerRequestCredentials {
+            proxy_token: Some("fixture-log-token".into()),
+        })
+    }
+}
+#[tokio::test]
+async fn stopped_dev_logs_require_configured_file_token_without_waking() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let serve_calls = calls.clone();
+    let upstream=Router::new().fallback(move |headers:axum::http::HeaderMap, uri:axum::http::Uri| {
+        let calls=serve_calls.clone();
+        async move {
+            assert!(!headers.contains_key("x-api-key"));
+            if headers.get("x-proxy-token").and_then(|value|value.to_str().ok()) != Some("fixture-log-token") {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            calls.fetch_add(1,Ordering::SeqCst);
+            if uri.path().ends_with("stream") { ([(header::CONTENT_TYPE,"text/event-stream")],"event: log\ndata: startup failed\n\n").into_response() }
+            else { Json(serde_json::json!({"success":true,"code":"0000","data":"startup failed on disk"})).into_response() }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+    let locator = Arc::new(ReadOnlyLocator {
+        address: Some(address),
+        ensure_calls: AtomicUsize::new(0),
+        read_calls: AtomicUsize::new(0),
+    });
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(MockRuntime::default());
+    let service = test_service(root.path(), runtime.clone()).await;
+    service.set_dev_locator(locator.clone()).unwrap();
+    service
+        .set_file_credentials_provider(Arc::new(LogCredentials))
+        .unwrap();
+    let router = public_router(Arc::new(AppManagerState {
+        app_service: Arc::new(service),
+        http_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+    }));
+    for suffix in ["sources/query", "query", "stream"] {
+        let request = axum::http::Request::post(format!(
+            "/api/v1/userapp/app1/dev/logs/{suffix}?user_id=user1"
+        ))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "configured token on stopped logs {suffix}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 16384)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("startup failed"));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(locator.ensure_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(locator.read_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.management_start_calls.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+struct FailingLogCredentials {
+    calls: AtomicUsize,
+}
+#[async_trait::async_trait]
+impl shared_types::FileServerCredentialsProvider for FailingLogCredentials {
+    async fn for_target(
+        &self,
+        _: shared_types::UserappStage,
+        _: &str,
+        _: tokio::time::Instant,
+    ) -> Result<shared_types::FileServerRequestCredentials, shared_types::WakeFailure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(shared_types::WakeFailure::new(
+            shared_types::ERR_RUNTIME_CONFIGURATION,
+            "file_credentials",
+            "Configured file token is unavailable",
+        ))
+    }
+}
+
+#[tokio::test]
+async fn dev_log_credential_failure_does_not_wake_and_prod_skips_file_credentials() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(MockRuntime::default());
+    let service = test_service(root.path(), runtime.clone()).await;
+    let locator = Arc::new(ReadOnlyLocator {
+        address: Some("http://127.0.0.1:9".into()),
+        ensure_calls: AtomicUsize::new(0),
+        read_calls: AtomicUsize::new(0),
+    });
+    service.set_dev_locator(locator.clone()).unwrap();
+    let provider = Arc::new(FailingLogCredentials {
+        calls: AtomicUsize::new(0),
+    });
+    service
+        .set_file_credentials_provider(provider.clone())
+        .unwrap();
+    let state = Arc::new(AppManagerState {
+        app_service: Arc::new(service),
+        http_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+    });
+    let prod_credentials = log_file_credentials(&state, shared_types::UserappStage::Prod, "app1")
+        .await
+        .unwrap();
+    assert!(prod_credentials.proxy_token.is_none());
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    let router = public_router(state);
+    let request = axum::http::Request::post("/api/v1/userapp/app1/dev/logs/query?user_id=user1")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = axum::body::to_bytes(response.into_body(), 16384)
+        .await
+        .unwrap();
+    let response: HttpResult<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response.code, shared_types::ERR_RUNTIME_CONFIGURATION);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(locator.read_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(locator.ensure_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.management_start_calls.load(Ordering::SeqCst), 0);
+}

@@ -3,7 +3,7 @@
 use super::ops::validate_recycle_policy_fields;
 use crate::models::{AppResult, AppRuntimeInfo, RecyclePolicyRequest};
 use crate::service::{AppService, OwnedOperation};
-use crate::utils::{map_runtime_error, validate_app_id};
+use crate::utils::{map_runtime_mutation_error, validate_app_id};
 
 impl AppService {
     pub async fn set_recycle_policy(
@@ -92,7 +92,13 @@ impl AppService {
                 ) {
                     guard.mark_rejected_before_mutation();
                 }
-                result.map_err(|error| map_runtime_error("Apply captured runtime policy", error))
+                result.map_err(|error| {
+                    map_runtime_mutation_error(
+                        "runtime_policy_apply",
+                        "Apply captured runtime policy",
+                        error,
+                    )
+                })
             }
             .await;
             match mutation {
@@ -102,6 +108,7 @@ impl AppService {
                     guard.mark_completed();
                 }
                 Err(error) => {
+                    let error = operation.correlate_error(error);
                     if guard.has_unfinished_mutation() {
                         operation.fail(&error).await?;
                     } else {

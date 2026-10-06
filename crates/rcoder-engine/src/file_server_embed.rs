@@ -19,21 +19,24 @@ use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use axum::Router;
-use container_runtime_api::WorkspaceRuntime;
+use container_runtime_api::{RuntimeErrorContext, WorkspaceRuntime, runtime_app_error};
 use file_server::error::AppResult;
 use file_server::{
     Config, FileServer, SubvolumeWorkspaceResolver, WorkspacePathResolver, WorkspaceResolver,
 };
 use shared_types::ServiceType;
-use tracing::{info, warn};
+use tracing::info;
+
+#[cfg(test)]
+#[path = "file_server_embed/workspace_authority_tests.rs"]
+mod workspace_authority_tests;
 
 /// 包 `Arc<dyn WorkspaceRuntime>` 实现 file-server 的 [`WorkspacePathResolver`] 窄 trait。
 ///
 /// ISP 收紧 (阶段3): file-server 仅需 workspace 能力 (resolve/ensure), 不依赖 agent 容器
 /// 生命周期或 Userapp Deployment —— 类型声明即编译期约束。
 ///
-/// `resolve_workspace_path` 失败 (K8s API 抖动 / PVC 未 Bound / Docker 模式) → 返回 `None`
-/// → [`SubvolumeWorkspaceResolver`] 降级到 LocalWorkspaceResolver (fail-open, 不阻断服务)。
+/// 运行时明确返回 `None` 时使用 Local；查询失败保留结构化诊断，避免改变源码权威。
 pub struct ContainerRuntimePathResolver {
     runtime: Arc<dyn WorkspaceRuntime>,
 }
@@ -51,19 +54,17 @@ impl WorkspacePathResolver for ContainerRuntimePathResolver {
         identifier: &str,
         service_type: &ServiceType,
     ) -> AppResult<Option<PathBuf>> {
-        // resolve_workspace_path 失败 → None (降级 Local), 不传播 Err
-        Ok(self
-            .runtime
+        self.runtime
             .resolve_workspace_path(identifier, service_type)
             .await
             .map(|opt| opt.map(PathBuf::from))
-            .unwrap_or_else(|e| {
-                warn!(
-                    "resolve_workspace_path failed for {} ({:?}): {}, falling back to Local",
-                    identifier, service_type, e
-                );
-                None
-            }))
+            .map_err(|error| {
+                file_server::error::AppError::runtime_diagnostic(runtime_app_error(
+                    &error,
+                    "workspace_resolve",
+                    RuntimeErrorContext::ReadOnly,
+                ))
+            })
     }
 
     async fn ensure_and_resolve(
@@ -73,25 +74,42 @@ impl WorkspacePathResolver for ContainerRuntimePathResolver {
     ) -> AppResult<Option<PathBuf>> {
         use file_server::error::AppError;
 
-        // 1. 先 resolve (cache 快): PVC 已存在?
-        if let Some(base) = self.resolve(identifier, service_type).await? {
-            // PVC 存在 → 检查迁移 (幂等: dst 非空跳过; 共享有数据才迁)
-            run_lazy_migrate(&self.runtime, identifier, service_type).await;
-            return Ok(Some(base));
+        // 首次查询可能是尚未创建的 PVC，也可能是临时读故障。ensure 按真实
+        // API 身份重新核验；只有其已核验的 NotFound 分支允许创建。
+        match self
+            .runtime
+            .resolve_workspace_path(identifier, service_type)
+            .await
+        {
+            Ok(Some(path)) => {
+                run_lazy_migrate(&self.runtime, identifier, service_type).await;
+                return Ok(Some(PathBuf::from(path)));
+            }
+            Ok(None) => {}
+            Err(error) => tracing::debug!(
+                identifier,
+                service_type = ?service_type,
+                error = %shared_types::sanitize_error_text(&error.to_string()),
+                "Initial workspace lookup failed; ensure will recheck the workspace"
+            ),
         }
-        // 2. PVC 不存在 → ensure + resolve (重试等 Bound) + 迁移
+        // ensure 成功后沿用原有 Bound 等待预算，再解析物理工作区。
         self.runtime
             .ensure_workspace(identifier, service_type, None)
             .await
-            .map_err(|e| AppError::system(format!("ensure_workspace: {e}")))?;
+            .map_err(|error| {
+                AppError::runtime_diagnostic(runtime_app_error(
+                    &error,
+                    "workspace_ensure",
+                    RuntimeErrorContext::Mutation,
+                ))
+            })?;
         // ensure 后 PVC 刚创建, ceph-csi provision 异步 (volumeName/subvolumePath 填充延迟)
         // 必须重试 resolve 等 Bound, 否则首次 None → fallback Local, 后续 Some → per-agent
         // → create-project 写 Local, git 读 per-agent, 路径不一致
         const MAX_RETRIES: u32 = 30;
         let mut base: Option<PathBuf> = None;
         for attempt in 0..MAX_RETRIES {
-            // 直接调 runtime.resolve_workspace_path (不经 self.resolve 吞 Err)
-            // self.resolve 把 Err → Ok(None) → 重试循环误判 Docker 模式直接 break
             match self
                 .runtime
                 .resolve_workspace_path(identifier, service_type)
@@ -108,21 +126,22 @@ impl WorkspacePathResolver for ContainerRuntimePathResolver {
                     break;
                 }
                 Ok(None) => break, // 真 Docker 模式 (runtime 无聚合视角)
-                Err(e) => {
+                Err(error) => {
                     if attempt + 1 < MAX_RETRIES {
                         tracing::debug!(
                             "[ensure_and_resolve] {} PVC pending (attempt {}/{}): {}",
                             identifier,
                             attempt + 1,
                             MAX_RETRIES,
-                            e
+                            shared_types::sanitize_error_text(&error.to_string())
                         );
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     } else {
-                        warn!(
-                            "[ensure_and_resolve] {} PVC resolve timeout after {} retries: {}, fallback Local",
-                            identifier, MAX_RETRIES, e
-                        );
+                        return Err(AppError::runtime_diagnostic(runtime_app_error(
+                            &error,
+                            "workspace_resolve",
+                            RuntimeErrorContext::ReadOnly,
+                        )));
                     }
                 }
             }
@@ -264,6 +283,7 @@ pub fn embedded_proxy_config(
     preview_enabled: bool,
     rcoder_port: u16,
 ) -> Result<file_server_proxy::FileServerProxyConfig, String> {
+    let implicit_host = section.is_none() && shared_types::is_deploy_host();
     let mut config = section
         .map(|mut c| {
             if preview_enabled {
@@ -271,13 +291,31 @@ pub fn embedded_proxy_config(
             }
             c
         })
-        .unwrap_or_else(|| file_server_proxy::FileServerProxyConfig {
-            rust_upstream_port: rcoder_port,
-            coordinated_dev_lifecycle: preview_enabled,
-            ..file_server_proxy::FileServerProxyConfig::default()
+        .unwrap_or_else(|| {
+            let mut config = file_server_proxy::FileServerProxyConfig {
+                rust_upstream_port: rcoder_port,
+                coordinated_dev_lifecycle: preview_enabled,
+                ..file_server_proxy::FileServerProxyConfig::default()
+            };
+            if shared_types::is_deploy_host() {
+                config.listen_host = "127.0.0.1".into();
+                config.policy = file_server_proxy::RoutePolicy::AllRust;
+            }
+            config
         });
+    if implicit_host {
+        // 显式 HOST 环境配置优先于 host 的 loopback 缺省。
+        match std::env::var("FILE_SERVER_PROXY_HOST") {
+            Ok(host) if !host.trim().is_empty() => config.listen_host = host,
+            Ok(_) | Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err("FILE_SERVER_PROXY_HOST must be valid UTF-8".into());
+            }
+        }
+    }
     // PX-10: 非法显式 env 值向调用方传播（fail-fast）, 不静默落回公开缺省。
     config.apply_public_bind_env()?;
+    config.apply_auth_token_env()?;
     Ok(config)
 }
 
@@ -411,5 +449,41 @@ mod embedded_config_tests {
         );
         drop(config);
         drop(guard);
+    }
+}
+
+#[cfg(all(test, feature = "deploy-host"))]
+mod implementation_stage3_host_tests {
+    use super::*;
+    #[test]
+    fn host_implicit_file_entry_uses_loopback_and_all_rust() {
+        let config = embedded_proxy_config(None, false, 18087).expect("host config");
+        assert_eq!(
+            config.listen_host, "127.0.0.1",
+            "host default must be loopback"
+        );
+        assert_eq!(config.listen_port, 60000);
+        assert_eq!(config.rust_upstream_port, 18087);
+        assert_eq!(
+            config.policy,
+            file_server_proxy::RoutePolicy::AllRust,
+            "host has no TS upstream"
+        );
+    }
+    #[test]
+    fn host_explicit_file_entry_configuration_has_priority() {
+        let section = file_server_proxy::FileServerProxyConfig {
+            listen_host: "192.0.2.1".into(),
+            listen_port: 61000,
+            rust_upstream_port: 18088,
+            policy: file_server_proxy::RoutePolicy::AllTs,
+            ..file_server_proxy::FileServerProxyConfig::default()
+        };
+        let config =
+            embedded_proxy_config(Some(section), false, 18087).expect("explicit host config");
+        assert_eq!(config.listen_host, "192.0.2.1");
+        assert_eq!(config.listen_port, 61000);
+        assert_eq!(config.rust_upstream_port, 18088);
+        assert_eq!(config.policy, file_server_proxy::RoutePolicy::AllTs);
     }
 }

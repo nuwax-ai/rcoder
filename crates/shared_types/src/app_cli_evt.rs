@@ -24,11 +24,13 @@ pub struct AppCliFailedService {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AppCliOrchestrationEvent {
+    /// Application command output or advisory; does not change startup outcome.
+    Log { service: String, line: String },
     /// 开始启动某服务（spawn 前）。
     ServiceStarting { service: String },
     /// 某服务启动成功（readiness 探测通过）。
     ServiceStartOk { service: String },
-    /// 某服务启动失败（spawn io 错误 / migrate 失败 / 探测超时）——不阻塞其余服务。
+    /// 某服务启动失败（服务 spawn io 错误 / 探测超时）——不阻塞其余服务。
     ServiceStartFail { service: String, error: String },
     /// 启动编排终局：`failed` 为失败清单（空 = 全部成功）。
     OrchestrationDone { failed: Vec<AppCliFailedService> },
@@ -59,7 +61,7 @@ impl AppCliOrchestrationEvent {
             .ok_or(AppCliEvtDecodeError::MissingEventTag)?
             .to_string();
         match tag.as_str() {
-            "service_starting" | "service_start_ok" | "service_start_fail"
+            "log" | "service_starting" | "service_start_ok" | "service_start_fail"
             | "orchestration_done" => serde_json::from_str(json).map_err(|error| {
                 AppCliEvtDecodeError::MalformedKnownEvent {
                     event: tag,
@@ -87,6 +89,15 @@ mod tests {
     /// wire 字符串锁定：两端（app-cli 生产 / 平台消费）各自测试锁同一组字符串。
     #[test]
     fn wire_shapes_are_locked() {
+        let log = AppCliOrchestrationEvent::Log {
+            service: "api".into(),
+            line: "[migrate err] script failed".into(),
+        };
+        assert_eq!(
+            log.encode(),
+            r#"{"event":"log","service":"api","line":"[migrate err] script failed"}"#
+        );
+        assert_eq!(AppCliOrchestrationEvent::decode(&log.encode()), Ok(log));
         assert_eq!(
             AppCliOrchestrationEvent::ServiceStarting {
                 service: "frontend".into()
@@ -137,6 +148,10 @@ mod tests {
         assert!(matches!(
             AppCliOrchestrationEvent::decode(r#"{"event":"service_start_ok"}"#),
             Err(AppCliEvtDecodeError::MalformedKnownEvent { event, .. }) if event == "service_start_ok"
+        ));
+        assert!(matches!(
+            AppCliOrchestrationEvent::decode(r#"{"event":"log","service":"x"}"#),
+            Err(AppCliEvtDecodeError::MalformedKnownEvent { event, .. }) if event == "log"
         ));
         assert!(matches!(
             AppCliOrchestrationEvent::decode(r#"{"event":"service_start_fail","service":"x"}"#),

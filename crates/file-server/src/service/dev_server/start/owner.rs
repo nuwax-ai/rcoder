@@ -1,4 +1,29 @@
 use super::*;
+use anyhow::Context as _;
+
+struct OwnerEventForwarding {
+    stop: tokio_util::sync::CancellationToken,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+impl OwnerEventForwarding {
+    async fn finish(&mut self) {
+        self.stop.cancel();
+        if let Some(task) = self.task.as_mut()
+            && let Err(error) = task.await
+        {
+            tracing::warn!(%error, "original owner event forwarding task failed; draining its durable event cursor");
+        }
+        let _finished = self.task.take();
+    }
+}
+impl Drop for OwnerEventForwarding {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
 
 impl DevServerManager {
     /// P3-02：探测 3010 的既有 owner——三种结局：
@@ -20,6 +45,20 @@ impl DevServerManager {
         artifact_release_id: Option<&str>,
         request_context: Option<&str>,
     ) -> AppResult<Option<StartedDev>> {
+        let deadline = hooks
+            .as_ref()
+            .and_then(|hooks| hooks.launch_deadline)
+            .unwrap_or_else(|| {
+                tokio::time::Instant::now()
+                    + crate::service::dev_server::DevEventHooks::launch_budget(
+                        self.config.dev_command_timeout_secs,
+                    )
+            });
+        let mut original_operation_id = None;
+        let outcome = tokio::time::timeout_at(deadline, async {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AppError::business("owner startup observation launch deadline expired before submission"));
+        }
         self.check_external_store().map_err(|error| {
             AppError::business(format!("external owner recovery required: {error:#}"))
         })?;
@@ -186,8 +225,17 @@ impl DevServerManager {
             let intent =
                 self.prepare_external_intent(project_id, project_path, &external, &request)?;
             let operation_id = intent.request.operation_id.clone();
-            self.resume_external_intent(project_id, &client, &intent, &request)
+            original_operation_id = Some(operation_id.clone());
+            anyhow::ensure!(tokio::time::Instant::now() < deadline,
+                "owner startup observation launch deadline expired before submitting operation {operation_id}; query this original operation before retrying");
+            let admitted = self.resume_external_intent(project_id, &client, &intent, &request)
                 .await?;
+            crate::service::dev_server::external_store::verify_view(&admitted, &intent.request)?;
+            // The local intent alone is not admission evidence. Only the
+            // authenticated owner's matching durable view releases Stop.
+            if let Some(hooks) = &hooks {
+                hooks.submitted();
+            }
             // R06：事件转发（游标重放轮询，替换 SSE 长连——无总超时/EOF 竞态，
             // 断线续传天然支持）
             let events_client =
@@ -195,10 +243,14 @@ impl DevServerManager {
             let hooks_line = hooks.as_ref().map(|hooks| hooks.on_line.clone());
             let stop_token = tokio_util::sync::CancellationToken::new();
             let cursor = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let terminal_cursor = Arc::new(crate::service::dev_server::owner_client::OwnerTerminalCursor::new(
+                &operation_id, &intent.request.expected_runtime_instance_id,
+            ));
             let stream_operation_id = operation_id.clone();
             let stream_task = tokio::spawn({
                 let stop_token = stop_token.clone();
                 let cursor = cursor.clone();
+                let terminal_cursor = terminal_cursor.clone();
                 async move {
                     let forward = move |json: String| {
                         if let Some(on_line) = hooks_line.as_ref() {
@@ -211,37 +263,33 @@ impl DevServerManager {
                         forward,
                         &stop_token,
                         &cursor,
+                        &terminal_cursor,
                         Duration::from_millis(250),
                     )
                     .await;
                 }
             });
-            let terminal = client
-                .wait_terminal(&operation_id, Duration::from_secs(180))
-                .await;
+            let mut forwarding = OwnerEventForwarding { stop: stop_token, task: Some(stream_task) };
+            let terminal = client.wait_terminal_until(&operation_id, deadline).await;
             // R06：终态先停转发并 join（不 abort——游标一致无重复投递），
             // 再按游标排空剩余事件——终态事件在状态可见后才落 journal，
             // 盲目中止会丢平台的 Done 终局。
-            stop_token.cancel();
-            let _joined = stream_task.await;
-            if terminal.is_ok()
-                && let Some(on_line) = hooks_line_for_drain.clone()
-            {
-                let last = cursor.load(std::sync::atomic::Ordering::SeqCst);
-                if let Err(error) =
-                    crate::service::dev_server::owner_client::drain_operation_events(
-                        &client,
-                        &operation_id,
-                        last,
-                        |json| on_line(&json),
-                    )
-                    .await
-                {
-                    tracing::warn!("owner terminal event drain failed: {error:#}");
-                }
-            }
+            forwarding.finish().await;
             let view = terminal?;
             crate::service::dev_server::external_store::verify_view(&view, &intent.request)?;
+            if let Some(on_line) = hooks_line_for_drain.clone()
+            {
+                let last = cursor.load(std::sync::atomic::Ordering::SeqCst);
+                crate::service::dev_server::owner_client::drain_operation_events(
+                        &client,
+                        &view,
+                        last,
+                        &terminal_cursor,
+                        deadline,
+                        |json| on_line(&json),
+                    )
+                    .await.with_context(|| format!("drain original operation {} {:?} ({})", view.operation_id, view.state, view.error_message.as_deref().unwrap_or("no failure detail")))?;
+            }
             if matches!(
                 view.state,
                 shared_types::RuntimeOperationState::Succeeded
@@ -279,6 +327,11 @@ impl DevServerManager {
             pid: 0,
             port: shared_types::APP_ENTRY_PORT,
         }))
+        }).await;
+        outcome.map_err(|_| AppError::business(match original_operation_id {
+            Some(id) => format!("owner startup observation launch deadline exceeded (operation {id}); query this original operation before retrying"),
+            None => "owner startup observation launch deadline exceeded before submission".to_owned(),
+        }))?
     }
 
     /// R03：制品态的 owner 路由决策——**激活权归属 owner**。

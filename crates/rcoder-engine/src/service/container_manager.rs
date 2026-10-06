@@ -7,9 +7,11 @@
 
 use crate::AppError;
 use anyhow::Result;
-use container_runtime_api::{ContainerCreateParams, ContainerRuntime};
+use container_runtime_api::{
+    ContainerCreateParams, ContainerRuntime, RuntimeErrorContext, runtime_app_error,
+};
 use docker_manager::ContainerBasicInfo;
-use shared_types::error_codes::{ERR_CONTAINER_ERROR, ERR_WORKSPACE_ERROR};
+use shared_types::error_codes::ERR_WORKSPACE_ERROR;
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
@@ -84,10 +86,7 @@ impl ContainerManager {
 
         runtime.get_container_info(project_id).await.map_err(|e| {
             error!("[CONTAINER_MGR] Failed to query container info: {}", e);
-            AppError::with_message(
-                ERR_CONTAINER_ERROR,
-                format!("Failed to query container info: {}", e),
-            )
+            runtime_app_error(&e, "container.query", RuntimeErrorContext::ReadOnly)
         })
     }
 }
@@ -98,10 +97,13 @@ async fn ensure_container_exists(
     container_identifier: &str,
 ) -> Result<ContainerBasicInfo, AppError> {
     // 1. 尝试获取现有容器（使用 container_identifier 查找）
-    if let Ok(Some(info)) = options
+    if let Some(info) = options
         .runtime
         .get_container_info(container_identifier)
         .await
+        .map_err(|error| {
+            runtime_app_error(&error, "container.query", RuntimeErrorContext::ReadOnly)
+        })?
     {
         info!(
             "[CONTAINER_MGR] container already exists: container_identifier={}, container_id={}",
@@ -174,10 +176,7 @@ async fn create_container_for_request(
         .await
         .map_err(|e| {
             error!("[CONTAINER_MGR] Failed to start container: {}", e);
-            AppError::with_message(
-                ERR_CONTAINER_ERROR,
-                format!("Failed to start container: {}", e),
-            )
+            runtime_app_error(&e, "container.create", RuntimeErrorContext::Mutation)
         })?;
 
     info!(

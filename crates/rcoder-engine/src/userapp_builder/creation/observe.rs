@@ -23,9 +23,18 @@ pub(crate) async fn observe_created_ready(
     }
     let info = crate::userapp_builder::refreshed_registration(&evidence.container, &runtime)
         .unwrap_or_else(|| evidence.container.clone());
-    if !crate::userapp_builder::probe_file_server(&crate::userapp_builder::dev_file_server_addr(
-        state, &info,
-    )?)
+    let credentials = crate::userapp_forward::file_credentials::credentials(
+        state,
+        shared_types::UserappStage::Dev,
+        &context.app_id,
+        Instant::now() + Duration::from_secs(3),
+    )
+    .await
+    .map_err(shared_types::WakeFailure::into_app_error)?;
+    if !crate::userapp_builder::probe_file_server(
+        &crate::userapp_builder::dev_file_server_addr(state, &info)?,
+        &credentials,
+    )
     .await
     {
         return Ok(None);

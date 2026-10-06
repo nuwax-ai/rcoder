@@ -144,9 +144,13 @@ pub async fn owner_serve(
                     // 只能靠预算超时（app 11 式静默）。
                     {
                         let kernel = kernel.clone();
+                        let event_state = state.clone();
                         crate::orchestration_events::install_bridge(Box::new(move |json| {
-                            if let Some(record) = bridge_event_fields(&json) {
+                            if let Some(operation_id) = event_state.current_runtime_operation()
+                                && let Some(record) = bridge_event_fields(&json)
+                            {
                                 kernel.append_orchestration_event(
+                                    &operation_id,
                                     &record.stage,
                                     record.service,
                                     &record.event_name,
@@ -556,7 +560,6 @@ async fn business_session_inner(
                             )?;
                         }
                         let release = crate::manifest::read_release_lock(&workspace)?;
-                        crate::migration_journal::require_confirmed_migrations(&workspace)?;
                         let mut journal = state
                             .journal
                             .lock()
@@ -598,7 +601,6 @@ async fn business_session_inner(
                             .and_then(|request| request.execution_target);
                         let workspace =
                             resolved_execution_workspace(&args.workspace, target, &state)?;
-                        crate::migration_journal::require_confirmed_migrations(&workspace)?;
                         let release = crate::manifest::read_release_lock(&workspace)?;
                         anyhow::ensure!(
                             release.release_id == active.artifact_release_id,
@@ -1113,7 +1115,6 @@ async fn serve_supervised_worker(
                             )?;
                         }
                         let release = crate::manifest::read_release_lock(&workspace)?;
-                        crate::migration_journal::require_confirmed_migrations(&workspace)?;
                         let mut journal = state
                             .journal
                             .lock()
@@ -1153,7 +1154,6 @@ async fn serve_supervised_worker(
                             .and_then(|request| request.execution_target);
                         let workspace =
                             resolved_execution_workspace(&args.workspace, target, &state)?;
-                        crate::migration_journal::require_confirmed_migrations(&workspace)?;
                         let release = crate::manifest::read_release_lock(&workspace)?;
                         anyhow::ensure!(
                             release.release_id == active.artifact_release_id,
@@ -1233,9 +1233,13 @@ async fn serve_supervised_worker(
                 state.set_runtime_kernel(kernel.clone());
                 {
                     let kernel = kernel.clone();
+                    let event_state = state.clone();
                     crate::orchestration_events::install_bridge(Box::new(move |json| {
-                        if let Some(record) = bridge_event_fields(&json) {
+                        if let Some(operation_id) = event_state.current_runtime_operation()
+                            && let Some(record) = bridge_event_fields(&json)
+                        {
                             kernel.append_orchestration_event(
+                                &operation_id,
                                 &record.stage,
                                 record.service,
                                 &record.event_name,
@@ -1817,7 +1821,23 @@ pub(super) async fn assemble_runtime_kernel(
                 let state = dispatch_state.clone();
                 let source = dispatch_workspace.clone();
                 tokio::spawn(async move {
-                    let checked = crate::manifest::preflight_startup(&source, dev_profile).await;
+                    if state.settle_cancelled_before_execution(&operation_id).await {
+                        return;
+                    }
+                    // This original admitted Source operation owns derivation;
+                    // neither its CLI caller nor artifact restoration writes it.
+                    // Retain the writer until physical publication has ended so
+                    // a native Stop/Shutdown cannot claim an unfinished writer.
+                    let checked = async {
+                        let mut writer = state.begin_auxiliary_write()?;
+                        let prepared = crate::build_deploy::source_lock::prepare(&source).await;
+                        // This is a rebuildable cache, not an unknown database
+                        // write. A completed I/O error remains retryable input.
+                        writer.confirm();
+                        prepared?;
+                        crate::manifest::preflight_startup(&source, dev_profile).await
+                    }
+                    .await;
                     if let Err(error) = checked {
                         if let Err(persist) = state
                             .finish_runtime_operation_by_id(
@@ -1920,7 +1940,9 @@ fn restore_standalone_generation_before_identity(
             journal.preserve_source_history()?;
             state.begin_source_history_hold();
             if credential_recovery::redacted_run_credentials(receipt) {
-                state.begin_credentials_hold();
+                tracing::warn!(
+                    "historical PostgreSQL input was redacted; source history remains unavailable"
+                );
             }
             // Retain the original bytes and real journal lease. The new Source
             // operation will publish its own identity after normal cleanup.
@@ -2122,9 +2144,9 @@ pub(super) fn recover_legacy_execution_target(
 }
 
 /// Resolving a confirmed directory is also needed by the idle control loop.
-/// Missing redacted credentials must suppress automatic business startup, not
-/// prevent the owner from consuming Stop. This does not clear recovery holds
-/// or authorize deployment; admission retains its existing checks.
+/// Durable credentials restore the confirmed business input. Historical
+/// redaction is diagnostic only; current environment or application inputs may
+/// still restore business. Identity and physical recovery checks remain intact.
 pub(super) fn restored_runtime_args_inner(
     args: &RuntimeArgs,
     state: &ServerState,
@@ -2146,7 +2168,9 @@ pub(super) fn restored_runtime_args_inner(
                 .as_ref()
                 .is_some_and(credential_recovery::redacted_run_credentials);
             if missing_credentials {
-                state.begin_credentials_hold();
+                tracing::warn!(
+                    "historical PostgreSQL input was redacted; source history remains unavailable"
+                );
             }
         } else {
             state.begin_runtime_recovery_hold();
@@ -2175,7 +2199,9 @@ pub(super) fn restored_runtime_args_inner(
                     .preserve_source_history()?;
                 state.begin_source_history_hold();
                 if credential_recovery::redacted_run_credentials(&receipt) {
-                    state.begin_credentials_hold();
+                    tracing::warn!(
+                        "historical PostgreSQL input was redacted; deployment generation changed"
+                    );
                 }
                 return Err(
                     credential_recovery::SourceHistoryProblem::DeploymentGenerationChanged.into(),
@@ -2190,18 +2216,6 @@ pub(super) fn restored_runtime_args_inner(
             .as_ref()
             .and_then(|active| active.request.as_ref())
         {
-            if require_run_credentials
-                && request
-                    .run_pg
-                    .as_ref()
-                    .is_some_and(|pg| pg.password.is_empty())
-                && !env_deploy_requested(state)
-            {
-                state.begin_credentials_hold();
-                anyhow::bail!(
-                    "confirmed runtime requires explicit PostgreSQL credentials before restarting business"
-                );
-            }
             // Old local-artifact receipts without a target cannot establish that
             // source/.run was selected safely. Keep recovery protection.
             if request.local_path.is_some() && request.execution_target.is_none() {
@@ -2214,6 +2228,19 @@ pub(super) fn restored_runtime_args_inner(
                 resolved_execution_workspace(&args.workspace, request.execution_target, state)?;
             if let Some(target) = request.execution_target {
                 state.set_pending_dev_profile(target == ExecutionTarget::Source);
+            }
+            if require_run_credentials && !env_deploy_requested(state) {
+                let mut pending = state
+                    .pending_run_config
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("pending run credential lock poisoned"))?;
+                // A current operation's explicit input wins over historical
+                // receipt data. Do not mutate or backfill the historical file.
+                if let Some(pg) = pending.as_ref() {
+                    shared_types::resolve_source_run_pg(Some(pg))?;
+                } else {
+                    *pending = credential_recovery::restored_run_pg(request.run_pg.as_ref())?;
+                }
             }
         }
     }
@@ -2257,10 +2284,6 @@ pub(super) async fn initialize_startup(
     }
     let restored = restored_runtime_args(&stopped_args, state)?;
     let args = &restored;
-    if let Err(error) = crate::migration_journal::require_confirmed_migrations(&args.workspace) {
-        state.begin_runtime_recovery_hold();
-        return Err(error).context("database migration requires reconciliation");
-    }
     if env_deploy_requested(state) {
         let generation = std::env::var(shared_types::APP_DEPLOY_GENERATION_ID)
             .context("APP_DEPLOY_GENERATION_ID is required")?;
@@ -2308,8 +2331,8 @@ pub(super) async fn initialize_startup(
         if receipt.boundary == Boundary::StartupFailed {
             // Explicit recovery of the confirmed artifact. Spec semantics: a
             // completed stop is not a permanent disable — a deliberate restart
-            // must bring the business back. The artifact identity and confirmed
-            // migrations were verified before resume; a fresh process scope
+            // must bring the business back. The artifact identity was verified
+            // before resume; a fresh process scope
             // proves the previous orchestration processes are gone, so this is
             // a new explicit attempt, not an in-process retry loop. The failed
             // operation itself stays failed in deploy status — recovery here
@@ -2351,7 +2374,7 @@ pub(super) async fn initialize_startup(
         state.set_release(release);
         // Reusing the confirmed artifact does not exchange directories. Keep
         // its existing boundary so a process stop cannot invent an interrupted
-        // activation. MigrationJournal independently fences unknown SQL work.
+        // activation. MigrationJournal retains diagnostics and the execution lease.
         state.set_phase(ServerPhase::Orchestrating);
         return Ok(Some(InitialAction::Existing {
             workspace: args.workspace.clone(),

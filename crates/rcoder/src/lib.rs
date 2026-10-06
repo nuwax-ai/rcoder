@@ -69,6 +69,7 @@ pub async fn run() -> anyhow::Result<()> {
         merged_fs,
         proxy_result,
         bg_handles,
+        startup_tasks,
         shutdown_tx,
         mut shutdown_rx,
         config,
@@ -82,32 +83,44 @@ pub async fn run() -> anyhow::Result<()> {
         _config_watcher,
     } = engine;
 
+    let sse_registry = Arc::clone(&state.session_stream_registry);
     let app = router::create_router(state, Some(Arc::clone(&telemetry)), merged_fs);
-    let server_handle = server::start_http_server(app, config.port, shutdown_tx.clone()).await?;
+    let server_handle = server::start_http_server(
+        app,
+        config.port,
+        shutdown_tx.clone(),
+        Arc::clone(&sse_registry),
+    )
+    .await?;
 
     let _ = shutdown_rx.recv().await;
     let deadline = tokio::time::Instant::now() + shutdown::SHUTDOWN_BUDGET;
+    sse_registry.close();
+    startup_tasks.stop();
     userapp_op_flight.close();
     // Tasks created after the first signal still need the shutdown notification.
     let _ = shutdown_tx.send(());
     if let Some(tx) = proxy_result.pingora_shutdown_tx {
-        let _ = tx.send(());
+        // A closed receiver is verified by the thread join below.
+        let _ = tx.send(deadline);
     }
     // Both producers receive shutdown before either is awaited. Detached business
     // tasks keep their admission guards through durable terminal publication.
     tokio::time::timeout_at(deadline, server_handle)
         .await
         .map_err(|_| anyhow::anyhow!("HTTP drain timed out; storage remains owned"))??;
+    sse_registry.drain(deadline).await?;
     if let Some(handle) = proxy_result.proxy_handle {
         tokio::time::timeout_at(deadline, handle)
             .await
-            .map_err(|_| anyhow::anyhow!("proxy drain timed out; storage remains owned"))??;
+            .map_err(|_| anyhow::anyhow!("proxy drain timed out; storage remains owned"))???;
     }
     tokio::time::timeout_at(deadline, file_server_proxy::stop())
         .await
         .map_err(|_| anyhow::anyhow!("file-server proxy drain timed out; storage remains owned"))?
         .map_err(anyhow::Error::msg)?;
     bg_handles.drain(deadline).await?;
+    startup_tasks.drain(deadline).await?;
     shutdown::graceful_shutdown(
         deadline,
         config.clone(),

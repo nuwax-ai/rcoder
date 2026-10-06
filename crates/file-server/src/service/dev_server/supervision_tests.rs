@@ -192,6 +192,177 @@ while True:
 /// 慢编排器（无监督面、仅存活）：探活窗口内进程存活但永不就绪。
 const SLEEP_ORCHESTRATOR: &str = "#!/bin/sh\nexec sleep 120\n";
 
+fn original_process_identity(pid: u32) -> String {
+    let output = std::process::Command::new("python3")
+        .args(["-c", "import pathlib,subprocess,sys; pid=sys.argv[1]; print(pathlib.Path('/proc/'+pid+'/stat').read_text().rsplit(')',1)[1].split()[19] if sys.platform=='linux' else subprocess.check_output(['ps','-p',pid,'-o','lstart='],text=True).strip())", &pid.to_string()])
+        .output().expect("read native process start time");
+    assert!(
+        output.status.success(),
+        "original process {pid} must exist: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let identity = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+    assert!(
+        !identity.is_empty(),
+        "original process start time must be present"
+    );
+    identity
+}
+
+/// The real registered child survives observation expiry until explicit Stop.
+#[tokio::test]
+async fn local_manifest_observation_uses_parent_deadline_without_cancelling_original_child() {
+    let env = fixture_env(SLEEP_ORCHESTRATOR).await;
+    let key = "userapp:local-observation-budget";
+    let mut hooks = crate::service::dev_server::DevEventHooks::noop();
+    hooks.launch_deadline =
+        Some(tokio::time::Instant::now() + std::time::Duration::from_millis(400));
+    let mut starting = tokio::spawn({
+        let manager = env.manager.clone();
+        let workspace = env.workspace.clone();
+        async move {
+            manager
+                .start_dev(
+                    key,
+                    &workspace,
+                    crate::service::dev_server::DevLaunch {
+                        base_path: None,
+                        hooks: Some(hooks),
+                        pg: None,
+                        request_context: Some("original-local-task"),
+                        artifact_release_id: None,
+                    },
+                )
+                .await
+        }
+    });
+    let child = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        loop {
+            if let Some(child) = env.manager.supervised_child(key) {
+                break child;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("real child registered before readiness observation");
+    let pid = child.pid();
+    let identity = original_process_identity(pid);
+    let launch_id = lock(&env.manager.launches).unwrap()[key].launch_id.clone();
+    assert_eq!(lock(&env.manager.processes).unwrap()[key].pid, pid);
+    let observed = tokio::time::timeout(std::time::Duration::from_millis(600), &mut starting).await;
+    let same_registered = env
+        .manager
+        .supervised_child(key)
+        .is_some_and(|registered| Arc::ptr_eq(&registered, &child))
+        && lock(&env.manager.launches).unwrap()[key].launch_id == launch_id
+        && lock(&env.manager.processes).unwrap()[key].pid == pid;
+    let alive_after_observation = is_alive(pid) && original_process_identity(pid) == identity;
+    if observed.is_err() {
+        starting.abort();
+    }
+    let stopped = env
+        .manager
+        .stop_dev(key)
+        .await
+        .expect("explicit Stop collects the original child");
+    wait_until_dead(pid, "original local deadline child").await;
+    assert!(stopped.killed_pids.iter().any(|k| k.pid == pid && k.killed));
+    let error = observed.expect("local readiness observation must consume the parent budget rather than start another full poll window")
+        .expect("local start worker").expect_err("deadline cannot be reported as readiness success");
+    assert!(error.to_string().contains("deadline"), "{error}");
+    assert!(
+        same_registered,
+        "deadline preserves the original launch and process registration"
+    );
+    assert!(
+        alive_after_observation,
+        "deadline ends observation, not the accepted original business execution"
+    );
+}
+
+/// Native Stop takes 300ms in this fixture. Its original identity remains
+/// recoverable, but a 200ms parent budget cannot authorize a late directory switch.
+#[tokio::test]
+async fn local_restart_cleanup_consumes_parent_budget_before_activation() {
+    let env = fixture_env(ORCHESTRATOR_FIXTURE).await;
+    let key = "userapp:local-cleanup-budget";
+    let started = env
+        .manager
+        .start_dev(
+            key,
+            &env.workspace,
+            crate::service::dev_server::DevLaunch {
+                base_path: None,
+                hooks: None,
+                pg: None,
+                request_context: None,
+                artifact_release_id: None,
+            },
+        )
+        .await
+        .expect("original local execution");
+    let original_identity = original_process_identity(started.pid);
+    assert_eq!(lock(&env.manager.processes).unwrap()[key].pid, started.pid);
+    assert_eq!(
+        env.manager.supervised_child(key).unwrap().pid(),
+        started.pid
+    );
+    assert!(is_alive(started.pid) && original_process_identity(started.pid) == original_identity);
+    let mut hooks = crate::service::dev_server::DevEventHooks::noop();
+    hooks.launch_deadline =
+        Some(tokio::time::Instant::now() + std::time::Duration::from_millis(200));
+    let activated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let activation = activated.clone();
+    let workspace = env.workspace.clone();
+    let outcome = env
+        .manager
+        .restart_dev_staged(
+            key,
+            &env.workspace,
+            crate::service::dev_server::DevLaunch {
+                base_path: None,
+                hooks: Some(hooks),
+                pg: None,
+                request_context: Some("original-cleanup-task"),
+                artifact_release_id: None,
+            },
+            async move {
+                std::fs::write(workspace.join("marker.txt"), "B").unwrap();
+                activation.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(workspace)
+            },
+        )
+        .await;
+    let did_activate = activated.load(std::sync::atomic::Ordering::SeqCst);
+    let marker_after_observation =
+        std::fs::read_to_string(env.workspace.join("marker.txt")).unwrap();
+    env.manager
+        .stop_userapp_dev(key, &env.workspace)
+        .await
+        .expect("resume original physical cleanup");
+    wait_until_dead(started.pid, "original cleanup-budget orchestrator").await;
+    let requests = stop_log_of(&env.workspace);
+    assert!(!requests.is_empty(), "native Stop really executed");
+    assert_eq!(
+        requests
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        1,
+        "cleanup retry must keep the original Stop identity: {requests:?}"
+    );
+    assert!(
+        outcome.is_err(),
+        "the consumed parent budget must end restart observation"
+    );
+    assert!(
+        !did_activate,
+        "cleanup consumed the parent deadline; no late activation or new launch is authorized"
+    );
+    assert_eq!(marker_after_observation, "A");
+}
+
 fn require_python3() {
     let Ok(status) = std::process::Command::new("python3")
         .arg("-c")
@@ -376,6 +547,283 @@ async fn starting_registration_is_fully_published_and_stoppable_during_poll() {
     assert!(lock(&env.manager.processes).unwrap().is_empty());
     assert!(lock(&env.manager.launches).unwrap().is_empty());
     assert!(lock(&env.manager.supervised).unwrap().is_empty());
+}
+
+/// 真正的 start_dev 发表本地 child 后卡住提交回调：Stop 收束原 child，
+/// 再用既有持久 intent API 注入 external successor，然后才恢复旧探活。
+/// successor 的登记是受控故障注入，不宣称真实 owner/容器端到端验收。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_local_start_does_not_retire_an_external_successor_after_stop() {
+    use std::time::Duration;
+
+    struct SubmissionGate {
+        entered: tokio::sync::Notify,
+        released: std::sync::Mutex<bool>,
+        condition: std::sync::Condvar,
+    }
+    impl SubmissionGate {
+        fn release(&self) {
+            let mut released = self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *released = true;
+            self.condition.notify_all();
+        }
+    }
+    struct ReleaseOnDrop(Arc<SubmissionGate>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    struct OriginalChildCleanup(Arc<super::SupervisedChild>);
+    impl Drop for OriginalChildCleanup {
+        fn drop(&mut self) {
+            if self.0.exited().is_none() {
+                let _ = super::process::kill_process_group_force(self.0.pid());
+            }
+        }
+    }
+
+    let env = fixture_env(SLEEP_ORCHESTRATOR).await;
+    let key = "userapp:late-local-failure";
+    let gate = Arc::new(SubmissionGate {
+        entered: tokio::sync::Notify::new(),
+        released: std::sync::Mutex::new(false),
+        condition: std::sync::Condvar::new(),
+    });
+    let _release_on_drop = ReleaseOnDrop(gate.clone());
+    let mut hooks = super::DevEventHooks::noop();
+    hooks.on_submitted = Some(Arc::new({
+        let gate = gate.clone();
+        move || {
+            // 卡住真实生产回调，不能持任何 manager registry 锁。
+            gate.entered.notify_one();
+            let mut released = gate.released.lock().unwrap();
+            while !*released {
+                released = gate.condition.wait(released).unwrap();
+            }
+        }
+    }));
+    let mut starting = tokio::spawn({
+        let manager = env.manager.clone();
+        let workspace = env.workspace.clone();
+        async move {
+            manager
+                .start_dev(
+                    key,
+                    &workspace,
+                    super::DevLaunch {
+                        base_path: None,
+                        hooks: Some(hooks),
+                        pg: None,
+                        request_context: Some("original-local-task"),
+                        artifact_release_id: None,
+                    },
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .expect("真实 local child 的完整登记必须先于提交回调");
+    let child = env.manager.supervised_child(key).unwrap();
+    let original_pid = child.pid();
+    let _original_cleanup = OriginalChildCleanup(child.clone());
+    let original_launch = lock(&env.manager.launches)
+        .unwrap()
+        .get(key)
+        .unwrap()
+        .launch_id
+        .clone();
+    assert!(is_alive(original_pid));
+    let stopped = tokio::time::timeout(
+        Duration::from_secs(8),
+        env.manager.stop_userapp_dev(key, &env.workspace),
+    )
+    .await
+    .expect("提交回调只持测试门，不能阻止真实 Stop")
+    .expect("显式 Stop 必须确认原 child 退出并条件退休原登记");
+    wait_until_dead(original_pid, "stopped original startup child").await;
+    assert!(matches!(child.exited(), Some(super::ChildExit::Exited(_))));
+    assert!(
+        stopped
+            .killed_pids
+            .iter()
+            .any(|entry| entry.pid == original_pid && entry.killed)
+    );
+    assert!(!lock(&env.manager.launches).unwrap().contains_key(key));
+    assert!(!starting.is_finished(), "旧 start 仍被真实提交回调门控");
+
+    // 真实小型 HTTP owner 进程绑定 successor 的 address/instance 物理见证。
+    // 仅提供 identity，所有访问留痕；不伪造运行成功，也不忽略 TERM/KILL。
+    const SUCCESSOR_IDENTITY_SERVER: &str = r#"
+import http.server, pathlib, sys
+address_file, payload, request_file = sys.argv[1:]
+class Handler(http.server.BaseHTTPRequestHandler):
+    def record(self):
+        with open(request_file, 'a') as stream:
+            stream.write(self.command + ' ' + self.path + '\n')
+    def do_GET(self):
+        self.record()
+        self.send_response(200 if self.path == '/v1/runtime/identity' else 404)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(payload.encode())
+    def do_POST(self):
+        self.record()
+        self.send_response(409)
+        self.end_headers()
+    def log_message(self, *_):
+        pass
+server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+pathlib.Path(address_file).write_text('127.0.0.1:%d' % server.server_port)
+server.serve_forever()
+"#;
+    let address_file = env.workspace.join("successor-address.txt");
+    let request_file = env.workspace.join("successor-requests.txt");
+    let identity = shared_types::RuntimeIdentityView {
+        application_id: std::env::var("PROJECT_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "unknown-app".into()),
+        service_family: "userapp-dev".into(),
+        workspace_id: "successor-workspace".into(),
+        source_root: env.workspace.display().to_string(),
+        runtime_instance_id: "external-successor-instance".into(),
+        deployment_generation_id: "successor-generation".into(),
+        protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+        capabilities: Vec::new(),
+    };
+    let mut successor = tokio::process::Command::new("python3")
+        .args(["-c", SUCCESSOR_IDENTITY_SERVER])
+        .arg(&address_file)
+        .arg(serde_json::to_string(&shared_types::HttpResult::success(identity.clone())).unwrap())
+        .arg(&request_file)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("独立 successor HTTP owner 进程");
+    let successor_pid = successor.id().unwrap();
+    assert_ne!(successor_pid, original_pid);
+    let successor_process_identity = original_process_identity(successor_pid);
+    let successor_address = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(address) = tokio::fs::read_to_string(&address_file).await
+                && !address.is_empty()
+            {
+                break address;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("真实 successor HTTP owner 必须发布监听地址");
+    let observed = super::owner_client::probe_owner(&successor_address)
+        .await
+        .unwrap()
+        .expect("真实 successor identity 响应");
+    assert_eq!(observed.runtime_instance_id, identity.runtime_instance_id);
+    let external = crate::models::ExternalOwner {
+        address: successor_address,
+        token: "controlled-successor-token".into(),
+        runtime_instance_id: observed.runtime_instance_id,
+    };
+    let request = shared_types::RuntimeOperationRequest {
+        operation_id: "controlled-successor-operation".into(),
+        expected_runtime_instance_id: external.runtime_instance_id.clone(),
+        expected_revision: 0,
+        workspace_id: "successor-workspace".into(),
+        kind: shared_types::RuntimeOperationKind::Restart,
+        profile: shared_types::RunProfileInput::Source {
+            workspace_id: "successor-workspace".into(),
+        },
+        run_config: None,
+        request_context: Some("successor-task".into()),
+    };
+    let intent = env
+        .manager
+        .prepare_external_intent(key, &env.workspace, &external, &request)
+        .expect("既有持久发布 API 注入后继 external 登记，不另造生产测试 seam");
+    let published = lock(&env.manager.processes)
+        .unwrap()
+        .get(key)
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        published
+            .external_owner
+            .as_ref()
+            .unwrap()
+            .runtime_instance_id,
+        external.runtime_instance_id
+    );
+
+    gate.release();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), &mut starting).await;
+    if outcome.is_err() {
+        starting.abort();
+    }
+    let remaining = lock(&env.manager.processes).unwrap().get(key).cloned();
+    let durable = env.manager.read_external_state().unwrap();
+    let successor_survived = successor.try_wait().unwrap().is_none();
+    let successor_identity_after =
+        successor_survived.then(|| original_process_identity(successor_pid));
+    let successor_requests = std::fs::read_to_string(&request_file).unwrap();
+    // 收集物理证据后总是清理本测试拥有的见证进程，再进行回归断言。
+    if successor_survived {
+        successor.start_kill().unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), successor.wait())
+        .await
+        .expect("见证进程必须退出")
+        .expect("收割见证进程");
+
+    let error = outcome
+        .expect("恢复原回调后旧 start 必须有界结束")
+        .expect("旧 start worker")
+        .expect_err("原 child 已被 Stop 收束，旧探活不能返回成功");
+    assert!(
+        error.to_string().contains(&format!("pid {original_pid}")),
+        "必须保留原探活早退错误，不被后继登记的清理拒绝覆盖：{error}"
+    );
+    let remaining = remaining.expect("旧启动失败收尾不能删除 successor DevProcess");
+    assert_eq!(
+        remaining
+            .external_owner
+            .as_ref()
+            .unwrap()
+            .runtime_instance_id,
+        external.runtime_instance_id
+    );
+    let owner = durable.owners.get(key).expect("后继持久 owner 必须保留");
+    assert_eq!(
+        owner.registration_operation_id.as_deref(),
+        Some(intent.request.operation_id.as_str())
+    );
+    assert_eq!(
+        owner.owner.runtime_instance_id,
+        external.runtime_instance_id
+    );
+    assert!(
+        successor_survived,
+        "旧收尾不得对 successor owner 进程发送 TERM/KILL"
+    );
+    assert_eq!(
+        successor_requests.lines().collect::<Vec<_>>(),
+        ["GET /v1/runtime/identity"],
+        "旧收尾不得向 successor 发送停止/重启或其他控制请求"
+    );
+    assert_eq!(
+        successor_identity_after.as_deref(),
+        Some(successor_process_identity.as_str())
+    );
+    assert!(
+        !lock(&env.manager.launches)
+            .unwrap()
+            .values()
+            .any(|launch| launch.launch_id == original_launch)
+    );
 }
 
 /// R1（旧记录但无进程）：磁盘保留 phase=Ready 的历史记录、owner 已退

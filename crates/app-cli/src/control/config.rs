@@ -23,13 +23,13 @@ pub enum Command {
     /// to restore management access without automatically starting application services.
     /// This command does not build the workspace.
     Serve(ServeArgs),
-    /// Run workspace services in the foreground and supervise them until stopped or exited.
+    /// Submit an explicit start request to the persistent management owner.
     ///
-    /// Starts services from release.lock.toml without building. When managing services
-    /// locally, the process stays running after startup. If an owner already exists,
-    /// the request is coordinated through that owner. Set APP_CLI_RUN_PROFILE=dev
-    /// to prefer [devrun]; otherwise [run] is used. Prefer serve for persistent
-    /// management, repeated start/stop operations, and deployments.
+    /// Reuses an existing verified owner or bootstraps serve --control-only.
+    /// Returns the original operation result; management remains running after
+    /// business Stop or a failed request. Source starts use current manifests and
+    /// prefer [devrun], then [run], without executing builds. Explicit APP_DEPLOY_*
+    /// input is forwarded as an artifact deployment rather than a Source start.
     Run(RunArgs),
     /// Build workspace services and optionally assemble a deployment directory without starting services.
     Build(BuildArgs),

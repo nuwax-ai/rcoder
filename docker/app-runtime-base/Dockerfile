@@ -19,7 +19,10 @@ FROM ${DOCKER_MIRROR}rust:trixie
 # 设置环境变量
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
-ENV TTYD_VERSION=1.7.7
+ARG TTYD_VERSION=1.7.7
+ENV TTYD_VERSION=${TTYD_VERSION}
+ARG NODE_RUNTIME_VERSION=22.23.2
+ARG DENO_VERSION=2.9.7
 # pingap 版本唯一来源 = docker/build-app-runtime.py 注入（与 make/docker.mk 的
 # dev agent-runner 构建同值；单一事实源 = app-cli devtool.rs，由 pingap_version_gate.py 核对）。
 # 此处不写默认值,避免多处版本号需同步;裸 docker build 不传 build-arg 会 fail-fast
@@ -86,7 +89,7 @@ RUN apt-get update && apt-get install -y \
 # 安装 ttyd (Web 终端) — 二进制预下载到 downloads/（与 build-agent-docker 09 同源分发）, COPY 进容器
 ARG TARGETARCH
 COPY downloads/ttyd-${TARGETARCH} /usr/local/bin/ttyd
-RUN chmod +x /usr/local/bin/ttyd && mkdir -p /usr/local/share/ttyd
+RUN chmod +x /usr/local/bin/ttyd && ttyd --version 2>&1 | grep -F "${TTYD_VERSION}" && mkdir -p /usr/local/share/ttyd
 
 # 复制 ttyd 启动脚本
 COPY start-ttyd.sh /usr/local/bin/start-ttyd.sh
@@ -159,9 +162,9 @@ RUN case "$(dpkg --print-architecture)" in \
 # 注: Node prebuilt 文件名用 x64 (非 amd64), dpkg 映射 amd64→x64。
 RUN ARCH=$(dpkg --print-architecture) \
     && case "$ARCH" in amd64) NA=x64 ;; arm64) NA=arm64 ;; *) echo "❌ Unsupported arch: $ARCH" >&2; exit 1 ;; esac \
-    && ls /tmp/cache/node-v*-linux-${NA}.tar.gz >/dev/null 2>&1 || { echo "❌ Node tarball missing in cache/"; exit 1; } \
-    && tar -C /usr/local -xzf /tmp/cache/node-v*-linux-${NA}.tar.gz --strip-components=1 \
-    && node --version && npm --version \
+    && test -f /tmp/cache/node-v${NODE_RUNTIME_VERSION}-linux-${NA}.tar.gz || { echo "❌ Node tarball missing in cache/"; exit 1; } \
+    && tar -C /usr/local -xzf /tmp/cache/node-v${NODE_RUNTIME_VERSION}-linux-${NA}.tar.gz --strip-components=1 \
+    && test "$(node --version)" = "v${NODE_RUNTIME_VERSION}" && npm --version \
     && npm config set fetch-retries 5 \
     && rm -rf /tmp/cache/node-*
 
@@ -170,7 +173,7 @@ RUN ARCH=$(dpkg --print-architecture) \
 RUN ARCH=$(dpkg --print-architecture) \
     && [ -f "/tmp/cache/deno-${ARCH}" ] || { echo "❌ Deno missing: /tmp/cache/deno-${ARCH}"; exit 1; } \
     && install -m 0755 /tmp/cache/deno-${ARCH} /usr/local/bin/deno \
-    && deno --version
+    && deno --version | grep -F "deno ${DENO_VERSION} "
 
 # ── Python（rust:trixie 自带 3.13）+ uv ────────────────────────────────────────
 # uv（Astral 极速 Python 包管理器，最新版）经 pip 装到 /usr/local/bin，在默认 PATH。
@@ -204,12 +207,14 @@ ENV PATH="${JAVA_HOME}/bin:${PATH}"
 # ── Go ───────────────────────────────────────────────────────────────────────────
 # Go tarball 预下载到 cache/（与 build-agent-docker download-go-cache 同源同版本）;
 # 缺失直接报错 (fail fast)。本段末尾统一清理 /tmp/cache（node/deno 段的残留也在此清掉）。
-ENV GO_VERSION=1.26.4
+ARG GO_VERSION=1.26.4
+ENV GO_VERSION=${GO_VERSION}
 RUN ARCH=$(dpkg --print-architecture) \
     && TARBALL="/tmp/cache/go${GO_VERSION}.linux-${ARCH}.tar.gz" \
     && [ -f "$TARBALL" ] || { echo "❌ Go tarball missing: $TARBALL"; exit 1; } \
     && echo "Using cached Go: $TARBALL" \
     && tar -C /usr/local -xzf "$TARBALL" \
+    && /usr/local/go/bin/go version | grep -F " go${GO_VERSION} " \
     && rm -rf /tmp/cache
 ENV GOPATH=/root/go
 # 多源冗余：七牛 → 阿里 → goproxy.io → direct（与 rcoder-agent-runner/Dockerfile.base 对齐）

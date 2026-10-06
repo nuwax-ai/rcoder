@@ -50,6 +50,17 @@ pub(crate) struct SseStreamParams {
 pub(crate) async fn build_sse_stream_from_container_name(
     params: SseStreamParams,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, AppError> {
+    if params.registry.is_closed() {
+        return Err(
+            AppError::from_code(shared_types::ERR_RUNTIME_UNAVAILABLE).with_error_detail(
+                shared_types::ErrorDetail::new(
+                    shared_types::ERR_RUNTIME_UNAVAILABLE,
+                    "sse_admission",
+                    "Server is draining accepted requests",
+                ),
+            ),
+        );
+    }
     // K8s 用 Service FQDN，Docker 用容器 IP（统一走 shared_types 分发）
     let grpc_addr = shared_types::build_grpc_addr(
         &params.container_name,

@@ -2,7 +2,7 @@
 //! Private inputs are resolved before admission; execution never admits child controls.
 use crate::models::*;
 use crate::service::{AppOperationGuard, AppService, OwnedOperation};
-use crate::utils::map_runtime_error;
+use crate::utils::{map_runtime_error, map_runtime_mutation_error};
 use serde::{Deserialize, Serialize};
 use shared_types::{UserAppControlCommand, UserAppExecutionInput, UserAppOperationKind};
 use std::sync::Arc;
@@ -93,31 +93,111 @@ impl AppService {
         request: StartAppRequest,
         restart: bool,
     ) -> AppResult<StartAppResult> {
+        let wait_deadline = if restart {
+            Some(self.restart_admission_deadline()?)
+        } else {
+            None
+        };
         super::start::validate_start_request(app_id, &request)?;
-        self.discover_missing_identity(app_id).await?;
-        self.verify_recovered_storage(app_id, shared_types::UserAppOperationScope::Prod)
-            .await?;
-        let guard = Arc::new(self.try_acquire_process_release_lock(app_id).await?);
-        let result = self
-            .deploy_admitted(app_id, request, restart, guard.clone())
-            .await;
-        let operation_id = match &result {
-            Ok(result) => result.operation_id.clone(),
-            Err(error) => error.operation_id().map(str::to_owned),
-        };
-        let correlate = |error: AppOperationError| match &operation_id {
-            Some(id) => error.with_operation_id(id.clone()),
-            None => error,
-        };
-        let guard = Arc::try_unwrap(guard).map_err(|_| {
-            correlate(AppOperationError::Conflict(
-                "Deployment executor still owns its resource lease".into(),
-            ))
-        })?;
-        if result.is_ok() || !guard.has_unfinished_mutation() {
-            guard.finish().await.map_err(correlate)?;
+        let identity = self.discover_missing_identity(app_id).await?;
+        if restart
+            && request
+                .url
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+            && identity.is_none()
+        {
+            // Do not mint an application row solely to reject a no-artifact
+            // restart. Authoritative absence remains the Java creation signal.
+            return Err(AppOperationError::NotFound(format!(
+                "Application to restart does not exist: {app_id}"
+            )));
         }
-        result
+        crate::service::restart_wait::prepare(
+            self.verify_recovered_storage(app_id, shared_types::UserAppOperationScope::Prod),
+        )
+        .await?;
+        crate::service::restart_wait::prepare(
+            self.metadata
+                .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref()),
+        )
+        .await?;
+        let captured_lifecycle = crate::service::restart_wait::prepare(async {
+            Ok(self
+                .metadata
+                .store
+                .get_application(app_id)
+                .await?
+                .map(|app| app.lifecycle_id))
+        })
+        .await?;
+        if restart
+            && let Some(previous) = crate::service::restart_wait::prepare(self.replay_control(
+                app_id,
+                &control_request(&request),
+                kind_from_restart(restart),
+                &deploy_fingerprint(&request)?,
+            ))
+            .await?
+        {
+            return decode_stored_deploy_result(&previous);
+        }
+        loop {
+            let guard = Arc::new(if let Some(deadline) = wait_deadline {
+                self.acquire_restart_admission_guard(
+                    app_id,
+                    captured_lifecycle.as_deref(),
+                    deadline,
+                )
+                .await?
+            } else {
+                self.try_acquire_process_release_lock(app_id).await?
+            });
+            let result = self
+                .deploy_admitted(app_id, request.clone(), restart, guard.clone())
+                .await;
+            let operation_id = match &result {
+                Ok(result) => result.operation_id.clone(),
+                Err(error) => error.operation_id().map(str::to_owned),
+            };
+            let correlate = |error: AppOperationError| match &operation_id {
+                Some(id) => error.with_operation_id(id.clone()),
+                None => error,
+            };
+            let guard = Arc::try_unwrap(guard).map_err(|_| {
+                correlate(AppOperationError::Conflict(
+                    "Deployment executor still owns its resource lease".into(),
+                ))
+            })?;
+            if result.is_ok() || !guard.has_unfinished_mutation() {
+                if let Some(deadline) = wait_deadline
+                    && operation_id.is_none()
+                    && result.is_err()
+                {
+                    guard.finish_unadmitted(deadline).await.map_err(correlate)?;
+                } else {
+                    guard.finish().await.map_err(correlate)?;
+                }
+            }
+            if let (Some(deadline), Err(error)) = (wait_deadline, &result)
+                && error.code() == shared_types::ERR_OPERATION_IN_PROGRESS
+                && error.operation_id().is_none()
+            {
+                self.wait_restart_blocker(
+                    app_id,
+                    result.err().ok_or_else(|| {
+                        AppOperationError::Backend(
+                            "Restart deployment rejection disappeared".into(),
+                        )
+                    })?,
+                    deadline,
+                )
+                .await?;
+                continue;
+            }
+            return result;
+        }
     }
 
     async fn deploy_admitted(
@@ -127,27 +207,54 @@ impl AppService {
         restart: bool,
         guard: Arc<AppOperationGuard>,
     ) -> AppResult<StartAppResult> {
-        self.metadata
-            .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())
-            .await?;
-        let identity = self.metadata.store.ensure_identity(app_id).await?;
+        crate::service::restart_wait::prepare(
+            self.metadata
+                .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref()),
+        )
+        .await?;
+        let initial_identity = if restart {
+            None
+        } else {
+            Some(self.metadata.store.ensure_identity(app_id).await?)
+        };
         let fingerprint = deploy_fingerprint(&request)?;
         let kind = kind_from_restart(restart);
-        if let Some(previous) = self
-            .replay_control(app_id, &control_request(&request), kind, &fingerprint)
+        if crate::service::restart_wait::prepare(async {
+            Ok(self.metadata.store.get_application(app_id).await?.is_some())
+        })
+        .await?
+            && let Some(previous) = crate::service::restart_wait::prepare(self.replay_control(
+                app_id,
+                &control_request(&request),
+                kind,
+                &fingerprint,
+            ))
             .await?
         {
             return decode_stored_deploy_result(&previous);
         }
         let operation_id = uuid::Uuid::new_v4().to_string();
-        let input = self
-            .prepare_deploy_input(app_id, request, restart, &operation_id)
-            .await?;
+        let input = crate::service::restart_wait::prepare(self.prepare_deploy_input(
+            app_id,
+            request,
+            restart,
+            &operation_id,
+        ))
+        .await?;
         let encoded = input.encode()?;
         let policy = shared_types::UserAppRuntimePolicy {
             recycle_enabled: input.request.idle_timeout_seconds.map(|value| value > 0),
             idle_timeout_seconds: input.request.idle_timeout_seconds,
             wake_on_traffic: Some(true),
+        };
+        // All runtime/configuration reads have finished. From this point the
+        // identity/admission writes are owned even if the receiver disappears.
+        if restart {
+            crate::service::restart_wait::begin_admission()?;
+        }
+        let identity = match initial_identity {
+            Some(identity) => identity,
+            None => self.metadata.store.ensure_identity(app_id).await?,
         };
         let mut operation = OwnedOperation::admit_with_input(
             self.metadata.store.clone(),
@@ -188,9 +295,17 @@ impl AppService {
                 .bind_deadline(now_ms.saturating_add(absolute_ms))
                 .await?;
         }
-        let result = self
-            .execute_deploy_input(app_id, input, &mut operation, guard.clone())
-            .await;
+        let result = async {
+            if restart {
+                self.metadata
+                    .store
+                    .check_compute_access(app_id, shared_types::UserAppOperationScope::Prod, true)
+                    .await?;
+            }
+            self.execute_deploy_input(app_id, input, &mut operation, guard.clone())
+                .await
+        }
+        .await;
         match result {
             Ok(result) => {
                 operation
@@ -202,6 +317,7 @@ impl AppService {
                 Ok(result)
             }
             Err(error) => {
+                let error = operation.correlate_error(error);
                 if guard.has_unfinished_mutation() {
                     operation
                         .fail(&error)
@@ -238,8 +354,11 @@ impl AppService {
             .as_deref()
             .is_some_and(|url| !url.trim().is_empty());
         if restart && !has_url && previous.is_none() {
-            return Err(AppOperationError::NotFound(
-                "Application to restart does not exist".into(),
+            return Err(map_runtime_error(
+                "Read deployment restart target",
+                container_runtime_api::ContainerRuntimeError::ContainerNotFound(
+                    "The retained application has no physical workload to restart".into(),
+                ),
             ));
         }
         if has_url
@@ -495,7 +614,13 @@ impl AppService {
                         .start_app_target_with_image(&target, restart_image.as_deref())
                         .await
                 }
-                .map_err(|error| map_runtime_error("Start captured deployment", error))?;
+                .map_err(|error| {
+                    map_runtime_mutation_error(
+                        "container_start",
+                        "Start captured deployment",
+                        error,
+                    )
+                })?;
                 if restart || restart_image.is_some() {
                     self.refresh_pingora_after_restart(app_id).await;
                 }
@@ -537,7 +662,13 @@ impl AppService {
                     },
                 )
                 .await
-                .map_err(|error| map_runtime_error("Apply deployment policy", error))?;
+                .map_err(|error| {
+                    map_runtime_mutation_error(
+                        "runtime_policy_apply",
+                        "Apply deployment policy",
+                        error,
+                    )
+                })?;
         }
         let sql_report = if url.is_some() && !hot && request.auto_execute_sql.unwrap_or(true) {
             match self.execute_database_sql(app_id).await {

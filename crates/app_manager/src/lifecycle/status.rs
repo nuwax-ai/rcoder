@@ -72,8 +72,9 @@ impl AppService {
         }
     }
 
-    /// 实时查状态，精确区分两种"查不到"：Ok(None)=集群中真不存在 → "应用不存在"(→404)；
-    /// Err=API Server 不可达/RBAC 拒绝 → "查询应用状态失败"(→500)。
+    /// Query failures retain their typed cause. An empty physical snapshot
+    /// is application absence only when there is no active authoritative row.
+    /// A retained active application instead reports CONTAINER_NOT_FOUND.
     ///
     /// 供需要精确错误分类的读路径（get_app/get_app_stats/ensure_app_exists）使用，
     /// 替代会塌缩错误的 `fetch_runtime_status`（后者仅供 create_app 这类 None 可接受的场景）。
@@ -87,21 +88,28 @@ impl AppService {
                 self.overlay_stored_runtime_policy(&mut s).await?;
                 Ok(s)
             }
-            Ok(None) => Err(AppOperationError::NotFound(format!(
-                "app does not exist: {app_id}"
-            ))),
+            Ok(None) => match self.metadata.store.get_application(app_id).await? {
+                Some(app) if app.state == shared_types::UserAppLifecycleState::Active => {
+                    Err(map_runtime_error(
+                        "Read application runtime",
+                        container_runtime_api::ContainerRuntimeError::ContainerNotFound(format!(
+                            "No physical workload exists for the retained application: {app_id}"
+                        )),
+                    ))
+                }
+                _ => Err(AppOperationError::NotFound(format!(
+                    "app does not exist: {app_id}"
+                ))),
+            },
             Err(e) => {
                 warn!("[APP] query app status failed app_id={}: {}", app_id, e);
-                Err(AppOperationError::Backend(format!(
-                    "failed to query app status: {e}"
-                )))
+                Err(map_runtime_error("failed to query app status", e))
             }
         }
     }
 
-    /// 确认 app 存在（集群中有 Deployment/容器），不存在返回"应用不存在"错误。
-    /// 调用方（start/stop/restart）据此返回 404，方便 Java 区分并触发 create 重建，
-    /// 而非收到 generic 500 误以为系统故障。
+    /// Require a physical workload; only authoritative application absence
+    /// may produce ERR_APP_NOT_FOUND. Physical absence never authorizes creation.
     pub(super) async fn ensure_app_exists(&self, app_id: &str) -> AppResult<()> {
         self.fetch_runtime_status_or_err(app_id).await.map(|_| ())
     }

@@ -45,7 +45,10 @@ impl AppService {
         app_id: &str,
         request: shared_types::UserAppControlRequest,
     ) -> AppResult<AppRuntimeInfo> {
-        self.activate_existing_runtime(app_id, request, true).await
+        crate::service::restart_wait::with_context(
+            self.activate_existing_runtime(app_id, request, true),
+        )
+        .await
     }
 
     async fn activate_existing_runtime(
@@ -59,121 +62,233 @@ impl AppService {
         } else {
             shared_types::UserAppOperationKind::Start
         };
+        let wait_deadline = if restart {
+            Some(self.restart_admission_deadline()?)
+        } else {
+            None
+        };
         validate_app_id(app_id)?;
         self.discover_missing_identity(app_id).await?;
-        self.verify_recovered_storage(app_id, shared_types::UserAppOperationScope::Prod)
-            .await?;
-        self.metadata
-            .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())
-            .await?;
-        // Check priority intent before waiting on the local process guard. A
-        // completed Stop permits an explicit start, an active Stop never queues it.
-        self.metadata
-            .store
-            .check_compute_access(app_id, shared_types::UserAppOperationScope::Prod, true)
-            .await?;
-        // restart 与带 url 的 deploy_controlled 一致：锁被占立即 Conflict；
-        // start 保持排队——本身是等待型操作（等就绪数分钟），调用方宽超时
-        // 预算覆盖排队。
-        let guard = if restart {
-            self.try_acquire_process_release_lock(app_id).await?
-        } else {
-            self.acquire_process_release_lock(app_id).await?
-        };
-        let result = async {
+        crate::service::restart_wait::prepare(
+            self.verify_recovered_storage(app_id, shared_types::UserAppOperationScope::Prod),
+        )
+        .await?;
+        crate::service::restart_wait::prepare(
             self.metadata
-                .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref())
-                .await?;
-            use sha2::Digest as _;
-            let fingerprint = hex::encode(sha2::Sha256::digest(
-                shared_types::encode_userapp_intent(&request).map_err(|error| {
-                    AppOperationError::Backend(format!("Encode runtime activation intent: {error}"))
-                })?,
-            ));
-            if self
-                .replay_control(app_id, &request, kind, &fingerprint)
+                .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref()),
+        )
+        .await?;
+        let captured_lifecycle = crate::service::restart_wait::prepare(async {
+            Ok(self
+                .metadata
+                .store
+                .get_application(app_id)
                 .await?
-                .is_some()
-            {
-                return self.get_app(app_id).await;
+                .map(|app| app.lifecycle_id))
+        })
+        .await?;
+        use sha2::Digest as _;
+        let fingerprint = hex::encode(sha2::Sha256::digest(
+            shared_types::encode_userapp_intent(&request).map_err(|error| {
+                AppOperationError::Backend(format!("Encode runtime activation intent: {error}"))
+            })?,
+        ));
+        if restart
+            && let Some(replayed) = crate::service::restart_wait::prepare(self.replay_control(
+                app_id,
+                &request,
+                kind,
+                &fingerprint,
+            ))
+            .await?
+        {
+            return self
+                .get_app(app_id)
+                .await
+                .map_err(|source| AppOperationError::Operation {
+                    operation_id: replayed.operation_id,
+                    source: Box::new(source),
+                });
+        }
+        loop {
+            // Check priority intent before waiting on the local process guard. A
+            // completed Stop permits an explicit start, an active Stop never queues it.
+            if !restart {
+                self.metadata
+                    .store
+                    .check_compute_access(app_id, shared_types::UserAppOperationScope::Prod, true)
+                    .await?;
             }
-            let previous = self.fetch_runtime_status_or_err(app_id).await?;
-            let mut operation = crate::service::OwnedOperation::admit(
-                self.metadata.store.clone(),
-                shared_types::UserAppAdmission {
-                    runtime_policy_on_success: None,
-                    command: Some(if restart {
-                        shared_types::UserAppControlCommand::Restart
-                    } else {
-                        shared_types::UserAppControlCommand::Start { traffic: false }
-                    }),
-                    app_id: app_id.into(),
-                    lifecycle_id: request.lifecycle_id.clone(),
-                    request_id: request.request_id.clone(),
-                    operation_id: uuid::Uuid::new_v4().to_string(),
+            // Restart shares one bounded pre-admission deadline across intent
+            // and physical ownership; Start keeps its existing queue semantics.
+            let guard = if let Some(deadline) = wait_deadline {
+                self.acquire_restart_admission_guard(
+                    app_id,
+                    captured_lifecycle.as_deref(),
+                    deadline,
+                )
+                .await?
+            } else {
+                self.acquire_process_release_lock(app_id).await?
+            };
+            let result = async {
+                crate::service::restart_wait::prepare(
+                    self.metadata.validate_request_lifecycle(
+                        app_id,
+                        captured_lifecycle
+                            .as_deref()
+                            .or(request.lifecycle_id.as_deref()),
+                    ),
+                )
+                .await?;
+                use sha2::Digest as _;
+                let fingerprint = hex::encode(sha2::Sha256::digest(
+                    shared_types::encode_userapp_intent(&request).map_err(|error| {
+                        AppOperationError::Backend(format!(
+                            "Encode runtime activation intent: {error}"
+                        ))
+                    })?,
+                ));
+                if let Some(replayed) = crate::service::restart_wait::prepare(self.replay_control(
+                    app_id,
+                    &request,
                     kind,
-                    request_fingerprint: fingerprint,
-                    metadata: None,
-                },
-            )
-            .await?;
-            let mutation = async {
-                operation.bind_lease(&guard).await?;
-                let context = operation.execution_context();
-                let target = self
-                    .capture_bound_app_target(&context, previous.resource_version.as_deref())
-                    .await?;
-                operation
-                    .checkpoint(
-                        if restart {
-                            "restarting_runtime"
+                    &fingerprint,
+                ))
+                .await?
+                {
+                    return self.get_app(app_id).await.map_err(|source| {
+                        AppOperationError::Operation {
+                            operation_id: replayed.operation_id,
+                            source: Box::new(source),
+                        }
+                    });
+                }
+                let previous =
+                    crate::service::restart_wait::prepare(self.fetch_runtime_status_or_err(app_id))
+                        .await?;
+                let mut operation = crate::service::OwnedOperation::admit(
+                    self.metadata.store.clone(),
+                    shared_types::UserAppAdmission {
+                        runtime_policy_on_success: None,
+                        command: Some(if restart {
+                            shared_types::UserAppControlCommand::Restart
                         } else {
-                            "starting_runtime"
-                        },
-                        serde_json::json!({"target":target}),
-                    )
-                    .await?;
-                operation.authorize_mutation().await?;
-                guard.mark_mutating()?;
-                let restart_image = crate::runtime::params::platform_restart_image(
-                    &std::env::var("RCODER_RUNTIME_IMAGE_DIGEST").ok(),
-                );
-                let result = if restart {
-                    self.runtime
-                        .restart_app_target(&target, restart_image.as_deref())
-                        .await
-                } else {
-                    self.runtime
-                        .start_app_target_with_image(&target, restart_image.as_deref())
-                        .await
-                };
-                result.map_err(|error| map_runtime_error("Activate captured application", error))
+                            shared_types::UserAppControlCommand::Start { traffic: false }
+                        }),
+                        app_id: app_id.into(),
+                        lifecycle_id: request.lifecycle_id.clone(),
+                        request_id: request.request_id.clone(),
+                        operation_id: uuid::Uuid::new_v4().to_string(),
+                        kind,
+                        request_fingerprint: fingerprint,
+                        metadata: None,
+                    },
+                )
+                .await?;
+                let mutation = async {
+                    if restart {
+                        self.metadata
+                            .store
+                            .check_compute_access(
+                                app_id,
+                                shared_types::UserAppOperationScope::Prod,
+                                true,
+                            )
+                            .await?;
+                    }
+                    operation.bind_lease(&guard).await?;
+                    let context = operation.execution_context();
+                    let target = self
+                        .capture_bound_app_target(&context, previous.resource_version.as_deref())
+                        .await?;
+                    operation
+                        .checkpoint(
+                            if restart {
+                                "restarting_runtime"
+                            } else {
+                                "starting_runtime"
+                            },
+                            serde_json::json!({"target":target}),
+                        )
+                        .await?;
+                    operation.authorize_mutation().await?;
+                    guard.mark_mutating()?;
+                    let restart_image = crate::runtime::params::platform_restart_image(
+                        &std::env::var("RCODER_RUNTIME_IMAGE_DIGEST").ok(),
+                    );
+                    let result = if restart {
+                        self.runtime
+                            .restart_app_target(&target, restart_image.as_deref())
+                            .await
+                    } else {
+                        self.runtime
+                            .start_app_target_with_image(&target, restart_image.as_deref())
+                            .await
+                    };
+                    result.map_err(|error| {
+                        map_runtime_mutation_error(
+                            "container_start",
+                            "Activate captured application",
+                            error,
+                        )
+                    })
+                }
+                .await;
+                let accepted_operation_id = operation.execution_context().operation_id;
+                match mutation {
+                    Ok(()) => {
+                        self.refresh_pingora_after_restart(app_id).await;
+                        operation.confirm_effects().await?;
+                        operation.succeed().await?;
+                        guard.mark_completed();
+                    }
+                    Err(error) => {
+                        let error = operation.correlate_error(error);
+                        if guard.has_unfinished_mutation() {
+                            operation.fail(&error).await?;
+                        } else {
+                            operation.reject_without_mutation(&error).await?;
+                        }
+                        return Err(error);
+                    }
+                }
+                self.activity.mark_running(app_id);
+                self.get_app(app_id)
+                    .await
+                    .map_err(|source| AppOperationError::Operation {
+                        operation_id: accepted_operation_id,
+                        source: Box::new(source),
+                    })
             }
             .await;
-            match mutation {
-                Ok(()) => {
-                    self.refresh_pingora_after_restart(app_id).await;
-                    operation.confirm_effects().await?;
-                    operation.succeed().await?;
-                    guard.mark_completed();
-                }
-                Err(error) => {
-                    if guard.has_unfinished_mutation() {
-                        operation.fail(&error).await?;
-                    } else {
-                        operation.reject_without_mutation(&error).await?;
-                    }
-                    return Err(error);
+            if result.is_ok() || !guard.has_unfinished_mutation() {
+                if let Some(deadline) = wait_deadline
+                    && result
+                        .as_ref()
+                        .is_err_and(|error| error.operation_id().is_none())
+                {
+                    guard.finish_unadmitted(deadline).await?;
+                } else {
+                    guard.finish().await?;
                 }
             }
-            self.activity.mark_running(app_id);
-            self.get_app(app_id).await
+            if let (Some(deadline), Err(error)) = (wait_deadline, &result)
+                && error.code() == shared_types::ERR_OPERATION_IN_PROGRESS
+                && error.operation_id().is_none()
+            {
+                self.wait_restart_blocker(
+                    app_id,
+                    result.err().ok_or_else(|| {
+                        AppOperationError::Backend("Restart admission rejection disappeared".into())
+                    })?,
+                    deadline,
+                )
+                .await?;
+                continue;
+            }
+            return result;
         }
-        .await;
-        if result.is_ok() || !guard.has_unfinished_mutation() {
-            guard.finish().await?;
-        }
-        result
     }
 
     /// 停止应用（scale replicas = 0）。拍板 2026-09-23：手动 stop 与闲置回收
@@ -250,7 +365,7 @@ impl AppService {
                     AppOperationError::Backend(format!("Encode stop intent: {error}"))
                 })?,
             ));
-            if self
+            if let Some(replayed) = self
                 .replay_control(
                     app_id,
                     &request,
@@ -258,9 +373,14 @@ impl AppService {
                     &fingerprint,
                 )
                 .await?
-                .is_some()
             {
-                return self.get_app(app_id).await;
+                return self
+                    .get_app(app_id)
+                    .await
+                    .map_err(|source| AppOperationError::Operation {
+                        operation_id: replayed.operation_id,
+                        source: Box::new(source),
+                    });
             }
             let previous = self.fetch_runtime_status_or_err(app_id).await?;
             let mut durable = crate::service::OwnedOperation::admit(
@@ -295,6 +415,7 @@ impl AppService {
                     .await
             }
             .await;
+            let accepted_operation_id = durable.execution_context().operation_id;
             match mutation {
                 Ok(()) => {
                     durable.confirm_effects().await?;
@@ -302,6 +423,7 @@ impl AppService {
                     operation.mark_completed();
                 }
                 Err(error) => {
+                    let error = durable.correlate_error(error);
                     if operation.has_unfinished_mutation() {
                         durable.fail(&error).await?;
                     } else {
@@ -310,7 +432,12 @@ impl AppService {
                     return Err(error);
                 }
             }
-            self.get_app(app_id).await
+            self.get_app(app_id)
+                .await
+                .map_err(|source| AppOperationError::Operation {
+                    operation_id: accepted_operation_id,
+                    source: Box::new(source),
+                })
         }
         .await;
         if result.is_ok() || !operation.has_unfinished_mutation() {
@@ -333,18 +460,25 @@ impl AppService {
         self.activity.mark_stopped(app_id);
         if let Err(error) = self.runtime.stop_app_target(target, wake_on_traffic).await {
             // This target operation makes exactly one remote stop/scale request.
-            // A structured rejection therefore proves this stop had no effects.
+            // Only a definitive rejection proves that this stop had no effects.
+            // Timeout/disconnection labels and server errors retain uncertainty
+            // even when a runtime presents them in a rejection envelope.
             if matches!(
                 error,
                 container_runtime_api::ContainerRuntimeError::RequestRejected(_)
-            ) {
+            ) && !container_runtime_api::runtime_mutation_outcome_unknown(&error)
+            {
                 operation.mark_rejected_before_mutation();
                 self.restore_activity_state(app_id, previous);
             }
             // Do not issue a compensating name-based patch after an uncertain
             // response or version conflict. It could modify a replacement.
             // Recovery resolves an uncertain stop outcome from durable state.
-            return Err(map_runtime_error("Stop captured application", error));
+            return Err(map_runtime_mutation_error(
+                "container_stop",
+                "Stop captured application",
+                error,
+            ));
         }
         info!(app_id, operation_id = %target.context.operation_id, "Application stopped using captured resource identity");
         Ok(())
@@ -512,18 +646,14 @@ impl AppService {
             use shared_types::AppWakeControl;
             match self.activity.ensure_running(app_id).await {
                 shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning => {}
-                shared_types::WakeOutcome::Timeout => {
-                    return Err(AppOperationError::InvalidState(format!(
-                        "app {app_id} wake timed out; retry later"
-                    )));
+                shared_types::WakeOutcome::Timeout(detail) => {
+                    return Err(AppOperationError::Diagnostic(detail));
                 }
                 shared_types::WakeOutcome::Blocked { message, blocker } => {
                     return Err(AppOperationError::ConflictBlocked { message, blocker });
                 }
-                shared_types::WakeOutcome::Failed(e) => {
-                    return Err(AppOperationError::InvalidState(format!(
-                        "app {app_id} wake failed: {e}"
-                    )));
+                shared_types::WakeOutcome::Failed(detail) => {
+                    return Err(AppOperationError::Diagnostic(detail));
                 }
             }
             let runtime = self.get_app(app_id).await?;

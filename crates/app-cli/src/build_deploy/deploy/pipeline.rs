@@ -251,7 +251,6 @@ pub(crate) fn restore_previous_generation(workspace: &Path, expected: &str) -> R
         crate::manifest::read_release_lock(&previous)?.release_id == expected,
         "previous generation artifact mismatch"
     );
-    crate::migration_journal::require_confirmed_migrations(workspace)?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     rustix::fs::renameat_with(
         rustix::fs::CWD,

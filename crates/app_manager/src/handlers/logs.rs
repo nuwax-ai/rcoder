@@ -82,7 +82,8 @@ pub async fn query_app_log_sources(
         .map_err(shared_types::garde_err_to_app_error)?;
     let base = state.app_service.log_api_base(app_stage, &app_id).await?;
     let path = log_path(app_stage, &app_id, LogOperation::Sources);
-    forward_json(&state, base, &path, request).await
+    let credentials = log_file_credentials(&state, app_stage, &app_id).await?;
+    forward_json(&state, base, &path, &credentials, request).await
 }
 
 /// 查询应用日志快照
@@ -127,7 +128,8 @@ pub async fn query_app_logs(
         .map_err(shared_types::garde_err_to_app_error)?;
     let base = state.app_service.log_api_base(app_stage, &app_id).await?;
     let path = log_path(app_stage, &app_id, LogOperation::Query);
-    forward_json(&state, base, &path, request).await
+    let credentials = log_file_credentials(&state, app_stage, &app_id).await?;
+    forward_json(&state, base, &path, &credentials, request).await
 }
 
 /// 实时日志 SSE 流
@@ -172,10 +174,14 @@ pub async fn stream_app_logs_v1(
         .map_err(shared_types::garde_err_to_app_error)?;
     let base = state.app_service.log_api_base(app_stage, &app_id).await?;
     let path = log_path(app_stage, &app_id, LogOperation::Stream);
-    let response = state
-        .http_client
-        .post(format!("{base}{path}"))
-        .json(&request)
+    let credentials = log_file_credentials(&state, app_stage, &app_id).await?;
+    let response = credentials
+        .apply(
+            state
+                .http_client
+                .post(format!("{base}{path}"))
+                .json(&request),
+        )
         .send()
         .await
         .map_err(|error| backend(format!("connect to runtime log stream: {error}")))?;
@@ -206,12 +212,16 @@ async fn forward_json(
     state: &Arc<AppManagerState>,
     base: String,
     path: &str,
+    credentials: &shared_types::FileServerRequestCredentials,
     request: LogQueryRequest,
 ) -> Result<Response<Body>, AppError> {
-    let response = state
-        .http_client
-        .post(format!("{base}{path}"))
-        .json(&request)
+    let response = credentials
+        .apply(
+            state
+                .http_client
+                .post(format!("{base}{path}"))
+                .json(&request),
+        )
         .send()
         .await
         .map_err(|error| {
@@ -230,6 +240,27 @@ async fn forward_json(
     builder
         .body(Body::from(body))
         .map_err(|error| AppError::from(backend(format!("build forwarded log response: {error}"))))
+}
+
+async fn log_file_credentials(
+    state: &AppManagerState,
+    stage: shared_types::UserappStage,
+    app_id: &str,
+) -> Result<shared_types::FileServerRequestCredentials, AppError> {
+    if stage == shared_types::UserappStage::Dev {
+        state
+            .app_service
+            .file_request_credentials(
+                stage,
+                app_id,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+            )
+            .await
+            .map_err(AppError::from)
+    } else {
+        // app-cli:3010 has its own management contract; it is not the file proxy.
+        Ok(shared_types::FileServerRequestCredentials::default())
+    }
 }
 
 #[derive(Clone, Copy)]

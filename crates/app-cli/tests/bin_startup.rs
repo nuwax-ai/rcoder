@@ -1,5 +1,5 @@
-//! P1-01/P1-02 bin 级回归：API 预绑定 fail-fast、早期失败非零退出、
-//! pingap 失败路径的 Done 终局事件 + 非零退出码。
+//! Bin 级回归：API 预绑定 fail-fast；run 是显式操作客户端，真实输入
+//! 或 pingap 失败仍非零退出、保留原失败 Done 和独立管理 owner。
 //!
 //! 走真实二进制（`CARGO_BIN_EXE_app-cli`）+ 受控 workspace / 端口 / pingap
 //! 注入，不依赖 PG（`APP_CLI_SKIP_PG_WAIT`）与真实 pingap（`--pingap-bin
@@ -84,6 +84,19 @@ fn base_command(subcommand: &str, workspace: &Path, logs: &Path, admin_addr: &st
         .env_remove("APP_DEPLOY_OPERATION_ID")
         .env_remove("APP_DEPLOY_GENERATION_ID")
         .env("APP_CLI_SKIP_PG_WAIT", "1")
+        .env("APP_CLI_REQUIRE_PG", "0")
+        .env_remove("APP_CLI_ATTACH")
+        .env("PROJECT_ID", "bin-startup-fixture")
+        .env(
+            "APP_CLI_STATE_ROOT",
+            workspace.parent().unwrap().join("state"),
+        )
+        .env(
+            "APP_CLI_PINGAP_RUNTIME_DIR",
+            workspace.parent().unwrap().join("pingap-runtime"),
+        )
+        .env_remove("PGUSER")
+        .env_remove("PGPASSWORD")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -91,7 +104,13 @@ fn base_command(subcommand: &str, workspace: &Path, logs: &Path, admin_addr: &st
 }
 
 /// 运行至退出（带硬超时防悬挂：失败路径都必须快速终结，不允许整窗等待）。
-fn run_to_exit(mut command: Command, hard_timeout: Duration) -> Output {
+fn run_to_exit(mut command: Command, hard_timeout: Duration) -> (Output, bool) {
+    let state = command
+        .get_envs()
+        .find(|(key, _)| *key == "APP_CLI_STATE_ROOT")
+        .and_then(|(_, value)| value)
+        .map(std::path::PathBuf::from)
+        .unwrap();
     let mut child = command.spawn().expect("spawn app-cli");
     let deadline = Instant::now() + hard_timeout;
     loop {
@@ -107,7 +126,60 @@ fn run_to_exit(mut command: Command, hard_timeout: Duration) -> Output {
     let mut output = child.wait_with_output().expect("collect app-cli output");
     // 拼接 stdout+stderr 便于断言（tracing 走 stderr、EVT 走 stdout）。
     output.stdout.extend_from_slice(&output.stderr);
-    output
+    // A successful bootstrap outlives its run client. Capture the real native
+    // instance before shutdown; never kill a PID/name guessed from discovery.
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let native = runtime
+        .block_on(runtime_supervisor::control(
+            &state,
+            runtime_supervisor::Request::new(runtime_supervisor::Action::Status),
+        ))
+        .ok();
+    let management_alive = native.is_some()
+        && runtime_supervisor::Owner::try_acquire(&state)
+            .unwrap()
+            .is_none();
+    if let Some(native) = native {
+        let mut request = runtime_supervisor::Request::new(runtime_supervisor::Action::Shutdown);
+        request.capture_generation(native.generation.as_deref());
+        runtime
+            .block_on(runtime_supervisor::control_verified(
+                &state,
+                request,
+                &native.supervisor_id,
+            ))
+            .expect("shutdown captured fixture management owner");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if runtime_supervisor::Owner::try_acquire(&state)
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture management owner failed to stop"
+            );
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    }
+    // Independent owner stdio is deliberately separate from the client pipe.
+    // Preserve the real orchestration events for the failure assertions below.
+    for entry in std::fs::read_dir(state.parent().unwrap().join("logs"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("owner-bootstrap-")
+        {
+            output.stdout.extend(std::fs::read(entry.path()).unwrap());
+        }
+    }
+    (output, management_alive)
 }
 
 fn done_event_count(combined: &[u8]) -> usize {
@@ -119,6 +191,14 @@ fn done_event_count(combined: &[u8]) -> usize {
 
 fn write_lock(workspace: &Path, content: &str) {
     std::fs::write(workspace.join("release.lock.toml"), content).expect("write lock");
+    std::fs::create_dir_all(workspace.join("web")).unwrap();
+    std::fs::write(
+        workspace.join("workspace.manifest.toml"),
+        "schema_version=1\n[workspace]\nname='bin-startup'\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.join("web/project.manifest.toml"),
+        "schema_version=1\n[project]\nservice_id='web'\nname='Web'\ntype='node'\n[build]\ncommand=['true']\nartifact='unused.zip'\n[run]\ncommand=['node','server.js']\n[health]\nstartup_timeout_seconds=2\n").unwrap();
 }
 
 fn temp_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -136,7 +216,7 @@ fn legacy_admin_port_conflict_fails_fast_before_orchestration() {
     write_lock(&workspace, MINIMAL_LOCK);
     let (_hold, address) = reserve_port();
     let logs = workspace.parent().unwrap().join("logs");
-    let output = run_to_exit(
+    let (output, management_alive) = run_to_exit(
         base_command("run", &workspace, &logs, &address),
         Duration::from_secs(30),
     );
@@ -144,6 +224,10 @@ fn legacy_admin_port_conflict_fails_fast_before_orchestration() {
         !output.status.success(),
         "bind conflict must exit non-zero; stdout+stderr: {}",
         String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !management_alive,
+        "bind failure cannot leave a management owner"
     );
     assert_eq!(
         done_event_count(&output.stdout),
@@ -161,48 +245,60 @@ fn serve_admin_port_conflict_fails_fast_before_recovery() {
     let (_hold, address) = reserve_port();
     let logs = workspace.parent().unwrap().join("logs");
     let command = base_command("serve", &workspace, &logs, &address);
-    let output = run_to_exit(command, Duration::from_secs(30));
+    let (output, management_alive) = run_to_exit(command, Duration::from_secs(30));
     assert!(
         !output.status.success(),
         "serve bind conflict must exit non-zero; stdout+stderr: {}",
         String::from_utf8_lossy(&output.stdout)
     );
+    assert!(!management_alive);
     assert_eq!(done_event_count(&output.stdout), 0);
 }
 
-/// A04 早期失败：release.lock 损坏 → supervisor 加载失败，进程非零退出
-/// （旧版 main 吞错退出码恒 0；P1-02 后退出码携带失败）。
+/// 损坏派生 lock 被当前 Source 重建；真实 pingap 失败使客户端非零退出，
+/// 管理 owner 保持在线。完整成功重试由 run_source_owner 覆盖。
 #[test]
-fn corrupted_lock_exits_non_zero() {
+fn corrupted_lock_is_rebuilt_and_real_startup_failure_exits_non_zero() {
     let (_dir, workspace) = temp_workspace();
     write_lock(&workspace, "");
     let address = free_port_address();
     let logs = workspace.parent().unwrap().join("logs");
-    let output = run_to_exit(
+    let (output, management_alive) = run_to_exit(
         base_command("run", &workspace, &logs, &address),
         Duration::from_secs(30),
     );
     assert!(
         !output.status.success(),
-        "corrupted lock must exit non-zero; stdout+stderr: {}",
+        "real startup failure must exit non-zero; stdout+stderr: {}",
         String::from_utf8_lossy(&output.stdout)
     );
-    // 早期失败（spawn 之前）无 Done——由父进程退出监督兜底（P1-02 语义）。
-    assert_eq!(done_event_count(&output.stdout), 0);
+    assert!(
+        management_alive,
+        "failed Source cannot terminate its management owner"
+    );
+    assert!(
+        app_cli::manifest::read_release_lock(&workspace).is_ok(),
+        "corrupt derived lock must be rebuilt"
+    );
+    assert_eq!(done_event_count(&output.stdout), 1);
 }
 
 /// A02/A04 失败终局事件：pingap 编译失败（--pingap-bin /bin/false）→
 /// 兜底路径补发**恰好一次** orchestration_done（含 orchestrator 自身条目与
-/// 服务失败清单），进程非零退出。
+/// 服务失败清单），客户端非零退出，管理面保留。
 #[test]
 fn pingap_failure_emits_single_done_and_exits_non_zero() {
     let (_dir, workspace) = temp_workspace();
     write_lock(&workspace, MINIMAL_LOCK);
     let address = free_port_address();
     let logs = workspace.parent().unwrap().join("logs");
-    let output = run_to_exit(
+    let (output, management_alive) = run_to_exit(
         base_command("run", &workspace, &logs, &address),
         Duration::from_secs(60),
+    );
+    assert!(
+        management_alive,
+        "business failure cannot terminate management"
     );
     let combined = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -249,7 +345,8 @@ fn legacy_deploy_url_with_port_conflict_has_no_deploy_side_effects() {
         .env("APP_RELEASE_ID", "test-release")
         .env("APP_DEPLOY_GENERATION_ID", "test-gen");
     let volume_root = workspace.parent().unwrap();
-    let output = run_to_exit(command, Duration::from_secs(30));
+    let (output, management_alive) = run_to_exit(command, Duration::from_secs(30));
+    assert!(!management_alive);
     assert!(
         !output.status.success(),
         "deploy URL + bind conflict must exit non-zero; stdout+stderr: {}",
@@ -329,7 +426,8 @@ fn serve_attach_identity_mismatch_exits_fast() {
     let logs = workspace.parent().unwrap().join("logs");
     let mut command = base_command("serve", &workspace, &logs, &server_addr);
     command.arg("--attach");
-    let output = run_to_exit(command, Duration::from_secs(15));
+    let (output, management_alive) = run_to_exit(command, Duration::from_secs(15));
+    assert!(!management_alive);
     assert!(
         !output.status.success(),
         "attach with mismatched identity must exit non-zero; stdout+stderr: {}",

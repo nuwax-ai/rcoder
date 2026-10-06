@@ -39,6 +39,8 @@ pub(super) enum ExecChannel<'a> {
         /// dev 容器 file-server 基址（`dev_file_server_addr` 产出）
         base: String,
         app_id: String,
+        credentials: shared_types::FileServerRequestCredentials,
+        command_timeout: std::time::Duration,
     },
     ProdRuntime {
         runtime: &'a Arc<dyn container_runtime_api::ContainerRuntime>,
@@ -48,52 +50,106 @@ pub(super) enum ExecChannel<'a> {
 
 #[async_trait]
 impl shared_types::PgCommandRunner for ExecChannel<'_> {
-    async fn run(&self, command: &str) -> Result<shared_types::CommandOutcome, String> {
+    async fn run(
+        &self,
+        command: &str,
+        mode: shared_types::PgCommandMode,
+    ) -> Result<shared_types::CommandOutcome, shared_types::PgCommandError> {
+        use shared_types::{PgCommandError, PgCommandEvidence};
         match self {
-            Self::DevHttp { base, app_id } => {
-                let resp = crate::http_client::shared_client()
+            Self::DevHttp {
+                base,
+                app_id,
+                credentials,
+                command_timeout,
+            } => {
+                let request = crate::http_client::shared_client()
                     .post(format!("{base}/api/v1/userapp/execute-command"))
-                    .json(&serde_json::json!({
-                        "app_id": app_id,
-                        "command": command,
-                    }))
-                    .timeout(std::time::Duration::from_secs(90))
-                    .send()
-                    .await
-                    .map_err(|e| format!("exec http failed: {e}"))?;
+                    .json(&serde_json::json!({"app_id": app_id, "command": command}))
+                    .timeout(*command_timeout);
+                let request = credentials.apply(request);
+                let resp = request.send().await.map_err(|error| {
+                    let code = if error.is_builder() {
+                        shared_types::ERR_RUNTIME_CONFIGURATION
+                    } else if error.is_timeout() {
+                        shared_types::ERR_RUNTIME_TIMEOUT
+                    } else {
+                        shared_types::ERR_RUNTIME_UNAVAILABLE
+                    };
+                    if error.is_connect() || error.is_builder() {
+                        PgCommandError::new(
+                            code,
+                            "PostgreSQL command was not dispatched",
+                            PgCommandEvidence::NotDispatched,
+                        )
+                    } else {
+                        PgCommandError::transport(mode, code, "PostgreSQL command transport failed")
+                    }
+                })?;
                 let status = resp.status();
-                let body: serde_json::Value = resp
-                    .json()
-                    .await
-                    .map_err(|e| format!("exec http body: {e}"))?;
-                // execute-command 契约：外层恒 success=true（命令结果由
-                // exit_code 表示）；非 2xx / success=false 是通道层问题
+                let body: serde_json::Value = resp.json().await.map_err(|error| {
+                    PgCommandError::transport(
+                        mode,
+                        if error.is_timeout() {
+                            shared_types::ERR_RUNTIME_TIMEOUT
+                        } else {
+                            shared_types::ERR_CONTAINER_EXEC_FAILED
+                        },
+                        if error.is_timeout() {
+                            "PostgreSQL command response body exceeded the request deadline"
+                        } else {
+                            "PostgreSQL command response was incomplete"
+                        },
+                    )
+                })?;
                 if !status.is_success() || body["success"].as_bool() != Some(true) {
-                    return Err(format!(
-                        "execute-command rejected: HTTP {status}: {}",
-                        serde_json::to_string(&body).unwrap_or_else(|_| "<unserializable>".into())
-                    ));
+                    // A generic error envelope cannot prove whether execute-command
+                    // was dispatched. Only the endpoint's validation denial is definitive.
+                    let definitive =
+                        status.is_client_error() && !matches!(status.as_u16(), 408 | 499);
+                    let diagnostic = command_response_diagnostic(&body, command);
+                    let error = PgCommandError::new(
+                        if mode == shared_types::PgCommandMode::Write && !definitive {
+                            shared_types::ERR_OPERATION_OUTCOME_UNKNOWN
+                        } else {
+                            shared_types::ERR_CONTAINER_EXEC_FAILED
+                        },
+                        format!("PostgreSQL command rejected: HTTP {status}"),
+                        if definitive {
+                            PgCommandEvidence::DefinitivelyRejected
+                        } else {
+                            PgCommandEvidence::OutcomeUnknown
+                        },
+                    );
+                    return Err(match diagnostic {
+                        Some(diagnostic) => error.with_diagnostic(diagnostic),
+                        None => error,
+                    });
                 }
-                // userapp 域 execute-command 响应键为 snake（exit_code——契约
-                // 测试 userapp_dev.rs:357 锁定）；-1 兜底 = 响应缺字段视为执行失败
+                let exit_code = body["exit_code"].as_i64().ok_or_else(|| {
+                    PgCommandError::transport(
+                        mode,
+                        shared_types::ERR_CONTAINER_EXEC_FAILED,
+                        "PostgreSQL command response has no exit status",
+                    )
+                })?;
                 Ok(shared_types::CommandOutcome {
-                    exit_code: body["exit_code"].as_i64().unwrap_or(-1),
-                    stdout: body["stdout"].as_str().unwrap_or_default().to_string(),
-                    stderr: body["stderr"].as_str().unwrap_or_default().to_string(),
+                    exit_code,
+                    stdout: body["stdout"].as_str().unwrap_or_default().into(),
+                    stderr: body["stderr"].as_str().unwrap_or_default().into(),
                 })
             }
             Self::ProdRuntime { runtime, app_id } => {
-                let r = runtime
-                    .exec(
-                        app_id,
-                        vec!["sh".to_string(), "-c".to_string(), command.to_string()],
-                    )
+                let result = runtime
+                    .exec(app_id, vec!["sh".into(), "-c".into(), command.into()])
                     .await
-                    .map_err(|e| format!("exec failed: {e}"))?;
+                    .map_err(|error| {
+                        container_runtime_api::runtime_pg_command_error(&error, mode)
+                    })?;
                 Ok(shared_types::CommandOutcome {
-                    exit_code: r.exit_code,
-                    stdout: r.stdout,
-                    stderr: r.stderr,
+                    exit_code: result.exit_code,
+                    stdout: result.stdout,
+                    stderr: result.stderr,
                 })
             }
         }
@@ -115,68 +171,52 @@ pub(super) async fn resolve_exec_target<'a>(
         UserappStage::Dev => {
             let (info, _recreated) = ensure_userapp_builder_probed(state, app_id)
                 .await
-                .map_err(|e| {
-                    tracing::error!(
-                        "[USERAPP_DB_ADMIN] ensure dev container failed: app_stage=dev, app_id={app_id}: {e:#}"
-                    );
-                    AppError::with_message(
-                        shared_types::error_codes::ERR_CONTAINER_ERROR,
-                        format!("ensure dev container failed: {e:#}"),
-                    )
-                })?;
+                .map_err(|error| crate::userapp_builder::control_error(&error))?;
             // dev 通道：dev 容器 file-server execute-command（契约见 ExecChannel）
             let channel = ExecChannel::DevHttp {
                 base: crate::userapp_builder::dev_file_server_addr(state, &info)?,
                 app_id: app_id.to_string(),
+                credentials: super::file_credentials::credentials(
+                    state,
+                    UserappStage::Dev,
+                    app_id,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(90),
+                )
+                .await
+                .map_err(shared_types::WakeFailure::into_app_error)?,
+                command_timeout: std::time::Duration::from_secs(90),
             };
             // builder 内 PG 可能刚 initdb（新容器/重建后），等就绪再执行改密命令
             let wait = channel
-                .run(&shared_types::pg_utils::pg_wait_ready_cmd(60))
+                .run(
+                    &shared_types::pg_utils::pg_wait_ready_cmd(60),
+                    shared_types::PgCommandMode::ReadOnly,
+                )
                 .await
-                .map_err(|e| {
-                    tracing::error!(
-                        "[USERAPP_DB_ADMIN] wait dev PG ready failed: app_id={app_id}: {e}"
-                    );
-                    AppError::with_message(
-                        shared_types::error_codes::ERR_CONTAINER_ERROR,
-                        format!("wait dev PG ready failed: {e}"),
-                    )
-                })?;
+                .map_err(|error| error.into_app_error("database_readiness"))?;
             if wait.exit_code != 0 {
                 return Err(AppError::with_message(
-                    shared_types::error_codes::ERR_CONTAINER_ERROR,
-                    "dev builder postgres not ready after ensure",
+                    shared_types::ERR_DATABASE_NOT_READY,
+                    "Development PostgreSQL is not ready after container preparation",
                 ));
             }
             Ok(channel)
         }
         UserappStage::Prod => {
-            if let Err(e) = state.app_service.get_app(app_id).await {
-                tracing::error!("[USERAPP_DB_ADMIN] prod app not found: app_id={app_id}: {e:#}");
-                // 与 align prod 侧同码（ERR_APP_NOT_FOUND）——同一"应用不存在"语义
-                // 双码（ERR_NOT_FOUND）曾是历史不一致，未上线期统一
-                return Err(AppError::with_message(
-                    shared_types::error_codes::ERR_APP_NOT_FOUND,
-                    format!("userapp prod app not found: {e:#}"),
-                ));
-            }
+            state
+                .app_service
+                .get_app(app_id)
+                .await
+                .map_err(AppError::from)?;
             use shared_types::AppWakeControl;
             match state.activity.ensure_running(app_id).await {
                 shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning => {}
                 shared_types::WakeOutcome::Blocked { message, blocker } => {
-                    let mut error =
-                        AppError::with_message(shared_types::error_codes::ERR_CONFLICT, message);
-                    if !blocker.operation_id.is_empty() {
-                        error = error.with_operation_id(blocker.operation_id.clone());
-                    }
-                    return Err(error.with_blocker(blocker));
+                    return Err(AppError::conflict(&message).with_blocker(blocker));
                 }
-                shared_types::WakeOutcome::Timeout | shared_types::WakeOutcome::Failed(_) => {
-                    tracing::error!("[USERAPP_DB_ADMIN] prod app wake failed: app_id={app_id}");
-                    return Err(AppError::with_message(
-                        shared_types::error_codes::ERR_CONTAINER_ERROR,
-                        "userapp prod app wake failed or timeout (still starting), retry later",
-                    ));
+                shared_types::WakeOutcome::Timeout(failure)
+                | shared_types::WakeOutcome::Failed(failure) => {
+                    return Err(failure.into_app_error());
                 }
             }
             // 唤醒后容器内 PG 启动窗口：等就绪再交还 exec 通道
@@ -185,21 +225,16 @@ pub(super) async fn resolve_exec_target<'a>(
                 app_id: app_id.to_string(),
             };
             let wait = channel
-                .run(&shared_types::pg_utils::pg_wait_ready_cmd(60))
+                .run(
+                    &shared_types::pg_utils::pg_wait_ready_cmd(60),
+                    shared_types::PgCommandMode::ReadOnly,
+                )
                 .await
-                .map_err(|e| {
-                    tracing::error!(
-                        "[USERAPP_DB_ADMIN] wait prod PG ready failed: app_id={app_id}: {e}"
-                    );
-                    AppError::with_message(
-                        shared_types::error_codes::ERR_CONTAINER_ERROR,
-                        format!("wait prod PG ready failed: {e}"),
-                    )
-                })?;
+                .map_err(|error| error.into_app_error("database_readiness"))?;
             if wait.exit_code != 0 {
                 return Err(AppError::with_message(
-                    shared_types::error_codes::ERR_CONTAINER_ERROR,
-                    "userapp prod postgres not ready after wake",
+                    shared_types::ERR_DATABASE_NOT_READY,
+                    "Production PostgreSQL is not ready after wake",
                 ));
             }
             Ok(ExecChannel::ProdRuntime {
@@ -217,8 +252,74 @@ fn db_admin_error_code(err: &shared_types::DbAdminError) -> &'static str {
     match err {
         E::InvalidInput(_) => shared_types::error_codes::ERR_VALIDATION,
         E::AlreadyExists(_) => shared_types::error_codes::ERR_CONFLICT,
-        E::Command { .. } => shared_types::error_codes::ERR_CONTAINER_ERROR,
+        E::Command { code, .. } => code,
     }
+}
+
+fn db_admin_app_error(error: shared_types::DbAdminError) -> AppError {
+    let code = db_admin_error_code(&error);
+    let message = error.to_string();
+    if let shared_types::DbAdminError::Command {
+        stage,
+        detail,
+        evidence,
+        cause_code,
+        diagnostic,
+        ..
+    } = error
+    {
+        let retryable = evidence == shared_types::PgCommandEvidence::NotDispatched
+            && matches!(
+                code,
+                shared_types::ERR_RUNTIME_UNAVAILABLE | shared_types::ERR_RUNTIME_TIMEOUT
+            );
+        if let Some(diagnostic) = diagnostic {
+            return diagnostic.into_app_error(code, cause_code, stage, &detail, retryable);
+        }
+        return AppError::with_message(code, message).with_error_detail(
+            shared_types::ErrorDetail::new(cause_code, stage, detail).with_retryable(retryable),
+        );
+    }
+    AppError::with_message(code, message)
+}
+
+fn command_response_diagnostic(
+    body: &serde_json::Value,
+    command: &str,
+) -> Option<shared_types::PgCommandDiagnostic> {
+    let code = body
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .filter(|code| !code.is_empty() && *code != "UNKNOWN_ERROR")
+        .unwrap_or_default()
+        .to_owned();
+    let operation_id = body
+        .get("operation_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let blocker = body
+        .get("blocker")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
+    let mut error_detail: Option<shared_types::ErrorDetail> = body
+        .get("error_detail")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
+    if let Some(detail) = &mut error_detail {
+        // Never echo the credential-bearing command sent to execute-command.
+        detail.detail = detail.detail.replace(command, "[REDACTED COMMAND]");
+        detail.hint = detail.hint.replace(command, "[REDACTED COMMAND]");
+        *detail = detail.localized(shared_types::current_request_locale());
+    }
+    if code.is_empty() && operation_id.is_none() && blocker.is_none() && error_detail.is_none() {
+        return None;
+    }
+    Some(shared_types::PgCommandDiagnostic {
+        code,
+        operation_id,
+        blocker,
+        error_detail,
+    })
 }
 
 /// `POST /api/v1/userapp/db/{app_stage}/reset-password`
@@ -323,7 +424,7 @@ pub(crate) async fn recover_deploy_pg(
         ("app_stage" = String, Path, description = "目标环境：`dev`=开发容器（UserappBuilder）内的 PG；`prod`=运行容器（Userapp）内的 PG")
     ),
     responses(
-        (status = 200, description = "HttpResult：成功表示数据库已创建；非法输入 ERR_VALIDATION、已有数据库 ERR_CONFLICT、执行失败 ERR_CONTAINER_ERROR。错误通过 code/message 返回", body = HttpResult<String>)
+        (status = 200, description = "HttpResult：成功表示数据库已创建；非法输入 ERR_VALIDATION、已有数据库 ERR_CONFLICT、执行失败 ERR_DATABASE_COMMAND_FAILED，未知写入 ERR_OPERATION_OUTCOME_UNKNOWN。错误通过 code/message 返回", body = HttpResult<String>)
     ),
     tag = "Userapp · 双态 · 数据库",
     operation_id = "userapp_db_create_database",
@@ -352,7 +453,7 @@ pub(crate) async fn create_database(
     let runner = resolve_exec_target(&state, app_stage, &body.app_id).await?;
     shared_types::create_pg_database(&runner, &body.database, body.owner.as_deref())
         .await
-        .map_err(|e| AppError::with_message(db_admin_error_code(&e), e.to_string()))?;
+        .map_err(db_admin_app_error)?;
     info!(
         "[USERAPP_DB_ADMIN] database created: app_stage={}, app_id={}, database={}, owner={:?}",
         app_stage.as_str(),
@@ -361,4 +462,354 @@ pub(crate) async fn create_database(
         body.owner
     );
     Ok(HttpResult::success("数据库已创建".to_string()))
+}
+
+#[cfg(test)]
+mod execution_key_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn database_http_execution_uses_optional_file_token_peer() {
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::post;
+        use axum::{Json, Router};
+        for (required, configured, success) in [
+            (false, None, true),
+            (true, Some("fixture-file-token"), true),
+            (true, None, false),
+            (true, Some("wrong-token"), false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("fixture");
+            let base = format!("http://{}", listener.local_addr().expect("address"));
+            let router = Router::new().route("/api/v1/userapp/execute-command", post(move |headers: HeaderMap| async move {
+                assert!(!headers.contains_key("x-api-key"));
+                if required && headers.get("x-proxy-token").and_then(|value| value.to_str().ok()) != Some("fixture-file-token") {
+                    return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"success":false})));
+                }
+                (StatusCode::OK, Json(serde_json::json!({"success":true,"exit_code":0,"stdout":"1","stderr":""})))
+            }));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router).await.expect("fixture server");
+            });
+            let channel = ExecChannel::DevHttp {
+                base,
+                app_id: "business".into(),
+                credentials: shared_types::FileServerRequestCredentials {
+                    proxy_token: configured.map(str::to_owned),
+                },
+                command_timeout: std::time::Duration::from_secs(5),
+            };
+            let result = channel
+                .run("read-only fixture", shared_types::PgCommandMode::ReadOnly)
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                success,
+                "actual optional-token peer: {result:?}"
+            );
+            if success {
+                assert_eq!(result.unwrap().stdout, "1");
+            } else {
+                assert_eq!(
+                    result.unwrap_err().evidence,
+                    shared_types::PgCommandEvidence::DefinitivelyRejected
+                );
+            }
+            server.abort();
+            drop(server.await);
+        }
+    }
+
+    #[tokio::test]
+    async fn database_http_body_timeout_preserves_cause_and_unknown_write() {
+        for mode in [
+            shared_types::PgCommandMode::ReadOnly,
+            shared_types::PgCommandMode::Write,
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("fixture");
+            let base = format!("http://{}", listener.local_addr().expect("address"));
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut input = Vec::new();
+                loop {
+                    let mut bytes = [0; 4096];
+                    let length = socket.read(&mut bytes).await.expect("request");
+                    input.extend_from_slice(&bytes[..length]);
+                    if length == 0 {
+                        break;
+                    }
+                    if let Some(end) = input.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&input[..end]);
+                        let body_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        if input.len() >= end + 4 + body_length {
+                            break;
+                        }
+                    }
+                }
+                assert!(String::from_utf8_lossy(&input).contains("same-fixture-command"));
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{\"success\":true,").await.expect("partial response");
+                stopped.await.expect("release fixture");
+            });
+            let channel = ExecChannel::DevHttp {
+                base,
+                app_id: "business".into(),
+                credentials: shared_types::FileServerRequestCredentials::default(),
+                command_timeout: std::time::Duration::from_millis(100),
+            };
+            let error = channel
+                .run("same-fixture-command", mode)
+                .await
+                .expect_err("missing response body");
+            stop.send(()).expect("stop fixture");
+            server.await.expect("join fixture");
+            assert_eq!(error.cause_code, shared_types::ERR_RUNTIME_TIMEOUT);
+            assert_eq!(
+                error.code,
+                if mode == shared_types::PgCommandMode::Write {
+                    shared_types::ERR_OPERATION_OUTCOME_UNKNOWN
+                } else {
+                    shared_types::ERR_RUNTIME_TIMEOUT
+                }
+            );
+            assert_eq!(
+                error.evidence,
+                shared_types::PgCommandEvidence::OutcomeUnknown
+            );
+            let response = error
+                .into_app_error("database_exec_response")
+                .into_http_result::<()>("en-US");
+            assert_eq!(
+                response.error_detail.expect("detail").retryable,
+                mode == shared_types::PgCommandMode::ReadOnly
+            );
+        }
+    }
+}
+#[cfg(test)]
+mod command_diagnostic_tests {
+    use super::*;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use shared_types::{PgCommandEvidence, PgCommandMode};
+
+    async fn server(status: axum::http::StatusCode) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let base = format!("http://{}", listener.local_addr().expect("fixture address"));
+        let app = Router::new().route("/api/v1/userapp/execute-command", post(move || async move {
+            (status, Json(serde_json::json!({
+                "success": false, "code": shared_types::ERR_DATABASE_NOT_READY,
+                "operation_id": "original-db-operation",
+                "blocker": { "scope":"Prod", "operation_id":"blocking-stop", "kind":"Stop", "state":"Running", "step":"stop" },
+                "error_detail": { "reason_code":shared_types::ERR_DATABASE_NOT_READY,
+                    "stage":"database_readiness", "detail":"Database startup has not completed; password=private_response_marker",
+                    "hint":"Wait for the original operation", "retryable":true,
+                    "task_id":"original-database-task", "service_id":"postgres" }
+            })))
+        }));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("fixture server");
+        });
+        (base, task)
+    }
+
+    #[tokio::test]
+    async fn devhttp_json_failure_preserves_original_error_and_operation() {
+        let (base, server) = server(axum::http::StatusCode::OK).await;
+        let channel = ExecChannel::DevHttp {
+            base,
+            app_id: "fixtureapp".into(),
+            credentials: shared_types::FileServerRequestCredentials::default(),
+            command_timeout: std::time::Duration::from_secs(5),
+        };
+        let error = shared_types::create_pg_database(&channel, "fixturedb", None)
+            .await
+            .expect_err("read rejected");
+        let response = db_admin_app_error(error).into_http_result::<()>("en-US");
+        assert_eq!(response.code, shared_types::ERR_DATABASE_NOT_READY);
+        assert_eq!(
+            response.operation_id.as_deref(),
+            Some("original-db-operation")
+        );
+        assert_eq!(
+            response.blocker.expect("original blocker").operation_id,
+            "blocking-stop"
+        );
+        let detail = response.error_detail.expect("original diagnostic");
+        assert_eq!(detail.stage, "database_readiness");
+        assert_eq!(detail.task_id.as_deref(), Some("original-database-task"));
+        assert_eq!(detail.service_id.as_deref(), Some("postgres"));
+        assert!(detail.detail.contains("Database startup has not completed"));
+        assert!(!format!("{detail:?}").contains("private_response_marker"));
+        assert!(detail.retryable);
+        server.abort();
+        drop(server.await);
+    }
+
+    #[tokio::test]
+    async fn devhttp_json_diagnostic_cannot_claim_an_unknown_write_is_retryable() {
+        for (status, unknown) in [
+            (axum::http::StatusCode::OK, true),
+            (axum::http::StatusCode::UNAUTHORIZED, false),
+        ] {
+            let (base, server) = server(status).await;
+            let channel = ExecChannel::DevHttp {
+                base,
+                app_id: "fixtureapp".into(),
+                credentials: shared_types::FileServerRequestCredentials::default(),
+                command_timeout: std::time::Duration::from_secs(5),
+            };
+            let error = channel
+                .run("same-single-write", PgCommandMode::Write)
+                .await
+                .expect_err("write failed");
+            assert_eq!(
+                error.evidence,
+                if unknown {
+                    PgCommandEvidence::OutcomeUnknown
+                } else {
+                    PgCommandEvidence::DefinitivelyRejected
+                }
+            );
+            let response = error
+                .into_app_error("database_write")
+                .into_http_result::<()>("en-US");
+            assert_eq!(
+                response.code,
+                if unknown {
+                    shared_types::ERR_OPERATION_OUTCOME_UNKNOWN
+                } else {
+                    shared_types::ERR_DATABASE_NOT_READY
+                }
+            );
+            assert_eq!(
+                response.operation_id.as_deref(),
+                Some("original-db-operation")
+            );
+            let detail = response.error_detail.expect("original cause");
+            assert_eq!(detail.reason_code, shared_types::ERR_DATABASE_NOT_READY);
+            assert_eq!(detail.stage, "database_readiness");
+            assert_eq!(detail.retryable, !unknown);
+            server.abort();
+            drop(server.await);
+        }
+    }
+
+    #[tokio::test]
+    async fn devhttp_password_upsert_redacts_peer_carrier_without_losing_write_evidence() {
+        use std::sync::Mutex;
+
+        let password = "peer-se'cret";
+        let fragment = shared_types::pg_utils::pg_shell_quote(password);
+        for locale in ["en-US", "zh-CN"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("fixture listener");
+            let base = format!("http://{}", listener.local_addr().expect("fixture address"));
+            let commands = Arc::new(Mutex::new(Vec::<String>::new()));
+            let observed = commands.clone();
+            let fragment = fragment.clone();
+            let app = Router::new().route(
+                "/api/v1/userapp/execute-command",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let observed = observed.clone();
+                    let fragment = fragment.clone();
+                    async move {
+                        let first = {
+                            let mut commands = observed.lock().unwrap();
+                            commands.push(body["command"].as_str().unwrap().to_owned());
+                            commands.len() == 1
+                        };
+                        if first {
+                            return Json(serde_json::json!({
+                                "success":true, "exit_code":0, "stdout":"1", "stderr":""
+                            }));
+                        }
+                        Json(serde_json::json!({
+                            "success":false, "code":shared_types::ERR_RUNTIME_TIMEOUT,
+                            "operation_id":"peer-password-operation",
+                            "blocker":{ "scope":"Prod", "operation_id":"blocking-password-write",
+                                "kind":"ResetProdDatabasePassword", "state":"RecoveryRequired", "step":"password_write_submitted" },
+                            "error_detail":{ "reason_code":shared_types::ERR_RUNTIME_TIMEOUT,
+                                "stage":"peer_exec_result", "detail":format!("Remote diagnostic fragment: {fragment}"),
+                                "hint":format!("Inspect the captured fragment {fragment}"), "retryable":true,
+                                "task_id":"peer-password-task", "service_id":"postgres" }
+                        }))
+                    }
+                }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("fixture server");
+            });
+            let channel = ExecChannel::DevHttp {
+                base,
+                app_id: "fixtureapp".into(),
+                credentials: shared_types::FileServerRequestCredentials::default(),
+                command_timeout: std::time::Duration::from_secs(5),
+            };
+            let error = shared_types::scope_request_locale(
+                locale,
+                shared_types::upsert_pg_user(&channel, "business", password),
+            )
+            .await
+            .expect_err("password write reply was not confirmed");
+            let domain_debug = format!("{error:?}");
+            let error = db_admin_app_error(error);
+            let public_debug = format!("{error:?}");
+            let response = error.into_http_result::<()>(locale);
+            assert_eq!(response.code, shared_types::ERR_OPERATION_OUTCOME_UNKNOWN);
+            assert_eq!(
+                response.operation_id.as_deref(),
+                Some("peer-password-operation")
+            );
+            assert_eq!(
+                response.blocker.as_ref().unwrap().operation_id,
+                "blocking-password-write"
+            );
+            let diagnostic = response.error_detail.as_ref().unwrap();
+            assert_eq!(diagnostic.reason_code, shared_types::ERR_RUNTIME_TIMEOUT);
+            assert_eq!(diagnostic.stage, "peer_exec_result");
+            assert_eq!(diagnostic.task_id.as_deref(), Some("peer-password-task"));
+            assert_eq!(diagnostic.service_id.as_deref(), Some("postgres"));
+            assert!(!diagnostic.retryable);
+            let json = serde_json::to_string(&response).unwrap();
+            for output in [&domain_debug, &public_debug, &json] {
+                assert!(
+                    !output.contains("peer-se"),
+                    "password peer carrier leaked: {output}"
+                );
+            }
+            assert_eq!(
+                diagnostic.hint,
+                shared_types::get_error_hint(shared_types::ERR_RUNTIME_TIMEOUT, locale)
+            );
+            {
+                let commands = commands.lock().unwrap();
+                assert_eq!(
+                    commands.len(),
+                    2,
+                    "unknown password writes must not be replayed"
+                );
+                assert!(commands[0].contains("pg_roles"));
+                assert!(commands[1].contains("ALTER USER"));
+            }
+            server.abort();
+            drop(server.await);
+        }
+    }
 }

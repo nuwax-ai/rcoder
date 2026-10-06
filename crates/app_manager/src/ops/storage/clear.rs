@@ -40,6 +40,18 @@ impl crate::service::AppService {
         guard: &crate::service::AppOperationGuard,
         leases: &mut StorageClearLeases,
     ) -> AppResult<()> {
+        // Resolve before capturing a physical target or admitting any external write.
+        // Clear's file peer is Dev; this reads existing configuration and never ensures a resource.
+        let credentials = if production {
+            shared_types::FileServerRequestCredentials::default()
+        } else {
+            self.file_request_credentials(
+                UserappStage::Dev,
+                app_id,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+            )
+            .await?
+        };
         operation.bind_lease(guard).await?;
         let workspace_client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -57,12 +69,15 @@ impl crate::service::AppService {
                 .await
                 .map_err(AppOperationError::Backend)?;
             let base_url = endpoint.base_url();
-            let response = workspace_client
-                .get(format!("{base_url}/api/v1/userapp/app-files/clear-target"))
-                .query(&shared_types::UserAppWorkspaceClearProbe {
-                    app_id: app_id.into(),
-                })
-                .timeout(std::time::Duration::from_secs(10))
+            let response = credentials
+                .apply(
+                    workspace_client
+                        .get(format!("{base_url}/api/v1/userapp/app-files/clear-target"))
+                        .query(&shared_types::UserAppWorkspaceClearProbe {
+                            app_id: app_id.into(),
+                        })
+                        .timeout(std::time::Duration::from_secs(10)),
+                )
                 .send()
                 .await
                 .map_err(|error| {
@@ -151,21 +166,28 @@ impl crate::service::AppService {
                     .begin_external_mutation()
                     .map_err(AppOperationError::Backend)?;
                 guard.mark_mutating()?;
-                let response = workspace_client
-                    .post(format!("{base_url}/api/v1/userapp/app-files/clear"))
-                    .timeout(std::time::Duration::from_secs(120))
-                    .json(&shared_types::UserAppWorkspaceClearRequest {
-                        app_id: app_id.into(),
-                        expected_instance_id: instance_id.clone(),
-                    })
+                let response = credentials
+                    .apply(
+                        workspace_client
+                            .post(format!("{base_url}/api/v1/userapp/app-files/clear"))
+                            .timeout(std::time::Duration::from_secs(120))
+                            .json(&shared_types::UserAppWorkspaceClearRequest {
+                                app_id: app_id.into(),
+                                expected_instance_id: instance_id.clone(),
+                            }),
+                    )
                     .send()
                     .await
                     .map_err(|error| {
                         AppOperationError::Backend(format!("Clear development workspace: {error}"))
                     })?;
-                let response =
-                    crate::ops::files::check_status(response, "clear-dev-workspace", app_id)
-                        .await?;
+                let response = crate::ops::files::check_status_with_context(
+                    response,
+                    "clear-dev-workspace",
+                    app_id,
+                    crate::ops::files::FileForwardContext::Mutation,
+                )
+                .await?;
                 let result: shared_types::UserAppWorkspaceClearResult =
                     response.json().await.map_err(|error| {
                         AppOperationError::Backend(format!(
@@ -320,7 +342,10 @@ impl crate::service::AppService {
                     } else {
                         operation.reject_without_mutation(&error).await?;
                     }
-                    Err(error)
+                    Err(AppOperationError::Operation {
+                        operation_id,
+                        source: Box::new(error),
+                    })
                 }
             }
         }

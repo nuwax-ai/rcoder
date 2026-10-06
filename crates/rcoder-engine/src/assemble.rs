@@ -35,6 +35,7 @@ pub struct AssembledEngine {
     pub merged_fs: file_server_embed::MergedFileServer,
     pub proxy_result: proxy_init::ProxyInitResult,
     pub bg_handles: background_tasks::BackgroundTaskHandles,
+    pub startup_tasks: startup_tasks::StartupTaskHandles,
     /// 关停广播源（serve/后台任务/Pingora 共用）；clone 给各消费方。
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
     /// 在装配早期（信号 handler 安装后立即）订阅并保持到关停等待——
@@ -194,11 +195,7 @@ pub async fn assemble(
     }
 
     // 阶段2 批量迁移: 启动后台 task 将共享 PVC 老数据一次性迁到 per-agent PVC (env 开关, 默认 false)
-    batch_migrate::spawn_if_enabled(runtime.clone());
-
-    // 启动 skill sync reconciler: 后台补齐旧 workspace 缺的 fan-out 目录 (grok/pi/...),
-    // 版本 marker 驱动, 已同步的 O(1) 跳过。env RCODER_SKILL_SYNC_RECONCILE_ON_STARTUP 默认 true。
-    skill_sync_reconciler::spawn_skill_sync_reconciler();
+    let startup_tasks = startup_tasks::StartupTaskHandles::start(runtime.clone());
 
     // file-server 路由合并进主服务（无独立 listener/端口；60000 让位反向代理）。
     // runtime 无条件注册, create_router 经 merged_router() 构造基础路由挂进主 Router
@@ -250,8 +247,8 @@ pub async fn assemble(
     // 60000 file-server 分流反代（Java/外部入口，独立 crate file-server-proxy）：
     // x-service-type: userapp → 本主服务（8086），其余 → TS nuwax-file-server（60001）。
     // 配置无条件注册（段缺失时兜底默认端口但 rust 上游对准本服务实际端口，
-    // 供运行时 `rcoder file-server start` 拉起）；段存在时自动启动（本地 dev 无段
-    // 则不监听 60000）。运行时启停经
+    // 供运行时 `rcoder file-server start` 拉起）；段存在或 host 部署时自动启动。
+    // host 无显式段时使用 loopback:60000 / AllRust。运行时启停经
     // /api/system/file-server/*（`rcoder file-server {start,stop,restart,status}`）。
     // 预览协调启用时：dev 生命周期 7 端点在所有策略下改路 Rust 上游（coordinated_dev_lifecycle）。
     // env 显式值优先于 config。拒绝结果也注册到代理，确保之后的管理
@@ -271,7 +268,9 @@ pub async fn assemble(
             false
         }
     };
-    if proxy_registered && bootstrap_result.config.file_server_proxy.is_some() {
+    if proxy_registered
+        && (bootstrap_result.config.file_server_proxy.is_some() || shared_types::is_deploy_host())
+    {
         // 同步 bind 语义：启动失败（如端口被占）此刻即报，不留到首个请求
         if let Err(e) = file_server_proxy::try_start().await {
             error!("file-server 分流代理启动失败: {e}");
@@ -347,6 +346,7 @@ pub async fn assemble(
         merged_fs,
         proxy_result,
         bg_handles,
+        startup_tasks,
         shutdown_tx,
         shutdown_rx,
         config: bootstrap_result.config,

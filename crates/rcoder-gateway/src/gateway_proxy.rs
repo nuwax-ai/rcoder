@@ -11,10 +11,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use matchit::Router;
 use pingora_core::upstreams::peer::HttpPeer;
-use pingora_http::ResponseHeader;
+use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cluster_cache::ClusterCache;
 use crate::config::GatewayConfig;
@@ -58,8 +58,6 @@ impl GatewayCtx {
     }
 }
 
-use shared_types::ServiceType;
-
 /// Agent Runner HTTP 端口
 const AGENT_HTTP_PORT: u16 = 8086;
 
@@ -77,7 +75,10 @@ pub struct GatewayProxy {
 
 impl GatewayProxy {
     pub fn new(config: Arc<GatewayConfig>) -> anyhow::Result<Self> {
-        let control_client = ControlPlaneClient::new(config.control_plane_url.clone());
+        let control_client = ControlPlaneClient::with_configured_key(
+            config.control_plane_url.clone(),
+            config.control_plane_api_key.clone(),
+        );
         let ttl = config.cache_ttl();
 
         let cluster_cache = Arc::new(ClusterCache::new(control_client.clone(), ttl));
@@ -122,34 +123,61 @@ impl GatewayProxy {
         path: &str,
         body: Option<&[u8]>,
         path_params: &HashMap<String, String>,
-    ) -> Option<String> {
-        match &route.source {
+    ) -> Result<Option<String>, shared_types::AppError> {
+        let identifier = match &route.source {
             IdentifierSource::Body => {
-                let body = body?;
-                IdentifierExtractor::from_body(body, route.identifier_field)
+                body.and_then(|body| IdentifierExtractor::from_body(body, route.identifier_field))
             }
             IdentifierSource::Path(param_name) => {
                 IdentifierExtractor::from_path_params(path_params, param_name)
             }
             IdentifierSource::Session => {
-                let session_id = path.split('/').next_back()?;
-                let info = self.session_resolver.resolve(session_id).await.ok()?;
-                Some(info.identifier)
+                let Some(session_id) = path.split('/').next_back() else {
+                    return Ok(None);
+                };
+                Some(self.session_resolver.resolve(session_id).await?.identifier)
             }
-        }
+        };
+        Ok(identifier)
     }
 
-    /// 根据 identifier 和 service_type 构建 K8s Service FQDN
-    ///
-    /// FQDN 格式：`{service_type}-{identifier}-svc.{namespace}.svc.cluster.local`
-    /// 例如：`web-agent-runner-project-123-svc.default.svc.cluster.local`
-    ///
-    /// 使用 ServiceType 的 Display trait 获取字符串前缀
-    fn build_service_fqdn(&self, identifier: &str, service_type: ServiceType) -> String {
+    /// Service 名称来自控制面核验的物理容器名称，不从业务标识符推算。
+    fn build_service_fqdn(&self, container_name: &str) -> String {
         format!(
-            "{}-{}-svc.{}.svc.{}",
-            service_type, identifier, self.config.namespace, self.cluster_domain
+            "{container_name}-svc.{}.svc.{}",
+            self.config.namespace, self.cluster_domain
         )
+    }
+
+    async fn write_control_error(
+        session: &mut Session,
+        error: shared_types::AppError,
+    ) -> pingora_core::Result<bool> {
+        let status = error.status_code().as_u16();
+        let locale = shared_types::parse_accept_language(
+            session
+                .req_header()
+                .headers
+                .get("accept-language")
+                .and_then(|value| value.to_str().ok()),
+        );
+        let body = serde_json::to_vec(&error.into_http_result::<()>(locale)).map_err(|error| {
+            pingora_core::Error::explain(
+                pingora_core::ErrorType::InternalError,
+                format!("serialize gateway diagnostic: {error}"),
+            )
+        })?;
+        let mut response = ResponseHeader::build(status, None)?;
+        response.insert_header("content-type", "application/json")?;
+        response.insert_header("content-length", body.len().to_string())?;
+        response.insert_header("cache-control", "no-store")?;
+        session
+            .write_response_header(Box::new(response), false)
+            .await?;
+        session
+            .write_response_body(Some(Bytes::from(body)), true)
+            .await?;
+        Ok(true)
     }
 
     /// 读取 request body（用于 POST 请求），带大小限制
@@ -227,8 +255,9 @@ impl ProxyHttp for GatewayProxy {
                     .await;
 
                 let identifier = match identifier {
-                    Some(id) => id,
-                    None => {
+                    Ok(Some(id)) => id,
+                    Err(error) => return Self::write_control_error(session, error).await,
+                    Ok(None) => {
                         warn!(
                             "[GATEWAY] failed to extract identifier from {} ({})",
                             path, route.identifier_field
@@ -238,31 +267,32 @@ impl ProxyHttp for GatewayProxy {
                     }
                 };
 
-                // 获取或确保 backend cluster
-                // 只读路由（GET status、SSE progress）仅查缓存，不触发 pod 创建
-                let ensure_result = if route.read_only {
-                    self.cluster_cache.get_only(&identifier).await
+                // 只读冷缓存直接转发控制面查询，不进入有副作用的 ensure。
+                let container_name = if route.read_only {
+                    match self
+                        .cluster_cache
+                        .get_only(&identifier, route.service_type)
+                        .await
+                    {
+                        Some(name) => name,
+                        None => {
+                            ctx.target = RouteTarget::ControlPlane;
+                            return Ok(false);
+                        }
+                    }
                 } else {
-                    self.cluster_cache
+                    match self
+                        .cluster_cache
                         .get_or_ensure(&identifier, route.service_type)
                         .await
+                    {
+                        Ok(name) => name,
+                        Err(error) => return Self::write_control_error(session, error).await,
+                    }
                 };
-
-                match ensure_result {
-                    Ok(_cluster_name) => {
-                        // 直接构建 K8s Service FQDN，路由到 agent_runner
-                        let fqdn = self.build_service_fqdn(&identifier, route.service_type);
-                        debug!("[GATEWAY] {} → {} → agent_svc ({})", path, identifier, fqdn);
-                        ctx.target = RouteTarget::AgentService(fqdn);
-                    }
-                    Err(e) => {
-                        error!(
-                            "[GATEWAY] cluster cache ensure failed for {}: {}, falling back to control plane",
-                            identifier, e
-                        );
-                        ctx.target = RouteTarget::ControlPlane;
-                    }
-                }
+                let fqdn = self.build_service_fqdn(&container_name);
+                debug!("[GATEWAY] {} → {} → agent_svc ({})", path, identifier, fqdn);
+                ctx.target = RouteTarget::AgentService(fqdn);
             }
         }
         Ok(false)
@@ -289,6 +319,42 @@ impl ProxyHttp for GatewayProxy {
                 )))
             }
         }
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        ctx: &mut Self::CTX,
+    ) -> pingora_core::Result<()> {
+        match ctx.target {
+            RouteTarget::ControlPlane => {
+                if let Some(key) = &self.config.control_plane_api_key {
+                    upstream_request.insert_header("x-api-key", key)?;
+                }
+            }
+            RouteTarget::AgentService(_) => {
+                // Remove only our configured control credential. This Gateway
+                // does not authenticate incoming keys; unrelated values keep their meaning.
+                if let Some(control_key) = &self.config.control_plane_api_key {
+                    let values: Vec<_> = upstream_request
+                        .headers
+                        .get_all("x-api-key")
+                        .iter()
+                        .filter(|value| value.as_bytes() != control_key.as_bytes())
+                        .cloned()
+                        .collect();
+                    if values.len() != upstream_request.headers.get_all("x-api-key").iter().count()
+                    {
+                        drop(upstream_request.remove_header("x-api-key"));
+                        for value in values {
+                            upstream_request.append_header("x-api-key", value)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 将缓冲的 request body 回注到 upstream 请求中
@@ -326,5 +392,129 @@ impl ProxyHttp for GatewayProxy {
             elapsed.as_secs_f64() * 1000.0
         );
         Ok(())
+    }
+}
+
+// Append to the saved current pre-fix gateway_proxy.rs. This calls the real
+// ProxyHttp callback with a real native TCP Pingora session; no header helper.
+#[cfg(test)]
+mod configured_control_key_boundary_tests {
+    use super::*;
+    #[tokio::test]
+    async fn gateway_agent_request_never_receives_the_configured_control_key() {
+        let proxy = GatewayProxy::new(Arc::new(GatewayConfig {
+            gateway_port: 8090,
+            control_plane_url: "http://127.0.0.1:8087".into(),
+            control_plane_api_key: Some("fixture-primary-control-key".into()),
+            envoy_gateway_url: "http://127.0.0.1:8080".into(),
+            namespace: "fixture".into(),
+            cache_ttl_seconds: 30,
+        }))
+        .expect("gateway config");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("TCP session");
+        let client = tokio::net::TcpStream::connect(listener.local_addr().expect("address"))
+            .await
+            .expect("client");
+        let (stream, _) = listener.accept().await.expect("accepted session");
+        let mut session = Session::new_h1(Box::new(
+            pingora_core::protocols::l4::stream::Stream::from(stream),
+        ));
+        let mut ctx = GatewayCtx::new();
+        ctx.target = RouteTarget::AgentService("fixture-agent-svc".into());
+        let mut request = RequestHeader::build("GET", b"/health", None).expect("request");
+        request
+            .insert_header("x-api-key", "fixture-primary-control-key")
+            .expect("incoming key");
+        request
+            .insert_header("x-business-correlation", "keep-this-value")
+            .expect("business header");
+        proxy
+            .upstream_request_filter(&mut session, &mut request, &mut ctx)
+            .await
+            .expect("actual callback");
+        assert!(
+            !request.headers.contains_key("x-api-key"),
+            "the configured RCoder control credential must not reach agent_runner:8086"
+        );
+        assert_eq!(request.headers["x-business-correlation"], "keep-this-value");
+        drop(client);
+    }
+    #[tokio::test]
+    async fn gateway_key_filter_keeps_unknown_keys_and_only_overrides_control_requests() {
+        for (agent, configured, incoming, expected) in [
+            (
+                true,
+                Some("configured-control"),
+                Some("business-peer-key"),
+                Some("business-peer-key"),
+            ),
+            (
+                true,
+                None,
+                Some("business-peer-key"),
+                Some("business-peer-key"),
+            ),
+            (true, Some("configured-control"), None, None),
+            (
+                false,
+                Some("configured-control"),
+                Some("business-peer-key"),
+                Some("configured-control"),
+            ),
+            (
+                false,
+                None,
+                Some("business-peer-key"),
+                Some("business-peer-key"),
+            ),
+        ] {
+            let proxy = GatewayProxy::new(Arc::new(GatewayConfig {
+                gateway_port: 8090,
+                control_plane_url: "http://127.0.0.1:8087".into(),
+                control_plane_api_key: configured.map(str::to_owned),
+                envoy_gateway_url: "http://127.0.0.1:8080".into(),
+                namespace: "fixture".into(),
+                cache_ttl_seconds: 30,
+            }))
+            .expect("gateway config");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("session listener");
+            let client = tokio::net::TcpStream::connect(listener.local_addr().expect("address"))
+                .await
+                .expect("client");
+            let (stream, _) = listener.accept().await.expect("session");
+            let mut session = Session::new_h1(Box::new(
+                pingora_core::protocols::l4::stream::Stream::from(stream),
+            ));
+            let mut ctx = GatewayCtx::new();
+            if agent {
+                ctx.target = RouteTarget::AgentService("fixture-agent-svc".into());
+            }
+            let mut request = RequestHeader::build("GET", b"/health", None).expect("request");
+            if let Some(key) = incoming {
+                request
+                    .insert_header("x-api-key", key)
+                    .expect("incoming key");
+            }
+            request
+                .insert_header("x-business-correlation", "keep-this-value")
+                .expect("business header");
+            proxy
+                .upstream_request_filter(&mut session, &mut request, &mut ctx)
+                .await
+                .expect("actual callback");
+            assert_eq!(
+                request
+                    .headers
+                    .get("x-api-key")
+                    .and_then(|value| value.to_str().ok()),
+                expected
+            );
+            assert_eq!(request.headers["x-business-correlation"], "keep-this-value");
+            drop(client);
+        }
     }
 }

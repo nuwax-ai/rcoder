@@ -1,25 +1,25 @@
 //! Computer Chat 容器就绪阶段
 //!
 //! 从 `handle_computer_chat_internal` 抽出：并发创建等待、容器按需创建、
-//! 空 IP 容器强制重建、项目映射写入与活动时间更新。
+//! 地址未就绪诊断、项目映射写入与活动时间更新。
 
 use shared_types::ComputerChatRequest;
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::{HttpResult, router::AppState, service::ComputerContainerManager};
+use crate::{router::AppState, service::ComputerContainerManager};
 use docker_manager::ContainerBasicInfo;
 
 use super::super::chat_forward::ChatFlowExit;
 use super::super::pod_handler::resolve_resource_limits_from_config;
 use super::helpers::ensure_project_mapping_in_state;
 
-/// 确保用户容器就绪：等待并发创建 / 按需创建 / 空 IP 修复，并写入项目映射
+/// 确保用户容器就绪：等待并发创建 / 按需创建 / 地址核验，并写入项目映射
 ///
 /// 阶段内容（与原内联实现逐步一致）：
 /// 1. 并发保护：若其他请求正在创建同一用户容器，等待其完成
 /// 2. 获取或创建用户容器
-/// 3. 二次验证：容器 IP 非空，否则清理并强制重建
+/// 3. 二次验证：容器 IP 非空，否则返回地址未就绪诊断
 /// 4. 检测 user_id 变化（负载测试场景告警）
 /// 5. 立即写入存储映射（防止孤立容器清理器误清理）
 /// 6. 更新活动时间
@@ -47,15 +47,22 @@ pub(super) async fn ensure_container_ready(
         create_container_with_marker(state, request, user_id, project_id, locale).await?
     };
 
-    // 🛡️ 二次验证：确保容器 IP 非空
-    // 容器管理器应该已经处理了空 IP 的情况，但缓存/Docker API 可能返回不一致结果
-    // 如果 IP 为空，先清理旧容器再强制重建（不返回错误给客户端）
-    let container_info = if container_info.container_ip.trim().is_empty() {
-        recreate_container_with_empty_ip(state, request, user_id, project_id, &container_info)
-            .await?
-    } else {
-        container_info
-    };
+    // An empty address is not proof that the captured workload has exited.
+    if container_info.container_ip.trim().is_empty() {
+        let code = shared_types::ERR_CONTAINER_ADDRESS_NOT_READY;
+        return Err(ChatFlowExit::response(
+            crate::AppError::with_message(code, "Container address is not available yet")
+                .with_error_detail(
+                    shared_types::ErrorDetail::new(
+                        code,
+                        "chat.container_address",
+                        "Container address is not available yet",
+                    )
+                    .with_retryable(true),
+                )
+                .into_http_result(locale),
+        ));
+    }
 
     debug!(
         "✅ [COMPUTER_CHAT] Container ready: user_id={}, container_id={}, ip={}",
@@ -237,74 +244,7 @@ async fn create_container_with_marker(
         Ok(info) => Ok(info),
         Err(e) => {
             error!("[COMPUTER_CHAT] Failed to get or create container: {}", e);
-            Err(ChatFlowExit::response(HttpResult::error_with_locale(
-                shared_types::error_codes::ERR_CONTAINER_ERROR,
-                locale,
-            )))
+            Err(ChatFlowExit::response(e.into_http_result(locale)))
         }
     }
-}
-
-/// 容器 IP 为空时的修复：先清理旧容器再强制重建
-///
-/// 必须先清理旧容器，否则 create_container 发现同名 "running" 容器会复用它
-#[instrument(skip_all, fields(user_id = %user_id, old_container_id = %container_info.container_id))]
-async fn recreate_container_with_empty_ip(
-    state: &Arc<AppState>,
-    request: &ComputerChatRequest,
-    user_id: &str,
-    project_id: &str,
-    container_info: &ContainerBasicInfo,
-) -> Result<ContainerBasicInfo, ChatFlowExit> {
-    warn!(
-        "⚠️ [COMPUTER_CHAT] Container has empty IP after get_or_create, cleaning up and recreating: \
-         user_id={}, old_container_id={}",
-        user_id, container_info.container_id
-    );
-    // 容器 IP 已空（被外部 kill）→ 旧 grpc_addr 不可用；按 project 维度关流
-    //（computer 域存储 key = project_id——传 user_id 是查不到的，一条流都关不掉），
-    // 避免前端挂在已死旧流上等重试耗尽。重建后新 IP 由 get_or_create 自动建新流。
-    state.shutdown_sse_streams_for_project(project_id);
-    // 必须先清理旧容器，否则 create_container 发现同名 "running" 容器会复用它
-    let container_identifier = request.pod_id.as_deref().unwrap_or(user_id);
-    if let Err(e) = state
-        .runtime()
-        .stop_container_by_identifier(
-            container_identifier,
-            &shared_types::ServiceType::ComputerAgentRunner,
-        )
-        .await
-    {
-        warn!(
-            "⚠️ [COMPUTER_CHAT] Failed to cleanup broken container before recreate: {}",
-            e
-        );
-    }
-    let options = crate::service::computer_container_manager::ContainerCreateOptions {
-        user_id: user_id.to_string(),
-        project_id: user_id.to_string(), // ComputerAgentRunner 使用 user_id 作为 project_id
-        resource_limits: resolve_resource_limits_from_config(
-            state,
-            &shared_types::ServiceType::ComputerAgentRunner,
-            request
-                .agent_config
-                .as_ref()
-                .and_then(|c| c.resource_limits.clone()),
-        )?,
-        pod_id: request.pod_id.clone(),
-        isolation_type: request.isolation_type.clone(),
-        tenant_id: request.tenant_id.clone(),
-        space_id: request.space_id.clone(),
-        service_type: shared_types::ServiceType::ComputerAgentRunner,
-    };
-    let info = ComputerContainerManager::force_create_container_for_user(&options, state.runtime())
-        .await
-        .map_err(|e| {
-            error!("[COMPUTER_CHAT] Force recreate container failed: {}", e);
-            crate::AppError::with_message(
-                shared_types::error_codes::ERR_CONTAINER_ERROR,
-                format!("Container recreation failed: {}", e),
-            )
-        })?;
-    Ok(info)
 }

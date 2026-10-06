@@ -118,7 +118,7 @@ class TestBuildCache(unittest.TestCase):
         class Cfg:
             state = self.config.state
             def get(self, name, default='', required=False):
-                return {'RUST_IMAGE': 'rust:1.95-trixie', 'JOBS': '4',
+                return {'RUST_IMAGE': 'rust:trixie', 'JOBS': '4',
                         'APT_MIRROR': 'http://deb.debian.org', 'CARGO_MIRROR': ''}.get(name, default)
         self.cfg = Cfg()
 
@@ -131,7 +131,7 @@ class TestBuildCache(unittest.TestCase):
         changed_bases = dict(self.bases, RCODER_BASE='r@sha256:' + '9' * 64)
         self.assertNotEqual(build_cache.cache_key('a' * 64, changed_bases, self.cfg), base, '基础镜像变化必须 miss')
         with patch.object(self.cfg, 'get', side_effect=lambda n, d='', required=False:
-                          {'RUST_IMAGE': 'rust:1.96-trixie'}.get(n, d)):
+                          {'RUST_IMAGE': 'example/rust:custom'}.get(n, d)):
             self.assertNotEqual(build_cache.cache_key('a' * 64, self.bases, self.cfg), base, '工具链变化必须 miss')
 
     def test_load_rejects_incomplete_or_failed_receipts(self):

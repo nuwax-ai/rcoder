@@ -1,5 +1,10 @@
 use super::*;
 
+pub(super) enum LaunchObservation {
+    Ready,
+    DeadlineExpired,
+}
+
 impl DevServerManager {
     /// 就绪轮询: 进程早退 → Err (读 stderr ring 分类成结构化错误); HTTP 就绪 → Ok;
     /// 超时但进程仍在 → Ok (nuwax 宽松)。
@@ -11,6 +16,20 @@ impl DevServerManager {
         stderr_ring: &Arc<StderrRing>,
         probe: AliveProbe<'_>,
     ) -> AppResult<()> {
+        self.poll_alive_with_launch_deadline(pid, port, base_path, stderr_ring, probe, None)
+            .await
+            .map(|_| ())
+    }
+
+    pub(super) async fn poll_alive_with_launch_deadline(
+        &self,
+        pid: u32,
+        port: u16,
+        base_path: Option<&str>,
+        stderr_ring: &Arc<StderrRing>,
+        probe: AliveProbe<'_>,
+        launch_deadline: Option<tokio::time::Instant>,
+    ) -> AppResult<LaunchObservation> {
         let max = self.config.dev_alive_max_wait_ms;
         let timeout = self.config.dev_alive_check_timeout_ms;
         let interval = Duration::from_millis(self.config.dev_alive_poll_interval_ms);
@@ -18,6 +37,9 @@ impl DevServerManager {
         // timeout), 固定步进累加会让 max 超时判断严重偏松 (实际墙钟远大于累加值)。
         let deadline = std::time::Instant::now() + Duration::from_millis(max);
         loop {
+            if launch_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                return Ok(LaunchObservation::DeadlineExpired);
+            }
             // 进程已退出 (端口冲突 / 配置错 / 依赖缺失) → 读 stderr 分类成可操作错误
             if !process::is_process_running(pid) {
                 return Err(early_exit_err(pid, port, stderr_ring));
@@ -31,11 +53,34 @@ impl DevServerManager {
             // (默认 max=30s >> timeout=1.5s 不触发, 仅防御 max<timeout 的错误配置)。
             // 首轮即探活 (不固定盲等 sleep): spawn 返回时 vite 端口未 listen, reqwest
             // connection refused 快速失败, 等价探测式等待; vite 提前 ready 能立刻发现。
-            let this_timeout = timeout.min((deadline - now).as_millis() as u64);
-            if probe(port, base_path, this_timeout).await {
-                return Ok(());
+            let mut this_timeout = timeout.min((deadline - now).as_millis() as u64);
+            if let Some(parent) = launch_deadline {
+                this_timeout = this_timeout.min(
+                    parent
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .as_millis() as u64,
+                );
             }
-            tokio::time::sleep(interval).await;
+            let observation = probe(port, base_path, this_timeout);
+            let ready = match launch_deadline {
+                Some(parent) => match tokio::time::timeout_at(parent, observation).await {
+                    Ok(ready) => ready,
+                    Err(_) => return Ok(LaunchObservation::DeadlineExpired),
+                },
+                None => observation.await,
+            };
+            if ready {
+                return Ok(LaunchObservation::Ready);
+            }
+            tokio::time::sleep_until(
+                launch_deadline.map_or(tokio::time::Instant::now() + interval, |parent| {
+                    parent.min(tokio::time::Instant::now() + interval)
+                }),
+            )
+            .await;
+        }
+        if launch_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Ok(LaunchObservation::DeadlineExpired);
         }
         // 超时: 进程仍存活但未响应 HTTP → 按 nuwax 宽松返回成功; 若已死则分类报错
         if !process::is_process_running(pid) {
@@ -44,7 +89,7 @@ impl DevServerManager {
         tracing::warn!(
             "dev server on port {port} (pid {pid}) 未在 {max}ms 内响应 HTTP, 进程仍在 — 返回成功 (nuwax 宽松)"
         );
-        Ok(())
+        Ok(LaunchObservation::Ready)
     }
 
     pub(super) async fn write_npmrc(&self, project_path: &Path) -> AppResult<()> {

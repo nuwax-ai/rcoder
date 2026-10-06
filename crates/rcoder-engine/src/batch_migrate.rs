@@ -19,70 +19,92 @@ use tracing::{info, warn};
 /// 启动批量迁移后台 task (不阻塞 rcoder 主流程)。
 ///
 /// 仅当 `FeatureFlags.batch_migrate_on_startup=true` 且 `per_agent_pvc=true` 时执行。
-pub fn spawn_if_enabled(runtime: Arc<dyn ContainerRuntime>) {
+pub fn spawn_if_enabled(
+    runtime: Arc<dyn ContainerRuntime>,
+    stop: tokio_util::sync::CancellationToken,
+) -> Option<tokio::task::JoinHandle<Result<(), String>>> {
     let flags = shared_types::FeatureFlags::get();
     if !flags.batch_migrate_on_startup {
-        return;
+        return None;
     }
     if !flags.per_agent_pvc {
         info!("[BATCH_MIGRATE] per_agent_pvc disabled, skip batch migration");
-        return;
+        return None;
     }
     info!("[BATCH_MIGRATE] starting batch migration (background task)");
-    tokio::spawn(async move {
-        if let Err(e) = run_batch_migrate(&runtime).await {
-            warn!("[BATCH_MIGRATE] batch migration failed: {e}");
+    Some(tokio::spawn(async move {
+        let result = run_batch_migrate(&runtime, &stop).await;
+        if let Err(error) = &result {
+            warn!(%error, "Batch migration failed");
         }
-    });
+        result
+    }))
 }
 
-async fn run_batch_migrate(runtime: &Arc<dyn ContainerRuntime>) -> Result<(), String> {
+async fn run_batch_migrate(
+    runtime: &Arc<dyn ContainerRuntime>,
+    stop: &tokio_util::sync::CancellationToken,
+) -> Result<(), String> {
     let mut total_migrated = 0u32;
-    let mut total_skipped = 0u32;
-    let mut total_failed = 0u32;
+    let mut counters = MigrationCounters::default();
 
     // Web projects: 共享 rcoder-workspace PVC subPath=workspace → /workspace/{projectId}
     total_migrated += migrate_shared_pvc(
-        runtime,
+        runtime.as_ref(),
+        stop,
         "RCODER_WORKSPACE_PVC_NAME",
         &["workspace"],
         ServiceType::WebAgentRunner,
         false,
-        &mut total_skipped,
-        &mut total_failed,
+        &mut counters,
     )
     .await;
 
     // Computer users: 共享 rcoder-computer-workspace PVC → /{userId}
     total_migrated += migrate_shared_pvc(
-        runtime,
+        runtime.as_ref(),
+        stop,
         "RCODER_COMPUTER_WORKSPACE_PVC_NAME",
         &[],
         ServiceType::ComputerAgentRunner,
         true,
-        &mut total_skipped,
-        &mut total_failed,
+        &mut counters,
     )
     .await;
 
     info!(
         "[BATCH_MIGRATE] completed: migrated={}, skipped={}, failed={}",
-        total_migrated, total_skipped, total_failed
+        total_migrated, counters.skipped, counters.failed
     );
+    if counters.failed > 0 {
+        return Err(format!(
+            "Batch migration failed for {} workspace(s)",
+            counters.failed
+        ));
+    }
     Ok(())
+}
+
+#[derive(Default)]
+struct MigrationCounters {
+    skipped: u32,
+    failed: u32,
 }
 
 /// 迁移一个共享 PVC 的所有子目录到 per-agent PVC。
 /// 返回成功迁移的项目数。
 async fn migrate_shared_pvc(
-    runtime: &Arc<dyn ContainerRuntime>,
+    runtime: &dyn container_runtime_api::WorkspaceRuntime,
+    stop: &tokio_util::sync::CancellationToken,
     pvc_env: &str,
     subpath: &[&str],
     service_type: ServiceType,
     dst_at_root: bool,
-    skipped: &mut u32,
-    failed: &mut u32,
+    counters: &mut MigrationCounters,
 ) -> u32 {
+    if stop.is_cancelled() {
+        return 0;
+    }
     let Some(shared_pvc) = std::env::var(pvc_env).ok().filter(|s| !s.is_empty()) else {
         info!("[BATCH_MIGRATE] {} not set, skip", pvc_env);
         return 0;
@@ -120,6 +142,10 @@ async fn migrate_shared_pvc(
 
     let mut migrated = 0u32;
     loop {
+        // Let an in-flight ensure/copy/marker finish before checking stop again.
+        if stop.is_cancelled() {
+            break;
+        }
         let entry = match rd.next_entry().await {
             Ok(Some(e)) => e,
             Ok(None) => break,
@@ -154,7 +180,7 @@ async fn migrate_shared_pvc(
                 "[BATCH_MIGRATE] ensure_workspace {} failed: {}, skip",
                 identifier, e
             );
-            *failed += 1;
+            counters.failed += 1;
             continue;
         }
 
@@ -169,7 +195,7 @@ async fn migrate_shared_pvc(
                     "[BATCH_MIGRATE] resolve per-agent {} failed, skip",
                     identifier
                 );
-                *failed += 1;
+                counters.failed += 1;
                 continue;
             }
         };
@@ -184,7 +210,7 @@ async fn migrate_shared_pvc(
         // 幂等: .migrated marker 存在 → skip
         let marker = dst_item.join(".migrated");
         if tokio::fs::try_exists(&marker).await.unwrap_or(false) {
-            *skipped += 1;
+            counters.skipped += 1;
             continue;
         }
 
@@ -195,7 +221,7 @@ async fn migrate_shared_pvc(
                 dst_item.display(),
                 e
             );
-            *failed += 1;
+            counters.failed += 1;
             continue;
         }
 
@@ -208,6 +234,8 @@ async fn migrate_shared_pvc(
                         marker.display(),
                         e
                     );
+                    counters.failed += 1;
+                    continue;
                 }
                 migrated += 1;
                 info!(
@@ -223,10 +251,96 @@ async fn migrate_shared_pvc(
                     "[BATCH_MIGRATE] {} {} copy failed: {}",
                     service_type, identifier, e
                 );
-                *failed += 1;
+                counters.failed += 1;
             }
         }
     }
 
     migrated
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    struct Workspace {
+        source: PathBuf,
+        destination: PathBuf,
+        stop: tokio_util::sync::CancellationToken,
+        ensured: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl container_runtime_api::WorkspaceRuntime for Workspace {
+        async fn resolve_workspace_path_by_pvcname(
+            &self,
+            _: &str,
+        ) -> container_runtime_api::ContainerRuntimeResult<Option<String>> {
+            Ok(Some(self.source.to_string_lossy().into_owned()))
+        }
+        async fn ensure_workspace(
+            &self,
+            _: &str,
+            _: &ServiceType,
+            _: Option<&str>,
+        ) -> container_runtime_api::ContainerRuntimeResult<()> {
+            self.ensured
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.stop.cancel();
+            Ok(())
+        }
+        async fn resolve_workspace_path(
+            &self,
+            _: &str,
+            _: &ServiceType,
+        ) -> container_runtime_api::ContainerRuntimeResult<Option<String>> {
+            Ok(Some(self.destination.to_string_lossy().into_owned()))
+        }
+    }
+    #[tokio::test]
+    async fn batch_shutdown_finishes_current_copy_and_marker_before_stopping() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        for name in ["one", "two"] {
+            tokio::fs::create_dir(source.path().join(name))
+                .await
+                .unwrap();
+            tokio::fs::write(source.path().join(name).join("data.txt"), name)
+                .await
+                .unwrap();
+        }
+        let stop = tokio_util::sync::CancellationToken::new();
+        let workspace = Workspace {
+            source: source.path().into(),
+            destination: destination.path().into(),
+            stop: stop.clone(),
+            ensured: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut counters = MigrationCounters::default();
+        // PATH supplies only a present env entry; the controlled resolver owns
+        // all paths and no production volume or process is involved.
+        let count = migrate_shared_pvc(
+            &workspace,
+            &stop,
+            "PATH",
+            &[],
+            ServiceType::WebAgentRunner,
+            false,
+            &mut counters,
+        )
+        .await;
+        assert_eq!(count, 1);
+        assert_eq!(counters.failed, 0);
+        assert_eq!(
+            workspace.ensured.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let entries: Vec<_> = std::fs::read_dir(destination.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].join(".migrated").exists());
+        assert!(entries[0].join("data.txt").exists());
+        assert!(source.path().join("one/data.txt").exists());
+        assert!(source.path().join("two/data.txt").exists());
+    }
 }

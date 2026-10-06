@@ -304,20 +304,24 @@ impl SupervisordHost {
         anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
         let previous_groups = self.dynamic_groups().await?;
 
-        // 1. migrate（Fail Fast，与 builtin 同语义）
+        // 1. 应用迁移失败为诊断；物理清理和父意图取消仍保护启动边界。
         for spec in &specs {
+            anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
             if run_migrations && !spec.run.migrate.is_empty() {
                 info!("🛠️  migrate {}", spec.service_id);
-                supervisor::run_migration_with_receipt_cancel(
+                let report = supervisor::run_migration_with_receipt_cancel(
                     spec,
                     release,
                     &args.workspace,
+                    &args.log_dir,
                     pg.as_ref(),
                     Some(cancel),
                 )
                 .await
                 .with_context(|| format!("migrate {}", spec.service_id))?;
+                tracing::debug!(service = %report.service_id, release = %report.release_id, outcome = ?report.outcome, stdout_bytes = report.stdout.len(), stderr_bytes = report.stderr.len(), "Migration stage finished");
             }
+            anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
         }
 
         // 2. pingap 配置编译（生成/校验/原子提交；未就绪前不启动）

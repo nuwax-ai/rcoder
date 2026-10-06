@@ -387,6 +387,8 @@ mod owner_reuse_tests {
                 sink.lock().unwrap().push(json.to_string());
             }) as process::OnLineCallback,
             on_end: None,
+            launch_deadline: None,
+            on_submitted: None,
         };
         let started = mgr
             .reuse_or_refuse_owner("userapp:app", &ws_reuse, Some(hooks), None, None, None)
@@ -657,6 +659,223 @@ mod owner_reuse_tests {
             "exactly the reuse Restart submission: {posted:?}"
         );
         assert_eq!(posted[0].kind, shared_types::RuntimeOperationKind::Restart);
+        server.abort();
+    }
+
+    /// Actual manager/HTTP-owner coordination must not expire a valid Source
+    /// operation at a hidden 180s while the configured launch budget remains.
+    /// This is a protocol counterexample, not a container/AI validation.
+    #[tokio::test]
+    async fn source_owner_launch_uses_configured_budget_beyond_migration_300_seconds() {
+        source_owner_budget_case(None, Duration::ZERO, false).await;
+    }
+
+    #[tokio::test]
+    async fn short_parent_launch_deadline_ends_observation_without_rewriting_original_operation() {
+        source_owner_budget_case(Some(Duration::from_secs(20)), Duration::ZERO, true).await;
+    }
+
+    #[tokio::test]
+    async fn consumed_parent_launch_budget_is_not_reset_at_owner_submission() {
+        source_owner_budget_case(
+            Some(Duration::from_secs(500)),
+            Duration::from_secs(480),
+            true,
+        )
+        .await;
+    }
+
+    async fn source_owner_budget_case(
+        parent_budget: Option<Duration>,
+        consumed: Duration,
+        expect_expiration: bool,
+    ) {
+        use axum::response::IntoResponse as _;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("source");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("workspace.manifest.toml"),
+            "# protocol fixture\n",
+        )
+        .unwrap();
+        let root = dir.path().join(".app-cli-state/unknown-app");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("token"), "test-token").unwrap();
+        let requests: Arc<Mutex<Vec<shared_types::RuntimeOperationRequest>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let ready = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let router = mock_owner_router("hashed-workspace", &workspace)
+            .with_state(Arc::new(AtomicUsize::new(0)))
+            .layer(axum::middleware::from_fn({
+                let requests = requests.clone();
+                let ready = ready.clone();
+                let polls = polls.clone();
+                let accepted = accepted.clone();
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let requests = requests.clone();
+                    let ready = ready.clone();
+                    let polls = polls.clone();
+                    let accepted = accepted.clone();
+                    async move {
+                        let path = request.uri().path().to_owned();
+                        if request.method() == axum::http::Method::POST {
+                            assert_eq!(request.headers()["x-deploy-token"], "test-token");
+                            let (parts, body) = request.into_parts();
+                            let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                            requests
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::from_slice(&bytes).unwrap());
+                            return next
+                                .run(axum::extract::Request::from_parts(
+                                    parts,
+                                    axum::body::Body::from(bytes),
+                                ))
+                                .await;
+                        }
+                        if let Some(id) = path.strip_prefix("/v1/runtime/operations/")
+                            && !id.contains('/')
+                        {
+                            if !requests.lock().unwrap().iter().any(|request| request.operation_id == id) {
+                                return (axum::http::StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"message":"original operation has not been submitted"}))).into_response();
+                            }
+                            polls.fetch_add(1, Ordering::SeqCst);
+                            accepted.notify_one();
+                            let state = if ready.load(Ordering::SeqCst) {
+                                shared_types::RuntimeOperationState::Succeeded
+                            } else {
+                                shared_types::RuntimeOperationState::Accepted
+                            };
+                            return axum::Json(envelope(&operation_view(id, state)))
+                                .into_response();
+                        }
+                        next.run(request).await
+                    }
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::from_env().unwrap();
+        config.log_base_dir = dir.path().join("logs");
+        config.app_cli_admin_probe_addr = listener.local_addr().unwrap().to_string();
+        config.dev_command_timeout_secs = 600;
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let manager = Arc::new(DevServerManager::new(Arc::new(config)));
+        let deadline = parent_budget.map(|budget| tokio::time::Instant::now() + budget);
+        if !consumed.is_zero() {
+            tokio::time::pause();
+            tokio::time::advance(consumed).await;
+            tokio::time::resume();
+        }
+        let hooks = deadline.map(|deadline| {
+            let mut hooks = crate::service::dev_server::DevEventHooks::noop();
+            hooks.launch_deadline = Some(deadline);
+            hooks
+        });
+        let mut launch = {
+            let manager = manager.clone();
+            let workspace = workspace.clone();
+            tokio::spawn(async move {
+                manager
+                    .start_dev(
+                        "userapp:budget",
+                        &workspace,
+                        crate::service::dev_server::DevLaunch {
+                            base_path: None,
+                            hooks,
+                            pg: None,
+                            request_context: Some("original-task"),
+                            artifact_release_id: None,
+                        },
+                    )
+                    .await
+            })
+        };
+        accepted.notified().await;
+        // Finish the loopback response before advancing time: a network
+        // request timeout must not stand in for the owner's execution budget.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(181)).await;
+        tokio::time::resume();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if expect_expiration {
+            let outcome = tokio::time::timeout(Duration::from_secs(3), &mut launch)
+                .await
+                .unwrap()
+                .unwrap();
+            let error = outcome.expect_err("the inherited parent deadline must end observation");
+            let original = requests.lock().unwrap().clone();
+            assert_eq!(
+                original.len(),
+                1,
+                "expiration must not submit a replacement request"
+            );
+            assert_eq!(
+                original[0].request_context.as_deref(),
+                Some("original-task")
+            );
+            assert!(
+                error.to_string().contains(&original[0].operation_id)
+                    && error.to_string().contains("deadline")
+                    && error.to_string().contains("query"),
+                "{error}"
+            );
+            let owner = crate::service::dev_server::owner_client::OwnerClient::new(
+                &manager.config.app_cli_admin_probe_addr,
+                "test-token",
+            )
+            .unwrap();
+            let observed = owner
+                .operation_if_exists(&original[0].operation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(observed.operation_id, original[0].operation_id);
+            assert_eq!(
+                observed.state,
+                shared_types::RuntimeOperationState::Accepted,
+                "observation expiry must not fabricate operation failure or business cancellation"
+            );
+            assert!(!ready.load(Ordering::SeqCst));
+            server.abort();
+            return;
+        }
+        if launch.is_finished() {
+            let outcome = launch.await.unwrap();
+            panic!(
+                "the accepted original Source request was cut off at 180s despite its configured budget; outcome={outcome:?}; requests={:?}",
+                requests.lock().unwrap()
+            );
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::time::resume();
+        ready.store(true, Ordering::SeqCst);
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut launch)
+            .await
+            .unwrap()
+            .unwrap();
+        let started =
+            result.expect("one original Source request must still be observable after 300s");
+        assert_eq!(started.pid, 0);
+        assert_eq!(started.port, shared_types::APP_ENTRY_PORT);
+        let posted = requests.lock().unwrap();
+        assert_eq!(
+            posted.len(),
+            1,
+            "a slow original operation must never be resubmitted"
+        );
+        assert_eq!(posted[0].request_context.as_deref(), Some("original-task"));
+        assert_eq!(posted[0].expected_runtime_instance_id, "instance-test");
+        assert_eq!(posted[0].kind, shared_types::RuntimeOperationKind::Restart);
+        assert!(polls.load(Ordering::SeqCst) >= 2);
+        drop(posted);
         server.abort();
     }
 

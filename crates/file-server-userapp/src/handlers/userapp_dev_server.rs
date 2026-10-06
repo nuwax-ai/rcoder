@@ -40,16 +40,6 @@ fn app_id_of_key(key: &str) -> Option<&str> {
     key.strip_prefix("userapp:")
 }
 
-/// app-cli 终局事件的有界等待上限（秒）。
-///
-/// P1-06：旧版硬编码 3600——"Startup completion event timed out" 在 app-cli
-/// 已失败退出时仍傻等一小时（原因是发送端保活 + EOF 不上报）；P1-03/04 修了
-/// 通道语义后仍需合理上限：合法慢启动（PG + java readiness + pingap 确认）
-/// 可达数百秒，但正常路径 done 先于 finish 到达——窗口仅兜底。
-///
-/// 最终值按 P1-06 `launch_budget()` 动态计算，此常量仅为后备默认。
-const START_DONE_WAIT_MAX_SECS: u64 = 1200;
-
 /// Whether this request produced startup events that must reach their terminal
 /// barrier. Reusing a ready service or cancelling before launch produces none.
 enum StartupCompletion {
@@ -59,12 +49,22 @@ enum StartupCompletion {
 
 use crate::service::userapp::start_events::{StartEvent as EvtOutcome, StartEventPipe};
 
+#[cfg(test)]
+#[path = "userapp_dev_server/owner_admission_tests.rs"]
+mod owner_admission_tests;
+
 /// app-cli EVT JSON → 进度事件/终局（UA-07: typed 解码走
 /// `shared_types::app_cli_evt` 唯一契约; 未知扩展与已知事件损坏分开留痕,
 /// 两者都不影响编排——尽力而为的观测通道）。返回 None = 调用方丢弃。
 fn map_app_cli_evt(json: &str) -> Option<EvtOutcome> {
     use shared_types::{AppCliEvtDecodeError as DecodeError, AppCliOrchestrationEvent as Evt};
     match Evt::decode(json) {
+        Ok(Evt::Log { service, line }) => {
+            Some(EvtOutcome::Event(shared_types::BuildProgressEvent::Log {
+                service,
+                line,
+            }))
+        }
         Ok(Evt::ServiceStarting { service }) => Some(EvtOutcome::Event(
             shared_types::BuildProgressEvent::ServiceStarting { service },
         )),
@@ -460,15 +460,20 @@ async fn spawn_dev_task(
             // P1-06：启动预算取配置兜底——不能用硬编码 3600s 掩盖通道语义缺陷，
             // 也不能截断合法慢启动。此处以 dev_command_timeout_secs 为基线加
             // pingap 确认余量（30s）与调度余量（120s），再取上限 1200s 兜底。
-            let launch_budget_secs = std::cmp::min(
-                START_DONE_WAIT_MAX_SECS,
-                state.fs.config.dev_command_timeout_secs.saturating_add(150),
-            );
+            let launch_budget_secs = file_server::service::dev_server::DevEventHooks::launch_budget(
+                state.fs.config.dev_command_timeout_secs,
+            ).as_secs();
             let launch_deadline = tokio::time::Instant::now()
                 + std::time::Duration::from_secs(launch_budget_secs);
             let hook_tx = evt_tx.clone();
             let runtime_hooks_tx = evt_tx.clone();
+            let submitted = tokio_util::sync::CancellationToken::new();
             let hooks = file_server::service::dev_server::DevEventHooks {
+                launch_deadline: Some(launch_deadline),
+                on_submitted: Some(std::sync::Arc::new({
+                    let submitted = submitted.clone();
+                    move || submitted.cancel()
+                })),
                 on_line: {
                     let tx = hook_tx;
                     std::sync::Arc::new(move |json: &str| match map_app_cli_evt(json) {
@@ -528,41 +533,30 @@ async fn spawn_dev_task(
                 // - 源码态：ensure 源码目录 release.lock（按当前输入校验派生内容），
                 //   app-cli 直接编排源码 workspace（devrun 优先、run 兜底）。
                 // 两种形态失败语义一致：旧运行态原样保留，任务 Failed。
-                if !dev_source_mode {
-                    match state
-                        .fs
-                        .dev_server
-                        .route_artifact_restart(
-                            &key,
-                            &ws,
-                            &release_id,
-                            Some(hooks.clone()),
-                            pg.as_ref(),
-                            Some(&task_clone.id),
-                        )
-                        .await
-                    {
-                        Ok(Some(_)) => {
-                            // owner 已受理并确认 Succeeded（含事件转发/终态排空/
-                            // external 登记，见 route_artifact_restart）——本地
-                            // .run 未被触碰，无需 commit_start 的本地激活段
-                            tracing::info!(%app_id, "artifact restart routed through runtime owner");
-                            // owner 仅把事件转交队列；外层统一等消费屏障，
-                            // 不能在此处 Drop 丢掉末尾服务结果日志。
-                            return Ok(StartupCompletion::WaitForEvents);
-                        }
-                        Ok(None) => { /* 无 owner：走下方本地激活 + spawn */ }
-                        Err(error) => return Err(error),
-                    }
-                }
-                let prepared = if dev_source_mode {
-                    None
-                } else {
-                    Some(crate::service::userapp::run_dir::prepare_run_dir(&ws, &release_id).await?)
-                };
                 let mut reused_source = false;
+                let mut routed_artifact = false;
                 if !task_clone
-                    .commit_start(&lifecycle, generation, async {
+                    .commit_start_until_submitted(&lifecycle, generation, &submitted, async {
+                        // Artifact and Source share the generation/Stop barrier.
+                        // Only proved owner admission releases it; afterwards
+                        // this branch observes that original operation and exits.
+                        if !dev_source_mode
+                            && state.fs.dev_server.route_artifact_restart(
+                                &key, &ws, &release_id, Some(hooks.clone()),
+                                pg.as_ref(), Some(&task_clone.id),
+                            ).await?.is_some()
+                        {
+                            routed_artifact = true;
+                            tracing::info!(%app_id, "artifact restart routed through runtime owner");
+                            return Ok::<(), AppError>(());
+                        }
+                        let prepared = if dev_source_mode {
+                            None
+                        } else {
+                            Some(tokio::time::timeout_at(launch_deadline,
+                                crate::service::userapp::run_dir::prepare_run_dir(&ws, &release_id))
+                                .await.map_err(|_| AppError::business("startup launch deadline exceeded before local artifact preparation completed; no execution submitted"))??)
+                        };
                         // Source lock preparation is validation, not artifact activation.
                         // Do it after the cancellation/generation barrier and before
                         // owner capability preflight or stopping any old execution.
@@ -591,11 +585,12 @@ async fn spawn_dev_task(
                                 // 先核验/收束本地旧执行（活 run 拒绝、死记录
                                 // 就地收束、在途停止续行）。此时若拒绝，任务
                                 // Failed 而 `.run` 保持原样。
-                                state
-                                    .fs
-                                    .dev_server
-                                    .ensure_no_local_execution(&key, &ws)
-                                    .await?;
+                                tokio::time::timeout_at(launch_deadline,
+                                    state.fs.dev_server.ensure_no_local_execution(&key, &ws))
+                                    .await.map_err(|_| AppError::business("startup launch deadline exceeded while observing original cleanup; no execution submitted"))??;
+                                if tokio::time::Instant::now() >= launch_deadline {
+                                    return Err(AppError::business("startup launch deadline expired before local activation or submission"));
+                                }
                                 let run_root = match prepared {
                                     Some(prepared) => prepared.activate()?,
                                     None => ws.clone(),
@@ -674,6 +669,9 @@ async fn spawn_dev_task(
                 if reused_source {
                     return Ok(StartupCompletion::NoNewExecution);
                 }
+                if routed_artifact {
+                    return Ok(StartupCompletion::WaitForEvents);
+                }
                 if let Some(supervised) = state.fs.dev_server.supervised_child(&key) {
                     let exit_tx = evt_tx.clone();
                     let span = tracing::Span::current();
@@ -681,7 +679,7 @@ async fn spawn_dev_task(
                         let supervised = supervised.clone();
                         async move {
                             if let Some(exit) = supervised
-                                .wait_exit(std::time::Duration::from_secs(launch_budget_secs))
+                                .wait_exit(launch_deadline.saturating_duration_since(tokio::time::Instant::now()))
                                 .await
                             {
                                 let _guard = span.enter();
@@ -916,6 +914,18 @@ mod tests {
     /// （跨进程行协议，两端测试锁同一组字面量；此处锁 file-server-userapp 侧）。
     #[test]
     fn maps_app_cli_evt_wire_to_progress_events() {
+        let line = format!("[migrate err] {} full-output-tail", "x".repeat(9000));
+        let json = serde_json::json!({"event":"log", "service":"backend", "line":line}).to_string();
+        match map_app_cli_evt(&json) {
+            Some(EvtOutcome::Event(shared_types::BuildProgressEvent::Log {
+                service,
+                line: output,
+            })) => {
+                assert_eq!(service, "backend");
+                assert_eq!(output, line);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
         match map_app_cli_evt(r#"{"event":"service_starting","service":"frontend"}"#) {
             Some(EvtOutcome::Event(shared_types::BuildProgressEvent::ServiceStarting {
                 service,

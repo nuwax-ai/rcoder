@@ -50,14 +50,19 @@ pub(crate) enum UserAppReply<T> {
     /// 专用错误码错误：code 显式指定（如 `ERR_WORKSPACE_EMPTY`），HTTP 200。
     /// 用于调用方（Java/前端）需要程序化区分的受理拒绝，AppError 类型映射
     /// 覆盖不到的细分语义。
-    ErrData(&'static str, String, shared_types::UserAppTaskFailureData),
+    ErrData(
+        String,
+        String,
+        shared_types::UserAppTaskFailureData,
+        Option<Box<shared_types::AppError>>,
+    ),
 }
 
 impl<T: Serialize> IntoResponse for UserAppReply<T> {
     fn into_response(self) -> Response {
         match self {
             UserAppReply::Ok(data) => Json(HttpResult::success(data)).into_response(),
-            UserAppReply::ErrData(code, message, data) => {
+            UserAppReply::ErrData(code, message, data, origin) => {
                 let mut value = match data.recovery.as_ref() {
                     Some(serde_json::Value::Object(details)) => details.clone(),
                     _ => serde_json::Map::new(),
@@ -69,7 +74,13 @@ impl<T: Serialize> IntoResponse for UserAppReply<T> {
                 if let Some(recovery) = data.recovery {
                     value.insert("recovery".into(), recovery);
                 }
-                let mut result = HttpResult::error(code, &message);
+                let mut result = match origin {
+                    Some(origin) => origin.into_http_result::<serde_json::Value>(
+                        shared_types::current_request_locale(),
+                    ),
+                    None => HttpResult::error(&code, &message),
+                };
+                result.message = message;
                 result.data = Some(serde_json::Value::Object(value));
                 Json(result).into_response()
             }
@@ -180,7 +191,7 @@ pub(crate) async fn dev_precheck_reply<T: Serialize>(
         UserAppDiagnosticCode as Code, UserAppDiagnosticPhase as Phase,
         UserAppRepairTarget as Target, error_codes as ec,
     };
-    let (code, message, diagnostics) = match error {
+    let (code, message, diagnostics, origin) = match error {
         userapp::DevPrecheckError::Resolve(
             error @ (AppError::Validation(..)
             | AppError::ValidationI18n(..)
@@ -191,7 +202,7 @@ pub(crate) async fn dev_precheck_reply<T: Serialize>(
             return UserAppReply::Err(error);
         }
         userapp::DevPrecheckError::Resolve(error) => {
-            let code = crate::error::app_error_code(&error);
+            let code = crate::error::app_error_code(&error).to_owned();
             let message = error.to_string();
             let ws =
                 file_server::workspace::resolve_userapp_dev(app_id, None, &state.fs.config).ok();
@@ -203,20 +214,37 @@ pub(crate) async fn dev_precheck_reply<T: Serialize>(
                 &message,
                 "检查源码根路径、文件类型及读取权限后重试。",
             );
-            (code, message, vec![item])
+            let origin = match error {
+                AppError::RuntimeDiagnostic(origin) => Some(origin),
+                _ => None,
+            };
+            (code, message, vec![item], origin)
         }
         userapp::DevPrecheckError::WorkspaceEmpty(problem) => (
-            ec::ERR_WORKSPACE_EMPTY,
+            ec::ERR_WORKSPACE_EMPTY.to_owned(),
             problem.message,
             problem.diagnostics,
+            None,
         ),
         userapp::DevPrecheckError::NoServices(problem) => (
-            ec::ERR_WORKSPACE_NO_SERVICES,
+            ec::ERR_WORKSPACE_NO_SERVICES.to_owned(),
             problem.message,
             problem.diagnostics,
+            None,
         ),
     };
-    failed_task_reply(state, app_id, kind, code, message, None, diagnostics, None).await
+    failed_task_reply(
+        state,
+        app_id,
+        kind,
+        &code,
+        message,
+        None,
+        diagnostics,
+        None,
+        origin,
+    )
+    .await
 }
 
 pub(crate) async fn submission_failure_reply<T: Serialize>(
@@ -233,8 +261,12 @@ pub(crate) async fn submission_failure_reply<T: Serialize>(
         AppError::RuntimeRecovery(_, data) => Some(data.clone()),
         _ => None,
     };
-    let code = crate::error::app_error_code(error.error.as_ref());
+    let code = crate::error::app_error_code(error.error.as_ref()).to_owned();
     let message = error.error.to_string();
+    let origin = match *error.error {
+        AppError::RuntimeDiagnostic(origin) => Some(origin),
+        _ => None,
+    };
     let diagnostics = if error.diagnostics.is_empty() {
         let ws = file_server::workspace::resolve_userapp_dev(app_id, None, &state.fs.config).ok();
         vec![userapp::diagnostics::diagnostic(
@@ -252,11 +284,12 @@ pub(crate) async fn submission_failure_reply<T: Serialize>(
         state,
         app_id,
         kind,
-        code,
+        &code,
         message,
         error.task_id,
         diagnostics,
         recovery,
+        origin,
     )
     .await
 }
@@ -266,11 +299,12 @@ async fn failed_task_reply<T: Serialize>(
     state: &UserAppState,
     app_id: &str,
     kind: BuildTaskKind,
-    code: &'static str,
+    code: &str,
     mut message: String,
     mut task_id: Option<String>,
     mut diagnostics: Vec<shared_types::UserAppDiagnostic>,
     recovery: Option<serde_json::Value>,
+    origin: Option<Box<shared_types::AppError>>,
 ) -> UserAppReply<T> {
     if task_id.is_none()
         && !diagnostics
@@ -315,7 +349,7 @@ async fn failed_task_reply<T: Serialize>(
         shared_types::UserAppDiagnosticTaskStatus::Failed
     };
     UserAppReply::ErrData(
-        code,
+        code.to_owned(),
         message,
         shared_types::UserAppTaskFailureData {
             task_id,
@@ -323,6 +357,7 @@ async fn failed_task_reply<T: Serialize>(
             diagnostics,
             recovery,
         },
+        origin,
     )
 }
 

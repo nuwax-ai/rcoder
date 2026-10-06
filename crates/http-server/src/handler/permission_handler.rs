@@ -140,6 +140,8 @@ async fn forward_permission_resolution(
         Ok(Json(HttpResult::success(dto)))
     } else {
         Ok(Json(HttpResult {
+            operation_in_progress_data: None,
+            error_detail: None,
             operation_id: None,
             blocker: None,
             code: dto.error_code.clone().unwrap_or_else(|| {

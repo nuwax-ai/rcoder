@@ -19,8 +19,6 @@ pub const RUNTIME_CONTROL_PROTOCOL_VERSION: u32 = 5;
 
 /// 受理冲突：同 operation_id 但 request_digest 不同（HTTP 409）。
 pub const ERR_OPERATION_ID_CONFLICT: &str = "ERR_OPERATION_ID_CONFLICT";
-/// 并发冲突：已有 active 操作进行中（HTTP 409，响应带进行中操作 ID）。
-pub const ERR_OPERATION_IN_PROGRESS: &str = "ERR_OPERATION_IN_PROGRESS";
 /// 身份不符：expected_runtime_instance_id 与当前实例不一致（HTTP 409）。
 pub const ERR_RUNTIME_INSTANCE_MISMATCH: &str = "ERR_RUNTIME_INSTANCE_MISMATCH";
 /// 修订过期：expected_revision 已被 stop/其他操作推进（HTTP 409）。
@@ -90,8 +88,9 @@ pub enum ArtifactInput {
 
 /// 受控的每操作运行配置（R08）：owner 复用时平台传入的显式覆盖——
 /// 用户更新的 PG 凭据经 Restart 到达编排的服务进程 env，不再沿用 owner
-/// 启动时的旧值。secret 只进内存与进程 env，不进摘要/事件/日志；
-/// 所有者侧持久化请求时须对凭据脱敏。
+/// 启动时的旧值。内部持久化请求保留真实凭据，文件在写入前限制为 0600；
+/// 对外 API/SSE 只返回视图与事件，Debug 仅显示用户名、是否提供及长度。
+/// 正规密码指纹/HMAC 审计方案留待后续设计，本次不引入。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 pub struct OperationRunConfig {
     /// PG 连接凭据（POSTGRES_USER/POSTGRES_PASSWORD 注入，运行时变量
@@ -302,12 +301,13 @@ pub struct RuntimeRecoveryView {
     pub boundary: Option<String>,
     /// None means no journal exists, not that the generation was verified.
     pub generation_matches: Option<bool>,
-    /// The confirmed active request requires credentials that were redacted.
+    /// The owner currently holds execution pending validated credentials.
+    /// Historical redaction alone does not establish this requirement.
     /// This flag alone does not prove that supplying credentials is sufficient.
     /// A fresh Source operation may supply current credentials without keeping
-    /// the historical artifact; cleanup and migration protection still apply.
+    /// the historical artifact; independent identity and cleanup checks apply.
     pub credentials_required: bool,
-    /// Observation only; execution must recheck under migration ownership.
+    /// Diagnostic observation only; this never denies operation admission.
     #[serde(default)]
     pub migrations: RuntimeMigrationRecoveryState,
 }

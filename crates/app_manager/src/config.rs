@@ -107,6 +107,9 @@ pub struct AppManagerConfig {
 
     /// 部署预算配置（旁路：stage/absolute/SQL/no-progress/failure thresholds）
     pub deploy_budget: DeployBudgetConfig,
+    /// Total pre-admission wait for an explicit production restart. This is
+    /// independent from application shutdown grace and deployment execution.
+    pub restart_admission_wait_secs: u64,
 }
 
 impl Default for AppManagerConfig {
@@ -127,7 +130,11 @@ impl Default for AppManagerConfig {
             access_mode: AppAccessMode::default(),
             http_expose: http_expose_from_env(),
             workspace_pvc_name: std::env::var("RCODER_WORKSPACE_PVC_NAME").ok(),
-            deploy_budget: deploy_budget_from_env(),
+            // Default is infallible and does not inspect unselected input.
+            // The loader resolves environment only for an enabled manager
+            // without an explicit budget section.
+            deploy_budget: DeployBudgetConfig::default(),
+            restart_admission_wait_secs: 30,
         }
     }
 }
@@ -197,57 +204,128 @@ impl Default for DeployBudgetConfig {
     }
 }
 
-/// 从环境变量读取部署预算配置，无效值直接 panic（fail-fast）。
-pub fn deploy_budget_from_env() -> DeployBudgetConfig {
-    let d = DeployBudgetConfig::default();
-    let parse_env = |key: &str, default: u64| -> u64 {
-        std::env::var(key)
-            .ok()
-            .map(|v| {
-                v.parse::<u64>()
-                    .unwrap_or_else(|e| panic!("{key}={v}: invalid u64: {e}"))
-            })
-            .unwrap_or(default)
-    };
-    let parse_u32 = |key: &str, default: u32| -> u32 {
-        std::env::var(key)
-            .ok()
-            .map(|v| {
-                v.parse::<u32>()
-                    .unwrap_or_else(|e| panic!("{key}={v}: invalid u32: {e}"))
-            })
-            .unwrap_or(default)
-    };
-    DeployBudgetConfig {
-        sql_stage_budget_secs: parse_env(
-            "RCODER_USERAPP_DEPLOY_SQL_STAGE_BUDGET_SECS",
-            d.sql_stage_budget_secs,
-        ),
-        no_progress_timeout_secs: parse_env(
-            "RCODER_USERAPP_DEPLOY_NO_PROGRESS_TIMEOUT_SECS",
-            d.no_progress_timeout_secs,
-        ),
-        pre_appcli_stage_budget_secs: parse_env(
-            "RCODER_USERAPP_DEPLOY_PRE_APPCLI_STAGE_BUDGET_SECS",
-            d.pre_appcli_stage_budget_secs,
-        ),
-        absolute_budget_secs: parse_env(
-            "RCODER_USERAPP_DEPLOY_ABSOLUTE_BUDGET_SECS",
-            d.absolute_budget_secs,
-        ),
-        failure_restart_threshold: parse_u32(
-            "RCODER_USERAPP_DEPLOY_FAILURE_RESTART_THRESHOLD",
-            d.failure_restart_threshold,
-        ),
-        oom_restart_threshold: parse_u32(
-            "RCODER_USERAPP_DEPLOY_OOM_RESTART_THRESHOLD",
-            d.oom_restart_threshold,
-        ),
-        fenced_alert_after_secs: parse_env(
-            "RCODER_USERAPP_DEPLOY_FENCED_ALERT_AFTER_SECS",
-            d.fenced_alert_after_secs,
-        ),
+/// Load selected deployment budget input. An invalid value remains a typed
+/// configuration failure; callers decide whether this configuration is in use.
+pub fn deploy_budget_from_env() -> Result<DeployBudgetConfig, shared_types::AppError> {
+    deploy_budget_from_env_with(|key| std::env::var_os(key))
+}
+
+pub fn restart_admission_wait_from_env() -> Result<u64, shared_types::AppError> {
+    restart_admission_wait_from_env_with(|| {
+        std::env::var_os("RCODER_USERAPP_RESTART_ADMISSION_WAIT_SECS")
+    })
+}
+
+pub fn validate_restart_admission_wait_secs(seconds: u64) -> Result<(), shared_types::AppError> {
+    if seconds == 0
+        || std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(seconds.saturating_add(300)))
+            .is_none()
+    {
+        return Err(shared_types::AppError::with_message(
+            shared_types::ERR_RUNTIME_CONFIGURATION,
+            "restart_admission_wait_secs must be positive and within the monotonic clock range",
+        ));
     }
+    Ok(())
+}
+
+pub fn restart_admission_wait_from_env_with(
+    lookup: impl FnOnce() -> Option<std::ffi::OsString>,
+) -> Result<u64, shared_types::AppError> {
+    let Some(value) = lookup() else {
+        return Ok(30);
+    };
+    let invalid = || {
+        shared_types::AppError::with_message(
+            shared_types::ERR_RUNTIME_CONFIGURATION,
+            "RCODER_USERAPP_RESTART_ADMISSION_WAIT_SECS must be a positive unsigned integer",
+        )
+    };
+    let seconds = value
+        .into_string()
+        .map_err(|_| invalid())?
+        .parse::<u64>()
+        .map_err(|_| invalid())?;
+    validate_restart_admission_wait_secs(seconds)?;
+    Ok(seconds)
+}
+
+/// Explicit lookup makes environment resolution deterministic without mutating
+/// process-global environment in tests or changing configuration precedence.
+pub fn deploy_budget_from_env_with(
+    mut lookup: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> Result<DeployBudgetConfig, shared_types::AppError> {
+    fn parse<T: std::str::FromStr>(
+        lookup: &mut impl FnMut(&str) -> Option<std::ffi::OsString>,
+        key: &str,
+        default: T,
+        kind: &str,
+    ) -> Result<T, shared_types::AppError> {
+        let Some(value) = lookup(key) else {
+            return Ok(default);
+        };
+        let invalid = || {
+            let detail = format!(
+                "Invalid deployment budget configuration: {key} must be a Unicode unsigned {kind} integer"
+            );
+            shared_types::AppError::with_message(shared_types::ERR_RUNTIME_CONFIGURATION, &detail)
+                .with_error_detail(shared_types::ErrorDetail::new(
+                    shared_types::ERR_RUNTIME_CONFIGURATION,
+                    "deploy_budget_configuration",
+                    detail,
+                ))
+        };
+        // Never echo environment values: a misconfigured field may contain a
+        // secret copied into the wrong key. Missing and non-Unicode differ.
+        let text = value.into_string().map_err(|_| invalid())?;
+        text.parse::<T>().map_err(|_| invalid())
+    }
+    let defaults = DeployBudgetConfig::default();
+    Ok(DeployBudgetConfig {
+        sql_stage_budget_secs: parse(
+            &mut lookup,
+            "RCODER_USERAPP_DEPLOY_SQL_STAGE_BUDGET_SECS",
+            defaults.sql_stage_budget_secs,
+            "64-bit",
+        )?,
+        no_progress_timeout_secs: parse(
+            &mut lookup,
+            "RCODER_USERAPP_DEPLOY_NO_PROGRESS_TIMEOUT_SECS",
+            defaults.no_progress_timeout_secs,
+            "64-bit",
+        )?,
+        pre_appcli_stage_budget_secs: parse(
+            &mut lookup,
+            "RCODER_USERAPP_DEPLOY_PRE_APPCLI_STAGE_BUDGET_SECS",
+            defaults.pre_appcli_stage_budget_secs,
+            "64-bit",
+        )?,
+        absolute_budget_secs: parse(
+            &mut lookup,
+            "RCODER_USERAPP_DEPLOY_ABSOLUTE_BUDGET_SECS",
+            defaults.absolute_budget_secs,
+            "64-bit",
+        )?,
+        failure_restart_threshold: parse(
+            &mut lookup,
+            "RCODER_USERAPP_DEPLOY_FAILURE_RESTART_THRESHOLD",
+            defaults.failure_restart_threshold,
+            "32-bit",
+        )?,
+        oom_restart_threshold: parse(
+            &mut lookup,
+            "RCODER_USERAPP_DEPLOY_OOM_RESTART_THRESHOLD",
+            defaults.oom_restart_threshold,
+            "32-bit",
+        )?,
+        fenced_alert_after_secs: parse(
+            &mut lookup,
+            "RCODER_USERAPP_DEPLOY_FENCED_ALERT_AFTER_SECS",
+            defaults.fenced_alert_after_secs,
+            "64-bit",
+        )?,
+    })
 }
 
 /// 运行时数据根（Docker 形态锁根与数据根同树约定的单一事实源）。
@@ -281,5 +359,71 @@ pub fn default_operation_lock_root() -> String {
     #[cfg(not(feature = "deploy-host"))]
     {
         shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod deploy_budget_tests {
+    #[test]
+    fn restart_wait_configuration_has_positive_bounded_selected_input() {
+        assert_eq!(
+            super::restart_admission_wait_from_env_with(|| None).unwrap(),
+            30
+        );
+        assert_eq!(
+            super::restart_admission_wait_from_env_with(|| Some("7".into())).unwrap(),
+            7
+        );
+        for value in ["0", "-1", "misplaced-secret-value", "18446744073709551615"] {
+            let error =
+                super::restart_admission_wait_from_env_with(|| Some(value.into())).unwrap_err();
+            assert!(!error.to_string().contains("misplaced-secret-value"));
+            assert_eq!(
+                error.into_http_result::<()>("en-US").code,
+                shared_types::ERR_RUNTIME_CONFIGURATION
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            assert!(
+                super::restart_admission_wait_from_env_with(|| Some(std::ffi::OsString::from_vec(
+                    vec![0xff]
+                )))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn selected_budget_values_and_invalid_errors_keep_configuration_evidence() {
+        let valid = super::deploy_budget_from_env_with(|key| {
+            if key == "RCODER_USERAPP_DEPLOY_SQL_STAGE_BUDGET_SECS" {
+                Some("27".into())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+        assert_eq!(valid.sql_stage_budget_secs, 27);
+        assert_eq!(valid.failure_restart_threshold, 3);
+        let error = super::deploy_budget_from_env_with(|key| {
+            if key == "RCODER_USERAPP_DEPLOY_FAILURE_RESTART_THRESHOLD" {
+                Some("misplaced-secret-value".into())
+            } else {
+                None
+            }
+        })
+        .unwrap_err();
+        assert!(!error.to_string().contains("misplaced-secret-value"));
+        let response = error.into_http_result::<()>("zh-CN");
+        assert_eq!(response.code, shared_types::ERR_RUNTIME_CONFIGURATION);
+        let detail = response.error_detail.unwrap();
+        assert_eq!(detail.stage, "deploy_budget_configuration");
+        assert!(!detail.retryable);
+        assert_eq!(
+            detail.hint,
+            shared_types::get_error_hint(shared_types::ERR_RUNTIME_CONFIGURATION, "zh-CN")
+        );
     }
 }

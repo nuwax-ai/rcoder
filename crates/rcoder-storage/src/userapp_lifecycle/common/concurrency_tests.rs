@@ -22,6 +22,96 @@ fn accepted(result: UserAppAdmissionOutcome) -> UserAppOperationRecord {
     }
 }
 
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn holder_progress_timestamp_reads_actual_column_and_exact_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ToastyUserAppStore::open_exclusive(&dir.path().join("holder-time.db"))
+        .await
+        .unwrap();
+    let app = store.ensure_identity("holder-progress-time").await.unwrap();
+    let op = accepted(
+        store
+            .admit(&request(&app, UserAppOperationKind::Start))
+            .await
+            .unwrap(),
+    );
+    let historical = chrono::Utc::now() - chrono::Duration::seconds(301);
+    let operation_id = op.operation_id.clone();
+    store
+        .run(false, move |tx, backend| {
+            Box::pin(async move {
+                toasty::sql::statement(repo::sql(
+                    backend,
+                    "UPDATE userapp_operations SET updated_at_us=$2 WHERE operation_id=$1",
+                ))
+                .bind(operation_id)
+                .bind(historical.timestamp_micros())
+                .exec(tx)
+                .await
+                .map_err(super::storage)?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    let actual = store
+        .get_operation_updated_at(&app.app_id, &op.operation_id, op.revision)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual.timestamp_micros(), historical.timestamp_micros());
+    assert_ne!(actual.timestamp_micros(), op.created_at.timestamp_micros());
+    assert!(
+        store
+            .get_operation_updated_at(&app.app_id, &op.operation_id, op.revision + 1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get_operation_updated_at("another-app", &op.operation_id, op.revision)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let compute = store
+        .admit_compute_control(&ComputeControlRequest {
+            app_id: app.app_id.clone(),
+            lifecycle_id: app.lifecycle_id.clone(),
+            scope: UserAppOperationScope::Prod,
+            operation_id: "holder-compute-time".into(),
+            request_id: "holder-compute-request".into(),
+            request_fingerprint: "c".repeat(64),
+            action: ComputeControlAction::Stop,
+            restart_image_roll: false,
+        })
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_compute_control_updated_at(&app.app_id, &compute.operation_id, compute.revision)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .get_compute_control_updated_at(
+                &app.app_id,
+                &compute.operation_id,
+                compute.revision + 1
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    crate::userapp_lifecycle::UserAppStoreControl::shutdown(&store)
+        .await
+        .unwrap();
+}
+
 // Also tests stale full-slot replacement independently from the root CAS:
 // releasing an old snapshot must not erase a subsequently admitted prod slot.
 async fn stale_slots(store: &ToastyUserAppStore) {

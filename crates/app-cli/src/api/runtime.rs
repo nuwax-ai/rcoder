@@ -204,7 +204,7 @@ pub(super) async fn status(
     ),
     responses(
         (status = 202, description = "Operation accepted or idempotent replay. Fresh Source Start/Restart uses current input and can replace a redacted-credential or missing-history hold without requiring the old artifact release. Artifact restoration retains its original identity checks. While a normal build/deploy is active, a newer Start/Restart supersedes it. While a Stop/Restart control is physically executing, a different Start/Restart is rejected Busy with the active operation identity instead of being queued; same-id retries replay recorded progress and terminal state.", body = serde_json::Value),
-        (status = 409, description = "Conflict: id/replay/busy/revision/instance/recovery. Missing current credentials or unknown cleanup/migration outcomes retain recovery protection with the specific cause. Stop retains kernel safety checks.", body = serde_json::Value),
+        (status = 409, description = "Conflict: id/replay/busy/revision/instance/recovery. Invalid current credentials, physical cleanup or independent platform write outcomes retain their specific protection. Application migration receipts are advisory and never block admission. Stop retains kernel safety checks.", body = serde_json::Value),
     ),
     tag = "Runtime Control"
 )]

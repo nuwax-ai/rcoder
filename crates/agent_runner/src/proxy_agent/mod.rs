@@ -13,24 +13,96 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::LazyLock;
 #[cfg(feature = "proxy")]
+use std::time::Duration;
+#[cfg(feature = "proxy")]
 use tracing::{error, info};
 
 /// Pingora 启动结果
 ///
-/// 持有关闭信号的发送端，`stop()` 时直接发送信号，无需 Mutex 锁。
+/// 持有关闭信号、代理和健康检查任务，只有真实退出后 stop 才返回成功。
 #[cfg(feature = "proxy")]
 pub struct PingoraStartResult {
     /// 关闭信号发送端
-    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<tokio::time::Instant>>,
+    /// 真实代理任务的完成结果
+    server_task: Option<tokio::task::JoinHandle<Result<()>>>,
+    health_stop: tokio::sync::watch::Sender<bool>,
+    health_task: Option<tokio::task::JoinHandle<()>>,
+    /// 首次受理关闭后，后续调用沿用同一总预算。
+    shutdown_deadline: Option<tokio::time::Instant>,
+    /// 已完成的失败结果不能在重复 stop 时被改写成成功。
+    shutdown_error: Option<String>,
 }
 
 #[cfg(feature = "proxy")]
 impl PingoraStartResult {
-    /// 停止 Pingora 服务器
-    pub async fn stop(&mut self) {
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
+    #[cfg(all(test, unix))]
+    pub(crate) fn shutdown_observer(
+        &self,
+    ) -> (
+        tokio::task::AbortHandle,
+        tokio::sync::watch::Sender<bool>,
+        Option<tokio::task::AbortHandle>,
+    ) {
+        (
+            self.server_task
+                .as_ref()
+                .expect("observe original proxy task")
+                .abort_handle(),
+            self.health_stop.clone(),
+            self.health_task
+                .as_ref()
+                .map(tokio::task::JoinHandle::abort_handle),
+        )
+    }
+
+    /// 请求关闭并在同一个十秒预算内确认代理、健康检查任务退出。
+    pub async fn stop(&mut self) -> Result<()> {
+        self.stop_until(tokio::time::Instant::now() + Duration::from_secs(10))
+            .await
+    }
+
+    /// 嵌入 HTTP 服务器时沿用父级 deadline，不重新分配阶段预算。
+    pub(crate) async fn stop_until(&mut self, deadline: tokio::time::Instant) -> Result<()> {
+        if let Some(error) = &self.shutdown_error {
+            anyhow::bail!("{error}");
         }
+        let deadline = *self.shutdown_deadline.get_or_insert(deadline);
+        if let Some(tx) = self.shutdown_tx.take() {
+            // 接收端可能已因启动失败关闭；以下实际 join 返回该失败。
+            if tx.send(deadline).is_err() {
+                tracing::debug!("Pingora shutdown receiver closed; observing task result");
+            }
+        }
+
+        if let Some(task) = self.server_task.as_mut() {
+            let completion = tokio::time::timeout_at(deadline, task).await.context(
+                "Pingora proxy shutdown deadline expired; task exit remains unconfirmed",
+            )?;
+            drop(self.server_task.take());
+            let result = completion
+                .context("Pingora proxy task failed; server thread exit remains unconfirmed")
+                .and_then(|result| result);
+            if let Err(error) = result {
+                self.shutdown_error = Some(format!("{error:#}"));
+                return Err(error);
+            }
+        }
+
+        // 代理已真实退出，随后才关闭健康检查；未知代理结果保持其所有权。
+        self.health_stop.send_replace(true);
+        if let Some(task) = self.health_task.as_mut() {
+            let completion = tokio::time::timeout_at(deadline, task).await.context(
+                "Pingora health check shutdown deadline expired; task exit remains unconfirmed",
+            )?;
+            drop(self.health_task.take());
+            if let Err(error) = completion.context("Pingora health check task failed") {
+                self.shutdown_error = Some(format!("{error:#}"));
+                return Err(error);
+            }
+        }
+        info!("Pingora proxy and health check tasks exited");
+        Ok(())
     }
 }
 
@@ -70,20 +142,29 @@ pub fn start_pingora(
 
     let pingora_service = server_manager.service();
 
-    // 启动健康检查循环（按配置）
-    if proxy_config.health_check.enabled {
+    // 生命周期对象持有关闭发送端和句柄，代理退出未确认时仍保留健康检查。
+    let (health_stop, health_stopped) = tokio::sync::watch::channel(false);
+    let health_task = if proxy_config.health_check.enabled {
         let hc = &proxy_config.health_check;
-        pingora_service.start_health_check_loop(hc.interval_seconds, hc.timeout_seconds * 1000);
-    }
+        Some(pingora_service.start_health_check_loop(
+            hc.interval_seconds,
+            hc.timeout_seconds * 1000,
+            health_stopped,
+        ))
+    } else {
+        None
+    };
 
     // 在外部创建 shutdown 通道，避免通过 Mutex 发送信号导致死锁
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
     // 在后台任务中启动 Pingora（直接 move server_manager，无需 Arc<Mutex<>>）
-    tokio::spawn(async move {
-        if let Err(e) = server_manager.start(shutdown_rx).await {
-            error!("Failed to start Pingora proxy server: {}", e);
+    let server_task = tokio::spawn(async move {
+        let server_result = server_manager.start_with_deadline(shutdown_rx).await;
+        if let Err(error) = &server_result {
+            error!(%error, "Pingora proxy server failed");
         }
+        server_result.context("Pingora proxy server failed")
     });
 
     info!(
@@ -93,8 +174,16 @@ pub fn start_pingora(
 
     Ok(PingoraStartResult {
         shutdown_tx: Some(shutdown_tx),
+        server_task: Some(server_task),
+        health_stop,
+        health_task,
+        shutdown_deadline: None,
+        shutdown_error: None,
     })
 }
+
+#[cfg(all(test, feature = "proxy", unix))]
+mod lifecycle_tests;
 
 #[cfg(feature = "proxy")]
 fn preflight_proxy_port(listen_port: u16) -> Result<()> {

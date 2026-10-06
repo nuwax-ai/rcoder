@@ -23,7 +23,7 @@ impl Drop for FlightGuard {
 impl OperationFlightGate {
     pub fn guard(self: &Arc<Self>) -> Result<FlightGuard, FlightAdmissionClosed> {
         self.state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 if state & CLOSING != 0 || state == CLOSING - 1 {
                     None
                 } else {
@@ -56,6 +56,53 @@ impl OperationFlightGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn admission_at_capacity_preserves_count_and_can_resume_after_a_guard_leaves() {
+        let gate = Arc::new(OperationFlightGate {
+            state: AtomicUsize::new(CLOSING - 1),
+        });
+        assert!(gate.guard().is_err());
+        assert_eq!(gate.state.load(Ordering::Acquire), CLOSING - 1);
+        // Represent one of the already admitted guards leaving at capacity.
+        drop(FlightGuard { gate: gate.clone() });
+        let admitted = gate.guard().unwrap();
+        assert_eq!(gate.active(), CLOSING - 1);
+        gate.close();
+        drop(admitted);
+        assert!(gate.guard().is_err());
+        assert_eq!(gate.state.load(Ordering::Acquire), CLOSING | (CLOSING - 2));
+    }
+
+    #[test]
+    fn concurrent_guards_do_not_lose_counts_and_close_remains_permanent() {
+        let gate = Arc::new(OperationFlightGate::default());
+        let entered = Arc::new(std::sync::Barrier::new(9));
+        let leave = Arc::new(std::sync::Barrier::new(9));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let gate = gate.clone();
+                let entered = entered.clone();
+                let leave = leave.clone();
+                std::thread::spawn(move || {
+                    let held = gate.guard().unwrap();
+                    entered.wait();
+                    leave.wait();
+                    drop(held);
+                })
+            })
+            .collect();
+        entered.wait();
+        assert_eq!(gate.active(), 8);
+        gate.close();
+        assert!(gate.guard().is_err());
+        leave.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(gate.active(), 0);
+        assert!(gate.guard().is_err());
+    }
+
     #[tokio::test]
     async fn closing_tracks_unpolled_worker_and_rejects_new_admission() {
         let gate = Arc::new(OperationFlightGate::default());

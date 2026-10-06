@@ -13,7 +13,11 @@ struct BoundManagementRunner<'a> {
 
 #[async_trait]
 impl shared_types::PgCommandRunner for BoundManagementRunner<'_> {
-    async fn run(&self, command: &str) -> Result<shared_types::CommandOutcome, String> {
+    async fn run(
+        &self,
+        command: &str,
+        mode: shared_types::PgCommandMode,
+    ) -> Result<shared_types::CommandOutcome, shared_types::PgCommandError> {
         let result = self
             .service
             .runtime
@@ -23,7 +27,7 @@ impl shared_types::PgCommandRunner for BoundManagementRunner<'_> {
                 vec!["sh".into(), "-c".into(), command.into()],
             )
             .await
-            .map_err(|error| format!("Bound PostgreSQL command failed: {error}"))?;
+            .map_err(|error| container_runtime_api::runtime_pg_command_error(&error, mode))?;
         Ok(shared_types::CommandOutcome {
             exit_code: result.exit_code,
             stdout: result.stdout,
@@ -50,12 +54,20 @@ impl AppService {
             let attempt = async {
                 // The image writes this marker from initdb/verified legacy PGDATA.
                 // Never guess the administrator from a new business credential.
-                let Ok(marker) = runner
-                    .run("test -n \"${PGDATA:-}\" && cat \"$PGDATA/.rcoder-admin-user\"")
+                let marker = runner
+                    .run(
+                        "test -n \"${PGDATA:-}\" && cat \"$PGDATA/.rcoder-admin-user\"",
+                        shared_types::PgCommandMode::ReadOnly,
+                    )
                     .await
-                else {
-                    return Ok::<_, AppOperationError>(None);
-                };
+                    .map_err(|error| {
+                        AppOperationError::credential_command_error(
+                            error,
+                            "database_readiness",
+                            CredentialMutationEvidence::NotAttempted,
+                            "Read PostgreSQL administrator identity failed before credential mutation",
+                        )
+                    })?;
                 if marker.exit_code != 0 {
                     return Ok(None);
                 }
@@ -64,9 +76,20 @@ impl AppService {
                     "/var/run/postgresql".into(),
                 )
                 .map_err(|_| AppOperationError::InvalidState("PGDATA administrator identity is invalid; explicit reconciliation is required".into()))?;
-                let Ok(ready) = runner.run(&admin.business_database_ready_command()).await else {
-                    return Ok(None);
-                };
+                let ready = runner
+                    .run(
+                        &admin.business_database_ready_command(),
+                        shared_types::PgCommandMode::ReadOnly,
+                    )
+                    .await
+                    .map_err(|error| {
+                        AppOperationError::credential_command_error(
+                            error,
+                            "database_readiness",
+                            CredentialMutationEvidence::NotAttempted,
+                            "PostgreSQL readiness command failed before credential mutation",
+                        )
+                    })?;
                 Ok((ready.exit_code == 0 && ready.stdout.trim() == "1").then_some(admin))
             };
             match tokio::time::timeout_at(deadline, attempt).await {
@@ -76,6 +99,7 @@ impl AppService {
                     tokio::time::sleep_until(std::cmp::min(deadline, tokio::time::Instant::now() + std::time::Duration::from_millis(500))).await;
                 }
                 _ => return Err(AppOperationError::CredentialApplication {
+                    diagnostic: Some(Box::new(shared_types::WakeFailure { cause_code: shared_types::ERR_DATABASE_NOT_READY.into(), ..shared_types::WakeFailure::new(shared_types::ERR_DATABASE_NOT_READY, "database_readiness", "PostgreSQL management readiness was not confirmed within the operation budget") })),
                     message: "PostgreSQL management readiness was not confirmed within the operation budget".into(),
                     mutation: CredentialMutationEvidence::NotAttempted,
                 }),
@@ -170,14 +194,27 @@ impl AppService {
                     &admin
                         .role_exists_command(&pg.username)
                         .map_err(AppOperationError::Validation)?,
+                    shared_types::PgCommandMode::ReadOnly,
                 )
                 .await
-                .map_err(|_| AppOperationError::CredentialApplication {
-                    message: "Explicit database account preflight transport failed".into(),
-                    mutation: CredentialMutationEvidence::NotAttempted,
+                .map_err(|error| {
+                    AppOperationError::credential_command_error(
+                        error,
+                        "database_account_preflight",
+                        CredentialMutationEvidence::NotAttempted,
+                        "Explicit database account preflight transport failed",
+                    )
                 })?;
             if exists.exit_code != 0 {
                 return Err(AppOperationError::CredentialApplication {
+                    diagnostic: Some(Box::new(shared_types::WakeFailure {
+                        cause_code: shared_types::ERR_DATABASE_COMMAND_FAILED.into(),
+                        ..shared_types::WakeFailure::new(
+                            shared_types::ERR_DATABASE_COMMAND_FAILED,
+                            "database_account_preflight",
+                            "Explicit database account preflight failed",
+                        )
+                    })),
                     message: "Explicit database account preflight failed".into(),
                     mutation: CredentialMutationEvidence::NotAttempted,
                 });
@@ -187,6 +224,14 @@ impl AppService {
                 "" => true,
                 _ => {
                     return Err(AppOperationError::CredentialApplication {
+                        diagnostic: Some(Box::new(shared_types::WakeFailure {
+                            cause_code: shared_types::ERR_DATABASE_COMMAND_FAILED.into(),
+                            ..shared_types::WakeFailure::new(
+                                shared_types::ERR_DATABASE_COMMAND_FAILED,
+                                "database_account_preflight",
+                                "Explicit database account preflight returned invalid data",
+                            )
+                        })),
                         message: "Explicit database account preflight returned invalid data".into(),
                         mutation: CredentialMutationEvidence::NotAttempted,
                     });
@@ -218,16 +263,27 @@ impl AppService {
                     })?,
                 )
                 .await?;
-            let applied =
-                runner
-                    .run(&sql)
-                    .await
-                    .map_err(|_| AppOperationError::CredentialApplication {
-                        message: "Explicit database write outcome is unknown".into(),
-                        mutation: CredentialMutationEvidence::Unknown,
-                    })?;
+            let applied = runner
+                .run(&sql, shared_types::PgCommandMode::Write)
+                .await
+                .map_err(|error| {
+                    AppOperationError::credential_command_error(
+                        error,
+                        "database_password_write",
+                        CredentialMutationEvidence::Unknown,
+                        "Explicit database write outcome is unknown",
+                    )
+                })?;
             if applied.exit_code != 0 {
                 return Err(AppOperationError::CredentialApplication {
+                    diagnostic: Some(Box::new(shared_types::WakeFailure {
+                        cause_code: shared_types::ERR_DATABASE_COMMAND_FAILED.into(),
+                        ..shared_types::WakeFailure::new(
+                            shared_types::ERR_OPERATION_OUTCOME_UNKNOWN,
+                            "database_password_write",
+                            "Explicit database write did not confirm success",
+                        )
+                    })),
                     message: "Explicit database write did not confirm success".into(),
                     mutation: CredentialMutationEvidence::Unknown,
                 });
@@ -241,32 +297,55 @@ impl AppService {
                             &pg.username,
                         )
                         .map_err(AppOperationError::Validation)?,
+                    shared_types::PgCommandMode::ReadOnly,
                 )
                 .await
-                .map_err(|_| AppOperationError::CredentialApplication {
-                    message: "Explicit database transaction receipt is unavailable".into(),
-                    mutation: CredentialMutationEvidence::Unknown,
+                .map_err(|error| {
+                    AppOperationError::credential_command_error(
+                        error,
+                        "database_password_receipt",
+                        CredentialMutationEvidence::Unknown,
+                        "Explicit database transaction receipt is unavailable",
+                    )
                 })?;
             if receipt.exit_code != 0 || receipt.stdout.trim() != "1" {
                 return Err(AppOperationError::CredentialApplication {
+                    diagnostic: Some(Box::new(shared_types::WakeFailure {
+                        cause_code: shared_types::ERR_DATABASE_COMMAND_FAILED.into(),
+                        ..shared_types::WakeFailure::new(
+                            shared_types::ERR_OPERATION_OUTCOME_UNKNOWN,
+                            "database_password_receipt",
+                            "Explicit database transaction commit could not be confirmed",
+                        )
+                    })),
                     message: "Explicit database transaction commit could not be confirmed".into(),
                     mutation: CredentialMutationEvidence::Unknown,
                 });
             }
             let verified = runner
-                .run(&shared_types::pg_utils::pg_verify_credentials_cmd(
-                    &pg.username,
-                    &pg.password,
-                ))
+                .run(
+                    &shared_types::pg_utils::pg_verify_credentials_cmd(&pg.username, &pg.password),
+                    shared_types::PgCommandMode::ReadOnly,
+                )
                 .await
-                .map_err(|_| AppOperationError::CredentialApplication {
-                    message:
-                        "Explicit database password changed but TCP verification is unavailable"
-                            .into(),
-                    mutation: CredentialMutationEvidence::AppliedButUnverified,
+                .map_err(|error| {
+                    AppOperationError::credential_command_error(
+                        error,
+                        "database_password_verification",
+                        CredentialMutationEvidence::AppliedButUnverified,
+                        "Explicit database password changed but TCP verification is unavailable",
+                    )
                 })?;
             if verified.exit_code != 0 {
                 return Err(AppOperationError::CredentialApplication {
+                    diagnostic: Some(Box::new(shared_types::WakeFailure {
+                        cause_code: shared_types::ERR_DATABASE_COMMAND_FAILED.into(),
+                        ..shared_types::WakeFailure::new(
+                            shared_types::ERR_DATABASE_COMMAND_FAILED,
+                            "database_password_verification",
+                            "Explicit database password changed but TCP verification failed",
+                        )
+                    })),
                     message: "Explicit database password changed but TCP verification failed"
                         .into(),
                     mutation: CredentialMutationEvidence::AppliedButUnverified,
@@ -283,9 +362,19 @@ impl AppService {
                 .await?;
             Ok(())
         };
-        tokio::time::timeout_at(deadline,effect).await.map_err(|_|AppOperationError::CredentialApplication {
-            message:"Explicit database write outcome requires reconciliation under the original operation".into(),
-            mutation:CredentialMutationEvidence::Unknown,
+        tokio::time::timeout_at(deadline, effect).await.map_err(|_| {
+            AppOperationError::CredentialApplication {
+                diagnostic: Some(Box::new(shared_types::WakeFailure {
+                    cause_code: shared_types::ERR_RUNTIME_TIMEOUT.into(),
+                    ..shared_types::WakeFailure::new(
+                        shared_types::ERR_OPERATION_OUTCOME_UNKNOWN,
+                        "database_credentials_deadline",
+                        "Explicit database write outcome requires reconciliation under the original operation",
+                    )
+                })),
+                message: "Explicit database write outcome requires reconciliation under the original operation".into(),
+                mutation: CredentialMutationEvidence::Unknown,
+            }
         })?
     }
 }

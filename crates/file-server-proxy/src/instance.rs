@@ -35,6 +35,10 @@ pub fn init(config: FileServerProxyConfig) {
 /// Register the assembly result, including a rejected configuration. Admin
 /// start/restart must not turn a startup validation error into public defaults.
 pub fn init_result(config: Result<FileServerProxyConfig, String>) {
+    let config = config.and_then(|mut config| {
+        config.apply_auth_token_env()?;
+        Ok(config)
+    });
     if CONFIG.set(config).is_err() {
         tracing::debug!("file-server-proxy config already registered, keep first");
     }

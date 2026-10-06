@@ -242,8 +242,8 @@ pub trait WorkspacePathResolver: Send + Sync {
 /// 聚合路径, 拼上 leaf → `{cephfs-root}/{subvolumePath}/{leaf}`。
 ///
 /// 多租户 tenant/space 被 per-project PVC 吸收 (PVC 身份=project), leaf 不含 tenant/space;
-/// computer PVC per-user, leaf 不含 user_id。resolve 返回 None (Docker 模式 / K8s API 抖动 /
-/// PVC 未 Bound) → 降级到内置 [`LocalWorkspaceResolver`] (fail-open, 不阻断服务)。
+/// computer PVC per-user, leaf 不含 user_id。运行时明确返回 None (Docker 无聚合视角)
+/// 时使用内置 [`LocalWorkspaceResolver`]；查询失败传播，不改变源码权威。
 pub struct SubvolumeWorkspaceResolver {
     path_resolver: Arc<dyn WorkspacePathResolver>,
     fallback: LocalWorkspaceResolver,
@@ -268,7 +268,7 @@ impl WorkspaceResolver for SubvolumeWorkspaceResolver {
         if !shared_types::per_agent_pvc_enabled() {
             return self.fallback.resolve_project(ctx).await;
         }
-        // 主动 ensure per-agent PVC + 迁移 (不被动 fallback; 失败才降级 Local)
+        // 主动 ensure per-agent PVC + 迁移；错误传播，只有明确 None 才用 Local。
         match self
             .path_resolver
             .ensure_and_resolve(project_id, &ServiceType::WebAgentRunner)

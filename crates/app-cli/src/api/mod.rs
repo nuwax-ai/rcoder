@@ -255,6 +255,10 @@ pub(super) struct DeployBody {
     pub pg: Option<shared_types::StartPgCredential>,
     #[serde(default)]
     pub operation_id: Option<String>,
+    /// Captured management instance. A stale caller cannot submit to a new owner.
+    /// Omit to retain the existing deployment client contract.
+    #[serde(default)]
+    pub expected_runtime_instance_id: Option<String>,
     /// Expected cold deployment generation; stale callers cannot mutate a replacement.
     #[serde(default)]
     pub deployment_generation_id: Option<String>,
@@ -297,7 +301,8 @@ pub(super) struct DeployAcceptedData {
     responses(
         (status = 202, body = envelope::HttpResult<DeployAcceptedData>, description = "Deploy accepted; poll /v1/deploy/status"),
         (status = 403, body = envelope::HttpResult<String>, description = "Token missing/mismatch or endpoint disabled"),
-        (status = 409, body = envelope::HttpResult<String>, description = "Deployment busy, reused operation ID with different input, generation mismatch, or unresolved recovery"),
+        (status = 409, body = envelope::HttpResult<String>, description = "Deployment busy, reused operation ID with different input, captured runtime instance or generation mismatch, or unresolved recovery"),
+        (status = 503, body = envelope::HttpResult<String>, description = "Captured runtime identity cannot be verified; deployment was not accepted"),
         (status = 400, body = envelope::HttpResult<String>, description = "Invalid body (sha256 shape etc.)"),
         (status = 500, body = envelope::HttpResult<String>, description = "Deployment admission task failed; inspect operation status before retrying")
     ),
@@ -310,6 +315,24 @@ async fn submit_deploy(
 ) -> Response {
     if let Err(message) = authorize_deploy(&state, &headers) {
         return envelope::error(StatusCode::FORBIDDEN, "DEPLOY_FORBIDDEN", message);
+    }
+    if let Some(expected) = body.expected_runtime_instance_id.as_deref() {
+        let Some(kernel) = state.server.runtime_kernel() else {
+            return envelope::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "DEPLOY_RUNTIME_IDENTITY_UNAVAILABLE",
+                "management identity is unavailable; deployment was not accepted",
+            );
+        };
+        // The kernel is installed once for this process. This immutable
+        // identity remains valid through journal admission below.
+        if kernel.identity().runtime_instance_id != expected {
+            return envelope::error(
+                StatusCode::CONFLICT,
+                "DEPLOY_RUNTIME_INSTANCE_CONFLICT",
+                "captured management instance does not match this owner; deployment was not accepted",
+            );
+        }
     }
     // 初始化恢复期拒绝运行态变更（P1-01：API 先 bind，恢复完成前写端点门控；
     // token 校验优先——不向未授权方暴露恢复状态）。
@@ -657,6 +680,58 @@ mod tests {
                 assert_eq!(body["code"], "DEPLOY_OPERATION_CONFLICT");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn deployment_from_an_old_runtime_instance_has_no_admission_or_side_effects() {
+        let state = test_state();
+        state.server.mark_initialized();
+        state.server.initialize_owner_token().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::runtime_kernel::RuntimeStore::open_with_root(
+            root.path().join("state"),
+            root.path(),
+        )
+        .unwrap();
+        let identity = store
+            .load_or_init_identity(
+                "instance-test".into(),
+                "userapp-dev".into(),
+                "instance-test".into(),
+                root.path().to_string_lossy().into_owned(),
+                "deployment-test".into(),
+            )
+            .unwrap();
+        state
+            .server
+            .set_runtime_kernel(Arc::new(crate::runtime_kernel::RuntimeKernel::new(
+                store,
+                identity,
+                Box::new(|_| panic!("stale runtime must never dispatch")),
+            )));
+        let token = state.server.control_token().unwrap();
+        let request = axum::http::Request::builder().method("POST").uri("/v1/deploy")
+            .header("X-Deploy-Token", token).header("Content-Type", "application/json")
+            .body(Body::from(json!({"url":"http://127.0.0.1:1/unreachable.zip", "release_id":"explicit-release", "operation_id":"stale-caller", "expected_runtime_instance_id":"old-instance"}).to_string())).unwrap();
+        let response = api_router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["code"], "DEPLOY_RUNTIME_INSTANCE_CONFLICT");
+        assert!(
+            state
+                .server
+                .recorded_deployment("stale-caller")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state.server.pending_deploy_count().await, 0);
+        assert_eq!(
+            state.server.deploy_status().phase,
+            shared_types::AppCliDeployPhase::Idle
+        );
+        assert!(!root.path().join(".incoming").exists());
     }
 
     #[tokio::test]

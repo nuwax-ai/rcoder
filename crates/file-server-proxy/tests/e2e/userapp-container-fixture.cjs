@@ -48,7 +48,7 @@ async function waitFor(label, probe, budget = 90000) {
 }
 
 class UserappFixture {
-  constructor(kind, appCli, proxy, image = "dev-rcoder-agent-runner:latest") {
+  constructor(kind, appCli, proxy, image = "dev-rcoder-agent-runner:latest", options = {}) {
     assert(appCli && proxy, "app-cli and file-server-proxy Linux binaries are required");
     this.binaries = { "app-cli": path.resolve(appCli), "file-server-proxy": path.resolve(proxy) };
     this.source = verifyBuild(this.binaries);
@@ -62,6 +62,7 @@ class UserappFixture {
       assert(header.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46])) && header[5] === 1 && header.readUInt16LE(18) === machine, "test binary must be a matching little-endian Linux ELF");
     }
     this.kind = kind;
+    this.options = options;
     this.id = randomUUID();
     this.app = "e2e" + this.id.replaceAll("-", "").slice(0, 12);
     this.workspace = "/home/user/" + this.app;
@@ -107,6 +108,15 @@ class UserappFixture {
       FILE_SERVER_PROXY_STATE_DIR: this.workspace + "/proxy-state", FILE_SERVER_PROXY_PUBLIC_BIND: "true", FILE_SERVER_LOG_DIR: "/home/user/proxy-logs",
       RCODER_PLATFORM_BINDING_DIR: "/etc/rcoder/fixture-platform" };
     if (this.kind === "f4") env.RCODER_EXECUTION_DOMAIN = JSON.stringify(domain);
+    const privateEnv = [];
+    if (this.options.postgresPassword) {
+      // Configure the fixture's database at first init, without exposing its
+      // private password in command argv or the public evidence report.
+      assert(!/[\r\n\0]/.test(this.options.postgresPassword));
+      const privateEnvFile = path.join(this.host, "postgres-" + this.containers.length + ".env");
+      fs.writeFileSync(privateEnvFile, "POSTGRES_PASSWORD=" + this.options.postgresPassword + "\n", { mode: 0o600 });
+      privateEnv.push("--env-file", privateEnvFile);
+    }
     this.cid = this.docker(["create", "--name", "rcoder-" + this.kind + "-" + randomUUID(), "--label", "rcoder.e2e.owner=" + this.id, "--user", "0",
       "--mount", `type=volume,src=${this.volume},dst=/home/user,volume-nocopy`,
       // app-cli publishes/removes 50-app-services.conf through captured engine
@@ -115,6 +125,7 @@ class UserappFixture {
       "--mount", `type=bind,src=${conf},dst=/etc/supervisor/supervisord.conf,readonly`,
       "--mount", `type=bind,src=${platformDir},dst=/etc/rcoder/fixture-platform,readonly`,
       ...Object.entries(env).flatMap(([key, value]) => ["-e", key + "=" + value]),
+      ...privateEnv,
       "--entrypoint", "sh", this.image, "-ec", `install -d -o postgres -g postgres "\${PGDATA:-/home/user/.pgdata}"; mkdir -p ${this.workspace} /home/user/proxy-logs /app/logs; exec supervisord -n -c /etc/supervisor/supervisord.conf`]).stdout.trim();
     this.containers.push(this.cid);
     this.report.containers.push({ id: this.cid, domain_instance: domain.instance });

@@ -136,3 +136,6 @@ pathdiff = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 junction = "2.0"
 winapi-util = "0.1.11"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

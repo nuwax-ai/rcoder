@@ -11,7 +11,7 @@ pub const USERAPP_PATH_PREFIX: &str = "/api/v1/userapp";
 pub use shared_types::{AGENT_FILE_SERVER_PORT, NUWAX_FILE_SERVER_INTERNAL_PORT};
 
 /// 分流代理配置（config.yml 顶层 `file_server_proxy:` 段 / agent_runner env 构造）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FileServerProxyConfig {
     /// 对外监听主机（N03：容器形态 0.0.0.0（K8s NodePort 入口）；原生
     /// standalone 经 env `FILE_SERVER_PROXY_HOST` 收敛到 127.0.0.1——
@@ -49,6 +49,25 @@ pub struct FileServerProxyConfig {
     /// 同源配置渲染）。默认 false=分流行为与历史完全一致。
     #[serde(default)]
     pub coordinated_dev_lifecycle: bool,
+}
+
+impl std::fmt::Debug for FileServerProxyConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FileServerProxyConfig")
+            .field("listen_host", &self.listen_host)
+            .field("listen_port", &self.listen_port)
+            .field("rust_upstream_port", &self.rust_upstream_port)
+            .field("ts_upstream_port", &self.ts_upstream_port)
+            .field("policy", &self.policy)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("public_bind_declared", &self.public_bind_declared)
+            .field("coordinated_dev_lifecycle", &self.coordinated_dev_lifecycle)
+            .finish()
+    }
 }
 
 fn default_listen_host() -> String {
@@ -221,6 +240,32 @@ impl FileServerProxyConfig {
         Ok(())
     }
 
+    /// 非空环境令牌优先；空值或未设置保留配置，不创建新凭据。
+    pub fn resolve_auth_token(
+        configured: Option<String>,
+        environment: Option<std::ffi::OsString>,
+    ) -> Result<Option<String>, String> {
+        let environment = environment
+            .map(|value| {
+                value
+                    .into_string()
+                    .map_err(|_| "FILE_SERVER_PROXY_TOKEN must be valid UTF-8".to_owned())
+            })
+            .transpose()?;
+        Ok(environment
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .or(configured))
+    }
+
+    pub fn apply_auth_token_env(&mut self) -> Result<(), String> {
+        self.auth_token = Self::resolve_auth_token(
+            self.auth_token.clone(),
+            std::env::var_os("FILE_SERVER_PROXY_TOKEN"),
+        )?;
+        Ok(())
+    }
+
     /// 分流规则纯函数（按 [`RoutePolicy`] 分派）：
     /// - [`RoutePolicy::TsFirst`]：`/api/v1/userapp*` 前缀或
     ///   `x-service-type: userapp` header（任一命中）→ Rust 上游，其余 → TS 上游
@@ -344,5 +389,54 @@ mod coordinated_dev_tests {
                 "{path} must stay on ts when coordination disabled"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod token_configuration_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_token_precedence_preserves_config_without_generating_credentials() {
+        for (configured, environment, expected) in [
+            (None, None, None),
+            (None, Some(""), None),
+            (Some("configured"), None, Some("configured")),
+            (Some("configured"), Some("  "), Some("configured")),
+            (Some("configured"), Some(" supplied "), Some("supplied")),
+        ] {
+            assert_eq!(
+                FileServerProxyConfig::resolve_auth_token(
+                    configured.map(str::to_owned),
+                    environment.map(std::ffi::OsString::from)
+                )
+                .expect("valid token setting"),
+                expected.map(str::to_owned)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_unicode_token_is_an_error_without_echoing_secret() {
+        use std::os::unix::ffi::OsStringExt;
+        let error = FileServerProxyConfig::resolve_auth_token(
+            Some("configured-secret".into()),
+            Some(std::ffi::OsString::from_vec(vec![0xff, 0xfe])),
+        )
+        .expect_err("invalid Unicode token");
+        assert_eq!(error, "FILE_SERVER_PROXY_TOKEN must be valid UTF-8");
+        assert!(!error.contains("configured-secret"));
+    }
+
+    #[test]
+    fn config_debug_redacts_token() {
+        let config = FileServerProxyConfig {
+            auth_token: Some("secret-value".into()),
+            ..Default::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("secret-value"));
     }
 }

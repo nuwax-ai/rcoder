@@ -177,17 +177,16 @@ async fn busy_delete_fails_fast_and_stale_version_conflicts_after_release() {
     .await
     .expect("busy delete must not queue behind the held lock")
     .expect_err("held lock must reject delete");
-    // M3 结构化 blocker：裸持锁（无 durable admission）窗口 → ConflictBlocked
-    // 携带 scope=Prod 哨兵 blocker（operation_id 空——不伪造身份）
-    assert!(
-        matches!(
-            &error,
-            AppOperationError::ConflictBlocked { message, blocker }
-                if message.contains("in progress")
-                    && blocker.scope == shared_types::UserAppOperationScope::Prod
-                    && blocker.operation_id.is_empty()
-        ),
-        "got: {error}"
+    // A bare lease has no durable holder; preserve the unknown window without
+    // manufacturing a Start/Pending sentinel or exposing a runtime token.
+    assert_eq!(error.code(), shared_types::ERR_OPERATION_IN_PROGRESS);
+    assert!(matches!(
+        &error,
+        AppOperationError::OperationInProgress { blocker: None, .. }
+    ));
+    assert_eq!(
+        error.operation_in_progress_data(),
+        Some(shared_types::OperationInProgressData::default())
     );
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
     assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 0);
@@ -204,9 +203,27 @@ async fn busy_delete_fails_fast_and_stale_version_conflicts_after_release() {
         .await
         .expect_err("stale expected version must conflict after lock release");
     assert!(
-        matches!(&error, AppOperationError::Conflict(_)),
+        matches!(error.root_cause(), AppOperationError::Conflict(message)
+            if message.contains("resource version mismatch: expected=1, actual=2")),
         "got: {error}"
     );
+    assert_eq!(error.code(), shared_types::ERR_CONFLICT);
+    let operation = service
+        .metadata
+        .store
+        .get_operation(
+            "deleterace",
+            error.operation_id().expect("admitted delete identity"),
+        )
+        .await
+        .expect("operation query")
+        .expect("durable delete receipt");
+    assert_eq!(
+        operation.error_code.as_deref(),
+        Some(shared_types::ERR_CONFLICT)
+    );
+    assert_eq!(operation.state, shared_types::UserAppOperationState::Failed);
+    assert_eq!(operation.step, "rejected_without_mutation");
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
     assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 0);
 }
@@ -258,17 +275,16 @@ async fn stop_conflicts_immediately_while_release_lock_held() {
     .await
     .expect("stop must not queue behind the held lock")
     .expect_err("held lock must reject stop");
-    // M3 结构化 blocker：裸持锁（无 durable admission）窗口 → ConflictBlocked
-    // 携带 scope=Prod 哨兵 blocker（operation_id 空——不伪造身份）
-    assert!(
-        matches!(
-            &error,
-            AppOperationError::ConflictBlocked { message, blocker }
-                if message.contains("in progress")
-                    && blocker.scope == shared_types::UserAppOperationScope::Prod
-                    && blocker.operation_id.is_empty()
-        ),
-        "got: {error}"
+    // A bare lease has no durable holder; preserve the unknown window without
+    // manufacturing a Start/Pending sentinel or exposing a runtime token.
+    assert_eq!(error.code(), shared_types::ERR_OPERATION_IN_PROGRESS);
+    assert!(matches!(
+        &error,
+        AppOperationError::OperationInProgress { blocker: None, .. }
+    ));
+    assert_eq!(
+        error.operation_in_progress_data(),
+        Some(shared_types::OperationInProgressData::default())
     );
     // 拒绝后零副作用
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
@@ -344,17 +360,16 @@ async fn restart_conflicts_immediately_while_restart_lock_held() {
     .await
     .expect("restart must not queue behind the held lock")
     .expect_err("held lock must reject restart");
-    // M3 结构化 blocker：裸持锁（无 durable admission）窗口 → ConflictBlocked
-    // 携带 scope=Prod 哨兵 blocker（operation_id 空——不伪造身份）
-    assert!(
-        matches!(
-            &error,
-            AppOperationError::ConflictBlocked { message, blocker }
-                if message.contains("in progress")
-                    && blocker.scope == shared_types::UserAppOperationScope::Prod
-                    && blocker.operation_id.is_empty()
-        ),
-        "got: {error}"
+    // A bare lease has no durable holder; preserve the unknown window without
+    // manufacturing a Start/Pending sentinel or exposing a runtime token.
+    assert_eq!(error.code(), shared_types::ERR_OPERATION_IN_PROGRESS);
+    assert!(matches!(
+        &error,
+        AppOperationError::OperationInProgress { blocker: None, .. }
+    ));
+    assert_eq!(
+        error.operation_in_progress_data(),
+        Some(shared_types::OperationInProgressData::default())
     );
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
     assert!(
@@ -420,17 +435,16 @@ async fn delete_conflicts_immediately_while_release_lock_held() {
     .await
     .expect("delete must not queue behind the held lock")
     .expect_err("held lock must reject delete");
-    // M3 结构化 blocker：裸持锁（无 durable admission）窗口 → ConflictBlocked
-    // 携带 scope=Prod 哨兵 blocker（operation_id 空——不伪造身份）
-    assert!(
-        matches!(
-            &error,
-            AppOperationError::ConflictBlocked { message, blocker }
-                if message.contains("in progress")
-                    && blocker.scope == shared_types::UserAppOperationScope::Prod
-                    && blocker.operation_id.is_empty()
-        ),
-        "got: {error}"
+    // A bare lease has no durable holder; preserve the unknown window without
+    // manufacturing a Start/Pending sentinel or exposing a runtime token.
+    assert_eq!(error.code(), shared_types::ERR_OPERATION_IN_PROGRESS);
+    assert!(matches!(
+        &error,
+        AppOperationError::OperationInProgress { blocker: None, .. }
+    ));
+    assert_eq!(
+        error.operation_in_progress_data(),
+        Some(shared_types::OperationInProgressData::default())
     );
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
     assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 0);
@@ -546,8 +560,23 @@ async fn start_and_recycle_keep_waiting_for_the_held_lock() {
 async fn external_operations_fail_fast_across_service_file_lock() {
     let root = tempfile::tempdir().expect("tempdir");
     let first = test_service(root.path(), Arc::new(MockRuntime::default())).await;
-    let second_runtime = Arc::new(MockRuntime::default());
-    let second = test_service(root.path(), second_runtime.clone()).await;
+    // Establish the actual authority and runtime before testing ownership:
+    // absence must still fail as ERR_APP_NOT_FOUND before restart admission.
+    let (second, second_runtime) = created_app_service(root.path(), "crosslock").await;
+    let lifecycle_before = second.get_lifecycle("crosslock").await.unwrap();
+    let counters = || {
+        (
+            second_runtime.create_calls.load(Ordering::SeqCst),
+            second_runtime.scale_calls.load(Ordering::SeqCst),
+            second_runtime.delete_calls.load(Ordering::SeqCst),
+            second_runtime.destroy_pvc_calls.load(Ordering::SeqCst),
+        )
+    };
+    let baseline = counters();
+    assert_eq!(
+        baseline.0, 1,
+        "fixture must have performed real create admission"
+    );
     let held = first
         .acquire_process_release_lock("crosslock")
         .await
@@ -568,9 +597,22 @@ async fn external_operations_fail_fast_across_service_file_lock() {
                 panic!("{label} must not queue behind the cross-instance file lock")
             }
         };
-        assert!(
-            matches!(&error, AppOperationError::Conflict(message) if message.contains("another process")),
+        assert_eq!(
+            error.code(),
+            shared_types::ERR_OPERATION_IN_PROGRESS,
             "{label} got: {error}"
+        );
+        assert!(
+            matches!(
+                &error,
+                AppOperationError::OperationInProgress { blocker: None, .. }
+            ),
+            "{label} got: {error}"
+        );
+        assert_eq!(error.operation_id(), None);
+        assert_eq!(
+            error.operation_in_progress_data(),
+            Some(shared_types::OperationInProgressData::default())
         );
     }
 
@@ -597,12 +639,34 @@ async fn external_operations_fail_fast_across_service_file_lock() {
         ),
     )
     .await;
-    assert_eq!(second_runtime.scale_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(second_runtime.delete_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        counters(),
+        baseline,
+        "rejected requests must not change runtime resources"
+    );
+    assert_eq!(
+        second.get_lifecycle("crosslock").await.unwrap(),
+        lifecycle_before
+    );
+    for request_id in ["crosslockreject", "crosslockrejectdelete"] {
+        assert!(
+            second
+                .get_control_operation_by_request("crosslock", request_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 
     // 释放后第二实例可正常取得文件锁（等待版语义未变，见
     // independent_services_share_application_file_lock）。
     drop(held);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        counters(),
+        baseline,
+        "rejected requests must not execute after release"
+    );
     let guard = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         second.acquire_process_release_lock("crosslock"),
@@ -642,6 +706,7 @@ async fn test_service_with_mode(
     let store = Arc::new(store);
     AppService {
         operation_flight: Arc::default(),
+        file_credentials: std::sync::OnceLock::new(),
         config,
         runtime: runtime as Arc<dyn UserAppRuntime>,
         activity: Arc::new(AppActivityRegistry::new(std::time::Duration::from_secs(
@@ -737,12 +802,12 @@ async fn kubernetes_lease_conflict_fails_fast_without_queueing() {
     .await
     .expect("K8s lease conflict must fail fast without queueing")
     .expect_err("held lease must reject stop");
-    // f49b594d/6885fabd 起租约冲突走 ConflictBlocked（保留 blocker 细节与
-    // legacy 持有者身份的消息）——仍须是快失败的 ERR_CONFLICT 形态。
-    assert!(
-        matches!(&error, AppOperationError::ConflictBlocked { message, .. }
-            if message.contains("occupied") && message.contains("rcoder-operation-prod-k8sbusy")),
-        "got: {error}"
+    assert_eq!(error.code(), shared_types::ERR_OPERATION_IN_PROGRESS);
+    assert_eq!(error.operation_id(), None);
+    assert!(!error.message().contains("rcoder-operation-prod-k8sbusy"));
+    assert_eq!(
+        error.operation_in_progress_data(),
+        Some(shared_types::OperationInProgressData::default())
     );
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
     assert!(
@@ -768,9 +833,9 @@ async fn kubernetes_lease_conflict_fails_fast_without_queueing() {
 }
 
 /// 正式信封验收：忙锁 stop 经真实 handler + axum router + envelope_errors
-/// 中间件 → HTTP 200、success=false、code=ERR_CONFLICT（不能只看 HTTP 状态）。
+/// 中间件 → HTTP 200、success=false、code=ERR_OPERATION_IN_PROGRESS（不能只看 HTTP 状态）。
 #[tokio::test]
-async fn busy_stop_envelope_returns_http_200_with_err_conflict() {
+async fn busy_stop_envelope_returns_http_200_with_operation_in_progress() {
     let directory = tempfile::tempdir().expect("directory");
     let runtime = Arc::new(MockRuntime::default());
     let service = Arc::new(test_service(directory.path(), runtime.clone()).await);
@@ -818,12 +883,19 @@ async fn busy_stop_envelope_returns_http_200_with_err_conflict() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let envelope: serde_json::Value = response.json().await.expect("JSON envelope");
     assert_eq!(envelope["success"], false);
-    assert_eq!(envelope["code"], shared_types::error_codes::ERR_CONFLICT);
+    assert_eq!(
+        envelope["code"],
+        shared_types::error_codes::ERR_OPERATION_IN_PROGRESS
+    );
+    assert_eq!(
+        envelope["data"],
+        serde_json::to_value(shared_types::OperationInProgressData::default()).unwrap()
+    );
     assert!(
         envelope["message"]
             .as_str()
             .expect("message")
-            .contains("in progress"),
+            .contains("holder unknown"),
         "envelope: {envelope}"
     );
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
@@ -849,16 +921,31 @@ pub(crate) async fn create_app_runtime_failure_does_not_delete_unowned_resources
     .await
     .expect("write release lock");
 
+    let mut request = create_request("appr2");
+    request.request_id = Some("unowned-create-failure".into());
     let error = service
-        .create_app(create_request("appr2"))
+        .create_app(request)
         .await
         .expect_err("create_app must fail");
 
     // 原始错误原样返回（create_deployment 失败的映射，未被清理逻辑覆盖）
     assert!(
-        matches!(&error, AppOperationError::Backend(message) if message.contains("mock create_deployment failure")),
+        matches!(error.root_cause(), AppOperationError::Diagnostic(failure)
+            if failure.code.as_ref() == shared_types::ERR_CONTAINER_CREATE_FAILED
+                && failure.message.contains("mock create_deployment failure")),
         "original error must be preserved, got: {error}"
     );
+    assert_eq!(error.code(), shared_types::ERR_CONTAINER_CREATE_FAILED);
+    let operation = service
+        .metadata
+        .store
+        .get_operation_by_request("appr2", "unowned-create-failure")
+        .await
+        .expect("read admission")
+        .expect("durable creation receipt");
+    assert_eq!(error.operation_id(), Some(operation.operation_id.as_str()));
+    assert_eq!(operation.error_code.as_deref(), Some(error.code()));
+    assert_eq!(operation.kind, shared_types::UserAppOperationKind::Create);
     assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         runtime.delete_calls.load(Ordering::SeqCst),
@@ -896,7 +983,7 @@ pub(crate) async fn creation_safe_failure_settles_failed_and_releases_fence() {
         .expect_err("definitive claim rejection must fail creation");
     // wire 保真：source 是 Conflict → ERR_CONFLICT；安全注记进 message
     assert!(
-        matches!(&error, AppOperationError::Conflict(message)
+        matches!(error.root_cause(), AppOperationError::Conflict(message)
             if message.contains("safe failure")
                 && message.contains("workspace pvc ensured")
                 && message.contains("storage-claim annotations may persist")),
@@ -910,6 +997,9 @@ pub(crate) async fn creation_safe_failure_settles_failed_and_releases_fence() {
         .await
         .expect("read")
         .expect("operation");
+    assert_eq!(error.code(), shared_types::ERR_CONFLICT);
+    assert_eq!(error.operation_id(), Some(operation.operation_id.as_str()));
+    assert_eq!(operation.error_code.as_deref(), Some(error.code()));
     assert_eq!(operation.state, shared_types::UserAppOperationState::Failed);
     assert_eq!(operation.step, "rejected_without_mutation");
     assert!(
@@ -954,12 +1044,8 @@ pub(crate) async fn creation_unknown_outcome_keeps_recovery_fence() {
         .create_app(request)
         .await
         .expect_err("unknown claim outcome must fail creation");
-    // source Timeout → Backend（wire 不变），且无安全注记
-    assert!(
-        matches!(&error, AppOperationError::Backend(message)
-            if !message.contains("safe failure")),
-        "unknown outcome keeps backend class without safe note, got: {error}"
-    );
+    assert_eq!(error.code(), shared_types::ERR_OPERATION_OUTCOME_UNKNOWN);
+    assert!(!error.message().contains("safe failure"));
 
     let operation = service
         .metadata
@@ -974,6 +1060,16 @@ pub(crate) async fn creation_unknown_outcome_keeps_recovery_fence() {
     );
 
     // 围栏仍在：新创建被未完成变更围栏挡回
+    let response = shared_types::AppError::from(error).into_http_result::<()>("en-US");
+    assert_eq!(
+        response.operation_id.as_deref(),
+        Some(operation.operation_id.as_str())
+    );
+    let detail = response.error_detail.expect("creation failure diagnostic");
+    assert_eq!(detail.reason_code, shared_types::ERR_RUNTIME_TIMEOUT);
+    assert_eq!(detail.stage, "creation_storage_claim");
+    assert!(!detail.retryable);
+
     let fenced = service
         .create_app(create_request("appunknown"))
         .await
@@ -1083,15 +1179,30 @@ pub(crate) async fn create_app_cleanup_failure_keeps_original_error() {
     .await
     .expect("write release lock");
 
+    let mut request = create_request("appr2b");
+    request.request_id = Some("cleanup-create-failure".into());
     let error = service
-        .create_app(create_request("appr2b"))
+        .create_app(request)
         .await
         .expect_err("create_app must fail");
 
     assert!(
-        matches!(&error, AppOperationError::Backend(message) if message.contains("mock create_deployment failure")),
+        matches!(error.root_cause(), AppOperationError::Diagnostic(failure)
+            if failure.code.as_ref() == shared_types::ERR_CONTAINER_CREATE_FAILED
+                && failure.message.contains("mock create_deployment failure")),
         "original error must not be masked by cleanup failure, got: {error}"
     );
+    assert_eq!(error.code(), shared_types::ERR_CONTAINER_CREATE_FAILED);
+    let operation = service
+        .metadata
+        .store
+        .get_operation_by_request("appr2b", "cleanup-create-failure")
+        .await
+        .expect("read admission")
+        .expect("durable creation receipt");
+    assert_eq!(error.operation_id(), Some(operation.operation_id.as_str()));
+    assert_eq!(operation.error_code.as_deref(), Some(error.code()));
+    assert_eq!(operation.kind, shared_types::UserAppOperationKind::Create);
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
 }
 
@@ -1491,7 +1602,7 @@ async fn stop_rejection_releases_ownership_but_uncertain_result_retains_it() {
             .expect_err("injected failure");
         let rejected = status == 403;
         assert_eq!(
-            matches!(error, AppOperationError::RuntimeRejected(_)),
+            matches!(error.root_cause(), AppOperationError::RuntimeRejected(_)),
             rejected
         );
         let record = service
@@ -1501,6 +1612,19 @@ async fn stop_rejection_releases_ownership_but_uncertain_result_retains_it() {
             .await
             .expect("operation query")
             .expect("operation");
+        assert_eq!(error.operation_id(), Some(record.operation_id.as_str()));
+        if !rejected {
+            assert_eq!(error.code(), shared_types::ERR_OPERATION_OUTCOME_UNKNOWN);
+            let response = shared_types::AppError::from(error).into_http_result::<()>("en-US");
+            assert_eq!(
+                response.operation_id.as_deref(),
+                Some(record.operation_id.as_str())
+            );
+            let detail = response.error_detail.expect("unknown write diagnostic");
+            assert_eq!(detail.reason_code, shared_types::ERR_RUNTIME_UNAVAILABLE);
+            assert_eq!(detail.stage, "container_stop");
+            assert!(!detail.retryable);
+        }
         assert_eq!(
             record.state,
             if rejected {
@@ -1984,14 +2108,28 @@ pub(crate) async fn update_app_storage_shrink_rejected_blocks_update() {
         });
     let create_calls_before = runtime.create_calls.load(Ordering::SeqCst);
 
+    let mut request = update_request_with_storage(Some("50Gi"));
+    request.request_id = Some("shrink-rejected-update".into());
     let error = service
-        .update_app("appshrink", update_request_with_storage(Some("50Gi")))
+        .update_app("appshrink", request)
         .await
         .expect_err("shrink must be rejected");
     assert!(
-        matches!(error, AppOperationError::Validation(_)),
+        matches!(error.root_cause(), AppOperationError::Validation(_)),
         "got: {error}"
     );
+    assert_eq!(error.code(), shared_types::ERR_VALIDATION);
+    let operation = service
+        .metadata
+        .store
+        .get_operation_by_request("appshrink", "shrink-rejected-update")
+        .await
+        .expect("read admission")
+        .expect("durable update receipt");
+    assert_eq!(error.operation_id(), Some(operation.operation_id.as_str()));
+    assert_eq!(operation.error_code.as_deref(), Some(error.code()));
+    assert_eq!(operation.kind, shared_types::UserAppOperationKind::Update);
+    assert_eq!(operation.state, shared_types::UserAppOperationState::Failed);
     assert_eq!(
         runtime.create_calls.load(Ordering::SeqCst),
         create_calls_before,
@@ -2007,14 +2145,30 @@ pub(crate) async fn update_app_storage_resize_failure_blocks_update() {
     runtime.resize_fails.store(true, Ordering::SeqCst);
     let create_calls_before = runtime.create_calls.load(Ordering::SeqCst);
 
+    let mut request = update_request_with_storage(Some("200Gi"));
+    request.request_id = Some("resize-unknown-outcome".into());
     let error = service
-        .update_app("apprfail", update_request_with_storage(Some("200Gi")))
+        .update_app("apprfail", request)
         .await
         .expect_err("resize failure must block update");
-    assert!(
-        matches!(error, AppOperationError::Backend(_)),
-        "got: {error}"
+    assert_eq!(error.code(), shared_types::ERR_OPERATION_OUTCOME_UNKNOWN);
+    let operation = service
+        .metadata
+        .store
+        .get_operation_by_request("apprfail", "resize-unknown-outcome")
+        .await
+        .unwrap()
+        .expect("durable resize admission");
+    assert_eq!(error.operation_id(), Some(operation.operation_id.as_str()));
+    assert_eq!(
+        operation.state,
+        shared_types::UserAppOperationState::RecoveryRequired
     );
+    let response = shared_types::AppError::from(error).into_http_result::<()>("en-US");
+    let detail = response.error_detail.expect("original resize cause");
+    assert_eq!(detail.reason_code, shared_types::ERR_RUNTIME_UNAVAILABLE);
+    assert_eq!(detail.stage, "container_storage_resize");
+    assert!(!detail.retryable);
     assert_eq!(
         runtime.create_calls.load(Ordering::SeqCst),
         create_calls_before,
@@ -2483,7 +2637,7 @@ async fn failed_purge_retains_both_runtime_and_registry_deletion_receipts() {
 }
 
 /// 状态查询失败不得当成"不存在"（对齐 fetch_runtime_status_or_err 两态分类）：
-/// 透传 Backend，且未执行任何删除步骤。
+/// 保留运行时不可用诊断，且未执行任何删除步骤。
 #[tokio::test]
 pub(crate) async fn purge_app_query_failure_propagates_not_treated_as_absent() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -2495,7 +2649,13 @@ pub(crate) async fn purge_app_query_failure_propagates_not_treated_as_absent() {
 
     let error = service.purge_app("appp4").await.expect_err("must fail");
 
-    assert!(matches!(error, AppOperationError::Backend(_)));
+    assert!(matches!(
+        &error,
+        AppOperationError::Diagnostic(failure)
+            if failure.code.as_ref() == shared_types::ERR_RUNTIME_UNAVAILABLE
+                && failure.cause_code.as_ref() == shared_types::ERR_RUNTIME_UNAVAILABLE
+    ));
+    assert_ne!(error.code(), shared_types::ERR_APP_NOT_FOUND);
     assert!(
         error.to_string().contains("capture purge resources"),
         "query failure message, got: {error}"
@@ -2560,10 +2720,31 @@ async fn rejected_delete_version_releases_kubernetes_operation_before_return() {
         .await
         .expect("owner identity");
     service.config.access_mode = AppAccessMode::Kubernetes;
-    assert!(matches!(
-        service.delete_app("versionlease", false, Some("1")).await,
-        Err(AppOperationError::Conflict(_))
-    ));
+    let error = service
+        .delete_app("versionlease", false, Some("1"))
+        .await
+        .expect_err("stale version must reject before deletion");
+    assert!(
+        matches!(error.root_cause(), AppOperationError::Conflict(message)
+        if message.contains("resource version mismatch: expected=1, actual=2"))
+    );
+    assert_eq!(error.code(), shared_types::ERR_CONFLICT);
+    let operation = service
+        .metadata
+        .store
+        .get_operation(
+            "versionlease",
+            error.operation_id().expect("admitted delete identity"),
+        )
+        .await
+        .expect("operation query")
+        .expect("durable delete receipt");
+    assert_eq!(
+        operation.error_code.as_deref(),
+        Some(shared_types::ERR_CONFLICT)
+    );
+    assert_eq!(operation.state, shared_types::UserAppOperationState::Failed);
+    assert_eq!(operation.step, "rejected_without_mutation");
     assert!(!runtime.lease_held.load(Ordering::SeqCst));
     service
         .acquire_process_release_lock("versionlease")
@@ -2727,8 +2908,8 @@ async fn failed_update_preparation_releases_lease_for_next_update() {
         .ensure_identity("prepareretry")
         .await
         .expect("authoritative application identity");
-    let request = || UpdateAppRequest {
-        request_id: None,
+    let request = |attempt| UpdateAppRequest {
+        request_id: Some(format!("failed-update-preparation-{attempt}")),
         lifecycle_id: None,
         image: Some("unavailable:image".into()),
         name: None,
@@ -2741,13 +2922,38 @@ async fn failed_update_preparation_releases_lease_for_next_update() {
         idle_timeout_seconds: None,
         expected_resource_version: None,
     };
-    for _ in 0..2 {
+    let mut previous_operation_id = None;
+    for attempt in 0..2 {
         let error = service
-            .update_app("prepareretry", request())
+            .update_app("prepareretry", request(attempt))
             .await
             .expect_err("preparation fails");
-        assert!(matches!(error, AppOperationError::Backend(_)));
+        assert_eq!(error.code(), shared_types::ERR_BACKEND_ERROR);
+        assert!(
+            matches!(error.root_cause(), AppOperationError::Diagnostic(failure)
+            if failure.code.as_ref() == shared_types::ERR_BACKEND_ERROR)
+        );
         assert!(error.to_string().contains("image preparation failed"));
+        let operation = service
+            .metadata
+            .store
+            .get_operation_by_request(
+                "prepareretry",
+                &format!("failed-update-preparation-{attempt}"),
+            )
+            .await
+            .expect("read admission")
+            .expect("durable update receipt");
+        assert_eq!(error.operation_id(), Some(operation.operation_id.as_str()));
+        assert_eq!(operation.error_code.as_deref(), Some(error.code()));
+        assert_eq!(operation.kind, shared_types::UserAppOperationKind::Update);
+        assert_eq!(operation.state, shared_types::UserAppOperationState::Failed);
+        assert_ne!(
+            previous_operation_id.as_deref(),
+            Some(operation.operation_id.as_str()),
+            "new retry is admitted as a distinct operation after preparation failure"
+        );
+        previous_operation_id = Some(operation.operation_id);
     }
     assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
@@ -3759,7 +3965,12 @@ async fn controlled_production_clear_refuses_existing_compute_before_storage_eff
             },
         )
         .await;
-    assert!(matches!(result, Err(AppOperationError::InvalidState(_))));
+    let error = result.expect_err("existing compute rejects production clear");
+    assert_eq!(error.code(), shared_types::ERR_INVALID_STATE);
+    assert!(matches!(
+        error.root_cause(),
+        AppOperationError::InvalidState(_)
+    ));
     assert_eq!(runtime.destroy_pvc_calls.load(Ordering::SeqCst), 0);
     assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
     let operation = service
@@ -3769,6 +3980,8 @@ async fn controlled_production_clear_refuses_existing_compute_before_storage_eff
         .await
         .expect("read")
         .expect("recorded rejection");
+    assert_eq!(error.operation_id(), Some(operation.operation_id.as_str()));
+    assert_eq!(operation.error_code.as_deref(), Some(error.code()));
     assert_eq!(operation.state, shared_types::UserAppOperationState::Failed);
     assert!(operation.checkpoint.is_null());
 }
@@ -4216,12 +4429,14 @@ async fn admitted_deployment_failure_keeps_identity_and_recovery_fence() {
         .unwrap()
         .expect("durable admission exists");
     assert_eq!(error.operation_id(), Some(record.operation_id.as_str()));
-    assert_eq!(error.code(), shared_types::ERR_BACKEND_ERROR);
+    assert_eq!(error.code(), shared_types::ERR_CONTAINER_CREATE_FAILED);
     assert!(
-        matches!(error.root_cause(), AppOperationError::Backend(message)
-        if message.contains("mock create_deployment failure")),
+        matches!(error.root_cause(), AppOperationError::Diagnostic(failure)
+        if failure.code.as_ref() == shared_types::ERR_CONTAINER_CREATE_FAILED
+            && failure.message.contains("mock create_deployment failure")),
         "{error}"
     );
+    assert_eq!(record.error_code.as_deref(), Some(error.code()));
     assert_eq!(
         record.state,
         shared_types::UserAppOperationState::RecoveryRequired
@@ -4249,4 +4464,1057 @@ async fn admitted_deployment_failure_keeps_identity_and_recovery_fence() {
         current.state,
         shared_types::UserAppOperationState::RecoveryRequired
     );
+}
+
+// Append to crates/app_manager/src/service/tests.rs in the current pre-fix snapshot.
+// Protocol/runtime fixture only; exercises real AppService + persisted lifecycle store.
+mod physical_absence_service_counterexamples {
+    use crate::app_service_trait::AppServiceTrait;
+    use crate::test_support::{MockRuntime, test_service};
+    use container_runtime_api::{
+        ContainerRuntimeError, ContainerRuntimeResult, DeploymentStatus, UserAppDeploymentRuntime,
+        WorkspaceRuntime,
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct PhysicalMissingRuntime {
+        missing_at_query: bool,
+        queries: AtomicUsize,
+        captures: AtomicUsize,
+        writes: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceRuntime for PhysicalMissingRuntime {}
+
+    #[async_trait::async_trait]
+    impl UserAppDeploymentRuntime for PhysicalMissingRuntime {
+        async fn get_deployment_status(
+            &self,
+            app_id: &str,
+        ) -> ContainerRuntimeResult<Option<DeploymentStatus>> {
+            self.queries.fetch_add(1, Ordering::SeqCst);
+            if self.missing_at_query {
+                return Err(ContainerRuntimeError::ContainerNotFound(
+                    "captured physical workload disappeared".into(),
+                ));
+            }
+            Ok(Some(DeploymentStatus {
+                app_id: app_id.into(),
+                phase: "Running".into(),
+                replicas: 1,
+                ready_replicas: 1,
+                ..Default::default()
+            }))
+        }
+
+        async fn capture_app_mutation_target(
+            &self,
+            context: &shared_types::UserAppExecutionContext,
+            _expected_version: Option<&str>,
+        ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
+            context
+                .validate_identity(&context.app_id)
+                .expect("real admitted identity");
+            self.captures.fetch_add(1, Ordering::SeqCst);
+            Err(ContainerRuntimeError::ContainerNotFound(
+                "observed workload disappeared before physical capture".into(),
+            ))
+        }
+
+        async fn stop_app_target(
+            &self,
+            _target: &shared_types::UserAppMutationTarget,
+            _wake_on_traffic: bool,
+        ) -> ContainerRuntimeResult<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Err(ContainerRuntimeError::ConfigurationError(
+                "A missing physical target must never be stopped".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn known_application_runtime_not_found_is_not_application_absence() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let mut service = test_service(directory.path(), Arc::new(MockRuntime::default())).await;
+        let runtime = Arc::new(PhysicalMissingRuntime {
+            missing_at_query: true,
+            queries: AtomicUsize::new(0),
+            captures: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+        });
+        service.runtime = runtime.clone();
+        service
+            .metadata
+            .record(
+                "physicalquery",
+                Some("retained application".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("authoritative application row");
+        let before = service
+            .metadata
+            .store
+            .get_application("physicalquery")
+            .await
+            .expect("read identity")
+            .expect("application exists");
+        let error = service
+            .get_app_for_owner("physicalquery")
+            .await
+            .expect_err("physical query must propagate");
+        assert_eq!(runtime.queries.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.captures.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.writes.load(Ordering::SeqCst), 0);
+        let after = service
+            .metadata
+            .store
+            .get_application("physicalquery")
+            .await
+            .expect("read retained row")
+            .expect("row retained");
+        assert_eq!(after.lifecycle_id, before.lifecycle_id);
+        assert_eq!(after.lifecycle_epoch, before.lifecycle_epoch);
+        assert_eq!(after.state, shared_types::UserAppLifecycleState::Active);
+        assert_eq!(after.name.as_deref(), Some("retained application"));
+        let response = shared_types::AppError::from(error).into_http_result::<()>("en-US");
+        assert_eq!(
+            response.code,
+            shared_types::ERR_CONTAINER_NOT_FOUND,
+            "a physical runtime error cannot authorize Java to recreate an existing application"
+        );
+        assert!(!response.success);
+        assert_eq!(
+            response
+                .error_detail
+                .expect("physical diagnostic")
+                .reason_code,
+            shared_types::ERR_CONTAINER_NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_stop_missing_physical_capture_is_not_application_absence() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let mut service = test_service(directory.path(), Arc::new(MockRuntime::default())).await;
+        let runtime = Arc::new(PhysicalMissingRuntime {
+            missing_at_query: false,
+            queries: AtomicUsize::new(0),
+            captures: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+        });
+        service.runtime = runtime.clone();
+        service
+            .metadata
+            .record("physicalcapture", None, None, None)
+            .await
+            .expect("authoritative application row");
+        let before = service
+            .metadata
+            .store
+            .get_application("physicalcapture")
+            .await
+            .expect("read identity")
+            .expect("application exists");
+        let error = service
+            .stop_app_controlled(
+                "physicalcapture",
+                shared_types::UserAppControlRequest {
+                    lifecycle_id: Some(before.lifecycle_id.clone()),
+                    request_id: Some("stop-before-physical-disappearance".into()),
+                },
+            )
+            .await
+            .expect_err("physical capture must propagate");
+        assert_eq!(runtime.queries.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.captures.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.writes.load(Ordering::SeqCst), 0);
+        assert!(
+            !error.requires_recovery(),
+            "capture failed before any physical write"
+        );
+        let after = service
+            .metadata
+            .store
+            .get_application("physicalcapture")
+            .await
+            .expect("read retained row")
+            .expect("row retained");
+        assert_eq!(after.lifecycle_id, before.lifecycle_id);
+        assert_eq!(after.lifecycle_epoch, before.lifecycle_epoch);
+        assert_eq!(after.state, shared_types::UserAppLifecycleState::Active);
+        let response = shared_types::AppError::from(error).into_http_result::<()>("en-US");
+        assert_eq!(
+            response.code,
+            shared_types::ERR_CONTAINER_NOT_FOUND,
+            "a physical capture race is not authoritative application absence"
+        );
+        assert!(!response.success);
+        assert_eq!(
+            response
+                .error_detail
+                .expect("physical diagnostic")
+                .reason_code,
+            shared_types::ERR_CONTAINER_NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_authoritative_application_still_has_original_app_not_found_code() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let mut service = test_service(directory.path(), Arc::new(MockRuntime::default())).await;
+        let runtime = Arc::new(PhysicalMissingRuntime {
+            missing_at_query: true,
+            queries: AtomicUsize::new(0),
+            captures: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+        });
+        service.runtime = runtime.clone();
+        let error = service
+            .get_app_for_owner("absentapplication")
+            .await
+            .expect_err("no authoritative identity");
+        assert_eq!(runtime.queries.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.captures.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.writes.load(Ordering::SeqCst), 0);
+        let response = shared_types::AppError::from(error).into_http_result::<()>("en-US");
+        assert_eq!(response.code, shared_types::ERR_APP_NOT_FOUND);
+        assert!(!response.success);
+    }
+}
+
+#[tokio::test]
+async fn known_application_empty_runtime_snapshot_is_not_application_absence() {
+    use crate::app_service_trait::AppServiceTrait as _;
+    for action in ["query", "stop", "restart", "deployment_restart"] {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let (service, runtime) = created_app_service(directory.path(), "emptyworkload").await;
+        let before = service
+            .metadata
+            .store
+            .get_application("emptyworkload")
+            .await
+            .unwrap()
+            .unwrap();
+        runtime.deployments.remove("emptyworkload");
+        let creates = runtime.create_calls.load(Ordering::SeqCst);
+        let scales = runtime.scale_calls.load(Ordering::SeqCst);
+        let request_id = format!("missing-physical-{action}");
+        let control = shared_types::UserAppControlRequest {
+            lifecycle_id: Some(before.lifecycle_id.clone()),
+            request_id: Some(request_id.clone()),
+        };
+        let error = match action {
+            "query" => service
+                .get_app_for_owner("emptyworkload")
+                .await
+                .unwrap_err(),
+            "stop" => service
+                .stop_app_controlled("emptyworkload", control)
+                .await
+                .unwrap_err(),
+            "restart" => service
+                .restart_app_controlled("emptyworkload", control)
+                .await
+                .unwrap_err(),
+            "deployment_restart" => service
+                .restart_app_enhanced(
+                    "emptyworkload",
+                    StartAppRequest {
+                        lifecycle_id: Some(before.lifecycle_id.clone()),
+                        request_id: Some(request_id.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            error.code(),
+            shared_types::ERR_CONTAINER_NOT_FOUND,
+            "{action}: retained authoritative application with no workload must not authorize Java to recreate it: {error}"
+        );
+        assert!(error.operation_id().is_none(), "no command was admitted");
+        let after = service
+            .metadata
+            .store
+            .get_application("emptyworkload")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.lifecycle_id, before.lifecycle_id);
+        assert_eq!(after.lifecycle_epoch, before.lifecycle_epoch);
+        assert_eq!(after.state, before.state);
+        assert!(
+            service
+                .metadata
+                .store
+                .get_operation_by_request("emptyworkload", &request_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(runtime.create_calls.load(Ordering::SeqCst), creates);
+        assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), scales);
+        let response = shared_types::AppError::from(error).into_http_result::<()>("en-US");
+        assert!(!response.success);
+        assert_eq!(response.code, shared_types::ERR_CONTAINER_NOT_FOUND);
+        assert!(!response.error_detail.unwrap().retryable);
+    }
+}
+
+mod final_error_contract_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn known_application_missing_operation_is_generic_not_found() {
+        let directory = tempfile::tempdir().expect("directory");
+        let runtime = Arc::new(MockRuntime::default());
+        let service = test_service(directory.path(), runtime.clone()).await;
+        service
+            .metadata
+            .record("missingoperation", None, None, None)
+            .await
+            .unwrap();
+        let before = service.get_lifecycle("missingoperation").await.unwrap();
+        let error = service
+            .get_control_operation("missingoperation", Some("absent-operation"))
+            .await
+            .expect_err("operation record does not exist");
+        assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            service.get_lifecycle("missingoperation").await.unwrap(),
+            before
+        );
+        assert!(
+            service
+                .get_control_operation("missingoperation", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let response_error = shared_types::AppError::from(error);
+        assert_eq!(
+            response_error.status_code(),
+            axum::http::StatusCode::NOT_FOUND
+        );
+        let response = response_error.into_http_result::<()>("en-US");
+        assert!(!response.success);
+        assert_eq!(
+            response.code,
+            shared_types::ERR_NOT_FOUND,
+            "a missing operation must not tell Java that the retained application disappeared"
+        );
+        assert!(
+            response.operation_id.is_none(),
+            "an absent record supplies no admitted identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_stop_retry_preserves_persisted_error_code_and_identity() {
+        let directory = tempfile::tempdir().expect("directory");
+        let (service, runtime) = created_app_service(directory.path(), "failedreplay").await;
+        runtime.stop_failure_status.store(409, Ordering::SeqCst);
+        let request = shared_types::UserAppControlRequest {
+            lifecycle_id: None,
+            request_id: Some("failed-stop-original-request".into()),
+        };
+        let original = service
+            .stop_app_controlled("failedreplay", request.clone())
+            .await
+            .unwrap_err();
+        let persisted = service
+            .metadata
+            .store
+            .get_operation_by_request("failedreplay", "failed-stop-original-request")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.state, shared_types::UserAppOperationState::Failed);
+        assert_eq!(
+            persisted.error_code.as_deref(),
+            Some(shared_types::ERR_CONFLICT)
+        );
+        assert_eq!(
+            original.operation_id(),
+            Some(persisted.operation_id.as_str())
+        );
+        assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
+        let retry = service
+            .stop_app_controlled("failedreplay", request)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            runtime.scale_calls.load(Ordering::SeqCst),
+            1,
+            "retry must not issue another Stop"
+        );
+        assert_eq!(
+            service
+                .metadata
+                .store
+                .get_operation("failedreplay", &persisted.operation_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            persisted,
+            "querying a terminal result cannot rewrite its receipt"
+        );
+        assert_eq!(retry.operation_id(), Some(persisted.operation_id.as_str()));
+        let response = shared_types::AppError::from(retry).into_http_result::<()>("en-US");
+        assert!(!response.success);
+        assert_eq!(
+            response.operation_id.as_deref(),
+            Some(persisted.operation_id.as_str())
+        );
+        assert_eq!(
+            response.code,
+            persisted.error_code.clone().unwrap(),
+            "replay must retain the stored failure classification"
+        );
+        assert!(
+            response
+                .message
+                .contains(persisted.error_message.as_deref().unwrap())
+        );
+        let diagnostic = response.error_detail.expect("persisted failure diagnostic");
+        assert_eq!(diagnostic.stage, persisted.step);
+        assert!(
+            !diagnostic.retryable,
+            "retry must query the original terminal result"
+        );
+    }
+
+    async fn stop_observation_failure_retains_receipt(replay: bool) {
+        let directory = tempfile::tempdir().expect("directory");
+        let (service, runtime) = created_app_service(directory.path(), "stopobservation").await;
+        let before = service.get_lifecycle("stopobservation").await.unwrap();
+        let request = shared_types::UserAppControlRequest {
+            lifecycle_id: Some(before.lifecycle_id.clone()),
+            request_id: Some("acknowledged-stop-request".into()),
+        };
+        if replay {
+            service
+                .stop_app_controlled("stopobservation", request.clone())
+                .await
+                .unwrap();
+            runtime.status_fails.store(1, Ordering::SeqCst);
+        } else {
+            runtime.post_stop_status_fails.store(1, Ordering::SeqCst);
+        }
+        let error = service
+            .stop_app_controlled("stopobservation", request)
+            .await
+            .unwrap_err();
+        let persisted = service
+            .metadata
+            .store
+            .get_operation_by_request("stopobservation", "acknowledged-stop-request")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.state,
+            shared_types::UserAppOperationState::Succeeded,
+            "the final read failure must not overwrite the acknowledged Stop result"
+        );
+        assert_eq!(persisted.step, "completed");
+        assert!(persisted.error_code.is_none());
+        assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
+        let physical = runtime.deployments.get("stopobservation").unwrap();
+        assert_eq!(physical.replicas, 0);
+        assert_eq!(physical.phase, "Stopped");
+        drop(physical);
+        assert!(shared_types::AppWakeControl::is_stopped(
+            service.activity.as_ref(),
+            "stopobservation"
+        ));
+        let after = service.get_lifecycle("stopobservation").await.unwrap();
+        assert_eq!(after.lifecycle_id, before.lifecycle_id);
+        assert_eq!(after.lifecycle_epoch, before.lifecycle_epoch);
+        assert_eq!(after.active_operations.occupied_scopes().count(), 0);
+        assert!(
+            !error.requires_recovery(),
+            "only the read observation failed after confirmed completion"
+        );
+        assert_eq!(
+            error.operation_id(),
+            Some(persisted.operation_id.as_str()),
+            "a failed final observation must retain the admitted parent operation"
+        );
+        let response = shared_types::AppError::from(error).into_http_result::<()>("en-US");
+        assert!(!response.success);
+        assert_eq!(response.code, shared_types::ERR_RUNTIME_UNAVAILABLE);
+        assert_eq!(
+            response.operation_id.as_deref(),
+            Some(persisted.operation_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledged_stop_final_query_failure_retains_parent_identity() {
+        stop_observation_failure_retains_receipt(false).await;
+    }
+
+    #[tokio::test]
+    async fn succeeded_stop_replay_query_failure_retains_parent_identity() {
+        stop_observation_failure_retains_receipt(true).await;
+    }
+
+    #[tokio::test]
+    async fn unsafe_stop_rejection_labels_preserve_activity_and_mutation_fence() {
+        for status in [408, 499, 500, 503] {
+            let directory = tempfile::tempdir().expect("directory");
+            let (mut service, runtime) =
+                created_app_service(directory.path(), "unsaferejection").await;
+            service.config.access_mode = AppAccessMode::Kubernetes;
+            runtime.stop_failure_status.store(status, Ordering::SeqCst);
+            runtime.stop_raw_rejection.store(true, Ordering::SeqCst);
+            let error = service
+                .stop_app_controlled(
+                    "unsaferejection",
+                    shared_types::UserAppControlRequest {
+                        lifecycle_id: None,
+                        request_id: Some("unsafe-stop-rejection".into()),
+                    },
+                )
+                .await
+                .unwrap_err();
+            let record = service
+                .metadata
+                .store
+                .get_operation_by_request("unsaferejection", "unsafe-stop-rejection")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                record.state,
+                shared_types::UserAppOperationState::RecoveryRequired
+            );
+            assert_eq!(record.step, "stopping_runtime");
+            assert_eq!(
+                record.error_code.as_deref(),
+                Some(shared_types::ERR_OPERATION_OUTCOME_UNKNOWN)
+            );
+            assert_eq!(error.operation_id(), Some(record.operation_id.as_str()));
+            assert!(error.requires_recovery());
+            assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
+            assert!(
+                shared_types::AppWakeControl::is_stopped(
+                    service.activity.as_ref(),
+                    "unsaferejection"
+                ),
+                "HTTP {status} does not establish that the captured Stop had no effects"
+            );
+            assert!(
+                runtime.lease_held.load(Ordering::SeqCst),
+                "unconfirmed physical mutation retains its exact runtime lease"
+            );
+            assert!(
+                service
+                    .try_acquire_process_release_lock("unsaferejection")
+                    .await
+                    .is_err(),
+                "no second writer may enter"
+            );
+            assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
+            let response = shared_types::AppError::from(error).into_http_result::<()>("en-US");
+            assert!(!response.success);
+            assert_eq!(
+                response.operation_id.as_deref(),
+                Some(record.operation_id.as_str())
+            );
+            assert_eq!(response.code, shared_types::ERR_OPERATION_OUTCOME_UNKNOWN);
+            assert!(!response.error_detail.unwrap().retryable);
+        }
+    }
+
+    #[tokio::test]
+    async fn traffic_wake_missing_workload_is_not_authoritative_application_absence() {
+        let directory = tempfile::tempdir().expect("directory");
+        let (service, runtime) = created_app_service(directory.path(), "wakephysicalabsence").await;
+        let before = service.get_lifecycle("wakephysicalabsence").await.unwrap();
+        let creates = runtime.create_calls.load(Ordering::SeqCst);
+        let service = Arc::new(service);
+        service.attach_activity_coordinator().unwrap();
+        service.activity.set_runtime(runtime.clone());
+        runtime.deployments.remove("wakephysicalabsence");
+        let outcome = shared_types::AppWakeControl::ensure_running(
+            service.activity.as_ref(),
+            "wakephysicalabsence",
+        )
+        .await;
+        assert_eq!(runtime.create_calls.load(Ordering::SeqCst), creates);
+        assert_eq!(
+            runtime.scale_calls.load(Ordering::SeqCst),
+            0,
+            "observation cannot start a missing physical workload"
+        );
+        assert_eq!(
+            service.get_lifecycle("wakephysicalabsence").await.unwrap(),
+            before
+        );
+        let shared_types::WakeOutcome::Failed(failure) = outcome else {
+            panic!("physical absence must report a failure: {outcome:?}")
+        };
+        assert_eq!(
+            failure.code.as_ref(),
+            shared_types::ERR_CONTAINER_NOT_FOUND,
+            "the retained application identity must not be reported as absent to Java"
+        );
+        assert_eq!(
+            failure.cause_code.as_ref(),
+            shared_types::ERR_CONTAINER_NOT_FOUND
+        );
+        assert_eq!(failure.stage.as_ref(), "wake_runtime_probe");
+        assert!(
+            failure.operation_id.is_none(),
+            "a read-only cold probe admits no operation"
+        );
+        assert!(!failure.retryable);
+    }
+
+    async fn explicit_pg_readiness_transport_failure_preserves_cause(marker_succeeds: bool) {
+        let directory = tempfile::tempdir().expect("directory");
+        let (mut service, runtime) =
+            created_app_service(directory.path(), "pgreadinesscause").await;
+        service.config.access_mode = AppAccessMode::Kubernetes;
+        service.config.deploy_budget.absolute_budget_secs = 1;
+        let before = service.get_lifecycle("pgreadinesscause").await.unwrap();
+        runtime.specs.insert(
+            "pgreadinesscause".into(),
+            container_runtime_api::ContainerSpecSnapshot {
+                env: Some(
+                    [(
+                        shared_types::APP_DEPLOY_GENERATION_ID.into(),
+                        "retained-generation".into(),
+                    )]
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        if marker_succeeds {
+            runtime.configuration_replies.lock().unwrap().push_back(
+                container_runtime_api::ExecResult {
+                    stdout: "administrator".into(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                },
+            );
+        }
+        // Exhausting the scripted response queue produces the runtime's actual
+        // typed ConfigurationError, not a normal PostgreSQL nonzero exit code.
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            service.start_app_enhanced(
+                "pgreadinesscause",
+                StartAppRequest {
+                    request_id: Some("pg-readiness-original-request".into()),
+                    lifecycle_id: Some(before.lifecycle_id.clone()),
+                    pg: Some(StartPgCredential {
+                        username: "business".into(),
+                        password: "newprivate".into(),
+                    }),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("bounded explicit credential request")
+        .unwrap_err();
+        let record = service
+            .metadata
+            .store
+            .get_operation_by_request("pgreadinesscause", "pg-readiness-original-request")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(error.operation_id(), Some(record.operation_id.as_str()));
+        assert_eq!(
+            record.state,
+            shared_types::UserAppOperationState::RecoveryRequired,
+            "an earlier acknowledged Start still owns this deployment operation"
+        );
+        assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
+        assert!(runtime.lease_held.load(Ordering::SeqCst));
+        let commands = runtime.configuration_commands.lock().unwrap().clone();
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.join(" ").contains("BEGIN")
+                    || command.join(" ").contains("ALTER ROLE")
+                    || command.join(" ").contains("CREATE ROLE")),
+            "no credential mutation was issued"
+        );
+        assert_eq!(
+            error.code(),
+            shared_types::ERR_RUNTIME_CONFIGURATION,
+            "a typed runtime error must not become ordinary database unreadiness or a fabricated unknown write"
+        );
+        assert_eq!(
+            record.error_code.as_deref(),
+            Some(shared_types::ERR_RUNTIME_CONFIGURATION)
+        );
+        assert_eq!(
+            commands.len(),
+            if marker_succeeds { 2 } else { 1 },
+            "typed failure is propagated without retrying it as unreadiness"
+        );
+        let response = shared_types::AppError::from(error).into_http_result::<()>("en-US");
+        assert_eq!(
+            response.operation_id.as_deref(),
+            Some(record.operation_id.as_str())
+        );
+        let detail = response
+            .error_detail
+            .expect("readiness transport diagnostic");
+        assert_eq!(detail.reason_code, shared_types::ERR_RUNTIME_CONFIGURATION);
+        assert_eq!(detail.stage, "database_readiness");
+        assert!(!response.message.contains("newprivate"));
+        assert!(!detail.detail.contains("newprivate"));
+        assert!(
+            !detail.retryable,
+            "the admitted parent owns the previous Start write"
+        );
+        assert_eq!(
+            service
+                .get_lifecycle("pgreadinesscause")
+                .await
+                .unwrap()
+                .lifecycle_id,
+            before.lifecycle_id
+        );
+        assert!(
+            service
+                .try_acquire_process_release_lock("pgreadinesscause")
+                .await
+                .is_err()
+        );
+        assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_pg_marker_transport_failure_preserves_typed_cause() {
+        explicit_pg_readiness_transport_failure_preserves_cause(false).await;
+    }
+
+    #[tokio::test]
+    async fn explicit_pg_readiness_transport_failure_preserves_typed_cause() {
+        explicit_pg_readiness_transport_failure_preserves_cause(true).await;
+    }
+
+    #[tokio::test]
+    async fn explicit_pg_normal_readiness_nonzero_still_retries_and_succeeds() {
+        let directory = tempfile::tempdir().expect("directory");
+        let (mut service, runtime) = created_app_service(directory.path(), "pgreadyretry").await;
+        service.config.access_mode = AppAccessMode::Kubernetes;
+        service.config.deploy_budget.absolute_budget_secs = 3;
+        runtime.specs.insert(
+            "pgreadyretry".into(),
+            container_runtime_api::ContainerSpecSnapshot {
+                env: Some(
+                    [(
+                        shared_types::APP_DEPLOY_GENERATION_ID.into(),
+                        "retained-generation".into(),
+                    )]
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        for (stdout, exit_code) in [
+            ("administrator", 0),
+            ("", 1),
+            ("administrator", 0),
+            ("1", 0),
+            ("1", 0),
+            ("", 0),
+            ("1", 0),
+            ("1", 0),
+        ] {
+            runtime.configuration_replies.lock().unwrap().push_back(
+                container_runtime_api::ExecResult {
+                    stdout: stdout.into(),
+                    stderr: String::new(),
+                    exit_code,
+                },
+            );
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.start_app_enhanced(
+                "pgreadyretry",
+                StartAppRequest {
+                    request_id: Some("normal-pg-readiness-retry".into()),
+                    pg: Some(StartPgCredential {
+                        username: "business".into(),
+                        password: "newprivate".into(),
+                    }),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("bounded normal readiness retry")
+        .unwrap();
+        assert_eq!(result.pg_aligned, Some(true));
+        let record = service
+            .metadata
+            .store
+            .get_operation_by_request("pgreadyretry", "normal-pg-readiness-retry")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, shared_types::UserAppOperationState::Succeeded);
+        assert_eq!(
+            result.operation_id.as_deref(),
+            Some(record.operation_id.as_str())
+        );
+        let commands = runtime.configuration_commands.lock().unwrap().clone();
+        assert_eq!(commands.len(), 8);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command
+                    .join(" ")
+                    .contains("BEGIN ISOLATION LEVEL READ COMMITTED;"))
+                .count(),
+            1
+        );
+        let targets = runtime.configuration_targets.lock().unwrap().clone();
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.deployment_generation == "retained-generation")
+        );
+        assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.management_start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
+        assert!(!record.checkpoint.to_string().contains("newprivate"));
+    }
+}
+
+mod historical_failure_replay_tests {
+    use super::*;
+    use sha2::Digest as _;
+
+    #[tokio::test]
+    async fn historical_failure_code_and_stage_survive_control_replay_and_wake_conversion() {
+        for code in ["ERR_VENDOR_HISTORICAL_FAILURE", "LEGACY_RESOURCE_DENIED"] {
+            let directory = tempfile::tempdir().expect("directory");
+            let (service, runtime) =
+                created_app_service(directory.path(), "historicalfailure").await;
+            let identity = service.get_lifecycle("historicalfailure").await.unwrap();
+            let request = shared_types::UserAppControlRequest {
+                lifecycle_id: Some(identity.lifecycle_id.clone()),
+                request_id: Some("original-historical-failure".into()),
+            };
+            let fingerprint = hex::encode(sha2::Sha256::digest(
+                shared_types::encode_userapp_intent(&serde_json::json!({
+                    "request": &request,
+                    "wake_on_traffic": false,
+                }))
+                .unwrap(),
+            ));
+            let admitted = OwnedOperation::admit(
+                service.metadata.store.clone(),
+                shared_types::UserAppAdmission {
+                    runtime_policy_on_success: None,
+                    command: Some(shared_types::UserAppControlCommand::Stop {
+                        wake_on_traffic: false,
+                    }),
+                    app_id: "historicalfailure".into(),
+                    lifecycle_id: Some(identity.lifecycle_id),
+                    operation_id: uuid::Uuid::new_v4().to_string(),
+                    request_id: request.request_id.clone(),
+                    request_fingerprint: fingerprint,
+                    kind: shared_types::UserAppOperationKind::Stop,
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+            let original_id = admitted.execution_context().operation_id;
+            admitted
+                .reject_without_mutation(&AppOperationError::Diagnostic(
+                    shared_types::WakeFailure::new(
+                        code.to_owned(),
+                        "historical_preflight".to_owned(),
+                        "Historical failure with safe details",
+                    ),
+                ))
+                .await
+                .unwrap();
+            let stored = service
+                .metadata
+                .store
+                .get_operation("historicalfailure", &original_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.state, shared_types::UserAppOperationState::Failed);
+            assert_eq!(stored.error_code.as_deref(), Some(code));
+            let error = service
+                .stop_app_controlled("historicalfailure", request)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), code);
+            assert_eq!(error.operation_id(), Some(original_id.as_str()));
+            assert_eq!(
+                runtime.scale_calls.load(Ordering::SeqCst),
+                0,
+                "recorded failure replay must not execute Stop"
+            );
+            assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                service
+                    .metadata
+                    .store
+                    .get_operation("historicalfailure", &original_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                stored
+            );
+            let wake = error.wake_failure("later_observation");
+            assert_eq!(wake.code.as_ref(), code);
+            assert_eq!(wake.cause_code.as_ref(), code);
+            assert_eq!(wake.stage.as_ref(), stored.step);
+            assert!(!wake.retryable);
+            let response = wake.into_app_error().into_http_result::<()>("en-US");
+            assert!(!response.success);
+            assert_eq!(response.code, code);
+            assert_eq!(response.operation_id.as_deref(), Some(original_id.as_str()));
+            let detail = response.error_detail.unwrap();
+            assert_eq!(detail.reason_code, code);
+            assert_eq!(detail.stage, stored.step);
+            assert!(!detail.retryable);
+        }
+    }
+}
+
+mod activation_final_query_identity_tests {
+    use super::*;
+
+    async fn acknowledged_activation_query_failure_keeps_original_receipt(
+        restart: bool,
+        replay: bool,
+    ) {
+        let directory = tempfile::tempdir().expect("directory");
+        let (service, runtime) = created_app_service(directory.path(), "activationquery").await;
+        let before = service.get_lifecycle("activationquery").await.unwrap();
+        let request = shared_types::UserAppControlRequest {
+            lifecycle_id: Some(before.lifecycle_id.clone()),
+            request_id: Some("activation-final-query-original".into()),
+        };
+        if replay {
+            if restart {
+                service
+                    .restart_app_controlled("activationquery", request.clone())
+                    .await
+                    .unwrap();
+            } else {
+                service
+                    .start_app_controlled("activationquery", request.clone())
+                    .await
+                    .unwrap();
+            }
+            runtime.status_fails.store(1, Ordering::SeqCst);
+        } else {
+            // The first post-write read refreshes Pingora (best effort); the
+            // second is the public final runtime result. Both are read-only.
+            runtime
+                .post_activation_status_fails
+                .store(2, Ordering::SeqCst);
+        }
+        let error = if restart {
+            service
+                .restart_app_controlled("activationquery", request)
+                .await
+                .unwrap_err()
+        } else {
+            service
+                .start_app_controlled("activationquery", request)
+                .await
+                .unwrap_err()
+        };
+        let record = service
+            .metadata
+            .store
+            .get_operation_by_request("activationquery", "activation-final-query-original")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, shared_types::UserAppOperationState::Succeeded);
+        assert_eq!(record.step, "completed");
+        assert!(
+            record.error_code.is_none(),
+            "observation failure cannot rewrite the successful physical receipt"
+        );
+        assert_eq!(
+            record.kind,
+            if restart {
+                shared_types::UserAppOperationKind::Restart
+            } else {
+                shared_types::UserAppOperationKind::Start
+            }
+        );
+        assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime.restart_calls.load(Ordering::SeqCst),
+            usize::from(restart)
+        );
+        assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
+        let physical = runtime.deployments.get("activationquery").unwrap();
+        assert_eq!(physical.replicas, 1);
+        assert_eq!(physical.phase, "Running");
+        drop(physical);
+        assert!(!shared_types::AppWakeControl::is_stopped(
+            service.activity.as_ref(),
+            "activationquery"
+        ));
+        let after = service.get_lifecycle("activationquery").await.unwrap();
+        assert_eq!(after.lifecycle_id, before.lifecycle_id);
+        assert_eq!(after.lifecycle_epoch, before.lifecycle_epoch);
+        assert_eq!(after.active_operations.occupied_scopes().count(), 0);
+        assert!(
+            !error.requires_recovery(),
+            "only the post-acknowledgement query failed"
+        );
+        assert_eq!(error.operation_id(), Some(record.operation_id.as_str()));
+        let response = shared_types::AppError::from(error).into_http_result::<()>("en-US");
+        assert!(!response.success);
+        assert_eq!(response.code, shared_types::ERR_RUNTIME_UNAVAILABLE);
+        assert_eq!(
+            response.operation_id.as_deref(),
+            Some(record.operation_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledged_start_final_query_failure_keeps_parent_identity() {
+        acknowledged_activation_query_failure_keeps_original_receipt(false, false).await;
+    }
+    #[tokio::test]
+    async fn succeeded_start_replay_query_failure_keeps_parent_identity() {
+        acknowledged_activation_query_failure_keeps_original_receipt(false, true).await;
+    }
+    #[tokio::test]
+    async fn acknowledged_restart_final_query_failure_keeps_parent_identity() {
+        acknowledged_activation_query_failure_keeps_original_receipt(true, false).await;
+    }
+    #[tokio::test]
+    async fn succeeded_restart_replay_query_failure_keeps_parent_identity() {
+        acknowledged_activation_query_failure_keeps_original_receipt(true, true).await;
+    }
 }

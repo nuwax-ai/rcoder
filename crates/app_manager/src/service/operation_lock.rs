@@ -7,7 +7,7 @@ use std::fs::{File, TryLockError};
 
 /// File descriptor remains open for the complete create/delete/purge transaction.
 pub(crate) struct AppOperationGuard {
-    _flight: shared_types::FlightGuard,
+    _flight: Option<shared_types::FlightGuard>,
     runtime: Option<Box<dyn shared_types::AppOperationLease>>,
     builder_lease: Option<std::sync::Arc<SharedBuilderLease>>,
     marker: shared_types::AppFileMutationMarker,
@@ -155,6 +155,34 @@ impl AppOperationGuard {
         }
         Ok(())
     }
+
+    pub(crate) async fn finish_unadmitted(self, deadline: tokio::time::Instant) -> AppResult<()> {
+        let mut task = tokio::spawn(async move {
+            let result = self.finish().await;
+            if let Err(error) = &result {
+                tracing::error!(%error, "owned pre-admission exact lease release is unconfirmed");
+            }
+            result.map_err(|_| AppOperationError::Diagnostic(shared_types::WakeFailure::new(
+                shared_types::ERR_OPERATION_OUTCOME_UNKNOWN, "operation_lease_release",
+                "The exact pre-admission lease release was not confirmed; inspect the original runtime lease before retrying",
+            )))
+        });
+        let cancel = super::restart_wait::cancellation();
+        tokio::select! {
+            result = &mut task => result.map_err(|error| {
+                tracing::error!(%error, "owned pre-admission lease release task stopped without confirmation");
+                AppOperationError::Diagnostic(shared_types::WakeFailure::new(
+                    shared_types::ERR_OPERATION_OUTCOME_UNKNOWN, "operation_lease_release",
+                    "The owned exact lease release task stopped before cleanup was confirmed",
+                ))
+            })?,
+            () = tokio::time::sleep_until(deadline) => Err(AppOperationError::Diagnostic(shared_types::WakeFailure::new(
+                shared_types::ERR_OPERATION_OUTCOME_UNKNOWN, "operation_lease_release",
+                "Restart admission deadline ended before exact lease release was confirmed; cleanup remains owned and must not be replayed",
+            ))),
+            () = cancel.cancelled() => Err(AppOperationError::Validation("Restart admission waiting was abandoned before acceptance; exact lease cleanup remains owned".into())),
+        }
+    }
 }
 
 impl Drop for AppOperationGuard {
@@ -171,7 +199,9 @@ impl Drop for AppOperationGuard {
             if let Some(lease) = self.runtime.take()
                 && let Ok(runtime) = tokio::runtime::Handle::try_current()
             {
+                let flight = self._flight.take();
                 runtime.spawn(async move {
+                    let _flight = flight;
                     if let Err(error) = lease.release().await {
                         tracing::error!(%error, "release application lease before mutation failed");
                     }
@@ -188,7 +218,58 @@ impl Drop for AppOperationGuard {
     }
 }
 
+type LeaseAttemptResult =
+    container_runtime_api::ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>>;
+struct PendingLeaseAcquisition {
+    task: Option<tokio::task::JoinHandle<(LeaseAttemptResult, shared_types::FlightGuard)>>,
+    app_id: String,
+}
+impl Drop for PendingLeaseAcquisition {
+    fn drop(&mut self) {
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        let app_id = self.app_id.clone();
+        // The request is already dispatched. Do not abort it or claim that a
+        // missing response proves no lease was created. Its flight stays owned.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                match task.await {
+                    Ok((Ok(Some(lease)), _flight)) => {
+                        if let Err(error) = lease.release().await {
+                            tracing::error!(app_id, %error, "abandoned pre-admission exact lease cleanup remains unconfirmed");
+                        }
+                    }
+                    Ok((Ok(None), _flight)) => {}
+                    Ok((Err(error), _flight)) => tracing::error!(app_id, %error, "abandoned lease acquisition result remains unknown or failed"),
+                    Err(error) => tracing::error!(app_id, %error, "owned lease acquisition task failed without confirmed cleanup"),
+                }
+            });
+        } else {
+            tracing::error!(
+                app_id,
+                "owned lease acquisition cannot be observed during runtime shutdown; result remains unconfirmed"
+            );
+        }
+    }
+}
+
 impl AppService {
+    pub(crate) async fn operation_guard_until(
+        &self,
+        app_id: &str,
+        process: tokio::sync::OwnedMutexGuard<()>,
+        deadline: tokio::time::Instant,
+    ) -> AppResult<AppOperationGuard> {
+        self.operation_guard_scoped_inner(
+            app_id,
+            shared_types::UserAppOperationScope::Prod,
+            process,
+            false,
+            Some(deadline),
+        )
+        .await
+    }
     pub(crate) async fn operation_guard(
         &self,
         app_id: &str,
@@ -214,10 +295,23 @@ impl AppService {
         process: tokio::sync::OwnedMutexGuard<()>,
         wait: bool,
     ) -> AppResult<AppOperationGuard> {
-        let flight = self
-            .operation_flight
-            .guard()
-            .map_err(|error| AppOperationError::Conflict(error.to_string()))?;
+        self.operation_guard_scoped_inner(app_id, scope, process, wait, None)
+            .await
+    }
+
+    async fn operation_guard_scoped_inner(
+        &self,
+        app_id: &str,
+        scope: shared_types::UserAppOperationScope,
+        process: tokio::sync::OwnedMutexGuard<()>,
+        wait: bool,
+        deadline: Option<tokio::time::Instant>,
+    ) -> AppResult<AppOperationGuard> {
+        let mut flight = Some(
+            self.operation_flight
+                .guard()
+                .map_err(|error| AppOperationError::Conflict(error.to_string()))?,
+        );
         let builder_family = scope == shared_types::UserAppOperationScope::Dev;
         let runtime = if builder_family || self.config.access_mode == AppAccessMode::Kubernetes {
             // K8s 租约等待语义对齐 Docker flock 轮询：wait=true 时 409
@@ -226,7 +320,56 @@ impl AppService {
             // 立即 Conflict（外部 stop/restart/delete 快失败）。
             const LEASE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
             let lease = loop {
-                let attempt = if builder_family {
+                let attempt = if let Some(deadline) = deadline {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(AppOperationError::operation_in_progress(
+                            None,
+                            shared_types::OperationInProgressData::default(),
+                        ));
+                    }
+                    // Read-only checks may have yielded while the HTTP receiver
+                    // disappeared. Do not start another physical lease write.
+                    super::restart_wait::check_waiting()?;
+                    let runtime = self.runtime.clone();
+                    let worker_app = app_id.to_owned();
+                    let owned_flight = flight.take().ok_or_else(|| {
+                        AppOperationError::Backend(
+                            "Lease acquisition accounting is unavailable".into(),
+                        )
+                    })?;
+                    let mut pending = PendingLeaseAcquisition {
+                        app_id: app_id.to_owned(),
+                        task: Some(tokio::spawn(async move {
+                            let result = runtime.acquire_app_operation(&worker_app).await;
+                            (result, owned_flight)
+                        })),
+                    };
+                    let cancel = super::restart_wait::cancellation();
+                    let task = pending.task.as_mut().ok_or_else(|| {
+                        AppOperationError::Backend("Lease acquisition task is unavailable".into())
+                    })?;
+                    let completed = tokio::select! {
+                        result = task => result,
+                        () = tokio::time::sleep_until(deadline) => {
+                            return Err(AppOperationError::Diagnostic(shared_types::WakeFailure::new(
+                                shared_types::ERR_OPERATION_OUTCOME_UNKNOWN,
+                                "operation_lease_acquire",
+                                "Restart admission deadline ended during a dispatched lease acquisition; business was not admitted and the exact lease result remains under observation",
+                            )));
+                        }
+                        () = cancel.cancelled() => return Err(AppOperationError::Validation("Restart admission waiting was abandoned before acceptance".into())),
+                    };
+                    let _completed_task = pending.task.take();
+                    let (result, owned_flight) = completed.map_err(|error| {
+                        tracing::error!(app_id, %error, "owned lease acquisition task stopped without a confirmed result");
+                        AppOperationError::Diagnostic(shared_types::WakeFailure::new(
+                            shared_types::ERR_OPERATION_OUTCOME_UNKNOWN, "operation_lease_acquire",
+                            "The dispatched lease acquisition task stopped before its exact result was confirmed; business was not admitted",
+                        ))
+                    })?;
+                    flight = Some(owned_flight);
+                    result
+                } else if builder_family {
                     self.runtime
                         .acquire_builder_family_operation(app_id)
                         .await
@@ -253,22 +396,32 @@ impl AppService {
                     }
                     Err(container_runtime_api::ContainerRuntimeError::OperationInProgress(
                         detail,
-                    )) if !builder_family => {
-                        let mut conflict = self.prod_lock_conflict(app_id).await;
-                        // A legacy runtime lease may have no durable operation.
-                        // Preserve its identity in the message instead of claiming
-                        // that admission is necessarily still in flight.
-                        if let AppOperationError::ConflictBlocked { message, .. } = &mut conflict {
-                            *message =
-                                format!("Application runtime operation is occupied: {detail}");
-                        }
-                        return Err(conflict);
+                    )) => {
+                        tracing::debug!(app_id, %detail, "runtime lease holder diagnostic");
+                        let diagnostic =
+                            self.operation_lock_conflict_scoped(app_id, scope, None, Some(&detail));
+                        return Err(match deadline {
+                            Some(deadline) => tokio::time::timeout_at(deadline, diagnostic)
+                                .await
+                                .unwrap_or_else(|_| {
+                                    AppOperationError::operation_in_progress(
+                                        None,
+                                        shared_types::OperationInProgressData::default(),
+                                    )
+                                }),
+                            None => diagnostic.await,
+                        });
                     }
                     Err(error) => {
-                        return Err(crate::utils::map_runtime_error(
-                            "acquire application operation",
-                            error,
-                        ));
+                        return Err(if deadline.is_some() {
+                            crate::utils::map_runtime_mutation_error(
+                                "operation_lease_acquire",
+                                "acquire application operation",
+                                error,
+                            )
+                        } else {
+                            crate::utils::map_runtime_error("acquire application operation", error)
+                        });
                     }
                 }
             };
@@ -285,26 +438,34 @@ impl AppService {
                 ));
             }
             let directory = std::path::Path::new(root).join(".app-operation-locks");
-            tokio::fs::create_dir_all(&directory).await.map_err(|e| {
-                AppOperationError::Backend(format!("create application lock directory: {e}"))
-            })?;
-            let lock_name = if builder_family {
-                format!("builder-{app_id}.lock")
-            } else {
-                format!("prod-{app_id}.lock")
+            let prepare_file = async {
+                tokio::fs::create_dir_all(&directory).await.map_err(|e| {
+                    AppOperationError::Backend(format!("create application lock directory: {e}"))
+                })?;
+                let lock_name = if builder_family {
+                    format!("builder-{app_id}.lock")
+                } else {
+                    format!("prod-{app_id}.lock")
+                };
+                let file = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(directory.join(lock_name))
+                    .await
+                    .map_err(|e| {
+                        AppOperationError::Backend(format!("open application operation lock: {e}"))
+                    })?
+                    .into_std()
+                    .await;
+                Ok::<_, AppOperationError>(file)
             };
-            let file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(directory.join(lock_name))
-                .await
-                .map_err(|e| {
-                    AppOperationError::Backend(format!("open application operation lock: {e}"))
-                })?
-                .into_std()
-                .await;
+            let file = match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, prepare_file).await
+                    .map_err(|_| AppOperationError::Backend("Restart admission file observation exceeded total wait budget before acceptance".into()))??,
+                None => prepare_file.await?,
+            };
             loop {
                 match file.try_lock() {
                     Ok(()) => break,
@@ -312,9 +473,19 @@ impl AppService {
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await
                     }
                     Err(TryLockError::WouldBlock) => {
-                        return Err(AppOperationError::Conflict(
-                            "application operation is in progress on another process".into(),
-                        ));
+                        let diagnostic =
+                            self.operation_lock_conflict_scoped(app_id, scope, None, None);
+                        return Err(match deadline {
+                            Some(deadline) => tokio::time::timeout_at(deadline, diagnostic)
+                                .await
+                                .unwrap_or_else(|_| {
+                                    AppOperationError::operation_in_progress(
+                                        None,
+                                        shared_types::OperationInProgressData::default(),
+                                    )
+                                }),
+                            None => diagnostic.await,
+                        });
                     }
                     Err(TryLockError::Error(error)) => {
                         return Err(AppOperationError::Backend(format!(
@@ -346,7 +517,9 @@ impl AppService {
         };
         Ok(AppOperationGuard {
             builder_lease,
-            _flight: flight,
+            _flight: Some(flight.ok_or_else(|| {
+                AppOperationError::Backend("Operation acquisition accounting was lost".into())
+            })?),
             runtime,
             marker: shared_types::AppFileMutationMarker::new(),
             side_effect_started: std::sync::atomic::AtomicBool::new(false),
@@ -402,9 +575,11 @@ mod tests {
 
     async fn guard(releases: Arc<AtomicUsize>) -> AppOperationGuard {
         AppOperationGuard {
-            _flight: Arc::new(shared_types::OperationFlightGate::default())
-                .guard()
-                .unwrap(),
+            _flight: Some(
+                Arc::new(shared_types::OperationFlightGate::default())
+                    .guard()
+                    .unwrap(),
+            ),
             runtime: Some(Box::new(Lease(releases))),
             builder_lease: None,
             marker: shared_types::AppFileMutationMarker::new(),

@@ -224,6 +224,37 @@ impl BuildTask {
         Ok(true)
     }
 
+    /// Release admission locks only once the start future proves that its
+    /// original execution was submitted. Continue observing that execution
+    /// outside the locks, so Stop can cancel it while migration is still running.
+    pub async fn commit_start_until_submitted<F, E>(
+        &self,
+        lifecycle: &Mutex<u64>,
+        expected: u64,
+        submitted: &tokio_util::sync::CancellationToken,
+        start: F,
+    ) -> Result<bool, E>
+    where
+        F: Future<Output = Result<(), E>>,
+    {
+        let generation = lifecycle.lock().await;
+        let commit = self.commit_guard().await;
+        if *generation != expected || self.is_cancelled() {
+            self.cancel();
+            self.emit(BuildProgressEvent::Cancelled).await;
+            return Ok(false);
+        }
+        tokio::pin!(start);
+        tokio::select! {
+            result = &mut start => return result.map(|()| true),
+            () = submitted.cancelled() => {}
+        }
+        drop(commit);
+        drop(generation);
+        start.await?;
+        Ok(true)
+    }
+
     /// Pending stays Pending while queued; expose the reason through the
     /// existing snapshot stage and log event, without a new protocol variant.
     pub async fn waiting_for_build_slot(&self, seconds: u64) {

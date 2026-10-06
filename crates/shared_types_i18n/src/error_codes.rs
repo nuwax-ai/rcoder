@@ -33,6 +33,21 @@ pub const ERR_INVALID_RESOURCE_LIMITS: &str = "INVALID_RESOURCE_LIMITS";
 /// 容器操作失败
 pub const ERR_CONTAINER_ERROR: &str = "ERR_CONTAINER_ERROR";
 
+/// Platform runtime configuration is invalid, independent of user input validation.
+pub const ERR_RUNTIME_CONFIGURATION: &str = "ERR_RUNTIME_CONFIGURATION";
+pub const ERR_RUNTIME_UNAVAILABLE: &str = "ERR_RUNTIME_UNAVAILABLE";
+pub const ERR_RUNTIME_TIMEOUT: &str = "ERR_RUNTIME_TIMEOUT";
+pub const ERR_CONTAINER_CREATE_FAILED: &str = "ERR_CONTAINER_CREATE_FAILED";
+pub const ERR_CONTAINER_START_FAILED: &str = "ERR_CONTAINER_START_FAILED";
+pub const ERR_CONTAINER_STOP_FAILED: &str = "ERR_CONTAINER_STOP_FAILED";
+pub const ERR_CONTAINER_EXEC_FAILED: &str = "ERR_CONTAINER_EXEC_FAILED";
+pub const ERR_CONTAINER_ADDRESS_NOT_READY: &str = "ERR_CONTAINER_ADDRESS_NOT_READY";
+pub const ERR_DATABASE_NOT_READY: &str = "ERR_DATABASE_NOT_READY";
+pub const ERR_DATABASE_COMMAND_FAILED: &str = "ERR_DATABASE_COMMAND_FAILED";
+pub const ERR_USERAPP_WAKE_FAILED: &str = "ERR_USERAPP_WAKE_FAILED";
+/// Dispatched mutation completion was not proven; never blindly retry.
+pub const ERR_OPERATION_OUTCOME_UNKNOWN: &str = "ERR_OPERATION_OUTCOME_UNKNOWN";
+
 /// 工作目录错误
 pub const ERR_WORKSPACE_ERROR: &str = "WORKSPACE_ERROR";
 
@@ -181,6 +196,9 @@ pub const ERR_NOT_FOUND: &str = "ERR_NOT_FOUND";
 
 /// 资源冲突（已存在）
 pub const ERR_CONFLICT: &str = "ERR_CONFLICT";
+/// Another application operation owns the admission slot or physical lease.
+/// Retry safety is carried in OperationInProgressData, not implied by this code.
+pub const ERR_OPERATION_IN_PROGRESS: &str = "ERR_OPERATION_IN_PROGRESS";
 /// Waiting expired; the accepted operation may still be running.
 pub const ERR_USERAPP_WAIT_TIMEOUT: &str = "ERR_USERAPP_WAIT_TIMEOUT";
 
@@ -232,7 +250,8 @@ pub const ERR_DEV_NOT_RUNNING: &str = "ERR_DEV_NOT_RUNNING";
 
 /// 判断错误码是否可重试（Java 据此决定是否指数退避重发）。
 ///
-/// 注意：`retryable` 是错误码的固有属性，不在响应体重复（HttpResult 不变）。
+/// 历史错误码保留既有建议。结构化运行时错误及 ERR_OPERATION_IN_PROGRESS
+/// 必须以响应中的执行证据判断；错误码本身不授权重放未知写入。
 /// 详见 docs/application-management-service-v2-design.md §12.3。
 pub fn is_retryable_code(code: &str) -> bool {
     matches!(
@@ -256,6 +275,18 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_INVALID_PARAMS => "error.invalid_params",
         ERR_INVALID_RESOURCE_LIMITS => "error.invalid_resource_limits",
         ERR_CONTAINER_ERROR => "error.container_error",
+        ERR_RUNTIME_CONFIGURATION => "error.runtime_configuration",
+        ERR_RUNTIME_UNAVAILABLE => "error.runtime_unavailable",
+        ERR_RUNTIME_TIMEOUT => "error.runtime_timeout",
+        ERR_CONTAINER_CREATE_FAILED => "error.container_create_failed",
+        ERR_CONTAINER_START_FAILED => "error.container_start_failed",
+        ERR_CONTAINER_STOP_FAILED => "error.container_stop_failed",
+        ERR_CONTAINER_EXEC_FAILED => "error.container_exec_failed",
+        ERR_CONTAINER_ADDRESS_NOT_READY => "error.container_address_not_ready",
+        ERR_DATABASE_NOT_READY => "error.database_not_ready",
+        ERR_DATABASE_COMMAND_FAILED => "error.database_command_failed",
+        ERR_USERAPP_WAKE_FAILED => "error.userapp_wake_failed",
+        ERR_OPERATION_OUTCOME_UNKNOWN => "error.operation_outcome_unknown",
         ERR_WORKSPACE_ERROR => "error.workspace_error",
         ERR_GRPC_ADDR_ERROR => "error.grpc_addr_error",
         ERR_GRPC_ERROR => "error.grpc_error",
@@ -301,6 +332,7 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_MODEL_UNAVAILABLE => "error.model_unavailable",
         ERR_NOT_FOUND => "error.not_found",
         ERR_CONFLICT => "error.conflict",
+        ERR_OPERATION_IN_PROGRESS => "error.operation_in_progress",
         ERR_USERAPP_WAIT_TIMEOUT => "error.userapp_wait_timeout",
         ERR_APP_NOT_FOUND => "error.app_not_found",
         ERR_APP_ALREADY_EXISTS => "error.app_already_exists",
@@ -332,6 +364,20 @@ pub fn get_error_message(code: &str, locale: &str) -> String {
     t(key, locale)
 }
 
+/// Catalog guidance is advisory; retry permission comes from execution evidence.
+pub fn get_error_hint(reason_code: &str, locale: &str) -> String {
+    let key = match reason_code {
+        ERR_RUNTIME_CONFIGURATION => "hint.runtime_configuration",
+        ERR_RUNTIME_UNAVAILABLE => "hint.runtime_unavailable",
+        ERR_RUNTIME_TIMEOUT => "hint.runtime_timeout",
+        ERR_CONTAINER_ADDRESS_NOT_READY | ERR_DATABASE_NOT_READY => "hint.readiness",
+        ERR_OPERATION_OUTCOME_UNKNOWN => "hint.operation_outcome_unknown",
+        ERR_OPERATION_IN_PROGRESS => "hint.operation_in_progress",
+        _ => "hint.runtime_failure",
+    };
+    t(key, locale)
+}
+
 /// 通过 i18n key 直接获取多语言消息
 ///
 /// # Arguments
@@ -342,6 +388,27 @@ pub fn get_error_message(code: &str, locale: &str) -> String {
 /// 多语言消息
 pub fn get_i18n_message(key: &str, locale: &str) -> String {
     t(key, locale)
+}
+
+/// Per-request conflict text; the structured fields, rather than this text,
+/// determine whether a rejected admission can safely be retried.
+pub fn get_operation_in_progress_message(
+    holder_kind: Option<&str>,
+    retryable: bool,
+    retry_after_seconds: u64,
+    locale: &str,
+) -> String {
+    let kind = holder_kind
+        .map(str::to_owned)
+        .unwrap_or_else(|| t("error.operation_holder_unknown", locale));
+    let key = if retryable {
+        "error.operation_in_progress_retryable"
+    } else {
+        "error.operation_in_progress_review"
+    };
+    t(key, locale)
+        .replace("%{kind}", &kind)
+        .replace("%{seconds}", &retry_after_seconds.to_string())
 }
 
 /// 通过 i18n key 获取默认语言消息
@@ -368,6 +435,19 @@ pub fn get_error_description(code: &str) -> &'static str {
         ERR_INVALID_PARAMS => "Parameter missing or invalid",
         ERR_INVALID_RESOURCE_LIMITS => "Invalid resource limit configuration",
         ERR_CONTAINER_ERROR => "Container operation failed",
+        ERR_RUNTIME_CONFIGURATION => "Platform runtime configuration is invalid",
+        ERR_RUNTIME_UNAVAILABLE => "Container runtime is unavailable",
+        ERR_RUNTIME_TIMEOUT => "Runtime operation timed out",
+        ERR_CONTAINER_CREATE_FAILED => "Container creation failed",
+        ERR_CONTAINER_START_FAILED => "Container start failed",
+        ERR_CONTAINER_STOP_FAILED => "Container stop failed",
+        ERR_CONTAINER_EXEC_FAILED => "Container command execution failed",
+        ERR_CONTAINER_ADDRESS_NOT_READY => "Container management address is not ready",
+        ERR_DATABASE_NOT_READY => "Database is not ready",
+        ERR_DATABASE_COMMAND_FAILED => "Database command failed",
+        ERR_USERAPP_WAKE_FAILED => "Application wake failed",
+        ERR_OPERATION_OUTCOME_UNKNOWN => "Operation completion was not confirmed",
+        ERR_OPERATION_IN_PROGRESS => "Another application operation is in progress",
         ERR_WORKSPACE_ERROR => "Workspace error",
         ERR_GRPC_ADDR_ERROR => "gRPC address resolution failed",
         ERR_GRPC_ERROR => "gRPC call failed",
@@ -436,6 +516,60 @@ pub fn get_error_description(code: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_error_codes_and_guidance_have_all_supported_catalogs() {
+        for code in [
+            ERR_RUNTIME_CONFIGURATION,
+            ERR_RUNTIME_UNAVAILABLE,
+            ERR_RUNTIME_TIMEOUT,
+            ERR_CONTAINER_CREATE_FAILED,
+            ERR_CONTAINER_START_FAILED,
+            ERR_CONTAINER_STOP_FAILED,
+            ERR_CONTAINER_EXEC_FAILED,
+            ERR_CONTAINER_ADDRESS_NOT_READY,
+            ERR_DATABASE_NOT_READY,
+            ERR_DATABASE_COMMAND_FAILED,
+            ERR_USERAPP_WAKE_FAILED,
+            ERR_OPERATION_OUTCOME_UNKNOWN,
+            ERR_OPERATION_IN_PROGRESS,
+        ] {
+            for locale in crate::SUPPORTED_LOCALES {
+                let message = get_error_message(code, locale);
+                let hint = get_error_hint(code, locale);
+                assert!(
+                    !message.is_empty() && !message.starts_with("error."),
+                    "{code}: {locale}"
+                );
+                assert!(
+                    !hint.is_empty() && !hint.starts_with("hint."),
+                    "{code}: {locale}"
+                );
+            }
+            assert!(
+                !is_retryable_code(code),
+                "new code alone must not authorize retry: {code}"
+            );
+        }
+        assert_eq!(ERR_APP_NOT_FOUND, "ERR_APP_NOT_FOUND");
+    }
+
+    #[test]
+    fn operation_in_progress_text_uses_requested_locale_and_keeps_retry_evidence_separate() {
+        for locale in crate::SUPPORTED_LOCALES {
+            let message = get_operation_in_progress_message(Some("start"), true, 20, locale);
+            assert!(
+                message.contains("start") && message.contains("20"),
+                "{locale}: {message}"
+            );
+            assert!(!message.contains("%{") && !message.starts_with("error."));
+            let review = get_operation_in_progress_message(None, false, 0, locale);
+            assert!(!review.starts_with("error.") && !review.contains("%{"));
+            assert_ne!(message, review);
+        }
+        assert!(!is_retryable_code(ERR_OPERATION_IN_PROGRESS));
+        assert_eq!(ERR_CONFLICT, "ERR_CONFLICT");
+    }
 
     #[test]
     fn userapp_wait_timeout_prompt_gives_a_simple_retry_action() {

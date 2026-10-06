@@ -203,14 +203,13 @@ impl KubernetesRuntime {
             validate_owner(Kind::PersistentVolumeClaim, &object, app_id)?;
             if let Some(context) = context {
                 let annotations = object.metadata.annotations.as_ref();
-                for (key, expected) in [("rcoder.io/lifecycle-id", &context.lifecycle_id)] {
-                    if let Some(actual) = annotations.and_then(|values| values.get(key))
-                        && actual != expected
-                    {
-                        return Err(Error::Conflict(
-                            "Builder storage lifecycle ownership changed".into(),
-                        ));
-                    }
+                if let Some(actual) =
+                    annotations.and_then(|values| values.get("rcoder.io/lifecycle-id"))
+                    && actual != &context.lifecycle_id
+                {
+                    return Err(Error::Conflict(
+                        "Builder storage lifecycle ownership changed".into(),
+                    ));
                 }
             }
             if object.metadata.deletion_timestamp.is_some() {

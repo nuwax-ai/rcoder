@@ -67,7 +67,11 @@ struct DeployRunner<'a> {
 
 #[async_trait::async_trait]
 impl PgCommandRunner for DeployRunner<'_> {
-    async fn run(&self, command: &str) -> Result<CommandOutcome, String> {
+    async fn run(
+        &self,
+        command: &str,
+        mode: PgCommandMode,
+    ) -> Result<CommandOutcome, PgCommandError> {
         let args = vec!["sh".into(), "-c".into(), command.into()];
         let result = timeout_at(self.deadline, async {
             self.state
@@ -76,8 +80,14 @@ impl PgCommandRunner for DeployRunner<'_> {
                 .await
         })
         .await
-        .map_err(|_| "Deployment database command deadline exceeded".to_string())?
-        .map_err(|_| "Identity-bound deployment database command failed".to_string())?;
+        .map_err(|_| {
+            PgCommandError::transport(
+                mode,
+                ERR_RUNTIME_TIMEOUT,
+                "Deployment database command deadline exceeded",
+            )
+        })?
+        .map_err(|error| container_runtime_api::runtime_pg_command_error(&error, mode))?;
         Ok(CommandOutcome {
             exit_code: result.exit_code,
             stdout: result.stdout,
@@ -164,8 +174,20 @@ async fn recover_deploy_pg_coordinated(
             state.runtime().get_app_container_spec(&record.app_id),
         )
         .await
-        .map_err(|_| backend("Deployment database observation deadline exceeded"))?
-        .map_err(|_| backend("Read deployment database generation failed"))?;
+        .map_err(|_| {
+            database_diagnostic(
+                ERR_RUNTIME_TIMEOUT,
+                "database_recovery_target",
+                "Deployment database observation deadline exceeded",
+            )
+        })?
+        .map_err(|error| {
+            container_runtime_api::runtime_app_error(
+                &error,
+                "database_recovery_target",
+                container_runtime_api::RuntimeErrorContext::ReadOnly,
+            )
+        })?;
         let generation = spec
             .env
             .as_ref()
@@ -179,8 +201,20 @@ async fn recover_deploy_pg_coordinated(
                 .capture_app_configuration_target(&evidence.context, generation),
         )
         .await
-        .map_err(|_| backend("Deployment database observation deadline exceeded"))?
-        .map_err(|_| backend("Capture deployment database target failed"))?;
+        .map_err(|_| {
+            database_diagnostic(
+                ERR_RUNTIME_TIMEOUT,
+                "database_recovery_target",
+                "Deployment database observation deadline exceeded",
+            )
+        })?
+        .map_err(|error| {
+            container_runtime_api::runtime_app_error(
+                &error,
+                "database_recovery_target",
+                container_runtime_api::RuntimeErrorContext::ReadOnly,
+            )
+        })?;
         if target != evidence.explicit_pg_target {
             return Err(AppError::conflict(
                 "Original deployment database target was replaced; manual reconciliation required",
@@ -193,17 +227,35 @@ async fn recover_deploy_pg_coordinated(
             deadline,
         };
         let marker = runner
-            .run("test -n \"${PGDATA:-}\" && cat \"$PGDATA/.rcoder-admin-user\"")
+            .run(
+                "test -n \"${PGDATA:-}\" && cat \"$PGDATA/.rcoder-admin-user\"",
+                PgCommandMode::ReadOnly,
+            )
             .await
-            .map_err(|_| backend("Read original database administrator failed"))?;
+            .map_err(|error| {
+                error.into_credential_app_error(
+                    "database_recovery_admin",
+                    "Deployment database recovery administrator query transport failed",
+                )
+            })?;
         if marker.exit_code != 0 {
-            return Err(backend("Original database administrator is unavailable"));
+            return Err(database_diagnostic(
+                ERR_DATABASE_NOT_READY,
+                "database_recovery_admin",
+                "Original database administrator is unavailable",
+            ));
         }
         let admin = pg_utils::PgAdministrationTarget::new(
             marker.stdout.trim().into(),
             "/var/run/postgresql".into(),
         )
-        .map_err(|_| backend("Original database administrator is invalid"))?;
+        .map_err(|_| {
+            database_diagnostic(
+                ERR_RUNTIME_CONFIGURATION,
+                "database_recovery_admin",
+                "Original database administrator is invalid",
+            )
+        })?;
         evidence.stage = confirm_deploy_outcome(
             &runner,
             &admin,
@@ -265,11 +317,18 @@ async fn confirm_deploy_outcome(
         .password_operation_cancel_command(context, UserAppOperationScope::Prod, username)
         .map_err(|_| backend("Build deployment password recovery command failed"))?;
     let result = runner
-        .run(&command)
+        .run(&command, PgCommandMode::Write)
         .await
-        .map_err(|_| backend("Deployment password recovery receipt outcome is unknown"))?;
+        .map_err(|error| {
+            error.into_credential_app_error(
+                "database_recovery_receipt",
+                "Deployment password recovery receipt completion was not confirmed",
+            )
+        })?;
     if result.exit_code != 0 {
-        return Err(backend(
+        return Err(database_diagnostic(
+            ERR_OPERATION_OUTCOME_UNKNOWN,
+            "database_recovery_receipt",
             "Deployment password recovery receipt transaction did not confirm commit",
         ));
     }
@@ -277,11 +336,23 @@ async fn confirm_deploy_outcome(
         "cancelled" => DatabasePasswordStage::Cancelled,
         "committed" => {
             let verified = runner
-                .run(&pg_utils::pg_verify_credentials_cmd(username, password))
+                .run(
+                    &pg_utils::pg_verify_credentials_cmd(username, password),
+                    PgCommandMode::ReadOnly,
+                )
                 .await
-                .map_err(|_| backend("Committed password TCP verification is unavailable"))?;
+                .map_err(|error| {
+                    error.into_credential_app_error(
+                        "database_recovery_verification",
+                        "Committed deployment password TCP verification transport failed",
+                    )
+                })?;
             if verified.exit_code != 0 || verified.stdout.trim() != "1" {
-                return Err(backend("Committed password TCP verification failed"));
+                return Err(database_diagnostic(
+                    ERR_DATABASE_COMMAND_FAILED,
+                    "database_recovery_verification",
+                    "Committed password TCP verification failed",
+                ));
             }
             DatabasePasswordStage::Verified
         }

@@ -45,9 +45,9 @@ impl shared_types::AppRuntimeIpResolver for DockerRuntimeIpResolver {
 }
 
 pub struct ProxyInitResult {
-    pub proxy_handle: Option<tokio::task::JoinHandle<()>>,
+    pub proxy_handle: Option<tokio::task::JoinHandle<Result<(), rcoder_proxy::ProxyError>>>,
     pub pingora_service: Option<Arc<rcoder_proxy::PingoraProxyService>>,
-    pub pingora_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    pub pingora_shutdown_tx: Option<tokio::sync::oneshot::Sender<tokio::time::Instant>>,
 }
 
 pub async fn init_proxy(
@@ -106,24 +106,43 @@ pub async fn init_proxy(
     let pingora_service = server_manager.service();
     info!("[Pingora] API Key config already loaded (no updates)");
 
-    if proxy_config.health_check.enabled {
+    let (health_stop, health_stopped) = tokio::sync::watch::channel(false);
+    let health_handle = if proxy_config.health_check.enabled {
         let hc = &proxy_config.health_check;
         info!(
             "[Pingora] Starting health check loop: interval={}s, timeout={}s",
             hc.interval_seconds, hc.timeout_seconds
         );
-        pingora_service.start_health_check_loop(hc.interval_seconds, hc.timeout_seconds * 1000);
+        let handle = pingora_service.start_health_check_loop(
+            hc.interval_seconds,
+            hc.timeout_seconds * 1000,
+            health_stopped,
+        );
         info!("[Pingora] health check already started");
-    }
+        Some(handle)
+    } else {
+        None
+    };
 
     info!("[Pingora] starting Pingora server...");
     let (pingora_shutdown_tx, pingora_shutdown_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
         info!("[Pingora] calling server_manager.start()...");
-        if let Err(e) = server_manager.start(pingora_shutdown_rx).await {
-            error!("[Pingora] Pingora proxy start failed, error: {:?}", e);
+        let result = server_manager
+            .start_with_deadline(pingora_shutdown_rx)
+            .await;
+        health_stop.send_replace(true);
+        if let Some(handle) = health_handle {
+            handle.await.map_err(|error| {
+                rcoder_proxy::ProxyError::Backend(format!(
+                    "Pingora health check task failed: {error}"
+                ))
+            })?;
         }
-        info!("[Pingora] server exited");
+        if let Err(error) = &result {
+            error!(%error, "Pingora proxy failed");
+        }
+        result
     });
 
     info!("[Pingora] already started");

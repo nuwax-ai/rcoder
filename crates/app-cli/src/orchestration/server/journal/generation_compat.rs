@@ -189,8 +189,6 @@ impl Journal {
                 && active.artifact_release_id == release.release_id,
             "legacy active artifact does not match the execution directory"
         );
-        crate::migration_journal::require_confirmed_migrations(workspace)
-            .context("verify SQL outcomes before deployment generation normalization")?;
 
         let path = self.root.join(OPERATION_RECORD);
         let original = std::fs::read(&path).context("read original legacy deployment receipt")?;
@@ -656,15 +654,22 @@ format = "jsonl"
     #[test]
     fn compatibility_evidence_survives_a_failed_attempt_and_new_coordinator() {
         let mut fixture = Fixture::new(true);
-        let pending = serde_json::json!({
-            "identity":fixture.migration_identity, "completed":false
-        });
+        let release_path = fixture.workspace.join("release.lock.toml");
+        let original_release = std::fs::read_to_string(&release_path).unwrap();
+        let migration_before = std::fs::read(&fixture.migration_path).unwrap();
         std::fs::write(
-            &fixture.migration_path,
-            serde_json::to_vec(&pending).unwrap(),
+            &release_path,
+            original_release.replace("manifest-b", "another-release"),
         )
         .unwrap();
-        assert!(fixture.normalize().is_err());
+        assert!(
+            fixture
+                .normalize()
+                .unwrap_err()
+                .to_string()
+                .contains("does not match the execution directory")
+        );
+        assert!(fixture.backups().is_empty());
         fixture
             .journal
             .attach_worker_generation(uuid::Uuid::new_v4().to_string());
@@ -681,17 +686,19 @@ format = "jsonl"
             Some(fixture.native_generation.as_str())
         );
         assert_eq!(fixture.bytes(), fixture.original);
-        std::fs::write(
-            &fixture.migration_path,
-            serde_json::to_vec(&serde_json::json!({
-                "identity":fixture.migration_identity, "completed":true
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        assert_eq!(
+            std::fs::read(&fixture.migration_path).unwrap(),
+            migration_before
+        );
+        std::fs::write(&release_path, original_release).unwrap();
         assert!(
             fixture.normalize().unwrap(),
             "the bound original owner proof survives retry"
+        );
+        assert_eq!(fixture.backups().len(), 1);
+        assert_eq!(
+            std::fs::read(&fixture.migration_path).unwrap(),
+            migration_before
         );
         assert_eq!(
             fixture
@@ -727,17 +734,54 @@ format = "jsonl"
     }
 
     #[test]
-    fn pending_migration_rejects_normalization_without_writing_or_backing_up() {
+    fn advisory_pending_and_corrupt_migrations_allow_generation_normalization() {
+        for bytes in [
+            br#"{"identity":"legacy","completed":false}"#.as_slice(),
+            b"corrupt-receipt".as_slice(),
+        ] {
+            let mut fixture = Fixture::new(false);
+            std::fs::write(&fixture.migration_path, bytes).unwrap();
+            assert!(
+                fixture
+                    .normalize()
+                    .expect("application migrations are advisory")
+            );
+            assert_eq!(std::fs::read(&fixture.migration_path).unwrap(), bytes);
+            assert_eq!(fixture.backups().len(), 1);
+            let normalized = fixture.journal.resume("cold-op").unwrap().unwrap();
+            assert_eq!(normalized.generation, "cold-op");
+            assert_eq!(normalized.active.unwrap().artifact_release_id, "manifest-b");
+            assert_eq!(normalized.operation.operation_id, "hot-op");
+        }
+    }
+
+    #[test]
+    fn pending_migration_allows_normalization_and_preserves_diagnostic_bytes() {
         let mut fixture = Fixture::new(false);
         let pending = serde_json::to_vec(&serde_json::json!({
             "identity": fixture.migration_identity, "completed": false
         }))
         .unwrap();
         std::fs::write(&fixture.migration_path, &pending).unwrap();
-        assert!(format!("{:#}", fixture.normalize().unwrap_err()).contains("unconfirmed"));
-        assert_eq!(fixture.bytes(), fixture.original);
+        assert!(fixture.normalize().unwrap());
+        let normalized = fixture.journal.resume("cold-op").unwrap().unwrap();
+        assert_eq!(normalized.generation, "cold-op");
+        assert_eq!(normalized.operation.operation_id, "hot-op");
+        assert_eq!(normalized.active.unwrap().artifact_release_id, "manifest-b");
         assert_eq!(std::fs::read(&fixture.migration_path).unwrap(), pending);
-        assert!(fixture.backups().is_empty());
+        let backups = fixture.backups();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), fixture.original);
+        let value: serde_json::Value = serde_json::from_slice(&fixture.bytes()).unwrap();
+        assert_eq!(
+            value["unknown_receipt"],
+            serde_json::json!({"keep": [1, 2, 3]})
+        );
+        assert_eq!(value["operation"]["unknown_result"], "unchanged");
+        assert_eq!(
+            value["deploy_replays"]["foreign-op"]["unknown_history"],
+            true
+        );
     }
 
     #[test]

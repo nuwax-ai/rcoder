@@ -205,6 +205,7 @@ async fn attach_coordinator(
         .expect("application identity");
     let service = Arc::new(crate::service::AppService {
         operation_flight: Arc::default(),
+        file_credentials: OnceLock::new(),
         config: crate::config::AppManagerConfig {
             access_mode: crate::config::AppAccessMode::Kubernetes,
             ..Default::default()
@@ -299,16 +300,15 @@ async fn wake_timeout_when_never_ready() {
     reg.mark_stopped("appt");
 
     let outcome = reg.ensure_running("appt").await;
-    assert_eq!(outcome, WakeOutcome::Timeout);
+    assert!(matches!(outcome, WakeOutcome::Timeout(_)));
     // Timeout closes the attempt with evidence (confirmed start write +
     // observation deadline) instead of leaving an un-reconciled operation.
     // The stopped mark is retained, so a later traffic wake is a fresh,
     // legitimate retry — not a bypass of the stop semantics (single-flight
     // still serializes concurrent wakeups).
     assert!(reg.is_stopped("appt"));
-    assert_eq!(
-        reg.ensure_running("appt").await,
-        WakeOutcome::Timeout,
+    assert!(
+        matches!(reg.ensure_running("appt").await, WakeOutcome::Timeout(_)),
         "a retry after an observed-timeout wakes again and times out again"
     );
     assert_eq!(
@@ -620,7 +620,7 @@ async fn cached_running_state_requires_a_durable_application_identity() {
 
     let outcome = registry.ensure_running("unregisteredapp").await;
     assert!(
-        matches!(&outcome, WakeOutcome::Failed(message) if message.contains("Application identity not found")),
+        matches!(&outcome, WakeOutcome::Failed(message) if message.message.contains("Application identity not found")),
         "{outcome:?}"
     );
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
@@ -836,7 +836,7 @@ fn deletion_outcome_is_retained_for_a_late_wake_subscriber() {
     registry.forget_app("deletedlatesubscriber");
     let receiver = handle.tx.subscribe();
     assert!(
-        matches!(&*receiver.borrow(), Some(WakeOutcome::Failed(message)) if message == "Application was deleted")
+        matches!(&*receiver.borrow(), Some(WakeOutcome::Failed(message)) if message.message == "Application was deleted")
     );
     assert!(!registry.waking.contains_key("deletedlatesubscriber"));
 }
@@ -965,7 +965,7 @@ async fn traffic_wake_does_not_confirm_a_replacement_running_resource() {
     registry.mark_stopped("replacedwake");
     let outcome = registry.ensure_running("replacedwake").await;
     assert!(
-        matches!(outcome, WakeOutcome::Failed(ref message) if message.contains("replaced")),
+        matches!(outcome, WakeOutcome::Failed(ref message) if message.message.contains("replaced")),
         "{outcome:?}"
     );
     assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
@@ -1011,7 +1011,7 @@ async fn traffic_wake_retains_confirmation_gate_while_start_is_in_flight() {
         .await
         .expect("bounded observation")
         .expect("worker");
-    assert_eq!(result, WakeOutcome::Timeout);
+    assert!(matches!(result, WakeOutcome::Timeout(_)));
     assert!(registry.is_stopped("pendingready"));
     assert!(runtime.lease_held.load(Ordering::SeqCst));
     assert!(matches!(
@@ -1155,4 +1155,32 @@ fn late_deletion_completion_cannot_clear_recreated_activity() {
         Some(("new".into(), 2))
     );
     assert!(registry.drain_deleted().is_empty());
+}
+
+#[tokio::test]
+async fn typed_remote_probe_keeps_query_error_without_authorizing_wake() {
+    let runtime = Arc::new(MockRuntime::new(true));
+    runtime.fail_status.store(true, Ordering::SeqCst);
+    let registry = AppActivityRegistry::new(Duration::from_secs(5));
+    registry.set_runtime(runtime.clone());
+    let failure = registry
+        .remote_wake_pending_result("querycase")
+        .await
+        .expect_err("failed query");
+    assert_eq!(failure.code.as_ref(), shared_types::ERR_RUNTIME_UNAVAILABLE);
+    assert_eq!(failure.stage.as_ref(), "wake_runtime_probe");
+    assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
+    runtime.fail_status.store(false, Ordering::SeqCst);
+    *runtime.phase.lock().unwrap() = "Running".into();
+    assert!(
+        !registry
+            .remote_wake_pending_result("querycase")
+            .await
+            .expect("repaired query")
+    );
+    assert_eq!(
+        runtime.status_calls.load(Ordering::SeqCst),
+        2,
+        "failed query must not become negative cache"
+    );
 }

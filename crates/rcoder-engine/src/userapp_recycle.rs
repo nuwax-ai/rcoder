@@ -21,6 +21,10 @@ use tracing::{debug, info, warn};
 
 use crate::app_state::AppState;
 
+#[cfg(all(test, feature = "userapp-turso"))]
+#[path = "userapp_recycle/expired_wake_scan_tests.rs"]
+mod expired_wake_scan_tests;
+
 /// 扫描器运行期配置(秒 → Duration,由 background_tasks 从 AppConfig 装配)
 pub(crate) struct UserAppRecycleRuntimeConfig {
     /// 闲置阈值(秒;per-app 注解可覆盖)
@@ -304,7 +308,7 @@ fn recycle_access_baseline(
 
 /// This is not a generic operation TTL. Only traffic-wake's durable acknowledged
 /// write boundary permits closing its read-only observation after its budget.
-async fn recover_expired_wake_observation(
+pub(crate) async fn recover_expired_wake_observation(
     store: &dyn UserAppLifecycleStore,
     service: &dyn app_manager::AppServiceTrait,
     app: &shared_types::UserAppLifecycleRecord,
@@ -400,7 +404,7 @@ async fn recover_expired_wake_observation(
             },
         )
         .await?;
-    info!(app_id = %app.app_id, operation_id = %id, "Expired wake observation reconciled before idle recycling");
+    info!(app_id = %app.app_id, operation_id = %id, "Expired acknowledged wake observation reconciled");
     Ok(true)
 }
 

@@ -33,10 +33,17 @@ node crates/file-server-proxy/tests/e2e/f4-volume-reuse.test.js \
 USERAPP_E2E_BUILD_SOURCE=/tmp/quality-build-source.json \
 node crates/file-server-proxy/tests/e2e/f6-app11-fixture.test.js \
   /实际Linux路径/app-cli /实际Linux路径/file-server-proxy dev-rcoder-agent-runner:latest
+
+USERAPP_E2E_BUILD_SOURCE=/tmp/quality-build-source.json \
+node crates/file-server-proxy/tests/e2e/source-credential-recovery.test.js \
+  /实际Linux路径/app-cli /实际Linux路径/file-server-proxy dev-rcoder-agent-runner:latest
 ```
 
 - native-link：临时状态根，真实 npm→Rust→HTTP；仅确认捕获 owner 退出后删状态根。清理失败保留根并失败。
 - F4：真正编译和 HTTP→强制回收本测试容器→原卷新容器重新编译／HTTP→Stop→Start。只验证本地运行链，不宣称 RCoder 闲置扫描器或 K8s 控制面通过。
 - F6：合法、脱敏的 app11形态 Discovery/Generation；owner启动前导入，经只读平台绑定文件恢复、真实编译／HTTP、Stop/Start；旧未知运行结果不改成成功。它不是线上完整目录原件，也不能替代旧二进制升级对照。
+- Source 凭据恢复 v2：内部 operations/部署记录保留真实 PG，核对 0600 和原操作身份；HTTP、操作/任务 SSE 与鉴权拒绝响应不输出密码。同卷替换 owner 实际没有继承 PG 用户/密码，业务仍用持久输入完成真实 TCP 查询并自动恢复；另导入旧脱敏输入，验证有效当前环境可恢复、历史空串不被补成猜测密码。新错误显式输入仍失败且无 SQL 写入；新版本、Stop/Start、pkill 恢复保留身份、数据和已确认 SQL 去重。私有 PG 仅在首次初始化设置随机凭据，不轮换已有账号，报告不保存密码。
+
+`node --test crates/file-server-proxy/tests/e2e/source-credential-recovery.contract.test.js` 只验证探针、权限/身份判定和公开边界检查本身，不启动 Docker，不能作为上述真实恢复验收。
 
 容器脚本拒绝远端 Docker endpoint，不自动部署集群；仅清理带本测试唯一标签、捕获 ID 的计算容器，保留卷。报告位于 `tests-e2e/reports/`，可用 `USERAPP_E2E_REPORT` 指定路径。缺前置、任务失败、HTTP错误、源码漂移及清理未知均失败。

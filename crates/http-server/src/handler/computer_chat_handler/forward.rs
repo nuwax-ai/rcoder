@@ -59,10 +59,13 @@ pub(super) async fn forward_computer_request_to_container(
     ) {
         Ok(addr) => addr,
         Err(error) => {
-            return HttpResult::error(
-                shared_types::error_codes::ERR_CONTAINER_ERROR,
-                &error.to_string(),
-            );
+            let code = shared_types::ERR_CONTAINER_ADDRESS_NOT_READY;
+            return AppError::with_message(code, error.to_string())
+                .with_error_detail(
+                    shared_types::ErrorDetail::new(code, "chat.grpc_address", error.to_string())
+                        .with_retryable(true),
+                )
+                .into_http_result(params.locale);
         }
     };
 

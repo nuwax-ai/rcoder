@@ -19,6 +19,42 @@ fn registry_default_is_empty() {
     assert_eq!(reg.len(), 0);
 }
 
+#[tokio::test]
+async fn sse_shutdown_drain_waits_for_task_exit_after_registration_removed() {
+    let reg = registry();
+    let guard = reg.admit_stream("addr", "original-session").unwrap();
+    assert_eq!(reg.shutdown_streams_by_addr("addr"), 1);
+    assert!(reg.is_empty(), "discovery map was removed");
+    let result = reg
+        .drain(tokio::time::Instant::now() + std::time::Duration::from_millis(20))
+        .await;
+    assert!(
+        result.is_err(),
+        "cancelled registration does not prove task exit"
+    );
+    assert!(guard.token().is_cancelled());
+    assert!(
+        reg.admit_stream("addr", "late-session").is_none(),
+        "shutdown must close admission"
+    );
+    drop(guard);
+    reg.drain(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+}
+
+#[test]
+fn sse_shutdown_close_cancels_all_existing_streams_and_late_registration() {
+    let reg = registry();
+    let (before, after) = token_pair();
+    reg.register_stream("addr", "old", &before);
+    reg.close();
+    reg.register_stream("addr", "late", &after);
+    assert!(before.is_cancelled());
+    assert!(after.is_cancelled());
+    assert!(reg.admit_stream("addr", "new").is_none());
+}
+
 /// 首连资格：首次 claim true（from_seq=0 兜时间差），后续 false（live-only
 /// 不重放——防重复红线），turn 终态归还后新一轮首连重新 true。
 #[tokio::test]
@@ -117,7 +153,15 @@ async fn shutdown_streams_by_addr_returns_zero_for_unknown_addr() {
 /// 终态错误事件 payload 必须是合法 JSON（前端解析依赖）
 #[tokio::test]
 async fn terminal_error_event_payload_is_valid_json() {
-    let ev = make_terminal_error_event(None, "en").await;
+    let ev = make_terminal_error_event(
+        None,
+        "en",
+        Code::Unavailable,
+        "original connect failure",
+        "grpc_connect",
+        None,
+    )
+    .await;
     assert_eq!(ev.message_type, "SessionPromptEnd");
     assert_eq!(ev.sub_type, "error");
     assert!(serde_json::from_str::<serde_json::Value>(&ev.payload).is_ok());
@@ -128,6 +172,19 @@ fn stream_error_payload_is_valid_json() {
     let ev = make_stream_error_event(Code::Unavailable, "boom");
     assert_eq!(ev.sub_type, "error");
     assert!(serde_json::from_str::<serde_json::Value>(&ev.payload).is_ok());
+}
+
+#[test]
+fn sse_error_retains_original_transport_cause() {
+    let event = make_stream_error_event(Code::Unavailable, "subscription_original_failure");
+    let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+    assert!(
+        payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("subscription_original_failure")
+    );
+    assert_eq!(payload["error_detail"]["retryable"], false);
 }
 
 /// cursor-reset 哨兵：非终态（不关流），seq=0（不污染游标）

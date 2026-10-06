@@ -53,6 +53,8 @@ jobs:
 
   build:
     needs: meta
+    env:
+      RUSTUP_TOOLCHAIN: stable
     strategy:
       fail-fast: false
       matrix:
@@ -68,13 +70,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 读 rust-toolchain.toml（1.96.0）安装工具链，并加 matrix 目标。
-      # 用 runner 自带 rustup，不依赖第三方 action 的输入语义。
-      - name: Install Rust toolchain + target
+      # 显式更新 stable，并记录本轮工具链；不依赖 runner 的默认版本。
+      - name: Update and record Rust stable + target
         shell: bash
         run: |
-          rustup show
+          rustup update stable
           rustup target add ${{ matrix.target }}
+          rustc --version
+          cargo --version
 
       # protoc/nasm 与 release-file-server.yml 同款保留：default embed 直连形态的
       # 依赖树包含 file-server 全树（prost/reqwest rustls aws-lc-rs），构建需求一致。

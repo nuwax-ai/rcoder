@@ -36,7 +36,7 @@ pub use crate::app_state::AppState;
 
 /// 内部 API 路由（供 rcoder-gateway 调用）
 ///
-/// 这些端点挂载在中间件之后、鉴权层之前 merge，绕过 API Key 鉴权。
+/// 默认可信内网；显式开启服务 key 时与业务、文件接口共用鉴权。
 fn create_internal_routes(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/internal/pod/ensure", post(handler::internal_pod_ensure))
@@ -85,8 +85,7 @@ fn app_manager_routes(state: &Arc<AppState>) -> Router {
 /// warn 可见、缺路由面可诊断）。
 ///
 /// TS 移植版老路径：/api/project、/api/computer、/api/git、/api/build、/api/page；
-/// 排除 /api/v1/userapp——由 rcoder 转发层接管。与 TS 行为一致不设 API key
-/// （merge 在 api-key layer 之后，同 internal 先例）；computer 域拦截层：
+/// 排除 /api/v1/userapp——由 rcoder 转发层接管。显式服务 key 与主接口同源；computer 域拦截层：
 /// header X-Service-Type=userapp 的请求短路转发到该 app 开发容器
 /// （反向代理转来的 TS 老路径，body 零解析）。
 fn file_server_routes_with_intercept(
@@ -144,27 +143,34 @@ pub fn create_router(
     // 🆕 克隆共享的 API Key 配置用于中间件
     let api_key_config = Arc::clone(&state.api_key_config);
 
-    // 全局中间件 → internal / file-server 两面在鉴权层之后 merge（不受
-    // API Key 约束的既有语义）→ 安全响应头覆盖全部面。
-    // 最外层 hotpath::axum! 剖析层（feature 关闭时原样返回 router）：按路由模板
-    // 统计延迟/4xx/5xx，覆盖含中间件的完整请求栈；须在所有 route/merge 之后包裹。
-    hotpath::axum!(layers::apply_security_headers(
-        layers::apply_global_middleware(router, api_key_config)
-            // 内部 API（供 rcoder-gateway 调用，绕过 API Key 鉴权）
-            .merge(create_internal_routes(state.clone()))
-            // 预览协调器跨 Pod 内部执行端点（自带令牌鉴权；未装配时空 Router）
-            .merge(
-                merged_fs
-                    .coordinator
-                    .clone()
-                    .map_or_else(Router::new, |c| { preview_coordinator::internal_router(c) })
-            )
-            .merge(file_server_routes_with_intercept(&state, merged_fs)),
+    hotpath::axum!(apply_route_security(
+        router,
+        create_internal_routes(state.clone()),
+        merged_fs
+            .coordinator
+            .clone()
+            .map_or_else(Router::new, preview_coordinator::internal_router),
+        file_server_routes_with_intercept(&state, merged_fs),
+        api_key_config,
     ))
     .layer(axum::middleware::from_fn_with_state(
         state.userapp_op_flight.clone(),
         admission_during_shutdown,
     ))
+}
+
+/// Compose the real protected surfaces; preview keeps its own peer token.
+fn apply_route_security(
+    router: Router,
+    internal: Router,
+    preview: Router,
+    files: Router,
+    api_key_config: Arc<arc_swap::ArcSwap<shared_types::ApiKeyAuthConfig>>,
+) -> Router {
+    layers::apply_security_headers(
+        layers::apply_global_middleware(router.merge(internal).merge(files), api_key_config)
+            .merge(preview),
+    )
 }
 
 async fn admission_during_shutdown(
@@ -207,6 +213,79 @@ mod assembly_guard {
             assert!(
                 src.contains(family),
                 "create_router 装配缺路由面: {family}（对照拆分前 router.rs merge 链）"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod optional_key_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn optional_service_key_covers_internal_and_file_surfaces() {
+        for enabled in [false, true] {
+            let config = Arc::new(arc_swap::ArcSwap::from_pointee(
+                shared_types::ApiKeyAuthConfig {
+                    enabled,
+                    api_key: "configured-service-key".into(),
+                },
+            ));
+            let app = apply_route_security(
+                Router::new().route("/chat", post(|| async { "accepted" })),
+                Router::new().route("/internal/pod/ensure", post(|| async { "accepted" })),
+                // Preview is tested through its own token layer elsewhere.
+                Router::new().route("/preview-peer", get(|| async { "peer route" })),
+                Router::new().route("/api/computer/fs/roots", get(|| async { "accepted" })),
+                config,
+            );
+            for (path, method) in [
+                ("/chat", "POST"),
+                ("/internal/pod/ensure", "POST"),
+                ("/api/computer/fs/roots", "GET"),
+            ] {
+                for key in [None, Some("incorrect"), Some("configured-service-key")] {
+                    let mut builder = Request::builder().uri(path).method(method);
+                    if let Some(key) = key {
+                        builder = builder.header("x-api-key", key);
+                    }
+                    let response = app
+                        .clone()
+                        .oneshot(builder.body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    let expected = if enabled && key != Some("configured-service-key") {
+                        StatusCode::UNAUTHORIZED
+                    } else {
+                        StatusCode::OK
+                    };
+                    assert_eq!(
+                        response.status(),
+                        expected,
+                        "{path} enabled={enabled} configured_key={}",
+                        key == Some("configured-service-key")
+                    );
+                }
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/preview-peer")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "service key must not replace peer token contract"
             );
         }
     }

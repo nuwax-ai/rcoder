@@ -54,14 +54,32 @@ pub type StreamEndCallback = Arc<dyn Fn(&StreamEndReason) + Send + Sync>;
 pub struct DevEventHooks {
     pub on_line: OnLineCallback,
     pub on_end: Option<StreamEndCallback>,
+    /// Absolute parent startup deadline, shared by owner discovery and its original operation.
+    pub launch_deadline: Option<tokio::time::Instant>,
+    /// Called only after the original owner operation was verified as admitted,
+    /// or a local child and its launch identity were atomically registered.
+    /// The callback releases submission barriers; it must not perform new work.
+    pub on_submitted: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl DevEventHooks {
+    /// Existing launch policy: configured command budget plus 30s Pingap and
+    /// 120s scheduling margin, with a 1200s upper bound.
+    pub fn launch_budget(command_budget_secs: u64) -> Duration {
+        Duration::from_secs(command_budget_secs.saturating_add(150).min(1200))
+    }
     /// 最小钩子（行回调 no-op、无结束回调）——与旧 `None` 行为等价。
     pub fn noop() -> Self {
         Self {
             on_line: Arc::new(|_json: &str| {}),
             on_end: None,
+            launch_deadline: None,
+            on_submitted: None,
+        }
+    }
+    pub(super) fn submitted(&self) {
+        if let Some(callback) = &self.on_submitted {
+            callback();
         }
     }
 }

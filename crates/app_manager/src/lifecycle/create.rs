@@ -154,6 +154,7 @@ impl AppService {
         match mutation {
             Ok(()) => operation.succeed().await?,
             Err(error) => {
+                let error = operation.correlate_error(error);
                 if _process_lock.has_unfinished_mutation() {
                     operation.fail(&error).await?;
                 } else {
@@ -251,7 +252,7 @@ impl AppService {
                         Some(note) => format!("Create application runtime (safe failure; {note})"),
                         None => "Create application runtime".to_string(),
                     };
-                    return Err(map_runtime_error(&ctx, error));
+                    return Err(map_runtime_mutation_error("container_create", &ctx, error));
                 }
             },
         };

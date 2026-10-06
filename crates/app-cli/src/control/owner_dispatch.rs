@@ -5,8 +5,8 @@
 //! 提交 Start/Restart(Source) 并等待终态（“重复启动是正常操作”）。身份不符、
 //! 协议不兼容、凭据缺失 → 明确拒绝（不杀对方、不换端口、不删锁文件）。
 //!
-//! 无人持锁 → 调用方走本地 legacy 编排（行为不变，且进程持锁期间第三个
-//! CLI 同样被分派/拒绝——owner 唯一性由锁保证，不是靠端口探测猜测）。
+//! 普通 run 无 owner 时由 run_client 拉起 serve --control-only，再提交
+//! 明确 Source 或 Artifact 操作。serve 自身承载 owner；内核锁保证唯一性。
 
 use anyhow::{Context, Result, bail};
 use shared_types::{
@@ -173,7 +173,7 @@ fn envelope_data(body: &serde_json::Value) -> Result<serde_json::Value> {
 pub enum OwnerDispatch {
     /// 提交已被 owner 受理并到达终态（Succeeded = 启动生效）。
     Terminal(RuntimeOperationView),
-    /// 无人持锁/无 owner 应答——调用方走本地 legacy 编排。
+    /// 已确认锁释放或错误位置的 owner 收束——调用方重新获取管理 owner。
     NoOwner,
 }
 
@@ -184,6 +184,71 @@ pub enum ManagementReuse {
     Ready,
     /// An authorized misdirected owner was retired; bootstrap must reacquire.
     NoOwner,
+}
+
+pub(crate) struct EnvironmentDeployment {
+    pub request: crate::server::DeployRequest,
+    pub operation_id: String,
+    pub generation: String,
+}
+
+/// Preserve the existing environment artifact contract, independently of
+/// Source manifests and their rebuildable cache. Every observation belongs to
+/// this original operation and captured owner; a newer deployment is unrelated.
+pub(crate) async fn dispatch_environment_deployment(
+    args: &crate::RuntimeArgs,
+    state_root: &std::path::Path,
+    application_id: &str,
+    deployment: &EnvironmentDeployment,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    tokio::time::timeout_at(deadline, async {
+        let (address, identity) = discover_owner(&args.admin_addr, state_root, std::time::Duration::from_secs(10)).await.context("discover artifact deployment owner")?;
+        anyhow::ensure!(identity.protocol_version == RUNTIME_CONTROL_PROTOCOL_VERSION && identity.application_id == application_id && identity.service_family == "userapp-dev", "artifact owner application or protocol changed before submission");
+        anyhow::ensure!(identity.capabilities.iter().any(|cap| cap == "deploy-artifact-url"), "runtime owner cannot deploy artifact URLs");
+        let expected_root = runtime_state_layout::resolve_project_origin(&args.workspace)?;
+        let owner_root = runtime_state_layout::resolve_project_origin(std::path::Path::new(&identity.source_root))?;
+        anyhow::ensure!(runtime_state_layout::canonical_project_root(&expected_root) == runtime_state_layout::canonical_project_root(&owner_root), "artifact owner workspace changed before submission");
+        verify_saved_management_identity(state_root, &identity)?;
+        let native = runtime_supervisor::control(state_root, runtime_supervisor::Request::new(runtime_supervisor::Action::Status)).await?;
+        anyhow::ensure!(native.binding.component == "app-cli" && runtime_state_layout::canonical_project_root(&native.binding.resource) == runtime_state_layout::canonical_project_root(&expected_root), "native artifact authority belongs to another workspace");
+        let token = crate::runtime_kernel::RuntimeStore::read_token(state_root).context("artifact owner credentials are unavailable")?;
+        let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(std::time::Duration::from_secs(10)).no_proxy().build()?;
+        wait_until_initialized(&client, &address, std::time::Duration::from_secs(10)).await?;
+        let observed = probe_identity(&address).await.context("artifact owner disappeared before submission")?;
+        anyhow::ensure!(same_management_identity(&identity, &observed), "artifact owner changed before submission; no operation was submitted");
+        let pg = shared_types::resolve_source_run_pg(None).context("capture current explicit artifact credentials")?;
+        let id = &deployment.operation_id;
+        println!("observing artifact deployment operation {id}");
+        let response = client.post(format!("http://{address}/v1/deploy")).header("X-Deploy-Token", &token)
+            .json(&serde_json::json!({"operation_id":id, "expected_runtime_instance_id":identity.runtime_instance_id, "deployment_generation_id":deployment.generation, "url":deployment.request.url, "release_id":deployment.request.release_id, "sha256":deployment.request.sha256, "pg":pg}))
+            .send().await.with_context(|| format!("submit artifact operation {id}; query this ID before retrying an unconfirmed submission"))?;
+        let status = response.status();
+        let accepted: serde_json::Value = response.json().await.context("decode artifact acceptance")?;
+        anyhow::ensure!(status.is_success() && accepted["success"] == true, "artifact operation {id} rejected: {} ({})", accepted["message"].as_str().unwrap_or("no detail"), accepted["code"].as_str().unwrap_or("ERR"));
+        let poll = format!("/v1/deploy/status?operation_id={id}");
+        anyhow::ensure!(accepted["data"]["operation_id"] == id.as_str() && accepted["data"]["poll"] == poll, "artifact acceptance refers to another operation");
+        loop {
+            runtime_supervisor::control_verified(state_root, runtime_supervisor::Request::new(runtime_supervisor::Action::Status), &native.supervisor_id).await.context("artifact owner changed while observing original operation")?;
+            let observed = probe_identity(&address).await.context("artifact management identity disappeared while observing original operation")?;
+            anyhow::ensure!(same_management_identity(&identity, &observed), "artifact operation {id} owner changed; its original result must be queried, not replayed on a new owner");
+            let response = client.get(format!("http://{address}{poll}")).header("X-Deploy-Token", &token).send().await?;
+            let status = response.status();
+            let body: serde_json::Value = response.json().await?;
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE && body["code"] == "ERR_INITIALIZING" {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+            anyhow::ensure!(status.is_success() && body["success"] == true, "artifact operation {id} observation failed ({})", body["code"].as_str().unwrap_or("ERR"));
+            let operation: shared_types::AppDeploymentOperation = serde_json::from_value(body["data"]["operation"].clone()).context("decode original artifact operation")?;
+            anyhow::ensure!(operation.operation_id == *id && operation.request_release_id == deployment.request.release_id && operation.deployment_generation_id == deployment.generation, "artifact owner returned a different operation or deployment generation");
+            match operation.phase {
+                shared_types::AppCliDeployPhase::Running if operation.persisted => { println!("artifact operation {id} completed on the running owner"); return Ok(()); }
+                shared_types::AppCliDeployPhase::Failed => bail!("artifact operation {id} failed: {}", operation.error.as_deref().unwrap_or("no detail")),
+                _ => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+            }
+        }
+    }).await.with_context(|| format!("artifact operation {} deadline exceeded; query its original result before retrying", deployment.operation_id))?
 }
 
 /// Reuse only management. In particular, this path never reads release.lock or
@@ -397,9 +462,7 @@ async fn dispatch_to_owner_inner(
         );
     }
     let expected_ws = identity.workspace_id.clone();
-    let release = crate::manifest::read_release_lock(workspace)
-        .context("read source startup contract before owner dispatch")?;
-    workspace_manifest::require_startup_probe_capability(&release, &identity.capabilities)?;
+    crate::build_deploy::source_lock::require_owner_capability(workspace, &identity.capabilities)?;
 
     // 凭据：owner 启用写端点时落盘状态根（与平台侧同一读取契约）
     let token = crate::runtime_kernel::RuntimeStore::read_token(state_root);
@@ -476,6 +539,7 @@ async fn dispatch_to_owner_inner(
         }
     }
     let operation_id = format!("cli-dispatch-{}", uuid::Uuid::new_v4().simple());
+    println!("observing Source operation {operation_id}");
     let request = RuntimeOperationRequest {
         operation_id: operation_id.clone(),
         expected_runtime_instance_id: identity.runtime_instance_id.clone(),
@@ -497,7 +561,7 @@ async fn dispatch_to_owner_inner(
         .json(&request)
         .send()
         .await
-        .context("submit dispatch operation")?;
+        .with_context(|| format!("submit Source operation {operation_id}; query this ID before retrying an unconfirmed submission"))?;
     let status_code = response.status();
     let body: serde_json::Value = response.json().await.context("parse submit response")?;
     if !status_code.is_success() {
@@ -541,7 +605,7 @@ async fn dispatch_to_owner_inner(
         };
         let view = tokio::time::timeout_at(deadline, poll)
             .await
-            .context("dispatched operation observation deadline exceeded")??;
+            .with_context(|| format!("Source operation {operation_id} observation deadline exceeded; query its original result before retrying"))??;
         anyhow::ensure!(
             view.operation_id == operation_id
                 && view.runtime_instance_id == identity.runtime_instance_id
@@ -578,7 +642,8 @@ pub fn describe_terminal(view: &RuntimeOperationView) -> Result<()> {
             Ok(())
         }
         other => bail!(
-            "dispatched start failed: {other:?} ({})",
+            "dispatched start operation {} failed: {other:?} ({})",
+            view.operation_id,
             view.error_message.as_deref().unwrap_or("no detail"),
         ),
     }
@@ -867,7 +932,15 @@ mod tests {
         // mock owner：身份匹配 + token 落盘 + 受理→Succeeded
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().join("ws-d");
-        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(ws.join("backend-go")).unwrap();
+        std::fs::write(
+            ws.join("workspace.manifest.toml"),
+            "schema_version=1\n[workspace]\nname='demo'\n",
+        )
+        .unwrap();
+        let current_project = "schema_version=1\n[project]\nservice_id='backend-go'\nname='Go Backend'\ntype='go'\n[build]\ncommand=['true']\nartifact='server.zip'\n[run]\ncommand=['./server']\nshutdown_timeout_seconds=3\n[health]\nstartup_path='/health'\nreadiness_path='/ready'\nliveness_path='/health'\n[proxy]\npath='/api/go/'\nstrip_prefix=true\n";
+        let project_path = ws.join("backend-go/project.manifest.toml");
+        std::fs::write(&project_path, current_project).unwrap();
         std::fs::write(
             ws.join("release.lock.toml"),
             include_str!("../../../workspace-manifest/tests/fixtures/lock_v1.toml"),
@@ -1090,6 +1163,36 @@ mod tests {
                 .contains("different app-cli owner")
         );
         assert_eq!(submitted.lock().unwrap().len(), 3);
+
+        // Capability follows current Source input, not the old derived lock.
+        // Keep this older owner's empty capability list: an unsupported new
+        // strategy must fail before admission, and corrected input may retry.
+        let cached = std::fs::read(ws.join("release.lock.toml")).unwrap();
+        std::fs::write(
+            &project_path,
+            current_project.replace("[health]", "[health]\nstartup_probe='http'"),
+        )
+        .unwrap();
+        let error = dispatch_to_owner(&addr, &ws, &state_root, &application_id)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(workspace_manifest::STARTUP_PROBE_CAPABILITY),
+            "got: {error:#}"
+        );
+        assert_eq!(submitted.lock().unwrap().len(), 3);
+        assert_eq!(std::fs::read(ws.join("release.lock.toml")).unwrap(), cached);
+        std::fs::write(&project_path, current_project).unwrap();
+        assert!(matches!(
+            dispatch_to_owner(&addr, &ws, &state_root, &application_id)
+                .await
+                .unwrap(),
+            OwnerDispatch::Terminal(_)
+        ));
+        assert_eq!(submitted.lock().unwrap().len(), 4);
+        assert_eq!(std::fs::read(ws.join("release.lock.toml")).unwrap(), cached);
         task.abort();
     }
 }

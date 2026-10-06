@@ -21,7 +21,8 @@ pub(crate) enum DeployAdmission {
 }
 
 pub(super) fn fingerprint(request: &DeployRequest) -> Result<String, AdmissionError> {
-    // Do not serialize DeployRequest here: its serializer deliberately redacts PG.
+    // Hash the stable execution input explicitly; process-local fields and
+    // future unrelated receipt metadata must not change replay identity.
     let input = serde_json::to_vec(&(
         &request.url,
         &request.release_id,

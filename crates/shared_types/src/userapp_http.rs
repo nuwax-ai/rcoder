@@ -53,7 +53,7 @@ pub async fn envelope_errors(request: Request, next: Next) -> Response {
     let code = parsed
         .as_ref()
         .and_then(|v| v["code"].as_str())
-        .filter(|c| c.starts_with("ERR_"))
+        .filter(|c| !c.trim().is_empty())
         .unwrap_or(fallback);
     let message = parsed
         .as_ref()
@@ -64,7 +64,24 @@ pub async fn envelope_errors(request: Request, next: Next) -> Response {
         .filter(|m| !m.trim().is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| crate::error_codes::get_error_message(code, "en-US"));
-    let mut envelope = crate::HttpResult::<()>::error(code, &message);
+    let mut envelope = crate::HttpResult::<serde_json::Value>::error(code, &message);
+    // Failure data contains real diagnostic tasks and recovery receipts. It is
+    // not success data and must survive the transport normalization boundary.
+    envelope.data = parsed.as_ref().and_then(|value| value.get("data")).cloned();
+    if let Some(tid) = parsed
+        .as_ref()
+        .and_then(|value| value["tid"].as_str())
+        .filter(|tid| !tid.is_empty())
+    {
+        envelope.tid = Some(tid.to_owned());
+    }
+    if let Some(detail) = parsed
+        .as_ref()
+        .and_then(|value| value.get("error_detail"))
+        .and_then(|value| serde_json::from_value::<crate::ErrorDetail>(value.clone()).ok())
+    {
+        envelope = envelope.with_error_detail(detail);
+    }
     if let Some(operation_id) = parsed
         .as_ref()
         .and_then(|value| value["operation_id"].as_str())
@@ -96,6 +113,92 @@ pub async fn envelope_errors(request: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn error_contract_formal_envelope_retains_original_failure_payload() {
+        use tower::ServiceExt as _;
+        let input = serde_json::json!({
+            "code": "ERR_OPERATION_OUTCOME_UNKNOWN",
+            "message": "Database command completion was not confirmed",
+            "data": {"task_id": "task-original", "recovery": {"phase": "write"}},
+            "tid": "trace-original",
+            "operation_id": "operation-original",
+            "success": false,
+            "error_detail": {
+                "reason_code": "database_write_unknown",
+                "stage": "create_database",
+                "detail": "Connection closed before the result arrived",
+                "hint": "Inspect the original operation before retrying.",
+                "retryable": false
+            }
+        });
+        let payload = input.clone();
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/userapp/example/start",
+                axum::routing::post(move || async move {
+                    (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(payload))
+                }),
+            )
+            .layer(axum::middleware::from_fn(envelope_errors));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/userapp/example/start")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+        let output: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for key in ["data", "tid", "operation_id", "error_detail"] {
+            assert_eq!(output[key], input[key], "lost failure field: {key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn formal_operation_in_progress_retains_typed_data_in_http_200_envelope() {
+        use tower::ServiceExt as _;
+        let holder = crate::OperationInProgressData {
+            holder_operation_id: Some("actual-durable-holder".into()),
+            holder_kind: Some("start".into()),
+            holder_traffic_wake: true,
+            holder_state: Some("running".into()),
+            holder_step: Some("traffic_wake_observing".into()),
+            retryable: true,
+            retry_after_seconds: 20,
+        };
+        let expected = serde_json::to_value(&holder).unwrap();
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/userapp/example/restart",
+                axum::routing::post(move || async move {
+                    crate::AppError::from_code(crate::ERR_OPERATION_IN_PROGRESS)
+                        .with_operation_in_progress_data(holder)
+                }),
+            )
+            .layer(axum::middleware::from_fn(envelope_errors));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/userapp/example/restart")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+        let output: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(output["code"], crate::ERR_OPERATION_IN_PROGRESS);
+        assert_eq!(output["data"], expected);
+        assert!(output.get("operation_id").is_none());
+        assert_eq!(output["success"], false);
+    }
 
     #[tokio::test]
     async fn formal_backend_error_keeps_utf8_cause_and_operation() {

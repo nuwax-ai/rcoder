@@ -26,7 +26,22 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 type Job =
     Box<dyn FnOnce(toasty::Db) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send>;
-type Completion = Option<Result<(), String>>;
+type Completion = Option<Result<(), CompletionFailure>>;
+
+#[derive(Clone)]
+enum CompletionFailure {
+    OutcomeUnknown(shared_types::OperationOutcomeUnknown),
+    Failed(String),
+}
+
+impl CompletionFailure {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::OutcomeUnknown(error) => error.into(),
+            Self::Failed(message) => anyhow::Error::msg(message),
+        }
+    }
+}
 
 /// Backoff between failed reopen probes while the database stays unreachable.
 const REOPEN_PROBE_BACKOFF: Duration = Duration::from_secs(1);
@@ -133,14 +148,12 @@ impl Shared {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct OutcomeUnknown;
-impl std::fmt::Display for OutcomeUnknown {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("database execution outcome is unknown; query the original operation identity")
-    }
+fn outcome_unknown() -> shared_types::OperationOutcomeUnknown {
+    shared_types::OperationOutcomeUnknown::new(
+        "storage.execute",
+        "database execution outcome is unknown; query the original operation identity",
+    )
 }
-impl std::error::Error for OutcomeUnknown {}
 
 impl DatabaseOwner {
     /// A terminal execution boundary for queue/drain failure tests; it cannot
@@ -246,12 +259,20 @@ impl DatabaseOwner {
             .name("rcoder-db-join".into())
             .spawn(move || {
                 let outcome = match worker.join() {
-                    Ok(result) => {
-                        result.map_err(|error| format!("database owner failed: {error:#}"))
-                    }
-                    Err(_) => {
-                        Err("database owner panicked; execution outcome may be unknown".into())
-                    }
+                    Ok(result) => result.map_err(|error| match error
+                        .downcast_ref::<shared_types::OperationOutcomeUnknown>(
+                    ) {
+                        Some(unknown) => CompletionFailure::OutcomeUnknown(unknown.clone()),
+                        None => {
+                            CompletionFailure::Failed(format!("database owner failed: {error:#}"))
+                        }
+                    }),
+                    Err(_) => Err(CompletionFailure::OutcomeUnknown(
+                        shared_types::OperationOutcomeUnknown::new(
+                            "storage.shutdown",
+                            "database owner panicked; execution outcome may be unknown",
+                        ),
+                    )),
                 };
                 finished.send_replace(Some(outcome));
             })?;
@@ -298,7 +319,7 @@ impl DatabaseOwner {
                     // never reopened by a probe).
                     shared.mark_recovering_if_open();
                 }
-                drop(reply.send(outcome.unwrap_or_else(|_| Err(OutcomeUnknown.into()))));
+                drop(reply.send(outcome.unwrap_or_else(|_| Err(outcome_unknown().into()))));
                 anyhow::ensure!(
                     !panicked,
                     "database transaction task panicked; outcome requires verification"
@@ -319,7 +340,7 @@ impl DatabaseOwner {
         }
         result
             .await
-            .map_err(|_| anyhow::Error::new(OutcomeUnknown))?
+            .map_err(|_| anyhow::Error::new(outcome_unknown()))?
     }
 
     pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
@@ -333,7 +354,7 @@ impl DatabaseOwner {
 async fn wait_for_completion(mut completion: watch::Receiver<Completion>) -> anyhow::Result<()> {
     loop {
         if let Some(result) = completion.borrow_and_update().clone() {
-            return result.map_err(anyhow::Error::msg);
+            return result.map_err(CompletionFailure::into_error);
         }
         completion
             .changed()
@@ -437,7 +458,11 @@ async fn supervise(
     }
     drop(db);
     if let Some(failure) = pending_failure {
-        anyhow::bail!("database execution failed and did not recover: {failure}");
+        return Err(shared_types::OperationOutcomeUnknown::new(
+            "storage.shutdown",
+            format!("database execution failed and did not recover: {failure}"),
+        )
+        .into());
     }
     Ok(())
 }

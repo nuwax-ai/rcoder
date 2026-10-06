@@ -51,8 +51,33 @@ pub use storage::*;
 /// 直接转换——错误码在 service 抛出点确定（Fail Fast），无需 downcast / 字符串匹配。
 impl From<crate::error::AppOperationError> for shared_types::AppError {
     fn from(e: crate::error::AppOperationError) -> Self {
-        let error = shared_types::AppError::with_message(e.code(), e.message().to_string());
-        match e {
+        let in_progress_data = e.operation_in_progress_data();
+        let message = e.message().to_string();
+        let e_code = e.code().to_owned();
+        let error = shared_types::AppError::with_message(&e_code, message.clone());
+        let mapped = match e {
+            crate::error::AppOperationError::CredentialApplication {
+                diagnostic: Some(mut detail),
+                ..
+            } => {
+                detail.code = e_code.into();
+                detail.retryable = false;
+                detail.into_app_error()
+            }
+            crate::error::AppOperationError::CredentialApplication { mutation, .. } => error
+                .with_error_detail(
+                    shared_types::ErrorDetail::new(
+                        if mutation == shared_types::CredentialMutationEvidence::NotAttempted {
+                            shared_types::ERR_DATABASE_COMMAND_FAILED
+                        } else {
+                            shared_types::ERR_OPERATION_OUTCOME_UNKNOWN
+                        },
+                        "database_credentials",
+                        message,
+                    )
+                    .with_retryable(false),
+                ),
+            crate::error::AppOperationError::Diagnostic(detail) => detail.into_app_error(),
             crate::error::AppOperationError::Operation {
                 operation_id,
                 source,
@@ -60,17 +85,89 @@ impl From<crate::error::AppOperationError> for shared_types::AppError {
             crate::error::AppOperationError::ConflictBlocked { blocker, .. } => {
                 error.with_blocker(blocker)
             }
+            crate::error::AppOperationError::OperationInProgress { blocker, data, .. } => {
+                let error = error.with_operation_in_progress_data(*data);
+                match blocker {
+                    Some(blocker) => error.with_blocker(*blocker),
+                    None => error,
+                }
+            }
             crate::error::AppOperationError::NotFound(_)
+            | crate::error::AppOperationError::OperationNotFound(_)
             | crate::error::AppOperationError::AlreadyExists(_)
             | crate::error::AppOperationError::InvalidState(_)
             | crate::error::AppOperationError::FileNotFound(_)
             | crate::error::AppOperationError::Validation(_)
             | crate::error::AppOperationError::DevNotRunning(_)
             | crate::error::AppOperationError::Backend(_)
-            | crate::error::AppOperationError::CredentialApplication { .. }
             | crate::error::AppOperationError::RuntimeRejected(_)
             | crate::error::AppOperationError::Conflict(_)
             | crate::error::AppOperationError::HotDeployEnvChange(_) => error,
+        };
+        match in_progress_data {
+            Some(data) => mapped.with_operation_in_progress_data(data),
+            None => mapped,
         }
+    }
+}
+
+#[cfg(test)]
+mod credential_carrier_boundary_tests {
+    #[test]
+    fn credential_http_error_keeps_child_diagnostic_under_captured_parent_identity() {
+        let blocker = shared_types::UserAppOperationBlocker {
+            scope: shared_types::UserAppOperationScope::Prod,
+            operation_id: "downstream-blocking-stop".into(),
+            kind: shared_types::UserAppOperationKind::Stop,
+            state: shared_types::UserAppOperationState::Running,
+            step: "stop".into(),
+        };
+        let source = crate::AppOperationError::CredentialApplication {
+            message: "Credential write completion remains unconfirmed".into(),
+            mutation: shared_types::CredentialMutationEvidence::Unknown,
+            diagnostic: Some(Box::new(shared_types::WakeFailure {
+                cause_code: shared_types::ERR_RUNTIME_TIMEOUT.into(),
+                command_diagnostic: Some(Box::new(shared_types::PgCommandDiagnostic {
+                    code: shared_types::ERR_RUNTIME_TIMEOUT.into(),
+                    operation_id: Some("original-downstream-db-operation".into()),
+                    blocker: Some(blocker.clone()),
+                    error_detail: Some(
+                        shared_types::ErrorDetail::new(
+                            shared_types::ERR_RUNTIME_TIMEOUT,
+                            "original_db_response",
+                            "Original database response timed out",
+                        )
+                        .with_task_id("real-downstream-db-task")
+                        .with_service_id("postgres")
+                        .with_retryable(true),
+                    ),
+                })),
+                ..shared_types::WakeFailure::new(
+                    shared_types::ERR_RUNTIME_TIMEOUT,
+                    "credential_write",
+                    "Credential write completion remains unconfirmed",
+                )
+            })),
+        }
+        .with_operation_id("captured-parent-reset-password".into());
+        assert!(source.requires_recovery());
+        let response = shared_types::AppError::from(source).into_http_result::<()>("en-US");
+        assert_eq!(response.code, shared_types::ERR_RECOVERY_REQUIRED);
+        assert_eq!(
+            response.operation_id.as_deref(),
+            Some("captured-parent-reset-password")
+        );
+        assert_eq!(response.blocker, Some(blocker));
+        let detail = response
+            .error_detail
+            .expect("original downstream diagnostic");
+        assert_eq!(detail.task_id.as_deref(), Some("real-downstream-db-task"));
+        assert_eq!(detail.service_id.as_deref(), Some("postgres"));
+        assert_eq!(detail.reason_code, shared_types::ERR_RUNTIME_TIMEOUT);
+        assert_eq!(detail.stage, "original_db_response");
+        assert!(
+            !detail.retryable,
+            "downstream observation cannot release the parent's unknown-write protection"
+        );
     }
 }

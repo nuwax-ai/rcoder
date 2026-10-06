@@ -8,7 +8,7 @@ use tokio::time::{Instant, sleep, timeout_at};
 
 use crate::models::{AppOperationError, AppResult};
 use crate::service::{AppService, OwnedOperation};
-use crate::utils::{map_runtime_error, validate_app_id};
+use crate::utils::{map_runtime_mutation_error, validate_app_id};
 
 impl AppService {
     /// 流量唤醒（rcoder-proxy 被动流量与 pod/ensure 共用同一语义）。拍板
@@ -47,7 +47,13 @@ impl AppService {
         };
         let (guard, identity, previous) = match timeout_at(deadline, preflight).await {
             Ok(result) => result?,
-            Err(_) => return Ok(WakeOutcome::Timeout),
+            Err(_) => {
+                return Ok(WakeOutcome::Timeout(shared_types::WakeFailure::timeout(
+                    "wake_preflight",
+                    None,
+                    true,
+                )));
+            }
         };
         // Even an already-running workload must be bound to the current lifecycle.
         // The operation records that observation and prevents a stale cache from
@@ -57,6 +63,7 @@ impl AppService {
             "trigger":"traffic", "lifecycle_id":identity.lifecycle_id,
         }))
         .map_err(|error| AppOperationError::Backend(format!("Encode wake intent: {error}")))?;
+        let operation_id = uuid::Uuid::new_v4().to_string();
         let admission = OwnedOperation::admit(
             self.metadata.store.clone(),
             UserAppAdmission {
@@ -65,18 +72,26 @@ impl AppService {
                 app_id: app_id.into(),
                 lifecycle_id: Some(identity.lifecycle_id.clone()),
                 request_id: None,
-                operation_id: uuid::Uuid::new_v4().to_string(),
+                operation_id: operation_id.clone(),
                 kind: UserAppOperationKind::Start,
                 request_fingerprint: hex::encode(sha2::Sha256::digest(intent)),
                 metadata: None,
             },
         );
         let mut operation = match timeout_at(deadline, admission).await {
-            Ok(result) => result?,
+            Ok(result) => result.map_err(|error| error.with_operation_id(operation_id.clone()))?,
             // A cancelled SQL commit may have succeeded. Do not retry admission;
             // persisted Pending/Running records are reconciled by recovery.
-            Err(_) => return Ok(WakeOutcome::Timeout),
+            Err(_) => {
+                return Ok(WakeOutcome::Timeout(
+                    shared_types::WakeFailure::unknown_timeout(
+                        "wake_admission_outcome_unknown",
+                        operation_id,
+                    ),
+                ));
+            }
         };
+        let operation_id = operation.execution_context().operation_id;
         let activation = async {
             operation.bind_lease(&guard).await?;
             let context = operation.execution_context();
@@ -99,7 +114,11 @@ impl AppService {
                     .start_app_target(&target)
                     .await
                     .map_err(|error| {
-                        map_runtime_error("Start captured traffic wake target", error)
+                        map_runtime_mutation_error(
+                            "container_start",
+                            "Start captured traffic wake target",
+                            error,
+                        )
                     })?;
                 // Both runtimes have returned from their complete write chain.
                 // Persist that boundary before entering read-only observation.
@@ -128,35 +147,71 @@ impl AppService {
         match result {
             Ok(outcome) => {
                 self.refresh_pingora_after_restart(app_id).await;
-                operation.succeed().await?;
+                operation
+                    .succeed()
+                    .await
+                    .map_err(|error| error.with_operation_id(operation_id.clone()))?;
                 guard.mark_completed();
                 if !self.activity.try_mark_woken(app_id) {
-                    guard.finish().await?;
+                    guard
+                        .finish()
+                        .await
+                        .map_err(|error| error.with_operation_id(operation_id.clone()))?;
                     return Err(AppOperationError::InvalidState(
                         "Application was stopped during traffic wake completion".into(),
                     ));
                 }
-                guard.finish().await?;
+                guard
+                    .finish()
+                    .await
+                    .map_err(|error| error.with_operation_id(operation_id.clone()))?;
                 Ok(outcome)
             }
             Err(error) => {
-                if operation.has_confirmed_wake_write() {
+                let confirmed = operation.has_confirmed_wake_write();
+                if confirmed {
                     // No write future survives this boundary: the entire runtime
                     // start returned before the durable observation checkpoint.
                     // Failure/timeout of later reads does not create an unknown write.
-                    operation.fail_confirmed_wake_observation(&error).await?;
+                    operation
+                        .fail_confirmed_wake_observation(&error)
+                        .await
+                        .map_err(|error| error.with_operation_id(operation_id.clone()))?;
                     guard.mark_completed();
-                    guard.finish().await?;
+                    guard
+                        .finish()
+                        .await
+                        .map_err(|error| error.with_operation_id(operation_id.clone()))?;
                 } else if guard.has_unfinished_mutation() {
-                    operation.fail(&error).await?;
+                    operation
+                        .fail(&error)
+                        .await
+                        .map_err(|error| error.with_operation_id(operation_id.clone()))?;
                 } else {
-                    operation.reject_without_mutation(&error).await?;
-                    guard.finish().await?;
+                    operation
+                        .reject_without_mutation(&error)
+                        .await
+                        .map_err(|error| error.with_operation_id(operation_id.clone()))?;
+                    guard
+                        .finish()
+                        .await
+                        .map_err(|error| error.with_operation_id(operation_id.clone()))?;
                 }
                 if timed_out {
-                    Ok(WakeOutcome::Timeout)
+                    Ok(WakeOutcome::Timeout(if confirmed {
+                        shared_types::WakeFailure::timeout(
+                            "wake_observation",
+                            Some(operation_id),
+                            true,
+                        )
+                    } else {
+                        shared_types::WakeFailure::unknown_timeout(
+                            "wake_write_outcome_unknown",
+                            operation_id,
+                        )
+                    }))
                 } else {
-                    Err(error)
+                    Err(error.with_operation_id(operation_id))
                 }
             }
         }

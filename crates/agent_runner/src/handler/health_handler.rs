@@ -89,6 +89,8 @@ pub async fn ready_check() -> (
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(HttpResult {
+                operation_in_progress_data: None,
+                error_detail: None,
                 operation_id: None,
                 blocker: None,
                 code: "SERVICE_NOT_READY".to_string(),
@@ -163,6 +165,8 @@ pub fn build_health_response(
         HttpResult::success(health_response)
     } else {
         HttpResult {
+            operation_in_progress_data: None,
+            error_detail: None,
             operation_id: None,
             blocker: None,
             code: "SERVICE_NOT_READY".to_string(),

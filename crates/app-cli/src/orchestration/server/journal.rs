@@ -21,7 +21,7 @@ pub(crate) enum Boundary {
     Active,
     /// The previous artifact is serving again; the failed attempt stays failed.
     RestoredActive,
-    /// Artifact and shutdown confirmed; migrations confirmed, only startup failed.
+    /// Artifact and shutdown confirmed; only business startup failed.
     StartupFailed,
     Failed,
 }
@@ -43,8 +43,9 @@ pub(crate) struct Receipt {
     pub active: Option<ActiveVersion>,
 }
 
-/// Flattening keeps old receipts readable and preserves the on-disk request
-/// redaction. History is committed with the current receipt, never separately.
+/// Flattening keeps old receipts readable, including historical redaction.
+/// New internal receipts retain actual credentials for recovery and audit.
+/// History is committed with the current receipt, never separately.
 #[derive(Serialize, Deserialize)]
 struct StoredReceipt {
     #[serde(flatten)]
@@ -119,6 +120,13 @@ fn write_record_verified<T: Serialize + serde::de::DeserializeOwned>(
     value: &T,
 ) -> Result<T> {
     let mut temp = tempfile::NamedTempFile::new_in(root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .context("protect deployment record before writing credentials")?;
+    }
     temp.write_all(&serde_json::to_vec(value)?)?;
     temp.as_file().sync_all()?;
     temp.persist(root.join(name))
@@ -608,8 +616,8 @@ impl Journal {
             .context("preserved active journal missing")
     }
 
-    /// Caller proved process quiescence, current artifact identity and no
-    /// unconfirmed migrations. This records startup interruption, not rollback.
+    /// Caller proved process quiescence and current artifact identity.
+    /// This records startup interruption, not rollback.
     pub(crate) fn confirm_interrupted_activation(&mut self, expected: &Receipt) -> Result<Receipt> {
         let current = self
             .receipt
@@ -1270,6 +1278,58 @@ mod tests {
             }),
         }
     }
+
+    #[test]
+    fn deployment_receipt_keeps_actual_pg_across_atomic_write_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("state");
+        let mut original = receipt(Boundary::Active);
+        let credential = shared_types::StartPgCredential {
+            username: "business".into(),
+            password: "deployment-private-credential".into(),
+        };
+        original.request.run_pg = Some(credential.clone());
+        original
+            .active
+            .as_mut()
+            .unwrap()
+            .request
+            .as_mut()
+            .unwrap()
+            .run_pg = Some(credential.clone());
+        let mut journal = Journal::open_root(root.clone()).unwrap();
+        journal.write(original).unwrap();
+        let bytes = std::fs::read(root.join(".deploy-operation.json")).unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for pointer in [
+            "/request/run_pg/password",
+            "/active/request/run_pg/password",
+        ] {
+            assert_eq!(
+                stored.pointer(pointer).unwrap(),
+                "deployment-private-credential"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(root.join(".deploy-operation.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        drop(journal);
+        let reopened = Journal::open_root(root).unwrap();
+        let active = reopened.receipt.as_ref().unwrap().active.as_ref().unwrap();
+        assert_eq!(
+            active.request.as_ref().unwrap().run_pg.as_ref(),
+            Some(&credential)
+        );
+    }
     #[test]
     fn retired_configuration_fields_do_not_change_deployment_identity_or_boundary() {
         let mut legacy = serde_json::to_value(receipt(Boundary::RestoredActive)).unwrap();
@@ -1537,7 +1597,7 @@ mod tests {
         let mut journal = Journal::open_with_root(&workspace, dir.path().into()).unwrap();
         assert!(!journal.automatic_recovery_allowed().unwrap());
         // A damaged marker is diagnostic bookkeeping too: explicit replacement
-        // repairs it without discarding the raw bytes or the migration fence.
+        // repairs it without discarding the raw bytes or migration diagnostics.
         std::fs::write(dir.path().join(RECOVERY_REQUIRED_RECORD), b"invalid-marker").unwrap();
         assert!(!journal.automatic_recovery_allowed().unwrap());
         journal.write(receipt(Boundary::Preparing)).unwrap();
@@ -1549,7 +1609,7 @@ mod tests {
         journal.write(receipt(Boundary::Active)).unwrap();
         assert!(journal.automatic_recovery_allowed().unwrap());
         assert_eq!(std::fs::read(&pending_migration).unwrap(), pending_bytes);
-        assert!(crate::migration_journal::require_confirmed_migrations(&workspace).is_err());
+        assert!(!crate::migration_journal::inspect_migrations(&workspace).unwrap());
         drop(journal);
         assert!(
             Journal::open_with_root(&workspace, dir.path().into())

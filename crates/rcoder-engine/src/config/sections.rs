@@ -196,7 +196,7 @@ impl Default for CleanupConfigSettings {
 /// `CreateAppRequest.recycle_enabled=false`（注解 `rcoder.io/recycle-enabled=false`）opt-out 永不回收。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserAppRecycleConfig {
-    /// 是否启用自动回收 + 流量唤醒（默认 true；部署侧可 env/helm 关闭）
+    /// 是否启用定时闲置回收（默认 true；不关闭显式启动或流量唤醒）
     #[serde(default = "default_userapp_recycle_enabled")]
     pub enabled: bool,
     /// 闲置超时阈值（秒），默认 3600（1 小时）

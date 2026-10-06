@@ -13,6 +13,17 @@ pub(crate) struct OwnedOperation {
 }
 
 impl OwnedOperation {
+    /// This parent identity is durable; downstream observations cannot replace it.
+    pub(crate) fn correlate_error(&self, error: AppOperationError) -> AppOperationError {
+        if error.operation_id() == Some(self.record.operation_id.as_str()) {
+            return error;
+        }
+        AppOperationError::Operation {
+            operation_id: self.record.operation_id.clone(),
+            source: Box::new(error),
+        }
+    }
+
     /// Claim an existing unexecuted command; never mint a replacement operation.
     /// The caller already holds the application resource operation guard.
     pub(crate) async fn claim_pending(
@@ -76,15 +87,41 @@ impl OwnedOperation {
         input: Option<&shared_types::UserAppExecutionInput>,
         pg: Option<&shared_types::StartPgCredential>,
     ) -> AppResult<Self> {
+        super::restart_wait::begin_admission()?;
         let outcome = if let Some(input) = input {
-            store.admit_with_configuration(&request, input, pg).await?
+            store.admit_with_configuration(&request, input, pg).await
         } else {
             if pg.is_some() {
                 return Err(AppOperationError::Validation(
                     "Deployment credentials require private input".into(),
                 ));
             }
-            store.admit_with_input(&request, None).await?
+            store.admit_with_input(&request, None).await
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(shared_types::UserAppStoreError::OperationInProgress(blocker)) => {
+                // This transaction definitively rejected admission. An HTTP
+                // disconnect that raced ADMITTING must now cancel the waiter.
+                super::restart_wait::rejected_before_admission();
+                return Err(super::restart_wait::prepare(
+                    super::operation_progress::enrich_store_blocker(
+                        store.as_ref(),
+                        &request.app_id,
+                        &blocker,
+                    ),
+                )
+                .await?
+                .into_error());
+            }
+            Err(error) => {
+                let error = AppOperationError::from(error);
+                return Err(if error.requires_recovery() {
+                    error.with_operation_id(request.operation_id.clone())
+                } else {
+                    error
+                });
+            }
         };
         let record = match outcome {
             UserAppAdmissionOutcome::Accepted(record) => record,
@@ -352,7 +389,8 @@ impl OwnedOperation {
                 error_code: error.map(|e| e.code().into()),
                 error_message: error.map(ToString::to_string),
             })
-            .await?;
+            .await
+            .map_err(|error| self.correlate_error(error.into()))?;
         Ok(())
     }
 }
@@ -387,15 +425,29 @@ impl super::AppService {
         }
         match operation.state {
             UserAppOperationState::Succeeded => Ok(Some(operation)),
-            UserAppOperationState::Failed => Err(AppOperationError::Backend(format!(
-                "Application operation {} failed: {}",
-                operation.operation_id,
-                operation
-                    .error_message
-                    .as_deref()
-                    .unwrap_or("No failure details recorded")
-            ))
-            .with_operation_id(operation.operation_id.clone())),
+            UserAppOperationState::Failed => {
+                // A terminal replay reports the stored outcome, not a newly
+                // executed backend failure. Older/unknown nonempty codes remain
+                // intact; the record has no full original diagnostic to invent.
+                let mut failure = shared_types::WakeFailure::new(
+                    operation
+                        .error_code
+                        .clone()
+                        .filter(|code| !code.is_empty())
+                        .unwrap_or_else(|| shared_types::ERR_BACKEND_ERROR.into()),
+                    operation.step.clone(),
+                    shared_types::sanitize_error_text(&format!(
+                        "Application operation {} failed: {}",
+                        operation.operation_id,
+                        operation
+                            .error_message
+                            .as_deref()
+                            .unwrap_or("No failure details recorded")
+                    )),
+                );
+                failure.operation_id = Some(operation.operation_id);
+                Err(AppOperationError::Diagnostic(failure))
+            }
             _ => Err(AppOperationError::Conflict(format!(
                 "Application operation {} is not complete ({:?})",
                 operation.operation_id, operation.state
@@ -444,7 +496,9 @@ impl super::AppService {
             .get_operation(app_id, id)
             .await?
             .ok_or_else(|| {
-                AppOperationError::NotFound(format!("Application operation not found: {id}"))
+                AppOperationError::OperationNotFound(format!(
+                    "Application operation not found: {id}"
+                ))
             })?;
         if operation.lifecycle_id != app.lifecycle_id {
             return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
@@ -659,6 +713,7 @@ mod tests {
             .await
             .unwrap();
             let error = AppOperationError::CredentialApplication {
+                diagnostic: None,
                 message: "Credential result requires recovery".into(),
                 mutation,
             }

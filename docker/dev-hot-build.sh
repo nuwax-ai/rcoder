@@ -80,7 +80,7 @@ if [[ "$FEATURES_ARG" =~ $DIAL9_FEATURE_PATTERN ]]; then
 else
     export CARGO_TARGET_DIR="$SRC_DIR/target"
 fi
-echo "🔨 cargo ${CARGO_ARGS[*]}（target: $CARGO_TARGET_DIR）..."
+echo "🔨 cargo ${CARGO_ARGS[*]}（target: ${CARGO_TARGET_DIR}）..."
 cargo "${CARGO_ARGS[@]}"
 BIN_SRC="$CARGO_TARGET_DIR/release/rcoder"
 # target directories are compilation caches only; start-rcoder.sh always uses

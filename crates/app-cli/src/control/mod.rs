@@ -3,4 +3,5 @@ pub mod config;
 pub(crate) mod managed_owner;
 pub mod owner_dispatch;
 pub mod readiness_query;
+pub mod run_client;
 pub mod supervision;

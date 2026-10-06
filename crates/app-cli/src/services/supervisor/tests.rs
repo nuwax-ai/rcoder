@@ -6,7 +6,7 @@ mod cases {
     use workspace_manifest::{DevrunSection, RunSection};
 
     /// 最小 ServiceSpec（LockedService）：只填启动命令相关字段。
-    fn spec_with(devrun: Option<Vec<&str>>) -> ServiceSpec {
+    pub(super) fn spec_with(devrun: Option<Vec<&str>>) -> ServiceSpec {
         ServiceSpec {
             service_id: "frontend".into(),
             name: "Frontend".into(),
@@ -628,4 +628,385 @@ mod real_pg_readiness_fixture {
             "migration released before delayed database existed"
         );
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn migration_timeout_is_advisory_after_confirmed_tree_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("source");
+    let directory = workspace.join("frontend");
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut spec = cases::spec_with(None);
+    spec.run.migrate = vec!["sh".into(), "-c".into(), "printf 'timeout-stdout\\n'; printf 'timeout-stderr\\n' >&2; echo $$ > migration.pid; exec sleep 30".into()];
+    let release = workspace_manifest::ReleaseLock {
+        schema_version: 1,
+        release_id: "migration-timeout-fixture".into(),
+        workspace_name: "migration-timeout-fixture".into(),
+        pingap: workspace_manifest::LockedPingap {
+            mode: workspace_manifest::PingapMode::Managed,
+            config: None,
+            version: "0.14.3".into(),
+            commit: "fixture".into(),
+        },
+        minimum_app_cli_version: "0.1.3".into(),
+        runtime_image_digest: "native-test-fixture".into(),
+        services: vec![spec.clone()],
+        bridge_service: None,
+    };
+    let result = run_migration_with_receipt_and_timeout(
+        &spec,
+        &release,
+        &workspace,
+        &root.path().join("logs"),
+        None,
+        None,
+        Duration::from_millis(100),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "a timed-out application migration must return an advisory after its tree is stopped: {result:?}"
+    );
+    let report = result.unwrap();
+    assert!(matches!(
+        report.outcome,
+        MigrationOutcome::Advisory(MigrationFailure {
+            kind: MigrationFailureKind::Timeout,
+            ..
+        })
+    ));
+    assert!(
+        report.stdout.contains("timeout-stdout"),
+        "{}",
+        report.stdout
+    );
+    assert!(
+        report.stderr.contains("timeout-stderr"),
+        "{}",
+        report.stderr
+    );
+    let out = std::fs::read_to_string(root.path().join("logs/frontend/runtime.out.log")).unwrap();
+    let err = std::fs::read_to_string(root.path().join("logs/frontend/runtime.err.log")).unwrap();
+    assert!(out.contains("timeout-stdout"), "{out}");
+    assert!(
+        err.contains("timeout-stderr") && err.contains("ERROR") && err.contains("timed out"),
+        "{err}"
+    );
+    let pid: u32 = std::fs::read_to_string(directory.join("migration.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        !process_utils::process_group_exists(pid).unwrap(),
+        "the original migration process group must be confirmed stopped"
+    );
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    spec.port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    std::fs::write(
+        directory.join("ready.txt"),
+        "service-after-migration-timeout",
+    )
+    .unwrap();
+    let argv = vec![
+        "python3".into(),
+        "-m".into(),
+        "http.server".into(),
+        spec.port.to_string(),
+        "--bind".into(),
+        "127.0.0.1".into(),
+    ];
+    let mut child = start_service(
+        &spec,
+        &argv,
+        &workspace,
+        &root.path().join("logs"),
+        &release.release_id,
+        None,
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(response) = client
+                .get(format!("http://127.0.0.1:{}/ready.txt", spec.port))
+                .send()
+                .await
+                && let Ok(body) = response.text().await
+                && body == "service-after-migration-timeout"
+            {
+                break body;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert_ne!(child.stop(Duration::ZERO).await, StopOutcome::Unconfirmed);
+    assert_eq!(response.unwrap(), "service-after-migration-timeout");
+}
+
+#[cfg(unix)]
+fn migration_test_release(spec: &ServiceSpec) -> workspace_manifest::ReleaseLock {
+    workspace_manifest::ReleaseLock {
+        schema_version: 1,
+        release_id: "migration-fixture".into(),
+        workspace_name: "migration-fixture".into(),
+        pingap: workspace_manifest::LockedPingap {
+            mode: workspace_manifest::PingapMode::Managed,
+            config: None,
+            version: "0.14.3".into(),
+            commit: "fixture".into(),
+        },
+        minimum_app_cli_version: "0.1.3".into(),
+        runtime_image_digest: "native-test-fixture".into(),
+        services: vec![spec.clone()],
+        bridge_service: None,
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn migration_failure_streams_full_output_and_redacts_runtime_secrets() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("source");
+    std::fs::create_dir_all(workspace.join("frontend")).unwrap();
+    let mut spec = cases::spec_with(None);
+    spec.run.migrate = vec!["sh".into(), "-c".into(), "printf 'live-migration-output %s\\n' \"$POSTGRES_PASSWORD\"; printf '%12000s stdout-tail\\n' x; printf 'stderr-output %s\\n' \"$DATABASE_URL\" >&2; while [ ! -f release-now ]; do sleep 0.02; done; exit 1".into()];
+    spec.env.insert(
+        "DATABASE_URL".into(),
+        "postgresql://stale:stale@localhost/db".into(),
+    );
+    let release = migration_test_release(&spec);
+    let password = "test-migration-secret@:/%\nsecond-secret-line";
+    let pg = shared_types::StartPgCredential {
+        username: "fixture-user".into(),
+        password: password.into(),
+    };
+    let logs = root.path().join("logs");
+    let execution = {
+        let workspace = workspace.clone();
+        let logs = logs.clone();
+        tokio::spawn(async move {
+            run_migration_with_receipt_and_timeout(
+                &spec,
+                &release,
+                &workspace,
+                &logs,
+                Some(&pg),
+                None,
+                Duration::from_secs(5),
+            )
+            .await
+        })
+    };
+    let streamed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(content) =
+                tokio::fs::read_to_string(logs.join("frontend/runtime.out.log")).await
+                && content.contains("stdout-tail")
+            {
+                break content;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    tokio::fs::write(workspace.join("frontend/release-now"), "release")
+        .await
+        .unwrap();
+    let report = execution.await.unwrap().unwrap();
+    let live = streamed.expect("migration stdout must be visible before the script exits");
+    assert!(live.contains("live-migration-output") && live.contains("[REDACTED]"));
+    assert!(!live.contains(password));
+    assert!(!live.contains("test-migration-secret") && !live.contains("second-secret-line"));
+    assert!(matches!(
+        report.outcome,
+        MigrationOutcome::Advisory(MigrationFailure {
+            kind: MigrationFailureKind::Exit,
+            exit_code: Some(1),
+            ..
+        })
+    ));
+    assert!(report.stdout.len() > 12000 && report.stdout.contains("stdout-tail"));
+    assert!(report.stderr.contains("stderr-output") && !report.stderr.contains(password));
+    let err = std::fs::read_to_string(logs.join("frontend/runtime.err.log")).unwrap();
+    assert!(err.contains("stderr-output") && err.contains("ERROR") && !err.contains(password));
+    assert!(!err.contains("test-migration-secret") && !err.contains("second-secret-line"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn migration_cancel_retains_partial_output_and_confirms_tree_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("source");
+    let directory = workspace.join("frontend");
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut spec = cases::spec_with(None);
+    spec.run.migrate = vec!["sh".into(), "-c".into(), "printf 'partial-stdout'; printf 'partial-stderr' >&2; echo $$ > migration.pid; exec sleep 30".into()];
+    let release = migration_test_release(&spec);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let execution = {
+        let cancel = cancel.clone();
+        let workspace = workspace.clone();
+        let logs = root.path().join("logs");
+        tokio::spawn(async move {
+            run_migration_with_receipt_and_timeout(
+                &spec,
+                &release,
+                &workspace,
+                &logs,
+                None,
+                Some(&cancel),
+                Duration::from_secs(5),
+            )
+            .await
+        })
+    };
+    let pid = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(text) = tokio::fs::read_to_string(directory.join("migration.pid")).await
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    cancel.cancel();
+    let report = execution.await.unwrap().unwrap();
+    assert!(matches!(
+        report.outcome,
+        MigrationOutcome::Advisory(MigrationFailure {
+            kind: MigrationFailureKind::Cancelled,
+            ..
+        })
+    ));
+    assert_eq!(report.stdout, "partial-stdout");
+    assert_eq!(report.stderr, "partial-stderr");
+    assert!(!process_utils::process_group_exists(pid.unwrap()).unwrap());
+    assert!(
+        std::fs::read_to_string(root.path().join("logs/frontend/runtime.out.log"))
+            .unwrap()
+            .contains("partial-stdout")
+    );
+    assert!(
+        std::fs::read_to_string(root.path().join("logs/frontend/runtime.err.log"))
+            .unwrap()
+            .contains("partial-stderr")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn migration_spawn_failure_is_advisory_and_persisted() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("source");
+    std::fs::create_dir_all(workspace.join("frontend")).unwrap();
+    let mut spec = cases::spec_with(None);
+    spec.run.migrate = vec!["/definitely-missing/migration-executable".into()];
+    let release = migration_test_release(&spec);
+    let report = run_migration_with_receipt_and_timeout(
+        &spec,
+        &release,
+        &workspace,
+        &root.path().join("logs"),
+        None,
+        None,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        report.outcome,
+        MigrationOutcome::Advisory(MigrationFailure {
+            kind: MigrationFailureKind::Spawn,
+            ..
+        })
+    ));
+    let err = std::fs::read_to_string(root.path().join("logs/frontend/runtime.err.log")).unwrap();
+    assert!(
+        err.contains("ERROR") && err.contains("spawn migration"),
+        "{err}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn migration_lease_contention_skips_script_without_startup_error() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("source");
+    std::fs::create_dir_all(workspace.join("frontend")).unwrap();
+    let mut spec = cases::spec_with(None);
+    spec.run.migrate = vec!["sh".into(), "-c".into(), "touch migration-executed".into()];
+    let release = migration_test_release(&spec);
+    let lease = crate::migration_journal::MigrationJournal::begin(
+        &workspace,
+        crate::migration_journal::identity(&release, &spec.service_id).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    let report = run_migration_with_receipt_and_timeout(
+        &spec,
+        &release,
+        &workspace,
+        &root.path().join("logs"),
+        None,
+        None,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        report.outcome,
+        MigrationOutcome::Advisory(MigrationFailure {
+            kind: MigrationFailureKind::ExecutionLease,
+            ..
+        })
+    ));
+    assert!(
+        !workspace.join("frontend/migration-executed").exists(),
+        "a second migration must never execute without the lease"
+    );
+    drop(lease);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn migration_log_io_failure_preserves_full_capture_and_reports_the_cause() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("source");
+    std::fs::create_dir_all(workspace.join("frontend")).unwrap();
+    let mut spec = cases::spec_with(None);
+    spec.run.migrate = vec!["sh".into(), "-c".into(), "i=0; while [ \"$i\" -lt 2048 ]; do printf 'line-%s\\n' \"$i\"; i=$((i + 1)); done; printf 'last-stderr\\n' >&2; exit 1".into()];
+    let release = migration_test_release(&spec);
+    let log_dir = root.path().join("file-blocking-log-directory");
+    std::fs::write(&log_dir, "regular file").unwrap();
+    let report = run_migration_with_receipt_and_timeout(
+        &spec,
+        &release,
+        &workspace,
+        &log_dir,
+        None,
+        None,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.stdout.lines().count(), 2048);
+    assert!(report.stdout.starts_with("line-0\n") && report.stdout.ends_with("line-2047\n"));
+    assert_eq!(report.stderr, "last-stderr\n");
+    let MigrationOutcome::Advisory(failure) = report.outcome else {
+        panic!("log failure must be diagnostic");
+    };
+    assert_eq!(failure.kind, MigrationFailureKind::Exit);
+    assert!(
+        failure.detail.contains("open migration")
+            && failure.detail.contains("persist migration result"),
+        "{}",
+        failure.detail
+    );
 }

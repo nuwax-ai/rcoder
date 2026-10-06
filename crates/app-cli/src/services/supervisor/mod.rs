@@ -34,6 +34,7 @@ type ManagedChildren = Vec<(String, ManagedChild)>;
 /// failed 清单按条目映射进任务失败汇总，编排阶段错误不再依赖超时兜底）。
 pub(crate) const ORCHESTRATOR_FAILURE_SERVICE: &str = "orchestrator";
 
+mod migration;
 mod pg_wait;
 mod pingap;
 mod run;
@@ -46,6 +47,7 @@ mod tests;
 // workspace_needs_pg / ShutdownUnconfirmed 等）被 xmlrpc/supervisord_host/
 // startup_probe 经 `supervisor::X` 路径引用——glob 重导出按各条目自身可见性封顶，
 // pub(super) 项仍限 supervisor 子树。
+pub(crate) use migration::*;
 pub(crate) use pg_wait::*;
 use pingap::*;
 pub use run::*;

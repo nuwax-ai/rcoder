@@ -689,7 +689,7 @@ impl KubernetesRuntime {
             .get_opt(&target.resource.name)
             .await
             .map_err(|e| ContainerRuntimeError::K8sError(format!("Read stop receipt: {e}")))?;
-        if !before.as_ref().is_some_and(&matches) {
+        if !before.as_ref().is_some_and(matches) {
             return Ok(false);
         }
         self.confirm_captured_compute_stopped(target).await?;

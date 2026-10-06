@@ -49,8 +49,9 @@ proto 权威定义在 [`crates/shared_types_grpc/proto/agent.proto`](../../crate
 | `GetStatus` | Unary | 查询 Agent 状态 |
 | `StopAgent` | Unary | 停止 Agent |
 | `GetContainerStatus` / `GetVncStatus` | Unary | 容器 / VNC 状态 |
-| `ListAgents` / `GetAgent` / `CheckAgent` | Unary | Agent 清单与探测 |
-| `InstallAgent`（客户端流式）/ `UninstallAgent` | Streaming/Unary | Agent 安装/卸载 |
+
+
+Agent 安装管理属于同一 proto 中的 `AgentMgmtService`：`ListAgents`、`GetAgent`、`CheckAgent`、`UninstallAgent` 为 Unary，`InstallAgent` 为客户端流式调用。
 
 实现位置：
 
@@ -58,25 +59,22 @@ proto 权威定义在 [`crates/shared_types_grpc/proto/agent.proto`](../../crate
 - 客户端：`crates/rcoder-engine/src/grpc/`（`chat_client.rs`、`sse_stream.rs`、`channel_pool.rs`、`status_query.rs`、`retry.rs`）
 - 容器内服务地址：`{容器地址}:50051`（K8s 下为 `{pod}-svc.{ns}.svc.cluster.local:50051`）
 
-## 进度事件：Protobuf oneof
+## 进度事件：JSON 载荷透传
 
-`ProgressEvent` 使用 `oneof` 承载 8 种事件类型，编译期类型检查、二进制编码，避免"事件类型字符串 + JSON payload"的二次解析：
+`ProgressEvent` 使用扁平 Protobuf 字段传递事件分类、原始 ACP JSON 与会话游标。载荷仍需按 ACP/schema 契约解析；Protobuf 仅约束外层信封，不将 ACP 子类型收缩成固定事件集合。
 
 ```protobuf
 message ProgressEvent {
-  oneof event {
-    LogEvent log = 1;
-    ThinkingEvent thinking = 2;
-    ChunkEvent chunk = 3;
-    CompletionEvent completion = 4;
-    ErrorEvent error = 5;
-    AskConfirmationEvent ask_confirmation = 6;
-    ProgressNotificationEvent progress_notification = 7;
-    ToolUseEvent tool_use = 8;
-  }
+  string message_type = 1;
+  string sub_type = 2;
+  string payload = 3;
+  optional string request_id = 4;
+  uint64 seq = 5;
   int64 timestamp = 11;
 }
 ```
+
+`seq >= 1` 是真实消息游标；`seq == 0` 表示合成消息或旧版本，没有增量游标意义。`timestamp` 为 Unix 毫秒。
 
 事件在三层之间的转换路径：
 
@@ -102,8 +100,8 @@ gRPC 关键 span 的耗时直方图（`grpc_request_duration_seconds{method="cha
 
 ## 设计收益
 
-- **类型安全**：Protobuf 编译期检查，消除 JSON 解析错误
-- **性能**：二进制序列化替代 JSON，消息更小更快
+- **信封类型检查**：Protobuf 检查外层字段，ACP JSON 载荷按 schema 校验
+- **协议传输**：外层信封使用 Protobuf，ACP JSON 载荷保留原始字段
 - **连接复用**：全局连接池 + HTTP/2 多路复用
 - **实时性**：Server Streaming 替代轮询推送进度
 - **兼容**：对外 HTTP API 不变，gRPC 仅用于内部通信

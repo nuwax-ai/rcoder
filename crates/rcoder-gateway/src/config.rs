@@ -11,12 +11,14 @@ const DEFAULT_GATEWAY_PORT: u16 = 8090;
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 600;
 
 /// rcoder-gateway 配置
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GatewayConfig {
     /// 网关监听端口（默认 8090）
     pub gateway_port: u16,
     /// rcoder-control 服务地址（K8s Service FQDN 或 localhost）
     pub control_plane_url: String,
+    /// 可选内部服务凭据。未配置时不发送服务 key。
+    pub control_plane_api_key: Option<String>,
     /// Envoy Gateway 服务地址
     pub envoy_gateway_url: String,
     /// K8s namespace（用于构建 Service FQDN）
@@ -42,10 +44,15 @@ impl GatewayConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_CACHE_TTL_SECONDS);
+        let control_plane_api_key = std::env::var("RCODER_CONTROL_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("RCODER_API_KEY").ok())
+            .filter(|key| !key.trim().is_empty());
 
         Self {
             gateway_port,
             control_plane_url,
+            control_plane_api_key,
             envoy_gateway_url,
             namespace,
             cache_ttl_seconds,
@@ -69,6 +76,23 @@ impl GatewayConfig {
     }
 }
 
+impl std::fmt::Debug for GatewayConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewayConfig")
+            .field("gateway_port", &self.gateway_port)
+            .field("control_plane_url", &self.control_plane_url)
+            .field(
+                "control_plane_api_key",
+                &self.control_plane_api_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("envoy_gateway_url", &self.envoy_gateway_url)
+            .field("namespace", &self.namespace)
+            .field("cache_ttl_seconds", &self.cache_ttl_seconds)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,5 +111,17 @@ mod tests {
             GatewayConfig::parse_addr("http://localhost"),
             ("localhost", 80)
         );
+    }
+    #[test]
+    fn config_debug_never_prints_service_key() {
+        let config = GatewayConfig {
+            gateway_port: 8090,
+            control_plane_url: "http://127.0.0.1:8087".into(),
+            control_plane_api_key: Some("private-service-key".into()),
+            envoy_gateway_url: "http://127.0.0.1:8080".into(),
+            namespace: "default".into(),
+            cache_ttl_seconds: 600,
+        };
+        assert!(!format!("{config:?}").contains("private-service-key"));
     }
 }

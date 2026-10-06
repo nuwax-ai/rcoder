@@ -36,7 +36,7 @@ def cache_key(source_sha256, bases, config, rust_image=None):
         'source_sha256': source_sha256,
         'bases': bases,
         'rust_image': rust_image if rust_image is not None
-        else config.get('RUST_IMAGE', 'rust:1.95-trixie'),
+        else config.get('RUST_IMAGE', 'rust:trixie'),
         'cargo_jobs': config.get('JOBS', '4'),
         'apt_mirror': config.get('APT_MIRROR', 'http://deb.debian.org'),
         'cargo_mirror': config.get('CARGO_MIRROR', ''),

@@ -93,10 +93,20 @@ impl AppService {
             let locator = self
                 .dev_locator
                 .read()
-                .expect("dev_locator lock")
+                .map_err(|_| {
+                    AppOperationError::Diagnostic(shared_types::WakeFailure::new(
+                        shared_types::ERR_RUNTIME_UNAVAILABLE,
+                        "dev_locator",
+                        "UserApp development container locator lock is poisoned",
+                    ))
+                })?
                 .clone()
                 .ok_or_else(|| {
-                    AppOperationError::Backend("dev container locator not injected".to_string())
+                    AppOperationError::Diagnostic(shared_types::WakeFailure::new(
+                        shared_types::ERR_RUNTIME_CONFIGURATION,
+                        "dev_locator",
+                        "UserApp development container locator is not configured",
+                    ))
                 })?;
             return locator.dev_file_server_addr(app_id).await.map_err(|e| {
                 AppOperationError::Backend(format!(
@@ -106,18 +116,14 @@ impl AppService {
         }
         match self.activity.ensure_running(app_id).await {
             shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning => {}
-            shared_types::WakeOutcome::Timeout => {
-                return Err(AppOperationError::InvalidState(format!(
-                    "app {app_id} wake timed out; retry later"
-                )));
+            shared_types::WakeOutcome::Timeout(detail) => {
+                return Err(AppOperationError::Diagnostic(detail));
             }
             shared_types::WakeOutcome::Blocked { message, blocker } => {
                 return Err(AppOperationError::ConflictBlocked { message, blocker });
             }
-            shared_types::WakeOutcome::Failed(e) => {
-                return Err(AppOperationError::InvalidState(format!(
-                    "app {app_id} wake failed: {e}"
-                )));
+            shared_types::WakeOutcome::Failed(detail) => {
+                return Err(AppOperationError::Diagnostic(detail));
             }
         }
         let runtime = self.get_app(app_id).await?;
@@ -166,15 +172,23 @@ impl AppService {
             .text("target", target.to_string())
             .text("flatten", flatten.to_string())
             .part("file", part);
-        let resp = FILE_FORWARD_CLIENT
-            .post(format!("{base}/api/v1/userapp/app-files/upload"))
-            .timeout(Duration::from_secs(FILE_TRANSFER_TIMEOUT_SECS))
-            .multipart(form)
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(FILE_TRANSFER_TIMEOUT_SECS);
+        let credentials = self
+            .file_request_credentials(app_stage, app_id, deadline)
+            .await?;
+        let resp = credentials
+            .apply(
+                FILE_FORWARD_CLIENT
+                    .post(format!("{base}/api/v1/userapp/app-files/upload"))
+                    .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                    .multipart(form),
+            )
             .send()
             .await
-            .map_err(|e| forward_error("upload", app_id, e))?;
-        let resp = check_status(resp, "upload", app_id).await?;
-        let parsed: UploadResp = resp.json().await.map_err(|e| {
+            .map_err(|e| forward_error("upload", app_id, e, FileForwardContext::Mutation))?;
+        let body = read_file_response(resp, "upload", app_id, FileForwardContext::Mutation).await?;
+        let parsed: UploadResp = serde_json::from_value(body).map_err(|e| {
             AppOperationError::Backend(format!("upload response decode (app {app_id}): {e}"))
         })?;
         info!(
@@ -190,7 +204,7 @@ impl AppService {
     }
 
     /// 从 URL 部署文件（容器内流式下载后走上传核心——大制品不进 rcoder 内存）。
-    #[instrument(skip(self))]
+    #[instrument(skip(self, url))]
     pub async fn upload_from_url(
         &self,
         app_stage: UserappStage,
@@ -208,15 +222,31 @@ impl AppService {
             "target": target,
             "flatten": flatten,
         });
-        let resp = FILE_FORWARD_CLIENT
-            .post(format!("{base}/api/v1/userapp/app-files/upload-from-url"))
-            .timeout(Duration::from_secs(FILE_TRANSFER_TIMEOUT_SECS))
-            .json(&body)
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(FILE_TRANSFER_TIMEOUT_SECS);
+        let credentials = self
+            .file_request_credentials(app_stage, app_id, deadline)
+            .await?;
+        let resp = credentials
+            .apply(
+                FILE_FORWARD_CLIENT
+                    .post(format!("{base}/api/v1/userapp/app-files/upload-from-url"))
+                    .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                    .json(&body),
+            )
             .send()
             .await
-            .map_err(|e| forward_error("upload-from-url", app_id, e))?;
-        let resp = check_status(resp, "upload-from-url", app_id).await?;
-        let parsed: UploadResp = resp.json().await.map_err(|e| {
+            .map_err(|e| {
+                forward_error("upload-from-url", app_id, e, FileForwardContext::Mutation)
+            })?;
+        let body = read_file_response(
+            resp,
+            "upload-from-url",
+            app_id,
+            FileForwardContext::Mutation,
+        )
+        .await?;
+        let parsed: UploadResp = serde_json::from_value(body).map_err(|e| {
             AppOperationError::Backend(format!(
                 "upload-from-url response decode (app {app_id}): {e}"
             ))
@@ -255,14 +285,22 @@ impl AppService {
             url.push_str("&path=");
             url.push_str(&urlencode(p));
         }
-        let resp = FILE_FORWARD_CLIENT
-            .get(url)
-            .timeout(Duration::from_secs(FILE_OPS_TIMEOUT_SECS))
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(FILE_OPS_TIMEOUT_SECS);
+        let credentials = self
+            .file_request_credentials(app_stage, app_id, deadline)
+            .await?;
+        let resp = credentials
+            .apply(
+                FILE_FORWARD_CLIENT
+                    .get(url)
+                    .timeout(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            )
             .send()
             .await
-            .map_err(|e| forward_error("list-files", app_id, e))?;
-        let resp = check_status(resp, "list-files", app_id).await?;
-        let parsed: ListResp = resp.json().await.map_err(|e| {
+            .map_err(|e| forward_error("list-files", app_id, e, FileForwardContext::ReadOnly))?;
+        let body =
+            read_file_response(resp, "list-files", app_id, FileForwardContext::ReadOnly).await?;
+        let parsed: ListResp = serde_json::from_value(body).map_err(|e| {
             AppOperationError::Backend(format!("list-files response decode (app {app_id}): {e}"))
         })?;
         Ok(parsed
@@ -293,15 +331,21 @@ impl AppService {
         }
         let base = self.app_files_base(app_stage, app_id).await?;
         let body = serde_json::json!({"app_id": app_id, "path": file_path});
-        let resp = FILE_FORWARD_CLIENT
-            .post(format!("{base}/api/v1/userapp/app-files/delete"))
-            .timeout(Duration::from_secs(FILE_OPS_TIMEOUT_SECS))
-            .json(&body)
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(FILE_OPS_TIMEOUT_SECS);
+        let credentials = self
+            .file_request_credentials(app_stage, app_id, deadline)
+            .await?;
+        let resp = credentials
+            .apply(
+                FILE_FORWARD_CLIENT
+                    .post(format!("{base}/api/v1/userapp/app-files/delete"))
+                    .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                    .json(&body),
+            )
             .send()
             .await
-            .map_err(|e| forward_error("delete-file", app_id, e))?;
-        let checked = check_status(resp, "delete-file", app_id).await?;
-        drop(checked);
+            .map_err(|e| forward_error("delete-file", app_id, e, FileForwardContext::Mutation))?;
+        read_file_response(resp, "delete-file", app_id, FileForwardContext::Mutation).await?;
         info!(
             "[APP] file deleted via container file-server: {}",
             file_path
@@ -310,29 +354,193 @@ impl AppService {
     }
 }
 
-/// 非 2xx → 对应错误（携带容器侧错误信息，便于 Java/排障定位）。
+/// The caller declares whether dispatch can change files; operation names are diagnostic only.
+#[derive(Clone, Copy)]
+pub(crate) enum FileForwardContext {
+    ReadOnly,
+    Mutation,
+}
+
+/// Preserve the Response for storage protocols that decode their own physical identity.
 pub(crate) async fn check_status(
     resp: reqwest::Response,
-    op: &str,
+    op: &'static str,
     app_id: &str,
+) -> AppResult<reqwest::Response> {
+    check_status_with_context(resp, op, app_id, FileForwardContext::ReadOnly).await
+}
+
+pub(crate) async fn check_status_with_context(
+    resp: reqwest::Response,
+    op: &'static str,
+    app_id: &str,
+    context: FileForwardContext,
 ) -> AppResult<reqwest::Response> {
     let status = resp.status();
     if status.is_success() {
         return Ok(resp);
     }
-    let body = resp.text().await.unwrap_or_default();
-    warn!("[APP] app-files forward {op} non-success (app {app_id}): {status} {body}");
-    Err(match status {
-        reqwest::StatusCode::NOT_FOUND => AppOperationError::NotFound(format!("{op}: {body}")),
-        reqwest::StatusCode::BAD_REQUEST => AppOperationError::Validation(format!("{op}: {body}")),
-        _ => AppOperationError::Backend(format!("{op} failed: {status} {body}")),
-    })
+    let text = resp
+        .text()
+        .await
+        .map_err(|error| forward_error(op, app_id, error, context))?;
+    let body = serde_json::from_str::<serde_json::Value>(&text).ok();
+    Err(file_peer_error(
+        status,
+        body.as_ref(),
+        &text,
+        op,
+        app_id,
+        context,
+    ))
 }
 
-fn forward_error(op: &str, app_id: &str, e: reqwest::Error) -> AppOperationError {
-    AppOperationError::Backend(format!(
-        "forward {op} to container file-server (app {app_id}) failed: {e}"
-    ))
+async fn read_file_response(
+    resp: reqwest::Response,
+    op: &'static str,
+    app_id: &str,
+    context: FileForwardContext,
+) -> AppResult<serde_json::Value> {
+    let response = check_status_with_context(resp, op, app_id, context).await?;
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| forward_error(op, app_id, error, context))?;
+    // Every app-files success response has success:true. HTTP 2xx alone is not execution evidence.
+    if body.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(file_peer_error(
+            status,
+            Some(&body),
+            "File response did not confirm success",
+            op,
+            app_id,
+            context,
+        ));
+    }
+    Ok(body)
+}
+
+fn file_peer_error(
+    status: reqwest::StatusCode,
+    body: Option<&serde_json::Value>,
+    raw: &str,
+    op: &'static str,
+    app_id: &str,
+    context: FileForwardContext,
+) -> AppOperationError {
+    let source_code = body
+        .and_then(|body| body.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|code| {
+            !code.is_empty() && *code != shared_types::ERR_UNKNOWN && *code != shared_types::SUCCESS
+        });
+    let source_type = body
+        .and_then(|body| body.pointer("/error/type"))
+        .and_then(serde_json::Value::as_str);
+    let fallback = match source_type {
+        Some("RESOURCE_ERROR") => shared_types::ERR_FILE_NOT_FOUND,
+        Some("VALIDATION_ERROR" | "BUSINESS_ERROR") => shared_types::ERR_VALIDATION,
+        Some("CONFLICT") => shared_types::ERR_CONFLICT,
+        Some("NETWORK_ERROR") => shared_types::ERR_RUNTIME_UNAVAILABLE,
+        _ => match status {
+            reqwest::StatusCode::NOT_FOUND => shared_types::ERR_NOT_FOUND,
+            reqwest::StatusCode::BAD_REQUEST => shared_types::ERR_VALIDATION,
+            reqwest::StatusCode::CONFLICT => shared_types::ERR_CONFLICT,
+            reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::GATEWAY_TIMEOUT => {
+                shared_types::ERR_RUNTIME_TIMEOUT
+            }
+            reqwest::StatusCode::SERVICE_UNAVAILABLE | reqwest::StatusCode::BAD_GATEWAY => {
+                shared_types::ERR_RUNTIME_UNAVAILABLE
+            }
+            _ => shared_types::ERR_BACKEND_ERROR,
+        },
+    };
+    let message = body
+        .and_then(|body| {
+            body.get("message")
+                .or_else(|| body.pointer("/error/message"))
+        })
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(raw);
+    let message = shared_types::sanitize_error_text(message);
+    let message = format!("{op} failed: HTTP {status}: {message}");
+    warn!(app_id, operation = op, status = status.as_u16(), detail = %message, "app-files peer rejected request");
+    let definitive = status.is_client_error() && !matches!(status.as_u16(), 408 | 499);
+    let protected = matches!(context, FileForwardContext::Mutation) && !definitive;
+    let code = if protected {
+        shared_types::ERR_OPERATION_OUTCOME_UNKNOWN
+    } else {
+        fallback
+    };
+    let mut failure = shared_types::WakeFailure::new(code, op, message.clone());
+    failure.cause_code = fallback.into();
+    failure.retryable = !protected
+        && matches!(
+            fallback,
+            shared_types::ERR_RUNTIME_TIMEOUT | shared_types::ERR_RUNTIME_UNAVAILABLE
+        );
+    let mut diagnostic = body
+        .and_then(|body| body.get("error_detail"))
+        .cloned()
+        .and_then(|detail| serde_json::from_value::<shared_types::ErrorDetail>(detail).ok())
+        .unwrap_or_else(|| {
+            shared_types::ErrorDetail::new(source_code.unwrap_or(fallback), op, message)
+                .with_retryable(failure.retryable)
+        });
+    diagnostic = diagnostic.localized(shared_types::current_request_locale());
+    diagnostic.retryable &= !protected;
+    failure.command_diagnostic = Some(Box::new(shared_types::PgCommandDiagnostic {
+        code: source_code.unwrap_or(fallback).to_owned(),
+        operation_id: body
+            .and_then(|body| body.get("operation_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        blocker: body
+            .and_then(|body| body.get("blocker"))
+            .cloned()
+            .and_then(|blocker| serde_json::from_value(blocker).ok()),
+        error_detail: Some(diagnostic),
+    }));
+    AppOperationError::Diagnostic(failure)
+}
+
+fn forward_error(
+    op: &'static str,
+    app_id: &str,
+    error: reqwest::Error,
+    context: FileForwardContext,
+) -> AppOperationError {
+    let cause = if error.is_builder() {
+        shared_types::ERR_RUNTIME_CONFIGURATION
+    } else if error.is_timeout() {
+        shared_types::ERR_RUNTIME_TIMEOUT
+    } else if error.is_decode() {
+        shared_types::ERR_BACKEND_ERROR
+    } else {
+        shared_types::ERR_RUNTIME_UNAVAILABLE
+    };
+    let dispatched = !error.is_connect() && !error.is_builder();
+    let protected = matches!(context, FileForwardContext::Mutation) && dispatched;
+    let code = if protected {
+        shared_types::ERR_OPERATION_OUTCOME_UNKNOWN
+    } else {
+        cause
+    };
+    let mut failure = shared_types::WakeFailure::new(
+        code,
+        op,
+        shared_types::sanitize_error_text(&format!(
+            "forward {op} to container file-server (app {app_id}) failed: {error}"
+        )),
+    );
+    failure.cause_code = cause.into();
+    failure.retryable = !protected
+        && matches!(
+            cause,
+            shared_types::ERR_RUNTIME_TIMEOUT | shared_types::ERR_RUNTIME_UNAVAILABLE
+        );
+    AppOperationError::Diagnostic(failure)
 }
 
 /// query 参数百分号编码（防 `&`/空格 截断 query）。
@@ -359,3 +567,13 @@ mod tests {
         assert_eq!(urlencode("app1.2_x"), "app1.2_x");
     }
 }
+
+#[cfg(test)]
+#[path = "files/config_budget_tests.rs"]
+mod config_budget_tests;
+
+#[cfg(test)]
+mod credential_tests;
+
+#[cfg(test)]
+mod response_contract_tests;

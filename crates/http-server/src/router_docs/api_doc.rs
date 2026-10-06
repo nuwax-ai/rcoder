@@ -123,6 +123,8 @@ use crate::handler;
     ),
     components(
         schemas(
+            shared_types::ErrorDetail,
+            shared_types::OperationInProgressData,
             // userApp 转发层（PG 账号/库管理；create-workspace 为内部接口不入文档）
             shared_types::UserappDbResetPasswordRequest,
             shared_types::UserappDbPasswordRecoveryRequest,

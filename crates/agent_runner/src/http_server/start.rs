@@ -3,7 +3,7 @@
 //! 提供便捷的 HTTP 服务器启动 API
 //! 支持 HTTP REST API 和可选的 Pingora 代理服务
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,10 +46,22 @@ pub struct HttpServerHandle {
     /// 关闭信号令牌
     shutdown_token: CancellationToken,
     /// 活跃任务集合
-    join_set: Arc<tokio::sync::Mutex<JoinSet<()>>>,
+    join_set: Arc<tokio::sync::Mutex<JoinSet<Result<()>>>>,
+    /// 所有控制柄共享关闭顺序、总预算及已确认的失败结果。
+    shutdown_state: Arc<tokio::sync::Mutex<HttpShutdownState>>,
     /// Pingora 结果（用于调用 stop）
     #[cfg(feature = "proxy")]
     pingora_result: Arc<tokio::sync::Mutex<Option<crate::proxy_agent::PingoraStartResult>>>,
+}
+
+#[derive(Default)]
+struct HttpShutdownState {
+    deadline: Option<tokio::time::Instant>,
+    grace_deadline: Option<tokio::time::Instant>,
+    http_abort_requested: bool,
+    http_failures: Vec<String>,
+    proxy_error: Option<String>,
+    error: Option<String>,
 }
 
 impl HttpServerHandle {
@@ -59,56 +71,134 @@ impl HttpServerHandle {
     }
 
     /// 停止 HTTP 服务器并等待所有任务完成
-    pub async fn stop(&self) {
+    pub async fn stop(&self) -> Result<()> {
+        // clone 之间串行确认；取消任一调用后，下次调用继续同一关闭。
+        let mut shutdown_state = self.shutdown_state.lock().await;
+        if let Some(error) = &shutdown_state.error {
+            anyhow::bail!("{error}");
+        }
+        let started = tokio::time::Instant::now();
+        let deadline = *shutdown_state
+            .deadline
+            .get_or_insert(started + Duration::from_secs(10));
+        let grace_deadline = *shutdown_state
+            .grace_deadline
+            .get_or_insert(deadline.min(started + Duration::from_secs(3)));
         info!("Stopping HTTP server...");
 
         // 1. 发送关闭信号
         self.shutdown_token.cancel();
 
-        // 2. 停止 Pingora 服务
-        #[cfg(feature = "proxy")]
-        {
-            let mut pingora_guard = self.pingora_result.lock().await;
-            let pingora = pingora_guard.take();
-            drop(pingora_guard);
-            if let Some(mut pingora) = pingora {
-                pingora.stop().await;
+        // 2. 两个服务同时排空，避免等待代理时延长 HTTP 的三秒宽限。
+        let HttpShutdownState {
+            http_abort_requested,
+            http_failures,
+            proxy_error,
+            ..
+        } = &mut *shutdown_state;
+        let proxy_shutdown = async {
+            let result: Result<()> = async {
+                #[cfg(feature = "proxy")]
+                {
+                    // 所有权始终留在共享对象；取消等待只释放 guard，不 detach 任务。
+                    let mut pingora_guard = self.pingora_result.lock().await;
+                    if let Some(pingora) = pingora_guard.as_mut() {
+                        pingora
+                            .stop_until(deadline)
+                            .await
+                            .context("Pingora shutdown failed")?;
+                        // 仅真实代理和健康任务均成功退出后才移除对象。
+                        drop(pingora_guard.take());
+                    }
+                }
+                Ok(())
             }
+            .await;
+            if let Err(error) = result {
+                error!(%error, "Pingora shutdown failed; exit remains unconfirmed");
+                // join! 的另一分支仍可能等待；失败须在下次 await 前持久化。
+                *proxy_error = Some(format!("{error:#}"));
+            }
+        };
+        tokio::join!(
+            proxy_shutdown,
+            self.join_http_until(
+                grace_deadline,
+                deadline,
+                http_abort_requested,
+                http_failures
+            )
+        );
+        let mut failures = Vec::new();
+        if let Some(error) = &shutdown_state.proxy_error {
+            failures.push(error.clone());
         }
-
-        // 3. 等待所有任务完成（带超时）
-        // 使用 3 秒超时：清理任务会立即退出，axum 有 3 秒进行连接排空
-        let timeout = Duration::from_secs(3);
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut join_set = self.join_set.lock().await;
-
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                warn!("Timed out waiting for tasks (3s total), aborting remaining tasks");
-                join_set.abort_all();
-                break;
-            }
-            match tokio::time::timeout(remaining, join_set.join_next()).await {
-                Ok(Some(Ok(()))) => {
-                    info!("Task exited normally");
-                }
-                Ok(Some(Err(e))) => {
-                    warn!("Task error: {:?}", e);
-                }
-                Ok(None) => {
-                    // JoinSet 为空，所有任务已完成
-                    break;
-                }
-                Err(_) => {
-                    warn!("Timed out waiting for tasks (3s total), aborting remaining tasks");
-                    join_set.abort_all();
-                    break;
-                }
-            }
+        failures.extend(shutdown_state.http_failures.iter().cloned());
+        if !failures.is_empty() {
+            let error = failures.join("; ");
+            error!(%error, "HTTP server shutdown failed");
+            shutdown_state.error = Some(error.clone());
+            anyhow::bail!("{error}");
         }
-
         info!("HTTP server stopped");
+        Ok(())
+    }
+
+    async fn join_http_until(
+        &self,
+        grace_deadline: tokio::time::Instant,
+        deadline: tokio::time::Instant,
+        abort_requested: &mut bool,
+        failures: &mut Vec<String>,
+    ) {
+        // 3. HTTP 与 Pingora 在同一时刻收到关闭，保留三秒连接排空宽限。
+        let mut join_set = self.join_set.lock().await;
+        if !*abort_requested {
+            loop {
+                match tokio::time::timeout_at(grace_deadline, join_set.join_next()).await {
+                    Ok(Some(Ok(Ok(())))) => {
+                        info!("Task exited normally");
+                    }
+                    Ok(Some(Ok(Err(error)))) => {
+                        // join_next 已消费结果，须同步写回共享状态以抵抗外层取消。
+                        failures.push(format!("HTTP service failed: {error:#}"));
+                    }
+                    Ok(Some(Err(error))) => {
+                        failures.push(format!("HTTP task failed: {error}"));
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        warn!(
+                            "HTTP graceful shutdown exceeded 3 seconds, cancelling remaining tasks"
+                        );
+                        *abort_requested = true;
+                        join_set.abort_all();
+                        break;
+                    }
+                }
+            }
+        }
+
+        // abort 仅请求取消，必须在父 deadline 内实际 drain，才确认任务退出。
+        while !join_set.is_empty() {
+            match tokio::time::timeout_at(deadline, join_set.join_next()).await {
+                Ok(Some(Ok(Ok(())))) => {}
+                Ok(Some(Ok(Err(error)))) => {
+                    failures.push(format!("HTTP service failed during shutdown: {error:#}"));
+                }
+                Ok(Some(Err(error))) if error.is_cancelled() => {}
+                Ok(Some(Err(error))) => {
+                    failures.push(format!("HTTP task failed during shutdown: {error}"));
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    failures.push(
+                        "HTTP shutdown deadline expired; task exit remains unconfirmed".into(),
+                    );
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -122,7 +212,7 @@ impl HttpServerHandle {
 /// use std::path::PathBuf;
 ///
 /// #[tokio::main]
-/// async fn main() {
+/// async fn main() -> anyhow::Result<()> {
 ///     // 创建 Agent Session Service（第二参为 ACP session 创建超时秒数，取自 GrpcTimeoutConfig）
 ///     let agent_session_service = Arc::new(AgentSessionService::new(
 ///         agent_abstraction::launcher::direct_model_runtime_env_resolver(),
@@ -154,10 +244,11 @@ impl HttpServerHandle {
 ///     };
 ///
 ///     // 启动 HTTP Server
-///     let handle = start_http_server(config).await.unwrap();
+///     let handle = start_http_server(config).await?;
 ///
 ///     // 优雅停止
-///     handle.stop().await;
+///     handle.stop().await?;
+///     Ok(())
 /// }
 /// ```
 pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHandle> {
@@ -244,19 +335,22 @@ pub async fn start_http_server(config: HttpServerConfig) -> Result<HttpServerHan
             let _ = http_token.cancelled().await;
         });
 
-        match server.await {
-            Ok(()) => info!("HTTP service exited normally"),
-            Err(e) => error!("HTTP service error: {:?}", e),
-        }
+        server.await.context("HTTP service exited with an error")?;
+        info!("HTTP service exited normally");
+        Ok(())
     });
 
     // 创建 handle
     let handle = HttpServerHandle {
         shutdown_token,
         join_set,
+        shutdown_state: Arc::new(tokio::sync::Mutex::new(HttpShutdownState::default())),
         #[cfg(feature = "proxy")]
         pingora_result,
     };
 
     Ok(handle)
 }
+
+#[cfg(all(test, unix))]
+mod shutdown_tests;

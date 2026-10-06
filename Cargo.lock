@@ -11027,6 +11027,8 @@ dependencies = [
  "shared_types",
  "tempfile",
  "thiserror 2.0.21",
+ "toasty",
+ "toasty-driver-turso",
  "tokio",
  "tokio-stream",
  "tokio-util",

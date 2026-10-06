@@ -7,7 +7,7 @@
 ### 架构
 
 - [架构总览](architecture/overview.md) —— 主链路、核心组件、crate 地图与三种部署形态
-- [gRPC 内部通信](architecture/grpc.md) —— rcoder 与 agent_runner 之间的 gRPC 设计：RPC 清单、oneof 事件系统、连接池
+- [gRPC 内部通信](architecture/grpc.md) —— rcoder 与 agent_runner 之间的 gRPC 设计：RPC 清单、ACP JSON 事件透传、连接池
 
 ### 业务概念
 

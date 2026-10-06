@@ -24,6 +24,7 @@ pub mod dbx_readiness;
 pub mod dev_cleanup;
 pub mod dev_locator;
 pub mod forward_contract;
+pub mod http_credentials;
 pub mod metadata;
 pub mod run_credentials;
 

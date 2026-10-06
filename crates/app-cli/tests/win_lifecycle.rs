@@ -1,6 +1,6 @@
 //! Windows 原生生命周期集成测试（XP 生命周期门禁的真机等价物）。
 //!
-//! 场景：空 workspace 的 app-cli run→ idle 形态常驻：
+//! 场景：空 workspace 的 app-cli serve --control-only 常驻：
 //! /health 200 应答 → 强杀（taskkill /F）→ 进程退出、端口释放。
 //! 对照 Unix 侧 serve_restart/bin_startup（#![cfg(unix)]）——本文件补
 //! Windows 侧的最小真实生命周期闭环。
@@ -46,7 +46,8 @@ fn windows_idle_serve_lifecycle() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_app-cli"))
         .args([
-            "run",
+            "serve",
+            "--control-only",
             "--workspace",
             workspace.to_str().expect("workspace path"),
             "--log-dir",
@@ -56,6 +57,9 @@ fn windows_idle_serve_lifecycle() {
         ])
         .env_remove("APP_DEPLOY_URL")
         .env_remove("APP_RELEASE_ID")
+        .env_remove("APP_DEPLOY_OPERATION_ID")
+        .env_remove("APP_CLI_ATTACH")
+        .env("APP_CLI_STATE_ROOT", dir.path().join("state"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -101,7 +105,7 @@ fn windows_idle_serve_lifecycle() {
 }
 
 /// XP01（Windows）：两个 CLI 并发首次启动（真实二进制同端口同 workspace）——
-/// 恰好一个 owner 胜出（/health 200 常驻），另一个非零退出。
+/// 恰好一个 owner 胜出（/health 200 常驻），另一个复用管理面后成功退出。
 #[test]
 fn xp01_two_cli_concurrent_first_start_single_winner() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -114,6 +118,7 @@ fn xp01_two_cli_concurrent_first_start_single_winner() {
         Command::new(env!("CARGO_BIN_EXE_app-cli"))
             .args([
                 "serve",
+                "--control-only",
                 "--workspace",
                 workspace.to_str().expect("workspace path"),
                 "--log-dir",
@@ -123,6 +128,9 @@ fn xp01_two_cli_concurrent_first_start_single_winner() {
             ])
             .env_remove("APP_DEPLOY_URL")
             .env_remove("APP_RELEASE_ID")
+            .env_remove("APP_DEPLOY_OPERATION_ID")
+            .env_remove("APP_CLI_ATTACH")
+            .env("APP_CLI_STATE_ROOT", dir.path().join("state"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -132,7 +140,7 @@ fn xp01_two_cli_concurrent_first_start_single_winner() {
     let mut first = spawn_serve();
     let mut second = spawn_serve();
 
-    // 收敛判定：胜者 /health 200 且存活；败者已退出非零（OwnerGuard 排他）
+    // 收敛判定：胜者 /health 200 且存活；后到者已成功复用（真实排他锁仍只有一个 owner）
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         assert!(
@@ -147,8 +155,8 @@ fn xp01_two_cli_concurrent_first_start_single_winner() {
             && let Some(status) = second_status
         {
             assert!(
-                !status.success(),
-                "loser must exit non-zero (owner lock / bind conflict)"
+                status.success(),
+                "control-only caller must reuse the verified owner"
             );
             let _ = Command::new("taskkill")
                 .args(["/PID", &first.id().to_string(), "/F", "/T"])
@@ -158,7 +166,10 @@ fn xp01_two_cli_concurrent_first_start_single_winner() {
         }
         if http_get_health(&address) == Some(200) && second_status.is_none() && !first_alive {
             let status = first.wait().expect("reap first");
-            assert!(!status.success(), "loser must exit non-zero");
+            assert!(
+                status.success(),
+                "control-only caller must reuse the verified owner"
+            );
             let _ = Command::new("taskkill")
                 .args(["/PID", &second.id().to_string(), "/F", "/T"])
                 .output();

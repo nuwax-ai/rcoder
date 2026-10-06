@@ -50,6 +50,48 @@ mod cases {
     }
 
     #[tokio::test]
+    async fn internal_operation_retains_pg_for_audit_but_views_and_events_do_not() {
+        let (dir, _) = temp_store();
+        let kernel = kernel(dir.path());
+        let mut input = request(RuntimeOperationKind::Start, "auditcredentials");
+        input.run_config = Some(shared_types::OperationRunConfig {
+            pg: Some(shared_types::StartPgCredential {
+                username: "business".into(),
+                password: "audit-private-credential".into(),
+            }),
+        });
+        kernel.admit(input).await.unwrap();
+        let path = kernel.store.operation_path("auditcredentials");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            stored["request"]["run_config"]["pg"]["username"],
+            "business"
+        );
+        assert_eq!(
+            stored["request"]["run_config"]["pg"]["password"], "audit-private-credential",
+            "internal operation input must retain the actual dispatched password"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let view = serde_json::to_value(kernel.get("auditcredentials").await.unwrap()).unwrap();
+        assert!(view.get("request").is_none());
+        assert!(!view.to_string().contains("audit-private-credential"));
+        let events = kernel.store.replay_events("auditcredentials", 0).unwrap();
+        assert!(
+            !serde_json::to_string(&events)
+                .unwrap()
+                .contains("audit-private-credential")
+        );
+    }
+
+    #[tokio::test]
     async fn foreground_failure_exit_and_new_admission_share_one_boundary() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -168,10 +210,11 @@ mod cases {
                 });
             }
             kernel.admit(queued).await.unwrap();
-            assert!(
-                !std::fs::read_to_string(kernel.store.operation_path("b"))
+            assert_eq!(
+                std::fs::read_to_string(kernel.store.operation_path("b"))
                     .unwrap()
-                    .contains("probe-secret")
+                    .contains("probe-secret"),
+                kind == RuntimeOperationKind::Restart
             );
             assert_eq!(
                 kernel.commit_execution("a").await.unwrap(),
@@ -316,8 +359,8 @@ mod cases {
             .admit(request(RuntimeOperationKind::Start, "a"))
             .await
             .unwrap();
-        assert!(kernel.append_orchestration_event("build", None, "Building", None));
-        assert!(kernel.append_orchestration_event("ready", None, "Ready", None));
+        assert!(kernel.append_orchestration_event("a", "build", None, "Building", None));
+        assert!(kernel.append_orchestration_event("a", "ready", None, "Ready", None));
         assert_eq!(
             kernel.commit_execution("a").await.unwrap(),
             CommitBarrierOutcome::Committed
@@ -330,6 +373,76 @@ mod cases {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].sequence, 4);
         assert_eq!(events[0].stage, "terminal");
+    }
+
+    #[tokio::test]
+    async fn migration_output_survives_admission_contention_and_keeps_original_identity() {
+        let (dir, _) = temp_store();
+        let kernel = kernel(dir.path());
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "migration-source"))
+            .await
+            .unwrap();
+        kernel
+            .admit(request(RuntimeOperationKind::Stop, "newer-stop"))
+            .await
+            .unwrap();
+        let admission = kernel.admission.lock().await;
+        assert_eq!(
+            admission.active_operation_id.as_deref(),
+            Some("migration-source")
+        );
+        for line in [
+            "[migrate out] original stdout",
+            "[migrate err] original stderr",
+        ] {
+            assert!(kernel.append_orchestration_event(
+                "migration-source",
+                "migration",
+                Some("backend".into()),
+                "log",
+                Some(serde_json::json!({"line": line}))
+            ));
+        }
+        drop(admission);
+        let events = kernel.store.replay_events("migration-source", 0).unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.operation_id == "migration-source"
+                    && event.runtime_instance_id == "instance-1")
+        );
+        assert_eq!(events[1].service.as_deref(), Some("backend"));
+        assert_eq!(
+            events[2].payload.as_ref().unwrap()["line"],
+            "[migrate err] original stderr"
+        );
+        assert_eq!(
+            kernel.store.replay_events("newer-stop", 0).unwrap().len(),
+            1,
+            "original migration output must never be relabeled as a newer Stop"
+        );
+        kernel
+            .finish(
+                "migration-source",
+                RuntimeOperationState::Cancelled,
+                None,
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !kernel.append_orchestration_event(
+                "migration-source",
+                "migration",
+                Some("backend".into()),
+                "log",
+                Some(serde_json::json!({"line":"late old output"}))
+            ),
+            "a terminal operation stream must stay closed"
+        );
     }
 
     #[tokio::test]
@@ -384,7 +497,7 @@ mod cases {
         let path = runtime.store.events_path("a");
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
-        assert!(!runtime.append_orchestration_event("progress", None, "Step", None));
+        assert!(!runtime.append_orchestration_event("a", "progress", None, "Step", None));
     }
 
     #[tokio::test]
@@ -751,10 +864,9 @@ mod cases {
         }
     }
 
-    /// R08：Restart 携带 run_config.pg → 派发动作拿到真实凭据；持久化副本
-    /// 密码脱敏（重放摘要不含 run_config，脱敏不影响幂等语义）。
+    /// Restart 派发与内部持久化均保留实际输入；外部只读取操作视图。
     #[tokio::test]
-    async fn run_config_pg_reaches_dispatch_and_redacts_on_disk() {
+    async fn run_config_pg_reaches_dispatch_and_is_retained_on_disk() {
         use std::sync::Mutex;
         let (dir, _keep) = temp_store();
         let captured: std::sync::Arc<Mutex<Vec<DispatchAction>>> = Default::default();
@@ -786,7 +898,7 @@ mod cases {
             other => panic!("expected single orchestrate dispatch with pg, got {other:?}"),
         }
         drop(actions);
-        // 持久化副本：密码为空（脱敏），用户名保留诊断
+        // Internal audit retains the same username/password dispatched above.
         let stored = kernel
             .store()
             .load_operation("op-pg")
@@ -800,8 +912,8 @@ mod cases {
             .expect("run config persisted");
         assert_eq!(persisted_pg.username, "biz_user");
         assert_eq!(
-            persisted_pg.password, "",
-            "password must be redacted on disk"
+            persisted_pg.password, "s3cret",
+            "internal audit must retain the actual dispatched password"
         );
     }
 
@@ -839,8 +951,9 @@ mod cases {
     async fn orchestration_bridge_appends_to_active_operation() {
         let (dir, _keep) = temp_store();
         let kernel = kernel(dir.path());
-        // 无活跃操作：no-op（idle 期只有 stdout 消费者）
+        // 未受理的操作身份不写日志（idle 期只有 stdout 消费者）。
         assert!(!kernel.append_orchestration_event(
+            "op-bridge",
             "service",
             Some("frontend".into()),
             "service_starting",
@@ -852,12 +965,14 @@ mod cases {
             .expect("admit");
         // admit 已发 accepted 事件（sequence 1）→ 桥接事件从 2 起
         assert!(kernel.append_orchestration_event(
+            "op-bridge",
             "service",
             Some("frontend".into()),
             "service_starting",
             None
         ));
         assert!(kernel.append_orchestration_event(
+            "op-bridge",
             "orchestration",
             None,
             "orchestration_done",

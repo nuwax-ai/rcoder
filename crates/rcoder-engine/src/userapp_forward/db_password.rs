@@ -15,6 +15,10 @@ use recovery::validate_recovery_snapshot;
 fn backend(message: &str) -> AppError {
     AppError::with_message(ERR_BACKEND_ERROR, message)
 }
+fn database_diagnostic(code: &str, stage: &str, message: &str) -> AppError {
+    AppError::with_message(code, message)
+        .with_error_detail(ErrorDetail::new(code, stage, message).with_retryable(false))
+}
 fn request_fingerprint(
     stage: UserappStage,
     body: &UserappDbResetPasswordRequest,
@@ -71,7 +75,9 @@ fn replay_result(
 
 fn store_error(error: UserAppStoreError) -> AppError {
     match error {
-        UserAppStoreError::NotFound => AppError::not_found("Application was not found"),
+        UserAppStoreError::NotFound => {
+            AppError::with_message(ERR_APP_NOT_FOUND, "Application was not found")
+        }
         UserAppStoreError::LifecycleConflict | UserAppStoreError::OwnershipConflict => {
             AppError::conflict(
                 "Application lifecycle changed; refresh its identity before changing the password",
@@ -182,7 +188,11 @@ fn management_available<T>(
         Err(container_runtime_api::ContainerRuntimeError::Conflict(_)) => Err(AppError::conflict(
             "Database management target identity changed",
         )),
-        Err(_) => Err(backend("Database management target observation failed")),
+        Err(error) => Err(container_runtime_api::runtime_app_error(
+            &error,
+            "database_management_probe",
+            container_runtime_api::RuntimeErrorContext::ReadOnly,
+        )),
     }
 }
 
@@ -217,7 +227,11 @@ struct Runner<'a> {
 }
 #[async_trait::async_trait]
 impl PgCommandRunner for Runner<'_> {
-    async fn run(&self, command: &str) -> Result<CommandOutcome, String> {
+    async fn run(
+        &self,
+        command: &str,
+        mode: PgCommandMode,
+    ) -> Result<CommandOutcome, PgCommandError> {
         let args = vec!["sh".into(), "-c".into(), command.into()];
         let result = timeout_at(self.deadline, async {
             match self.target {
@@ -236,8 +250,14 @@ impl PgCommandRunner for Runner<'_> {
             }
         })
         .await
-        .map_err(|_| "Database command deadline exceeded".to_string())?
-        .map_err(|_| "Identity-bound database command failed".to_string())?;
+        .map_err(|_| {
+            PgCommandError::transport(
+                mode,
+                ERR_RUNTIME_TIMEOUT,
+                "Database command deadline exceeded",
+            )
+        })?
+        .map_err(|error| container_runtime_api::runtime_pg_command_error(&error, mode))?;
         Ok(CommandOutcome {
             exit_code: result.exit_code,
             stdout: result.stdout,
@@ -436,9 +456,12 @@ async fn coordinated(
         };
         let marker = loop {
             let marker = runner
-                .run("test -n \"${PGDATA:-}\" && cat \"$PGDATA/.rcoder-admin-user\"")
+                .run(
+                    "test -n \"${PGDATA:-}\" && cat \"$PGDATA/.rcoder-admin-user\"",
+                    PgCommandMode::ReadOnly,
+                )
                 .await
-                .map_err(|_| backend("Read database administrator identity failed"))?;
+                .map_err(|error| error.into_app_error("database_admin_identity"))?;
             if marker.exit_code == 0 {
                 break marker;
             }
@@ -525,9 +548,9 @@ async fn coordinated(
         .await?;
         loop {
             let ready = runner
-                .run(&admin.ready_command())
+                .run(&admin.ready_command(), PgCommandMode::ReadOnly)
                 .await
-                .map_err(|_| backend("Database administrator readiness could not be observed"))?;
+                .map_err(|error| error.into_app_error("database_admin_readiness"))?;
             if ready.exit_code == 0 {
                 break;
             }
@@ -547,9 +570,10 @@ async fn coordinated(
                 &admin
                     .role_exists_command(&username)
                     .map_err(|e| AppError::bad_request(&e))?,
+                PgCommandMode::ReadOnly,
             )
             .await
-            .map_err(|_| backend("Database account preflight failed"))?;
+            .map_err(|error| error.into_app_error("database_account_preflight"))?;
         if exists.exit_code != 0 {
             return Err(backend("Database account preflight failed"));
         }
@@ -574,9 +598,9 @@ async fn coordinated(
         )
         .await?;
         let applied = runner
-            .run(&sql)
+            .run(&sql, PgCommandMode::Write)
             .await
-            .map_err(|_| backend("Password command outcome is unknown"))?;
+            .map_err(|error| error.into_app_error("database_password_write"))?;
         if applied.exit_code != 0 {
             return Err(backend("Password command did not confirm success"));
         }
@@ -585,21 +609,22 @@ async fn coordinated(
                 &admin
                     .password_operation_receipt_command(&context, op.scope, &username)
                     .map_err(|e| AppError::bad_request(&e))?,
+                PgCommandMode::ReadOnly,
             )
             .await
-            .map_err(|_| backend("Password transaction receipt is unavailable"))?;
+            .map_err(|error| error.into_app_error("database_password_receipt"))?;
         if receipt.exit_code != 0 || receipt.stdout.trim() != "1" {
             return Err(backend(
                 "Password transaction commit could not be confirmed",
             ));
         }
         let verified = runner
-            .run(&pg_utils::pg_verify_credentials_cmd(
-                &username,
-                &body.password,
-            ))
+            .run(
+                &pg_utils::pg_verify_credentials_cmd(&username, &body.password),
+                PgCommandMode::ReadOnly,
+            )
             .await
-            .map_err(|_| backend("Password changed but TCP verification is unavailable"))?;
+            .map_err(|error| error.into_app_error("database_password_verify"))?;
         if verified.exit_code != 0 {
             return Err(backend("Password changed but TCP verification failed"));
         }
@@ -671,10 +696,26 @@ async fn coordinated(
                 .with_operation_id(context.operation_id.clone()),
         );
     }
-    result.map_err(|error| match &record {
-        Some(record) => error.with_operation_id(record.operation_id.clone()),
-        None if admission_uncertain => error.with_operation_id(context.operation_id.clone()),
-        None => error,
+    result.map_err(|error| {
+        let error = if uncertain {
+            let original = error.into_http_result::<()>(current_request_locale());
+            let detail = original.error_detail.unwrap_or_else(|| {
+                ErrorDetail::new(
+                    original.code,
+                    "database_password_result",
+                    original.message.clone(),
+                )
+            });
+            AppError::with_message(ERR_OPERATION_OUTCOME_UNKNOWN, original.message)
+                .with_error_detail(detail.with_retryable(false))
+        } else {
+            error
+        };
+        match &record {
+            Some(record) => error.with_operation_id(record.operation_id.clone()),
+            None if admission_uncertain => error.with_operation_id(context.operation_id.clone()),
+            None => error,
+        }
     })
 }
 

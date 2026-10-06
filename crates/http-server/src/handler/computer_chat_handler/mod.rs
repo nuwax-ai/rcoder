@@ -332,10 +332,9 @@ async fn run_userapp_dev_chat_flow(
                 "❌ [USERAPP_DEV_CHAT] ensure dev container failed: app_id={}: {e:#}",
                 project_id
             );
-            ChatFlowExit::response(HttpResult::error_with_locale(
-                shared_types::error_codes::ERR_CONTAINER_ERROR,
-                locale,
-            ))
+            ChatFlowExit::response(
+                crate::userapp_builder::control_error(&e).into_http_result(locale),
+            )
         })?;
     // 注册/会话映射键 = 复合 identifier（协作模型多实例——注册信息携带）；
     // work_dir/workspace 仍按纯 app_id（容器内路径契约不变）。
@@ -345,18 +344,28 @@ async fn run_userapp_dev_chat_flow(
     // 3. workspace 就绪（容器内幂等建目录；userapp_forward 公共调用）
     let addr =
         crate::userapp_builder::dev_file_server_addr(&state, &container_info).map_err(|error| {
-            ChatFlowExit::response(HttpResult::error(
-                shared_types::error_codes::ERR_CONTAINER_ERROR,
-                &error.to_string(),
-            ))
+            let code = shared_types::ERR_CONTAINER_ADDRESS_NOT_READY;
+            ChatFlowExit::response(
+                AppError::with_message(code, error.to_string())
+                    .with_error_detail(
+                        shared_types::ErrorDetail::new(
+                            code,
+                            "chat.file_server_address",
+                            error.to_string(),
+                        )
+                        .with_retryable(true),
+                    )
+                    .into_http_result(locale),
+            )
         })?;
-    if let Err(e) = crate::userapp_forward::ensure_workspace_via_dev(&addr, &project_id).await {
-        error!("[USERAPP_DEV_CHAT] {e}: app_id={project_id}");
-        return Err(ChatFlowExit::response(HttpResult::error_with_locale(
-            shared_types::error_codes::ERR_CONTAINER_ERROR,
-            locale,
-        )));
-    }
+    let credentials = crate::userapp_forward::file_server_request_credentials(
+        &state,
+        shared_types::UserappStage::Dev,
+        &project_id,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+    .await;
+    userapp_workspace::ensure(&addr, &project_id, credentials, locale).await?;
 
     // 4. Agent 状态探活 + session 解析（复用 computer 实现；session 映射按
     //    复合实例键——多用户同 app 各会话映射各自容器）
@@ -408,4 +417,5 @@ mod container;
 mod forward;
 mod helpers;
 mod session;
+mod userapp_workspace;
 mod validation;

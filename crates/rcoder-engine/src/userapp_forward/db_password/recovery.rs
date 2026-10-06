@@ -152,17 +152,35 @@ async fn recover_coordinated(
             deadline,
         };
         let marker = runner
-            .run("test -n \"${PGDATA:-}\" && cat \"$PGDATA/.rcoder-admin-user\"")
+            .run(
+                "test -n \"${PGDATA:-}\" && cat \"$PGDATA/.rcoder-admin-user\"",
+                PgCommandMode::ReadOnly,
+            )
             .await
-            .map_err(|_| backend("Read original database administrator failed"))?;
+            .map_err(|error| {
+                error.into_credential_app_error(
+                    "database_recovery_admin",
+                    "Database recovery administrator query transport failed",
+                )
+            })?;
         if marker.exit_code != 0 {
-            return Err(backend("Original database administrator is unavailable"));
+            return Err(database_diagnostic(
+                ERR_DATABASE_NOT_READY,
+                "database_recovery_admin",
+                "Original database administrator is unavailable",
+            ));
         }
         let admin = pg_utils::PgAdministrationTarget::new(
             marker.stdout.trim().into(),
             "/var/run/postgresql".into(),
         )
-        .map_err(|_| backend("Original database administrator is invalid"))?;
+        .map_err(|_| {
+            database_diagnostic(
+                ERR_RUNTIME_CONFIGURATION,
+                "database_recovery_admin",
+                "Original database administrator is invalid",
+            )
+        })?;
         evidence.stage = confirm_remote_outcome(
             &runner,
             &admin,
@@ -223,11 +241,18 @@ async fn confirm_remote_outcome(
         .password_operation_cancel_command(&evidence.context, scope, &evidence.username)
         .map_err(|_| backend("Build password recovery command failed"))?;
     let result = runner
-        .run(&command)
+        .run(&command, PgCommandMode::Write)
         .await
-        .map_err(|_| backend("Password recovery receipt outcome is unknown"))?;
+        .map_err(|error| {
+            error.into_credential_app_error(
+                "database_recovery_receipt",
+                "Password recovery receipt completion was not confirmed",
+            )
+        })?;
     if result.exit_code != 0 {
-        return Err(backend(
+        return Err(database_diagnostic(
+            ERR_OPERATION_OUTCOME_UNKNOWN,
+            "database_recovery_receipt",
             "Password recovery receipt transaction did not confirm commit",
         ));
     }
@@ -235,14 +260,23 @@ async fn confirm_remote_outcome(
         "cancelled" => DatabasePasswordStage::Cancelled,
         "committed" => {
             let verified = runner
-                .run(&pg_utils::pg_verify_credentials_cmd(
-                    &evidence.username,
-                    password,
-                ))
+                .run(
+                    &pg_utils::pg_verify_credentials_cmd(&evidence.username, password),
+                    PgCommandMode::ReadOnly,
+                )
                 .await
-                .map_err(|_| backend("Committed password TCP verification is unavailable"))?;
+                .map_err(|error| {
+                    error.into_credential_app_error(
+                        "database_recovery_verification",
+                        "Committed password TCP verification transport failed",
+                    )
+                })?;
             if verified.exit_code != 0 || verified.stdout.trim() != "1" {
-                return Err(backend("Committed password TCP verification failed"));
+                return Err(database_diagnostic(
+                    ERR_DATABASE_COMMAND_FAILED,
+                    "database_recovery_verification",
+                    "Committed password TCP verification failed",
+                ));
             }
             DatabasePasswordStage::Verified
         }
@@ -266,13 +300,20 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl PgCommandRunner for Scripted {
-        async fn run(&self, command: &str) -> Result<CommandOutcome, String> {
+        async fn run(
+            &self,
+            command: &str,
+            mode: PgCommandMode,
+        ) -> Result<CommandOutcome, PgCommandError> {
             self.commands.lock().unwrap().push(command.into());
             self.outcomes
                 .lock()
                 .unwrap()
                 .pop_front()
                 .expect("unexpected command")
+                .map_err(|detail| {
+                    PgCommandError::transport(mode, ERR_CONTAINER_EXEC_FAILED, detail)
+                })
         }
     }
     fn outcome(code: i64, text: &str) -> Result<CommandOutcome, String> {
@@ -285,6 +326,150 @@ mod tests {
     fn evidence() -> DatabasePasswordEvidence {
         let op = super::super::tests::completed();
         serde_json::from_value(op.checkpoint).unwrap()
+    }
+
+    struct CarrierScripted {
+        outcomes: Mutex<VecDeque<Result<CommandOutcome, PgCommandError>>>,
+        commands: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl PgCommandRunner for CarrierScripted {
+        async fn run(
+            &self,
+            command: &str,
+            _mode: PgCommandMode,
+        ) -> Result<CommandOutcome, PgCommandError> {
+            self.commands.lock().unwrap().push(command.into());
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected credential command")
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_transport_carrier_redacts_text_and_retains_original_evidence() {
+        let admin =
+            pg_utils::PgAdministrationTarget::new("postgres".into(), "/var/run/postgresql".into())
+                .unwrap();
+        for locale in ["en-US", "zh-CN"] {
+            for (verification, code, cause, dispatch, retryable) in [
+                (
+                    false,
+                    ERR_OPERATION_OUTCOME_UNKNOWN,
+                    ERR_RUNTIME_TIMEOUT,
+                    PgCommandEvidence::OutcomeUnknown,
+                    false,
+                ),
+                (
+                    true,
+                    ERR_RUNTIME_TIMEOUT,
+                    ERR_RUNTIME_TIMEOUT,
+                    PgCommandEvidence::OutcomeUnknown,
+                    true,
+                ),
+                (
+                    false,
+                    ERR_CONFLICT,
+                    ERR_CONFLICT,
+                    PgCommandEvidence::NotDispatched,
+                    false,
+                ),
+            ] {
+                let blocker = UserAppOperationBlocker {
+                    scope: UserAppOperationScope::Prod,
+                    operation_id: "original-password-operation".into(),
+                    kind: UserAppOperationKind::ResetProdDatabasePassword,
+                    state: UserAppOperationState::RecoveryRequired,
+                    step: "password_write_submitted".into(),
+                };
+                // Arbitrary transport text and shell-escaped argv are not
+                // recognizable by a generic password-pattern sanitizer.
+                let raw = "sensitive transport diagnostics: carrier-se'\\''cret";
+                let transport = PgCommandError::new(code, raw, dispatch)
+                    .with_cause_code(cause)
+                    .with_diagnostic(PgCommandDiagnostic {
+                        code: cause.into(),
+                        operation_id: Some(blocker.operation_id.clone()),
+                        blocker: Some(blocker.clone()),
+                        error_detail: Some(
+                            ErrorDetail::new(cause, "captured_exec", "private SQL")
+                                .with_hint("carrier-se'\\''cret")
+                                .with_retryable(retryable || code == ERR_OPERATION_OUTCOME_UNKNOWN)
+                                .with_task_id("retained-password-task")
+                                .with_service_id("postgres-service"),
+                        ),
+                    });
+                let mut outcomes = VecDeque::new();
+                if verification {
+                    outcomes.push_back(Ok(CommandOutcome {
+                        exit_code: 0,
+                        stdout: "committed".into(),
+                        stderr: String::new(),
+                    }));
+                }
+                outcomes.push_back(Err(transport));
+                let runner = CarrierScripted {
+                    outcomes: Mutex::new(outcomes),
+                    commands: Mutex::new(Vec::new()),
+                };
+                let error = scope_request_locale(
+                    locale,
+                    confirm_remote_outcome(
+                        &runner,
+                        &admin,
+                        &evidence(),
+                        UserAppOperationScope::Prod,
+                        "carrier-se'cret",
+                    ),
+                )
+                .await
+                .unwrap_err();
+                let debug = format!("{error:?}");
+                let display = error.to_string();
+                let result = error.into_http_result::<()>(locale);
+                assert_eq!(result.code, code);
+                assert_eq!(
+                    result.operation_id.as_deref(),
+                    Some("original-password-operation")
+                );
+                assert_eq!(result.blocker, Some(blocker));
+                let diagnostic = result.error_detail.as_ref().unwrap();
+                assert_eq!(diagnostic.reason_code, cause);
+                assert_eq!(diagnostic.stage, "captured_exec");
+                assert_eq!(
+                    diagnostic.task_id.as_deref(),
+                    Some("retained-password-task")
+                );
+                assert_eq!(diagnostic.service_id.as_deref(), Some("postgres-service"));
+                assert_eq!(diagnostic.retryable, retryable);
+                let response = serde_json::to_string(&result).unwrap();
+                for output in [&debug, &display, &response] {
+                    for secret in [
+                        "sensitive transport diagnostics",
+                        "private SQL",
+                        "carrier-se'\\''cret",
+                        "carrier-se'cret",
+                    ] {
+                        assert!(
+                            !output.contains(secret),
+                            "credential diagnostics leaked: {output}"
+                        );
+                    }
+                }
+                assert_eq!(diagnostic.hint, get_error_hint(cause, locale));
+                let commands = runner.commands.lock().unwrap();
+                assert_eq!(commands.len(), if verification { 2 } else { 1 });
+                assert!(commands.iter().all(|command| {
+                    !command.contains("ALTER ROLE") && !command.contains("CREATE ROLE")
+                }));
+                assert!(commands[0].contains("COMMIT"));
+                if verification {
+                    assert!(commands[1].contains("-h 127.0.0.1"));
+                }
+            }
+        }
     }
 
     #[tokio::test]

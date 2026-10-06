@@ -85,9 +85,13 @@ async fn resolve_existing_dev(
     namespace: &str,
     cluster_domain: &str,
 ) -> Result<Option<String>, HttpResultError> {
-    let found = lookup
-        .await
-        .map_err(|e| HttpResultError::bad_gateway(format!("lookup dev container failed: {e}")))?;
+    let found = lookup.await.map_err(|error| {
+        HttpResultError::from_app_error(container_runtime_api::runtime_app_error(
+            &error,
+            "development_container_lookup",
+            container_runtime_api::RuntimeErrorContext::ReadOnly,
+        ))
+    })?;
     let Some(info) = found else {
         return Ok(None);
     };
@@ -110,8 +114,11 @@ async fn resolve_existing_dev(
         cluster_domain,
     );
     if host.trim().is_empty() {
-        return Err(HttpResultError::bad_gateway(
-            "dev container address unavailable",
+        return Err(HttpResultError::from_app_error(
+            shared_types::AppError::with_message(
+                shared_types::ERR_CONTAINER_ADDRESS_NOT_READY,
+                "Development container address is not ready",
+            ),
         ));
     }
     let addr = shared_types::build_container_port_addr(
@@ -234,14 +241,25 @@ pub(super) struct HttpResultError {
     message: String,
     /// 503 唤醒类错误的 Retry-After 秒数（对齐 proxy_http 流量唤醒面）。
     retry_after_secs: Option<u32>,
+    cause: Option<shared_types::AppError>,
 }
 
 impl HttpResultError {
+    pub(super) fn from_app_error(cause: shared_types::AppError) -> Self {
+        Self {
+            status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            message: String::new(),
+            retry_after_secs: None,
+            cause: Some(cause),
+        }
+    }
+
     pub(super) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: axum::http::StatusCode::BAD_REQUEST,
             message: message.into(),
             retry_after_secs: None,
+            cause: None,
         }
     }
 
@@ -250,6 +268,7 @@ impl HttpResultError {
             status: axum::http::StatusCode::BAD_GATEWAY,
             message: message.into(),
             retry_after_secs: None,
+            cause: None,
         }
     }
 
@@ -258,6 +277,7 @@ impl HttpResultError {
             status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
             message: message.into(),
             retry_after_secs: Some(retry_after_secs),
+            cause: None,
         }
     }
 
@@ -266,6 +286,7 @@ impl HttpResultError {
             status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
             retry_after_secs: None,
+            cause: None,
         }
     }
 
@@ -278,6 +299,9 @@ impl HttpResultError {
 
 impl IntoResponse for HttpResultError {
     fn into_response(self) -> Response {
+        if let Some(cause) = self.cause {
+            return cause.into_response();
+        }
         // 与 shared_types::HttpResult 同形态(code=字符串错误码/message/data/tid/success),
         // 但保留真实 HTTP 状态码(400/404/502/503 对代理与客户端有语义; HttpResult 的
         // IntoResponse 恒 200, 不适用于透传层的传输级错误)

@@ -110,6 +110,7 @@ impl AppService {
                     self.activity.forget_lifecycle(app_id, &completed_lifecycle);
                 }
                 Err(error) => {
+                    let error = durable.correlate_error(error);
                     if release_lock.has_unfinished_mutation() {
                         durable.fail(&error).await?;
                     } else {
@@ -240,7 +241,8 @@ impl AppService {
         self.unregister_pingora_backends(app_id).await;
         self.activity.mark_wake_blocked(app_id);
         if let Err(error) = self.runtime.delete_app_snapshot(snapshot).await {
-            return Err(map_runtime_error(
+            return Err(map_runtime_mutation_error(
+                "container_delete",
                 &format!("[APP] delete_deployment failed app_id={app_id}"),
                 error,
             ));

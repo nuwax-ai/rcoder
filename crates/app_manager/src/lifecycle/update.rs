@@ -193,6 +193,7 @@ impl AppService {
                 Ok(())
             }
             Err(error) => {
+                let error = operation.correlate_error(error);
                 if _update_lock.has_unfinished_mutation() {
                     operation.fail(&error).await?;
                 } else {
@@ -281,7 +282,8 @@ impl AppService {
                     )));
                 }
                 Err(e) => {
-                    return Err(map_runtime_error(
+                    return Err(map_runtime_mutation_error(
+                        "container_storage_resize",
                         &format!("[APP] resize_app_storage failed app_id={app_id}"),
                         e,
                     ));
@@ -334,7 +336,8 @@ impl AppService {
                 {
                     _update_lock.mark_completed();
                 }
-                return Err(map_runtime_error(
+                return Err(map_runtime_mutation_error(
+                    "container_update",
                     &format!("[APP] patch_deployment failed app_id={app_id}"),
                     e,
                 ));

@@ -791,6 +791,7 @@ mod wait_timeout_tests {
 pub struct UserAppOperationBlocker {
     /// Blocking scope: Dev, Prod, or Application.
     pub scope: UserAppOperationScope,
+    /// Durable identity of the existing operation that blocks this request.
     pub operation_id: String,
     /// Blocking operation kind: EnsureBuilder, AdoptBuilder, AdoptApplication,
     /// StopBuilder, RestartBuilder, Create, StartDeployment, RestartDeployment,
@@ -802,6 +803,7 @@ pub struct UserAppOperationBlocker {
     /// Blocking operation state: Pending, Running, WaitingRetry,
     /// RecoveryRequired, Succeeded, or Failed.
     pub state: UserAppOperationState,
+    /// Current recorded execution step of the blocking operation.
     pub step: String,
 }
 
@@ -895,6 +897,17 @@ pub trait UserAppLifecycleStore: Send + Sync {
         app_id: &str,
         operation_id: &str,
     ) -> Result<Option<crate::ComputeControlRecord>, UserAppStoreError>;
+
+    /// Actual persisted progress time for this exact compute revision. None
+    /// means unsupported, absent, or replaced evidence; never use created_at.
+    async fn get_compute_control_updated_at(
+        &self,
+        _app_id: &str,
+        _operation_id: &str,
+        _expected_revision: i64,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, UserAppStoreError> {
+        Ok(None)
+    }
 
     /// Read the current lifecycle/scope intent and its associated operation,
     /// including terminal results, in one short read-only transaction.
@@ -1428,6 +1441,16 @@ pub trait UserAppLifecycleStore: Send + Sync {
         app_id: &str,
         operation_id: &str,
     ) -> Result<Option<UserAppOperationRecord>, UserAppStoreError>;
+    /// Actual persisted progress time for this exact ordinary revision.
+    /// Unknown freshness never authorizes a retry of an application write.
+    async fn get_operation_updated_at(
+        &self,
+        _app_id: &str,
+        _operation_id: &str,
+        _expected_revision: i64,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, UserAppStoreError> {
+        Ok(None)
+    }
     /// Stable cursor, bounded page size, existing filters only — must not
     /// degenerate into an unbounded full-table load.
     async fn unfinished_operations(

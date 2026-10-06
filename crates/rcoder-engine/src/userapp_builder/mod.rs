@@ -278,7 +278,15 @@ async fn ensure_userapp_builder_probed_until(
 
     if !fenced && let Some(info) = registered_or_discovered_builder(state, instance).await? {
         let addr = dev_file_server_addr(state, &info)?;
-        if probe_file_server(&addr).await {
+        let credentials = crate::userapp_forward::file_credentials::credentials(
+            state,
+            shared_types::UserappStage::Dev,
+            app_id,
+            deadline,
+        )
+        .await
+        .map_err(shared_types::WakeFailure::into_app_error)?;
+        if probe_file_server(&addr, &credentials).await {
             // 探活过 ≠ 归属正确：跨族污染形态下生产容器的 file-server 同样在
             // 60000 应答（探活恒过、remediation 永不触发）——追加归属交叉校验
             if let Some(updated) = cross_verify_registration(state, app_id, instance, &info).await?
@@ -333,6 +341,12 @@ async fn within_builder_deadline<T>(
 /// Preserve typed lifecycle failures through anyhow context into HTTP envelopes.
 /// Never classify an operation by searching its formatted error text.
 pub fn control_error(error: &anyhow::Error) -> shared_types::AppError {
+    if let Some(unknown) = error.downcast_ref::<shared_types::OperationOutcomeUnknown>() {
+        let code = shared_types::ERR_OPERATION_OUTCOME_UNKNOWN;
+        return shared_types::AppError::with_message(code, &unknown.detail).with_error_detail(
+            shared_types::ErrorDetail::new(code, unknown.stage, &unknown.detail),
+        );
+    }
     if let Some(control) = error.downcast_ref::<shared_types::BuilderControlError>() {
         return shared_types::AppError::with_message(
             shared_types::error_codes::ERR_BACKEND_ERROR,
@@ -371,6 +385,13 @@ pub fn control_error(error: &anyhow::Error) -> shared_types::AppError {
         )
         .with_operation_id(blocker.operation_id.clone())
         .with_blocker(blocker.clone());
+    }
+    if let Some(runtime) = error.downcast_ref::<container_runtime_api::ContainerRuntimeError>() {
+        return container_runtime_api::runtime_app_error(
+            runtime,
+            "builder.ensure",
+            container_runtime_api::RuntimeErrorContext::Mutation,
+        );
     }
     shared_types::AppError::with_message(
         shared_types::error_codes::ERR_BACKEND_ERROR,
@@ -470,10 +491,16 @@ fn validate_builder_identity(
 }
 
 /// 开发容器 file-server 轻量探活（连接失败/非 2xx 均不可用）。
-async fn probe_file_server(addr: &str) -> bool {
-    crate::http_client::shared_client()
-        .get(format!("{addr}/api/version"))
-        .timeout(std::time::Duration::from_secs(3))
+async fn probe_file_server(
+    addr: &str,
+    credentials: &shared_types::FileServerRequestCredentials,
+) -> bool {
+    credentials
+        .apply(
+            crate::http_client::shared_client()
+                .get(format!("{addr}/api/version"))
+                .timeout(std::time::Duration::from_secs(3)),
+        )
         .send()
         .await
         .map(|r| r.status().is_success())
@@ -677,7 +704,15 @@ async fn confirm_builder_ready_inner(
                 if actual.container_id != info.container_id {
                     return Err(anyhow!("Builder resource replaced before readiness"));
                 }
-                if probe_file_server(&dev_file_server_addr(state, &actual)?).await {
+                let credentials = crate::userapp_forward::file_credentials::credentials(
+                    state,
+                    shared_types::UserappStage::Dev,
+                    app_id,
+                    deadline,
+                )
+                .await
+                .map_err(shared_types::WakeFailure::into_app_error)?;
+                if probe_file_server(&dev_file_server_addr(state, &actual)?, &credentials).await {
                     return Ok(actual);
                 }
             }
@@ -946,5 +981,50 @@ mod control_error_tests {
             shared_types::error_codes::ERR_BACKEND_ERROR
         );
         assert!(envelope.get("operation_id").is_none());
+    }
+}
+
+#[cfg(test)]
+mod file_token_probe_tests {
+    use super::*;
+    use axum::Router;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::get;
+    #[tokio::test]
+    async fn builder_file_probe_uses_existing_optional_file_token() {
+        for token in [None, Some("fixture-file-token"), Some("wrong-token")] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("fixture listener");
+            let addr = format!("http://{}", listener.local_addr().expect("address"));
+            let router = Router::new().route(
+                "/api/version",
+                get(|headers: HeaderMap| async move {
+                    assert!(!headers.contains_key("x-api-key"));
+                    if headers.get("x-proxy-token").and_then(|v| v.to_str().ok())
+                        == Some("fixture-file-token")
+                    {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::UNAUTHORIZED
+                    }
+                }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router).await.expect("fixture server");
+            });
+            assert_eq!(
+                probe_file_server(
+                    &addr,
+                    &shared_types::FileServerRequestCredentials {
+                        proxy_token: token.map(str::to_owned)
+                    }
+                )
+                .await,
+                token == Some("fixture-file-token")
+            );
+            server.abort();
+            drop(server.await);
+        }
     }
 }

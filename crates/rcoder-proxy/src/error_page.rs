@@ -308,6 +308,24 @@ fn failure_span(session: &Session, status: u16, context: &str) -> tracing::Span 
     span
 }
 
+fn attach_wake_diagnostic(
+    payload: &mut serde_json::Value,
+    failure: &shared_types::WakeFailure,
+    locale: &str,
+) {
+    payload["error"]["operation_id"] = serde_json::json!(failure.operation_id);
+    payload["error"]["blocker"] = serde_json::json!(failure.blocker);
+    payload["error"]["error_detail"] = serde_json::json!(
+        shared_types::ErrorDetail::new(
+            failure.cause_code.as_ref(),
+            failure.stage.as_ref(),
+            failure.message.clone(),
+        )
+        .with_retryable(failure.retryable)
+        .localized(locale)
+    );
+}
+
 /// 写出 UserApp 代理失败响应（在下游最终响应尚未开始时调用一次）。
 ///
 /// - 保留真实状态码；503 携带 `Retry-After` 建议（非恢复保证）；
@@ -324,6 +342,7 @@ pub async fn write_error_response(
     retry_after_secs: Option<u64>,
     context: &str,
     detail: &str,
+    wake_failure: Option<&shared_types::WakeFailure>,
 ) -> () {
     // 响应已开始（上游中途断流等）：绝不再写第二份响应——正文追加会污染
     // 截断的原始流。守卫语义与 pingora-core write_error_response（server.rs
@@ -353,6 +372,7 @@ pub async fn write_error_response(
         retry_after_secs,
         context,
         detail,
+        wake_failure,
         &span,
     )
     .instrument(span.clone())
@@ -371,6 +391,7 @@ async fn write_error_response_inner(
     retry_after_secs: Option<u64>,
     context: &str,
     detail: &str,
+    wake_failure: Option<&shared_types::WakeFailure>,
     span: &tracing::Span,
 ) {
     // 错误页被消费 → 触发按需刷新（K8s 投射/手工换页的最终收敛路径之一）
@@ -391,7 +412,7 @@ async fn write_error_response_inner(
             ("text/html; charset=utf-8", renderer.render(&vars))
         }
         ErrorRepresentation::Machine => {
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "error": {
                     "code": "USERAPP_PROXY_FAILURE",
                     "status": status,
@@ -400,6 +421,16 @@ async fn write_error_response_inner(
                     "diagnostic_id": diagnostic_id,
                 }
             });
+            if let Some(failure) = wake_failure {
+                let locale = shared_types::parse_accept_language(
+                    session
+                        .req_header()
+                        .headers
+                        .get("accept-language")
+                        .and_then(|value| value.to_str().ok()),
+                );
+                attach_wake_diagnostic(&mut payload, failure, locale);
+            }
             ("application/json", payload.to_string().into_bytes())
         }
     };
@@ -426,6 +457,12 @@ async fn write_error_response_inner(
                 );
             }
         };
+    }
+    if let Some(failure) = wake_failure {
+        insert!("x-rcoder-error-code", failure.code.as_ref());
+        if let Some(operation_id) = &failure.operation_id {
+            insert!("x-rcoder-operation-id", operation_id);
+        }
     }
     insert!("content-type", content_type);
     insert!("content-length", body.len().to_string());
@@ -511,5 +548,39 @@ mod tests {
             assert!(!title.is_empty());
             assert!(!message.is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod wake_diagnostic_tests {
+    #[test]
+    fn wake_page_keeps_original_operation_stage_and_safe_detail() {
+        let mut payload = serde_json::json!({"error":{"code":"USERAPP_PROXY_FAILURE"}});
+        let blocker = shared_types::UserAppOperationBlocker {
+            scope: shared_types::UserAppOperationScope::Prod,
+            operation_id: "original-blocking-stop".into(),
+            kind: shared_types::UserAppOperationKind::Stop,
+            state: shared_types::UserAppOperationState::Running,
+            step: "stop".into(),
+        };
+        let failure = shared_types::WakeFailure {
+            operation_id: Some("original-wake".into()),
+            blocker: Some(Box::new(blocker.clone())),
+            ..shared_types::WakeFailure::new(
+                shared_types::ERR_RUNTIME_CONFIGURATION,
+                "wake_runtime",
+                "POSTGRES_PASSWORD=private_marker",
+            )
+        };
+        super::attach_wake_diagnostic(&mut payload, &failure, "en-US");
+        assert_eq!(payload["error"]["code"], "USERAPP_PROXY_FAILURE");
+        assert_eq!(payload["error"]["operation_id"], "original-wake");
+        assert_eq!(payload["error"]["blocker"], serde_json::json!(blocker));
+        assert_eq!(payload["error"]["error_detail"]["stage"], "wake_runtime");
+        assert_eq!(
+            payload["error"]["error_detail"]["reason_code"],
+            shared_types::ERR_RUNTIME_CONFIGURATION
+        );
+        assert!(!payload.to_string().contains("private_marker"));
     }
 }

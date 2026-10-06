@@ -1,4 +1,4 @@
-# 质量门禁 CI：格式 / Lint / 依赖安全 / 许可证合规
+# 质量门禁 CI：格式 / 默认及全 feature Lint、测试 / 依赖安全 / 许可证合规
 # 口径分两档:
 #   拦截档（失败即红）: fmt / clippy -D warnings / vulnerability / 违禁许可证 / 未知来源
 #   观察档（只警告）: unmaintained 依赖、重复版本（bans.multiple-versions=warn）
@@ -21,10 +21,14 @@ env:
 
 jobs:
   quality:
-    name: fmt + clippy + audit + deny
+    name: fmt + audit + deny
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
 
@@ -39,11 +43,60 @@ jobs:
       - name: Format check
         run: cargo fmt --all --check
 
-      - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
       - name: cargo audit (vulnerabilities fail, unmaintained warn)
         run: cargo audit
 
       - name: cargo deny (licenses/sources/advisories)
         run: cargo deny check
+
+  workspace:
+    name: workspace ${{ matrix.name }} clippy + nextest
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default features
+            features: ""
+          - name: all features
+            features: --all-features
+    env:
+      FEATURE_ARGS: ${{ matrix.features }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-${{ matrix.name }}
+
+      - name: Install native build prerequisites
+        # --workspace includes the desktop member's Linux font/X11/Wayland bindings.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config libssl-dev libclang-dev \
+            libfontconfig1-dev libfreetype6-dev libxcb1-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
+
+      - name: Install protoc
+        uses: ./.github/actions/install-protoc
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Record toolchain
+        run: |
+          rustc --version
+          cargo --version
+          cargo nextest --version
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets $FEATURE_ARGS -- -D warnings
+
+      - name: Tests
+        run: cargo nextest run --workspace --no-fail-fast $FEATURE_ARGS

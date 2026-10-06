@@ -195,7 +195,7 @@ def build(c, expected_manifest=None):
     # 必须 miss。解析失败 → 本轮**完全禁用**缓存读写（不是给失败 key 加字样：
     # 稳定的失败 key 仍会命中上一轮同失败路径下写入的产物），构建继续用 tag
     # 并如实记录不可复现性。
-    rust_ref = c.get('RUST_IMAGE', 'rust:1.95-trixie')
+    rust_ref = c.get('RUST_IMAGE', 'rust:trixie')
     rust_build_arg = rust_ref
     cache_key_this_round = None
     try:

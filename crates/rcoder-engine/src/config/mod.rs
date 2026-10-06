@@ -79,7 +79,8 @@ pub struct AppConfig {
     pub proxy_config: Option<ProxyConfig>,
     /// file-server 分流反向代理（60000 入口：userApp → 主服务, 其余 → TS nuwax-file-server）
     ///
-    /// 段缺失 → None → 不监听 60000（本地 dev 形态）；K8s 部署经 helm 渲染此段。
+    /// host 段缺失时自动监听 loopback:60000 / AllRust；容器段缺失时仅注册，
+    /// 可经管理入口启动。显式配置段优先。K8s 部署经 helm 渲染此段。
     #[serde(default)]
     pub file_server_proxy: Option<file_server_proxy::FileServerProxyConfig>,
     /// Custom Page 预览协调器（多副本 dev 生命周期/预览路由收口）。

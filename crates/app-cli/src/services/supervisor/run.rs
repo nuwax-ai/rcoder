@@ -108,7 +108,7 @@ pub(super) async fn run_inner(
     // 路径已自行清理, 此处对已 take 空的集合再调 shutdown_all 幂等无害。
     let mut children: ManagedChildren = Vec::new();
     let mut started_user_services = 0usize;
-    // 启动失败清单（容错语义：单服务 migrate/spawn/探测失败不阻塞其余服务；
+    // 启动失败清单（容错语义：单服务 spawn/探测失败不阻塞其余服务；
     // pingap 失败仍整体 Err 全组清理——入口必需）
     let mut startup_failures: Vec<FailedService> = Vec::new();
     // Done 终局是否已发射（正常路径 :241；失败兜底路径据此保证"至多一次"）。
@@ -138,26 +138,25 @@ pub(super) async fn run_inner(
                 started_user_services += 1;
                 continue;
             }
-            // migrate（如有）—— per-service：失败=该服务跳过（不再全局 fail-fast；
-            // 迁移错误即启动失败原因，EVT 带原始错误链）。
+            // 应用迁移失败只记录诊断；同一服务继续启动。真实进程树
+            // 未收束仍返回物理保护错误，整个意图取消则不晚拉业务。
             if run_migrations && !spec.run.migrate.is_empty() {
                 info!("🛠️  migrate {}", spec.service_id);
-                if let Err(e) =
-                    run_migration_with_receipt(spec, &release, &args.workspace, pg.as_ref()).await
-                {
-                    let error = format!("migrate {}: {e:#}", spec.service_id);
-                    warn!("⚠️  {error} — 跳过该服务，继续启动其余服务");
-                    emit_event(&OrchestrationEvent::ServiceStartFail {
-                        service: spec.service_id.clone(),
-                        error: error.clone(),
-                    });
-                    startup_failures.push(FailedService {
-                        service: spec.service_id.clone(),
-                        error,
-                    });
-                    continue;
-                }
+                let report = run_migration_with_receipt_cancel(
+                    spec,
+                    &release,
+                    &args.workspace,
+                    &args.log_dir,
+                    pg.as_ref(),
+                    cancel.as_ref(),
+                )
+                .await?;
+                tracing::debug!(service = %report.service_id, release = %report.release_id, outcome = ?report.outcome, stdout_bytes = report.stdout.len(), stderr_bytes = report.stderr.len(), "Migration stage finished");
             }
+            anyhow::ensure!(
+                !cancel.as_ref().is_some_and(|token| token.is_cancelled()),
+                "Orchestration cancelled"
+            );
             // start（dev 形态下 [devrun].command 优先、[run].command 兜底）
             let argv = effective_run_argv(spec, dev_profile);
             if argv.is_empty() {

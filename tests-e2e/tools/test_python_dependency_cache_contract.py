@@ -30,6 +30,7 @@ command=["python3","main.py"]
 ''',
         "backend-python/scripts/build-standalone.py": b"# frozen actual build input\n",
         "backend-python/scripts/build-standalone.sh": b"exec python3 scripts/build-standalone.py\n",
+        "backend-python/scripts/artifact_pack.py": b"# frozen actual runtime artifact helper\n",
         "cli/package.json": b'{"version":"1.0.0"}',
     }
 
@@ -60,7 +61,8 @@ class CacheContractTests(unittest.TestCase):
         original = source_files()
         raw, hashes = cache.fixture_zip(original, "http://172.20.0.20:8080/simple/", "sentinel")
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-            for name in ("backend-python/scripts/build-standalone.py", "backend-python/scripts/build-standalone.sh"):
+            for name in ("backend-python/scripts/build-standalone.py", "backend-python/scripts/build-standalone.sh",
+                         "backend-python/scripts/artifact_pack.py"):
                 self.assertEqual(archive.read(name), original[name])
                 self.assertEqual(hashes[name], cache.digest(original[name]))
             self.assertEqual(archive.read("backend-python/requirements.lock"), b"cache-probe==1.0\n")
@@ -87,6 +89,21 @@ class CacheContractTests(unittest.TestCase):
             self.assertEqual(data, files)
             self.assertEqual(identity["commit"], "abcdef")
             self.assertEqual(identity["files_sha256"]["backend-python/scripts/build-standalone.py"], cache.digest(files["backend-python/scripts/build-standalone.py"]))
+            self.assertEqual(identity["files_sha256"]["backend-python/scripts/artifact_pack.py"], cache.digest(files["backend-python/scripts/artifact_pack.py"]))
+
+    def test_missing_actual_helper_fails_before_recording_frozen_identity(self):
+        files = source_files()
+        files.pop("backend-python/scripts/artifact_pack.py")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name, raw in files.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(raw)
+            with patch.object(cache.subprocess, "run") as git:
+                with self.assertRaises(FileNotFoundError):
+                    cache.frozen_template(root)
+                git.assert_not_called()
 
     def test_counter_filters_health_and_requires_real_index_or_wheel(self):
         self.assertEqual(cache.dependency_requests(["/__stats", "/favicon.ico", "/simple/cache-probe/", "/cache_probe.whl"]),

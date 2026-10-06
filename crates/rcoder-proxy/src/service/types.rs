@@ -264,6 +264,8 @@ pub struct TrackingCtx {
     pub preview_origin_port: Option<u16>,
     /// UserApp app 代理路由（request_filter 阶段捕获；错误页/来源识别只覆盖该域）
     pub userapp_route: Option<UserAppRouteCtx>,
+    /// Captured wake failure; later readiness advice must not replace its identity.
+    pub wake_failure: Option<shared_types::WakeFailure>,
     /// 已确认来源的 Pingap 自产错误正文替换（response_filter 决定；body filter
     /// 首块输出新正文并丢弃原错误体，不拼接）。None = 不替换。
     pub replace_error_body: Option<bytes::Bytes>,
@@ -288,6 +290,7 @@ impl TrackingCtx {
         Self {
             start: std::time::Instant::now(),
             userapp_route: None,
+            wake_failure: None,
             replace_error_body: None,
             error_replacement_emitted: false,
             target_port: None,

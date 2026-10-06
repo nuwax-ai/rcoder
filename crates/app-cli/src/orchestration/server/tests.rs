@@ -604,7 +604,7 @@ mod cases {
         assert_eq!(original.error.as_deref(), Some("confirmed failure"));
         assert!(matches!(
             restarted
-                .try_accept_deploy_with_id(input, "b".into())
+                .try_accept_deploy_with_id(input.clone(), "b".into())
                 .unwrap(),
             DeployAdmission::Replayed(_)
         ));
@@ -623,20 +623,41 @@ mod cases {
                 .operation_id,
             "b"
         );
-        assert!(
-            !std::fs::read_to_string(dir.path().join(".deploy-operation.json"))
-                .unwrap()
-                .contains("original-secret")
-        );
         assert_eq!(
             restarted
-                .recorded_deployment("a")
+                .journal
+                .lock()
                 .unwrap()
+                .as_ref()
                 .unwrap()
-                .error
-                .as_deref(),
-            Some("confirmed failure")
+                .receipt
+                .as_ref()
+                .unwrap()
+                .request
+                .run_pg,
+            input.run_pg,
+            "reopened internal receipt must retain the original credentials"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(dir.path().join(".deploy-operation.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let recorded = restarted.recorded_deployment("a").unwrap().unwrap();
+        assert_eq!(recorded.error.as_deref(), Some("confirmed failure"));
+        for view in [&original, &recorded] {
+            let public = serde_json::to_value(view).unwrap();
+            assert!(public.get("request").is_none());
+            assert!(public.get("run_pg").is_none());
+            assert!(!public.to_string().contains("original-secret"));
+        }
     }
 
     #[tokio::test]
@@ -886,6 +907,57 @@ format = "jsonl"
         assert_eq!(op.deploy_stage, AppDeploymentStage::Succeeded);
         assert!(op.persisted);
         assert_eq!(op.phase, AppCliDeployPhase::Orchestrating);
+    }
+
+    #[tokio::test]
+    async fn advisory_pending_and_corrupt_receipts_allow_confirmed_artifact_startup() {
+        for bytes in [
+            br#"{"identity":"legacy","completed":false}"#.as_slice(),
+            b"corrupt-receipt".as_slice(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let workspace = dir.path().join("code");
+            std::fs::create_dir(&workspace).unwrap();
+            let artifact = release("confirmed-artifact");
+            std::fs::write(
+                workspace.join("release.lock.toml"),
+                toml::to_string(&artifact).unwrap(),
+            )
+            .unwrap();
+            let first = state();
+            first.set_generation("generation-a".into());
+            *first.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
+            first
+                .try_accept_deploy_with_id(request(), "confirmed-operation".into())
+                .unwrap();
+            first.set_release(artifact);
+            first.complete_stage().unwrap();
+            first.complete_running().unwrap();
+            drop(first);
+            let receipts = dir.path().join("migration-receipts");
+            std::fs::create_dir(&receipts).unwrap();
+            let path = receipts.join("legacy.json");
+            std::fs::write(&path, bytes).unwrap();
+            let restarted = state();
+            restarted.set_generation("generation-a".into());
+            *restarted.journal.lock().unwrap() = Some(Journal::open(&workspace).unwrap());
+            let args = RuntimeArgs {
+                workspace: workspace.clone(),
+                ..Default::default()
+            };
+            assert!(matches!(initialize_startup(&args, &restarted).await
+                .expect("application receipt data must not block startup"), Some(InitialAction::Existing { workspace: current }) if current == workspace));
+            assert!(!restarted.runtime_recovery_hold_active());
+            assert_eq!(
+                restarted.release().unwrap().release_id,
+                "confirmed-artifact"
+            );
+            assert_eq!(
+                restarted.deploy_status().operation.unwrap().operation_id,
+                "confirmed-operation"
+            );
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
     }
 
     #[tokio::test]

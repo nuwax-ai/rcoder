@@ -7,11 +7,13 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tracing::{error, info};
+use tracing::info;
 
 use pingora_core::Result as PingoraResult;
 use pingora_core::protocols::Digest;
+#[cfg(unix)]
 use pingora_core::server::Server;
+#[cfg(unix)]
 use pingora_core::server::configuration::Opt;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::ResponseHeader;
@@ -101,67 +103,114 @@ impl PingoraServerManager {
         self
     }
 
-    /// 启动 Pingora 服务器
-    ///
-    /// 接受一个 `shutdown_rx` 用于接收外部关闭信号。
-    /// 当 `shutdown_rx` 收到信号（或 sender 被 drop）时，`start()` 返回。
-    /// Pingora 服务器线程运行 `run_forever()`，由进程退出时 OS 清理。
+    /// Run standalone until its caller requests shutdown, then confirm exit.
     pub async fn start(&mut self, shutdown_rx: oneshot::Receiver<()>) -> Result<(), ProxyError> {
-        info!("starting Pingora proxy server...");
-        info!("listening on: 0.0.0.0:{}", self.config.listen_port);
-        info!("route: /proxy/{{port}}{{/path}}");
+        self.start_until(async move {
+            drop(shutdown_rx.await);
+            tokio::time::Instant::now() + std::time::Duration::from_secs(10)
+        })
+        .await
+    }
 
-        // 创建 Pingora 服务器配置
-        let opt = Opt::default();
+    /// Embedded callers provide their common parent deadline, never a new budget.
+    pub async fn start_with_deadline(
+        &mut self,
+        shutdown_rx: oneshot::Receiver<tokio::time::Instant>,
+    ) -> Result<(), ProxyError> {
+        self.start_until(async move {
+            match shutdown_rx.await {
+                Ok(deadline) => deadline,
+                Err(_) => tokio::time::Instant::now(),
+            }
+        })
+        .await
+    }
 
-        // 创建 Pingora 服务器
-        let mut my_server = Server::new(Some(opt))
-            .map_err(|e| ProxyError::Config(format!("Failed to create Pingora server: {}", e)))?;
-        my_server.bootstrap();
-
-        // 创建代理服务实例
-        let proxy_service = self.service.create_pingora_proxy().map_err(|e| {
-            error!("[PINGORA] create proxy failed: {}", e);
-            e
+    #[cfg(unix)]
+    async fn start_until(
+        &mut self,
+        shutdown: impl Future<Output = tokio::time::Instant>,
+    ) -> Result<(), ProxyError> {
+        use pingora_core::server::RunArgs;
+        let mut server = Server::new(Some(Opt::default())).map_err(|error| {
+            ProxyError::Config(format!("Failed to create Pingora server: {error}"))
         })?;
-        let proxy_service = Arc::new(proxy_service);
-        // 创建 HTTP 代理服务
-        let mut http_proxy = pingora_proxy::http_proxy_service(
-            &my_server.configuration,
-            ProxyServiceWrapper {
-                inner: proxy_service.clone(),
-            },
+        // The coordinator owns process signals and the parent deadline.
+        // Close proxy admission on its signal and allow three seconds for
+        // admitted connections, rather than Pingora's default grace period.
+        Arc::get_mut(&mut server.configuration)
+            .ok_or_else(|| {
+                ProxyError::Config("Pingora configuration was shared before bootstrap".into())
+            })?
+            .grace_period_seconds = Some(3);
+        server.bootstrap();
+        let proxy = Arc::new(self.service.create_pingora_proxy()?);
+        let mut http = pingora_proxy::http_proxy_service(
+            &server.configuration,
+            ProxyServiceWrapper { inner: proxy },
         );
-
-        // 添加 TCP 监听器
-        http_proxy.add_tcp(&format!("0.0.0.0:{}", self.config.listen_port));
-
-        // 将服务添加到服务器
-        my_server.add_service(http_proxy);
-
-        // 在独立线程中运行服务器（使用 std::thread 而不是 spawn_blocking）
-        // spawn_blocking 在某些环境下可能有调度延迟问题
-        info!("created Pingora proxy service...");
-        let server_thread = std::thread::spawn(move || {
-            info!("Pingora proxy starting...");
-            my_server.run_forever();
-        });
-        info!("Pingora server already created");
-
-        // 等待外部关闭信号（sender 被 drop 或显式发送信号都会触发）
-        let _ = shutdown_rx.await;
-        info!("shutdown signal received, Pingora proxy cleanup by OS");
-
-        // 不再 join 线程 — run_forever() 永不返回，join() 会导致永久阻塞
-        // detach 线程，让进程退出时自动清理
-        drop(server_thread);
-
+        http.add_tcp(&format!("0.0.0.0:{}", self.config.listen_port));
+        server.add_service(http);
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let thread = std::thread::Builder::new()
+            .name("rcoder-pingora".into())
+            .spawn(move || {
+                server.run(RunArgs {
+                    shutdown_signal: Box::new(CoordinatedShutdown { stopped }),
+                });
+            })
+            .map_err(|error| {
+                ProxyError::Config(format!("Failed to start Pingora thread: {error}"))
+            })?;
+        let deadline = shutdown.await;
+        stop.send_replace(true);
+        while !thread.is_finished() {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ProxyError::Backend(
+                    "Pingora shutdown deadline expired; thread exit remains unconfirmed".into(),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        thread
+            .join()
+            .map_err(|_| ProxyError::Backend("Pingora server thread panicked".into()))?;
+        info!("Pingora server thread exited");
         Ok(())
+    }
+
+    #[cfg(not(unix))]
+    async fn start_until(
+        &mut self,
+        _shutdown: impl Future<Output = tokio::time::Instant>,
+    ) -> Result<(), ProxyError> {
+        Err(ProxyError::Config(
+            "Embedded Pingora requires a runtime with a custom shutdown watcher".into(),
+        ))
     }
 
     /// 获取服务引用
     pub fn service(&self) -> Arc<PingoraProxyService> {
         self.service.clone()
+    }
+}
+
+#[cfg(unix)]
+struct CoordinatedShutdown {
+    stopped: tokio::sync::watch::Receiver<bool>,
+}
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl pingora_core::server::ShutdownSignalWatch for CoordinatedShutdown {
+    async fn recv(&self) -> pingora_core::server::ShutdownSignal {
+        let mut stopped = self.stopped.clone();
+        while !*stopped.borrow_and_update() {
+            if stopped.changed().await.is_err() {
+                break;
+            }
+        }
+        pingora_core::server::ShutdownSignal::GracefulTerminate
     }
 }
 
@@ -406,8 +455,7 @@ mod tests {
             .service
             .add_app_backend("coldcase", backend_addr.port(), backend_host.clone());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        drop(shutdown_tx);
-        manager.start(shutdown_rx).await.expect("start local proxy");
+        let proxy_task = tokio::spawn(async move { manager.start(shutdown_rx).await });
 
         let mut downstream = None;
         for _ in 0..100 {
@@ -510,6 +558,8 @@ mod tests {
             "{text}"
         );
         assert!(started.elapsed() >= Duration::from_secs(3));
+        shutdown_tx.send(()).unwrap();
+        proxy_task.await.unwrap().unwrap();
         #[cfg(feature = "deploy-host")]
         shared_types::published::unregister(&backend_host);
     }
@@ -566,8 +616,7 @@ mod tests {
             .service
             .add_app_backend("coldcase", backend_addr.port(), backend_host.clone());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        drop(shutdown_tx);
-        manager.start(shutdown_rx).await.expect("start local proxy");
+        let proxy_task = tokio::spawn(async move { manager.start(shutdown_rx).await });
 
         let mut listener_ready = None;
         for _ in 0..100 {
@@ -648,6 +697,8 @@ mod tests {
             .map(|(_, body)| body)
             .unwrap_or_default();
         assert!(body.is_empty(), "HEAD must not carry a body: {body}");
+        shutdown_tx.send(()).unwrap();
+        proxy_task.await.unwrap().unwrap();
     }
 
     /// 失败顾问桩：可控的来源确认 + 就绪状态。
@@ -738,8 +789,8 @@ mod tests {
             status: shared_types::UserAppReadinessStatus::Starting,
         }));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        drop(shutdown_tx);
-        manager.start(shutdown_rx).await.expect("start proxy");
+        let control_service = manager.service();
+        let proxy_task = tokio::spawn(async move { manager.start(shutdown_rx).await });
         for _ in 0..100 {
             if tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
                 .await
@@ -810,7 +861,7 @@ mod tests {
         );
 
         // 2) 未确认来源（custom/旧配置）→ 原响应原样透传（正文与标记头保留）。
-        manager.service.set_failure_advisor(Arc::new(StubAdvisor {
+        control_service.set_failure_advisor(Arc::new(StubAdvisor {
             confirmed: false,
             status: shared_types::UserAppReadinessStatus::Starting,
         }));
@@ -827,5 +878,123 @@ mod tests {
             passthrough.to_ascii_lowercase().contains("x-pingap-etype"),
             "unconfirmed origin keeps the marker header: {passthrough}"
         );
+        shutdown_tx.send(()).unwrap();
+        proxy_task.await.unwrap().unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod embedded_shutdown_tests {
+    use super::*;
+    #[tokio::test]
+    async fn embedded_pingora_shutdown_confirms_listener_exit() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let manager = PingoraServerManager::new(ProxyConfig::with_listen_port(port));
+        let (stop, stopping) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut manager = manager;
+            manager.start(stopping).await
+        });
+        let mut ready = false;
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(ready, "isolated proxy never listened");
+        stop.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err(),
+            "successful shutdown detached a live proxy listener"
+        );
+    }
+}
+
+#[cfg(test)]
+mod implementation_probe_timeout_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct ProbeTimeoutControl(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl shared_types::AppWakeControl for ProbeTimeoutControl {
+        fn is_stopped(&self, _: &str) -> bool {
+            false
+        }
+        fn wake_timeout(&self) -> std::time::Duration {
+            std::time::Duration::from_millis(100)
+        }
+        async fn remote_wake_pending(&self, _: &str) -> bool {
+            std::future::pending().await
+        }
+        async fn ensure_running(&self, _: &str) -> shared_types::WakeOutcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("read-only probe timeout must not authorize wake")
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_status_probe_timeout_keeps_runtime_timeout_and_never_wakes() {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve proxy");
+        let port = reservation.local_addr().expect("address").port();
+        drop(reservation);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut manager = PingoraServerManager::new(ProxyConfig::with_listen_port(port))
+            .with_wake_control(Arc::new(ProbeTimeoutControl(calls.clone())));
+        manager
+            .service
+            .set_error_pages(Arc::new(crate::error_page::ErrorPageRenderer::new(None)));
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(async move { manager.start(stopped).await });
+        let mut listening = false;
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                listening = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(listening, "isolated proxy never listened");
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        stream.write_all(b"GET /api/v1/userapp/proxy/app/prod/u1/probecase/assets/app.js HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Dest: empty\r\nAccept: application/json\r\nConnection: close\r\n\r\n").await.expect("request");
+        let mut bytes = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut bytes),
+        )
+        .await
+        .expect("response deadline")
+        .expect("response");
+        stop.send(()).expect("stop isolated proxy");
+        task.await.expect("join proxy").expect("proxy shutdown");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "read-only failure cannot authorize wake"
+        );
+        let response = String::from_utf8_lossy(&bytes);
+        assert!(response.starts_with("HTTP/1.1 504"), "{response}");
+        assert!(response.contains("ERR_RUNTIME_TIMEOUT"), "{response}");
+        assert!(response.contains("wake_runtime_probe"), "{response}");
     }
 }

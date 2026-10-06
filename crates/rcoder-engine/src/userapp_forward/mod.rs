@@ -14,6 +14,7 @@
 pub mod db;
 mod db_password;
 mod error_body;
+pub(crate) mod file_credentials;
 pub mod forward;
 pub(crate) mod semantics;
 pub(crate) mod upstream;
@@ -31,6 +32,10 @@ use crate::app_state::AppState;
 // （与 pod 族接口单一词表；userapp 业务域在受理层结合 app_stage 推导容器形态）。
 pub use forward::computer_intercept;
 pub(crate) use upstream::invalidate_probe_cache;
+
+/// Resolve the existing file-peer token from platform and target configuration.
+/// This performs configuration reads only and does not require AppService.
+pub use file_credentials::credentials as file_server_request_credentials;
 
 /// 容器 file-server 对外接口的**显式透传清单**（全路径；handler 统一复用
 /// [`forward::forward_userapp`]，method/path/query/body 原样流式转发，容器侧
@@ -209,7 +214,11 @@ pub fn routes() -> Router<Arc<AppState>> {
 /// 全新容器的 file-server 有启动窗口（镜像全套 agent_runner+PG+file-server），
 /// 连接类失败按 5s/10s/15s 退避重试（HTTP 4xx/5xx 业务错误不重试，直接上抛）。
 /// 错误返回面向日志的描述串（调用方各自映射响应类型）。
-pub async fn ensure_workspace_via_dev(addr: &str, app_id: &str) -> Result<(), String> {
+pub async fn ensure_workspace_via_dev(
+    addr: &str,
+    app_id: &str,
+    credentials: &shared_types::FileServerRequestCredentials,
+) -> Result<(), shared_types::AppError> {
     // 五档退避最坏 120s：agent_runner(file-server 60000) 在宿主高负载（多 builder 并发
     // 构建/对话）下启动可超 30s——原三档 30s 上限在 e2e 六场景并行时实测不够
     // （后发容器被先发容器负载拖慢 → 60000 连接失败）。
@@ -220,7 +229,10 @@ pub async fn ensure_workspace_via_dev(addr: &str, app_id: &str) -> Result<(), St
     const TOTAL_BUDGET_SECS: u64 = 150;
     let deadline =
         tokio::time::Instant::now() + tokio::time::Duration::from_secs(TOTAL_BUDGET_SECS);
-    let mut last_err = String::new();
+    let mut last_err = shared_types::AppError::with_message(
+        shared_types::ERR_RUNTIME_TIMEOUT,
+        "Workspace preparation deadline exceeded",
+    );
     for (attempt, delay) in std::iter::once(0u64)
         .chain(BACKOFF_SECS.iter().copied())
         .enumerate()
@@ -239,32 +251,148 @@ pub async fn ensure_workspace_via_dev(addr: &str, app_id: &str) -> Result<(), St
             );
             tokio::time::sleep(sleep).await;
         }
-        let resp = crate::http_client::shared_client()
-            .post(format!("{addr}/api/v1/userapp/ensure-workspace"))
-            .timeout(std::time::Duration::from_secs(30))
-            .json(&serde_json::json!({"app_id": app_id}))
+        let resp = credentials
+            .apply(
+                crate::http_client::shared_client()
+                    .post(format!("{addr}/api/v1/userapp/ensure-workspace"))
+                    .timeout(
+                        std::time::Duration::from_secs(30)
+                            .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                    )
+                    .json(&serde_json::json!({"app_id": app_id})),
+            )
             .send()
             .await;
         match resp {
-            Ok(resp) if resp.status().is_success() => return Ok(()),
             Ok(resp) => {
-                // 业务错误（4xx/5xx 响应）重试无益，直接上抛
                 let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(format!("ensure-workspace returned {status}: {text}"));
+                let body = resp.json::<serde_json::Value>().await.map_err(|_| {
+                    shared_types::AppError::with_message(
+                        shared_types::ERR_CONTAINER_EXEC_FAILED,
+                        "Workspace preparation returned an invalid response",
+                    )
+                    .with_error_detail(shared_types::ErrorDetail::new(
+                        shared_types::ERR_CONTAINER_EXEC_FAILED,
+                        "ensure_workspace_response",
+                        format!("HTTP {status}: invalid JSON response"),
+                    ))
+                })?;
+                return workspace_response_result(status, body);
             }
-            Err(e) => {
-                last_err = format!("dev container ensure-workspace failed: {e}");
+            Err(error) => {
+                let code = if error.is_timeout() {
+                    shared_types::ERR_RUNTIME_TIMEOUT
+                } else {
+                    shared_types::ERR_RUNTIME_UNAVAILABLE
+                };
+                last_err = shared_types::AppError::with_message(
+                    code,
+                    format!("Workspace preparation request failed: {error}"),
+                )
+                .with_error_detail(
+                    shared_types::ErrorDetail::new(
+                        code,
+                        "ensure_workspace_transport",
+                        error.to_string(),
+                    )
+                    .with_retryable(true),
+                );
             }
         }
     }
     Err(last_err)
 }
 
+fn workspace_response_result(
+    status: axum::http::StatusCode,
+    body: serde_json::Value,
+) -> Result<(), shared_types::AppError> {
+    if status.is_success() && body.get("success").and_then(serde_json::Value::as_bool) == Some(true)
+    {
+        return Ok(());
+    }
+    let code = body
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .filter(|code| code.starts_with("ERR_"))
+        .unwrap_or(if status == axum::http::StatusCode::SERVICE_UNAVAILABLE {
+            shared_types::ERR_RUNTIME_UNAVAILABLE
+        } else if status == axum::http::StatusCode::GATEWAY_TIMEOUT {
+            shared_types::ERR_RUNTIME_TIMEOUT
+        } else {
+            shared_types::ERR_CONTAINER_EXEC_FAILED
+        });
+    let message = body
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Workspace preparation was rejected");
+    let detail = body
+        .get("error_detail")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<shared_types::ErrorDetail>(value).ok())
+        .unwrap_or_else(|| {
+            shared_types::ErrorDetail::new(
+                code,
+                "ensure_workspace_response",
+                format!("HTTP {status}: {message}"),
+            )
+        });
+    let mut error = shared_types::AppError::with_message(code, message).with_error_detail(detail);
+    if let Some(operation_id) = body.get("operation_id").and_then(serde_json::Value::as_str) {
+        error = error.with_operation_id(operation_id.into());
+    }
+    if let Some(blocker) = body
+        .get("blocker")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+    {
+        error = error.with_blocker(blocker);
+    }
+    Err(error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::workspace::CreateWorkspaceBody;
     use super::*;
+
+    #[tokio::test]
+    async fn ensure_workspace_rejects_http_200_business_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture bind");
+        let address = listener.local_addr().expect("fixture addr");
+        let router = Router::new().route("/api/v1/userapp/ensure-workspace", post(|| async {
+            axum::Json(serde_json::json!({"success": false, "code": "ERR_VALIDATION", "message": "Invalid workspace root"}))
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("fixture serve");
+        });
+        let result = ensure_workspace_via_dev(
+            &format!("http://{address}"),
+            "fixtureapp",
+            &shared_types::FileServerRequestCredentials::default(),
+        )
+        .await;
+        server.abort();
+        drop(server.await);
+        assert!(
+            result.is_err(),
+            "HTTP 200 success=false must not be reported as workspace ready: {result:?}"
+        );
+    }
+    #[test]
+    fn workspace_business_failure_preserves_original_diagnostic_and_operation() {
+        let error = workspace_response_result(axum::http::StatusCode::OK, serde_json::json!({
+            "success": false, "code": shared_types::ERR_VALIDATION, "message": "Invalid project root",
+            "operation_id": "original-workspace", "error_detail": {
+                "reason_code": shared_types::ERR_VALIDATION, "stage": "workspace_preflight", "detail": "Missing directory", "hint": "Fix directory", "retryable": false
+            }
+        })).unwrap_err().into_http_result::<()>("en-US");
+        assert_eq!(error.code, shared_types::ERR_VALIDATION);
+        assert_eq!(error.operation_id.as_deref(), Some("original-workspace"));
+        assert_eq!(error.error_detail.unwrap().stage, "workspace_preflight");
+    }
 
     #[test]
     fn create_workspace_body_is_snake_case() {
@@ -354,5 +482,47 @@ mod tests {
                 "new-endpoint path not in pass-through table (unroutable): {path}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod implementation_http_credential_baseline_tests {
+    use super::*;
+    use axum::{
+        Json, Router,
+        http::{HeaderMap, StatusCode},
+        routing::post,
+    };
+    #[tokio::test]
+    async fn workspace_call_reaches_target_requiring_configured_credentials() {
+        // Explicit configured file-peer credentials: the existing FILE_SERVER_PROXY_TOKEN channel
+        // configures the real file peer. The approved fix passes its resolved
+        // value explicitly at the internal call boundary. This file peer does
+        // not implement RCoder's independent x-api-key control-plane protocol.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new().route("/api/v1/userapp/ensure-workspace", post(|headers: HeaderMap| async move {
+            if headers.get("x-proxy-token").and_then(|v| v.to_str().ok()) == Some("fixture-file-token") {
+                (StatusCode::OK, Json(serde_json::json!({"success":true})))
+            } else {
+                (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"success":false,"code":"4010","message":"missing configured credentials"})))
+            }
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let result = ensure_workspace_via_dev(
+            &format!("http://{address}"),
+            "fixtureapp",
+            &shared_types::FileServerRequestCredentials {
+                proxy_token: Some("fixture-file-token".into()),
+            },
+        )
+        .await;
+        server.abort();
+        assert!(
+            result.is_ok(),
+            "the production workspace request must carry the explicitly configured file token: {result:?}"
+        );
     }
 }

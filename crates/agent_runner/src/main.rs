@@ -321,7 +321,7 @@ async fn agent_runner_run(cli_args: CliArgs) -> anyhow::Result<()> {
         };
 
         // 🔥 3. 启动 HTTP 服务器（内部会启动 Pingora）
-        let _handle = start_http_server(http_config).await?;
+        let http_handle = start_http_server(http_config).await?;
 
         // 🔥 3.5 可选：内嵌 file-server (RCODER_EMBED_FILE_SERVER=true)
         //         路由 merge 进 8086 主服务（create_router 内按开关注入）；
@@ -376,6 +376,7 @@ async fn agent_runner_run(cli_args: CliArgs) -> anyhow::Result<()> {
             info!("Received shutdown signal, preparing graceful shutdown...");
         }
 
+        http_handle.stop().await?;
         Ok(())
     }
 
@@ -522,7 +523,7 @@ async fn agent_runner_run(cli_args: CliArgs) -> anyhow::Result<()> {
         // 停止 Pingora 服务
         #[cfg(feature = "proxy")]
         if let Some(mut result) = pingora_result {
-            result.stop().await;
+            result.stop().await?;
         }
 
         #[cfg(not(feature = "proxy"))]

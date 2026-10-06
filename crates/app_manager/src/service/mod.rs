@@ -10,7 +10,10 @@
 
 use std::sync::Arc;
 mod control;
+mod file_credentials;
 mod operation_lock;
+mod operation_progress;
+pub(crate) mod restart_wait;
 pub(crate) use control::OwnedOperation;
 pub(crate) use operation_lock::AppOperationGuard;
 
@@ -29,6 +32,8 @@ use super::utils::*;
 
 /// 应用管理服务（Docker / K8s 统一）
 pub struct AppService {
+    pub(crate) file_credentials:
+        std::sync::OnceLock<Arc<dyn shared_types::FileServerCredentialsProvider>>,
     pub(crate) operation_flight: Arc<shared_types::OperationFlightGate>,
     pub(crate) config: AppManagerConfig,
     /// ISP 收紧 (阶段3): app_manager 只需 workspace (B) + Userapp Deployment (C) 能力,
@@ -102,6 +107,11 @@ impl AppService {
         pingora: Option<Arc<PingoraProxyService>>,
         store: Arc<dyn shared_types::UserAppLifecycleStore>,
     ) -> AppResult<Self> {
+        if let Err(error) =
+            crate::config::validate_restart_admission_wait_secs(config.restart_admission_wait_secs)
+        {
+            return Err(AppOperationError::Validation(error.to_string()));
+        }
         if config.access_mode == AppAccessMode::Docker
             && config.operation_lock_root != crate::config::default_operation_lock_root()
         {
@@ -132,6 +142,7 @@ impl AppService {
 
         let svc = Self {
             operation_flight: Arc::default(),
+            file_credentials: std::sync::OnceLock::new(),
             config,
             runtime,
             activity,
@@ -211,49 +222,13 @@ impl AppService {
     /// 以 scope 哨兵 blocker 表达（operation_id 为空——诚实标记"持锁
     /// 但持久身份尚未可见"）。不等待锁、不旁路互斥。
     async fn prod_lock_conflict(&self, app_id: &str) -> AppOperationError {
-        match self.get_current_operations(app_id).await {
-            Ok(operations) => {
-                // Prod 槽优先；无则 Application 槽（它同样持有该执行权）
-                if let Some(blocker) = operations
-                    .iter()
-                    .find(|view| view.scope == shared_types::UserAppOperationScope::Prod)
-                    .or_else(|| {
-                        operations.iter().find(|view| {
-                            view.scope == shared_types::UserAppOperationScope::Application
-                        })
-                    })
-                {
-                    return AppOperationError::ConflictBlocked {
-                        message: "application operation is in progress".into(),
-                        blocker: shared_types::UserAppOperationBlocker {
-                            scope: blocker.scope,
-                            operation_id: blocker.operation_id.clone(),
-                            kind: blocker.kind,
-                            state: blocker.state,
-                            step: blocker.step.clone(),
-                        },
-                    };
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    app_id,
-                    "query durable blocker for prod lock conflict failed: {error}"
-                );
-            }
-        }
-        // admission 窗口（持锁但 durable 记录尚未提交）或查询失败：
-        // scope 哨兵——identity 留空，不虚构
-        AppOperationError::ConflictBlocked {
-            message: "application operation is in progress (admission in flight)".into(),
-            blocker: shared_types::UserAppOperationBlocker {
-                scope: shared_types::UserAppOperationScope::Prod,
-                operation_id: String::new(),
-                kind: shared_types::UserAppOperationKind::Start,
-                state: shared_types::UserAppOperationState::Pending,
-                step: "acquiring".into(),
-            },
-        }
+        self.operation_lock_conflict_scoped(
+            app_id,
+            shared_types::UserAppOperationScope::Prod,
+            None,
+            None,
+        )
+        .await
     }
 
     /// 锁条目无人持有（strong_count==1，仅 map 自身）时移除，防 DashMap 无界增长。
@@ -273,6 +248,9 @@ impl AppService {
 // list/query/get/update/delete 编排实现拆至 lifecycle/{query,update}.rs（extension-impl）。
 #[async_trait::async_trait]
 impl super::AppServiceTrait for AppService {
+    fn restart_admission_wait_secs(&self) -> u64 {
+        self.config.restart_admission_wait_secs
+    }
     async fn verify_recovered_storage(
         &self,
         app_id: &str,
@@ -595,6 +573,15 @@ impl super::AppServiceTrait for AppService {
         self.readiness_reader()
     }
 
+    async fn file_request_credentials(
+        &self,
+        stage: shared_types::UserappStage,
+        app_id: &str,
+        deadline: tokio::time::Instant,
+    ) -> AppResult<shared_types::FileServerRequestCredentials> {
+        AppService::file_request_credentials(self, stage, app_id, deadline).await
+    }
+
     async fn log_api_base(
         &self,
         app_stage: shared_types::UserappStage,
@@ -653,5 +640,7 @@ impl super::AppServiceTrait for AppService {
     }
 }
 
+#[cfg(test)]
+mod restart_wait_tests;
 #[cfg(test)]
 mod tests;
