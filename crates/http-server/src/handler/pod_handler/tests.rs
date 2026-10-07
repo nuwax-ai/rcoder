@@ -326,14 +326,14 @@ fn userapp_query_deserializes_with_three_field_form() {
 
 #[cfg(feature = "userapp-turso")]
 mod compute_error_route_tests {
-    use super::super::{pod_restart, pod_stop};
+    use super::super::{pod_compute_operation, pod_restart, pod_stop};
     use arc_swap::ArcSwap;
     use async_trait::async_trait;
     use axum::{
         Router,
         body::{Body, to_bytes},
         http::{Request, StatusCode},
-        routing::post,
+        routing::{get, post},
     };
     use container_runtime_api::{
         AgentContainerRuntime, ContainerCreateParams, ContainerRuntimeError,
@@ -349,7 +349,7 @@ mod compute_error_route_tests {
     };
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use tower::ServiceExt as _;
 
@@ -359,6 +359,7 @@ mod compute_error_route_tests {
     #[derive(Default)]
     struct ReadOnlyRuntime {
         writes: AtomicUsize,
+        discovery_fails: AtomicBool,
     }
     #[async_trait]
     impl AgentContainerRuntime for ReadOnlyRuntime {
@@ -439,6 +440,11 @@ mod compute_error_route_tests {
             &self,
             _: &str,
         ) -> ContainerRuntimeResult<Option<shared_types::UserAppDiscoveredIdentity>> {
+            if self.discovery_fails.load(Ordering::SeqCst) {
+                return Err(ContainerRuntimeError::ConnectionError(
+                    "controlled identity connection failure".into(),
+                ));
+            }
             Ok(None)
         }
         async fn prepare_compute_operation(
@@ -577,6 +583,17 @@ mod compute_error_route_tests {
             lifecycle_id: &str,
             request_id: &str,
         ) -> (StatusCode, serde_json::Value) {
+            self.request_for(route, "routeapp", "dev", lifecycle_id, request_id)
+                .await
+        }
+        async fn request_for(
+            &self,
+            route: &str,
+            app_id: &str,
+            stage: &str,
+            lifecycle_id: &str,
+            request_id: &str,
+        ) -> (StatusCode, serde_json::Value) {
             let router = Router::new()
                 .route("/computer/pod/restart", post(pod_restart))
                 .route("/computer/pod/stop", post(pod_stop))
@@ -588,7 +605,7 @@ mod compute_error_route_tests {
                         .header("accept-language", "en-US")
                         .body(Body::from(
                             serde_json::json!({
-                                "app_id": "routeapp", "app_stage": "dev", "service_type": "userapp",
+                                "app_id": app_id, "app_stage": stage, "service_type": "userapp",
                                 "lifecycle_id": lifecycle_id, "request_id": request_id,
                             })
                             .to_string(),
@@ -626,6 +643,114 @@ mod compute_error_route_tests {
                 "rejection must not dispatch physical writes"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn compute_route_missing_application_preserves_app_not_found_without_creation() {
+        for (route, stage) in [
+            ("/computer/pod/stop", "dev"),
+            ("/computer/pod/stop", "prod"),
+            ("/computer/pod/restart", "prod"),
+        ] {
+            let fixture = Fixture::new().await;
+            let before = fixture.snapshot().await;
+            let (status, body) = fixture
+                .request_for(
+                    route,
+                    "missingapp",
+                    stage,
+                    "missing-lifecycle",
+                    "missing-app-request",
+                )
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert_eq!(body["code"], shared_types::ERR_APP_NOT_FOUND, "{body}");
+            assert_eq!(body["success"], false);
+            assert!(body.get("operation_id").is_none());
+            assert!(
+                fixture
+                    .store
+                    .get_application("missingapp")
+                    .await
+                    .expect("authoritative read")
+                    .is_none(),
+                "a missing application must not be created by rejected control"
+            );
+            fixture.unchanged(&before).await;
+            fixture.store.shutdown().await.expect("close");
+        }
+    }
+
+    #[tokio::test]
+    async fn compute_route_identity_query_failure_is_not_application_absence() {
+        for (route, stage) in [
+            ("/computer/pod/stop", "dev"),
+            ("/computer/pod/stop", "prod"),
+            ("/computer/pod/restart", "prod"),
+        ] {
+            let fixture = Fixture::new().await;
+            let before = fixture.snapshot().await;
+            fixture
+                .runtime
+                .discovery_fails
+                .store(true, Ordering::SeqCst);
+            let (status, body) = fixture
+                .request_for(
+                    route,
+                    "missingapp",
+                    stage,
+                    "missing-lifecycle",
+                    "query-failure-request",
+                )
+                .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+            assert_eq!(
+                body["code"],
+                shared_types::ERR_RUNTIME_UNAVAILABLE,
+                "{body}"
+            );
+            assert_eq!(body["success"], false);
+            assert!(body.get("operation_id").is_none());
+            assert!(
+                fixture
+                    .store
+                    .get_application("missingapp")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            fixture.unchanged(&before).await;
+            fixture.store.shutdown().await.expect("close");
+        }
+    }
+
+    #[tokio::test]
+    async fn compute_route_missing_operation_keeps_operation_not_found() {
+        let fixture = Fixture::new().await;
+        let before = fixture.snapshot().await;
+        let router = Router::new()
+            .route(
+                "/computer/pod/operations/{app_id}/{operation_id}",
+                get(pod_compute_operation),
+            )
+            .with_state(fixture.state.clone());
+        let response = router
+            .oneshot(
+                Request::get("/computer/pod/operations/routeapp/missing-operation")
+                    .header("accept-language", "en-US")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], shared_types::ERR_NOT_FOUND, "{body}");
+        assert_eq!(body["success"], false);
+        assert!(body.get("operation_id").is_none());
+        fixture.unchanged(&before).await;
+        fixture.store.shutdown().await.expect("close");
     }
 
     #[tokio::test]

@@ -109,7 +109,9 @@ async fn submit_with_image_policy(
     }
     let app = super::adoption::discover_missing_identity(state, &app_id)
         .await?
-        .ok_or(UserAppStoreError::NotFound)?;
+        .ok_or_else(|| {
+            app_manager::AppOperationError::NotFound(format!("Application {app_id} was not found"))
+        })?;
     if app.state != UserAppLifecycleState::Active {
         return Err(UserAppStoreError::LifecycleConflict.into());
     }
