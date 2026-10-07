@@ -53,6 +53,8 @@ pub(crate) mod k8s_app_observation;
 #[cfg(feature = "kubernetes")]
 mod k8s_app_operation;
 #[cfg(feature = "kubernetes")]
+mod k8s_app_pod;
+#[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_app_query;
 #[cfg(feature = "kubernetes")]
 mod k8s_app_restart;

@@ -51,15 +51,22 @@ pub use storage::*;
 /// 直接转换——错误码在 service 抛出点确定（Fail Fast），无需 downcast / 字符串匹配。
 impl From<crate::error::AppOperationError> for shared_types::AppError {
     fn from(e: crate::error::AppOperationError) -> Self {
+        Self::from(&e)
+    }
+}
+
+impl From<&crate::error::AppOperationError> for shared_types::AppError {
+    fn from(e: &crate::error::AppOperationError) -> Self {
         let in_progress_data = e.operation_in_progress_data();
         let message = e.message().to_string();
         let e_code = e.code().to_owned();
         let error = shared_types::AppError::with_message(&e_code, message.clone());
         let mapped = match e {
             crate::error::AppOperationError::CredentialApplication {
-                diagnostic: Some(mut detail),
+                diagnostic: Some(detail),
                 ..
             } => {
+                let mut detail = (**detail).clone();
                 detail.code = e_code.into();
                 detail.retryable = false;
                 detail.into_app_error()
@@ -67,7 +74,7 @@ impl From<crate::error::AppOperationError> for shared_types::AppError {
             crate::error::AppOperationError::CredentialApplication { mutation, .. } => error
                 .with_error_detail(
                     shared_types::ErrorDetail::new(
-                        if mutation == shared_types::CredentialMutationEvidence::NotAttempted {
+                        if *mutation == shared_types::CredentialMutationEvidence::NotAttempted {
                             shared_types::ERR_DATABASE_COMMAND_FAILED
                         } else {
                             shared_types::ERR_OPERATION_OUTCOME_UNKNOWN
@@ -77,18 +84,18 @@ impl From<crate::error::AppOperationError> for shared_types::AppError {
                     )
                     .with_retryable(false),
                 ),
-            crate::error::AppOperationError::Diagnostic(detail) => detail.into_app_error(),
+            crate::error::AppOperationError::Diagnostic(detail) => detail.clone().into_app_error(),
             crate::error::AppOperationError::Operation {
                 operation_id,
                 source,
-            } => Self::from(*source).with_operation_id(operation_id),
+            } => Self::from(source.as_ref()).with_operation_id(operation_id.clone()),
             crate::error::AppOperationError::ConflictBlocked { blocker, .. } => {
-                error.with_blocker(blocker)
+                error.with_blocker(blocker.clone())
             }
             crate::error::AppOperationError::OperationInProgress { blocker, data, .. } => {
-                let error = error.with_operation_in_progress_data(*data);
+                let error = error.with_operation_in_progress_data((**data).clone());
                 match blocker {
-                    Some(blocker) => error.with_blocker(*blocker),
+                    Some(blocker) => error.with_blocker((**blocker).clone()),
                     None => error,
                 }
             }

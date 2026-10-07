@@ -86,10 +86,10 @@ fn store_error(error: UserAppStoreError) -> AppError {
         UserAppStoreError::VersionConflict => AppError::conflict(
             "Application operation revision changed; reload the original operation",
         ),
+        UserAppStoreError::RequestReplayConflict(message) => AppError::conflict(&message),
         UserAppStoreError::OperationInProgress(blocker) => {
-            AppError::conflict("A conflicting application operation is in progress")
-                .with_operation_id(blocker.operation_id.clone())
-                .with_blocker(blocker)
+            app_manager::AppOperationError::from(UserAppStoreError::OperationInProgress(blocker))
+                .into()
         }
         UserAppStoreError::InvalidOperation(message) => AppError::bad_request(&message),
         // Driver diagnostics can include a failed row. Never return or log private
@@ -854,6 +854,21 @@ mod tests {
         assert_eq!(blocker.state, UserAppOperationState::RecoveryRequired);
         assert_eq!(blocker.scope, UserAppOperationScope::Prod);
         assert!(!format!("{op:?}").contains("private_marker"));
+    }
+
+    #[test]
+    fn password_store_live_holder_preserves_busy_identity_without_admitting_caller() {
+        let mut operation = completed();
+        operation.state = UserAppOperationState::Running;
+        operation.step = "password_prepared".into();
+        let error = store_error(UserAppStoreError::OperationInProgress(operation.blocker()));
+        let body = serde_json::to_value(error.into_http_result::<()>("en-US")).unwrap();
+        assert_eq!(body["code"], "ERR_OPERATION_IN_PROGRESS");
+        assert_eq!(body["data"]["holder_operation_id"], operation.operation_id);
+        assert_eq!(body["data"]["holder_traffic_wake"], false);
+        assert_eq!(body["data"]["retryable"], false);
+        assert_eq!(body["data"]["retry_after_seconds"], 0);
+        assert!(body.get("operation_id").is_none());
     }
     #[test]
     fn password_recovery_rejects_stale_foreign_and_legacy_evidence() {

@@ -341,6 +341,9 @@ async fn within_builder_deadline<T>(
 /// Preserve typed lifecycle failures through anyhow context into HTTP envelopes.
 /// Never classify an operation by searching its formatted error text.
 pub fn control_error(error: &anyhow::Error) -> shared_types::AppError {
+    if let Some(operation) = error.downcast_ref::<app_manager::AppOperationError>() {
+        return shared_types::AppError::from(operation);
+    }
     if let Some(unknown) = error.downcast_ref::<shared_types::OperationOutcomeUnknown>() {
         let code = shared_types::ERR_OPERATION_OUTCOME_UNKNOWN;
         return shared_types::AppError::with_message(code, &unknown.detail).with_error_detail(
@@ -366,25 +369,20 @@ pub fn control_error(error: &anyhow::Error) -> shared_types::AppError {
     if let Some(timeout) = error.downcast_ref::<shared_types::UserAppWaitTimeout>() {
         return shared_types::AppError::from(timeout);
     }
-    if let Some(shared_types::UserAppStoreError::OperationInProgress(blocker)) =
-        error.downcast_ref::<shared_types::UserAppStoreError>()
-    {
-        // step-E 观测：Java 信封会丢弃 blocker 字段（blocker-envelope-java-handoff），
-        // 这里保证阻塞者身份在 rcoder 日志可查（排障不再依赖响应体）。
-        tracing::warn!(
-            blocker_operation_id = %blocker.operation_id,
-            blocker_kind = ?blocker.kind,
-            blocker_state = ?blocker.state,
-            blocker_step = %blocker.step,
-            blocker_scope = ?blocker.scope,
-            "Application operation conflict: admission blocked by an in-flight operation"
-        );
-        return shared_types::AppError::with_message(
-            shared_types::error_codes::ERR_CONFLICT,
-            "A conflicting application operation is in progress",
-        )
-        .with_operation_id(blocker.operation_id.clone())
-        .with_blocker(blocker.clone());
+    if let Some(store_error) = error.downcast_ref::<shared_types::UserAppStoreError>() {
+        if let shared_types::UserAppStoreError::OperationInProgress(blocker) = store_error {
+            tracing::warn!(
+                blocker_operation_id = %blocker.operation_id,
+                blocker_kind = ?blocker.kind,
+                blocker_state = ?blocker.state,
+                blocker_step = %blocker.step,
+                blocker_scope = ?blocker.scope,
+                "Application operation conflict: admission blocked by an in-flight operation"
+            );
+        }
+        // The blocker remains observational evidence in blocker/data. It does
+        // not create an accepted operation_id for this rejected caller.
+        return app_manager::AppOperationError::from(store_error).into();
     }
     if let Some(runtime) = error.downcast_ref::<container_runtime_api::ContainerRuntimeError>() {
         return container_runtime_api::runtime_app_error(
@@ -970,8 +968,15 @@ mod control_error_tests {
         let response = control_error(&error).into_response();
         let body = to_bytes(response.into_body(), 4096).await.expect("body");
         let envelope: serde_json::Value = serde_json::from_slice(&body).expect("json");
-        assert_eq!(envelope["code"], shared_types::error_codes::ERR_CONFLICT);
-        assert_eq!(envelope["operation_id"], "owner-operation");
+        assert_eq!(
+            envelope["code"],
+            shared_types::error_codes::ERR_OPERATION_IN_PROGRESS
+        );
+        assert_eq!(envelope["blocker"]["operation_id"], "owner-operation");
+        assert_eq!(envelope["data"]["holder_operation_id"], "owner-operation");
+        assert_eq!(envelope["data"]["retryable"], false);
+        assert_eq!(envelope["data"]["retry_after_seconds"], 0);
+        assert!(envelope.get("operation_id").is_none());
         let text_only = anyhow::anyhow!("Application operation in progress: owner-operation");
         let response = control_error(&text_only).into_response();
         let body = to_bytes(response.into_body(), 4096).await.expect("body");
@@ -981,6 +986,234 @@ mod control_error_tests {
             shared_types::error_codes::ERR_BACKEND_ERROR
         );
         assert!(envelope.get("operation_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn wrapped_typed_store_errors_preserve_their_existing_classification() {
+        for (cause, expected) in [
+            (
+                shared_types::UserAppStoreError::OwnershipConflict,
+                shared_types::ERR_CONFLICT,
+            ),
+            (
+                shared_types::UserAppStoreError::LifecycleConflict,
+                shared_types::ERR_CONFLICT,
+            ),
+            (
+                shared_types::UserAppStoreError::VersionConflict,
+                shared_types::ERR_CONFLICT,
+            ),
+            (
+                shared_types::UserAppStoreError::InvalidOperation("invalid scope".into()),
+                shared_types::ERR_INVALID_STATE,
+            ),
+        ] {
+            let error = anyhow::Error::new(cause).context("compute admission");
+            let response = control_error(&error).into_response();
+            assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+            let body = to_bytes(response.into_body(), 4096).await.expect("body");
+            let envelope: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(envelope["code"], expected);
+            assert_eq!(envelope["success"], false);
+            assert!(envelope.get("operation_id").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_or_replay_words_without_a_typed_cause_remain_backend_errors() {
+        for message in [
+            "Application lifecycle conflict",
+            "Invalid application operation: Compute request identity was reused with different input",
+        ] {
+            let error = anyhow::Error::msg(message).context("compute admission");
+            let response = control_error(&error).into_response();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+            let body = to_bytes(response.into_body(), 4096).await.expect("body");
+            let envelope: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(envelope["code"], shared_types::ERR_BACKEND_ERROR);
+            assert_eq!(envelope["success"], false);
+            assert!(envelope.get("operation_id").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_operation_conflict_preserves_code_and_original_cause_through_anyhow_context() {
+        let error = anyhow::Error::new(app_manager::AppOperationError::Conflict(
+            "Application lifecycle is no longer Active".into(),
+        ))
+        .context("discover_missing_identity for captured lifecycle");
+        let response = control_error(&error).into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), 8192).await.expect("body");
+        let envelope: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(envelope["code"], shared_types::ERR_CONFLICT);
+        assert_eq!(envelope["success"], false);
+        assert_eq!(
+            envelope["message"],
+            "Application lifecycle is no longer Active"
+        );
+        assert!(envelope.get("operation_id").is_none());
+        assert!(envelope.get("blocker").is_none());
+        assert!(envelope["data"].is_null());
+    }
+
+    #[tokio::test]
+    async fn direct_operation_diagnostic_preserves_unknown_outcome_original_child_and_parent_identity()
+     {
+        let blocker = shared_types::UserAppOperationBlocker {
+            scope: shared_types::UserAppOperationScope::Dev,
+            operation_id: "original-downstream-holder".into(),
+            kind: shared_types::UserAppOperationKind::StopBuilder,
+            state: shared_types::UserAppOperationState::Running,
+            step: "original_stop_write".into(),
+        };
+        let source = app_manager::AppOperationError::Operation {
+            operation_id: "accepted-parent-builder".into(),
+            source: Box::new(app_manager::AppOperationError::Diagnostic(
+                shared_types::WakeFailure {
+                    cause_code: shared_types::ERR_RUNTIME_TIMEOUT.into(),
+                    operation_id: Some("original-child-db-request".into()),
+                    blocker: Some(Box::new(blocker.clone())),
+                    command_diagnostic: Some(Box::new(shared_types::PgCommandDiagnostic {
+                        code: shared_types::ERR_RUNTIME_TIMEOUT.into(),
+                        operation_id: Some("original-child-db-request".into()),
+                        blocker: Some(blocker.clone()),
+                        error_detail: Some(
+                            shared_types::ErrorDetail::new(
+                                shared_types::ERR_RUNTIME_TIMEOUT,
+                                "original_db_write_response",
+                                "Original PostgreSQL command response was lost",
+                            )
+                            .with_task_id("original-db-diagnostic-task")
+                            .with_service_id("postgres")
+                            .with_retryable(true),
+                        ),
+                    })),
+                    ..shared_types::WakeFailure::new(
+                        shared_types::ERR_OPERATION_OUTCOME_UNKNOWN,
+                        "captured_parent_observation",
+                        "Original dispatched database write outcome is unknown",
+                    )
+                },
+            )),
+        };
+        let error = anyhow::Error::new(source).context("builder recovery readback");
+        let response = control_error(&error).into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = to_bytes(response.into_body(), 8192).await.expect("body");
+        let envelope: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            envelope["code"],
+            shared_types::ERR_OPERATION_OUTCOME_UNKNOWN
+        );
+        assert_eq!(envelope["operation_id"], "accepted-parent-builder");
+        assert_eq!(
+            envelope["blocker"],
+            serde_json::to_value(&blocker).expect("blocker")
+        );
+        assert_eq!(
+            envelope["error_detail"]["reason_code"],
+            shared_types::ERR_RUNTIME_TIMEOUT
+        );
+        assert_eq!(
+            envelope["error_detail"]["stage"],
+            "original_db_write_response"
+        );
+        assert_eq!(
+            envelope["error_detail"]["task_id"],
+            "original-db-diagnostic-task"
+        );
+        assert_eq!(envelope["error_detail"]["service_id"], "postgres");
+        assert_eq!(envelope["error_detail"]["retryable"], false);
+        assert_eq!(
+            envelope["error_detail"]["detail"],
+            "Original PostgreSQL command response was lost"
+        );
+        assert_eq!(
+            envelope["message"],
+            "Original dispatched database write outcome is unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_accepted_operation_preserves_its_holder_and_clamps_retry_without_mutating_cause()
+     {
+        let blocker = shared_types::UserAppOperationBlocker {
+            scope: shared_types::UserAppOperationScope::Dev,
+            operation_id: "real-holder-operation".into(),
+            kind: shared_types::UserAppOperationKind::RestartBuilder,
+            state: shared_types::UserAppOperationState::Running,
+            step: "captured_holder_step".into(),
+        };
+        let data = shared_types::OperationInProgressData::from_blocker(&blocker, false, true, 45);
+        let source = app_manager::AppOperationError::Operation {
+            operation_id: "already-admitted-builder".into(),
+            source: Box::new(app_manager::AppOperationError::OperationInProgress {
+                message: "Actual application holder blocks physical execution".into(),
+                blocker: Some(Box::new(blocker.clone())),
+                data: Box::new(data),
+            }),
+        };
+        let error = anyhow::Error::new(source).context("accepted builder continuation");
+        let response = control_error(&error).into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), 8192).await.expect("body");
+        let envelope: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(envelope["code"], shared_types::ERR_OPERATION_IN_PROGRESS);
+        assert_eq!(envelope["operation_id"], "already-admitted-builder");
+        assert_eq!(
+            envelope["blocker"],
+            serde_json::to_value(&blocker).expect("blocker")
+        );
+        assert_eq!(
+            envelope["data"]["holder_operation_id"],
+            "real-holder-operation"
+        );
+        assert_eq!(envelope["data"]["holder_step"], "captured_holder_step");
+        assert_eq!(envelope["data"]["retryable"], false);
+        assert_eq!(envelope["data"]["retry_after_seconds"], 0);
+        let original = error
+            .downcast_ref::<app_manager::AppOperationError>()
+            .expect("original cause");
+        match original.root_cause() {
+            app_manager::AppOperationError::OperationInProgress { data, .. } => {
+                assert!(
+                    data.retryable,
+                    "borrowed HTTP conversion must not alter the original producer evidence"
+                );
+                assert_eq!(data.retry_after_seconds, 45);
+            }
+            other => panic!("original operation type changed: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_operation_words_without_a_typed_cause_remain_backend_and_have_no_fabricated_identity()
+     {
+        for message in [
+            "[ERR_CONFLICT] Application lifecycle is no longer Active",
+            "[ERR_OPERATION_OUTCOME_UNKNOWN] Original dispatched database write outcome is unknown",
+            "Actual application holder blocks physical execution",
+        ] {
+            let error = anyhow::Error::msg(message).context("builder recovery readback");
+            let response = control_error(&error).into_response();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+            let body = to_bytes(response.into_body(), 8192).await.expect("body");
+            let envelope: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(envelope["code"], shared_types::ERR_BACKEND_ERROR);
+            assert!(envelope.get("operation_id").is_none());
+            assert!(envelope.get("blocker").is_none());
+            assert!(envelope["data"].is_null());
+        }
     }
 }
 

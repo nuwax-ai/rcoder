@@ -7,6 +7,10 @@ use tracing::{error, info, warn};
 use crate::config::AppConfig;
 use crate::utils;
 
+#[cfg(test)]
+#[path = "docker_init/prefix_tests.rs"]
+mod prefix_tests;
+
 pub async fn init_path_resolver(runtime_type: RuntimeType) -> anyhow::Result<()> {
     // deploy-host 宿主机形态：不做容器自检（宿主机无 /proc/self/cgroup），
     // 路径解析改"容器根→宿主机根"映射（默认 ~/.rcoder 约定，env 覆盖）。
@@ -280,22 +284,6 @@ pub async fn get_container_prefixes(config: &AppConfig) -> anyhow::Result<(Strin
     // KubernetesRuntime::service_container_prefix）——容器名反解必须与创建侧
     // 同源，否则前缀配置漂移时反解系统性失准。k8s 配置缺失的键回退
     // docker 多镜像链（compose 部署的主源，行为不变）。
-    let docker_config = config
-        .docker_config
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Docker config is required for container prefix"))?;
-    let multi_config = docker_config.get_multi_image_config();
-    let selector = docker_manager::image_selector::ImageSelector::new(multi_config);
-
-    let rcoder_cfg = selector
-        .get_service_config(&shared_types::ServiceType::WebAgentRunner)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to get RCoder service config: {e}"))?;
-    let computer_cfg = selector
-        .get_service_config(&shared_types::ServiceType::ComputerAgentRunner)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to get ComputerAgentRunner service config: {e}"))?;
-
     let k8s_rcoder = config
         .kubernetes_config
         .as_ref()
@@ -307,10 +295,41 @@ pub async fn get_container_prefixes(config: &AppConfig) -> anyhow::Result<(Strin
         .and_then(|k8s| k8s.get_service_config(&shared_types::ServiceType::ComputerAgentRunner))
         .map(|cfg| cfg.container_prefix().to_string());
 
-    Ok((
-        k8s_rcoder.unwrap_or_else(|| rcoder_cfg.container_prefix().to_string()),
-        k8s_computer.unwrap_or_else(|| computer_cfg.container_prefix().to_string()),
-    ))
+    match (k8s_rcoder, k8s_computer) {
+        (Some(rcoder), Some(computer)) => Ok((rcoder, computer)),
+        (rcoder, computer) => {
+            // Parse the existing Docker selector only when a K8s key is missing.
+            // An already-resolved K8s service never depends on an unused key.
+            let docker_config = config
+                .docker_config
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Docker config is required for container prefix"))?;
+            let selector = docker_manager::image_selector::ImageSelector::new(
+                docker_config.get_multi_image_config(),
+            );
+            let rcoder = match rcoder {
+                Some(prefix) => prefix,
+                None => selector
+                    .get_service_config(&shared_types::ServiceType::WebAgentRunner)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to get RCoder service config: {e}"))?
+                    .container_prefix()
+                    .to_string(),
+            };
+            let computer = match computer {
+                Some(prefix) => prefix,
+                None => selector
+                    .get_service_config(&shared_types::ServiceType::ComputerAgentRunner)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to get ComputerAgentRunner service config: {e}")
+                    })?
+                    .container_prefix()
+                    .to_string(),
+            };
+            Ok((rcoder, computer))
+        }
+    }
 }
 
 fn show_docker_configuration_help(socket_path: &str) {

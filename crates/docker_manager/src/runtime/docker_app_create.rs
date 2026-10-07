@@ -42,6 +42,7 @@ impl DockerRuntime {
     ) -> ContainerRuntimeResult<PreparedAppContainer> {
         use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
 
+        params.validate_execution_context()?;
         let app_id = params.project_id.clone().ok_or_else(|| {
             ContainerRuntimeError::ConfigurationError(
                 "create_deployment requires project_id (app_id)".to_string(),
@@ -98,6 +99,7 @@ impl DockerRuntime {
         // USERAPP_SINGLE_APP_ID），对齐 K8s 注入——Docker 缺失会让 supervisord
         // 插值失败直接拒启
         env_map.insert("APP_ID".to_string(), app_id.to_string());
+        env_map.insert("PROJECT_ID".into(), app_id.to_string());
         let env_vec: Vec<String> = env_map.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
         // labels（供对账/list 过滤）

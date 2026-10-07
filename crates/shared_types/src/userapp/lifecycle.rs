@@ -840,6 +840,9 @@ pub enum UserAppStoreError {
     OperationInProgress(UserAppOperationBlocker),
     #[error("Application state version conflict")]
     VersionConflict,
+    /// A valid request identity already belongs to a different compute intent.
+    #[error("Application request replay conflict: {0}")]
+    RequestReplayConflict(String),
     #[error("Application not found")]
     NotFound,
     #[error("Invalid application operation: {0}")]

@@ -354,16 +354,23 @@ impl std::error::Error for AppOperationError {
 
 impl From<shared_types::UserAppStoreError> for AppOperationError {
     fn from(error: shared_types::UserAppStoreError) -> Self {
+        Self::from(&error)
+    }
+}
+
+impl From<&shared_types::UserAppStoreError> for AppOperationError {
+    fn from(error: &shared_types::UserAppStoreError) -> Self {
         use shared_types::UserAppStoreError;
         match error {
             UserAppStoreError::OperationInProgress(blocker) => {
                 let data =
-                    shared_types::OperationInProgressData::from_blocker(&blocker, false, false, 0);
-                Self::operation_in_progress(Some(blocker), data)
+                    shared_types::OperationInProgressData::from_blocker(blocker, false, false, 0);
+                Self::operation_in_progress(Some(blocker.clone()), data)
             }
             UserAppStoreError::OwnershipConflict
             | UserAppStoreError::LifecycleConflict
-            | UserAppStoreError::VersionConflict => Self::Conflict(error.to_string()),
+            | UserAppStoreError::VersionConflict
+            | UserAppStoreError::RequestReplayConflict(_) => Self::Conflict(error.to_string()),
             UserAppStoreError::NotFound => Self::OperationNotFound(error.to_string()),
             UserAppStoreError::InvalidOperation(_) => Self::InvalidState(error.to_string()),
             UserAppStoreError::Storage(source) => {

@@ -6,6 +6,12 @@ impl KubernetesRuntime {
         app_id: &str,
         params: &ContainerCreateParams,
     ) -> ContainerRuntimeResult<Deployment> {
+        params.validate_execution_context()?;
+        if params.project_id.as_deref() != Some(app_id) {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Rendered UserApp differs from its admitted project identity".into(),
+            ));
+        }
         let image = params.image_override.clone().ok_or_else(|| {
             ContainerRuntimeError::ConfigurationError(
                 "Userapp create_deployment requires image_override".to_string(),
@@ -91,6 +97,11 @@ impl KubernetesRuntime {
                     &self.app_workspace_pvc_name(app_id)?,
                     &app_flat_volume_mounts(app_id),
                 )),
+                ..Default::default()
+            },
+            EnvVar {
+                name: "PROJECT_ID".into(),
+                value: Some(app_id.into()),
                 ..Default::default()
             },
             EnvVar {

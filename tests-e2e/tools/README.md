@@ -209,3 +209,46 @@ CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_dev E2E_FILTER=userap
 镜像默认是 `dev-master-rcoder:latest` 和 `dev-rcoder-agent-runner:latest`。运行前应重建与当前源码配套的 RCoder、agent_runner（内嵌 file-server）和 app-cli；可用 `E2E_IDLE_RCODER_IMAGE`、`E2E_IDLE_BUILDER_IMAGE` 指定已构建的独立测试镜像。测试固定解析后的 image ID，不在运行期间更新镜像；报告记录二进制 SHA-256，旧镜像的结果不能作为当前源码验收。
 
 报告在场景目录的 `idle-owner.json` 和 `idle-owner-runtime/`：保留每轮任务、owner、容器/挂载、回收日志及失败原因。退出或被启动器中断后只清理核验归属的测试容器/网络，保留数据库、工作区、构建计数与诊断证据，不清空登记、不手工改终态。
+
+## 本机 K8s 保卷计算回归
+
+`local_k8s_core.py` 是独立的首批 Dev compute 验证入口，不执行 Cargo、部署或 AI 请求。
+它要求新建、带本轮 owner 标签的专属 `rcoder-*` namespace；拒绝 `rcoder-dev`。
+已有 DevSpace、Gateway、PVC 和 namespace 不作为清理对象。
+
+执行者先在自己的外盘 run 目录准备 `identity.json`：包含 `root`、32 位十六进制
+`run_id`、`namespace`、`context: orbstack`、本机 `cluster_api`、该目录内的私有
+`kubeconfig` 路径，以及显式 `apps` 列表。应用 ID 使用小写字母数字，最长 22 字符。
+namespace 必须有 `rcoder.e2e.owner=<run_id>` 标签。不要把 kubeconfig 或数据库输入放入报告。
+
+同目录还需冻结 `host-build-after-identity.json` 的 `frozen_binary`、`sha256`、
+`cargo_exit: 0`，并在启动后更新 `host-primary-process.json` 的 `pid`、
+`executable`、`namespace` 和 `url`。build identity 必须含实际构建输入的
+`source_inputs_sha256`，缺失或与当前输入不同即拒绝；不以程序版本号代替源码身份。
+
+```bash
+python3 tests-e2e/tools/local_k8s_core.py \
+  --root /Volumes/your-workspace/rcoder/.cache/build-verification/owned-run \
+  --url http://127.0.0.1:18297 \
+  --app coreyouruniquerun
+```
+
+验证实际两调用者并发 workspace ensure、唯一 STS/Pod/PVC、稳定 Stop 请求的原操作重放、
+原终态与同 PVC、反复 readiness 不唤醒、Restart 的新 Pod UID/原 PVC/原数据，
+并在受控新工作区写入无效 manifest，核验其不阻止计算 Stop。成功后仅再次通过
+`/computer/pod/stop` 停止计算，保留所有 PVC；失败只查询原操作与资源，保留现场，
+不 purge、不删除 PVC 或 namespace。Compute operation 没有 SSE 端点，使用原
+`status_url` 的真实 GET 轮询；此 compute-only 入口不编造业务 task ID 或 SSE。
+
+缺前置、未受理、RecoveryRequired、未知状态、空检查或源/二进制/进程变化均不能算通过。
+工具自身行为验证使用以下入口；它们只测试受控协议及保护边界，不是集群验收：
+
+```bash
+python3 -m unittest discover -s tests-e2e/tools -p test_local_k8s_core.py -v
+```
+
+后续 Source/迁移、精确 owner 故障与 Prod Lease 场景使用同目录的
+`local_k8s_business.py`、`local_k8s_owner_fault.py`、`local_k8s_prod.py`、
+`local_k8s_prod_execute.py` 和 `local_k8s_prod_expiry.py`。各脚本的 `--help`
+列出明确前置；续跑保留旧报告并核验原身份。验收边界和实例就绪规则见
+[本机 K8s 核心回归](../../docs/development/local-k8s-core-validation.md)。

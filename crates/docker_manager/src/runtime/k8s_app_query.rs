@@ -42,7 +42,7 @@ impl KubernetesRuntime {
                 )));
             }
         };
-        Ok(Some(self.deployment_to_status(app_id, &deploy).await))
+        Ok(Some(self.deployment_to_status(app_id, &deploy).await?))
     }
 
     /// 读 app 当前容器的 desired 快照（update 部分更新回退用）。
@@ -202,7 +202,7 @@ impl KubernetesRuntime {
             if app_id.is_empty() {
                 continue;
             }
-            out.push(self.deployment_to_status(&app_id, &d).await);
+            out.push(self.deployment_to_status(&app_id, &d).await?);
         }
         Ok(out)
     }
@@ -214,17 +214,24 @@ impl KubernetesRuntime {
     /// - `derive_phase`：replicas+ready+error → phase —— 纯函数
     /// - `collect_tcp_nodeports`：查 NodePort Service 的 TCP node_port —— IO
     /// - `derive_port_statuses`：container ports + annotation + nodeports → 端口状态 —— 纯函数
-    async fn deployment_to_status(&self, app_id: &str, deploy: &Deployment) -> DeploymentStatus {
+    async fn deployment_to_status(
+        &self,
+        app_id: &str,
+        deploy: &Deployment,
+    ) -> ContainerRuntimeResult<DeploymentStatus> {
         let replicas = deploy.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0);
-        let ready_replicas = deploy
+        let mut ready_replicas = deploy
             .status
             .as_ref()
             .and_then(|s| s.ready_replicas)
             .unwrap_or(0);
 
         // 关联 Pod 信息先取：phase 判定需要容器状态（CrashLoop/ImagePull/异常退出 → Error）。
-        let (pod_ip, node, restart_count, started_at, error_message, error_reason) =
-            self.fetch_app_pod_info(app_id).await;
+        let (pod_ip, node, restart_count, started_at, error_message, error_reason, pod_ready) =
+            self.fetch_app_pod_info(app_id, deploy).await?;
+        if !pod_ready {
+            ready_replicas = 0;
+        }
         let phase = derive_phase(replicas, ready_replicas, &error_message);
         let tcp_nodeports = self.collect_tcp_nodeports(app_id).await;
         let ports = derive_port_statuses(deploy, &tcp_nodeports);
@@ -247,7 +254,7 @@ impl KubernetesRuntime {
             .as_ref()
             .map(|t| t.0.to_string());
 
-        DeploymentStatus {
+        Ok(DeploymentStatus {
             app_id: app_id.to_string(),
             lifecycle_id: deploy
                 .metadata
@@ -275,82 +282,67 @@ impl KubernetesRuntime {
             wake_on_traffic,
             created_at,
             deployment_uid: deploy.metadata.uid.clone(),
-        }
+        })
     }
 
-    /// 拉取 app 关联 Pod 的实时信息（取一个；app 当前为单副本）。
-    /// 返回 (pod_ip, node, restart_count, started_at, error_message, error_reason)；
-    /// 无 Pod 或 list 失败返默认空值。error_reason 是 typed 容器状态字段的结构化
-    /// 失败原因（见 `container_error_reason`），error_message 仅作人类可读详情。
+    /// Read only the current Pod belonging to the captured Prod Deployment.
+    /// API failures remain typed errors; an absent current Pod has no address.
     async fn fetch_app_pod_info(
         &self,
         app_id: &str,
-    ) -> (
+        deployment: &Deployment,
+    ) -> ContainerRuntimeResult<(
         String,
         String,
         u32,
         Option<String>,
         Option<String>,
         Option<container_runtime_api::ContainerFailureReason>,
-    ) {
-        let lp = ListParams {
-            label_selector: Some(format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX)),
-            // 查询面同样走 watch cache（与 list_app_status 一致）
-            resource_version: Some("0".to_string()),
-            ..Default::default()
+        bool,
+    )> {
+        let Some(pod) = self.current_app_pod(app_id, deployment).await? else {
+            return Ok(Default::default());
         };
-        match self.pods_api().list(&lp).await {
-            Ok(pods) => pods
-                .items
-                .into_iter()
-                .next()
-                .and_then(|p| {
-                    let st = p.status.as_ref()?;
-                    // 按容器名取 "app" 容器状态（防御 sidecar 注入后 pop() 取错容器）
-                    let cs = match st
-                        .container_statuses
-                        .as_ref()
-                        .and_then(|v| v.iter().find(|c| c.name == APP_CONTAINER_NAME))
-                    {
-                        Some(cs) => cs.clone(),
-                        // 容器状态缺失 = 尚未创建容器（Pending 未调度/拉镜像前）——
-                        // 上浮调度拒绝原因（Unschedulable：资源不足不会自愈但可能
-                        // 被缓解，由上层策略判断持续性，不在此判死）
-                        None => {
-                            let scheduling = unschedulable_message(st);
-                            return Some((
-                                st.pod_ip.clone().unwrap_or_default(),
-                                p.spec.and_then(|s| s.node_name).unwrap_or_default(),
-                                0,
-                                None,
-                                scheduling,
-                                None,
-                            ));
-                        }
-                    };
-                    // started_at：从 container state.running 提取实际启动时间
-                    let started_at = cs
-                        .state
-                        .as_ref()
-                        .and_then(|s| s.running.as_ref())
-                        .and_then(|r| r.started_at.as_ref())
-                        .map(|t| t.0.to_string());
-                    // 启动失败原因（CrashLoop / 镜像拉取失败 / 异常退出）；正常拉起的中间态
-                    // （ContainerCreating）不在此列，不会被误判为 Error。
-                    let error_message = container_error_message(&cs);
-                    let error_reason = container_error_reason(&cs);
-                    Some((
-                        st.pod_ip.clone().unwrap_or_default(),
-                        p.spec.and_then(|s| s.node_name).unwrap_or_default(),
-                        cs.restart_count as u32,
-                        started_at,
-                        error_message,
-                        error_reason,
-                    ))
-                })
-                .unwrap_or_default(),
-            Err(_) => (String::new(), String::new(), 0, None, None, None),
-        }
+        let Some(status) = pod.status.as_ref() else {
+            return Ok(Default::default());
+        };
+        let node = pod
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.node_name.clone())
+            .unwrap_or_default();
+        let ip = status.pod_ip.clone().unwrap_or_default();
+        let container = status.container_statuses.as_ref().and_then(|containers| {
+            containers
+                .iter()
+                .find(|container| container.name == APP_CONTAINER_NAME)
+        });
+        let Some(container) = container else {
+            return Ok((
+                ip,
+                node,
+                0,
+                None,
+                unschedulable_message(status),
+                None,
+                false,
+            ));
+        };
+        let started = container
+            .state
+            .as_ref()
+            .and_then(|state| state.running.as_ref())
+            .and_then(|running| running.started_at.as_ref())
+            .map(|time| time.0.to_string());
+        Ok((
+            ip,
+            node,
+            container.restart_count as u32,
+            started,
+            container_error_message(container),
+            container_error_reason(container),
+            container.ready,
+        ))
     }
 
     /// 结构化应用 Pod 故障观察（部署等待循环的确定性失败信号数据源）。
@@ -614,3 +606,7 @@ mod secret_environment_tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "k8s_app_query/pod_identity_tests.rs"]
+mod pod_identity_tests;

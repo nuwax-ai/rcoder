@@ -323,3 +323,408 @@ fn userapp_query_deserializes_with_three_field_form() {
     assert_eq!(ps.app_id.as_deref(), Some("app-1"));
     assert!(ps.service_type.is_none() && ps.app_stage.is_none());
 }
+
+#[cfg(feature = "userapp-turso")]
+mod compute_error_route_tests {
+    use super::super::{pod_restart, pod_stop};
+    use arc_swap::ArcSwap;
+    use async_trait::async_trait;
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+        routing::post,
+    };
+    use container_runtime_api::{
+        AgentContainerRuntime, ContainerCreateParams, ContainerRuntimeError,
+        ContainerRuntimeResult, DeploymentStatus, RuntimeContainerInfo, UserAppDeploymentRuntime,
+        WorkspaceRuntime,
+    };
+    use rcoder_storage::userapp_lifecycle::TursoUserAppStore;
+    use shared_types::{
+        AppResourceIdentity, AppResourceKind, BuilderControlTarget, ComputeControlAction,
+        ComputeControlRecord, ComputeControlRequest, ContainerBasicInfo, ServiceType,
+        UserAppComputeStatus, UserAppExecutionContext, UserAppLifecycleRecord,
+        UserAppLifecycleStore as _, UserAppOperationScope,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tower::ServiceExt as _;
+
+    // Controlled runtime protocol fixture. The store, submit coordinator,
+    // extractors, actual handlers, and HTTP envelope conversion are production.
+    // No HTTP response or AI result is synthesized by the fixture.
+    #[derive(Default)]
+    struct ReadOnlyRuntime {
+        writes: AtomicUsize,
+    }
+    #[async_trait]
+    impl AgentContainerRuntime for ReadOnlyRuntime {
+        async fn create_container(
+            &self,
+            _: ContainerCreateParams,
+        ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Err(ContainerRuntimeError::ConfigurationError(
+                "unexpected create".into(),
+            ))
+        }
+        async fn get_container_info(
+            &self,
+            _: &str,
+        ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+            Ok(None)
+        }
+        async fn find_container(
+            &self,
+            _: &str,
+            _: &ServiceType,
+        ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
+            Ok(None)
+        }
+        async fn stop_container(&self, _: &str) -> ContainerRuntimeResult<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Err(ContainerRuntimeError::ConfigurationError(
+                "unexpected stop".into(),
+            ))
+        }
+        async fn is_container_running(&self, _: &str) -> ContainerRuntimeResult<bool> {
+            Ok(false)
+        }
+        async fn list_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>> {
+            Ok(vec![])
+        }
+        async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
+            Ok(())
+        }
+        async fn health_check(&self) -> ContainerRuntimeResult<()> {
+            Ok(())
+        }
+        async fn inspect_builder_candidate(
+            &self,
+            context: &UserAppExecutionContext,
+        ) -> ContainerRuntimeResult<BuilderControlTarget> {
+            Ok(BuilderControlTarget {
+                resource_binding: None,
+                context: context.clone(),
+                workload: Some(AppResourceIdentity {
+                    kind: AppResourceKind::StatefulSet,
+                    name: "rcoder-app-builder-routeapp".into(),
+                    uid: "retained-sts".into(),
+                    resource_version: Some("7".into()),
+                }),
+                pod: None,
+                restart_image: None,
+                restart_runtime_workspace: None,
+            })
+        }
+        async fn capture_builder_control(
+            &self,
+            context: &UserAppExecutionContext,
+        ) -> ContainerRuntimeResult<BuilderControlTarget> {
+            self.inspect_builder_candidate(context).await
+        }
+    }
+    #[async_trait]
+    impl WorkspaceRuntime for ReadOnlyRuntime {}
+    #[async_trait]
+    impl UserAppDeploymentRuntime for ReadOnlyRuntime {
+        async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
+            Ok(vec![])
+        }
+
+        async fn discover_application_identity(
+            &self,
+            _: &str,
+        ) -> ContainerRuntimeResult<Option<shared_types::UserAppDiscoveredIdentity>> {
+            Ok(None)
+        }
+        async fn prepare_compute_operation(
+            &self,
+            _: &UserAppExecutionContext,
+            _: UserAppOperationScope,
+        ) -> ContainerRuntimeResult<Box<dyn shared_types::PreparedComputeLease>> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Err(ContainerRuntimeError::ConfigurationError(
+                "unexpected compute preparation".into(),
+            ))
+        }
+    }
+
+    struct Fixture {
+        state: Arc<crate::app_state::AppState>,
+        store: Arc<TursoUserAppStore>,
+        runtime: Arc<ReadOnlyRuntime>,
+        _root: tempfile::TempDir,
+    }
+    impl Fixture {
+        async fn new() -> Self {
+            let root = tempfile::tempdir().expect("fixture root");
+            let store = Arc::new(
+                TursoUserAppStore::open_exclusive(&root.path().join("control.db"))
+                    .await
+                    .expect("real Turso"),
+            );
+            store
+                .ensure_identity("routeapp")
+                .await
+                .expect("active lifecycle");
+            let runtime = Arc::new(ReadOnlyRuntime::default());
+            let activity = Arc::new(app_manager::AppActivityRegistry::new(
+                std::time::Duration::from_secs(300),
+            ));
+            let app_service: Arc<dyn app_manager::AppServiceTrait> = Arc::new(
+                app_manager::service::AppService::new(
+                    app_manager::config::AppManagerConfig {
+                        access_mode: app_manager::config::AppAccessMode::Docker,
+                        ..Default::default()
+                    },
+                    runtime.clone(),
+                    activity.clone(),
+                    None,
+                    store.clone(),
+                )
+                .await
+                .expect("real AppService"),
+            );
+            let (adapter, _cleanup_rx) =
+                crate::storage::ProjectAdapter::new("test-ns".into(), "cluster.local".into());
+            let (pod_created_tx, _) = tokio::sync::broadcast::channel(8);
+            let state = Arc::new(crate::app_state::AppState {
+                userapp_store: store.clone(),
+                userapp_store_control: store.clone(),
+                userapp_op_flight: Arc::new(Default::default()),
+                userapp_recovery_handle: Arc::new(std::sync::Mutex::new(None)),
+                config: crate::config::AppConfig::default(),
+                projects: Arc::new(crate::storage::ProjectStoreBackend::Memory(Arc::new(
+                    adapter,
+                ))),
+                pingora_service: None,
+                userapp_error_page: None,
+                grpc_pool: Arc::new(crate::grpc::GrpcChannelPool::new()),
+                session_stream_registry: Arc::new(crate::grpc::SessionStreamRegistry::new()),
+                api_key_config: Arc::new(ArcSwap::from_pointee(
+                    crate::config::ApiKeyAuthConfig::default(),
+                )),
+                pod_creating: Arc::new(dashmap::DashMap::new()),
+                pod_created_tx: Arc::new(pod_created_tx),
+                container_prefix_rcoder: "fixture-web".into(),
+                container_prefix_computer: "fixture-computer".into(),
+                runtime: runtime.clone(),
+                cleanup_rx: Arc::new(std::sync::Mutex::new(None)),
+                agent_download_manager: Arc::new(
+                    agent_provisioning::AgentDownloadManager::new(root.path()).expect("downloads"),
+                ),
+                app_service,
+                activity,
+                cluster_domain: "cluster.local".into(),
+            });
+            Self {
+                state,
+                store,
+                runtime,
+                _root: root,
+            }
+        }
+        async fn app(&self) -> UserAppLifecycleRecord {
+            self.store
+                .get_application("routeapp")
+                .await
+                .expect("read")
+                .expect("known app")
+        }
+        async fn snapshot(
+            &self,
+        ) -> (
+            UserAppLifecycleRecord,
+            UserAppComputeStatus,
+            Vec<ComputeControlRecord>,
+        ) {
+            let app = self.app().await;
+            let status = self
+                .store
+                .read_compute_status("routeapp", &app.lifecycle_id, UserAppOperationScope::Dev)
+                .await
+                .expect("intent snapshot");
+            let active = self
+                .store
+                .active_compute_controls("routeapp")
+                .await
+                .expect("active control snapshot");
+            (app, status, active)
+        }
+        async fn seed_stop(&self) -> ComputeControlRecord {
+            let app = self.app().await;
+            self.store
+                .admit_compute_control(&ComputeControlRequest {
+                    app_id: "routeapp".into(),
+                    lifecycle_id: app.lifecycle_id,
+                    scope: UserAppOperationScope::Dev,
+                    action: ComputeControlAction::Stop,
+                    request_id: "original-stop-request".into(),
+                    operation_id: "original-stop-operation".into(),
+                    request_fingerprint: "a".repeat(64),
+                    restart_image_roll: false,
+                })
+                .await
+                .expect("real durable original Stop")
+        }
+        async fn request(
+            &self,
+            route: &str,
+            lifecycle_id: &str,
+            request_id: &str,
+        ) -> (StatusCode, serde_json::Value) {
+            let router = Router::new()
+                .route("/computer/pod/restart", post(pod_restart))
+                .route("/computer/pod/stop", post(pod_stop))
+                .with_state(self.state.clone());
+            let response = router
+                .oneshot(
+                    Request::post(route)
+                        .header("content-type", "application/json")
+                        .header("accept-language", "en-US")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "app_id": "routeapp", "app_stage": "dev", "service_type": "userapp",
+                                "lifecycle_id": lifecycle_id, "request_id": request_id,
+                            })
+                            .to_string(),
+                        ))
+                        .expect("request"),
+                )
+                .await
+                .expect("actual handler response");
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("body");
+            (
+                status,
+                serde_json::from_slice(&body).expect("JSON envelope"),
+            )
+        }
+        async fn unchanged(
+            &self,
+            before: &(
+                UserAppLifecycleRecord,
+                UserAppComputeStatus,
+                Vec<ComputeControlRecord>,
+            ),
+        ) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert_eq!(
+                &self.snapshot().await,
+                before,
+                "rejected input must not admit or alter an intent"
+            );
+            assert_eq!(
+                self.runtime.writes.load(Ordering::SeqCst),
+                0,
+                "rejection must not dispatch physical writes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compute_route_wrong_lifecycle_preserves_conflict_without_admission() {
+        for route in ["/computer/pod/restart", "/computer/pod/stop"] {
+            let fixture = Fixture::new().await;
+            let before = fixture.snapshot().await;
+            let (status, body) = fixture
+                .request(
+                    route,
+                    "other-valid-lifecycle",
+                    "new-invalid-lifecycle-request",
+                )
+                .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["code"], shared_types::ERR_CONFLICT);
+            assert_eq!(body["success"], false);
+            assert!(body.get("operation_id").is_none());
+            fixture.unchanged(&before).await;
+            fixture.store.shutdown().await.expect("close");
+        }
+    }
+
+    #[tokio::test]
+    async fn compute_route_reused_stop_request_for_restart_is_a_narrow_replay_conflict() {
+        let fixture = Fixture::new().await;
+        let original = fixture.seed_stop().await;
+        let before = fixture.snapshot().await;
+        let (status, body) = fixture
+            .request(
+                "/computer/pod/restart",
+                &original.lifecycle_id,
+                &original.request_id,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], shared_types::ERR_CONFLICT);
+        assert_eq!(body["success"], false);
+        assert!(body.get("operation_id").is_none());
+        fixture.unchanged(&before).await;
+        assert_eq!(
+            fixture
+                .store
+                .get_compute_control("routeapp", &original.operation_id)
+                .await
+                .unwrap(),
+            Some(original)
+        );
+        fixture.store.shutdown().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn compute_route_live_stop_holder_uses_new_busy_code_without_queue_or_new_receipt() {
+        let fixture = Fixture::new().await;
+        let original = fixture.seed_stop().await;
+        let before = fixture.snapshot().await;
+        let (status, body) = fixture
+            .request(
+                "/computer/pod/restart",
+                &original.lifecycle_id,
+                "different-restart-request",
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], shared_types::ERR_OPERATION_IN_PROGRESS);
+        assert_eq!(body["success"], false);
+        assert!(
+            body.get("operation_id").is_none(),
+            "holder is not an accepted request identity"
+        );
+        assert_eq!(body["blocker"]["operation_id"], original.operation_id);
+        assert_eq!(
+            body["data"],
+            serde_json::json!({
+                "holder_operation_id": original.operation_id, "holder_kind": "stop_builder",
+                "holder_state": "pending", "holder_step": "accepted", "holder_traffic_wake": false,
+                "retryable": false, "retry_after_seconds": 0,
+            })
+        );
+        fixture.unchanged(&before).await;
+        fixture.store.shutdown().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn compute_route_invalid_reserved_request_is_not_reclassified_as_replay_conflict() {
+        let fixture = Fixture::new().await;
+        let before = fixture.snapshot().await;
+        let (status, body) = fixture
+            .request(
+                "/computer/pod/stop",
+                &before.0.lifecycle_id,
+                "auto-repair-reserved-request",
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], shared_types::ERR_INVALID_STATE);
+        assert_eq!(body["success"], false);
+        assert!(body.get("operation_id").is_none());
+        fixture.unchanged(&before).await;
+        fixture.store.shutdown().await.expect("close");
+    }
+}

@@ -272,30 +272,21 @@ impl KubernetesRuntime {
         timestamps: bool,
     ) -> ContainerRuntimeResult<Vec<ContainerLogEntry>> {
         use kube::api::LogParams;
-        let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
-        let pods = self
-            .pods_api()
-            .list(&lp)
-            .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("list pods for logs: {e}")))?;
-        // 无 Pod（app stopped / 副本缩为 0）→ 返回空，与 Docker 侧"容器不存在→空日志"一致，
-        // 避免 stopped app 查日志被误报 404（应用还在，只是当前无运行实例）。
-        let Some(pod_name) = pods
-            .items
-            .into_iter()
-            .next()
-            .and_then(|p| p.metadata.name.clone())
-        else {
+        let Some(pod) = self.read_current_app_pod(app_id).await? else {
             return Ok(vec![]);
         };
+        let pod_name = pod.metadata.name.as_deref().ok_or_else(|| {
+            ContainerRuntimeError::Conflict("Current Prod Pod name missing".into())
+        })?;
         let log_lp = LogParams {
+            container: Some(APP_CONTAINER_NAME.into()),
             tail_lines: Some(tail as i64),
             timestamps,
             ..Default::default()
         };
         let raw = self
             .pods_api()
-            .logs(&pod_name, &log_lp)
+            .logs(pod_name, &log_lp)
             .await
             .map_err(|e| ContainerRuntimeError::K8sError(format!("pod logs: {e}")))?;
         // K8s logs API 合并 stdout/stderr，stream 统一记 "stdout"
@@ -320,26 +311,56 @@ impl KubernetesRuntime {
         app_id: &str,
         command: Vec<String>,
     ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
-        // 1. Pod 定位(复用 app_logs 的 label selector)
-        let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
-        let pods = self
-            .pods_api()
-            .list(&lp)
+        if command.is_empty() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Application exec command is empty".into(),
+            ));
+        }
+        let pod = self.read_current_app_pod(app_id).await?.ok_or_else(|| {
+            ContainerRuntimeError::ContainerNotFound(format!(
+                "no current Prod Pod for app {app_id}"
+            ))
+        })?;
+        let name = pod.metadata.name.as_deref().ok_or_else(|| {
+            ContainerRuntimeError::Conflict("Current Prod Pod name missing".into())
+        })?;
+        let uid = pod.metadata.uid.as_deref().ok_or_else(|| {
+            ContainerRuntimeError::Conflict("Current Prod Pod UID missing".into())
+        })?;
+        let container = pod
+            .spec
+            .as_ref()
+            .and_then(|spec| {
+                spec.containers
+                    .iter()
+                    .find(|container| container.name == APP_CONTAINER_NAME)
+            })
+            .ok_or_else(|| {
+                ContainerRuntimeError::Conflict("Current Prod app container missing".into())
+            })?;
+        let uid_fields: Vec<_> = container
+            .env
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|env| env.name == "RCODER_PHYSICAL_POD_UID")
+            .collect();
+        if uid_fields.len() != 1
+            || uid_fields[0].value.is_some()
+            || !uid_fields[0]
+                .value_from
+                .as_ref()
+                .and_then(|source| source.field_ref.as_ref())
+                .is_some_and(|field| field.field_path == "metadata.uid")
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "Current Prod Pod UID field is not bound to its physical identity".into(),
+            ));
+        }
+        // Exec resolves a Pod by name. Check the captured UID inside the destination
+        // before executing the original arguments, including name-replacement races.
+        self.exec_app_pod(name, pod_uid_guard_command(uid, command))
             .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("list pods for exec: {e}")))?;
-        let Some(pod_name) = pods
-            .items
-            .into_iter()
-            .next()
-            .and_then(|p| p.metadata.name.clone())
-        else {
-            // exec 是写操作,需活 Pod;无 Pod(app stopped)→ ContainerNotFound
-            return Err(ContainerRuntimeError::ContainerNotFound(format!(
-                "no running pod for app {app_id}"
-            )));
-        };
-
-        self.exec_app_pod(&pod_name, command).await
     }
 
     async fn exec_app_pod(
@@ -412,22 +433,17 @@ impl KubernetesRuntime {
         use futures_util::{AsyncBufReadExt, StreamExt};
         use kube::api::LogParams;
 
-        let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
-        let pods = self.pods_api().list(&lp).await.map_err(|e| {
-            ContainerRuntimeError::K8sError(format!("list pods for log stream: {e}"))
+        let pod = self.read_current_app_pod(app_id).await?.ok_or_else(|| {
+            ContainerRuntimeError::ContainerNotFound(format!(
+                "no current Prod Pod for app {app_id}"
+            ))
         })?;
-        let pod_name = pods
-            .items
-            .into_iter()
-            .next()
-            .and_then(|p| p.metadata.name.clone())
-            .ok_or_else(|| {
-                ContainerRuntimeError::ConfigurationError(format!(
-                    "app {app_id} 当前无运行 Pod（可能已 stopped）"
-                ))
-            })?;
+        let pod_name = pod.metadata.name.as_deref().ok_or_else(|| {
+            ContainerRuntimeError::Conflict("Current Prod Pod name missing".into())
+        })?;
         let timestamps = true;
         let log_lp = LogParams {
+            container: Some(APP_CONTAINER_NAME.into()),
             tail_lines: if tail > 0 { Some(tail as i64) } else { None },
             follow: true,
             timestamps,
@@ -435,7 +451,7 @@ impl KubernetesRuntime {
         };
         let reader = self
             .pods_api()
-            .log_stream(&pod_name, &log_lp)
+            .log_stream(pod_name, &log_lp)
             .await
             .map_err(|e| ContainerRuntimeError::K8sError(format!("log_stream: {e}")))?;
         let (tx, rx) = container_runtime_api::mpsc::channel::<ContainerLogEntry>(64);
@@ -668,6 +684,16 @@ impl KubernetesRuntime {
             mem_limit_bytes: limit_mem,
         })
     }
+}
+
+fn pod_uid_guard_command(uid: &str, command: Vec<String>) -> Vec<String> {
+    let mut guarded = vec![
+        "sh".into(), "-c".into(),
+        "if [ \"${RCODER_PHYSICAL_POD_UID:-}\" != \"$1\" ]; then printf '%s\\n' 'Application exec Pod identity changed' >&2; exit 125; fi; shift; exec \"$@\"".into(),
+        "rcoder-prod-exec".into(), uid.into(),
+    ];
+    guarded.extend(command);
+    guarded
 }
 
 fn configuration_guard_command(

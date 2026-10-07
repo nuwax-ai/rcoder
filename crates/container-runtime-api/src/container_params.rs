@@ -75,6 +75,26 @@ pub struct ContainerCreateParams {
 
 impl ContainerCreateParams {
     pub fn validate_execution_context(&self) -> super::types::ContainerRuntimeResult<()> {
+        // UserApp platform identity is checked in each input independently:
+        // Docker merges secrets over env, while Kubernetes uses envFrom.
+        if self.service_type == ServiceType::Userapp {
+            let app_id = self
+                .execution_context
+                .as_ref()
+                .map(|context| context.app_id.as_str())
+                .or(self.project_id.as_deref());
+            for environment in [&self.env, &self.secrets] {
+                if let Some(value) = environment
+                    .as_ref()
+                    .and_then(|values| values.get("PROJECT_ID"))
+                    && Some(value.as_str()) != app_id
+                {
+                    return Err(super::types::ContainerRuntimeError::ConfigurationError(
+                        "Explicit PROJECT_ID differs from the UserApp operation identity".into(),
+                    ));
+                }
+            }
+        }
         let Some(context) = &self.execution_context else {
             if self.mutation_target.is_some() || self.resource_binding.is_some() {
                 return Err(super::types::ContainerRuntimeError::ConfigurationError(
@@ -381,3 +401,7 @@ mod mutation_target_tests {
         assert!(params.validate_execution_context().is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "container_params/project_identity_tests.rs"]
+mod project_identity_tests;

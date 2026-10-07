@@ -279,7 +279,27 @@ async fn compute_priority_rejects_new_busy_requests_without_releasing_business_s
     assert_eq!(replay.state, ComputeControlState::Superseded);
     let mut changed = request(&app, "restartone", ComputeControlAction::Restart);
     changed.request_fingerprint = "c".repeat(64);
-    assert!(store.admit_compute_control(&changed).await.is_err());
+    let original_application =
+        serde_json::to_value(store.get_application(&app.app_id).await.unwrap()).unwrap();
+    assert!(matches!(
+        store.admit_compute_control(&changed).await.unwrap_err(),
+        UserAppStoreError::RequestReplayConflict(_)
+    ));
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .get_compute_control(&app.app_id, &replay.operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&replay).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(store.get_application(&app.app_id).await.unwrap()).unwrap(),
+        original_application
+    );
     let mut prod = request(&app, "prodrestart", ComputeControlAction::Restart);
     prod.scope = UserAppOperationScope::Prod;
     let prod = store.admit_compute_control(&prod).await.unwrap();

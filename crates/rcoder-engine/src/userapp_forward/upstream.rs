@@ -710,14 +710,14 @@ mod control_response_tests {
                     operation_id: Some("accepted-builder".into()),
                 }),
                 shared_types::error_codes::ERR_USERAPP_WAIT_TIMEOUT,
-                "accepted-builder",
+                Some("accepted-builder"),
             ),
             (
                 anyhow::Error::new(crate::userapp_builder::BuilderEnsureSuperseded {
                     operation_id: "interrupted-ensure".into(),
                 }),
                 shared_types::error_codes::ERR_CONFLICT,
-                "interrupted-ensure",
+                Some("interrupted-ensure"),
             ),
             (
                 anyhow::Error::from(shared_types::UserAppStoreError::OperationInProgress(
@@ -729,8 +729,8 @@ mod control_response_tests {
                         step: "claimed".into(),
                     },
                 )),
-                shared_types::error_codes::ERR_CONFLICT,
-                "conflicting-operation",
+                shared_types::error_codes::ERR_OPERATION_IN_PROGRESS,
+                None,
             ),
         ];
         for (error, code, operation_id) in cases {
@@ -741,7 +741,17 @@ mod control_response_tests {
                 .expect("error envelope");
             let envelope: serde_json::Value = serde_json::from_slice(&body).expect("JSON envelope");
             assert_eq!(envelope["code"], code);
-            assert_eq!(envelope["operation_id"], operation_id);
+            if let Some(operation_id) = operation_id {
+                assert_eq!(envelope["operation_id"], operation_id);
+            } else {
+                assert!(envelope.get("operation_id").is_none());
+                assert_eq!(
+                    envelope["data"]["holder_operation_id"],
+                    "conflicting-operation"
+                );
+                assert_eq!(envelope["blocker"]["operation_id"], "conflicting-operation");
+                assert_eq!(envelope["data"]["retryable"], false);
+            }
             assert_eq!(envelope["success"], false);
         }
     }

@@ -183,8 +183,13 @@ async fn conflict_deadline_preserves_last_blocker_without_another_attempt() {
             .await
             .expect("body");
         let envelope: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
-        assert_eq!(envelope["code"], shared_types::error_codes::ERR_CONFLICT);
-        assert_eq!(envelope["operation_id"], "control-2");
+        assert_eq!(
+            envelope["code"],
+            shared_types::error_codes::ERR_OPERATION_IN_PROGRESS
+        );
+        assert!(envelope.get("operation_id").is_none());
+        assert_eq!(envelope["data"]["holder_operation_id"], "control-2");
+        assert_eq!(envelope["data"]["retryable"], false);
         assert_eq!(envelope["blocker"]["operation_id"], "control-2");
     }
 }

@@ -239,8 +239,8 @@ pub(super) async fn admit(
             || replay.request_fingerprint != request.request_fingerprint
             || replay.action != action(request.action)
         {
-            return Err(invalid(
-                "Compute request identity was reused with different input",
+            return Err(Error::RequestReplayConflict(
+                "Compute request identity was reused with different input".into(),
             ));
         }
         return decode(replay);
