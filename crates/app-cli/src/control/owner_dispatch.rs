@@ -587,6 +587,7 @@ async fn dispatch_to_owner_inner(
     // A 202 receipt is not a full operation view, even on terminal replay.
     // Fetch the authoritative view before trusting its instance, kind or outcome.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+    let mut event_cursor: u64 = 0;
     loop {
         let poll = async {
             let body: serde_json::Value = client
@@ -612,7 +613,33 @@ async fn dispatch_to_owner_inner(
                 && view.kind == RuntimeOperationKind::Start,
             "owner returned a different operation or runtime identity while observing {operation_id}"
         );
+        // run 客户端是 file-server 管道的流端点（spawn 路径 stdout 是唯一
+        // 通道）：serve 内编排产生的事件经 journal 读出后重新呈现在客户端
+        // stdout 上（转发是尽力而为——读不到不阻塞观察）。serve 的
+        // orchestration_done 是单一权威终局信号，客户端转发它、不重复合成；
+        // 仅当终局前未转发到任何 done（如取消路径未入事件流）才兜底合成。
+        let mut done_forwarded = forward_operation_events(
+            &client,
+            admin_addr,
+            &token,
+            &operation_id,
+            &mut event_cursor,
+        )
+        .await;
         if view.state.is_terminal() || view.state == RuntimeOperationState::RecoveryRequired {
+            if !done_forwarded {
+                done_forwarded |= forward_operation_events(
+                    &client,
+                    admin_addr,
+                    &token,
+                    &operation_id,
+                    &mut event_cursor,
+                )
+                .await;
+            }
+            if !done_forwarded {
+                emit_terminal_done_event(&view);
+            }
             return Ok(OwnerDispatch::Terminal(view));
         }
         tokio::time::sleep_until(std::cmp::min(
@@ -621,6 +648,90 @@ async fn dispatch_to_owner_inner(
         ))
         .await;
     }
+}
+
+/// 终态 → EVT orchestration_done 兜底行（仅当 journal 终局前未转发到任何
+/// done 时调用；失败清单取自操作视图，错误面向操作者、无凭据）。
+fn emit_terminal_done_event(view: &RuntimeOperationView) {
+    let failed = match view.state {
+        RuntimeOperationState::Succeeded => Vec::new(),
+        state => vec![shared_types::AppCliFailedService {
+            service: "orchestrator".to_string(),
+            error: format!(
+                "[{state:?}] {}",
+                view.error_message
+                    .as_deref()
+                    .unwrap_or("operation ended without success")
+            ),
+        }],
+    };
+    crate::orchestration_events::emit(&shared_types::AppCliOrchestrationEvent::OrchestrationDone {
+        failed,
+    });
+}
+
+/// journal 事件 → EVT 行转发（游标推进）。返回是否转发了 orchestration_done
+///（serve 的权威终局信号；调用方据此决定是否需要兜底合成）。
+async fn forward_operation_events(
+    client: &reqwest::Client,
+    admin_addr: &str,
+    token: &str,
+    operation_id: &str,
+    after_seq: &mut u64,
+) -> bool {
+    let mut done_forwarded = false;
+    let url = format!(
+        "http://{admin_addr}/v1/runtime/operations/{operation_id}/events?after_seq={after_seq}"
+    );
+    let Ok(response) = client
+        .get(&url)
+        .header("X-Deploy-Token", token)
+        .send()
+        .await
+    else {
+        return done_forwarded;
+    };
+    let Ok(body) = response.json::<serde_json::Value>().await else {
+        return done_forwarded;
+    };
+    let Some(events) = body
+        .get("data")
+        .and_then(|data| data.get("events"))
+        .and_then(|events| events.as_array())
+    else {
+        return done_forwarded;
+    };
+    for event in events {
+        if let Some(sequence) = event.get("sequence").and_then(|s| s.as_u64()) {
+            *after_seq = (*after_seq).max(sequence);
+        }
+        let Some(name) = event.get("event_name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        if name == "orchestration_done" {
+            done_forwarded = true;
+        }
+        // 重建 EVT wire：{"event": name, "service"?: .., **payload}——与
+        // R06 桥的入库映射（bridge_event_fields）互逆。
+        let mut line = serde_json::Map::new();
+        line.insert("event".to_string(), serde_json::json!(name));
+        if let Some(service) = event.get("service").filter(|s| !s.is_null()) {
+            line.insert("service".to_string(), service.clone());
+        }
+        if let Some(payload) = event.get("payload").and_then(|p| p.as_object()) {
+            for (key, value) in payload {
+                line.entry(key.clone()).or_insert(value.clone());
+            }
+        }
+        let Ok(json) = serde_json::to_string(&serde_json::Value::Object(line)) else {
+            continue;
+        };
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{}{}", shared_types::APP_CLI_EVT_PREFIX, json);
+        let _ = out.flush();
+    }
+    done_forwarded
 }
 
 /// 终态视图的 CLI 友好呈现（错误信息面向操作者；无凭据内容）。

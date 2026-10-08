@@ -1424,11 +1424,18 @@ mod owner_reuse_tests {
 /// 主体是 `app-cli serve` owner。run 进程退出后：匹配 owner 在 → 移交
 /// 成立，宽松就绪成功；无 owner → 启动失败（stderr 分类文案不变）。
 async fn spawn_dead_pid() -> u32 {
-    let mut child = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg("exit 0")
-        .spawn()
-        .expect("spawn transient process");
+    // 跨平台的一次性进程：unix 用 sh -c、windows 用 cmd /C——只按命令名
+    // 走 PATH 解析，不硬编码具体路径（发行版 sh 位置差异不受影响）。
+    let mut command = if cfg!(windows) {
+        let mut command = std::process::Command::new("cmd");
+        command.arg("/C").arg("exit 0");
+        command
+    } else {
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg("exit 0");
+        command
+    };
+    let mut child = command.spawn().expect("spawn transient process");
     let pid = child.id();
     let _ = child.wait();
     pid

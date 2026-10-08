@@ -165,18 +165,23 @@ fn run_to_exit(mut command: Command, hard_timeout: Duration) -> (Output, bool) {
         }
     }
     // Independent owner stdio is deliberately separate from the client pipe.
-    // Preserve the real orchestration events for the failure assertions below.
-    for entry in std::fs::read_dir(state.parent().unwrap().join("logs"))
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("owner-bootstrap-")
+    // Preserve the real orchestration events for the failure assertions below:
+    // 客户端桥接后管道已完整镜像编排事件（含终局 done）；仅当管道缺失终局
+    // 信号时才并入 bootstrap 日志兜底（旧架构事件只在日志里），避免两路
+    // 叠加把"Done 恰好一次"的断言翻倍。
+    if done_event_count(&output.stdout) == 0 {
+        for entry in std::fs::read_dir(state.parent().unwrap().join("logs"))
+            .into_iter()
+            .flatten()
+            .flatten()
         {
-            output.stdout.extend(std::fs::read(entry.path()).unwrap());
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("owner-bootstrap-")
+            {
+                output.stdout.extend(std::fs::read(entry.path()).unwrap());
+            }
         }
     }
     (output, management_alive)

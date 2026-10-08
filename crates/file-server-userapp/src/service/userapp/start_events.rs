@@ -228,29 +228,15 @@ async fn consume(
                     .await;
                 }
             }
-            // Done 是终局判据——但**仅在未先观察到编排进程退出时**（R05：
-            // 退出先于 Done 被观察到 → 迟到的缓存成功 Done 不能证明启动
-            // 成功提交，Plan §阶段一"已观察到编排进程在启动完成提交前退出，
-            // 不能仅凭缓存 Done 成功"；排空窗收集的失败清单保留在诊断里）。
-            // Done 先到、之后才退出 = 成功提交后的运行健康变化，不在此路径。
+            // Done 是终局判据。到达本通道的 Done 必然先于进程退出写入管道
+            // （管道字节序），"观察到退出"与"读到 Done"来自不同发送任务、
+            // 到达顺序不携带信息——R05 的"退出后迟到的 Done 是缓存成功"
+            // 仅对非管道来源的事件成立；本通道内 EOF 前的 Done 一律可信。
+            // 排空窗超时/通道关闭仍无 Done 才按退出失败收场。
             StartEvent::Done { failed } => {
                 for (service, error) in &failed {
                     emit_startup_result_log(&task, &mut startup_results, service, Some(error))
                         .await;
-                }
-                if let Some(exit) = exited.as_deref() {
-                    let summary = failed
-                        .into_iter()
-                        .map(|(service, error)| format!("{service}: {error}"))
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    return Err(exited_failure(
-                        exit,
-                        format!(
-                            "completion event arrived after orchestrator exit was observed \
-                             (cached success is not a completion proof); failed services: {summary}"
-                        ),
-                    ));
                 }
                 return done_outcome(failed);
             }
@@ -526,10 +512,10 @@ mod tests {
         ));
     }
 
-    /// R05：退出先于成功 Done 被观察到 → 迟到的缓存成功不能证明启动成功
-    ///（exit 0 与非零同拒——Plan §阶段一"退出后无有效 Done"）。
+    /// 退出观察与 Done 到达来自不同发送任务，顺序不携带信息；经管道到达的
+    /// Done 必然先于进程退出写入（管道字节序）——EOF 前的 Done 一律可信。
     #[tokio::test]
-    async fn success_done_after_observed_exit_never_succeeds() {
+    async fn success_done_after_observed_exit_still_succeeds() {
         for exit in ["0", "1"] {
             let (tx, rx) = mpsc::unbounded_channel();
             let target = task().await;
@@ -543,16 +529,25 @@ mod tests {
             }))
             .unwrap();
             tx.send(StartEvent::Done { failed: vec![] }).unwrap();
-            let error = consumer.await.unwrap().unwrap_err();
-            assert!(
-                error.to_string().contains("exited before completion"),
-                "exit {exit}: {error}"
-            );
-            let (events, _) = target.subscribe(0).await;
-            assert!(events.iter().all(|(_, event)| {
-                !matches!(event, BuildProgressEvent::Log { line, .. } if line.contains("启动成功"))
-            }));
+            consumer.await.unwrap().unwrap();
         }
+    }
+
+    /// 退出后通道内**始终没有 Done**（EOF/排空窗耗尽）→ 仍按退出失败收场
+    ///——可信的判据是"有没有 Done"，不是"Done 与退出观察的先后"。
+    #[tokio::test]
+    async fn exit_without_any_done_still_fails() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let target = task().await;
+        let consumer = tokio::spawn(consume(target, rx));
+        tx.send(StartEvent::ProducerExited { exit: "1".into() })
+            .unwrap();
+        drop(tx);
+        let error = consumer.await.unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("exited before completion"),
+            "{error}"
+        );
     }
 
     /// R05 对照组：正常 Done 先提交、之后进程退出——成功不追改。
@@ -565,7 +560,7 @@ mod tests {
         consumer.await.unwrap().unwrap();
     }
 
-    /// R05：退出 → 失败 Done（带失败清单）→ 失败保留清单诊断。
+    /// 失败 Done（带失败清单）无论退出观察先后都按清单失败——诊断保留明细。
     #[tokio::test]
     async fn failed_done_after_observed_exit_keeps_failure_detail() {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -579,7 +574,7 @@ mod tests {
         .unwrap();
         let error = consumer.await.unwrap().unwrap_err();
         let message = error.to_string();
-        assert!(message.contains("exited before completion"), "{message}");
+        assert!(message.contains("Service startup failed"), "{message}");
         assert!(message.contains("web: probe failed"), "{message}");
     }
 
