@@ -219,17 +219,16 @@ impl DevServerManager {
             hooks.submitted();
         }
 
-        // 早退检测 + 宽松就绪（pingap 按 [proxy] path 路由，根路径可能 404——
-        // HTTP 判不通但进程存活即通过）
+        // 早退检测 + 宽松就绪——watch 对象是 serve owner 而非 spawn 的 run
+        // 进程：app-cli 0.3.16+ 的 `run` 是一次性引导（可重复执行），完成
+        // 移交后正常退出；9080 按 [proxy] path 路由时根路径 404，HTTP 判不
+        // 通但编排主体存活即通过。
         match self
-            .poll_alive_with_launch_deadline(
+            .wait_manifest_alive(
                 pid,
                 PINGAP_ENTRY_PORT,
-                None,
+                project_path,
                 &stderr_ring,
-                &|port, _base, timeout_ms| {
-                    Box::pin(process::is_project_alive(port, Some("/"), timeout_ms))
-                },
                 Some(deadline),
             )
             .await

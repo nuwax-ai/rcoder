@@ -5,6 +5,12 @@ pub(super) enum LaunchObservation {
     DeadlineExpired,
 }
 
+/// run 引导退出后的 owner 移交核验预算（覆盖 serve 绑定 3010 的竞态窗口；
+/// 真失败的引导也会等满该预算再报错——上限可控）。
+const HANDOVER_CONFIRM_BUDGET: Duration = Duration::from_secs(2);
+/// 移交核验重试间隔。
+const HANDOVER_PROBE_RETRY: Duration = Duration::from_millis(200);
+
 impl DevServerManager {
     /// 就绪轮询: 进程早退 → Err (读 stderr ring 分类成结构化错误); HTTP 就绪 → Ok;
     /// 超时但进程仍在 → Ok (nuwax 宽松)。
@@ -90,6 +96,143 @@ impl DevServerManager {
             "dev server on port {port} (pid {pid}) 未在 {max}ms 内响应 HTTP, 进程仍在 — 返回成功 (nuwax 宽松)"
         );
         Ok(LaunchObservation::Ready)
+    }
+
+    /// manifest 引擎启动等待。与 vite 路径的 [`Self::poll_alive_with_launch_deadline`]
+    /// 差异：spawn 的 `app-cli run` 自 0.3.16 起是一次性引导（可重复执行），
+    /// 常驻主体是 `app-cli serve` owner——run 进程退出不再单独构成失败判据：
+    /// 退出后经 owner 身份探活核验移交；核验通过则继续按 9080 探活/宽松语义
+    /// 等就绪，owner 确认缺席才按启动失败分类（stderr ring 兜底文案不变）。
+    pub(super) async fn wait_manifest_alive(
+        &self,
+        pid: u32,
+        port: u16,
+        workspace: &Path,
+        stderr_ring: &Arc<StderrRing>,
+        launch_deadline: Option<tokio::time::Instant>,
+    ) -> AppResult<LaunchObservation> {
+        let max = self.config.dev_alive_max_wait_ms;
+        let timeout = self.config.dev_alive_check_timeout_ms;
+        let interval = Duration::from_millis(self.config.dev_alive_poll_interval_ms);
+        let wall_deadline = std::time::Instant::now() + Duration::from_millis(max);
+        let probe_alive = |port: u16, timeout_ms: u64| {
+            Box::pin(process::is_project_alive(port, Some("/"), timeout_ms))
+                as std::pin::Pin<Box<dyn Future<Output = bool> + Send>>
+        };
+        let mut owner_confirmed = false;
+        loop {
+            if launch_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                return Ok(LaunchObservation::DeadlineExpired);
+            }
+            if !owner_confirmed && !process::is_process_running(pid) {
+                // run 引导退出（移交成功或引导失败二选一）：有界窗口内核验
+                // serve owner 是否接管（run 退出与 serve 绑定 3010 存在竞态，
+                // 短重试覆盖连接拒绝/初始化中的过渡态）。
+                let mut budget = HANDOVER_CONFIRM_BUDGET;
+                if let Some(deadline) = launch_deadline {
+                    budget =
+                        budget.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                }
+                if !self.confirm_owner_handover(workspace, budget).await {
+                    return Err(early_exit_err(pid, port, stderr_ring));
+                }
+                owner_confirmed = true;
+            }
+            let now = std::time::Instant::now();
+            if now >= wall_deadline {
+                break;
+            }
+            let mut this_timeout = timeout.min((wall_deadline - now).as_millis() as u64);
+            if let Some(parent) = launch_deadline {
+                this_timeout = this_timeout.min(
+                    parent
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .as_millis() as u64,
+                );
+            }
+            let observation = probe_alive(port, this_timeout);
+            let ready = match launch_deadline {
+                Some(parent) => match tokio::time::timeout_at(parent, observation).await {
+                    Ok(ready) => ready,
+                    Err(_) => return Ok(LaunchObservation::DeadlineExpired),
+                },
+                None => observation.await,
+            };
+            if ready {
+                return Ok(LaunchObservation::Ready);
+            }
+            tokio::time::sleep_until(
+                launch_deadline.map_or(tokio::time::Instant::now() + interval, |parent| {
+                    parent.min(tokio::time::Instant::now() + interval)
+                }),
+            )
+            .await;
+        }
+        if launch_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Ok(LaunchObservation::DeadlineExpired);
+        }
+        // 宽松就绪（9080 按 [proxy] path 路由时根路径 404 属常态）：存活判据
+        // 在移交前后分别锚定 run 进程 / serve owner。
+        let alive = if owner_confirmed {
+            self.confirm_owner_handover(workspace, HANDOVER_CONFIRM_BUDGET)
+                .await
+        } else {
+            process::is_process_running(pid)
+        };
+        if !alive {
+            return Err(early_exit_err(pid, port, stderr_ring));
+        }
+        tracing::warn!(
+            "dev server on port {port} (pid {pid}) 未在 {max}ms 内响应 HTTP, 编排主体仍在 — 返回成功 (nuwax 宽松)"
+        );
+        Ok(LaunchObservation::Ready)
+    }
+
+    /// run 引导退出后的移交核验：owner 就绪且身份匹配本工作区 → true；预算
+    /// 内未出现匹配 owner（含初始化中/连接拒绝/legacy/身份不符）→ false。
+    /// 身份不符或 legacy 立即失败不重试——重试只覆盖"尚未绑好"的过渡态。
+    async fn confirm_owner_handover(&self, workspace: &Path, budget: Duration) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            let address = self.config.app_cli_admin_probe_addr.clone();
+            match crate::service::dev_server::owner_client::probe_owner(&address).await {
+                Ok(Some(identity)) => {
+                    let application_id = std::env::var("PROJECT_ID")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or_else(|| "unknown-app".to_string());
+                    if crate::service::dev_server::owner_client::verify_project_identity(
+                        &identity,
+                        workspace,
+                        &application_id,
+                    )
+                    .is_ok()
+                    {
+                        return true;
+                    }
+                    tracing::warn!(
+                        application_id,
+                        "app-cli serve owner present after bootstrap but identity mismatch; refusing handover"
+                    );
+                    return false;
+                }
+                Ok(None) => {
+                    // 无人监听（含 legacy 应答）：引导没有留下可用的 serve。
+                    // 竞态窗口内可能是尚未 bind——预算未尽则重试。
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    tokio::time::sleep(HANDOVER_PROBE_RETRY).await;
+                }
+                Err(_) => {
+                    // 初始化中/传输抖动：预算内重试，耗尽按未移交收场。
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    tokio::time::sleep(HANDOVER_PROBE_RETRY).await;
+                }
+            }
+        }
     }
 
     pub(super) async fn write_npmrc(&self, project_path: &Path) -> AppResult<()> {

@@ -1419,3 +1419,111 @@ mod owner_reuse_tests {
         }
     }
 }
+
+/// 0.3.16+ 契约：spawn 的 `app-cli run` 是一次性引导（可重复执行），常驻
+/// 主体是 `app-cli serve` owner。run 进程退出后：匹配 owner 在 → 移交
+/// 成立，宽松就绪成功；无 owner → 启动失败（stderr 分类文案不变）。
+async fn spawn_dead_pid() -> u32 {
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exit 0")
+        .spawn()
+        .expect("spawn transient process");
+    let pid = child.id();
+    let _ = child.wait();
+    pid
+}
+
+fn wait_test_config(probe_addr: &str, logs: &Path) -> crate::Config {
+    let mut config = crate::Config::from_env().expect("test config");
+    config.app_cli_admin_probe_addr = probe_addr.to_string();
+    config.log_base_dir = logs.to_path_buf();
+    // 快速宽松就绪（不监听 9080，走移交核验分支）
+    config.dev_alive_max_wait_ms = 300;
+    config.dev_alive_check_timeout_ms = 100;
+    config.dev_alive_poll_interval_ms = 50;
+    config
+}
+
+#[tokio::test]
+async fn manifest_wait_treats_run_exit_as_owner_handover_when_owner_present() {
+    if std::env::var_os("PROJECT_ID").is_some() {
+        // 身份核验的 application_id 锚定 unknown-app 回退；宿主平台变量下跳过
+        return;
+    }
+    let ws = tempfile::tempdir().expect("workspace tempdir");
+    let dir = tempfile::tempdir().expect("harness tempdir");
+
+    // 假 serve owner：/v1/runtime/identity 返回与本工作区匹配的身份
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind owner");
+    let addr = listener.local_addr().expect("owner addr");
+    let source_root = ws.path().display().to_string();
+    let identity = shared_types::RuntimeIdentityView {
+        application_id: "unknown-app".to_string(),
+        service_family: "userapp-dev".to_string(),
+        workspace_id: source_root.clone(),
+        source_root,
+        runtime_instance_id: "instance-handover".to_string(),
+        deployment_generation_id: "gen-handover".to_string(),
+        protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+        capabilities: Vec::new(),
+    };
+    let router = axum::Router::new().route(
+        "/v1/runtime/identity",
+        axum::routing::get(move || {
+            let identity = identity.clone();
+            async move {
+                axum::Json(serde_json::json!({
+                    "success": true, "code": "OK", "data": identity, "message": "ok"
+                }))
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let config = wait_test_config(
+        &format!("127.0.0.1:{}", addr.port()),
+        &dir.path().join("logs"),
+    );
+    let manager = DevServerManager::new(Arc::new(config));
+    let pid = spawn_dead_pid().await;
+    let ring: Arc<StderrRing> = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+        STDERR_RING_CAP,
+    )));
+    let observation = manager
+        .wait_manifest_alive(pid, 1, ws.path(), &ring, None)
+        .await
+        .expect("handover-confirmed startup must be lenient-ready");
+    assert!(
+        matches!(observation, LaunchObservation::Ready),
+        "expected lenient Ready after confirmed owner handover"
+    );
+}
+
+#[tokio::test]
+async fn manifest_wait_reports_startup_failure_when_run_exits_without_owner() {
+    let ws = tempfile::tempdir().expect("workspace tempdir");
+    let dir = tempfile::tempdir().expect("harness tempdir");
+    // 探测地址恒拒绝连接（引导失败未留下 serve owner）
+    let config = wait_test_config("127.0.0.1:1", &dir.path().join("logs"));
+    let manager = DevServerManager::new(Arc::new(config));
+    let pid = spawn_dead_pid().await;
+    let ring: Arc<StderrRing> = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+        STDERR_RING_CAP,
+    )));
+    let outcome = manager
+        .wait_manifest_alive(pid, 1, ws.path(), &ring, None)
+        .await;
+    let error = match outcome {
+        Ok(_) => panic!("bootstrap without owner must be reported as startup failure"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("启动失败"),
+        "classified startup failure expected: {error}"
+    );
+}
