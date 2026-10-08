@@ -2132,10 +2132,19 @@ print(json.dumps(roots))"#,
         .expect("logs sources query after dev stop");
     let stopped_status = resp.status();
     let body: Value = resp.json().await.unwrap_or(Value::Null);
+    // 日志文件背书契约（2295e03bc：pkill 全灭 app-cli 后日志仍须可查）：
+    // 停止后 sources/query 返回 200，内置 orchestrator 源持续可查——
+    // 不再要求"未运行=快速 400"（那是有 app-cli 进程背书的旧契约）。
     report.assert_hard(
-        "dev/stop 后 logs/sources/query → 快速 400 ERR_DEV_NOT_RUNNING",
-        stopped_status.as_u16() == 200 && body["code"].as_str() == Some("ERR_DEV_NOT_RUNNING"),
-        format!("status={stopped_status}, body 截断: {}", trunc(&body, 120)),
+        "dev/stop 后 logs/sources/query → 200 持久 orchestrator 源可查（文件背书）",
+        stopped_status.as_u16() == 200
+            && body["code"].as_str() == Some("0000")
+            && body["data"].as_array().is_some_and(|sources| {
+                sources
+                    .iter()
+                    .any(|source| service_field(source) == Some("app-cli".to_string()))
+            }),
+        format!("status={stopped_status}, body 截断: {}", trunc(&body, 160)),
     );
 
     assert_hard_all(report).await;
@@ -2616,11 +2625,34 @@ async fn userapp_dev_precheck_rejects_empty_and_no_services() {
         .expect("dev start on empty workspace");
     let s1 = resp.status();
     let b1: Value = resp.json().await.unwrap_or(Value::Null);
-    let no_task = b1["data"]["task_id"].as_str().is_none_or(str::is_empty);
+    // 新契约：受理期拒绝直达错误码；如附带回查任务（终态诊断任务，提供
+    // GET/SSE 回查失败详情），其状态必须是 failed——不允许进入执行队列。
+    let rejection_task_terminal = match b1["data"]["task_id"].as_str() {
+        None | Some("") => true,
+        Some(task_id) => {
+            let task_resp = env
+                .http
+                .get(format!("{}/api/v1/userapp/tasks/{task_id}", env.rcoder))
+                .timeout(Duration::from_secs(15))
+                .header("X-App-Id", &app)
+                .query(&[("app_id", app.as_str()), ("user_id", user)])
+                .send()
+                .await;
+            match task_resp {
+                Ok(resp) => {
+                    let body: Value = resp.json().await.unwrap_or(Value::Null);
+                    body["data"]["status"].as_str() == Some("failed")
+                }
+                Err(_) => false,
+            }
+        }
+    };
     report.assert_hard(
-        "空 workspace → dev/start 400 ERR_WORKSPACE_EMPTY（不创建任务）",
-        s1.as_u16() == 200 && b1["code"].as_str() == Some("ERR_WORKSPACE_EMPTY") && no_task,
-        format!("HTTP {s1}, {}", trunc(&b1, 120)),
+        "空 workspace → dev/start 受理即拒 ERR_WORKSPACE_EMPTY（诊断任务终态失败）",
+        s1.as_u16() == 200
+            && b1["code"].as_str() == Some("ERR_WORKSPACE_EMPTY")
+            && rejection_task_terminal,
+        format!("HTTP {s1}, {}", trunc(&b1, 160)),
     );
 
     // 2. 写一个普通文件（非 manifest）→ 非空但 discover 无 enabled 服务
@@ -2673,14 +2705,30 @@ async fn userapp_dev_precheck_rejects_empty_and_no_services() {
         .expect("logs query never started");
     let s4 = resp.status();
     let b4: Value = resp.json().await.unwrap_or(Value::Null);
+    // 文件背书契约：未部署/未启动也返回 200，内置 orchestrator 源可查
+    // （API 文档：编排器日志常驻提供，空容器未部署时也可查）。
     report.assert_hard(
-        "从未 dev/start → logs/sources/query 400 ERR_DEV_NOT_RUNNING",
-        s4.as_u16() == 200 && b4["code"].as_str() == Some("ERR_DEV_NOT_RUNNING"),
-        format!("HTTP {s4}, {}", trunc(&b4, 120)),
+        "从未 dev/start → logs/sources/query 200 持久 orchestrator 源可查",
+        s4.as_u16() == 200
+            && b4["code"].as_str() == Some("0000")
+            && b4["data"].as_array().is_some_and(|sources| {
+                sources
+                    .iter()
+                    .any(|source| service_field(source) == Some("app-cli".to_string()))
+            }),
+        format!("HTTP {s4}, {}", trunc(&b4, 160)),
     );
 
     assert_hard_all(report).await;
     cleanup_builder(user, &app);
+}
+
+/// 日志源条目的 service_id 读取（sources/query 的文件背书断言用）。
+fn service_field(source: &Value) -> Option<String> {
+    source
+        .get("service_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
 }
 
 /// docker inspect 读容器 Id（cleanup_builder 同款 std::process::Command 先例）。

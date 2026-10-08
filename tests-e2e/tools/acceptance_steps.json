@@ -438,10 +438,10 @@
   ],
   "userapp_dev_precheck_rejects_empty_and_no_services": [
     "create-workspace（ensure 开发容器+建目录+owner 注册）",
-    "从未 dev/start → logs/sources/query 400 ERR_DEV_NOT_RUNNING",
+    "从未 dev/start → logs/sources/query 200 持久 orchestrator 源可查",
     "无 manifest workspace → dev/start 400 ERR_WORKSPACE_NO_SERVICES",
     "构造前提：generate-file 写入 probe.txt 成功",
-    "空 workspace → dev/start 400 ERR_WORKSPACE_EMPTY（不创建任务）"
+    "空 workspace → dev/start 受理即拒 ERR_WORKSPACE_EMPTY（诊断任务终态失败）"
   ],
   "userapp_dev_registry_self_heal_after_restart": [
     "create-workspace（ensure 开发容器+建目录+owner 注册）",
@@ -457,7 +457,7 @@
     "dev/start 受理（task_id + pending）",
     "dev/stop → Stopped",
     "dev/stop 后 list 空",
-    "dev/stop 后 logs/sources/query → 快速 400 ERR_DEV_NOT_RUNNING",
+    "dev/stop 后 logs/sources/query → 200 持久 orchestrator 源可查（文件背书）",
     "logs/query orchestrator 源 → app-cli 编排日志可见"
   ],
   "userapp_dev_skills_push": [
