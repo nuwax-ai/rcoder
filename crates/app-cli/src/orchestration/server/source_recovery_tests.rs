@@ -133,9 +133,12 @@ async fn fresh_owner_restores_actual_persisted_pg_into_business_input() {
     let kernel = assemble_runtime_kernel(&fresh, &args).await.unwrap();
     fresh.set_runtime_kernel(kernel);
     let restored = restored_runtime_args(&args, &fresh).unwrap();
-    assert_eq!(restored.workspace, args.workspace);
+    // macOS 的 tempfile 根经 /var → /private/var 符号链接，恢复侧返回规范化
+    // 拼写——断言按规范化形态比较（Linux 上 canonicalize 恒等，语义不变）。
+    let expected_workspace = args.workspace.canonicalize().unwrap();
+    assert_eq!(restored.workspace, expected_workspace);
     assert!(
-        matches!(initialize_startup(&args, &fresh).await.unwrap(), Some(InitialAction::Existing { workspace }) if workspace == args.workspace)
+        matches!(initialize_startup(&args, &fresh).await.unwrap(), Some(InitialAction::Existing { workspace }) if workspace == expected_workspace)
     );
     assert_eq!(fresh.take_pending_run_config(), Some(pg));
     assert!(!fresh.runtime_recovery_hold_active());
@@ -159,9 +162,10 @@ async fn legacy_redacted_receipt_is_diagnostic_and_does_not_hold_no_pg_business(
         crate::runtime_kernel::RuntimeStore::resolve_root(&args.workspace, "unknown-app").unwrap();
     let original = std::fs::read(root.join(".deploy-operation.json")).unwrap();
     let restored = restored_runtime_args(&args, &state).unwrap();
-    assert_eq!(restored.workspace, args.workspace);
+    let expected_workspace = args.workspace.canonicalize().unwrap();
+    assert_eq!(restored.workspace, expected_workspace);
     assert!(
-        matches!(initialize_startup(&args, &state).await.unwrap(), Some(InitialAction::Existing { workspace }) if workspace == args.workspace)
+        matches!(initialize_startup(&args, &state).await.unwrap(), Some(InitialAction::Existing { workspace }) if workspace == expected_workspace)
     );
     assert!(
         !state.runtime_recovery_hold_active(),

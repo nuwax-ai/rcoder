@@ -5,6 +5,18 @@ pub(super) enum LaunchObservation {
     DeadlineExpired,
 }
 
+/// spawn 进程退出时的处置策略——两条启动路径（vite / manifest 引擎）在
+/// 就绪等待上的唯一差异点。
+pub(super) enum ExitPolicy<'a> {
+    /// 进程常驻（vite 路径）：退出即启动失败，读 stderr 分类成可操作错误。
+    Fail,
+    /// `app-cli run` 是一次性引导（0.3.16+，可重复执行），常驻主体是
+    /// `app-cli serve` owner（manifest 路径）：run 退出后按 owner 身份探活
+    /// 核验移交；核验通过后存活判据锚定 owner 而非 run 进程，owner 确认
+    /// 缺席才按启动失败分类。
+    ConfirmOwner { workspace: &'a Path },
+}
+
 /// run 引导退出后的 owner 移交核验预算（覆盖 serve 绑定 3010 的竞态窗口；
 /// 真失败的引导也会等满该预算再报错——上限可控）。
 const HANDOVER_CONFIRM_BUDGET: Duration = Duration::from_secs(2);
@@ -12,7 +24,7 @@ const HANDOVER_CONFIRM_BUDGET: Duration = Duration::from_secs(2);
 const HANDOVER_PROBE_RETRY: Duration = Duration::from_millis(200);
 
 impl DevServerManager {
-    /// 就绪轮询: 进程早退 → Err (读 stderr ring 分类成结构化错误); HTTP 就绪 → Ok;
+    /// 就绪轮询: 进程早退 → Err (读 stderr ring 分类成可操作错误); HTTP 就绪 → Ok;
     /// 超时但进程仍在 → Ok (nuwax 宽松)。
     pub(crate) async fn poll_alive(
         &self,
@@ -36,19 +48,86 @@ impl DevServerManager {
         probe: AliveProbe<'_>,
         launch_deadline: Option<tokio::time::Instant>,
     ) -> AppResult<LaunchObservation> {
+        self.wait_alive(
+            pid,
+            port,
+            base_path,
+            stderr_ring,
+            probe,
+            launch_deadline,
+            &ExitPolicy::Fail,
+        )
+        .await
+    }
+
+    /// manifest 引擎启动等待：探活打 9080 根路径（按 [proxy] path 路由时 404
+    /// 属常态，靠宽松语义兜底），进程退出处置按 owner 移交核验。
+    pub(super) async fn wait_manifest_alive(
+        &self,
+        pid: u32,
+        port: u16,
+        workspace: &Path,
+        stderr_ring: &Arc<StderrRing>,
+        launch_deadline: Option<tokio::time::Instant>,
+    ) -> AppResult<LaunchObservation> {
+        self.wait_alive(
+            pid,
+            port,
+            None,
+            stderr_ring,
+            &|port, _base, timeout_ms| {
+                Box::pin(process::is_project_alive(port, Some("/"), timeout_ms))
+            },
+            launch_deadline,
+            &ExitPolicy::ConfirmOwner { workspace },
+        )
+        .await
+    }
+
+    /// 统一就绪等待循环：deadline 钳制、探活节奏与宽松收尾对两条路径共用；
+    /// 进程退出处置（见 [`ExitPolicy`]) 是唯一分支点。
+    async fn wait_alive(
+        &self,
+        pid: u32,
+        port: u16,
+        base_path: Option<&str>,
+        stderr_ring: &Arc<StderrRing>,
+        probe: AliveProbe<'_>,
+        launch_deadline: Option<tokio::time::Instant>,
+        exit_policy: &ExitPolicy<'_>,
+    ) -> AppResult<LaunchObservation> {
         let max = self.config.dev_alive_max_wait_ms;
         let timeout = self.config.dev_alive_check_timeout_ms;
         let interval = Duration::from_millis(self.config.dev_alive_poll_interval_ms);
         // 用墙钟 deadline 计时 (而非固定步进累加): 探活本身可能耗时 (未 ready 时等到
         // timeout), 固定步进累加会让 max 超时判断严重偏松 (实际墙钟远大于累加值)。
         let deadline = std::time::Instant::now() + Duration::from_millis(max);
+        let mut owner_confirmed = false;
         loop {
             if launch_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
                 return Ok(LaunchObservation::DeadlineExpired);
             }
-            // 进程已退出 (端口冲突 / 配置错 / 依赖缺失) → 读 stderr 分类成可操作错误
-            if !process::is_process_running(pid) {
-                return Err(early_exit_err(pid, port, stderr_ring));
+            // 进程退出处置（两条路径的唯一差异点）。
+            if !owner_confirmed && !process::is_process_running(pid) {
+                match exit_policy {
+                    // 常驻进程退出 = 端口冲突 / 配置错 / 依赖缺失 → stderr 分类。
+                    ExitPolicy::Fail => return Err(early_exit_err(pid, port, stderr_ring)),
+                    ExitPolicy::ConfirmOwner { workspace } => {
+                        // run 引导退出（移交成功或引导失败二选一）：有界窗口内
+                        // 核验 serve owner 是否接管（run 退出与 serve 绑定 3010
+                        // 存在竞态，短重试覆盖连接拒绝/初始化中的过渡态）。
+                        let mut budget = HANDOVER_CONFIRM_BUDGET;
+                        if let Some(deadline) = launch_deadline {
+                            budget = budget.min(
+                                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                            );
+                        }
+                        if !self.confirm_owner_handover(workspace, budget).await {
+                            return Err(early_exit_err(pid, port, stderr_ring));
+                        }
+                        owner_confirmed = true;
+                    }
+                }
             }
             // deadline 检查放探活前: 兜底 max=0 边界 + sleep 后已超 deadline 不再多探活。
             let now = std::time::Instant::now();
@@ -57,8 +136,8 @@ impl DevServerManager {
             }
             // 探活超时夹到剩余 deadline (min): 防单次探活越过 deadline, 让 max 成硬上限
             // (默认 max=30s >> timeout=1.5s 不触发, 仅防御 max<timeout 的错误配置)。
-            // 首轮即探活 (不固定盲等 sleep): spawn 返回时 vite 端口未 listen, reqwest
-            // connection refused 快速失败, 等价探测式等待; vite 提前 ready 能立刻发现。
+            // 首轮即探活 (不固定盲等 sleep): spawn 返回时端口未 listen, reqwest
+            // connection refused 快速失败, 等价探测式等待; 提前 ready 能立刻发现。
             let mut this_timeout = timeout.min((deadline - now).as_millis() as u64);
             if let Some(parent) = launch_deadline {
                 this_timeout = this_timeout.min(
@@ -88,96 +167,15 @@ impl DevServerManager {
         if launch_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             return Ok(LaunchObservation::DeadlineExpired);
         }
-        // 超时: 进程仍存活但未响应 HTTP → 按 nuwax 宽松返回成功; 若已死则分类报错
-        if !process::is_process_running(pid) {
-            return Err(early_exit_err(pid, port, stderr_ring));
-        }
-        tracing::warn!(
-            "dev server on port {port} (pid {pid}) 未在 {max}ms 内响应 HTTP, 进程仍在 — 返回成功 (nuwax 宽松)"
-        );
-        Ok(LaunchObservation::Ready)
-    }
-
-    /// manifest 引擎启动等待。与 vite 路径的 [`Self::poll_alive_with_launch_deadline`]
-    /// 差异：spawn 的 `app-cli run` 自 0.3.16 起是一次性引导（可重复执行），
-    /// 常驻主体是 `app-cli serve` owner——run 进程退出不再单独构成失败判据：
-    /// 退出后经 owner 身份探活核验移交；核验通过则继续按 9080 探活/宽松语义
-    /// 等就绪，owner 确认缺席才按启动失败分类（stderr ring 兜底文案不变）。
-    pub(super) async fn wait_manifest_alive(
-        &self,
-        pid: u32,
-        port: u16,
-        workspace: &Path,
-        stderr_ring: &Arc<StderrRing>,
-        launch_deadline: Option<tokio::time::Instant>,
-    ) -> AppResult<LaunchObservation> {
-        let max = self.config.dev_alive_max_wait_ms;
-        let timeout = self.config.dev_alive_check_timeout_ms;
-        let interval = Duration::from_millis(self.config.dev_alive_poll_interval_ms);
-        let wall_deadline = std::time::Instant::now() + Duration::from_millis(max);
-        let probe_alive = |port: u16, timeout_ms: u64| {
-            Box::pin(process::is_project_alive(port, Some("/"), timeout_ms))
-                as std::pin::Pin<Box<dyn Future<Output = bool> + Send>>
-        };
-        let mut owner_confirmed = false;
-        loop {
-            if launch_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-                return Ok(LaunchObservation::DeadlineExpired);
+        // 宽松就绪（超时未响应 HTTP）：存活判据按策略锚定——Fail=进程，
+        // ConfirmOwner 在移交成立后=serve owner（再核验一次），未移交=进程。
+        let alive = match exit_policy {
+            ExitPolicy::Fail => process::is_process_running(pid),
+            ExitPolicy::ConfirmOwner { workspace } if owner_confirmed => {
+                self.confirm_owner_handover(workspace, HANDOVER_CONFIRM_BUDGET)
+                    .await
             }
-            if !owner_confirmed && !process::is_process_running(pid) {
-                // run 引导退出（移交成功或引导失败二选一）：有界窗口内核验
-                // serve owner 是否接管（run 退出与 serve 绑定 3010 存在竞态，
-                // 短重试覆盖连接拒绝/初始化中的过渡态）。
-                let mut budget = HANDOVER_CONFIRM_BUDGET;
-                if let Some(deadline) = launch_deadline {
-                    budget =
-                        budget.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
-                }
-                if !self.confirm_owner_handover(workspace, budget).await {
-                    return Err(early_exit_err(pid, port, stderr_ring));
-                }
-                owner_confirmed = true;
-            }
-            let now = std::time::Instant::now();
-            if now >= wall_deadline {
-                break;
-            }
-            let mut this_timeout = timeout.min((wall_deadline - now).as_millis() as u64);
-            if let Some(parent) = launch_deadline {
-                this_timeout = this_timeout.min(
-                    parent
-                        .saturating_duration_since(tokio::time::Instant::now())
-                        .as_millis() as u64,
-                );
-            }
-            let observation = probe_alive(port, this_timeout);
-            let ready = match launch_deadline {
-                Some(parent) => match tokio::time::timeout_at(parent, observation).await {
-                    Ok(ready) => ready,
-                    Err(_) => return Ok(LaunchObservation::DeadlineExpired),
-                },
-                None => observation.await,
-            };
-            if ready {
-                return Ok(LaunchObservation::Ready);
-            }
-            tokio::time::sleep_until(
-                launch_deadline.map_or(tokio::time::Instant::now() + interval, |parent| {
-                    parent.min(tokio::time::Instant::now() + interval)
-                }),
-            )
-            .await;
-        }
-        if launch_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-            return Ok(LaunchObservation::DeadlineExpired);
-        }
-        // 宽松就绪（9080 按 [proxy] path 路由时根路径 404 属常态）：存活判据
-        // 在移交前后分别锚定 run 进程 / serve owner。
-        let alive = if owner_confirmed {
-            self.confirm_owner_handover(workspace, HANDOVER_CONFIRM_BUDGET)
-                .await
-        } else {
-            process::is_process_running(pid)
+            ExitPolicy::ConfirmOwner { .. } => process::is_process_running(pid),
         };
         if !alive {
             return Err(early_exit_err(pid, port, stderr_ring));
