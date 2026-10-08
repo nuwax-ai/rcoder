@@ -1,6 +1,82 @@
 //! dev 转发连接等待与发送失败分类的协议级回归（真实 socket，无 K8s）。
+use super::dev_connect::{DevConnectionObservation, observe_dev_connection_until};
 use super::*;
 use axum::http::StatusCode;
+
+fn restarting_operation() -> shared_types::UserAppOperationView {
+    shared_types::UserAppOperationView {
+        operation_id: "original-restart".into(),
+        app_id: "fixtureapp".into(),
+        lifecycle_id: "lifecycle".into(),
+        request_id: None,
+        kind: shared_types::UserAppOperationKind::RestartBuilder,
+        scope: shared_types::UserAppOperationScope::Dev,
+        state: shared_types::UserAppOperationState::Running,
+        revision: 1,
+        step: "starting".into(),
+        error_code: None,
+        error_message: None,
+        created_at: chrono::Utc::now(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn connect_wait_refreshes_finished_operation_and_preserves_query_failure() {
+    for query_fails in [false, true] {
+        let reads = std::cell::Cell::new(0);
+        let observed = observe_dev_connection_until(
+            tokio::time::Instant::now() + std::time::Duration::from_millis(750),
+            || std::future::ready(false),
+            || {
+                reads.set(reads.get() + 1);
+                std::future::ready(if reads.get() == 1 {
+                    Ok(vec![restarting_operation()])
+                } else if query_fails {
+                    Err(HttpResultError::bad_gateway(
+                        "operation storage unavailable",
+                    ))
+                } else {
+                    // The control head no longer holds this finished operation.
+                    Ok(vec![])
+                })
+            },
+        )
+        .await;
+        assert!(reads.get() >= 2, "must refresh the first Running snapshot");
+        if query_fails {
+            let response = observed
+                .expect_err("observation failure is not absence")
+                .into_response();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        } else {
+            assert!(
+                matches!(
+                    observed.unwrap(),
+                    DevConnectionObservation::Unreachable(None)
+                ),
+                "a finished operation must not be reported as still running"
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn connect_wait_rejects_ready_result_after_deadline() {
+    let observed = observe_dev_connection_until(
+        tokio::time::Instant::now() + std::time::Duration::from_millis(10),
+        || async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            true
+        },
+        || std::future::ready(Ok(vec![])),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        observed,
+        DevConnectionObservation::Unreachable(None)
+    ));
+}
 
 /// 事故反例回归（2026-10-08 app 221）：builder 重启窗口内连接失败——
 /// 不得把裸 reqwest 错误（含集群内部 svc 地址）直通用户；连接类失败

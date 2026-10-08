@@ -1184,12 +1184,38 @@ async fn guarded_migration_spawn_failure_still_starts_actual_http_and_commits_or
     fixture.same_owner(&client, &base, &identity, &native).await;
 }
 
-/// 慢启动 manifest：run 命令先 sleep 再起真实 HTTP，拉长原操作的
-/// 非终态窗口，供终局时序断言与 Stop 竞争使用。
+struct PipedRunEvents {
+    receiver: std::sync::mpsc::Receiver<Value>,
+    reader: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+}
+
+impl PipedRunEvents {
+    fn try_recv(&self) -> Result<Value, std::sync::mpsc::TryRecvError> {
+        self.receiver.try_recv()
+    }
+
+    async fn wait_for_eof(&mut self) {
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !self.reader.as_ref().unwrap().is_finished() {
+            assert!(
+                tokio::time::Instant::now() < until,
+                "run stdout reader must reach EOF before asserting terminal event count"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        self.reader
+            .take()
+            .unwrap()
+            .join()
+            .expect("stdout reader must not panic")
+            .expect("stdout reading must succeed");
+    }
+}
+
 impl Fixture {
     /// spawn run 客户端并捕获 stdout 的 EVT 行（跨线程 channel 回传解析后
     /// 的 JSON 事件；非 EVT 行忽略）。
-    fn spawn_run_piped(&mut self, log: &str) -> std::sync::mpsc::Receiver<Value> {
+    fn spawn_run_piped(&mut self, log: &str) -> PipedRunEvents {
         use std::io::{BufRead, BufReader};
         let mut child = self
             .command("run", log)
@@ -1199,20 +1225,25 @@ impl Fixture {
             .unwrap();
         let stdout = child.stdout.take().unwrap();
         let (events_tx, events_rx) = std::sync::mpsc::channel::<Value>();
-        std::thread::spawn(move || {
+        let reader = std::thread::spawn(move || -> std::io::Result<()> {
             for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                // wire 契约字面量（与 shared_types::APP_CLI_EVT_PREFIX 一致）。
-                let Some(payload) = line.strip_prefix("APP-CLI-EVT ") else {
+                let line = line?;
+                let Some(payload) = line.strip_prefix(shared_types::APP_CLI_EVT_PREFIX) else {
                     continue;
                 };
-                if let Ok(event) = serde_json::from_str::<Value>(payload) {
-                    let _ = events_tx.send(event);
+                let event = serde_json::from_str::<Value>(payload)
+                    .expect("every emitted EVT line must contain valid JSON");
+                if events_tx.send(event).is_err() {
+                    break;
                 }
             }
+            Ok(())
         });
         self.clients.push(child);
-        events_rx
+        PipedRunEvents {
+            receiver: events_rx,
+            reader: Some(reader),
+        }
     }
 }
 
@@ -1270,7 +1301,7 @@ async fn run_client_done_follows_authoritative_operation_result() {
         fixture.diagnostics()
     );
     fixture.slow_manifests("done-authority", 3);
-    let events = fixture.spawn_run_piped("done-authority");
+    let mut events = fixture.spawn_run_piped("done-authority");
     let client = client();
     let (base, identity, _native) = fixture.ready(&client).await;
     let token = std::fs::read_to_string(fixture.state.join("token")).unwrap();
@@ -1308,10 +1339,15 @@ async fn run_client_done_follows_authoritative_operation_result() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     };
+    events.wait_for_eof().await;
     // 进程退出后的管道残余事件同样计入终局计数。
     while let Ok(event) = events.try_recv() {
         if event["event"] == "orchestration_done" {
             dones_seen += 1;
+            assert!(
+                event["failed"].as_array().is_some_and(Vec::is_empty),
+                "success terminal must remain valid when buffered until EOF: {event}"
+            );
         }
     }
     assert_eq!(dones_seen, 1, "整条 stdout 恰好一个终局 done");
@@ -1336,7 +1372,7 @@ async fn stop_before_commit_yields_single_failure_done() {
         fixture.diagnostics()
     );
     fixture.slow_manifests("stop-race", 8);
-    let events = fixture.spawn_run_piped("stop-race");
+    let mut events = fixture.spawn_run_piped("stop-race");
     let client = client();
     let (base, identity, native) = fixture.ready(&client).await;
     let token = std::fs::read_to_string(fixture.state.join("token")).unwrap();
@@ -1384,6 +1420,7 @@ async fn stop_before_commit_yields_single_failure_done() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
+    events.wait_for_eof().await;
     let mut dones: Vec<Value> = Vec::new();
     while let Ok(event) = events.try_recv() {
         if event["event"] == "orchestration_done" {
@@ -1403,11 +1440,12 @@ async fn stop_before_commit_yields_single_failure_done() {
         "取消终局必须携带失败清单: {:?}",
         dones[0]
     );
-    // 退出码按终态契约（Cancelled=被取代语义为 0；其余失败态非零）——
-    // 这里只要求与 done 的失败语义不矛盾：记录即可，不强断言。
-    println!(
-        "stop-race client exit: {exit}, original state: {}",
-        final_view["state"]
+    // This is an explicit foreground `run`, whose own cancelled Start must
+    // report failure (`run_client::run`). Serve handover uses the separate
+    // `describe_terminal` cancellation contract to avoid supervisor retry loops.
+    assert!(
+        !exit.success(),
+        "the cancelled foreground Start must exit nonzero: {final_view}, exit {exit}"
     );
     fixture.same_owner(&client, &base, &identity, &native).await;
 }

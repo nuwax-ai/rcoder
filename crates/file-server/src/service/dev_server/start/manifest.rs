@@ -36,12 +36,54 @@ impl DevServerManager {
         };
         // 单一来源 shared_types::APP_ENTRY_PORT（release 流程、Pingora 免端口代理同值）
         const PINGAP_ENTRY_PORT: u16 = shared_types::APP_ENTRY_PORT;
-        if let Some(process) = lock(&self.processes)?.get(project_id).cloned()
-            && process.external_owner.is_none()
-        {
-            return Err(AppError::business(
-                "local orchestrator is already registered; readiness must be confirmed or an explicit restart requested",
-            ));
+        // HTTP readiness can precede the one-shot run's successful exit.
+        // On a later Start, finish that retained launch's handover before
+        // applying the local-live guard; a dead PID alone never authorizes it.
+        let retained = {
+            let launches = lock(&self.launches)?;
+            let processes = lock(&self.processes)?;
+            let supervised = lock(&self.supervised)?;
+            processes
+                .get(project_id)
+                .filter(|process| process.external_owner.is_none())
+                .map(|process| {
+                    (
+                        process.pid,
+                        launches
+                            .get(project_id)
+                            .map(|launch| launch.launch_id.clone()),
+                        supervised.get(project_id).cloned(),
+                    )
+                })
+        };
+        if let Some((pid, captured_launch, supervised)) = retained {
+            let successful_exit = supervised.as_ref().filter(|child| child.pid() == pid).and_then(|child| child.exited())
+                .is_some_and(|exit| matches!(exit,
+                    crate::service::dev_server::supervise::ChildExit::Exited(status) if status.success()));
+            let identity = if successful_exit {
+                self.confirm_owner_handover(
+                    project_path,
+                    HANDOVER_CONFIRM_BUDGET
+                        .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                )
+                .await
+            } else {
+                None
+            };
+            let promoted = match identity {
+                Some(identity) => self.publish_owner_handover(
+                    project_id,
+                    captured_launch.as_deref(),
+                    pid,
+                    &identity,
+                )?,
+                None => false,
+            };
+            if !promoted {
+                return Err(AppError::business(
+                    "local orchestrator is already registered; readiness must be confirmed or an explicit restart requested",
+                ));
+            }
         }
         // P1-05：旧 supervised 停止后未确认清理（如进程组残留或 stdout 排空未完成）——
         // 拒绝新 manifest 启动，直到后台清理确认完成。避免并发 dev 操作撞端口或误用残留状态。
@@ -242,16 +284,10 @@ impl DevServerManager {
                 // owner 复用链而非被历史 guard 拒绝。仅当登记仍指向本次
                 // launch 的 PID 且尚未转换时写入（Stop/后继实例竞争时不得
                 // 覆盖对方登记）；token 置空哨兵：停止路径按 owner 状态根重读。
-                let mut processes = lock(&self.processes)?;
-                if let Some(process) = processes.get_mut(project_id)
-                    && process.pid == pid
-                    && process.external_owner.is_none()
-                {
-                    process.external_owner = Some(ExternalOwner {
-                        address: self.config.app_cli_admin_probe_addr.clone(),
-                        token: String::new(),
-                        runtime_instance_id: identity.runtime_instance_id.clone(),
-                    });
+                if !self.publish_owner_handover(project_id, Some(&launch_id), pid, &identity)? {
+                    return Err(AppError::Conflict(
+                        "local startup launch changed while confirming owner handover; original execution was stopped or replaced".into(),
+                    ));
                 }
             }
             Ok(LaunchObservation::DeadlineExpired) => {
@@ -277,6 +313,41 @@ impl DevServerManager {
             pid,
             port: PINGAP_ENTRY_PORT,
         })
+    }
+
+    /// Publish only into the original launch. PID equality alone cannot protect
+    /// a successor whose numeric PID has already been reused by the OS.
+    pub(super) fn publish_owner_handover(
+        &self,
+        project_id: &str,
+        captured_launch: Option<&str>,
+        pid: u32,
+        identity: &shared_types::RuntimeIdentityView,
+    ) -> AppResult<bool> {
+        let Some(captured_launch) = captured_launch else {
+            return Ok(false);
+        };
+        let launches = lock(&self.launches)?;
+        if launches
+            .get(project_id)
+            .map(|launch| launch.launch_id.as_str())
+            != Some(captured_launch)
+        {
+            return Ok(false);
+        }
+        let mut processes = lock(&self.processes)?;
+        let Some(process) = processes.get_mut(project_id) else {
+            return Ok(false);
+        };
+        if process.pid != pid || process.external_owner.is_some() {
+            return Ok(false);
+        }
+        process.external_owner = Some(ExternalOwner {
+            address: self.config.app_cli_admin_probe_addr.clone(),
+            token: String::new(),
+            runtime_instance_id: identity.runtime_instance_id.clone(),
+        });
+        Ok(true)
     }
 
     /// DEV-R1：分类并清场本地执行目标（Start 在激活运行目录之前调用，

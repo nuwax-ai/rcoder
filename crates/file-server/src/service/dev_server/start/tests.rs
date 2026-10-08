@@ -1418,6 +1418,126 @@ mod owner_reuse_tests {
             }
         }
     }
+    /// HTTP readiness may finish while the one-shot launcher is still alive.
+    /// Its later exit must not turn the retained registration into a permanent
+    /// guard against the next real Start/owner Restart submission.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn manifest_http_ready_before_run_exit_allows_repeat_start() {
+        if std::env::var_os("PROJECT_ID").is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("source");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("workspace.manifest.toml"), "# fixture\n").unwrap();
+        let root = dir.path().join(".app-cli-state/unknown-app");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("token"), "test-token").unwrap();
+        let canonical = std::fs::canonicalize(&workspace).unwrap();
+        std::fs::write(
+            dir.path().join(".app-cli-state/registry.json"),
+            serde_json::to_vec(&std::collections::BTreeMap::from([(
+                canonical.to_string_lossy().into_owned(),
+                "unknown-app",
+            )]))
+            .unwrap(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let router = mock_owner_router("hashed-workspace", &workspace)
+            .with_state(Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let manager = DevServerManager::new(Arc::new(wait_test_config(
+            &address,
+            &dir.path().join("logs"),
+        )));
+        let flag = workspace.join("exit-flag");
+        let child = tokio::process::Command::new("sh")
+            .args([
+                "-c",
+                "while [ ! -f \"$1\" ]; do sleep 0.01; done; exit 0",
+                "fixture",
+            ])
+            .arg(&flag)
+            .spawn()
+            .unwrap();
+        let ring = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let supervised = SupervisedChild::adopt(child, ring.clone());
+        let pid = supervised.pid();
+        let key = "userapp:http-before-exit";
+        lock(&manager.launches).unwrap().insert(
+            key.into(),
+            super::super::super::types::LocalLaunch {
+                launch_id: "original-launch".into(),
+                state_root: None,
+            },
+        );
+        lock(&manager.processes).unwrap().insert(
+            key.into(),
+            DevProcess {
+                pid,
+                port: shared_types::APP_ENTRY_PORT,
+                project_id: key.into(),
+                instance_id: None,
+                base_path: None,
+                started_at: 0,
+                log_dir: dir.path().join("logs"),
+                temp_log_name: String::new(),
+                external_owner: None,
+            },
+        );
+        lock(&manager.supervised)
+            .unwrap()
+            .insert(key.into(), supervised.clone());
+        let ready = manager
+            .wait_alive(
+                pid,
+                AliveWatch {
+                    port: 1,
+                    base_path: None,
+                    stderr_ring: &ring,
+                    probe: &|_, _, _| Box::pin(async { true }),
+                    launch_deadline: None,
+                    exit_policy: &ExitPolicy::ConfirmOwner {
+                        workspace: &workspace,
+                        supervised: &supervised,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(ready, LaunchObservation::Ready));
+        std::fs::write(flag, "").unwrap();
+        assert!(matches!(supervised.wait_exit(Duration::from_secs(2)).await,
+            Some(crate::service::dev_server::supervise::ChildExit::Exited(status)) if status.success()));
+        let started = manager
+            .start_dev(
+                key,
+                &workspace,
+                crate::service::dev_server::DevLaunch {
+                    base_path: None,
+                    hooks: None,
+                    pg: None,
+                    request_context: None,
+                    artifact_release_id: None,
+                },
+            )
+            .await
+            .expect("a finished launcher must route a new Start to its verified owner");
+        assert_eq!(started.pid, 0);
+        assert!(
+            lock(&manager.processes)
+                .unwrap()
+                .get(key)
+                .unwrap()
+                .external_owner
+                .is_some()
+        );
+        server.abort();
+    }
+
     /// R3 回归：成功移交后本地登记转换为外部 owner——重复 Start 走 owner
     /// 复用链（向 owner 提交 Restart），不再被"local orchestrator is already
     /// registered"的死 run guard 拒绝。run 引导为受控脚本（等待放行文件后
@@ -1426,6 +1546,16 @@ mod owner_reuse_tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn manifest_handover_converts_registration_for_repeat_start() {
+        manifest_handover_registration_case(false).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn manifest_handover_after_original_launch_retired_never_reports_success() {
+        manifest_handover_registration_case(true).await;
+    }
+
+    async fn manifest_handover_registration_case(retire_before_handover: bool) {
         if std::env::var_os("PROJECT_ID").is_some() {
             // 身份核验的 application_id 锚定 unknown-app 回退；宿主平台变量下跳过
             return;
@@ -1516,8 +1646,30 @@ mod owner_reuse_tests {
         let first = {
             let manager = manager.clone();
             tokio::spawn(async move {
+                let hooks = if retire_before_handover {
+                    let retired = manager.clone();
+                    Some(crate::service::dev_server::DevEventHooks {
+                        on_submitted: Some(Arc::new(move || {
+                            // A controlled retirement barrier after atomic
+                            // publication, before launcher exit/owner handover.
+                            let mut launches = lock(&retired.launches).unwrap();
+                            let mut processes = lock(&retired.processes).unwrap();
+                            let mut children = lock(&retired.supervised).unwrap();
+                            launches.remove("userapp:handover-reg");
+                            processes.remove("userapp:handover-reg");
+                            children.remove("userapp:handover-reg");
+                        })),
+                        ..crate::service::dev_server::DevEventHooks::noop()
+                    })
+                } else {
+                    None
+                };
                 manager
-                    .start_dev("userapp:handover-reg", &first_workspace, launch())
+                    .start_dev(
+                        "userapp:handover-reg",
+                        &first_workspace,
+                        crate::service::dev_server::DevLaunch { hooks, ..launch() },
+                    )
                     .await
             })
         };
@@ -1533,10 +1685,29 @@ mod owner_reuse_tests {
         });
         std::fs::write(workspace.join(".release-flag"), "").unwrap();
 
-        let started = first
-            .await
-            .expect("start task join")
-            .expect("handover startup must succeed (run exit 0 + verified owner)");
+        let result = first.await.expect("start task join");
+        if retire_before_handover {
+            let error = result.expect_err("a retired launch cannot report a successful handover");
+            assert!(matches!(error, AppError::Conflict(_)), "{error}");
+            assert!(
+                !lock(&manager.processes)
+                    .unwrap()
+                    .contains_key("userapp:handover-reg")
+            );
+            assert!(
+                !lock(&manager.launches)
+                    .unwrap()
+                    .contains_key("userapp:handover-reg")
+            );
+            assert!(
+                !lock(&manager.supervised)
+                    .unwrap()
+                    .contains_key("userapp:handover-reg")
+            );
+            server.abort();
+            return;
+        }
+        let started = result.expect("handover startup must succeed (run exit 0 + verified owner)");
         assert_ne!(started.pid, 0, "首启走 spawn 路径（pid 为真实引导进程）");
 
         // R3 核心：重复 Start 不被死 run 的本地登记 guard 拒绝——登记已转换为
@@ -1712,5 +1883,152 @@ async fn manifest_wait_reports_startup_failure_when_run_exits_without_owner() {
     assert!(
         error.to_string().contains("启动失败"),
         "classified startup failure expected: {error}"
+    );
+}
+
+#[tokio::test]
+async fn manifest_http_ready_preserves_verified_handover() {
+    if std::env::var_os("PROJECT_ID").is_some() {
+        return;
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let logs = tempfile::tempdir().unwrap();
+    let address = spawn_identity_owner(workspace.path(), "http-ready-owner").await;
+    let manager = DevServerManager::new(Arc::new(wait_test_config(&address, logs.path())));
+    let (pid, supervised) = spawn_dead_run(0).await;
+    let ring = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let outcome = manager
+        .wait_alive(
+            pid,
+            AliveWatch {
+                port: 1,
+                base_path: None,
+                stderr_ring: &ring,
+                probe: &|_, _, _| Box::pin(async { true }),
+                launch_deadline: None,
+                exit_policy: &ExitPolicy::ConfirmOwner {
+                    workspace: workspace.path(),
+                    supervised: &supervised,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, LaunchObservation::HandedOver { identity }
+        if identity.runtime_instance_id == "http-ready-owner"));
+}
+
+#[tokio::test]
+async fn manifest_reaped_failure_is_authoritative_even_if_pid_is_live() {
+    let workspace = tempfile::tempdir().unwrap();
+    let logs = tempfile::tempdir().unwrap();
+    let manager = DevServerManager::new(Arc::new(wait_test_config("127.0.0.1:1", logs.path())));
+    let (_dead_pid, supervised) = spawn_dead_run(17).await;
+    let ring = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    // A live PID simulates reuse deterministically; the original Child's reaped
+    // result must win over this unrelated numeric process observation.
+    let outcome = manager
+        .wait_alive(
+            std::process::id(),
+            AliveWatch {
+                port: 1,
+                base_path: None,
+                stderr_ring: &ring,
+                probe: &|_, _, _| Box::pin(async { true }),
+                launch_deadline: None,
+                exit_policy: &ExitPolicy::ConfirmOwner {
+                    workspace: workspace.path(),
+                    supervised: &supervised,
+                },
+            },
+        )
+        .await;
+    assert!(
+        outcome.is_err(),
+        "ready HTTP cannot mask the original run's exit17: {outcome:?}"
+    );
+}
+
+#[test]
+fn manifest_late_handover_does_not_replace_successor_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = DevServerManager::new(Arc::new(wait_test_config("127.0.0.1:1", dir.path())));
+    let key = "userapp:handover-cas";
+    lock(&manager.launches).unwrap().insert(
+        key.into(),
+        super::super::types::LocalLaunch {
+            launch_id: "successor".into(),
+            state_root: None,
+        },
+    );
+    lock(&manager.processes).unwrap().insert(
+        key.into(),
+        DevProcess {
+            pid: 42,
+            port: shared_types::APP_ENTRY_PORT,
+            project_id: key.into(),
+            instance_id: None,
+            base_path: None,
+            started_at: 1,
+            log_dir: dir.path().to_path_buf(),
+            temp_log_name: String::new(),
+            external_owner: None,
+        },
+    );
+    let identity = shared_types::RuntimeIdentityView {
+        application_id: "unknown-app".into(),
+        service_family: "userapp-dev".into(),
+        workspace_id: "workspace".into(),
+        source_root: dir.path().display().to_string(),
+        runtime_instance_id: "original-owner".into(),
+        deployment_generation_id: "deploy".into(),
+        protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+        capabilities: vec![],
+    };
+    assert!(
+        !manager
+            .publish_owner_handover(key, Some("old-launch"), 42, &identity)
+            .unwrap(),
+        "equal numeric PIDs cannot authorize an old launch to convert a successor"
+    );
+    assert!(
+        lock(&manager.processes)
+            .unwrap()
+            .get(key)
+            .unwrap()
+            .external_owner
+            .is_none()
+    );
+    assert!(
+        !manager
+            .publish_owner_handover(key, None, 42, &identity)
+            .unwrap()
+    );
+    lock(&manager.launches).unwrap().remove(key);
+    assert!(
+        !manager
+            .publish_owner_handover(key, None, 42, &identity)
+            .unwrap(),
+        "a missing current/captured launch cannot degrade to PID-only ownership"
+    );
+    assert!(
+        lock(&manager.processes)
+            .unwrap()
+            .get(key)
+            .unwrap()
+            .external_owner
+            .is_none()
+    );
+    lock(&manager.launches).unwrap().insert(
+        key.into(),
+        super::super::types::LocalLaunch {
+            launch_id: "successor".into(),
+            state_root: None,
+        },
+    );
+    assert!(
+        manager
+            .publish_owner_handover(key, Some("successor"), 42, &identity)
+            .unwrap()
     );
 }

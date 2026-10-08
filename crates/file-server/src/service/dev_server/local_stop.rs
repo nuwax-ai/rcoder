@@ -298,13 +298,26 @@ impl DevServerManager {
             let pid = supervised.pid();
             // FS-09: 统一毫秒精度预算（200ms 不再截断为 0 秒）; 排空与退出等待共用同一 deadline。
             let drain_timeout = self.config.dev_stop_drain_budget();
-            let terminated = self.terminate_pid_group(pid).await;
-            killed.push(KilledPid {
-                pid,
-                killed: terminated,
-            });
+            let observed_exit = supervised.exited();
+            // A reaped launcher no longer owns its numeric PID; signaling that
+            // number could kill an unrelated process after PID reuse. A failed
+            // wait is also insufficient evidence to signal or confirm cleanup.
+            // Business-tree cleanup remains the captured StopWork's authority.
+            match &observed_exit {
+                Some(ChildExit::Exited(_) | ChildExit::WaitFailed(_)) => {}
+                None => {
+                    let terminated = self.terminate_pid_group(pid).await;
+                    killed.push(KilledPid {
+                        pid,
+                        killed: terminated,
+                    });
+                }
+            }
             supervised.drain_stdout(drain_timeout).await;
-            let exited = supervised.wait_exit(drain_timeout).await;
+            let exited = match observed_exit {
+                Some(exit) => Some(exit),
+                None => supervised.wait_exit(drain_timeout).await,
+            };
             let confirmed = matches!(exited, Some(ChildExit::Exited(_)));
             if !confirmed {
                 let launches = lock(&self.launches)?;

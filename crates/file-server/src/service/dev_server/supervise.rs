@@ -265,4 +265,107 @@ mod tests {
             "drain must honour the bounded window"
         );
     }
+
+    #[tokio::test]
+    async fn reaped_launcher_cleanup_never_signals_reused_pid() {
+        let status = tokio::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .status()
+            .await
+            .unwrap();
+        launcher_cleanup_signal_case(ChildExit::Exited(status), true).await;
+    }
+
+    #[tokio::test]
+    async fn unreadable_launcher_exit_never_signals_unconfirmed_pid() {
+        launcher_cleanup_signal_case(ChildExit::WaitFailed("reaper failed".into()), false).await;
+    }
+
+    /// Model PID reuse with a real unrelated process and a retained reaped
+    /// watch. Exercise the actual cleanup signal path, then reap our fixture
+    /// before any assertions so the red counterexample leaves no child behind.
+    async fn launcher_cleanup_signal_case(exit: ChildExit, expect_retired: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::Config::from_env().unwrap();
+        config.log_base_dir = dir.path().join("logs");
+        config.dev_stop_check_interval_ms = 10;
+        config.dev_stop_max_attempts = 1;
+        let manager = super::super::DevServerManager::new(Arc::new(config));
+        let mut victim = tokio::process::Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = victim.id().unwrap();
+        let (sender, receiver) = tokio::sync::watch::channel(Some(exit));
+        drop(sender);
+        let supervised = Arc::new(SupervisedChild {
+            pid,
+            exit: receiver,
+            stdout_task: Mutex::new(None),
+            stderr_ring: ring(),
+        });
+        let key = "userapp:reused-pid";
+        manager.launches.lock().unwrap().insert(
+            key.into(),
+            super::super::types::LocalLaunch {
+                launch_id: "original-launch".into(),
+                state_root: None,
+            },
+        );
+        manager.processes.lock().unwrap().insert(
+            key.into(),
+            crate::models::DevProcess {
+                pid,
+                port: shared_types::APP_ENTRY_PORT,
+                project_id: key.into(),
+                instance_id: None,
+                base_path: None,
+                started_at: 0,
+                log_dir: dir.path().join("logs"),
+                temp_log_name: String::new(),
+                external_owner: None,
+            },
+        );
+        manager
+            .supervised
+            .lock()
+            .unwrap()
+            .insert(key.into(), supervised);
+        let result = manager
+            .close_local_registration(key, Some("original-launch"))
+            .await;
+        let survived = victim.try_wait().unwrap().is_none();
+        if survived {
+            victim.kill().await.unwrap();
+        }
+        victim.wait().await.unwrap();
+
+        assert!(
+            survived,
+            "a retained launcher record must never signal this unrelated live process"
+        );
+        if expect_retired {
+            assert!(
+                result.unwrap().is_empty(),
+                "an already-reaped launcher needs no signal"
+            );
+            assert!(!manager.processes.lock().unwrap().contains_key(key));
+            assert!(!manager.launches.lock().unwrap().contains_key(key));
+            assert!(!manager.supervised.lock().unwrap().contains_key(key));
+        } else {
+            assert!(
+                result.is_err(),
+                "unreadable exit status cannot confirm cleanup"
+            );
+            assert!(manager.processes.lock().unwrap().contains_key(key));
+            assert!(manager.launches.lock().unwrap().contains_key(key));
+            assert!(manager.supervised.lock().unwrap().contains_key(key));
+            assert!(matches!(
+                manager.cleanup_state.lock().unwrap().get(key),
+                Some(super::super::types::CleanupStatus::Cleaning)
+            ));
+        }
+    }
 }

@@ -29,7 +29,7 @@ pub(super) enum ExitPolicy<'a> {
 
 /// run 引导退出后的 owner 移交核验预算（覆盖 serve 绑定 3010 的竞态窗口；
 /// 真失败的引导也会等满该预算再报错——上限可控）。
-const HANDOVER_CONFIRM_BUDGET: Duration = Duration::from_secs(2);
+pub(super) const HANDOVER_CONFIRM_BUDGET: Duration = Duration::from_secs(2);
 /// 移交核验重试间隔（兼作监督退出码收割的短等待窗）。
 const HANDOVER_PROBE_RETRY: Duration = Duration::from_millis(200);
 
@@ -115,7 +115,11 @@ impl DevServerManager {
 
     /// 统一就绪等待循环：deadline 钳制、探活节奏与宽松收尾对两条路径共用；
     /// 进程退出处置（见 [`ExitPolicy`]) 是唯一分支点。
-    async fn wait_alive(&self, pid: u32, watch: AliveWatch<'_>) -> AppResult<LaunchObservation> {
+    pub(super) async fn wait_alive(
+        &self,
+        pid: u32,
+        watch: AliveWatch<'_>,
+    ) -> AppResult<LaunchObservation> {
         let AliveWatch {
             port,
             base_path,
@@ -135,35 +139,8 @@ impl DevServerManager {
             if launch_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
                 return Ok(LaunchObservation::DeadlineExpired);
             }
-            // 进程退出处置（两条路径的唯一差异点）。
-            if owner_confirmed.is_none() && !process::is_process_running(pid) {
-                match exit_policy {
-                    // 常驻进程退出 = 端口冲突 / 配置错 / 依赖缺失 → stderr 分类。
-                    ExitPolicy::Fail => return Err(early_exit_err(pid, port, stderr_ring)),
-                    ExitPolicy::ConfirmOwner {
-                        workspace,
-                        supervised,
-                    } => {
-                        // R2：先取监督退出码——run 非零退出是启动失败的直接
-                        // 证据，owner 存活（管理面独立于业务）不能掩盖它。
-                        if run_exited_unsuccessfully(supervised).await {
-                            return Err(early_exit_err(pid, port, stderr_ring));
-                        }
-                        // run 引导退出（移交成功或引导失败二选一）：有界窗口内
-                        // 核验 serve owner 是否接管（run 退出与 serve 绑定 3010
-                        // 存在竞态，短重试覆盖连接拒绝/初始化中的过渡态）。
-                        let mut budget = HANDOVER_CONFIRM_BUDGET;
-                        if let Some(deadline) = launch_deadline {
-                            budget = budget.min(
-                                deadline.saturating_duration_since(tokio::time::Instant::now()),
-                            );
-                        }
-                        match self.confirm_owner_handover(workspace, budget).await {
-                            Some(identity) => owner_confirmed = Some(identity),
-                            None => return Err(early_exit_err(pid, port, stderr_ring)),
-                        }
-                    }
-                }
+            if owner_confirmed.is_none() {
+                owner_confirmed = self.observe_launcher_exit(pid, &watch).await?;
             }
             // deadline 检查放探活前: 兜底 max=0 边界 + sleep 后已超 deadline 不再多探活。
             let now = std::time::Instant::now();
@@ -191,7 +168,19 @@ impl DevServerManager {
                 None => observation.await,
             };
             if ready {
-                return Ok(LaunchObservation::Ready);
+                // The launcher can exit while the HTTP probe is in flight.
+                // Preserve a verified handover even when HTTP readiness succeeds;
+                // otherwise its dead PID would retain a local registration.
+                if owner_confirmed.is_none() {
+                    owner_confirmed = self.observe_launcher_exit(pid, &watch).await?;
+                }
+                if launch_deadline.is_some_and(|parent| tokio::time::Instant::now() >= parent) {
+                    return Ok(LaunchObservation::DeadlineExpired);
+                }
+                return Ok(match owner_confirmed {
+                    Some(identity) => LaunchObservation::HandedOver { identity },
+                    None => LaunchObservation::Ready,
+                });
             }
             tokio::time::sleep_until(
                 launch_deadline.map_or(tokio::time::Instant::now() + interval, |parent| {
@@ -213,8 +202,8 @@ impl DevServerManager {
             } => {
                 // R2（宽松收尾同款）：等待窗内 run 非零退出 = 失败，不被
                 // owner 存活或宽松语义掩盖。
-                if run_exited_unsuccessfully(supervised).await {
-                    return Err(early_exit_err(pid, port, stderr_ring));
+                if let Some(exit) = supervised.exited() {
+                    require_successful_run_exit(Some(exit), pid, port, stderr_ring)?;
                 }
                 if owner_confirmed.is_some() {
                     // 收尾复验钳制到移交预算与父 launch deadline 的较早者。
@@ -223,9 +212,13 @@ impl DevServerManager {
                         budget = budget
                             .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
                     }
-                    self.confirm_owner_handover(workspace, budget)
-                        .await
-                        .is_some()
+                    let refreshed = self.confirm_owner_handover(workspace, budget).await;
+                    refreshed
+                        .as_ref()
+                        .zip(owner_confirmed.as_ref())
+                        .is_some_and(|(current, captured)| {
+                            current.runtime_instance_id == captured.runtime_instance_id
+                        })
                 } else {
                     process::is_process_running(pid)
                 }
@@ -233,6 +226,9 @@ impl DevServerManager {
         };
         if !alive {
             return Err(early_exit_err(pid, port, stderr_ring));
+        }
+        if launch_deadline.is_some_and(|parent| tokio::time::Instant::now() >= parent) {
+            return Ok(LaunchObservation::DeadlineExpired);
         }
         tracing::warn!(
             "dev server on port {port} (pid {pid}) 未在 {max}ms 内响应 HTTP, 编排主体仍在 — 返回成功 (nuwax 宽松)"
@@ -243,12 +239,48 @@ impl DevServerManager {
         })
     }
 
+    /// Observe the launcher independently of its numeric PID. A reaped exit
+    /// remains authoritative even if the OS has reused that PID.
+    async fn observe_launcher_exit(
+        &self,
+        pid: u32,
+        watch: &AliveWatch<'_>,
+    ) -> AppResult<Option<shared_types::RuntimeIdentityView>> {
+        match watch.exit_policy {
+            ExitPolicy::Fail => {
+                if !process::is_process_running(pid) {
+                    return Err(early_exit_err(pid, watch.port, watch.stderr_ring));
+                }
+                Ok(None)
+            }
+            ExitPolicy::ConfirmOwner {
+                workspace,
+                supervised,
+            } => {
+                if supervised.exited().is_none() && process::is_process_running(pid) {
+                    return Ok(None);
+                }
+                let remaining = |budget: Duration| {
+                    watch.launch_deadline.map_or(budget, |parent| {
+                        budget.min(parent.saturating_duration_since(tokio::time::Instant::now()))
+                    })
+                };
+                let exit = supervised.wait_exit(remaining(HANDOVER_PROBE_RETRY)).await;
+                require_successful_run_exit(exit, pid, watch.port, watch.stderr_ring)?;
+                self.confirm_owner_handover(workspace, remaining(HANDOVER_CONFIRM_BUDGET))
+                    .await
+                    .map(Some)
+                    .ok_or_else(|| early_exit_err(pid, watch.port, watch.stderr_ring))
+            }
+        }
+    }
+
     /// run 引导退出后的移交核验：owner 就绪且身份匹配本工作区 →
     /// `Some(identity)`；预算内未出现匹配 owner（含初始化中/连接拒绝/
     /// legacy/身份不符）→ None。身份不符或 legacy 立即失败不重试——
     /// 重试只覆盖"尚未绑好"的过渡态。单次探测钳制到剩余预算（R4b）：
     /// 内部 HTTP 的自有超时不得越过观察预算。
-    async fn confirm_owner_handover(
+    pub(super) async fn confirm_owner_handover(
         &self,
         workspace: &Path,
         budget: Duration,
@@ -290,14 +322,22 @@ impl DevServerManager {
                     if std::time::Instant::now() >= deadline {
                         return None;
                     }
-                    tokio::time::sleep(HANDOVER_PROBE_RETRY).await;
+                    tokio::time::sleep(
+                        HANDOVER_PROBE_RETRY
+                            .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                    )
+                    .await;
                 }
                 Ok(Err(_)) => {
                     // 初始化中/传输抖动：预算内重试，耗尽按未移交收场。
                     if std::time::Instant::now() >= deadline {
                         return None;
                     }
-                    tokio::time::sleep(HANDOVER_PROBE_RETRY).await;
+                    tokio::time::sleep(
+                        HANDOVER_PROBE_RETRY
+                            .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                    )
+                    .await;
                 }
             }
         }
@@ -314,24 +354,24 @@ impl DevServerManager {
     }
 }
 
-/// R2：监督收割的 run 退出码是否为失败（非零/信号）。pid 已死但收割
-/// 尚未落表时给一个短等待窗（内核收割与 watch 通道传播在毫秒级）；
-/// 超窗仍无结果按"未知"放行给 owner 核验分支（wait 失败同放行并告警）。
-async fn run_exited_unsuccessfully(supervised: &Arc<SupervisedChild>) -> bool {
+/// A live management endpoint cannot prove that the original run succeeded.
+/// Missing/unreadable exit status is an observation error, never exit-code zero.
+fn require_successful_run_exit(
+    exit: Option<crate::service::dev_server::supervise::ChildExit>,
+    pid: u32,
+    port: u16,
+    stderr_ring: &Arc<StderrRing>,
+) -> AppResult<()> {
     use crate::service::dev_server::supervise::ChildExit;
-    // wait_exit：已收割立即返回；未收割短窗等待（毫秒级传播）。
-    let Some(exit) = supervised.wait_exit(HANDOVER_PROBE_RETRY).await else {
-        return false;
-    };
     match exit {
-        ChildExit::Exited(status) => !status.success(),
-        ChildExit::WaitFailed(_) => {
-            tracing::warn!(
-                "supervised run exit status unreadable ({}); proceeding to owner verification",
-                exit.describe()
-            );
-            false
-        }
+        Some(ChildExit::Exited(status)) if status.success() => Ok(()),
+        Some(ChildExit::Exited(_)) => Err(early_exit_err(pid, port, stderr_ring)),
+        Some(ChildExit::WaitFailed(error)) => Err(AppError::business(format!(
+            "run handover exit status could not be observed: {error}; no successful handover confirmed"
+        ))),
+        None => Err(AppError::business(
+            "run handover exit status is not yet confirmed; query the original launch before retrying",
+        )),
     }
 }
 
@@ -367,4 +407,26 @@ pub(crate) async fn legacy_app_cli_responds(address: &str) -> bool {
                 .and_then(|data| data.get("protocol_version"))
                 .is_some()
         })
+}
+
+#[cfg(test)]
+mod exit_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn unobserved_or_unreadable_run_exit_cannot_confirm_handover() {
+        let ring = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        for exit in [
+            None,
+            Some(
+                crate::service::dev_server::supervise::ChildExit::WaitFailed(
+                    "reaper failed".into(),
+                ),
+            ),
+        ] {
+            let error = require_successful_run_exit(exit, 1, 1, &ring)
+                .expect_err("unknown exit status must not authorize a successful handover");
+            assert!(error.to_string().contains("exit status"));
+        }
+    }
 }

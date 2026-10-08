@@ -208,23 +208,21 @@ impl ErrorPageCause {
     }
 }
 
-/// ERR_RUNTIME_TIMEOUT 的 Starting 判据（R5）：stage 属于"已捕获启动执行
-/// 的等待段"才宣称正在启动——派发后连接等待（wake_wait）、受理后观察
-/// （wake_observation，携带 operation_id）、跟随者等待 Leader 唤醒
-/// （wake_follower_wait）。前置查询/身份读取/配置读取超时
-/// （wake_preflight/wake_runtime_probe/file_credentials_configuration）
-/// 没有任何启动证据，不得报"正在启动"。
-fn timeout_stage_indicates_starting(stage: &str) -> bool {
-    matches!(
-        stage,
-        "wake_wait" | "wake_observation" | "wake_follower_wait"
-    )
+/// 只有原操作的已确认启动写入进入观察阶段，才可宣称正在启动。
+/// wake_wait 包裹整个 ensure_running，wake_follower_wait 的 leader 也可能
+/// 仍在预检；这两个外围等待阶段及单独的操作 ID 都不证明启动已经受理。
+fn timeout_indicates_starting(failure: &shared_types::WakeFailure) -> bool {
+    failure.stage.as_ref() == "wake_observation"
+        && failure
+            .operation_id
+            .as_ref()
+            .is_some_and(|operation_id| !operation_id.trim().is_empty())
 }
 
 /// 唤醒失败 → 失败页文案档位。分组与 `status_from_code` 的状态码
 /// 分组对齐（文案档位与真实状态码一致）；错误码来自持久准入链，是终局
 /// 证据——映射出的档位不再被就绪观察改写。超时类按结构化 stage 分类
-/// （见 [`timeout_stage_indicates_starting`]），不解析消息文本。
+/// （见 [`timeout_indicates_starting`]），不解析消息文本。
 pub fn wake_failure_cause(failure: &shared_types::WakeFailure) -> ErrorPageCause {
     use shared_types::{
         ERR_APP_NOT_FOUND, ERR_CONFLICT, ERR_CONTAINER_ADDRESS_NOT_READY, ERR_CONTAINER_NOT_FOUND,
@@ -238,7 +236,7 @@ pub fn wake_failure_cause(failure: &shared_types::WakeFailure) -> ErrorPageCause
         ERR_CONFLICT | ERR_OPERATION_IN_PROGRESS => ErrorPageCause::Blocked,
         ERR_RECOVERY_REQUIRED => ErrorPageCause::RecoveryRequired,
         ERR_IMAGE_PULL_FAILED | ERR_CONTAINER_START_FAILED => ErrorPageCause::Failed,
-        ERR_RUNTIME_TIMEOUT if timeout_stage_indicates_starting(&failure.stage) => {
+        ERR_RUNTIME_TIMEOUT if timeout_indicates_starting(failure) => {
             // 请求确实在等一次已捕获的启动执行（可重试，504 + Retry-After），
             // 不凭连接失败猜测
             ErrorPageCause::Starting
@@ -830,7 +828,10 @@ mod tests {
                 shared_types::ERR_CONTAINER_START_FAILED,
                 ErrorPageCause::Failed,
             ),
-            (shared_types::ERR_RUNTIME_TIMEOUT, ErrorPageCause::Starting),
+            (
+                shared_types::ERR_RUNTIME_TIMEOUT,
+                ErrorPageCause::PlatformUnavailable,
+            ),
             (
                 shared_types::ERR_USERAPP_WAIT_TIMEOUT,
                 ErrorPageCause::Starting,
@@ -901,18 +902,40 @@ mod tests {
                 "前置超时 stage={stage} 不得宣称正在启动"
             );
         }
-        for stage in ["wake_wait", "wake_observation", "wake_follower_wait"] {
-            let failure = shared_types::WakeFailure::new(
-                shared_types::ERR_RUNTIME_TIMEOUT,
-                stage,
-                "post-dispatch wait",
-            );
+        let failure = shared_types::WakeFailure::timeout(
+            "wake_observation",
+            Some("original-wake".into()),
+            true,
+        );
+        assert_eq!(wake_failure_cause(&failure), ErrorPageCause::Starting);
+    }
+
+    #[test]
+    fn broad_wake_timeout_does_not_claim_starting() {
+        for stage in ["wake_wait", "wake_follower_wait"] {
+            let failure = shared_types::WakeFailure::timeout(stage, None, false);
             assert_eq!(
                 wake_failure_cause(&failure),
-                ErrorPageCause::Starting,
-                "有启动证据的等待段 stage={stage} 应为 Starting"
+                ErrorPageCause::PlatformUnavailable,
+                "{stage} 包含 leader 尚未受理的前置查询，不能宣称正在启动"
+            );
+            let with_attempt = shared_types::WakeFailure::timeout(
+                stage,
+                Some("attempt-not-yet-confirmed".into()),
+                true,
+            );
+            assert_eq!(
+                wake_failure_cause(&with_attempt),
+                ErrorPageCause::PlatformUnavailable,
+                "外围等待即便有尝试 ID，也不是已确认启动写入的观察阶段"
             );
         }
+        let observation = shared_types::WakeFailure::timeout("wake_observation", None, true);
+        assert_eq!(
+            wake_failure_cause(&observation),
+            ErrorPageCause::PlatformUnavailable,
+            "观察阶段缺失原操作身份不能作为启动证据"
+        );
     }
 
     #[test]

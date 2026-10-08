@@ -627,7 +627,9 @@ async fn dispatch_to_owner_inner(
             admin_addr,
             &token,
             &operation_id,
+            &identity.runtime_instance_id,
             &mut event_cursor,
+            deadline,
         )
         .await
         {
@@ -679,6 +681,23 @@ pub fn describe_terminal(view: &RuntimeOperationView) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serve_handover_cancelled_operation_is_a_normal_exit() {
+        let view = RuntimeOperationView {
+            operation_id: "serve-handover-original".into(),
+            kind: RuntimeOperationKind::Start,
+            state: RuntimeOperationState::Cancelled,
+            request_digest: "d".repeat(64),
+            revision: 4,
+            runtime_instance_id: "serve-handover-instance".into(),
+            error_code: Some("ERR_CANCELLED".into()),
+            error_message: Some("superseded by an explicitly accepted request".into()),
+            failure_detail: None,
+        };
+        describe_terminal(&view)
+            .expect("cancelled serve handover must not trigger a supervisor restart loop");
+    }
 
     /// Protocol fixture only: real TCP and a real held owner lock, with a
     /// deliberately fenced native snapshot. It proves management reuse does

@@ -120,6 +120,16 @@ impl UserAppStorageConfig {
         {
             bail!("userApp interactive ensure wait must be between 1 and 3600 seconds");
         }
+        if let Some(value) = lookup("RCODER_USERAPP_DEV_FORWARD_CONNECT_WAIT_SECONDS") {
+            self.dev_forward_connect_wait_seconds = value
+                .parse()
+                .context("invalid userApp dev forward connect wait")?;
+        }
+        if self.dev_forward_connect_wait_seconds == 0
+            || self.dev_forward_connect_wait_seconds > 3600
+        {
+            bail!("userApp dev forward connect wait must be between 1 and 3600 seconds");
+        }
         if let Some(value) = lookup("RCODER_USERAPP_PG_URL") {
             if value.trim().is_empty() {
                 bail!("RCODER_USERAPP_PG_URL must not be empty");
@@ -318,6 +328,36 @@ mod tests {
             config.ensure_timeout_seconds, 90,
             "interactive override must not touch the full ensure budget"
         );
+    }
+    #[test]
+    fn dev_forward_connect_wait_defaults_overrides_and_rejects_invalid_config() {
+        let mut config: UserAppStorageConfig =
+            serde_yaml::from_str("ensure_timeout_seconds: 90").unwrap();
+        assert_eq!(config.dev_forward_connect_wait_seconds, 20);
+        config
+            .apply_overrides(|name| {
+                (name == "RCODER_USERAPP_DEV_FORWARD_CONNECT_WAIT_SECONDS").then(|| "45".into())
+            })
+            .unwrap();
+        assert_eq!(config.dev_forward_connect_wait_seconds, 45);
+        for value in ["0", "oops", "3601"] {
+            assert!(
+                UserAppStorageConfig::default()
+                    .apply_overrides(|name| {
+                        (name == "RCODER_USERAPP_DEV_FORWARD_CONNECT_WAIT_SECONDS")
+                            .then(|| value.into())
+                    })
+                    .is_err(),
+                "invalid environment value {value} must fail at startup"
+            );
+        }
+        for value in [0, 3601] {
+            let mut config = UserAppStorageConfig {
+                dev_forward_connect_wait_seconds: value,
+                ..Default::default()
+            };
+            assert!(config.apply_overrides(|_| None).is_err());
+        }
     }
     #[test]
     fn explicit_invalid_settings_never_fall_back_to_memory() {

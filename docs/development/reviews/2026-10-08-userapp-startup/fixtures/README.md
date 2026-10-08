@@ -65,6 +65,16 @@ node docs/development/reviews/2026-10-08-userapp-startup/fixtures/proxy_page_dom
 
 读取当前内置 HTML 中实际脚本和三语言 title，使用受控 DOM 执行。基线 exit0 证明语言引起状态失配，不能视为页面通过；修复后须扩充为正确 cause／状态／固定译文的正式测试，并在真实浏览器检查。
 
+修复版组件回归另存为 `proxy_page_regression.cjs`，不改写历史反例：
+
+```bash
+node docs/development/reviews/2026-10-08-userapp-startup/fixtures/proxy_page_regression.cjs
+```
+
+读取实际内置 HTML／脚本和 locale，用受控 DOM 验证三语言 × 九档 cause
+的节点状态、译文、加载／停止图形及复制提示；exit 0 表示这些组件断言通过。
+它补充 Rust 的模板注入测试，不等于真实浏览器、复制权限或容器 E2E。
+
 ## R4/R5/R7/R8
 
 - R4：为实际 handler／manager 注入慢运行时、慢存储、慢 owner，断言共同 deadline；旧查询 late-success不能在预算后报告 Ready。不要只测单独超时 helper。

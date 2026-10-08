@@ -82,3 +82,6 @@ target-linux-appcli/
 
 # 独立诊断/探针工具的本地构建产物
 tools/dial9-probe/target/
+docker/.runtime-assets-locks
+docker/app-runtime-base/.dbx-locks
+docker/rcoder-agent-runner/.dbx-locks

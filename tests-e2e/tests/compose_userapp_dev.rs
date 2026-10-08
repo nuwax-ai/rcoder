@@ -2804,6 +2804,7 @@ async fn userapp_dev_registry_self_heal_after_restart() {
     // ERR_CONTAINER_ADDRESS_NOT_READY / ERR_OPERATION_IN_PROGRESS 等分类码，
     // 不得出现裸 reqwest 连接错误文案（含集群内部地址）。
     let mut raw_transport_leak = String::new();
+    let mut unclassified_failure = String::new();
     if restart_ok {
         let deadline = Instant::now() + Duration::from_secs(120);
         while Instant::now() < deadline {
@@ -2813,14 +2814,25 @@ async fn userapp_dev_registry_self_heal_after_restart() {
                     "{}/api/v1/userapp/get-file-list?app_id={app}&user_id={user}",
                     env.rcoder
                 ))
-                .timeout(Duration::from_secs(30))
+                .timeout(
+                    Duration::from_secs(60).min(deadline.saturating_duration_since(Instant::now())),
+                )
                 .header("X-App-Id", &app)
                 .send()
                 .await
             {
                 Ok(resp) => {
                     let status = resp.status();
-                    let body: Value = resp.json().await.unwrap_or(Value::Null);
+                    let bytes = resp
+                        .text()
+                        .await
+                        .expect("read complete forwarding response");
+                    // Check the full wire text: truncation or JSON parse failure
+                    // must not hide a raw transport error in this invariant.
+                    if bytes.contains("error sending request") {
+                        raw_transport_leak = bytes.chars().take(300).collect();
+                    }
+                    let body: Value = serde_json::from_str(&bytes).unwrap_or(Value::Null);
                     // get-file-list 是 file-server 直转发的原始形态（success 字段，
                     // 无 HttpResult code 信封——判定对齐场景 1 的两路断言）
                     if status.is_success() && body["success"].as_bool() == Some(true) {
@@ -2828,8 +2840,15 @@ async fn userapp_dev_registry_self_heal_after_restart() {
                         break;
                     }
                     last = format!("HTTP {status}, {}", trunc(&body, 80));
-                    if trunc(&body, 300).contains("error sending request") {
-                        raw_transport_leak = trunc(&body, 300);
+                    if !body["code"]
+                        .as_str()
+                        .is_some_and(|code| code.starts_with("ERR_"))
+                        || !body["message"]
+                            .as_str()
+                            .is_some_and(|message| !message.is_empty())
+                        || body["success"].as_bool() != Some(false)
+                    {
+                        unclassified_failure = format!("HTTP {status}: {}", trunc(&body, 300));
                     }
                 }
                 Err(e) => last = format!("transport: {e}"),
@@ -2844,8 +2863,8 @@ async fn userapp_dev_registry_self_heal_after_restart() {
     );
     report.assert_hard(
         "重启窗口内转发失败分类呈现（无裸 reqwest 连接错误文案）",
-        raw_transport_leak.is_empty(),
-        format!("裸错误样例: {raw_transport_leak}"),
+        raw_transport_leak.is_empty() && unclassified_failure.is_empty(),
+        format!("裸错误样例: {raw_transport_leak}; 未分类响应: {unclassified_failure}"),
     );
 
     // 核心不变量：container_id 不变 = Alive 分支保容器（重建必换 Id）。

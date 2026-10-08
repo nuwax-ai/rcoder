@@ -89,6 +89,8 @@ OrbStack 首次供卷和拉起 UserApp Pod 可能超过默认 90 秒。运行本
 
 交互转发请求（git 状态/diff、文件列表等）定位 builder 的等待上限独立于上述总预算，由 `RCODER_USERAPP_INTERACTIVE_ENSURE_WAIT_SECONDS` 控制（默认 30 秒，实际取两者较小值；有效范围为 1～3600 秒）。一次测试集群的冷启动实测为 10～13 秒；调度、拉镜像或存储挂载较慢时仍可能超时。此时返回 `ERR_USERAPP_WAIT_TIMEOUT`，已受理的创建不会取消；先查询原操作状态，确认容器就绪后再重试。
 
+开发容器转发在发送请求体前等待 TCP 可连接，由 `userapp_storage.dev_forward_connect_wait_seconds` 或 `RCODER_USERAPP_DEV_FORWARD_CONNECT_WAIT_SECONDS` 配置（默认 20 秒，范围 1～3600 秒，非法值在启动时拒绝）。它是容器定位后的独立阶段预算，也适用于任务查询；调用方的 HTTP 等待时间应覆盖这两个阶段。等待只做连接和操作状态观察，不重放请求体、不因任务查询唤醒容器。连接仍不可达时保留最新可确认的操作身份，否则返回 `ERR_CONTAINER_ADDRESS_NOT_READY` 与 `Retry-After`；操作查询失败单独报告，不能作为“没有在途操作”的证据。
+
 ## K8s 形态三前置（`make dev-host-k8s`）
 
 K8s 形态（本地 kubeconfig 直连 OrbStack k3s 等）比 Docker 形态多三个前置，缺一会在启动或首个 agent 创建时 fail-fast：

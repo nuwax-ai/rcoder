@@ -398,10 +398,20 @@ where
     use crate::userapp_builder::compute_control::ComputeOperationView;
     let deadline = tokio::time::Instant::now() + budget;
     loop {
+        // timeout_at 先轮询内部 future，立即 Ready 时即便 deadline 已过仍可
+        // 返回 Ok。开始读取前及成功读取后都检查，避免把迟到值视作预算内观察。
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                app_id,
+                operation_id = %operation.operation_id,
+                "creation observation budget exhausted before reading the app record"
+            );
+            return (operation, false);
+        }
         // 单轮 get_app 钳制：超剩余预算 → 观察未完成（保留原 view 返回）。
         let app_ok = match tokio::time::timeout_at(deadline, get_app()).await {
-            Ok(result) => result,
-            Err(_) => {
+            Ok(result) if tokio::time::Instant::now() < deadline => result,
+            Ok(_) | Err(_) => {
                 tracing::warn!(
                     app_id,
                     operation_id = %operation.operation_id,
@@ -415,11 +425,13 @@ where
                 tokio::time::timeout_at(deadline, get_control(operation.operation_id.clone()))
                     .await;
             match record {
-                Ok(Some(record)) => operation = ComputeOperationView::from(record),
-                Ok(None) => {}
+                Ok(Some(record)) if tokio::time::Instant::now() < deadline => {
+                    operation = ComputeOperationView::from(record);
+                }
+                Ok(None) if tokio::time::Instant::now() < deadline => {}
                 // 预算耗尽于操作视图刷新：工作负载对象已观察到——创建
                 // 可观察成立，返回当前视图（留痕：观察到的视图可能滞后）。
-                Err(_) => {
+                Ok(_) | Err(_) => {
                     tracing::warn!(
                         app_id,
                         operation_id = %operation.operation_id,
@@ -433,7 +445,7 @@ where
         let record =
             tokio::time::timeout_at(deadline, get_control(operation.operation_id.clone())).await;
         match record {
-            Ok(Some(record)) => {
+            Ok(Some(record)) if tokio::time::Instant::now() < deadline => {
                 let view = ComputeOperationView::from(record);
                 let terminal_failure = matches!(
                     view.state,
@@ -445,9 +457,9 @@ where
                     return (operation, false);
                 }
             }
-            Ok(None) => {}
+            Ok(None) if tokio::time::Instant::now() < deadline => {}
             // 预算耗尽于状态刷新：观察未完成（留痕：已受理但对象未观察到）。
-            Err(_) => {
+            Ok(_) | Err(_) => {
                 tracing::warn!(
                     app_id,
                     operation_id = %operation.operation_id,
@@ -537,6 +549,64 @@ mod creation_budget_tests {
             state,
             "op-budget",
         ))
+    }
+
+    #[tokio::test]
+    async fn zero_budget_never_polls_or_reports_workload() {
+        let app_reads = std::cell::Cell::new(0);
+        let (result, observed) = observe_creation_with(
+            view(ComputeControlState::Running),
+            std::time::Duration::ZERO,
+            "app-budget".to_string(),
+            || {
+                app_reads.set(app_reads.get() + 1);
+                std::future::ready(true)
+            },
+            |_operation_id: String| async { None },
+        )
+        .await;
+        assert!(!observed, "耗尽预算不得宣称已观察");
+        assert_eq!(app_reads.get(), 0, "耗尽预算不得开始新的观察");
+        assert_eq!(result.operation_id, "op-budget");
+        assert_eq!(result.state, ComputeControlState::Running);
+    }
+
+    // timeout_at 会先轮询内部 future；不 yield 的读取可在 deadline 后返回
+    // Ready，因此必须在返回成功值后再次核验绝对 deadline。
+    #[tokio::test]
+    async fn late_ready_app_read_never_reports_observed() {
+        let (_result, observed) = observe_creation_with(
+            view(ComputeControlState::Running),
+            std::time::Duration::from_millis(20),
+            "app-budget".to_string(),
+            || async {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                true
+            },
+            |_operation_id: String| async { None },
+        )
+        .await;
+        assert!(!observed, "未让出执行权的迟到成功同样不能越过预算");
+    }
+
+    #[tokio::test]
+    async fn late_ready_control_record_does_not_replace_confirmed_view() {
+        let (result, observed) = observe_creation_with(
+            view(ComputeControlState::Running),
+            std::time::Duration::from_millis(20),
+            "app-budget".to_string(),
+            || async { true },
+            |_operation_id: String| async {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                let mut late = record(ComputeControlState::Failed, "op-budget");
+                late.revision = 2;
+                Some(late)
+            },
+        )
+        .await;
+        assert!(observed, "工作负载在预算内已观察到");
+        assert_eq!(result.state, ComputeControlState::Running);
+        assert_eq!(result.revision, 1, "预算外读取不能替换最后确认的视图");
     }
 
     /// R4 边界反例（审查数字复现）：20ms 预算、80ms 慢 runtime 读取——

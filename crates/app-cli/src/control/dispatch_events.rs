@@ -17,27 +17,63 @@ pub(super) async fn forward_operation_events(
     admin_addr: &str,
     token: &str,
     operation_id: &str,
+    runtime_instance_id: &str,
     after_seq: &mut u64,
+    deadline: tokio::time::Instant,
 ) -> Option<serde_json::Value> {
+    use anyhow::Context as _;
+
+    #[derive(serde::Deserialize)]
+    struct OperationEvents {
+        operation_id: String,
+        events: Vec<shared_types::RuntimeEventRecord>,
+    }
+
     let url = format!(
         "http://{admin_addr}/v1/runtime/operations/{operation_id}/events?after_seq={after_seq}"
     );
-    let Ok(response) = client
-        .get(&url)
-        .header("X-Deploy-Token", token)
-        .send()
-        .await
-    else {
-        return None;
+    let fetch = async {
+        let response = client
+            .get(&url)
+            .header("X-Deploy-Token", token)
+            .send()
+            .await
+            .context("read operation events")?
+            .error_for_status()
+            .context("owner rejected operation events")?;
+        let body = response
+            .json::<shared_types::HttpResult<OperationEvents>>()
+            .await
+            .context("decode operation events")?;
+        let data = body.data.context("operation events response has no data")?;
+        anyhow::ensure!(
+            data.operation_id == operation_id
+                && data.events.iter().all(|event| {
+                    event.operation_id == operation_id
+                        && event.runtime_instance_id == runtime_instance_id
+                }),
+            "operation events belong to a different operation or runtime instance"
+        );
+        Ok::<_, anyhow::Error>(data.events)
     };
-    let Ok(body) = response.json::<serde_json::Value>().await else {
-        return None;
+    let events = match tokio::time::timeout_at(deadline, fetch).await {
+        Ok(Ok(events)) => events,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                operation_id,
+                "operation event observation failed: {error:#}"
+            );
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(
+                operation_id,
+                "operation event observation deadline exhausted"
+            );
+            return None;
+        }
     };
-    let events = body
-        .get("data")
-        .and_then(|data| data.get("events"))
-        .and_then(|events| events.as_array())?;
-    let (lines, done) = rebuild_events(events, after_seq);
+    let (lines, done) = rebuild_events(&events, after_seq);
     if !lines.is_empty() {
         use std::io::Write as _;
         let mut out = std::io::stdout().lock();
@@ -53,24 +89,29 @@ pub(super) async fn forward_operation_events(
 /// wire 重建与 R06 桥的入库映射（bridge_event_fields）互逆：
 /// `{"event": name, "service"?: .., **payload}`。
 fn rebuild_events(
-    events: &[serde_json::Value],
+    events: &[shared_types::RuntimeEventRecord],
     after_seq: &mut u64,
 ) -> (Vec<String>, Option<serde_json::Value>) {
     let mut lines = Vec::new();
     let mut done = None;
     for event in events {
-        if let Some(sequence) = event.get("sequence").and_then(|s| s.as_u64()) {
-            *after_seq = (*after_seq).max(sequence);
+        if event.sequence <= *after_seq {
+            continue;
         }
-        let Some(name) = event.get("event_name").and_then(|n| n.as_str()) else {
+        *after_seq = event.sequence;
+        let Some(name) = event.event_name.as_deref() else {
             continue;
         };
         let mut line = serde_json::Map::new();
         line.insert("event".to_string(), serde_json::json!(name));
-        if let Some(service) = event.get("service").filter(|s| !s.is_null()) {
-            line.insert("service".to_string(), service.clone());
+        if let Some(service) = &event.service {
+            line.insert("service".to_string(), serde_json::json!(service));
         }
-        if let Some(payload) = event.get("payload").and_then(|p| p.as_object()) {
+        if let Some(payload) = event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.as_object())
+        {
             for (key, value) in payload {
                 line.entry(key.clone()).or_insert(value.clone());
             }
@@ -97,13 +138,22 @@ pub(super) fn captured_done_matches(
     state: &shared_types::RuntimeOperationState,
 ) -> bool {
     use shared_types::RuntimeOperationState;
-    let empty_failed = done
-        .get("failed")
-        .and_then(|failed| failed.as_array())
-        .is_none_or(|failed| failed.is_empty());
+    let Ok(shared_types::AppCliOrchestrationEvent::OrchestrationDone { failed }) =
+        serde_json::from_value(done.clone())
+    else {
+        return false;
+    };
+    let empty_failed = failed.is_empty();
     match state {
         RuntimeOperationState::Succeeded => empty_failed,
-        _ => !empty_failed,
+        RuntimeOperationState::Failed
+        | RuntimeOperationState::Cancelled
+        | RuntimeOperationState::RecoveryRequired => !empty_failed,
+        RuntimeOperationState::Accepted
+        | RuntimeOperationState::Preparing
+        | RuntimeOperationState::Stopping
+        | RuntimeOperationState::Activating
+        | RuntimeOperationState::Starting => false,
     }
 }
 
@@ -144,12 +194,20 @@ mod tests {
     use super::*;
     use shared_types::RuntimeOperationState;
 
-    fn journal_event(sequence: u64, name: &str, payload: serde_json::Value) -> serde_json::Value {
-        serde_json::json!({
-            "sequence": sequence,
-            "event_name": name,
-            "payload": payload,
-        })
+    fn journal_event(
+        sequence: u64,
+        name: &str,
+        payload: serde_json::Value,
+    ) -> shared_types::RuntimeEventRecord {
+        shared_types::RuntimeEventRecord {
+            operation_id: "event-operation".into(),
+            sequence,
+            runtime_instance_id: "event-instance".into(),
+            stage: "orchestration".into(),
+            service: None,
+            event_name: Some(name.into()),
+            payload: Some(payload),
+        }
     }
 
     /// R1 反例的失败先行断言：journal 在原操作非终态时给出的
@@ -204,6 +262,156 @@ mod tests {
             &empty,
             &RuntimeOperationState::Cancelled
         ));
+    }
+
+    #[test]
+    fn malformed_captured_done_is_never_terminal_evidence() {
+        for done in [
+            serde_json::json!({"event": "orchestration_done"}),
+            serde_json::json!({"event": "orchestration_done", "failed": null}),
+            serde_json::json!({"event": "orchestration_done", "failed": ""}),
+            serde_json::json!({"event": "orchestration_done", "failed": [{}]}),
+            serde_json::json!({"event": "log", "failed": []}),
+        ] {
+            for state in [
+                RuntimeOperationState::Succeeded,
+                RuntimeOperationState::Failed,
+                RuntimeOperationState::Cancelled,
+                RuntimeOperationState::RecoveryRequired,
+            ] {
+                assert!(
+                    !captured_done_matches(&done, &state),
+                    "invalid done must be synthesized from the authoritative view: {done}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replayed_records_do_not_emit_progress_or_replace_captured_done() {
+        let events = vec![
+            journal_event(1, "service_start_ok", serde_json::json!({"service": "web"})),
+            journal_event(2, "orchestration_done", serde_json::json!({"failed": []})),
+            journal_event(
+                3,
+                "log",
+                serde_json::json!({"service": "web", "line": "latest"}),
+            ),
+        ];
+        let mut cursor = 2;
+        let (lines, done) = rebuild_events(&events, &mut cursor);
+        assert!(
+            done.is_none(),
+            "an older done cannot replace the held terminal"
+        );
+        assert_eq!(cursor, 3);
+        assert_eq!(lines.len(), 1);
+        let log: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(log["event"], "log");
+        assert_eq!(log["line"], "latest");
+    }
+
+    struct EventServer {
+        address: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for EventServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn event_server(body: serde_json::Value, delay: std::time::Duration) -> EventServer {
+        let app = axum::Router::new().route(
+            "/v1/runtime/operations/event-operation/events",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move {
+                    tokio::time::sleep(delay).await;
+                    axum::Json(body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        EventServer { address, task }
+    }
+
+    #[tokio::test]
+    async fn foreign_event_identity_does_not_advance_cursor_or_supply_done() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for mismatch in ["envelope", "operation", "instance"] {
+            let mut event =
+                journal_event(3, "orchestration_done", serde_json::json!({"failed": []}));
+            match mismatch {
+                "operation" => event.operation_id = "other-operation".into(),
+                "instance" => event.runtime_instance_id = "replacement-instance".into(),
+                "envelope" => {}
+                _ => unreachable!(),
+            }
+            let server = event_server(
+                serde_json::json!({
+                    "code": "OK", "message": "ok",
+                    "data": {
+                        "operation_id": if mismatch == "envelope" { "other-operation" } else { "event-operation" },
+                        "events": [event],
+                    },
+                }),
+                std::time::Duration::ZERO,
+            )
+            .await;
+            let mut cursor = 1;
+            let captured = forward_operation_events(
+                &client,
+                &server.address,
+                "fixture-token",
+                "event-operation",
+                "event-instance",
+                &mut cursor,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .await;
+            assert!(captured.is_none(), "foreign {mismatch} supplied done");
+            assert_eq!(cursor, 1, "foreign {mismatch} consumed local event cursor");
+        }
+    }
+
+    #[tokio::test]
+    async fn event_fetch_respects_parent_deadline() {
+        let server = event_server(
+            serde_json::json!({
+                "code": "OK", "message": "ok",
+                "data": {
+                    "operation_id": "event-operation",
+                    "events": [journal_event(1, "orchestration_done", serde_json::json!({"failed": []}))],
+                },
+            }),
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut cursor = 0;
+        let started = tokio::time::Instant::now();
+        let captured = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            forward_operation_events(
+                &client,
+                &server.address,
+                "fixture-token",
+                "event-operation",
+                "event-instance",
+                &mut cursor,
+                started + std::time::Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("event I/O must not exceed the parent observation budget");
+        assert!(captured.is_none());
+        assert_eq!(cursor, 0);
     }
 
     /// payload 字段平铺进 wire 行（R06 桥互逆契约保持）。

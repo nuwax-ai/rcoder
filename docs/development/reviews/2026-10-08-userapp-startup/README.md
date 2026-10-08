@@ -160,3 +160,30 @@ cargo nextest run -p file-server -p file-server-userapp -p http-server -p rcoder
 同轮完成的关联改造（2026-10-08 app 221 预上线事故的转发层加固，方案见会话记录）：dev 转发发送前 TCP 有界预检 `wait_for_dev_service`（对齐 prod `wait_for_prod_service` 语义，默认 20s 可配置），在途 Dev 操作作为失败分级证据（`ERR_OPERATION_IN_PROGRESS`），无证据的不可达分类为 `ERR_CONTAINER_ADDRESS_NOT_READY` + Retry-After + 本地化文案；发送层连接失败不再裸抛 reqwest 原文。e2e `userapp_dev_registry_self_heal_after_restart` 增加窗口不变量断言。
 
 未覆盖项：真实浏览器下的错误页 JS 行为（DOM fixture 与旧模板耦合已失效；Rust 测试覆盖注入契约）；compose 容器级 R2/R3 复验由 e2e 既有 dev 场景回归；K8s 模式未在本轮验证。
+
+## 2026-10-08/09 第三轮独立复核（工作树修复）
+
+基线 `3b8c5e08a`，审查前仅 `.gitignore` 有本地改动，原样保留。复核仍发现以下边界，已在工作树修复；未提交或发布，不能将第二轮的全量计数当成本轮验证。
+
+| 范围 | 本轮修正 |
+|---|---|
+| R1 | 损坏 Done 不再把缺失 `failed` 当空；原操作事件核验 operation/runtime 身份，旧游标不重发，读取共享父 deadline；真实进程断言等待 stdout EOF，避免漏掉迟到终态。 |
+| R2/R3 | HTTP ready 保留已确认移交；run 后于 HTTP 退出时，下一次 Start 按原退出码与 owner 补完登记。未知退出不作 exit0；登记同时核验 launch/PID，Stop 或后继已替换时返回 Conflict，不恢复旧登记。 |
+| R4/R5 | 零预算及迟到 Ready 不被接受，迟到控制视图不覆盖已确认值；外围 wake_wait/follower 超时不证明启动，只有带原操作身份的 wake_observation 归 Starting。 |
+| dev 转发 | 连接预算补齐环境覆盖与启动校验；每轮刷新在途状态，查询失败不伪装无操作；迟到连接不作成功；失败信封结构体化，连接观察独立模块。 |
+| R6/测试 | 新增当前脚本三语言 DOM 回归，历史复现保留；窗口断言检查完整 wire，非 JSON 或长消息不能绕过。 |
+
+实际验证：7 个新增反例先红后绿；默认组合 **249/249**，同表达式全 features（含 Kubernetes）**249/249**；最终默认连接/配置补验 **10/10**；独立 app-cli 聚焦 **32/32**；两边受影响目标严格 Clippy、fmt、diff check 通过。首轮默认测试的 3 项 `ps` 沙箱失败在授权环境按原断言重跑通过；新测试一次错误的前台 run 取消退出码预期按实际契约修正，并单独锁住 serve 移交取消正常退出，生产逻辑未为测试改动。
+
+Docker 已编译本轮 RCoder：严格入口 `userapp_dev_registry_self_heal_after_restart` **1 case、4 硬断言通过**，报告 `77173ae30f634ce5ae2095e9f5ea553b`，源码摘要前后相同；重启前后 builder ID 相同、实际转发恢复、无裸或未分类响应。Docker 内原 file-server 进程测试 **10/10**，覆盖真实启动/停止/重启、manager 重建、原请求及后继保护。镜像无 nextest，该平台补验使用原 cargo test 精确模块筛选。
+
+当前页面 DOM **27 个语言/cause组合＋3 个剪贴板用例通过**，仍不等于真实浏览器。未跑完整 workspace/Compose 或远端 K8s；Docker 转发用例不等于新 app-cli/agent_runner 的配对发布验收。真实 Stop 用例发生在慢启动阶段，未精确冻结 journal Done 与提交屏障之间的窄窗口；该处只有转换反例，不能扩大真实链证据。
+
+
+## 2026-10-09 提交前核验（第四轮）
+
+再次确认并修复 `local_stop.rs` 的历史 PID 信号边界：launcher 已有收割退出观察时不再发信号；WaitFailed 不猜测 PID 归属，保留未确认状态；正常活进程停止和原业务监督清理保持。两个 Unix 反例以真实独立进程模拟 PID 复用，修复前均被误杀、修复后均保留；不宣称覆盖内核收割与 watch 发布之间所有微小时序。
+
+追加验证全部 exit0：受影响核心 **38/38**、独立 app-cli **10/10**、file-server 开发服务默认及全 features 各 **118/118**、Docker 内编译最新源码的开发服务 **118/118**；严格 Clippy、两工作区格式检查及三语言 DOM 回归通过。此前 Compose 报告保持原冻结摘要，本次最后的收尾修改由新的组件和 Docker 进程证据覆盖，不能把原报告当成新二进制验收。
+
+按用户要求一并纳入三个构建锁目录的 `.gitignore` 规则。修复纳入本轮源码提交；提交/push 不代表 npm 发布、K8s 配对镜像或集群部署验收。

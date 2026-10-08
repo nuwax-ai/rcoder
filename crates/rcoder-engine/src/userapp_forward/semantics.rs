@@ -339,12 +339,12 @@ impl IntoResponse for HttpResultError {
         // 与 shared_types::HttpResult 同形态(code=字符串错误码/message/data/tid/success),
         // 但保留真实 HTTP 状态码(400/404/502/503 对代理与客户端有语义; HttpResult 的
         // IntoResponse 恒 200, 不适用于透传层的传输级错误)
-        let payload = serde_json::json!({
-            "code": self.code.unwrap_or_else(|| error_code_for(self.status)),
-            "message": self.message,
-            "data": serde_json::Value::Null,
-            "success": false,
-        });
+        let payload = ForwardErrorEnvelope {
+            code: self.code.unwrap_or_else(|| error_code_for(self.status)),
+            message: self.message,
+            data: None,
+            success: false,
+        };
         let mut response = (self.status, axum::Json(payload)).into_response();
         if let Some(secs) = self.retry_after_secs
             && let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string())
@@ -353,6 +353,14 @@ impl IntoResponse for HttpResultError {
         }
         response
     }
+}
+
+#[derive(serde::Serialize)]
+struct ForwardErrorEnvelope {
+    code: &'static str,
+    message: String,
+    data: Option<()>,
+    success: bool,
 }
 
 /// HTTP 状态码 → 全站字符串错误码(对齐 shared_types::error_codes 词表)。

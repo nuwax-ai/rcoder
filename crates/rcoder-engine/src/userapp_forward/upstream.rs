@@ -526,107 +526,27 @@ pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request)
     .await
 }
 
-/// dev 转发发送前的 TCP 连接预检（对齐 prod [`Self::wait_for_prod_service`]
-/// 的语义与安全论证：请求 body 是单次流，连接失败不重放——在把 body 移入
-/// reqwest 之前确认真实 Service 路径可连接）。覆盖 builder 原地容器重启
-/// （svc 无就绪 endpoint 的 ~12s 窗口）与全量 pod 重建窗口；等待期间读取
-/// 在途 Dev 操作作为失败分级证据：
-/// - 预算内连上 → `Ok`（后续真实请求可能因残余竞态失败，由
-///   [`forward_to_addr`] 的分类出口兜底）；
-/// - 预算耗尽 + 有在途 Dev 操作 → `ERR_OPERATION_IN_PROGRESS`（带
-///   operation_id——语义"重启/停止进行中"，与 keepalive ensure 同构）；
-/// - 预算耗尽 + 无在途 → `ERR_CONTAINER_ADDRESS_NOT_READY` + Retry-After
-///   （本地化文案，不再裸抛 reqwest 连接错误）。
-async fn wait_for_dev_service(
-    state: &AppState,
-    app_id: &str,
-    addr: &str,
-) -> Result<(), HttpResultError> {
-    const CONNECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
-    let budget = std::time::Duration::from_secs(
-        state
-            .config
-            .userapp_storage
-            .dev_forward_connect_wait_seconds
-            .max(1),
-    );
-    let deadline = tokio::time::Instant::now() + budget;
-    let uri = addr.parse::<reqwest::Url>().map_err(|error| {
-        HttpResultError::bad_gateway(format!("Invalid dev container address: {error}"))
-    })?;
-    let host = uri
-        .host_str()
-        .ok_or_else(|| HttpResultError::bad_gateway("Dev container address has no host"))?;
-    let port = uri
-        .port_or_known_default()
-        .ok_or_else(|| HttpResultError::bad_gateway("Dev container address has no port"))?;
-    let mut inflight: Option<shared_types::UserAppOperationView> = None;
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        if tcp_connect_once_within(host, port, deadline).await {
-            return Ok(());
-        }
-        if inflight.is_none() {
-            // 在途证据读取同样受预算钳制（不因慢查询越过观察边界）。
-            if let Ok(operations) =
-                tokio::time::timeout_at(deadline, state.app_service.get_current_operations(app_id))
-                    .await
-            {
-                inflight = operations.ok().and_then(|operations| {
-                    operations.into_iter().find(|operation| {
-                        operation.scope == shared_types::UserAppOperationScope::Dev
-                            && !operation.state.is_terminal()
-                    })
-                });
-            }
-        }
-        tokio::time::sleep(
-            CONNECT_RETRY_DELAY
-                .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
-        )
-        .await;
-    }
-    let locale = shared_types::current_request_locale();
-    if let Some(operation) = inflight {
-        warn!(
-            app_id,
-            operation_id = %operation.operation_id,
-            kind = ?operation.kind,
-            "dev container unreachable while a Dev-scope operation is in flight"
-        );
-        return Err(HttpResultError::from_app_error(
-            shared_types::AppError::with_message(
-                shared_types::error_codes::ERR_OPERATION_IN_PROGRESS,
-                shared_types::get_error_message(
-                    shared_types::error_codes::ERR_OPERATION_IN_PROGRESS,
-                    locale,
-                ),
-            )
-            .with_operation_id(operation.operation_id),
-        ));
-    }
-    warn!(
-        app_id,
-        "dev container service path unreachable within the connect-wait budget"
-    );
-    Err(HttpResultError::dev_container_unreachable(locale))
-}
+#[path = "upstream_dev_connect.rs"]
+mod dev_connect;
+use dev_connect::wait_for_dev_service;
 
 /// 单次 TCP 连接尝试（2s 单次上限，钳制到剩余 deadline）——连接失败/
 /// 超时一律 false，由调用方决定重试节奏（与 prod 预检同款常量）。
 async fn tcp_connect_once_within(host: &str, port: u16, deadline: tokio::time::Instant) -> bool {
+    if tokio::time::Instant::now() >= deadline {
+        return false;
+    }
     const CONNECT_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     let attempt_deadline = (tokio::time::Instant::now() + CONNECT_ATTEMPT_TIMEOUT).min(deadline);
-    matches!(
+    let connected = matches!(
         tokio::time::timeout_at(
             attempt_deadline,
             tokio::net::TcpStream::connect((host, port))
         )
         .await,
         Ok(Ok(_))
-    )
+    );
+    connected && tokio::time::Instant::now() < deadline
 }
 
 /// 全量透传一个请求到该 app 生产运行容器的 file-server-proxy（同 path+query）。
