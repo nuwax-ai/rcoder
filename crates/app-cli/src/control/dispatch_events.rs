@@ -75,14 +75,15 @@ fn rebuild_events(
                 line.entry(key.clone()).or_insert(value.clone());
             }
         }
-        let Ok(json) = serde_json::to_string(&serde_json::Value::Object(line.clone())) else {
-            continue;
-        };
+        let value = serde_json::Value::Object(line);
         if name == "orchestration_done" {
             // 终局由权威视图决定（见模块注释）；仅捕获，不发出。
-            done = Some(serde_json::Value::Object(line));
+            done = Some(value);
             continue;
         }
+        let Ok(json) = serde_json::to_string(&value) else {
+            continue;
+        };
         lines.push(json);
     }
     (lines, done)

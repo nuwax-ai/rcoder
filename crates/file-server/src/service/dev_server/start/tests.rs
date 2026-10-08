@@ -1556,6 +1556,44 @@ mod owner_reuse_tests {
 /// 0.3.16+ 契约：spawn 的 `app-cli run` 是一次性引导（可重复执行），常驻
 /// 主体是 `app-cli serve` owner。run 进程退出后：匹配 owner 在 → 移交
 /// 成立，宽松就绪成功；无 owner → 启动失败（stderr 分类文案不变）。
+/// 起"匹配 owner"身份服务（仅 /v1/runtime/identity，返回本工作区身份；
+/// instance 标识便于区分测试），返回探测地址。项目环境变量存在时身份
+/// 核验锚点不同，调用方测试自行跳过。
+async fn spawn_identity_owner(ws: &Path, instance: &str) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind owner");
+    let addr = listener.local_addr().expect("owner addr");
+    let source_root = ws.display().to_string();
+    let identity = shared_types::RuntimeIdentityView {
+        application_id: "unknown-app".to_string(),
+        service_family: "userapp-dev".to_string(),
+        workspace_id: source_root.clone(),
+        source_root,
+        runtime_instance_id: instance.to_string(),
+        deployment_generation_id: format!("gen-{instance}"),
+        protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+        capabilities: Vec::new(),
+    };
+    let router = axum::Router::new().route(
+        "/v1/runtime/identity",
+        axum::routing::get(move || {
+            let identity = identity.clone();
+            async move {
+                axum::Json(serde_json::json!({
+                    "success": true, "code": "OK", "data": identity, "message": "ok"
+                }))
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, router).await {
+            tracing::warn!(%error, "test owner server terminated");
+        }
+    });
+    format!("127.0.0.1:{}", addr.port())
+}
+
 async fn spawn_dead_run(exit_code: i32) -> (u32, Arc<SupervisedChild>) {
     // 跨平台的一次性 run 引导：unix 用 sh -c、windows 用 cmd /C——只按命令名
     // 走 PATH 解析，不硬编码具体路径（发行版 sh 位置差异不受影响）。
@@ -1603,42 +1641,8 @@ async fn manifest_wait_treats_run_exit_as_owner_handover_when_owner_present() {
     let dir = tempfile::tempdir().expect("harness tempdir");
 
     // 假 serve owner：/v1/runtime/identity 返回与本工作区匹配的身份
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind owner");
-    let addr = listener.local_addr().expect("owner addr");
-    let source_root = ws.path().display().to_string();
-    let identity = shared_types::RuntimeIdentityView {
-        application_id: "unknown-app".to_string(),
-        service_family: "userapp-dev".to_string(),
-        workspace_id: source_root.clone(),
-        source_root,
-        runtime_instance_id: "instance-handover".to_string(),
-        deployment_generation_id: "gen-handover".to_string(),
-        protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
-        capabilities: Vec::new(),
-    };
-    let router = axum::Router::new().route(
-        "/v1/runtime/identity",
-        axum::routing::get(move || {
-            let identity = identity.clone();
-            async move {
-                axum::Json(serde_json::json!({
-                    "success": true, "code": "OK", "data": identity, "message": "ok"
-                }))
-            }
-        }),
-    );
-    tokio::spawn(async move {
-        if let Err(error) = axum::serve(listener, router).await {
-            tracing::warn!(%error, "test owner server terminated");
-        }
-    });
-
-    let config = wait_test_config(
-        &format!("127.0.0.1:{}", addr.port()),
-        &dir.path().join("logs"),
-    );
+    let probe_addr = spawn_identity_owner(ws.path(), "instance-handover").await;
+    let config = wait_test_config(&probe_addr, &dir.path().join("logs"));
     let manager = DevServerManager::new(Arc::new(config));
     let (pid, supervised) = spawn_dead_run(0).await;
     let ring: Arc<StderrRing> = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
@@ -1665,42 +1669,8 @@ async fn manifest_wait_reports_failure_when_run_exits_nonzero_despite_owner() {
     let dir = tempfile::tempdir().expect("harness tempdir");
 
     // 与移交测试同款的匹配 owner（identity 返回本工作区身份）
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind owner");
-    let addr = listener.local_addr().expect("owner addr");
-    let source_root = ws.path().display().to_string();
-    let identity = shared_types::RuntimeIdentityView {
-        application_id: "unknown-app".to_string(),
-        service_family: "userapp-dev".to_string(),
-        workspace_id: source_root.clone(),
-        source_root,
-        runtime_instance_id: "instance-nonzero".to_string(),
-        deployment_generation_id: "gen-nonzero".to_string(),
-        protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
-        capabilities: Vec::new(),
-    };
-    let router = axum::Router::new().route(
-        "/v1/runtime/identity",
-        axum::routing::get(move || {
-            let identity = identity.clone();
-            async move {
-                axum::Json(serde_json::json!({
-                    "success": true, "code": "OK", "data": identity, "message": "ok"
-                }))
-            }
-        }),
-    );
-    tokio::spawn(async move {
-        if let Err(error) = axum::serve(listener, router).await {
-            tracing::warn!(%error, "test owner server terminated");
-        }
-    });
-
-    let config = wait_test_config(
-        &format!("127.0.0.1:{}", addr.port()),
-        &dir.path().join("logs"),
-    );
+    let probe_addr = spawn_identity_owner(ws.path(), "instance-nonzero").await;
+    let config = wait_test_config(&probe_addr, &dir.path().join("logs"));
     let manager = DevServerManager::new(Arc::new(config));
     let (pid, supervised) = spawn_dead_run(17).await;
     let ring: Arc<StderrRing> = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(

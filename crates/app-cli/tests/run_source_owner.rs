@@ -50,18 +50,41 @@ impl Fixture {
     }
 
     fn manifests(&self, marker: &str) {
-        std::fs::write(
-            self.source.join("workspace.manifest.toml"),
-            "schema_version=1\n[workspace]\nname='run-source-owner'\n",
-        )
-        .unwrap();
         let command = toml::Value::Array(
             [env!("CARGO_BIN_EXE_tree-fixture"), "http", marker]
                 .into_iter()
                 .map(|s| toml::Value::String(s.into()))
                 .collect(),
         );
-        std::fs::write(self.source.join("web/project.manifest.toml"), format!("schema_version=1\n[project]\nservice_id={:?}\nname='real HTTP fixture'\ntype='rust'\n[build]\ncommand=['true']\nartifact='unused.zip'\n[run]\ncommand={command}\nshutdown_timeout_seconds=3\n[devrun]\ncommand={command}\n[health]\nstartup_timeout_seconds=5\nreadiness_path='/'\n[proxy]\npath='/'\n", self.app)).unwrap();
+        self.write_manifests(command, "real HTTP fixture", 5);
+    }
+
+    /// 慢启动 manifest：run 命令先 sleep 再起真实 HTTP，拉长原操作的
+    /// 非终态窗口，供终局时序断言与 Stop 竞争使用。
+    fn slow_manifests(&self, marker: &str, delay_secs: u64) {
+        let command = toml::Value::Array(
+            [
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "sleep {delay_secs} && exec {} http {marker}",
+                    env!("CARGO_BIN_EXE_tree-fixture")
+                ),
+            ]
+            .into_iter()
+            .map(toml::Value::String)
+            .collect(),
+        );
+        self.write_manifests(command, "slow start fixture", 30);
+    }
+
+    fn write_manifests(&self, command: toml::Value, name: &str, startup_timeout: u64) {
+        std::fs::write(
+            self.source.join("workspace.manifest.toml"),
+            "schema_version=1\n[workspace]\nname='run-source-owner'\n",
+        )
+        .unwrap();
+        std::fs::write(self.source.join("web/project.manifest.toml"), format!("schema_version=1\n[project]\nservice_id={:?}\nname='{name}'\ntype='rust'\n[build]\ncommand=['true']\nartifact='unused.zip'\n[run]\ncommand={command}\nshutdown_timeout_seconds=3\n[devrun]\ncommand={command}\n[health]\nstartup_timeout_seconds={startup_timeout}\nreadiness_path='/'\n[proxy]\npath='/'\n", self.app)).unwrap();
     }
 
     fn command(&self, action: &str, log: &str) -> Command {
@@ -1164,35 +1187,6 @@ async fn guarded_migration_spawn_failure_still_starts_actual_http_and_commits_or
 /// 慢启动 manifest：run 命令先 sleep 再起真实 HTTP，拉长原操作的
 /// 非终态窗口，供终局时序断言与 Stop 竞争使用。
 impl Fixture {
-    fn slow_manifests(&self, marker: &str, delay_secs: u64) {
-        std::fs::write(
-            self.source.join("workspace.manifest.toml"),
-            "schema_version=1\n[workspace]\nname='run-source-owner'\n",
-        )
-        .unwrap();
-        let command = toml::Value::Array(
-            [
-                "sh".to_string(),
-                "-c".to_string(),
-                format!(
-                    "sleep {delay_secs} && exec {} http {marker}",
-                    env!("CARGO_BIN_EXE_tree-fixture")
-                ),
-            ]
-            .into_iter()
-            .map(toml::Value::String)
-            .collect(),
-        );
-        std::fs::write(
-            self.source.join("web/project.manifest.toml"),
-            format!(
-                "schema_version=1\n[project]\nservice_id={:?}\nname='slow start fixture'\ntype='rust'\n[build]\ncommand=['true']\nartifact='unused.zip'\n[run]\ncommand={command}\nshutdown_timeout_seconds=3\n[devrun]\ncommand={command}\n[health]\nstartup_timeout_seconds=30\nreadiness_path='/'\n[proxy]\npath='/'\n",
-                self.app
-            ),
-        )
-        .unwrap();
-    }
-
     /// spawn run 客户端并捕获 stdout 的 EVT 行（跨线程 channel 回传解析后
     /// 的 JSON 事件；非 EVT 行忽略）。
     fn spawn_run_piped(&mut self, log: &str) -> std::sync::mpsc::Receiver<Value> {

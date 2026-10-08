@@ -303,6 +303,17 @@ impl HttpResultError {
         }
     }
 
+    /// dev 容器连接不可达（`wait_for_dev_service` 预检耗尽与发送层连接
+    /// 失败共用出口）：503 + `ERR_CONTAINER_ADDRESS_NOT_READY` +
+    /// Retry-After + 本地化文案。
+    pub(super) fn dev_container_unreachable(locale: &str) -> Self {
+        Self::unavailable_with_code(
+            error_codes::ERR_CONTAINER_ADDRESS_NOT_READY,
+            shared_types::t("error.dev_container_unreachable", locale),
+            10,
+        )
+    }
+
     pub(super) fn system(message: impl Into<String>) -> Self {
         Self {
             status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,

@@ -146,7 +146,7 @@ impl DevServerManager {
                     } => {
                         // R2：先取监督退出码——run 非零退出是启动失败的直接
                         // 证据，owner 存活（管理面独立于业务）不能掩盖它。
-                        if self.run_exited_unsuccessfully(supervised).await {
+                        if run_exited_unsuccessfully(supervised).await {
                             return Err(early_exit_err(pid, port, stderr_ring));
                         }
                         // run 引导退出（移交成功或引导失败二选一）：有界窗口内
@@ -213,7 +213,7 @@ impl DevServerManager {
             } => {
                 // R2（宽松收尾同款）：等待窗内 run 非零退出 = 失败，不被
                 // owner 存活或宽松语义掩盖。
-                if self.run_exited_unsuccessfully(supervised).await {
+                if run_exited_unsuccessfully(supervised).await {
                     return Err(early_exit_err(pid, port, stderr_ring));
                 }
                 if owner_confirmed.is_some() {
@@ -241,27 +241,6 @@ impl DevServerManager {
             Some(identity) => LaunchObservation::HandedOver { identity },
             None => LaunchObservation::Ready,
         })
-    }
-
-    /// R2：监督收割的 run 退出码是否为失败（非零/信号）。pid 已死但收割
-    /// 尚未落表时给一个短等待窗（内核收割与 watch 通道传播在毫秒级）；
-    /// 超窗仍无结果按"未知"放行给 owner 核验分支（wait 失败同放行并告警）。
-    async fn run_exited_unsuccessfully(&self, supervised: &Arc<SupervisedChild>) -> bool {
-        use crate::service::dev_server::supervise::ChildExit;
-        // wait_exit：已收割立即返回；未收割短窗等待（毫秒级传播）。
-        let Some(exit) = supervised.wait_exit(HANDOVER_PROBE_RETRY).await else {
-            return false;
-        };
-        match exit {
-            ChildExit::Exited(status) => !status.success(),
-            ChildExit::WaitFailed(_) => {
-                tracing::warn!(
-                    "supervised run exit status unreadable ({}); proceeding to owner verification",
-                    exit.describe()
-                );
-                false
-            }
-        }
     }
 
     /// run 引导退出后的移交核验：owner 就绪且身份匹配本工作区 →
@@ -332,6 +311,27 @@ impl DevServerManager {
         // --config.confirmModulesPurge=false 兜底 (见 pnpm/cli.rs)。
         crate::service::pnpm_config::create_pnpm_npmrc(project_path).await?;
         crate::service::pnpm_config::sanitize_pnpm_built_dependencies_config(project_path).await
+    }
+}
+
+/// R2：监督收割的 run 退出码是否为失败（非零/信号）。pid 已死但收割
+/// 尚未落表时给一个短等待窗（内核收割与 watch 通道传播在毫秒级）；
+/// 超窗仍无结果按"未知"放行给 owner 核验分支（wait 失败同放行并告警）。
+async fn run_exited_unsuccessfully(supervised: &Arc<SupervisedChild>) -> bool {
+    use crate::service::dev_server::supervise::ChildExit;
+    // wait_exit：已收割立即返回；未收割短窗等待（毫秒级传播）。
+    let Some(exit) = supervised.wait_exit(HANDOVER_PROBE_RETRY).await else {
+        return false;
+    };
+    match exit {
+        ChildExit::Exited(status) => !status.success(),
+        ChildExit::WaitFailed(_) => {
+            tracing::warn!(
+                "supervised run exit status unreadable ({}); proceeding to owner verification",
+                exit.describe()
+            );
+            false
+        }
     }
 }
 

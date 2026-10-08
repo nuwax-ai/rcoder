@@ -13,7 +13,7 @@ use axum::{
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use super::forward_to_addr;
+use super::{ForwardKind, forward_to_addr};
 
 struct CapturedPost {
     status: StatusCode,
@@ -67,7 +67,7 @@ async fn forwarded(
     };
     tokio::time::timeout(Duration::from_secs(5), async {
         let response = forward_to_addr(
-            "diagnostic fixture",
+            ForwardKind::Dev,
             "forward-app",
             addr,
             &shared_types::FileServerRequestCredentials::default(),
