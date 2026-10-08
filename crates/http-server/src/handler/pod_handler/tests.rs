@@ -853,3 +853,33 @@ mod compute_error_route_tests {
         fixture.store.shutdown().await.expect("close");
     }
 }
+
+mod ensure_retained_without_compute_tests {
+    use super::ensure::retained_without_compute;
+
+    /// 仅 Diagnostic(CONTAINER_NOT_FOUND)（保留记录+确证无负载）走创建路径；
+    /// 其它 Diagnostic 码与传输类错误仍是查询失败，不触发创建。
+    #[test]
+    fn only_container_not_found_diagnostic_routes_to_creation() {
+        let retained = app_manager::AppOperationError::Diagnostic(shared_types::WakeFailure::new(
+            shared_types::ERR_CONTAINER_NOT_FOUND,
+            "runtime",
+            "Read application runtime: Container not found",
+        ));
+        assert!(
+            retained_without_compute(&retained),
+            "retained app without workload must follow the creation path"
+        );
+        let other_code = app_manager::AppOperationError::Diagnostic(
+            shared_types::WakeFailure::new("ERR_SOMETHING_ELSE", "runtime", "transient"),
+        );
+        assert!(!retained_without_compute(&other_code));
+        let not_found = app_manager::AppOperationError::NotFound("app does not exist".to_string());
+        assert!(
+            !retained_without_compute(&not_found),
+            "NotFound keeps its own creation branch; the helper must not absorb it"
+        );
+        let backend = app_manager::AppOperationError::Backend("transport".to_string());
+        assert!(!retained_without_compute(&backend));
+    }
+}

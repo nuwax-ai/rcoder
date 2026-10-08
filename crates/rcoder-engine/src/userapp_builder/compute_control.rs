@@ -24,6 +24,9 @@ pub struct ComputeOperationView {
     pub error_code: Option<String>,
     pub error_message: Option<String>,
     pub status_url: String,
+    /// 物理工作负载创建是否已被观察（pod/ensure 有界等待的输出；
+    /// None = 本视图不经该路径，语义不变）。
+    pub creation_observed: Option<bool>,
 }
 impl From<ComputeControlRecord> for ComputeOperationView {
     fn from(r: ComputeControlRecord) -> Self {
@@ -39,6 +42,7 @@ impl From<ComputeControlRecord> for ComputeOperationView {
             revision: r.revision,
             error_code: r.error_code,
             error_message: r.error_message,
+            creation_observed: None,
         }
     }
 }

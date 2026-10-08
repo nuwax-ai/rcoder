@@ -13,7 +13,7 @@ use axum::response::IntoResponse;
     request_body(content = EnsurePodRequest, description = "启动容器请求"),
     responses(
         (status = 200, description = "容器已存在或普通容器已同步创建；UserApp 只表示计算资源已请求运行，不代表业务 Ready", body = HttpResult<EnsurePodResponse>),
-        (status = 202, description = "已有 UserApp 计算资源需要物理启动；返回持久操作 ID 和查询地址，不等待业务服务 Ready", body = HttpResult<crate::userapp_builder::compute_control::ComputeOperationView>),
+        (status = 202, description = "已有 UserApp 计算资源需要物理启动；返回持久操作 ID 和查询地址，不等待业务服务 Ready。受理后有界等待（≤15s）物理工作负载对象出现：creation_observed=true 表示创建已观察；false 表示仍在创建中（已受理，非失败），凭 operation_id 查询/重试", body = HttpResult<crate::userapp_builder::compute_control::ComputeOperationView>),
         (status = 400, description = "请求参数无效", body = HttpResult<String>),
         (status = 401, description = "API Key 鉴权失败", body = HttpResult<String>),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
@@ -254,6 +254,19 @@ async fn ensure_userapp_prod(
                 .await
                 .map(IntoResponse::into_response);
         }
+        Err(e) if retained_without_compute(&e) => {
+            // 保留的 Active 记录 + 物理工作负载缺失：fetch_runtime_status_or_err
+            // 的显式分类（防瞬时 API 故障被误判为应用不存在→404→Java 误重建）。
+            // 按本函数文档语义（Missing compute still follows the initial
+            // empty-container creation path）走初始空容器创建路径；其余查询
+            // 故障仍落入下方失败分支，不触发创建。
+            info!(
+                "[POD_ENSURE] retained app without physical workload, following creation path: app_id={app_id}"
+            );
+            return ensure_userapp_prod_created(state, locale, app_id)
+                .await
+                .map(IntoResponse::into_response);
+        }
         Err(e) => {
             // API Server 不可达/RBAC 拒绝等查询故障：语义=查询失败而非应用不存在，
             // 与唤醒路径的 Timeout/Failed 同码（Backend），不触发创建
@@ -290,7 +303,7 @@ async fn ensure_userapp_prod(
     }
     let operation = crate::userapp_builder::compute_control::submit_physical_start(
         state,
-        app_id,
+        app_id.clone(),
         shared_types::UserAppOperationScope::Prod,
         shared_types::UserAppControlRequest {
             lifecycle_id: None,
@@ -300,11 +313,80 @@ async fn ensure_userapp_prod(
     .await
     .map_err(|error| crate::userapp_builder::control_error(&error))?;
     let operation_id = operation.operation_id.clone();
+    // 受理后有界等待"物理创建已观察"（工作负载对象存在即算，不等就绪/健康）：
+    // 消除"受理≠开始"的观察空洞——成功返回时物理对象已在，调用方后续查询
+    // 不会再命中"记录在但查无负载"的瞬时窗口。预算耗尽不虚报失败（操作
+    // 仍在进行），返回受理成功并注明未观察；操作快速终态失败则提前返回。
+    let (mut operation, creation_observed) =
+        wait_creation_observed(state, app_id, operation, CREATE_OBSERVE_BUDGET).await;
+    operation.creation_observed = Some(creation_observed);
     Ok((
         axum::http::StatusCode::ACCEPTED,
         HttpResult::success(operation).with_operation_id(operation_id),
     )
         .into_response())
+}
+
+/// pod/ensure 物理创建观察预算（工作负载对象出现即返回；不等就绪）。
+const CREATE_OBSERVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+const CREATE_OBSERVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// 保留记录 + 物理工作负载缺失的显式分类（Diagnostic code=CONTAINER_NOT_FOUND）。
+/// 仅这一码代表"确证无负载"；其余查询故障语义仍是失败，不触发创建。
+pub(crate) fn retained_without_compute(error: &app_manager::AppOperationError) -> bool {
+    matches!(
+        error,
+        app_manager::AppOperationError::Diagnostic(detail)
+            if detail.code.as_ref() == shared_types::ERR_CONTAINER_NOT_FOUND
+    )
+}
+
+/// 受理后有界等待物理工作负载对象出现（`get_app` Ok 即算）。同时刷新操作
+/// 状态：failed/superseded 快速终态提前返回（调用方凭 view.state 判断）；
+/// 预算耗尽返回 (最新 view, false)——已受理的操作仍在进行，不构成失败。
+async fn wait_creation_observed(
+    state: &Arc<AppState>,
+    app_id: String,
+    mut operation: crate::userapp_builder::compute_control::ComputeOperationView,
+    budget: std::time::Duration,
+) -> (
+    crate::userapp_builder::compute_control::ComputeOperationView,
+    bool,
+) {
+    use crate::userapp_builder::compute_control::ComputeOperationView;
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if state.app_service.get_app(&app_id).await.is_ok() {
+            if let Ok(Some(record)) = state
+                .userapp_store
+                .get_compute_control(&app_id, &operation.operation_id)
+                .await
+            {
+                operation = ComputeOperationView::from(record);
+            }
+            return (operation, true);
+        }
+        if let Ok(Some(record)) = state
+            .userapp_store
+            .get_compute_control(&app_id, &operation.operation_id)
+            .await
+        {
+            let view = ComputeOperationView::from(record);
+            let terminal_failure = matches!(
+                view.state,
+                shared_types::ComputeControlState::Failed
+                    | shared_types::ComputeControlState::Superseded
+            );
+            operation = view;
+            if terminal_failure {
+                return (operation, false);
+            }
+        }
+        if tokio::time::Instant::now() + CREATE_OBSERVE_INTERVAL >= deadline {
+            return (operation, false);
+        }
+        tokio::time::sleep(CREATE_OBSERVE_INTERVAL).await;
+    }
 }
 
 /// prod 空容器预创建子分支：应用共享（无 owner 解析），复用 start 无 url
