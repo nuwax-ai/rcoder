@@ -242,6 +242,9 @@ pub(super) struct HttpResultError {
     /// 503 唤醒类错误的 Retry-After 秒数（对齐 proxy_http 流量唤醒面）。
     retry_after_secs: Option<u32>,
     cause: Option<shared_types::AppError>,
+    /// 显式错误码覆盖（状态码推断不出细分码时——如 503 下的
+    /// ERR_CONTAINER_ADDRESS_NOT_READY）；None = 按 `error_code_for(status)`。
+    code: Option<&'static str>,
 }
 
 impl HttpResultError {
@@ -251,6 +254,7 @@ impl HttpResultError {
             message: String::new(),
             retry_after_secs: None,
             cause: Some(cause),
+            code: None,
         }
     }
 
@@ -260,6 +264,7 @@ impl HttpResultError {
             message: message.into(),
             retry_after_secs: None,
             cause: None,
+            code: None,
         }
     }
 
@@ -269,6 +274,7 @@ impl HttpResultError {
             message: message.into(),
             retry_after_secs: None,
             cause: None,
+            code: None,
         }
     }
 
@@ -278,6 +284,22 @@ impl HttpResultError {
             message: message.into(),
             retry_after_secs: Some(retry_after_secs),
             cause: None,
+            code: None,
+        }
+    }
+
+    /// 指定错误码的 503（Retry-After + 覆盖码——dev 容器连接失败分级用）。
+    pub(super) fn unavailable_with_code(
+        code: &'static str,
+        message: impl Into<String>,
+        retry_after_secs: u32,
+    ) -> Self {
+        Self {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+            retry_after_secs: Some(retry_after_secs),
+            cause: None,
+            code: Some(code),
         }
     }
 
@@ -287,6 +309,7 @@ impl HttpResultError {
             message: message.into(),
             retry_after_secs: None,
             cause: None,
+            code: None,
         }
     }
 
@@ -306,7 +329,7 @@ impl IntoResponse for HttpResultError {
         // 但保留真实 HTTP 状态码(400/404/502/503 对代理与客户端有语义; HttpResult 的
         // IntoResponse 恒 200, 不适用于透传层的传输级错误)
         let payload = serde_json::json!({
-            "code": error_code_for(self.status),
+            "code": self.code.unwrap_or_else(|| error_code_for(self.status)),
             "message": self.message,
             "data": serde_json::Value::Null,
             "success": false,

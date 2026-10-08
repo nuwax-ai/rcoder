@@ -208,10 +208,11 @@ async fn consume(
                         startup_results.remove(service);
                         None
                     }
-                    // 已观察到编排进程退出时，迟到的缓存事件不是启动成功证明。
-                    BuildProgressEvent::ServiceStartOk { service } if exited.is_none() => {
-                        Some((service.clone(), None))
-                    }
+                    // 成功摘要跟随事件本身（R7）：管道字节序下"退出通知
+                    // 先到、ServiceStartOk 后到"是合法顺序（终局判据是 Done，
+                    // 见下方注释），退出观察不剥夺成功摘要；重试/重复由
+                    // emit_startup_result_log 的去重保护。
+                    BuildProgressEvent::ServiceStartOk { service } => Some((service.clone(), None)),
                     BuildProgressEvent::ServiceStartFail { service, error } => {
                         Some((service.clone(), Some(error.clone())))
                     }
@@ -530,6 +531,23 @@ mod tests {
             .unwrap();
             tx.send(StartEvent::Done { failed: vec![] }).unwrap();
             consumer.await.unwrap().unwrap();
+            // R7：合法成功顺序（Exited → ServiceStartOk → Done）必须保留
+            // 原任务的成功摘要日志——真实 service_id + 启动成功文案。
+            let (events, _) = target.subscribe(0).await;
+            let success_logs = events
+                .iter()
+                .filter_map(|(_, event)| match event {
+                    BuildProgressEvent::Log { service, line } => {
+                        Some((service.clone(), line.clone()))
+                    }
+                    _ => None,
+                })
+                .filter(|(service, line)| service == "web" && line.contains("启动成功"))
+                .count();
+            assert_eq!(
+                success_logs, 1,
+                "退出后到达的 ServiceStartOk 也要有成功摘要 (exit={exit})"
+            );
         }
     }
 

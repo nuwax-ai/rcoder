@@ -628,11 +628,30 @@ pub fn validate_page(content: &[u8]) -> std::result::Result<(), String> {
         let placeholder = &text[absolute..absolute + end + 2];
         let known = matches!(
             placeholder,
-            VAR_TITLE | VAR_MESSAGE | VAR_DIAGNOSTIC_ID | VAR_STATUS | VAR_LANG
+            VAR_TITLE
+                | VAR_MESSAGE
+                | VAR_DIAGNOSTIC_ID
+                | VAR_STATUS
+                | VAR_LANG
+                | rcoder_proxy::error_page::VAR_CAUSE
+                | rcoder_proxy::error_page::VAR_UI_BROWSER
+                | rcoder_proxy::error_page::VAR_UI_CONNECTED
+                | rcoder_proxy::error_page::VAR_UI_GATEWAY
+                | rcoder_proxy::error_page::VAR_UI_NORMAL
+                | rcoder_proxy::error_page::VAR_UI_APP
+                | rcoder_proxy::error_page::VAR_UI_UNAVAILABLE
+                | rcoder_proxy::error_page::VAR_UI_STARTING
+                | rcoder_proxy::error_page::VAR_UI_STOPPED
+                | rcoder_proxy::error_page::VAR_UI_FAILED
+                | rcoder_proxy::error_page::VAR_UI_RELOAD
+                | rcoder_proxy::error_page::VAR_UI_HINT
+                | rcoder_proxy::error_page::VAR_UI_COPY
+                | rcoder_proxy::error_page::VAR_UI_COPIED
+                | rcoder_proxy::error_page::VAR_UI_ARIA
         );
         if !known {
             return Err(format!(
-                "unknown placeholder {placeholder} (only RCODER_TITLE/RCODER_MESSAGE/RCODER_DIAGNOSTIC_ID/RCODER_STATUS/RCODER_LANG are supported)"
+                "unknown placeholder {placeholder} (supported: RCODER_TITLE/RCODER_MESSAGE/RCODER_DIAGNOSTIC_ID/RCODER_STATUS/RCODER_LANG plus RCODER_CAUSE and RCODER_UI_* fixed-label placeholders)"
             ));
         }
         scan = absolute + end + 2;
@@ -687,6 +706,11 @@ mod tests {
             validate_page(b"<html lang=\"{{RCODER_LANG}}\">{{RCODER_TITLE}}</html>").is_ok(),
             "lang placeholder must be accepted (rendered since the i18n copy)"
         );
+        // R6：档位与固定标签占位符合法（自定义页可选使用）。
+        assert!(validate_page(
+            b"<main data-causes=\"x\" data-cause=\"{{RCODER_CAUSE}}\" data-i18n=\"{{RCODER_UI_RELOAD}} {{RCODER_UI_ARIA}} {{RCODER_UI_COPIED}}\">{{RCODER_TITLE}}</main>"
+        )
+        .is_ok());
         assert!(
             validate_page(b"<html>{{RCODER_EVIL}}</html>").is_err(),
             "unknown RCODER placeholder must be rejected at save time"

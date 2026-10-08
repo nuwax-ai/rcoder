@@ -669,7 +669,9 @@ mod tests {
                 .contains("x-rcoder-diagnostic-id: "),
             "{document}"
         );
-        assert!(document.contains("重新访问"), "{document}");
+        // 无 Accept-Language → 默认英文页（R6：默认英文也正确——按钮为
+        // 本地化文案，不再是硬编码中文）
+        assert!(document.contains(">Reload</button>"), "{document}");
 
         // 2) fetch 请求 → 结构化 JSON（显式资源目标不被 Accept 覆盖）
         let fetch = exchange(format!(
@@ -684,7 +686,7 @@ mod tests {
             "{fetch}"
         );
         assert!(fetch.contains("USERAPP_PROXY_FAILURE"), "{fetch}");
-        assert!(!fetch.contains("重新访问"), "{fetch}");
+        assert!(!fetch.contains(">Reload</button>"), "{fetch}");
 
         // 3) HEAD → 状态与响应头，无正文
         let head = exchange(format!(

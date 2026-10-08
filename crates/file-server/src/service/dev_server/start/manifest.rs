@@ -222,18 +222,38 @@ impl DevServerManager {
         // 早退检测 + 宽松就绪——watch 对象是 serve owner 而非 spawn 的 run
         // 进程：app-cli 0.3.16+ 的 `run` 是一次性引导（可重复执行），完成
         // 移交后正常退出；9080 按 [proxy] path 路由时根路径 404，HTTP 判不
-        // 通但编排主体存活即通过。
+        // 通但编排主体存活即通过。移交判据 = 监督退出码 0 + owner 身份核验
+        // （R2：非零退出不再被 owner 存活掩盖）。
         match self
             .wait_manifest_alive(
                 pid,
                 PINGAP_ENTRY_PORT,
                 project_path,
+                &supervised,
                 &stderr_ring,
                 Some(deadline),
             )
             .await
         {
             Ok(LaunchObservation::Ready) => {}
+            Ok(LaunchObservation::HandedOver { identity }) => {
+                // R3：移交成立——本地登记从"run PID"转换为"外部 owner"，
+                // 死 PID 不再占据本地 orchestrator 槽位，重复 Start 走
+                // owner 复用链而非被历史 guard 拒绝。仅当登记仍指向本次
+                // launch 的 PID 且尚未转换时写入（Stop/后继实例竞争时不得
+                // 覆盖对方登记）；token 置空哨兵：停止路径按 owner 状态根重读。
+                let mut processes = lock(&self.processes)?;
+                if let Some(process) = processes.get_mut(project_id)
+                    && process.pid == pid
+                    && process.external_owner.is_none()
+                {
+                    process.external_owner = Some(ExternalOwner {
+                        address: self.config.app_cli_admin_probe_addr.clone(),
+                        token: String::new(),
+                        runtime_instance_id: identity.runtime_instance_id.clone(),
+                    });
+                }
+            }
             Ok(LaunchObservation::DeadlineExpired) => {
                 return Err(AppError::business(format!(
                     "local startup observation launch deadline exceeded (launch {launch_id}, pid {pid}); query this original execution before retrying"

@@ -2799,6 +2799,11 @@ async fn userapp_dev_registry_self_heal_after_restart() {
     // - 首几次 502 可接受：PROBE_OK 30s 缓存直打旧 IP / file-server ~10s 启动窗
     let mut healed = false;
     let mut last = String::new();
+    // 事故反例回归（2026-10-08 app 221）：窗口期内的转发失败必须分类呈现
+    // ——发送层有界等待（wait_for_dev_service）耗尽后返回
+    // ERR_CONTAINER_ADDRESS_NOT_READY / ERR_OPERATION_IN_PROGRESS 等分类码，
+    // 不得出现裸 reqwest 连接错误文案（含集群内部地址）。
+    let mut raw_transport_leak = String::new();
     if restart_ok {
         let deadline = Instant::now() + Duration::from_secs(120);
         while Instant::now() < deadline {
@@ -2823,6 +2828,9 @@ async fn userapp_dev_registry_self_heal_after_restart() {
                         break;
                     }
                     last = format!("HTTP {status}, {}", trunc(&body, 80));
+                    if trunc(&body, 300).contains("error sending request") {
+                        raw_transport_leak = trunc(&body, 300);
+                    }
                 }
                 Err(e) => last = format!("transport: {e}"),
             }
@@ -2833,6 +2841,11 @@ async fn userapp_dev_registry_self_heal_after_restart() {
         "restart 后 get-file-list 经自愈恢复 200（探活失败→刷新注册→转发成功）",
         healed,
         format!("restart_ok={restart_ok}, 末次: {last}"),
+    );
+    report.assert_hard(
+        "重启窗口内转发失败分类呈现（无裸 reqwest 连接错误文案）",
+        raw_transport_leak.is_empty(),
+        format!("裸错误样例: {raw_transport_leak}"),
     );
 
     // 核心不变量：container_id 不变 = Alive 分支保容器（重建必换 Id）。

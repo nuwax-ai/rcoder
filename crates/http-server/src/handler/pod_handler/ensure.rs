@@ -347,38 +347,112 @@ pub(crate) fn retained_without_compute(error: &app_manager::AppOperationError) -
 async fn wait_creation_observed(
     state: &Arc<AppState>,
     app_id: String,
-    mut operation: crate::userapp_builder::compute_control::ComputeOperationView,
+    operation: crate::userapp_builder::compute_control::ComputeOperationView,
     budget: std::time::Duration,
 ) -> (
     crate::userapp_builder::compute_control::ComputeOperationView,
     bool,
 ) {
+    let app_probe_id = app_id.clone();
+    let control_probe_id = app_id.clone();
+    observe_creation_with(
+        operation,
+        budget,
+        app_id,
+        move || {
+            let app_id = app_probe_id.clone();
+            async move { state.app_service.get_app(&app_id).await.is_ok() }
+        },
+        move |operation_id: String| {
+            let app_id = control_probe_id.clone();
+            async move {
+                state
+                    .userapp_store
+                    .get_compute_control(&app_id, &operation_id)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        },
+    )
+    .await
+}
+
+/// 观察循环核心（与状态源解耦——R4 边界测试注入受控慢读取）。
+/// R4：单轮读取钳制到共享 deadline——预算是硬边界，慢读越界（含迟到的
+/// 成功读取）一律按"已受理但观察未完成"收场，不得越过预算后报告已观察。
+async fn observe_creation_with<AppFut, CtlFut>(
+    mut operation: crate::userapp_builder::compute_control::ComputeOperationView,
+    budget: std::time::Duration,
+    app_id: String,
+    get_app: impl Fn() -> AppFut,
+    get_control: impl Fn(String) -> CtlFut,
+) -> (
+    crate::userapp_builder::compute_control::ComputeOperationView,
+    bool,
+)
+where
+    AppFut: Future<Output = bool>,
+    CtlFut: Future<Output = Option<shared_types::ComputeControlRecord>>,
+{
     use crate::userapp_builder::compute_control::ComputeOperationView;
     let deadline = tokio::time::Instant::now() + budget;
     loop {
-        if state.app_service.get_app(&app_id).await.is_ok() {
-            if let Ok(Some(record)) = state
-                .userapp_store
-                .get_compute_control(&app_id, &operation.operation_id)
-                .await
-            {
-                operation = ComputeOperationView::from(record);
+        // 单轮 get_app 钳制：超剩余预算 → 观察未完成（保留原 view 返回）。
+        let app_ok = match tokio::time::timeout_at(deadline, get_app()).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(
+                    app_id,
+                    operation_id = %operation.operation_id,
+                    "creation observation budget exhausted while reading the app record; accepted operation remains in flight"
+                );
+                return (operation, false);
+            }
+        };
+        if app_ok {
+            let record =
+                tokio::time::timeout_at(deadline, get_control(operation.operation_id.clone()))
+                    .await;
+            match record {
+                Ok(Some(record)) => operation = ComputeOperationView::from(record),
+                Ok(None) => {}
+                // 预算耗尽于操作视图刷新：工作负载对象已观察到——创建
+                // 可观察成立，返回当前视图（留痕：观察到的视图可能滞后）。
+                Err(_) => {
+                    tracing::warn!(
+                        app_id,
+                        operation_id = %operation.operation_id,
+                        "creation observation budget exhausted while refreshing the operation view; returning the last confirmed view"
+                    );
+                    return (operation, true);
+                }
             }
             return (operation, true);
         }
-        if let Ok(Some(record)) = state
-            .userapp_store
-            .get_compute_control(&app_id, &operation.operation_id)
-            .await
-        {
-            let view = ComputeOperationView::from(record);
-            let terminal_failure = matches!(
-                view.state,
-                shared_types::ComputeControlState::Failed
-                    | shared_types::ComputeControlState::Superseded
-            );
-            operation = view;
-            if terminal_failure {
+        let record =
+            tokio::time::timeout_at(deadline, get_control(operation.operation_id.clone())).await;
+        match record {
+            Ok(Some(record)) => {
+                let view = ComputeOperationView::from(record);
+                let terminal_failure = matches!(
+                    view.state,
+                    shared_types::ComputeControlState::Failed
+                        | shared_types::ComputeControlState::Superseded
+                );
+                operation = view;
+                if terminal_failure {
+                    return (operation, false);
+                }
+            }
+            Ok(None) => {}
+            // 预算耗尽于状态刷新：观察未完成（留痕：已受理但对象未观察到）。
+            Err(_) => {
+                tracing::warn!(
+                    app_id,
+                    operation_id = %operation.operation_id,
+                    "creation observation budget exhausted while reading runtime/store; accepted operation remains in flight"
+                );
                 return (operation, false);
             }
         }
@@ -423,5 +497,121 @@ async fn ensure_userapp_prod_created(
                 &format!("create userapp prod container failed: {e:#}"),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod creation_budget_tests {
+    use super::*;
+    use shared_types::{
+        ComputeControlAction, ComputeControlRecord, ComputeControlState, UserAppOperationScope,
+    };
+
+    fn record(state: ComputeControlState, operation_id: &str) -> ComputeControlRecord {
+        ComputeControlRecord {
+            created_at: chrono::Utc::now(),
+            app_id: "app-budget".to_string(),
+            lifecycle_id: "lifecycle".to_string(),
+            request_id: "request".to_string(),
+            scope: UserAppOperationScope::Prod,
+            operation_id: operation_id.to_string(),
+            request_fingerprint: "fingerprint".to_string(),
+            generation: 1,
+            revision: 1,
+            action: ComputeControlAction::Restart,
+            state,
+            executor_id: None,
+            stage: "observed".to_string(),
+            checkpoint: serde_json::Value::Null,
+            error_code: None,
+            error_message: None,
+            lease: None,
+            interrupted_operations: Vec::new(),
+        }
+    }
+
+    fn view(
+        state: ComputeControlState,
+    ) -> crate::userapp_builder::compute_control::ComputeOperationView {
+        crate::userapp_builder::compute_control::ComputeOperationView::from(record(
+            state,
+            "op-budget",
+        ))
+    }
+
+    /// R4 边界反例（审查数字复现）：20ms 预算、80ms 慢 runtime 读取——
+    /// 观察必须在预算内结束且不报告已观察（迟到的成功读取不算数）。
+    #[tokio::test]
+    async fn slow_app_read_never_crosses_the_budget() {
+        let started = Instant::now();
+        let (_result, observed) = observe_creation_with(
+            view(ComputeControlState::Running),
+            std::time::Duration::from_millis(20),
+            "app-budget".to_string(),
+            || async {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                true // 迟到的成功
+            },
+            |_operation_id: String| async { None },
+        )
+        .await;
+        assert!(!observed, "迟到成功不得越过预算报告已观察");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(60),
+            "观察应在预算附近结束（实测 {:?}）",
+            started.elapsed()
+        );
+    }
+
+    /// 慢 store 读取同受预算钳制：对象已观察到（get_app Ok）时，控制记录
+    /// 刷新被钳制——返回已观察 + 原视图，不越过预算。
+    #[tokio::test]
+    async fn slow_control_refresh_is_clamped_to_budget() {
+        let started = Instant::now();
+        let (_result, observed) = observe_creation_with(
+            view(ComputeControlState::Running),
+            std::time::Duration::from_millis(20),
+            "app-budget".to_string(),
+            || async { true },
+            |_operation_id: String| async {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                None
+            },
+        )
+        .await;
+        assert!(observed, "get_app 已 Ok：创建可观察成立");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(60),
+            "刷新钳制应在预算附近结束（实测 {:?}）",
+            started.elapsed()
+        );
+    }
+
+    /// 快速终态失败照旧提前返回（预算钳制不吞终态分类）。
+    #[tokio::test]
+    async fn terminal_failure_short_circuits() {
+        let (_result, observed) = observe_creation_with(
+            view(ComputeControlState::Running),
+            std::time::Duration::from_secs(2),
+            "app-budget".to_string(),
+            || async { false },
+            |_operation_id: String| async { Some(record(ComputeControlState::Failed, "op-x")) },
+        )
+        .await;
+        assert!(!observed);
+    }
+
+    /// 正常路径：对象出现即观察成功。
+    #[tokio::test]
+    async fn observed_when_workload_object_appears() {
+        let (_result, observed) = observe_creation_with(
+            view(ComputeControlState::Running),
+            std::time::Duration::from_secs(2),
+            "app-budget".to_string(),
+            || async { true },
+            |_operation_id: String| async { Some(record(ComputeControlState::Succeeded, "op-x")) },
+        )
+        .await;
+        assert!(observed);
     }
 }

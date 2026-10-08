@@ -677,12 +677,14 @@ impl PortProxy {
         let (content_type, body): (&'static str, bytes::Bytes) =
             match crate::error_page::negotiate(session) {
                 crate::error_page::ErrorRepresentation::Document => {
-                    let (title, message) = hint.page_cause().copywriting(locale);
+                    let page_cause = hint.page_cause();
+                    let (title, message) = page_cause.copywriting(locale);
                     let vars = crate::error_page::ErrorPageVars {
                         title,
                         message,
                         diagnostic_id: diagnostic_id.clone(),
                         status: status.to_string(),
+                        cause_slug: crate::error_page::cause_slug(page_cause).to_string(),
                     };
                     (
                         "text/html; charset=utf-8",
@@ -764,7 +766,7 @@ impl PortProxy {
         let code = failure.code.clone();
         // 错误码是终局证据：按码映射文案档位（404 已删除→Missing、409 围栏
         // →Blocked 等），不再恒用 Generic 等 advisor 观察
-        let cause = crate::error_page::wake_failure_cause(code.as_ref());
+        let cause = crate::error_page::wake_failure_cause(&failure);
         let detail = shared_types::sanitize_error_text(&failure.message);
         let retry = failure.retryable.then_some(15);
         ctx.wake_failure = Some(failure);

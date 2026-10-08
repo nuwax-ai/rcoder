@@ -1418,27 +1418,168 @@ mod owner_reuse_tests {
             }
         }
     }
+    /// R3 回归：成功移交后本地登记转换为外部 owner——重复 Start 走 owner
+    /// 复用链（向 owner 提交 Restart），不再被"local orchestrator is already
+    /// registered"的死 run guard 拒绝。run 引导为受控脚本（等待放行文件后
+    /// exit 0），owner 为进程内 mock（identity/status/operations 全 wire，
+    /// 复用前置探测时端口未监听——bind 延迟到 spawn 之后）。
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn manifest_handover_converts_registration_for_repeat_start() {
+        if std::env::var_os("PROJECT_ID").is_some() {
+            // 身份核验的 application_id 锚定 unknown-app 回退；宿主平台变量下跳过
+            return;
+        }
+        let dir = tempfile::tempdir().expect("harness tempdir");
+        let workspace = dir.path().join("ws-handover-reg");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("workspace.manifest.toml"), "# t\n").unwrap();
+        // owner 复用提交所需的平台状态根（registry 段 + deploy token）。
+        let state_root = dir.path().join(".app-cli-state").join("unknown-app");
+        std::fs::create_dir_all(&state_root).unwrap();
+        std::fs::write(state_root.join("token"), "test-token").unwrap();
+        let canonical = std::fs::canonicalize(&workspace).unwrap();
+        let registry = std::collections::BTreeMap::from([(
+            canonical.to_string_lossy().into_owned(),
+            "unknown-app".to_string(),
+        )]);
+        std::fs::write(
+            dir.path().join(".app-cli-state/registry.json"),
+            serde_json::to_string(&registry).unwrap(),
+        )
+        .unwrap();
+
+        // 受控 run 引导：argv = [script, run, --workspace, <ws>, ...] → $3 为
+        // 工作区；等待工作区内出现 .release-flag 后 exit 0。
+        let script = dir.path().join("fake-app-cli");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nwhile [ ! -f \"$3/.release-flag\" ]; do sleep 0.05; done\nexit 0\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // 预留 owner 端口（此刻不监听——首次 Start 的复用前置探测必须扑空，
+        // 才会走 spawn+移交路径）。
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+
+        let requests = Arc::new(Mutex::new(
+            Vec::<shared_types::RuntimeOperationRequest>::new(),
+        ));
+        let captured = requests.clone();
+        let router = mock_owner_router("hashed-workspace", &workspace)
+            .with_state(Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let captured = captured.clone();
+                    async move {
+                        if request.method() == axum::http::Method::POST {
+                            let (parts, body) = request.into_parts();
+                            let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                            captured
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::from_slice(&bytes).unwrap());
+                            next.run(axum::extract::Request::from_parts(
+                                parts,
+                                axum::body::Body::from(bytes),
+                            ))
+                            .await
+                        } else {
+                            next.run(request).await
+                        }
+                    }
+                },
+            ));
+
+        let mut config = wait_test_config(&reserved.to_string(), &dir.path().join("logs"));
+        // 宽松就绪窗覆盖脚本等待 + owner 上线 + 移交核验。
+        config.dev_alive_max_wait_ms = 4_000;
+        config.app_cli_bin = Some(script.display().to_string());
+        let manager = Arc::new(DevServerManager::new(Arc::new(config)));
+
+        let launch = || crate::service::dev_server::DevLaunch {
+            base_path: None,
+            hooks: None,
+            pg: None,
+            request_context: None,
+            artifact_release_id: None,
+        };
+        let first_workspace = workspace.clone();
+        let first = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .start_dev("userapp:handover-reg", &first_workspace, launch())
+                    .await
+            })
+        };
+        // 前置探测 + spawn 完成后（脚本挂起等 flag），owner 上线并放行脚本。
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let listener = tokio::net::TcpListener::bind(reserved)
+            .await
+            .expect("rebind reserved owner port");
+        let server = tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, router).await {
+                tracing::warn!(%error, "test owner server terminated");
+            }
+        });
+        std::fs::write(workspace.join(".release-flag"), "").unwrap();
+
+        let started = first
+            .await
+            .expect("start task join")
+            .expect("handover startup must succeed (run exit 0 + verified owner)");
+        assert_ne!(started.pid, 0, "首启走 spawn 路径（pid 为真实引导进程）");
+
+        // R3 核心：重复 Start 不被死 run 的本地登记 guard 拒绝——登记已转换为
+        // 外部 owner，复用链受理并提交 Restart。
+        let again = manager
+            .start_dev("userapp:handover-reg", &workspace, launch())
+            .await
+            .expect("repeat start after handover must route through the owner reuse chain");
+        assert_eq!(again.pid, 0, "复用形态（owner 进程保留，pid 0）");
+        let posted = requests.lock().unwrap();
+        assert_eq!(posted.len(), 1, "恰好一次复用 Restart 提交: {posted:?}");
+        assert_eq!(posted[0].kind, shared_types::RuntimeOperationKind::Restart);
+        server.abort();
+    }
 }
 
 /// 0.3.16+ 契约：spawn 的 `app-cli run` 是一次性引导（可重复执行），常驻
 /// 主体是 `app-cli serve` owner。run 进程退出后：匹配 owner 在 → 移交
 /// 成立，宽松就绪成功；无 owner → 启动失败（stderr 分类文案不变）。
-async fn spawn_dead_pid() -> u32 {
-    // 跨平台的一次性进程：unix 用 sh -c、windows 用 cmd /C——只按命令名
+async fn spawn_dead_run(exit_code: i32) -> (u32, Arc<SupervisedChild>) {
+    // 跨平台的一次性 run 引导：unix 用 sh -c、windows 用 cmd /C——只按命令名
     // 走 PATH 解析，不硬编码具体路径（发行版 sh 位置差异不受影响）。
+    // 经 SupervisedChild 收割：wait_exit 给出真实 ExitStatus（R2 判据源）。
     let mut command = if cfg!(windows) {
-        let mut command = std::process::Command::new("cmd");
-        command.arg("/C").arg("exit 0");
+        let mut command = tokio::process::Command::new("cmd");
+        command.arg("/C").arg(format!("exit {exit_code}"));
         command
     } else {
-        let mut command = std::process::Command::new("sh");
-        command.arg("-c").arg("exit 0");
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(format!("exit {exit_code}"));
         command
     };
-    let mut child = command.spawn().expect("spawn transient process");
-    let pid = child.id();
-    let _ = child.wait();
-    pid
+    let child = command.spawn().expect("spawn transient run");
+    let pid = child.id().expect("transient run pid");
+    let ring: Arc<StderrRing> = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+        STDERR_RING_CAP,
+    )));
+    let supervised = SupervisedChild::adopt(child, ring);
+    supervised
+        .wait_exit(Duration::from_secs(5))
+        .await
+        .expect("transient run must exit and be reaped");
+    (pid, supervised)
 }
 
 fn wait_test_config(probe_addr: &str, logs: &Path) -> crate::Config {
@@ -1489,7 +1630,9 @@ async fn manifest_wait_treats_run_exit_as_owner_handover_when_owner_present() {
         }),
     );
     tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
+        if let Err(error) = axum::serve(listener, router).await {
+            tracing::warn!(%error, "test owner server terminated");
+        }
     });
 
     let config = wait_test_config(
@@ -1497,17 +1640,84 @@ async fn manifest_wait_treats_run_exit_as_owner_handover_when_owner_present() {
         &dir.path().join("logs"),
     );
     let manager = DevServerManager::new(Arc::new(config));
-    let pid = spawn_dead_pid().await;
+    let (pid, supervised) = spawn_dead_run(0).await;
     let ring: Arc<StderrRing> = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
         STDERR_RING_CAP,
     )));
     let observation = manager
-        .wait_manifest_alive(pid, 1, ws.path(), &ring, None)
+        .wait_manifest_alive(pid, 1, ws.path(), &supervised, &ring, None)
         .await
         .expect("handover-confirmed startup must be lenient-ready");
     assert!(
-        matches!(observation, LaunchObservation::Ready),
-        "expected lenient Ready after confirmed owner handover"
+        matches!(observation, LaunchObservation::HandedOver { .. }),
+        "expected HandedOver (with verified identity) after confirmed owner handover: {observation:?}"
+    );
+}
+
+/// R2 回归：run 非零退出时，匹配 owner 在线也不能把启动报成功——监督
+/// 退出码是直接失败证据（管理面独立于业务存活是产品契约）。
+#[tokio::test]
+async fn manifest_wait_reports_failure_when_run_exits_nonzero_despite_owner() {
+    if std::env::var_os("PROJECT_ID").is_some() {
+        return;
+    }
+    let ws = tempfile::tempdir().expect("workspace tempdir");
+    let dir = tempfile::tempdir().expect("harness tempdir");
+
+    // 与移交测试同款的匹配 owner（identity 返回本工作区身份）
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind owner");
+    let addr = listener.local_addr().expect("owner addr");
+    let source_root = ws.path().display().to_string();
+    let identity = shared_types::RuntimeIdentityView {
+        application_id: "unknown-app".to_string(),
+        service_family: "userapp-dev".to_string(),
+        workspace_id: source_root.clone(),
+        source_root,
+        runtime_instance_id: "instance-nonzero".to_string(),
+        deployment_generation_id: "gen-nonzero".to_string(),
+        protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+        capabilities: Vec::new(),
+    };
+    let router = axum::Router::new().route(
+        "/v1/runtime/identity",
+        axum::routing::get(move || {
+            let identity = identity.clone();
+            async move {
+                axum::Json(serde_json::json!({
+                    "success": true, "code": "OK", "data": identity, "message": "ok"
+                }))
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, router).await {
+            tracing::warn!(%error, "test owner server terminated");
+        }
+    });
+
+    let config = wait_test_config(
+        &format!("127.0.0.1:{}", addr.port()),
+        &dir.path().join("logs"),
+    );
+    let manager = DevServerManager::new(Arc::new(config));
+    let (pid, supervised) = spawn_dead_run(17).await;
+    let ring: Arc<StderrRing> = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+        STDERR_RING_CAP,
+    )));
+    let outcome = manager
+        .wait_manifest_alive(pid, 1, ws.path(), &supervised, &ring, None)
+        .await;
+    let error = match outcome {
+        Ok(observation) => panic!(
+            "non-zero run exit must be startup failure even with a live owner: {observation:?}"
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("启动失败"),
+        "classified startup failure expected: {error}"
     );
 }
 
@@ -1518,12 +1728,12 @@ async fn manifest_wait_reports_startup_failure_when_run_exits_without_owner() {
     // 探测地址恒拒绝连接（引导失败未留下 serve owner）
     let config = wait_test_config("127.0.0.1:1", &dir.path().join("logs"));
     let manager = DevServerManager::new(Arc::new(config));
-    let pid = spawn_dead_pid().await;
+    let (pid, supervised) = spawn_dead_run(0).await;
     let ring: Arc<StderrRing> = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
         STDERR_RING_CAP,
     )));
     let outcome = manager
-        .wait_manifest_alive(pid, 1, ws.path(), &ring, None)
+        .wait_manifest_alive(pid, 1, ws.path(), &supervised, &ring, None)
         .await;
     let error = match outcome {
         Ok(_) => panic!("bootstrap without owner must be reported as startup failure"),

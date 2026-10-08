@@ -141,3 +141,22 @@ cargo nextest run -p file-server -p file-server-userapp -p http-server -p rcoder
 ```
 
 这些现有测试通过不能反证上述新反例。没有执行完整 root／app-cli nextest、完整 Compose/K8s 容器 E2E、生产 Pingap、部署或发布验收。修复后按影响补原失败反例和组件／容器验证，逐项记录基线、命令、退出码、实际行为与未覆盖平台。
+
+## 2026-10-08 复核与修复结果（第二轮，接手会话）
+
+原始审查记录保持原样（上表与各条证据为第一轮基线）。本轮逐项对照当前源码复核后确认 R1–R8 全部成立，并完成修复；修复要点与正式回归测试（取代一次性 fixture 断言）：
+
+| 编号 | 复核结论 | 修复要点 | 正式回归 |
+|---|---|---|---|
+| R1 | 成立 | journal `orchestration_done` 改为捕获不转发（`dispatch_events.rs`）；终局 Done 在原操作权威终态时恰好一次发出——捕获件与视图终态一致（空失败清单 ⇔ Succeeded）才保留原服务明细，否则按视图合成 | app-cli 单测×3 + `run_source_owner.rs` 真实链路×2（成功路径 done⇔权威终态绑定、恰好一次；Stop 竞争路径单一失败 done） |
+| R2 | 成立 | `ExitPolicy::ConfirmOwner` 以监督退出码为直接证据：run 非零退出即启动失败（stderr 分类），owner 存活不再掩盖（早退分支与宽松收尾双出口） | `manifest_wait_reports_failure_when_run_exits_nonzero_despite_owner`（exit 17 + 匹配 owner 在线 → 失败） |
+| R3 | 成立 | 移交成立后登记转换为外部 owner（`external_owner` 就位，token 空哨兵由停止路径重读）；重复 Start 走 owner 复用链 | `manifest_handover_converts_registration_for_repeat_start`（移交→登记转换→二次 Start 提交 Restart） |
+| R4 | 成立 | `wait_creation_observed` 抽出 `observe_creation_with` 核：单轮 runtime/store 读取钳制到共享 deadline，三个耗尽出口均留 warn 日志；`confirm_owner_handover` 单次探测钳制剩余预算、收尾复验钳制父 deadline | `creation_budget_tests`×4（20ms 预算 vs 80ms 慢读边界、终态短路、正常路径） |
+| R5 | 成立 | `wake_failure_cause` 按 `WakeFailure.stage` 结构化分类：`wake_wait`/`wake_observation`/`wake_follower_wait`（有启动证据）→ Starting；`wake_preflight`/`wake_runtime_probe`/`file_credentials_configuration` → PlatformUnavailable；不解析消息文本 | `timeout_stage_decides_starting_claim` + 映射表测试更新 |
+| R6 | 成立 | 内置页脚本改按服务端注入的 `data-cause` 档位驱动（不解析翻译标题）；固定标签/aria/按钮/复制提示经 `RCODER_UI_*` 占位符按 locale 渲染；白名单与管理面文档同步 | `builtin_page_renders_cause_slug_and_localized_ui_labels`（三语言 data-cause + 标签、默认英文页无中文残留）+ 白名单用例 |
+| R7 | 成立 | `ServiceStartOk` 成功摘要不再被"已观察退出"guard 剥夺（终局判据是 Done，管道字节序下退出通知先到是合法顺序） | `success_done_after_observed_exit_still_succeeds` 扩展：断言任务事件含真实 service_id 的 `event:"log"` 成功摘要 |
+| R8 | 成立 | `wait_alive` 参数收拢为 `AliveWatch`（8 参 → 3 参）；两处 `let _ =` 改显式处理 | `cargo clippy -p file-server --all-targets -- -D warnings` exit 0 |
+
+同轮完成的关联改造（2026-10-08 app 221 预上线事故的转发层加固，方案见会话记录）：dev 转发发送前 TCP 有界预检 `wait_for_dev_service`（对齐 prod `wait_for_prod_service` 语义，默认 20s 可配置），在途 Dev 操作作为失败分级证据（`ERR_OPERATION_IN_PROGRESS`），无证据的不可达分类为 `ERR_CONTAINER_ADDRESS_NOT_READY` + Retry-After + 本地化文案；发送层连接失败不再裸抛 reqwest 原文。e2e `userapp_dev_registry_self_heal_after_restart` 增加窗口不变量断言。
+
+未覆盖项：真实浏览器下的错误页 JS 行为（DOM fixture 与旧模板耦合已失效；Rust 测试覆盖注入契约）；compose 容器级 R2/R3 复验由 e2e 既有 dev 场景回归；K8s 模式未在本轮验证。

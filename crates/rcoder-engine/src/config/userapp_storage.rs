@@ -45,6 +45,10 @@ pub struct UserAppStorageConfig {
     /// 取 min(ensure_timeout_seconds, 本值)。冷启动（空闲回收后重建）实测
     /// 10~13s，默认 30s 覆盖并留余量。
     pub interactive_ensure_wait_seconds: u64,
+    /// dev 转发发送前的 TCP 连接预检预算（对齐 prod `wait_for_prod_service`
+    /// 语义）：覆盖 builder 原地容器重启（实测 ~12s）与全量 pod 重建
+    /// （~18-20s）的不可达窗口；耗尽后按在途证据分级报错而非裸连接错误。
+    pub dev_forward_connect_wait_seconds: u64,
 }
 
 impl Default for UserAppStorageConfig {
@@ -55,6 +59,7 @@ impl Default for UserAppStorageConfig {
             postgres: None,
             ensure_timeout_seconds: 90,
             interactive_ensure_wait_seconds: 30,
+            dev_forward_connect_wait_seconds: 20,
         }
     }
 }

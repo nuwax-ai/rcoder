@@ -396,11 +396,25 @@ async fn forward_to_addr(
     let upstream = match outbound.send().await {
         Ok(resp) => resp,
         Err(e) => {
+            // 完整原始错误（含目标地址）只进日志；对用户分类呈现——
+            // 连接建立失败（请求未送达，无副作用）→ 地址未就绪 + Retry-After；
+            // 其余（超时/中途断开）→ 净化后的通用文案，不泄露内部拓扑。
             warn!(
                 "[USERAPP_FORWARD] upstream request failed: app_id={app_id}, target={target}: {e:?}"
             );
+            // 分类仅限 dev 路径（dev 有重启窗口语义与专属文案；prod 的
+            // 连接失败由唤醒层分类，这里保持通用 502）。
+            let locale = shared_types::current_request_locale();
+            if e.is_connect() && target_label == "dev" {
+                return HttpResultError::unavailable_with_code(
+                    shared_types::error_codes::ERR_CONTAINER_ADDRESS_NOT_READY,
+                    shared_types::t("error.dev_container_unreachable", locale),
+                    10,
+                )
+                .into_response();
+            }
             return HttpResultError::bad_gateway(format!(
-                "{target_label} container request failed: {e}"
+                "{target_label} container request failed before a response was received"
             ))
             .into_response();
         }
@@ -450,6 +464,9 @@ pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request)
     ) {
         return match super::semantics::existing_dev_addr(state, app_id).await {
             Ok(Some(addr)) => {
+                if let Err(error) = wait_for_dev_service(state, app_id, &addr).await {
+                    return super::error_body::reject(req, error.into_response()).await;
+                }
                 forward_to_configured_addr(
                     state,
                     shared_types::UserappStage::Dev,
@@ -476,6 +493,9 @@ pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request)
         Ok(addr) => addr,
         Err(resp) => return super::error_body::reject(req, *resp).await,
     };
+    if let Err(error) = wait_for_dev_service(state, app_id, &addr).await {
+        return super::error_body::reject(req, error.into_response()).await;
+    }
     forward_to_configured_addr(
         state,
         shared_types::UserappStage::Dev,
@@ -487,6 +507,113 @@ pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request)
             + std::time::Duration::from_secs(state.config.userapp_storage.ensure_timeout_seconds),
     )
     .await
+}
+
+/// dev 转发发送前的 TCP 连接预检（对齐 prod [`Self::wait_for_prod_service`]
+/// 的语义与安全论证：请求 body 是单次流，连接失败不重放——在把 body 移入
+/// reqwest 之前确认真实 Service 路径可连接）。覆盖 builder 原地容器重启
+/// （svc 无就绪 endpoint 的 ~12s 窗口）与全量 pod 重建窗口；等待期间读取
+/// 在途 Dev 操作作为失败分级证据：
+/// - 预算内连上 → `Ok`（后续真实请求可能因残余竞态失败，由
+///   [`forward_to_addr`] 的分类出口兜底）；
+/// - 预算耗尽 + 有在途 Dev 操作 → `ERR_OPERATION_IN_PROGRESS`（带
+///   operation_id——语义"重启/停止进行中"，与 keepalive ensure 同构）；
+/// - 预算耗尽 + 无在途 → `ERR_CONTAINER_ADDRESS_NOT_READY` + Retry-After
+///   （本地化文案，不再裸抛 reqwest 连接错误）。
+async fn wait_for_dev_service(
+    state: &AppState,
+    app_id: &str,
+    addr: &str,
+) -> Result<(), HttpResultError> {
+    const CONNECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+    let budget = std::time::Duration::from_secs(
+        state
+            .config
+            .userapp_storage
+            .dev_forward_connect_wait_seconds
+            .max(1),
+    );
+    let deadline = tokio::time::Instant::now() + budget;
+    let uri = addr.parse::<reqwest::Url>().map_err(|error| {
+        HttpResultError::bad_gateway(format!("Invalid dev container address: {error}"))
+    })?;
+    let host = uri
+        .host_str()
+        .ok_or_else(|| HttpResultError::bad_gateway("Dev container address has no host"))?;
+    let port = uri
+        .port_or_known_default()
+        .ok_or_else(|| HttpResultError::bad_gateway("Dev container address has no port"))?;
+    let mut inflight: Option<shared_types::UserAppOperationView> = None;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        if tcp_connect_once_within(host, port, deadline).await {
+            return Ok(());
+        }
+        if inflight.is_none() {
+            // 在途证据读取同样受预算钳制（不因慢查询越过观察边界）。
+            if let Ok(operations) =
+                tokio::time::timeout_at(deadline, state.app_service.get_current_operations(app_id))
+                    .await
+            {
+                inflight = operations.ok().and_then(|operations| {
+                    operations.into_iter().find(|operation| {
+                        operation.scope == shared_types::UserAppOperationScope::Dev
+                            && !operation.state.is_terminal()
+                    })
+                });
+            }
+        }
+        tokio::time::sleep(
+            CONNECT_RETRY_DELAY
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+        )
+        .await;
+    }
+    let locale = shared_types::current_request_locale();
+    if let Some(operation) = inflight {
+        warn!(
+            app_id,
+            operation_id = %operation.operation_id,
+            kind = ?operation.kind,
+            "dev container unreachable while a Dev-scope operation is in flight"
+        );
+        return Err(HttpResultError::from_app_error(
+            shared_types::AppError::with_message(
+                shared_types::error_codes::ERR_OPERATION_IN_PROGRESS,
+                shared_types::get_error_message(
+                    shared_types::error_codes::ERR_OPERATION_IN_PROGRESS,
+                    locale,
+                ),
+            )
+            .with_operation_id(operation.operation_id),
+        ));
+    }
+    warn!(
+        app_id,
+        "dev container service path unreachable within the connect-wait budget"
+    );
+    Err(HttpResultError::unavailable_with_code(
+        shared_types::error_codes::ERR_CONTAINER_ADDRESS_NOT_READY,
+        shared_types::t("error.dev_container_unreachable", locale),
+        10,
+    ))
+}
+
+/// 单次 TCP 连接尝试（2s 单次上限，钳制到剩余 deadline）——连接失败/
+/// 超时一律 false，由调用方决定重试节奏（与 prod 预检同款常量）。
+async fn tcp_connect_once_within(host: &str, port: u16, deadline: tokio::time::Instant) -> bool {
+    const CONNECT_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let attempt_deadline = (tokio::time::Instant::now() + CONNECT_ATTEMPT_TIMEOUT).min(deadline);
+    matches!(
+        tokio::time::timeout_at(
+            attempt_deadline,
+            tokio::net::TcpStream::connect((host, port))
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 /// 全量透传一个请求到该 app 生产运行容器的 file-server-proxy（同 path+query）。
@@ -809,6 +936,78 @@ mod implementation_file_boundary_baseline_tests {
             response.status(),
             StatusCode::OK,
             "the file peer must not receive the primary RCoder control key"
+        );
+    }
+
+    /// 事故反例回归（2026-10-08 app 221）：builder 重启窗口内连接失败——
+    /// 不得把裸 reqwest 错误（含集群内部 svc 地址）直通用户；连接类失败
+    /// 分类为 ERR_CONTAINER_ADDRESS_NOT_READY + Retry-After + 本地化文案。
+    #[tokio::test]
+    async fn dev_forward_connect_failure_is_classified_not_raw() {
+        // 绑定后立即释放：拿到一个几乎必然拒绝连接的端口。
+        let address = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let request = Request::builder()
+            .uri("/api/v1/userapp/dev/restart")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let response = forward_to_addr(
+            "dev",
+            "fixture-221",
+            &format!("http://{address}"),
+            &shared_types::FileServerRequestCredentials::default(),
+            request,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            Some("10")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["code"],
+            shared_types::error_codes::ERR_CONTAINER_ADDRESS_NOT_READY
+        );
+        let message = payload["message"].as_str().unwrap_or_default();
+        assert!(
+            !message.contains("error sending request")
+                && !message.contains("http://")
+                && !message.is_empty(),
+            "连接失败文案必须分类净化（非空、无 reqwest 原文/内部地址）: {message}"
+        );
+    }
+
+    /// 预检核：端口可连立即 true；不可连在 deadline 内 false（供
+    /// wait_for_dev_service 的循环复用语义）。
+    #[tokio::test]
+    async fn tcp_connect_once_within_bounds() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            // 保持监听存活即可；连接由对端建立后立即结束测试。
+            while let Ok((_socket, _)) = listener.accept().await {}
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        assert!(tcp_connect_once_within("127.0.0.1", address.port(), deadline).await);
+
+        let refused = {
+            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            probe.local_addr().unwrap()
+        };
+        let tight_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+        assert!(
+            !tcp_connect_once_within("127.0.0.1", refused.port(), tight_deadline).await,
+            "拒绝连接的端口在紧预算内应返回 false"
         );
     }
 }

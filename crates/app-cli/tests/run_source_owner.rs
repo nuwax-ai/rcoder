@@ -1160,3 +1160,260 @@ async fn guarded_migration_spawn_failure_still_starts_actual_http_and_commits_or
     fixture.operation(&client, &base, &identity, "stop").await;
     fixture.same_owner(&client, &base, &identity, &native).await;
 }
+
+/// 慢启动 manifest：run 命令先 sleep 再起真实 HTTP，拉长原操作的
+/// 非终态窗口，供终局时序断言与 Stop 竞争使用。
+impl Fixture {
+    fn slow_manifests(&self, marker: &str, delay_secs: u64) {
+        std::fs::write(
+            self.source.join("workspace.manifest.toml"),
+            "schema_version=1\n[workspace]\nname='run-source-owner'\n",
+        )
+        .unwrap();
+        let command = toml::Value::Array(
+            [
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "sleep {delay_secs} && exec {} http {marker}",
+                    env!("CARGO_BIN_EXE_tree-fixture")
+                ),
+            ]
+            .into_iter()
+            .map(toml::Value::String)
+            .collect(),
+        );
+        std::fs::write(
+            self.source.join("web/project.manifest.toml"),
+            format!(
+                "schema_version=1\n[project]\nservice_id={:?}\nname='slow start fixture'\ntype='rust'\n[build]\ncommand=['true']\nartifact='unused.zip'\n[run]\ncommand={command}\nshutdown_timeout_seconds=3\n[devrun]\ncommand={command}\n[health]\nstartup_timeout_seconds=30\nreadiness_path='/'\n[proxy]\npath='/'\n",
+                self.app
+            ),
+        )
+        .unwrap();
+    }
+
+    /// spawn run 客户端并捕获 stdout 的 EVT 行（跨线程 channel 回传解析后
+    /// 的 JSON 事件；非 EVT 行忽略）。
+    fn spawn_run_piped(&mut self, log: &str) -> std::sync::mpsc::Receiver<Value> {
+        use std::io::{BufRead, BufReader};
+        let mut child = self
+            .command("run", log)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (events_tx, events_rx) = std::sync::mpsc::channel::<Value>();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                // wire 契约字面量（与 shared_types::APP_CLI_EVT_PREFIX 一致）。
+                let Some(payload) = line.strip_prefix("APP-CLI-EVT ") else {
+                    continue;
+                };
+                if let Ok(event) = serde_json::from_str::<Value>(payload) {
+                    let _ = events_tx.send(event);
+                }
+            }
+        });
+        self.clients.push(child);
+        events_rx
+    }
+}
+
+/// 等待 owner 出现非终态活跃操作并返回其 id（run 客户端提交的 Start）。
+async fn await_active_operation(fixture: &Fixture, client: &reqwest::Client, base: &str) -> String {
+    let until = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(response) = client.get(format!("{base}/v1/runtime/status")).send().await
+            && let Ok(body) = response.json::<Value>().await
+            && let Some(id) = body["data"]["active_operation_id"].as_str()
+        {
+            return id.to_string();
+        }
+        assert!(
+            tokio::time::Instant::now() < until,
+            "active start operation missing: {}",
+            fixture.diagnostics()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn operation_view(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    operation_id: &str,
+) -> Value {
+    client
+        .get(format!("{base}/v1/runtime/operations/{operation_id}"))
+        .header("X-Deploy-Token", token.trim())
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["data"]
+        .clone()
+}
+
+/// R1 回归：客户端 stdout 的 orchestration_done 绑定原操作的权威终态——
+/// done 出现的那一刻，捕获操作必须已终态成功；整条 stdout 终局恰好一次，
+/// 客户端 0 退出。（缺陷形态：journal done 早于提交屏障转发，操作随后可被
+/// Stop 取消而消费者已按成功收场。）
+#[tokio::test]
+async fn run_client_done_follows_authoritative_operation_result() {
+    let mut fixture = Fixture::new();
+    assert!(
+        fixture
+            .command("gen-lock", "gen-lock")
+            .status()
+            .unwrap()
+            .success(),
+        "{}",
+        fixture.diagnostics()
+    );
+    fixture.slow_manifests("done-authority", 3);
+    let events = fixture.spawn_run_piped("done-authority");
+    let client = client();
+    let (base, identity, _native) = fixture.ready(&client).await;
+    let token = std::fs::read_to_string(fixture.state.join("token")).unwrap();
+    let operation_id = await_active_operation(&fixture, &client, &base).await;
+
+    let mut dones_seen = 0usize;
+    let exit = {
+        let until = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            while let Ok(event) = events.try_recv() {
+                if event["event"] == "orchestration_done" {
+                    dones_seen += 1;
+                    assert_eq!(dones_seen, 1, "终局恰好一次: {}", fixture.diagnostics());
+                    assert!(
+                        event["failed"]
+                            .as_array()
+                            .is_some_and(|failed| failed.is_empty()),
+                        "成功终局不得带失败清单: {event}"
+                    );
+                    let view = operation_view(&client, &base, &token, &operation_id).await;
+                    assert_eq!(
+                        view["state"], "succeeded",
+                        "done 必须跟随原操作的权威终态: {view}"
+                    );
+                }
+            }
+            if let Some(exit) = fixture.clients.last_mut().unwrap().try_wait().unwrap() {
+                break exit;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "client exceeded budget: {}",
+                fixture.diagnostics()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    // 进程退出后的管道残余事件同样计入终局计数。
+    while let Ok(event) = events.try_recv() {
+        if event["event"] == "orchestration_done" {
+            dones_seen += 1;
+        }
+    }
+    assert_eq!(dones_seen, 1, "整条 stdout 恰好一个终局 done");
+    assert!(exit.success(), "client exit: {exit}");
+    let view = operation_view(&client, &base, &token, &operation_id).await;
+    assert_eq!(view["state"], "succeeded");
+    fixture.operation(&client, &base, &identity, "stop").await;
+}
+
+/// R1 反例回归：Stop 在原操作仍在途时受理——终局 done 必须单一且带失败
+/// 清单，原操作终态非 succeeded；Stop 受理前不得已出现过任何 done。
+#[tokio::test]
+async fn stop_before_commit_yields_single_failure_done() {
+    let mut fixture = Fixture::new();
+    assert!(
+        fixture
+            .command("gen-lock", "gen-lock")
+            .status()
+            .unwrap()
+            .success(),
+        "{}",
+        fixture.diagnostics()
+    );
+    fixture.slow_manifests("stop-race", 8);
+    let events = fixture.spawn_run_piped("stop-race");
+    let client = client();
+    let (base, identity, native) = fixture.ready(&client).await;
+    let token = std::fs::read_to_string(fixture.state.join("token")).unwrap();
+    let operation_id = await_active_operation(&fixture, &client, &base).await;
+
+    // Stop 受理前不允许已经出现终局 done（缺陷形态会提前转发空清单 done）。
+    let mut dones_before_stop = 0usize;
+    while let Ok(event) = events.try_recv() {
+        if event["event"] == "orchestration_done" {
+            dones_before_stop += 1;
+        }
+    }
+    assert_eq!(dones_before_stop, 0, "在途操作不得先输出终局 done");
+
+    fixture.operation(&client, &base, &identity, "stop").await;
+    let until = tokio::time::Instant::now() + Duration::from_secs(30);
+    let final_view = loop {
+        let view = operation_view(&client, &base, &token, &operation_id).await;
+        if matches!(
+            view["state"].as_str(),
+            Some("succeeded" | "failed" | "cancelled" | "recovery_required")
+        ) {
+            break view;
+        }
+        assert!(
+            tokio::time::Instant::now() < until,
+            "original operation did not settle: {view}"
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    };
+    assert_ne!(
+        final_view["state"], "succeeded",
+        "被 Stop 取消的原操作不得计成功: {final_view}"
+    );
+
+    let until = tokio::time::Instant::now() + Duration::from_secs(45);
+    let exit = loop {
+        if let Some(exit) = fixture.clients.last_mut().unwrap().try_wait().unwrap() {
+            break exit;
+        }
+        assert!(
+            tokio::time::Instant::now() < until,
+            "client exceeded budget: {}",
+            fixture.diagnostics()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let mut dones: Vec<Value> = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if event["event"] == "orchestration_done" {
+            dones.push(event);
+        }
+    }
+    assert_eq!(
+        dones.len(),
+        1,
+        "终局恰好一次（实得 {dones:?}）: {}",
+        fixture.diagnostics()
+    );
+    assert!(
+        dones[0]["failed"]
+            .as_array()
+            .is_some_and(|failed| !failed.is_empty()),
+        "取消终局必须携带失败清单: {:?}",
+        dones[0]
+    );
+    // 退出码按终态契约（Cancelled=被取代语义为 0；其余失败态非零）——
+    // 这里只要求与 done 的失败语义不矛盾：记录即可，不强断言。
+    println!(
+        "stop-race client exit: {exit}, original state: {}",
+        final_view["state"]
+    );
+    fixture.same_owner(&client, &base, &identity, &native).await;
+}

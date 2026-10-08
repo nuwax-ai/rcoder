@@ -142,59 +142,66 @@
 </style>
 </head>
 <body>
-<main class="card">
+<main class="card" data-cause="{{RCODER_CAUSE}}">
   <span class="badge"><span class="dot" aria-hidden="true"></span>HTTP {{RCODER_STATUS}}</span>
   <h1>{{RCODER_TITLE}}</h1>
   <p class="sub">{{RCODER_MESSAGE}}</p>
-  <div class="chain" role="img" aria-label="链路诊断：浏览器与网关正常，应用服务当前不可用">
+  <div class="chain" role="img" aria-label="{{RCODER_UI_ARIA}}">
     <div class="node ok">
       <span class="ring" aria-hidden="true">✓</span>
-      <span class="name">浏览器</span><span class="state">已连接</span>
+      <span class="name">{{RCODER_UI_BROWSER}}</span><span class="state">{{RCODER_UI_CONNECTED}}</span>
     </div>
     <span class="link" aria-hidden="true"></span>
     <div class="node ok">
       <span class="ring" aria-hidden="true">✓</span>
-      <span class="name">网关</span><span class="state">正常</span>
+      <span class="name">{{RCODER_UI_GATEWAY}}</span><span class="state">{{RCODER_UI_NORMAL}}</span>
     </div>
     <span class="link bad" id="link-app" aria-hidden="true"></span>
-    <div class="node bad" id="node-app">
+    <div class="node bad" id="node-app"
+         data-i18n-starting="{{RCODER_UI_STARTING}}"
+         data-i18n-stopped="{{RCODER_UI_STOPPED}}"
+         data-i18n-failed="{{RCODER_UI_FAILED}}">
       <span class="ring" id="node-app-glyph" aria-hidden="true">✕</span>
-      <span class="name">应用服务</span><span class="state" id="node-app-state">不可用</span>
+      <span class="name">{{RCODER_UI_APP}}</span><span class="state" id="node-app-state">{{RCODER_UI_UNAVAILABLE}}</span>
     </div>
   </div>
   <div class="actions">
-    <button class="primary" type="button" onclick="location.reload()">重新访问</button>
+    <button class="primary" type="button" onclick="location.reload()">{{RCODER_UI_RELOAD}}</button>
   </div>
   <footer>
-    <span class="hint">反馈问题时请附上此编号，便于定位本次请求</span>
-    <span class="diag" onclick="copyDiag(this)" role="button" tabindex="0">
-      <span class="id">{{RCODER_DIAGNOSTIC_ID}}</span><span class="copy">复制</span>
+    <span class="hint">{{RCODER_UI_HINT}}</span>
+    <span class="diag" onclick="copyDiag(this)" role="button" tabindex="0"
+          data-i18n-copy="{{RCODER_UI_COPY}}" data-i18n-copied="{{RCODER_UI_COPIED}}">
+      <span class="id">{{RCODER_DIAGNOSTIC_ID}}</span><span class="copy">{{RCODER_UI_COPY}}</span>
     </span>
   </footer>
 </main>
 <script>
-// 链路第三节点按失败原因呈现（原因由标题文案承载——四种固定文案）：
-// 启动中 → 琥珀色加载环；已停止 → 灰色暂停条；启动失败/不可用 → 红✕脉冲。
-// 无 JS 或未命中时保持默认红✕不可用（通用兜底）。
+// 链路第三节点按结构化失败档位呈现（R6：档位由服务端注入 data-cause，
+// 不解析翻译后的标题文案——三语言下状态判断一致）：
+// starting → 琥珀色加载环；stopped → 灰色暂停条；failed → 红✕ + 失败文案；
+// 其余档位/未知/无 JS 保持默认红✕不可用（通用兜底）。状态文案从节点
+// data-i18n-* 属性读取（服务端按 locale 渲染）。
 (function () {
-  var title = '';
-  try { title = document.querySelector('h1').textContent || ''; } catch (e) {}
+  var card = document.querySelector('main.card');
+  var cause = (card && card.getAttribute('data-cause')) || '';
   var node = document.getElementById('node-app');
   var glyph = document.getElementById('node-app-glyph');
   var state = document.getElementById('node-app-state');
   var link = document.getElementById('link-app');
-  if (title.indexOf('正在启动') !== -1) {
+  if (!node || !glyph || !state) { return; }
+  if (cause === 'starting') {
     node.className = 'node warn';
     glyph.innerHTML = '<span class="spin"></span>';
-    state.textContent = '启动中';
-    link.className = 'link warn';
-  } else if (title.indexOf('已停止') !== -1) {
+    state.textContent = node.getAttribute('data-i18n-starting') || '';
+    if (link) { link.className = 'link warn'; }
+  } else if (cause === 'stopped') {
     node.className = 'node idle';
     glyph.innerHTML = '<span class="bar"></span>';
-    state.textContent = '已停止';
-    link.className = 'link';
-  } else if (title.indexOf('启动失败') !== -1) {
-    state.textContent = '启动失败';
+    state.textContent = node.getAttribute('data-i18n-stopped') || '';
+    if (link) { link.className = 'link'; }
+  } else if (cause === 'failed') {
+    state.textContent = node.getAttribute('data-i18n-failed') || '';
   }
 })();
 function copyDiag(chip) {
@@ -202,8 +209,10 @@ function copyDiag(chip) {
   var label = chip.querySelector('.copy');
   if (navigator.clipboard) {
     navigator.clipboard.writeText(text).then(function () {
-      label.textContent = '已复制';
-      setTimeout(function () { label.textContent = '复制'; }, 1200);
+      label.textContent = chip.getAttribute('data-i18n-copied') || '';
+      setTimeout(function () {
+        label.textContent = chip.getAttribute('data-i18n-copy') || '';
+      }, 1200);
     });
   }
 }

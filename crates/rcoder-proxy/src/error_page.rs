@@ -38,6 +38,44 @@ pub const VAR_DIAGNOSTIC_ID: &str = "{{RCODER_DIAGNOSTIC_ID}}";
 pub const VAR_STATUS: &str = "{{RCODER_STATUS}}";
 /// `<html lang>` 用语言标记（如 zh-CN）；自定义页未包含该占位符则不受影响。
 pub const VAR_LANG: &str = "{{RCODER_LANG}}";
+/// 结构化失败档位 slug（如 starting/stopped/platform_unavailable）——内置
+/// 页脚本按它驱动 UI 状态（R6：不再解析翻译标题文案）；自定义页可选。
+pub const VAR_CAUSE: &str = "{{RCODER_CAUSE}}";
+/// 内置页固定标签的本地化占位符（键名与 userapp_error_page.ui.* 对应；
+/// 渲染时按 locale 注入，自定义页不强制包含）。
+pub const VAR_UI_BROWSER: &str = "{{RCODER_UI_BROWSER}}";
+pub const VAR_UI_CONNECTED: &str = "{{RCODER_UI_CONNECTED}}";
+pub const VAR_UI_GATEWAY: &str = "{{RCODER_UI_GATEWAY}}";
+pub const VAR_UI_NORMAL: &str = "{{RCODER_UI_NORMAL}}";
+pub const VAR_UI_APP: &str = "{{RCODER_UI_APP}}";
+pub const VAR_UI_UNAVAILABLE: &str = "{{RCODER_UI_UNAVAILABLE}}";
+pub const VAR_UI_STARTING: &str = "{{RCODER_UI_STARTING}}";
+pub const VAR_UI_STOPPED: &str = "{{RCODER_UI_STOPPED}}";
+pub const VAR_UI_FAILED: &str = "{{RCODER_UI_FAILED}}";
+pub const VAR_UI_RELOAD: &str = "{{RCODER_UI_RELOAD}}";
+pub const VAR_UI_HINT: &str = "{{RCODER_UI_HINT}}";
+pub const VAR_UI_COPY: &str = "{{RCODER_UI_COPY}}";
+pub const VAR_UI_COPIED: &str = "{{RCODER_UI_COPIED}}";
+pub const VAR_UI_ARIA: &str = "{{RCODER_UI_ARIA}}";
+
+/// UI 标签占位符 → i18n key（userapp_error_page.ui.<key>；渲染期按 locale
+/// 注入——固定文案跟随页面语言，脚本状态文案不再依赖标题子串）。
+const UI_LABELS: [(&str, &str); 14] = [
+    (VAR_UI_BROWSER, "browser"),
+    (VAR_UI_CONNECTED, "connected"),
+    (VAR_UI_GATEWAY, "gateway"),
+    (VAR_UI_NORMAL, "normal"),
+    (VAR_UI_APP, "app_service"),
+    (VAR_UI_UNAVAILABLE, "unavailable"),
+    (VAR_UI_STARTING, "starting"),
+    (VAR_UI_STOPPED, "stopped"),
+    (VAR_UI_FAILED, "failed"),
+    (VAR_UI_RELOAD, "reload"),
+    (VAR_UI_HINT, "hint"),
+    (VAR_UI_COPY, "copy"),
+    (VAR_UI_COPIED, "copied"),
+    (VAR_UI_ARIA, "aria_chain"),
+];
 
 /// 外部页快照（存储/加载器发布；内容不可变，热路径零 IO）。
 #[derive(Debug, Clone)]
@@ -87,12 +125,17 @@ impl ErrorPageRenderer {
     /// 渲染（变量全部 HTML 转义；未知占位符不解析——上传侧已校验拒绝）。
     pub fn render(&self, vars: &ErrorPageVars, locale: &str) -> Vec<u8> {
         let template = self.template();
-        let rendered = template
+        let mut rendered = template
             .replace(VAR_TITLE, &html_escape(&vars.title))
             .replace(VAR_MESSAGE, &html_escape(&vars.message))
             .replace(VAR_DIAGNOSTIC_ID, &html_escape(&vars.diagnostic_id))
             .replace(VAR_STATUS, &html_escape(&vars.status))
-            .replace(VAR_LANG, &html_escape(locale));
+            .replace(VAR_LANG, &html_escape(locale))
+            .replace(VAR_CAUSE, &html_escape(&vars.cause_slug));
+        for (placeholder, key) in UI_LABELS {
+            let text = shared_types::t(&format!("userapp_error_page.ui.{key}"), locale);
+            rendered = rendered.replace(placeholder, &html_escape(&text));
+        }
         rendered.into_bytes()
     }
 }
@@ -105,6 +148,9 @@ pub struct ErrorPageVars {
     pub message: String,
     pub diagnostic_id: String,
     pub status: String,
+    /// 失败档位 slug（[`crate::error_page::ErrorPageCause::i18n_slug`]）；
+    /// 空串 = 未分类（generic 兜底）。
+    pub cause_slug: String,
 }
 
 /// 失败原因分类（决定文案；确定性上下文才用确定档，证据不足一律通用文案）。
@@ -128,6 +174,11 @@ pub enum ErrorPageCause {
     OutcomeUnknown,
     /// 连接失败/状态未知：不凭连接拒绝宣称"正在启动"
     Generic,
+}
+
+/// 档位 slug（对外：[`ErrorPageVars::cause_slug`] 注入用）。
+pub fn cause_slug(cause: ErrorPageCause) -> &'static str {
+    cause.i18n_slug()
 }
 
 impl ErrorPageCause {
@@ -157,10 +208,24 @@ impl ErrorPageCause {
     }
 }
 
-/// 唤醒失败错误码 → 失败页文案档位。分组与 `status_from_code` 的状态码
+/// ERR_RUNTIME_TIMEOUT 的 Starting 判据（R5）：stage 属于"已捕获启动执行
+/// 的等待段"才宣称正在启动——派发后连接等待（wake_wait）、受理后观察
+/// （wake_observation，携带 operation_id）、跟随者等待 Leader 唤醒
+/// （wake_follower_wait）。前置查询/身份读取/配置读取超时
+/// （wake_preflight/wake_runtime_probe/file_credentials_configuration）
+/// 没有任何启动证据，不得报"正在启动"。
+fn timeout_stage_indicates_starting(stage: &str) -> bool {
+    matches!(
+        stage,
+        "wake_wait" | "wake_observation" | "wake_follower_wait"
+    )
+}
+
+/// 唤醒失败 → 失败页文案档位。分组与 `status_from_code` 的状态码
 /// 分组对齐（文案档位与真实状态码一致）；错误码来自持久准入链，是终局
-/// 证据——映射出的档位不再被就绪观察改写。
-pub fn wake_failure_cause(code: &str) -> ErrorPageCause {
+/// 证据——映射出的档位不再被就绪观察改写。超时类按结构化 stage 分类
+/// （见 [`timeout_stage_indicates_starting`]），不解析消息文本。
+pub fn wake_failure_cause(failure: &shared_types::WakeFailure) -> ErrorPageCause {
     use shared_types::{
         ERR_APP_NOT_FOUND, ERR_CONFLICT, ERR_CONTAINER_ADDRESS_NOT_READY, ERR_CONTAINER_NOT_FOUND,
         ERR_CONTAINER_START_FAILED, ERR_DATABASE_NOT_READY, ERR_IMAGE_PULL_FAILED,
@@ -168,16 +233,22 @@ pub fn wake_failure_cause(code: &str) -> ErrorPageCause {
         ERR_RECOVERY_REQUIRED, ERR_RESOURCE_EXHAUSTED, ERR_RUNTIME_TIMEOUT,
         ERR_RUNTIME_UNAVAILABLE, ERR_SERVICE_UNAVAILABLE, ERR_USERAPP_WAIT_TIMEOUT,
     };
-    match code {
+    match failure.code.as_ref() {
         ERR_APP_NOT_FOUND | ERR_CONTAINER_NOT_FOUND => ErrorPageCause::Missing,
         ERR_CONFLICT | ERR_OPERATION_IN_PROGRESS => ErrorPageCause::Blocked,
         ERR_RECOVERY_REQUIRED => ErrorPageCause::RecoveryRequired,
         ERR_IMAGE_PULL_FAILED | ERR_CONTAINER_START_FAILED => ErrorPageCause::Failed,
-        ERR_RUNTIME_TIMEOUT | ERR_USERAPP_WAIT_TIMEOUT => {
-            // 唤醒 deadline 超时是确定性上下文：请求确实在等启动（可重试，
-            // 状态码 504 + Retry-After），不凭连接失败猜测
+        ERR_RUNTIME_TIMEOUT if timeout_stage_indicates_starting(&failure.stage) => {
+            // 请求确实在等一次已捕获的启动执行（可重试，504 + Retry-After），
+            // 不凭连接失败猜测
             ErrorPageCause::Starting
         }
+        ERR_RUNTIME_TIMEOUT => {
+            // 无启动证据的超时（前置查询/身份/配置读取）：平台侧观察失败，
+            // 非应用正在启动
+            ErrorPageCause::PlatformUnavailable
+        }
+        ERR_USERAPP_WAIT_TIMEOUT => ErrorPageCause::Starting,
         ERR_RUNTIME_UNAVAILABLE
         | ERR_SERVICE_UNAVAILABLE
         | ERR_DATABASE_NOT_READY
@@ -486,6 +557,7 @@ async fn write_error_response_inner(
                 message,
                 diagnostic_id: diagnostic_id.clone(),
                 status: status.to_string(),
+                cause_slug: cause.i18n_slug().to_string(),
             };
             ("text/html; charset=utf-8", renderer.render(&vars, locale))
         }
@@ -605,6 +677,45 @@ mod tests {
         ]
     }
 
+    /// R6：内置页按结构化档位驱动 UI——data-cause 注入档位 slug；固定
+    /// 标签按 locale 渲染（默认英文页不再是中文标签；脚本不再解析标题）。
+    #[test]
+    fn builtin_page_renders_cause_slug_and_localized_ui_labels() {
+        let renderer = renderer();
+        let vars = ErrorPageVars {
+            title: "t".into(),
+            message: "m".into(),
+            diagnostic_id: "d".into(),
+            status: "503".into(),
+            cause_slug: "starting".into(),
+        };
+        let zh = String::from_utf8(renderer.render(&vars, "zh-CN")).unwrap();
+        assert!(
+            zh.contains("data-cause=\"starting\""),
+            "data-cause 必须携带档位 slug（脚本据此分支）"
+        );
+        assert!(zh.contains(">重新访问</button>"));
+        assert!(zh.contains("链路诊断"));
+
+        // 默认英文页：固定标签与 aria 全英文，无中文残留；档位标签三语一致结构。
+        let en = String::from_utf8(renderer.render(&vars, shared_types::DEFAULT_LOCALE)).unwrap();
+        assert!(en.contains("data-cause=\"starting\""));
+        assert!(en.contains(">Reload</button>"), "英文按钮文案: {en}");
+        assert!(en.contains(">Browser</span>"));
+        assert!(en.contains("Path diagnostics"));
+        assert!(
+            !en.contains(">重新访问<")
+                && !en.contains(">浏览器<")
+                && !en.contains(">复制<")
+                && !en.contains(">已连接<"),
+            "默认英文页不得残留中文固定标签（可见文本）"
+        );
+
+        let tw = String::from_utf8(renderer.render(&vars, "zh-TW")).unwrap();
+        assert!(tw.contains(">重新存取</button>"));
+        assert!(tw.contains("data-cause=\"starting\""));
+    }
+
     #[test]
     fn builtin_page_renders_all_variables_escaped() {
         let vars = ErrorPageVars {
@@ -612,6 +723,7 @@ mod tests {
             message: "请稍后 & 重试".into(),
             diagnostic_id: "abc123".into(),
             status: "503".into(),
+            cause_slug: "starting".into(),
         };
         let rendered = String::from_utf8(renderer().render(&vars, "zh-CN")).unwrap();
         assert!(rendered.contains("应用&lt;启动&gt;"));
@@ -758,7 +870,48 @@ mod tests {
             ),
         ];
         for (code, expected) in cases {
-            assert_eq!(wake_failure_cause(code), expected, "code {code}");
+            let failure =
+                shared_types::WakeFailure::new(code, "wake_wait", "mapping-table fixture");
+            assert_eq!(
+                wake_failure_cause(&failure),
+                expected,
+                "code {code} (stage wake_wait)"
+            );
+        }
+    }
+
+    /// R5 反例回归：前置查询/探测/配置读取的超时没有启动证据——按 stage
+    /// 分类，不显示"正在启动"；有启动证据的等待段保持 Starting。
+    #[test]
+    fn timeout_stage_decides_starting_claim() {
+        let pre_stages = [
+            "wake_preflight",
+            "wake_runtime_probe",
+            "file_credentials_configuration",
+        ];
+        for stage in pre_stages {
+            let failure = shared_types::WakeFailure::new(
+                shared_types::ERR_RUNTIME_TIMEOUT,
+                stage,
+                "preflight timeout",
+            );
+            assert_eq!(
+                wake_failure_cause(&failure),
+                ErrorPageCause::PlatformUnavailable,
+                "前置超时 stage={stage} 不得宣称正在启动"
+            );
+        }
+        for stage in ["wake_wait", "wake_observation", "wake_follower_wait"] {
+            let failure = shared_types::WakeFailure::new(
+                shared_types::ERR_RUNTIME_TIMEOUT,
+                stage,
+                "post-dispatch wait",
+            );
+            assert_eq!(
+                wake_failure_cause(&failure),
+                ErrorPageCause::Starting,
+                "有启动证据的等待段 stage={stage} 应为 Starting"
+            );
         }
     }
 

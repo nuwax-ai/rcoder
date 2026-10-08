@@ -588,6 +588,9 @@ async fn dispatch_to_owner_inner(
     // Fetch the authoritative view before trusting its instance, kind or outcome.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
     let mut event_cursor: u64 = 0;
+    // R1：journal done 的持留捕获——原操作终态确认后经一致性校验才发出，
+    // 终局绑定权威视图、恰好一次。
+    let mut held_done: Option<serde_json::Value> = None;
     loop {
         let poll = async {
             let body: serde_json::Value = client
@@ -615,23 +618,27 @@ async fn dispatch_to_owner_inner(
         );
         // run 客户端是 file-server 管道的流端点（spawn 路径 stdout 是唯一
         // 通道）：serve 内编排产生的事件经 journal 读出后重新呈现在客户端
-        // stdout 上（转发是尽力而为——读不到不阻塞观察）。serve 的
-        // orchestration_done 是单一权威终局信号，客户端转发它、不重复合成；
-        // 仅当终局前未转发到任何 done（如取消路径未入事件流）才兜底合成。
-        let done_forwarded = super::dispatch_events::forward_operation_events(
+        // stdout 上（转发是尽力而为——读不到不阻塞观察）。journal 的
+        // orchestration_done 早于操作状态机提交终局，只捕获不转发；
+        // 终局 Done 在视图终态时恰好一次地发出（捕获件一致则保留原服务
+        // 明细，否则按视图合成——同源于本操作的权威结果）。
+        if let Some(done) = super::dispatch_events::forward_operation_events(
             &client,
             admin_addr,
             &token,
             &operation_id,
             &mut event_cursor,
         )
-        .await;
+        .await
+        {
+            held_done = Some(done);
+        }
         if view.state.is_terminal() || view.state == RuntimeOperationState::RecoveryRequired {
-            // 终局前 journal 未给出 done（如取消路径未入事件流）→ 按视图合成，
-            // 保证 stdout 终局信号不缺失；不再二次拉取——0ms 间隔内 journal
-            // 不会有新事件，合成与转发的 wire 语义一致（同源于操作视图）。
-            if !done_forwarded {
-                super::dispatch_events::emit_terminal_done_event(&view);
+            match held_done.take() {
+                Some(done) if super::dispatch_events::captured_done_matches(&done, &view.state) => {
+                    super::dispatch_events::emit_captured_done(&done);
+                }
+                _ => super::dispatch_events::emit_terminal_done_event(&view),
             }
             return Ok(OwnerDispatch::Terminal(view));
         }

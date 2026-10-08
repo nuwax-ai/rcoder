@@ -446,6 +446,7 @@
   "userapp_dev_registry_self_heal_after_restart": [
     "create-workspace（ensure 开发容器+建目录+owner 注册）",
     "restart 后 get-file-list 经自愈恢复 200（探活失败→刷新注册→转发成功）",
+    "重启窗口内转发失败分类呈现（无裸 reqwest 连接错误文案）",
     "容器 Id 不变（remediate Alive 保容器，非杀重建）"
   ],
   "userapp_dev_server_lifecycle": [
