@@ -666,20 +666,31 @@ impl PortProxy {
         renderer.request_refresh();
         let status = upstream_response.status.as_u16();
         let diagnostic_id = crate::error_page::new_diagnostic_id();
+        // 语言协商与 write_error_response 同一函数（Accept-Language → locale）
+        let locale = shared_types::parse_accept_language(
+            session
+                .req_header()
+                .headers
+                .get("accept-language")
+                .and_then(|value| value.to_str().ok()),
+        );
         let (content_type, body): (&'static str, bytes::Bytes) =
             match crate::error_page::negotiate(session) {
                 crate::error_page::ErrorRepresentation::Document => {
-                    let (title, message) = hint.page_cause().copywriting();
+                    let (title, message) = hint.page_cause().copywriting(locale);
                     let vars = crate::error_page::ErrorPageVars {
-                        title: title.to_string(),
-                        message: message.to_string(),
+                        title,
+                        message,
                         diagnostic_id: diagnostic_id.clone(),
                         status: status.to_string(),
                     };
-                    ("text/html; charset=utf-8", renderer.render(&vars).into())
+                    (
+                        "text/html; charset=utf-8",
+                        renderer.render(&vars, locale).into(),
+                    )
                 }
                 crate::error_page::ErrorRepresentation::Machine => {
-                    let (_title, message) = hint.page_cause().copywriting();
+                    let (_title, message) = hint.page_cause().copywriting(locale);
                     let payload = serde_json::json!({
                         "error": {
                             "code": "USERAPP_PROXY_FAILURE",
@@ -751,19 +762,14 @@ impl PortProxy {
     ) {
         let status = failure.clone().into_app_error().status_code().as_u16();
         let code = failure.code.clone();
+        // 错误码是终局证据：按码映射文案档位（404 已删除→Missing、409 围栏
+        // →Blocked 等），不再恒用 Generic 等 advisor 观察
+        let cause = crate::error_page::wake_failure_cause(code.as_ref());
         let detail = shared_types::sanitize_error_text(&failure.message);
         let retry = failure.retryable.then_some(15);
         ctx.wake_failure = Some(failure);
-        self.respond_userapp_error(
-            session,
-            ctx,
-            status,
-            crate::error_page::ErrorPageCause::Generic,
-            code.as_ref(),
-            retry,
-            &detail,
-        )
-        .await;
+        self.respond_userapp_error(session, ctx, status, cause, code.as_ref(), retry, &detail)
+            .await;
     }
 
     #[allow(clippy::too_many_arguments)]

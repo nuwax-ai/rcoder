@@ -816,9 +816,10 @@ mod tests {
 
         // 1) 来源确认 + 文档导航 → 替换为友好页（starting 文案），原 pingap
         //    错误体不残留、标记头被移除、Content-Length 与新正文一致。
+        //    （Accept-Language: zh-CN——文案按语言协商，无头回落默认语言）
         let path = "/api/v1/userapp/proxy/app/prod/u1/markercase/";
         let document = exchange(format!(
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Dest: document\r\nAccept: text/html\r\nConnection: close\r\n\r\n"
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Dest: document\r\nAccept: text/html\r\nAccept-Language: zh-CN\r\nConnection: close\r\n\r\n"
         ))
         .await;
         assert!(document.starts_with("HTTP/1.1 502"), "{document}");
@@ -880,6 +881,127 @@ mod tests {
         );
         shutdown_tx.send(()).unwrap();
         proxy_task.await.unwrap().unwrap();
+    }
+
+    /// 探测即失败的 wake control：remote_wake_pending_result 携带给定错误码
+    /// 的 WakeFailure，触发 request_filter 的 respond_wake_failure 出口。
+    struct ProbeFailingWakeControl(shared_types::WakeFailure);
+
+    #[async_trait::async_trait]
+    impl shared_types::AppWakeControl for ProbeFailingWakeControl {
+        fn is_stopped(&self, _app_id: &str) -> bool {
+            false
+        }
+        async fn ensure_running(&self, _app_id: &str) -> WakeOutcome {
+            WakeOutcome::Failed(self.0.clone())
+        }
+        async fn remote_wake_pending_result(
+            &self,
+            _app_id: &str,
+        ) -> Result<bool, shared_types::WakeFailure> {
+            Err(self.0.clone())
+        }
+    }
+
+    /// 唤醒失败错误码 → 文案档位矩阵（真实 Pingora 栈）：同一 stub 模式
+    /// 参数化——状态码保留真实值，HTML 按错误码选档并按 Accept-Language
+    /// 协商语言；fetch 形态 JSON 的 reason_code 契约不变。
+    #[tokio::test]
+    async fn wake_failure_error_code_selects_localized_page_cause() {
+        let cases = [
+            (
+                shared_types::ERR_APP_NOT_FOUND,
+                "HTTP/1.1 404",
+                "已被回收",
+                "reclaimed",
+            ),
+            (
+                shared_types::ERR_RUNTIME_UNAVAILABLE,
+                "HTTP/1.1 503",
+                "平台服务暂不可用",
+                "not an issue with the application",
+            ),
+            (
+                shared_types::ERR_OPERATION_OUTCOME_UNKNOWN,
+                "HTTP/1.1 500",
+                "状态确认中",
+                "being confirmed",
+            ),
+            (
+                shared_types::ERR_OPERATION_IN_PROGRESS,
+                "HTTP/1.1 409",
+                "操作处理中",
+                "operation in progress",
+            ),
+        ];
+        for (code, status_line, zh_marker, en_marker) in cases {
+            let proxy_reservation =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("reserve proxy port");
+            let proxy_port = proxy_reservation
+                .local_addr()
+                .expect("proxy address")
+                .port();
+            drop(proxy_reservation);
+            let mut manager = PingoraServerManager::new(ProxyConfig::with_listen_port(proxy_port))
+                .with_wake_control(Arc::new(ProbeFailingWakeControl(
+                    shared_types::WakeFailure::new(code, "wake_preflight", "stub probe failure"),
+                )));
+            manager
+                .service
+                .set_error_pages(Arc::new(crate::error_page::ErrorPageRenderer::new(None)));
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let proxy_task = tokio::spawn(async move { manager.start(shutdown_rx).await });
+            for _ in 0..100 {
+                if tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            let exchange = |request: String| async move {
+                let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+                    .await
+                    .expect("connect proxy");
+                stream.write_all(request.as_bytes()).await.expect("send");
+                let mut response = Vec::new();
+                tokio::time::timeout(Duration::from_secs(15), stream.read_to_end(&mut response))
+                    .await
+                    .expect("response deadline")
+                    .expect("read response");
+                String::from_utf8_lossy(&response).to_string()
+            };
+
+            let path = "/api/v1/userapp/proxy/app/prod/u1/stubcase/";
+            // 文档导航 + zh-CN → 真实状态码 + 对应档位中文文案
+            let zh = exchange(format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Dest: document\r\nAccept: text/html\r\nAccept-Language: zh-CN\r\nConnection: close\r\n\r\n"
+            ))
+            .await;
+            assert!(zh.starts_with(status_line), "code {code}: {zh}");
+            assert!(zh.contains(zh_marker), "code {code}: {zh}");
+
+            // 同一失败 + en-US → 英文文案（多语言协商）
+            let en = exchange(format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Dest: document\r\nAccept: text/html\r\nAccept-Language: en-US\r\nConnection: close\r\n\r\n"
+            ))
+            .await;
+            assert!(en.starts_with(status_line), "code {code}: {en}");
+            assert!(en.contains(en_marker), "code {code}: {en}");
+
+            // fetch 形态 → 结构化 JSON 契约不变（reason_code 原样携带）
+            let fetch = exchange(format!(
+                "GET {path}assets/app.js HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Dest: empty\r\nSec-Fetch-Mode: cors\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+            ))
+            .await;
+            assert!(fetch.starts_with(status_line), "code {code}: {fetch}");
+            assert!(fetch.contains(code), "code {code}: {fetch}");
+
+            shutdown_tx.send(()).unwrap();
+            proxy_task.await.unwrap().unwrap();
+        }
     }
 }
 

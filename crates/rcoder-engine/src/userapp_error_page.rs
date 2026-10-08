@@ -22,7 +22,10 @@ use arc_swap::ArcSwapOption;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use rcoder_proxy::error_page::{ErrorPageRenderer, ErrorPageSnapshot};
+use rcoder_proxy::error_page::{
+    ErrorPageRenderer, ErrorPageSnapshot, VAR_DIAGNOSTIC_ID, VAR_LANG, VAR_MESSAGE, VAR_STATUS,
+    VAR_TITLE,
+};
 
 /// 单文件上限（512 KiB；按实际字节数限制）。
 pub const MAX_PAGE_BYTES: usize = 512 * 1024;
@@ -600,7 +603,8 @@ fn backend_name(backend: &ErrorPageBackend) -> &'static str {
 }
 
 /// 页面契约校验（上传与加载共用）：非空、UTF-8、≤512KiB、未知
-/// `{{RCODER_*}}` 占位符拒绝（四个已知占位符之外不解析其他大括号）。
+/// `{{RCODER_*}}` 占位符拒绝（渲染支持的占位符之外不解析其他大括号；
+/// 白名单引用 rcoder-proxy 的 VAR_* 常量，与渲染保持单一事实源）。
 pub fn validate_page(content: &[u8]) -> std::result::Result<(), String> {
     if content.is_empty() {
         return Err("error page content is empty".into());
@@ -624,14 +628,11 @@ pub fn validate_page(content: &[u8]) -> std::result::Result<(), String> {
         let placeholder = &text[absolute..absolute + end + 2];
         let known = matches!(
             placeholder,
-            "{{RCODER_TITLE}}"
-                | "{{RCODER_MESSAGE}}"
-                | "{{RCODER_DIAGNOSTIC_ID}}"
-                | "{{RCODER_STATUS}}"
+            VAR_TITLE | VAR_MESSAGE | VAR_DIAGNOSTIC_ID | VAR_STATUS | VAR_LANG
         );
         if !known {
             return Err(format!(
-                "unknown placeholder {placeholder} (only RCODER_TITLE/RCODER_MESSAGE/RCODER_DIAGNOSTIC_ID/RCODER_STATUS are supported)"
+                "unknown placeholder {placeholder} (only RCODER_TITLE/RCODER_MESSAGE/RCODER_DIAGNOSTIC_ID/RCODER_STATUS/RCODER_LANG are supported)"
             ));
         }
         scan = absolute + end + 2;
@@ -681,6 +682,10 @@ mod tests {
         assert!(validate_page(b"\xff\xfe invalid utf8").is_err());
         assert!(
             validate_page(b"<html>{{RCODER_TITLE}} {{RCODER_MESSAGE}} {{RCODER_DIAGNOSTIC_ID}} {{RCODER_STATUS}}</html>").is_ok()
+        );
+        assert!(
+            validate_page(b"<html lang=\"{{RCODER_LANG}}\">{{RCODER_TITLE}}</html>").is_ok(),
+            "lang placeholder must be accepted (rendered since the i18n copy)"
         );
         assert!(
             validate_page(b"<html>{{RCODER_EVIL}}</html>").is_err(),

@@ -67,15 +67,15 @@ fn store_error_response(error: ErrorPageStoreError) -> Response {
 #[utoipa::path(
     put,
     path = "/api/v1/admin/userapp/error-page",
-    summary = "上传部署级 UserApp 故障页（≤512KiB UTF-8 HTML，四个转义占位符）",
+    summary = "上传部署级 UserApp 故障页（≤512KiB UTF-8 HTML，五个转义占位符）",
     request_body(content = String, content_type = "text/html"),
     description = r#"
 上传一份本地 HTML 作为部署级 UserApp 故障页（权威存储原子替换 + 本副本热加载）。
 
 - 正文 `text/html`（charset 缺省按 UTF-8 处理）；单文件 ≤ 512 KiB、非空、UTF-8；
 - 仅支持 `{{RCODER_TITLE}}` / `{{RCODER_MESSAGE}}` / `{{RCODER_DIAGNOSTIC_ID}}` /
-  `{{RCODER_STATUS}}` 四个转义文本占位符，未知 `{{RCODER_*}}` 拒绝（422）；
-  无占位符的完整静态页合法；
+  `{{RCODER_STATUS}}` / `{{RCODER_LANG}}`（语言标记，如 zh-CN）五个转义文本
+  占位符，未知 `{{RCODER_*}}` 拒绝（422）；无占位符的完整静态页合法；
 - 成功 = 权威已保存；`loaded_by_this_replica` 才表示本副本已加载（K8s 多副本
   经 ConfigMap 投射最终收敛，不承诺立即全副本切换）；
 - 415 类型不符 / 413 过大 / 422 校验失败 / 409 并发冲突 /

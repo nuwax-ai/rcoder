@@ -148,12 +148,27 @@ impl UserAppProxyFailureAdvisorImpl {
                         == Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT),
                 })
             }
-            // 无快照（停止/不可达/换代/不支持）= 无来源证据：不确认替换，
-            // 停止态本身可作为文案证据返回。
+            // 无快照（不可达/换代/不支持）= 无来源证据：不确认替换。停止态
+            // 与计算资源缺失（未部署/已删除/被回收）本身可作为文案证据返回。
+            // Missing 仅 prod 透传：dev scope 无计算资源 ≠ 应用不存在（dev
+            // 运行时未启动/被回收是常态），dev 路由的 cause 细分按方案延后。
             Ok(UserAppReadinessObservation::NoCompute { state }) => {
-                let stopped = state == shared_types::UserAppNoComputeState::Stopped;
-                stopped.then_some(UserAppProxyFailureHint {
-                    readiness_status: Some(shared_types::UserAppReadinessStatus::Stopped),
+                // 全枚举显式匹配：NoComputeState 新增/改名时编译期即暴露此分支
+                let status = match state {
+                    shared_types::UserAppNoComputeState::Stopped => {
+                        Some(shared_types::UserAppReadinessStatus::Stopped)
+                    }
+                    shared_types::UserAppNoComputeState::Missing if stage == UserappStage::Prod => {
+                        Some(shared_types::UserAppReadinessStatus::NotDeployed)
+                    }
+                    shared_types::UserAppNoComputeState::Missing
+                    | shared_types::UserAppNoComputeState::Starting
+                    | shared_types::UserAppNoComputeState::Stopping
+                    | shared_types::UserAppNoComputeState::Failed
+                    | shared_types::UserAppNoComputeState::Unknown => None,
+                };
+                status.map(|readiness_status| UserAppProxyFailureHint {
+                    readiness_status: Some(readiness_status),
                     error_origin_confirmed: false,
                 })
             }

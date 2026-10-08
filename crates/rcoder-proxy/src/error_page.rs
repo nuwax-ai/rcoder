@@ -36,6 +36,8 @@ pub const VAR_TITLE: &str = "{{RCODER_TITLE}}";
 pub const VAR_MESSAGE: &str = "{{RCODER_MESSAGE}}";
 pub const VAR_DIAGNOSTIC_ID: &str = "{{RCODER_DIAGNOSTIC_ID}}";
 pub const VAR_STATUS: &str = "{{RCODER_STATUS}}";
+/// `<html lang>` 用语言标记（如 zh-CN）；自定义页未包含该占位符则不受影响。
+pub const VAR_LANG: &str = "{{RCODER_LANG}}";
 
 /// 外部页快照（存储/加载器发布；内容不可变，热路径零 IO）。
 #[derive(Debug, Clone)]
@@ -83,13 +85,14 @@ impl ErrorPageRenderer {
     }
 
     /// 渲染（变量全部 HTML 转义；未知占位符不解析——上传侧已校验拒绝）。
-    pub fn render(&self, vars: &ErrorPageVars) -> Vec<u8> {
+    pub fn render(&self, vars: &ErrorPageVars, locale: &str) -> Vec<u8> {
         let template = self.template();
         let rendered = template
             .replace(VAR_TITLE, &html_escape(&vars.title))
             .replace(VAR_MESSAGE, &html_escape(&vars.message))
             .replace(VAR_DIAGNOSTIC_ID, &html_escape(&vars.diagnostic_id))
-            .replace(VAR_STATUS, &html_escape(&vars.status));
+            .replace(VAR_STATUS, &html_escape(&vars.status))
+            .replace(VAR_LANG, &html_escape(locale));
         rendered.into_bytes()
     }
 }
@@ -104,7 +107,7 @@ pub struct ErrorPageVars {
     pub status: String,
 }
 
-/// 失败原因分类（决定文案；T8 首批仅确定性上下文，证据不足一律通用文案）。
+/// 失败原因分类（决定文案；确定性上下文才用确定档，证据不足一律通用文案）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorPageCause {
     /// 有当前实例的启动证据
@@ -113,19 +116,76 @@ pub enum ErrorPageCause {
     Stopped,
     /// 有明确启动失败证据
     Failed,
+    /// 计算资源不存在（未部署/已删除/被回收）——不可访问，重试无意义
+    Missing,
+    /// 生命周期操作进行中/被围栏（删除中、停止中）
+    Blocked,
+    /// 恢复门禁（ERR_RECOVERY_REQUIRED）——需显式恢复或重新部署
+    RecoveryRequired,
+    /// 平台侧组件不可用——非应用自身问题
+    PlatformUnavailable,
+    /// 操作结果未知（不虚报成败，也不凭连接失败断言）
+    OutcomeUnknown,
     /// 连接失败/状态未知：不凭连接拒绝宣称"正在启动"
     Generic,
 }
 
 impl ErrorPageCause {
-    /// 平台预设文案（中文；公共页面不含内部地址/凭据/操作细节）。
-    pub fn copywriting(self) -> (&'static str, &'static str) {
+    /// i18n key 段（userapp_error_page.<slug>.{title,message}）。
+    fn i18n_slug(self) -> &'static str {
         match self {
-            Self::Starting => ("应用正在启动", "应用正在启动，请稍后重新访问。"),
-            Self::Stopped => ("应用已停止", "应用已停止，请在应用管理页面启动后重试。"),
-            Self::Failed => ("应用启动失败", "应用启动失败，请重新部署或稍后重试。"),
-            Self::Generic => ("应用暂时无法访问", "应用暂时无法访问，请稍后重试。"),
+            Self::Starting => "starting",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+            Self::Missing => "missing",
+            Self::Blocked => "blocked",
+            Self::RecoveryRequired => "recovery_required",
+            Self::PlatformUnavailable => "platform_unavailable",
+            Self::OutcomeUnknown => "outcome_unknown",
+            Self::Generic => "generic",
         }
+    }
+
+    /// 平台预设文案（按 locale 经 shared_types_i18n 取；公共页面不含内部
+    /// 地址/凭据/操作细节）。
+    pub fn copywriting(self, locale: &str) -> (String, String) {
+        let slug = self.i18n_slug();
+        (
+            shared_types::t(&format!("userapp_error_page.{slug}.title"), locale),
+            shared_types::t(&format!("userapp_error_page.{slug}.message"), locale),
+        )
+    }
+}
+
+/// 唤醒失败错误码 → 失败页文案档位。分组与 `status_from_code` 的状态码
+/// 分组对齐（文案档位与真实状态码一致）；错误码来自持久准入链，是终局
+/// 证据——映射出的档位不再被就绪观察改写。
+pub fn wake_failure_cause(code: &str) -> ErrorPageCause {
+    use shared_types::{
+        ERR_APP_NOT_FOUND, ERR_CONFLICT, ERR_CONTAINER_ADDRESS_NOT_READY, ERR_CONTAINER_NOT_FOUND,
+        ERR_CONTAINER_START_FAILED, ERR_DATABASE_NOT_READY, ERR_IMAGE_PULL_FAILED,
+        ERR_OPERATION_IN_PROGRESS, ERR_OPERATION_OUTCOME_UNKNOWN, ERR_PROXY_SERVICE_UNAVAILABLE,
+        ERR_RECOVERY_REQUIRED, ERR_RESOURCE_EXHAUSTED, ERR_RUNTIME_TIMEOUT,
+        ERR_RUNTIME_UNAVAILABLE, ERR_SERVICE_UNAVAILABLE, ERR_USERAPP_WAIT_TIMEOUT,
+    };
+    match code {
+        ERR_APP_NOT_FOUND | ERR_CONTAINER_NOT_FOUND => ErrorPageCause::Missing,
+        ERR_CONFLICT | ERR_OPERATION_IN_PROGRESS => ErrorPageCause::Blocked,
+        ERR_RECOVERY_REQUIRED => ErrorPageCause::RecoveryRequired,
+        ERR_IMAGE_PULL_FAILED | ERR_CONTAINER_START_FAILED => ErrorPageCause::Failed,
+        ERR_RUNTIME_TIMEOUT | ERR_USERAPP_WAIT_TIMEOUT => {
+            // 唤醒 deadline 超时是确定性上下文：请求确实在等启动（可重试，
+            // 状态码 504 + Retry-After），不凭连接失败猜测
+            ErrorPageCause::Starting
+        }
+        ERR_RUNTIME_UNAVAILABLE
+        | ERR_SERVICE_UNAVAILABLE
+        | ERR_DATABASE_NOT_READY
+        | ERR_RESOURCE_EXHAUSTED
+        | ERR_CONTAINER_ADDRESS_NOT_READY
+        | ERR_PROXY_SERVICE_UNAVAILABLE => ErrorPageCause::PlatformUnavailable,
+        ERR_OPERATION_OUTCOME_UNKNOWN => ErrorPageCause::OutcomeUnknown,
+        _ => ErrorPageCause::Generic,
     }
 }
 
@@ -141,13 +201,23 @@ pub struct UserAppProxyFailureHint {
 
 impl UserAppProxyFailureHint {
     /// 失败页文案分类：有证据才用确定文案，缺证据一律通用（不凭连接拒绝
-    /// 宣称"正在启动"）。
+    /// 宣称"正在启动"）。全枚举显式匹配：ReadinessStatus 新增/改名时编译期
+    /// 即暴露此映射。
     pub fn page_cause(&self) -> ErrorPageCause {
+        use shared_types::UserAppReadinessStatus as Status;
         match self.readiness_status {
-            Some(shared_types::UserAppReadinessStatus::Starting) => ErrorPageCause::Starting,
-            Some(shared_types::UserAppReadinessStatus::Stopped) => ErrorPageCause::Stopped,
-            Some(shared_types::UserAppReadinessStatus::Failed) => ErrorPageCause::Failed,
-            _ => ErrorPageCause::Generic,
+            Some(Status::Starting) => ErrorPageCause::Starting,
+            Some(Status::Stopped) => ErrorPageCause::Stopped,
+            Some(Status::Failed) => ErrorPageCause::Failed,
+            Some(Status::NotDeployed) => ErrorPageCause::Missing,
+            // Ready/Degraded 出现在失败出口说明健康证据与本次失败并存，
+            // Stopping/Unknown/Unsupported 无确定文案证据——一律通用
+            None
+            | Some(Status::Stopping)
+            | Some(Status::Ready)
+            | Some(Status::Degraded)
+            | Some(Status::Unknown)
+            | Some(Status::Unsupported) => ErrorPageCause::Generic,
         }
     }
 }
@@ -397,19 +467,27 @@ async fn write_error_response_inner(
     // 错误页被消费 → 触发按需刷新（K8s 投射/手工换页的最终收敛路径之一）
     renderer.request_refresh();
     let diagnostic_id = new_diagnostic_id();
-    let (title, message) = cause.copywriting();
+    // 语言协商：与机器 JSON 路径同一函数（Accept-Language；缺失回落默认语言）
+    let locale = shared_types::parse_accept_language(
+        session
+            .req_header()
+            .headers
+            .get("accept-language")
+            .and_then(|value| value.to_str().ok()),
+    );
+    let (title, message) = cause.copywriting(locale);
     let representation = negotiate(session);
     let is_head = session.req_header().method == pingora::http::Method::HEAD;
 
     let (content_type, body): (&'static str, Vec<u8>) = match representation {
         ErrorRepresentation::Document => {
             let vars = ErrorPageVars {
-                title: title.to_string(),
-                message: message.to_string(),
+                title,
+                message,
                 diagnostic_id: diagnostic_id.clone(),
                 status: status.to_string(),
             };
-            ("text/html; charset=utf-8", renderer.render(&vars))
+            ("text/html; charset=utf-8", renderer.render(&vars, locale))
         }
         ErrorRepresentation::Machine => {
             let mut payload = serde_json::json!({
@@ -422,13 +500,6 @@ async fn write_error_response_inner(
                 }
             });
             if let Some(failure) = wake_failure {
-                let locale = shared_types::parse_accept_language(
-                    session
-                        .req_header()
-                        .headers
-                        .get("accept-language")
-                        .and_then(|value| value.to_str().ok()),
-                );
                 attach_wake_diagnostic(&mut payload, failure, locale);
             }
             ("application/json", payload.to_string().into_bytes())
@@ -520,6 +591,20 @@ mod tests {
         ErrorPageRenderer::new(None)
     }
 
+    fn all_causes() -> [ErrorPageCause; 9] {
+        [
+            ErrorPageCause::Starting,
+            ErrorPageCause::Stopped,
+            ErrorPageCause::Failed,
+            ErrorPageCause::Missing,
+            ErrorPageCause::Blocked,
+            ErrorPageCause::RecoveryRequired,
+            ErrorPageCause::PlatformUnavailable,
+            ErrorPageCause::OutcomeUnknown,
+            ErrorPageCause::Generic,
+        ]
+    }
+
     #[test]
     fn builtin_page_renders_all_variables_escaped() {
         let vars = ErrorPageVars {
@@ -528,23 +613,173 @@ mod tests {
             diagnostic_id: "abc123".into(),
             status: "503".into(),
         };
-        let rendered = String::from_utf8(renderer().render(&vars)).unwrap();
+        let rendered = String::from_utf8(renderer().render(&vars, "zh-CN")).unwrap();
         assert!(rendered.contains("应用&lt;启动&gt;"));
         assert!(rendered.contains("请稍后 &amp; 重试"));
         assert!(rendered.contains("abc123"));
         assert!(rendered.contains("503"));
+        assert!(rendered.contains("<html lang=\"zh-CN\">"));
         assert!(!rendered.contains("{{RCODER_"));
     }
 
     #[test]
+    fn zh_cn_copywriting_matches_approved_matrix() {
+        let cases = [
+            (
+                ErrorPageCause::Starting,
+                "应用正在启动",
+                "应用正在启动，耗时较长，请稍后重新访问。",
+            ),
+            (
+                ErrorPageCause::Stopped,
+                "应用已停止",
+                "应用已停止，请在应用管理页面启动后重试。",
+            ),
+            (
+                ErrorPageCause::Failed,
+                "应用启动失败",
+                "应用启动失败，请重新部署或稍后重试。",
+            ),
+            (
+                ErrorPageCause::Missing,
+                "应用不存在或已被回收",
+                "访问的应用不存在或已被删除，无法访问；请确认应用状态或重新部署。",
+            ),
+            (
+                ErrorPageCause::Blocked,
+                "应用操作处理中",
+                "应用正在执行停止或删除等操作，暂时无法访问，请稍后重试。",
+            ),
+            (
+                ErrorPageCause::RecoveryRequired,
+                "应用待恢复",
+                "应用需要完成恢复处理后才能访问，请重新部署或联系管理员。",
+            ),
+            (
+                ErrorPageCause::PlatformUnavailable,
+                "平台服务暂不可用",
+                "平台服务暂时不可用，请稍后重试；这与应用本身无关。",
+            ),
+            (
+                ErrorPageCause::OutcomeUnknown,
+                "应用状态确认中",
+                "应用操作结果正在确认，请稍后重试；如持续出现请重新部署。",
+            ),
+            (
+                ErrorPageCause::Generic,
+                "应用暂时无法访问",
+                "应用暂时无法访问，请稍后重试。",
+            ),
+        ];
+        for (cause, title, message) in cases {
+            let (actual_title, actual_message) = cause.copywriting("zh-CN");
+            assert_eq!(actual_title, title, "title for {cause:?}");
+            assert_eq!(actual_message, message, "message for {cause:?}");
+        }
+    }
+
+    #[test]
+    fn copywriting_covers_all_causes_in_all_locales() {
+        for locale in ["zh-CN", "zh-TW", "en-US"] {
+            for cause in all_causes() {
+                let (title, message) = cause.copywriting(locale);
+                // t() 缺条目时归一为裸 key——两条都不能是裸 key 形状（防漏
+                // yml 条目，参照 2026-09-22 app-105 泄露事故的防线）
+                for text in [&title, &message] {
+                    assert!(!text.is_empty(), "{cause:?}/{locale} empty copy");
+                    assert!(
+                        !text.starts_with("userapp_error_page"),
+                        "{cause:?}/{locale} leaked bare key: {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wake_failure_cause_maps_codes_to_aligned_causes() {
+        let cases = [
+            (shared_types::ERR_APP_NOT_FOUND, ErrorPageCause::Missing),
+            (
+                shared_types::ERR_CONTAINER_NOT_FOUND,
+                ErrorPageCause::Missing,
+            ),
+            (shared_types::ERR_CONFLICT, ErrorPageCause::Blocked),
+            (
+                shared_types::ERR_OPERATION_IN_PROGRESS,
+                ErrorPageCause::Blocked,
+            ),
+            (
+                shared_types::ERR_RECOVERY_REQUIRED,
+                ErrorPageCause::RecoveryRequired,
+            ),
+            (shared_types::ERR_IMAGE_PULL_FAILED, ErrorPageCause::Failed),
+            (
+                shared_types::ERR_CONTAINER_START_FAILED,
+                ErrorPageCause::Failed,
+            ),
+            (shared_types::ERR_RUNTIME_TIMEOUT, ErrorPageCause::Starting),
+            (
+                shared_types::ERR_USERAPP_WAIT_TIMEOUT,
+                ErrorPageCause::Starting,
+            ),
+            (
+                shared_types::ERR_RUNTIME_UNAVAILABLE,
+                ErrorPageCause::PlatformUnavailable,
+            ),
+            (
+                shared_types::ERR_SERVICE_UNAVAILABLE,
+                ErrorPageCause::PlatformUnavailable,
+            ),
+            (
+                shared_types::ERR_DATABASE_NOT_READY,
+                ErrorPageCause::PlatformUnavailable,
+            ),
+            (
+                shared_types::ERR_RESOURCE_EXHAUSTED,
+                ErrorPageCause::PlatformUnavailable,
+            ),
+            (
+                shared_types::ERR_CONTAINER_ADDRESS_NOT_READY,
+                ErrorPageCause::PlatformUnavailable,
+            ),
+            (
+                shared_types::ERR_PROXY_SERVICE_UNAVAILABLE,
+                ErrorPageCause::PlatformUnavailable,
+            ),
+            (
+                shared_types::ERR_OPERATION_OUTCOME_UNKNOWN,
+                ErrorPageCause::OutcomeUnknown,
+            ),
+            ("ERR_SOMETHING_ELSE", ErrorPageCause::Generic),
+            (
+                shared_types::ERR_USERAPP_WAKE_FAILED,
+                ErrorPageCause::Generic,
+            ),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(wake_failure_cause(code), expected, "code {code}");
+        }
+    }
+
+    #[test]
+    fn page_cause_maps_not_deployed_to_missing() {
+        let hint = UserAppProxyFailureHint {
+            readiness_status: Some(shared_types::UserAppReadinessStatus::NotDeployed),
+            error_origin_confirmed: false,
+        };
+        assert_eq!(hint.page_cause(), ErrorPageCause::Missing);
+        let unknown = UserAppProxyFailureHint {
+            readiness_status: None,
+            error_origin_confirmed: false,
+        };
+        assert_eq!(unknown.page_cause(), ErrorPageCause::Generic);
+    }
+
+    #[test]
     fn cause_copywriting_covers_all_categories() {
-        for cause in [
-            ErrorPageCause::Starting,
-            ErrorPageCause::Stopped,
-            ErrorPageCause::Failed,
-            ErrorPageCause::Generic,
-        ] {
-            let (title, message) = cause.copywriting();
+        for cause in all_causes() {
+            let (title, message) = cause.copywriting(shared_types::DEFAULT_LOCALE);
             assert!(!title.is_empty());
             assert!(!message.is_empty());
         }
