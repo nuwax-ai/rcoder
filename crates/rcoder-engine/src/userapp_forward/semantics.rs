@@ -336,15 +336,13 @@ impl IntoResponse for HttpResultError {
         if let Some(cause) = self.cause {
             return cause.into_response();
         }
-        // 与 shared_types::HttpResult 同形态(code=字符串错误码/message/data/tid/success),
-        // 但保留真实 HTTP 状态码(400/404/502/503 对代理与客户端有语义; HttpResult 的
-        // IntoResponse 恒 200, 不适用于透传层的传输级错误)
-        let payload = ForwardErrorEnvelope {
-            code: self.code.unwrap_or_else(|| error_code_for(self.status)),
-            message: self.message,
-            data: None,
-            success: false,
-        };
+        // Reuse the shared envelope (including trace and safe error text), but
+        // let the outer response retain the transport status: HttpResult's own
+        // IntoResponse uses 200 for business envelopes.
+        let payload = shared_types::HttpResult::<()>::error(
+            self.code.unwrap_or_else(|| error_code_for(self.status)),
+            &self.message,
+        );
         let mut response = (self.status, axum::Json(payload)).into_response();
         if let Some(secs) = self.retry_after_secs
             && let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string())
@@ -353,14 +351,6 @@ impl IntoResponse for HttpResultError {
         }
         response
     }
-}
-
-#[derive(serde::Serialize)]
-struct ForwardErrorEnvelope {
-    code: &'static str,
-    message: String,
-    data: Option<()>,
-    success: bool,
 }
 
 /// HTTP 状态码 → 全站字符串错误码(对齐 shared_types::error_codes 词表)。
@@ -378,6 +368,49 @@ pub(super) fn error_code_for(status: axum::http::StatusCode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shared_error_envelope_preserves_transport_status_and_retry_after() {
+        use axum::http::StatusCode;
+        for (error, status, code, retry_after) in [
+            (
+                HttpResultError::bad_gateway("应用请求失败；稍后重试"),
+                StatusCode::BAD_GATEWAY,
+                error_codes::ERR_BACKEND_ERROR,
+                None,
+            ),
+            (
+                HttpResultError::dev_container_unreachable("en-US"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                error_codes::ERR_CONTAINER_ADDRESS_NOT_READY,
+                Some("10"),
+            ),
+        ] {
+            let response = error.into_response();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("retry-after")
+                    .map(|header| header.to_str().unwrap()),
+                retry_after,
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .unwrap();
+            let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(envelope["code"], code);
+            assert_eq!(envelope["success"], false);
+            assert_eq!(envelope["data"], serde_json::Value::Null);
+            assert!(
+                envelope.get("tid").is_some(),
+                "use the shared trace envelope"
+            );
+            if status == StatusCode::BAD_GATEWAY {
+                assert_eq!(envelope["message"], "应用请求失败；稍后重试");
+            }
+        }
+    }
 
     fn classify_kind(path: &str) -> &'static str {
         match classify_dev_absent(path) {
