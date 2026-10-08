@@ -55,6 +55,23 @@ impl TrafficHolder {
 }
 
 async fn traffic_holder(service: &AppService, app_id: &str) -> TrafficHolder {
+    operation_holder(
+        service,
+        app_id,
+        UserAppOperationKind::Start,
+        Some(UserAppControlCommand::Start { traffic: true }),
+        "traffic_wake_observing",
+    )
+    .await
+}
+
+async fn operation_holder(
+    service: &AppService,
+    app_id: &str,
+    kind: UserAppOperationKind,
+    command: Option<UserAppControlCommand>,
+    step: &str,
+) -> TrafficHolder {
     let guard = service.acquire_process_release_lock(app_id).await.unwrap();
     let lifecycle = service.get_lifecycle(app_id).await.unwrap();
     let operation_id = uuid::Uuid::new_v4().to_string();
@@ -62,13 +79,13 @@ async fn traffic_holder(service: &AppService, app_id: &str) -> TrafficHolder {
         service.metadata.store.clone(),
         UserAppAdmission {
             runtime_policy_on_success: None,
-            command: Some(UserAppControlCommand::Start { traffic: true }),
+            command,
             app_id: app_id.into(),
             lifecycle_id: Some(lifecycle.lifecycle_id),
             operation_id: operation_id.clone(),
             request_id: Some(format!("wake-{operation_id}")),
             request_fingerprint: "a".repeat(64),
-            kind: UserAppOperationKind::Start,
+            kind,
             metadata: None,
         },
     )
@@ -76,10 +93,7 @@ async fn traffic_holder(service: &AppService, app_id: &str) -> TrafficHolder {
     .unwrap();
     operation.bind_lease(&guard).await.unwrap();
     operation
-        .checkpoint(
-            "traffic_wake_observing",
-            serde_json::json!({"start_write_acknowledged": true}),
-        )
+        .checkpoint(step, serde_json::json!({"start_write_acknowledged": true}))
         .await
         .unwrap();
     let record = service
@@ -143,6 +157,9 @@ fn assert_traffic_diagnostic(data: &OperationInProgressData, holder_id: &str) {
     assert!(data.retryable);
     assert_eq!(data.retry_after_seconds, 20);
 }
+
+#[path = "restart_wait_diagnostic_tests.rs"]
+mod diagnostic_tests;
 
 async fn waits_then_restarts_once(physical_guard_held: bool) {
     let directory = tempfile::tempdir().unwrap();
@@ -618,11 +635,33 @@ async fn lease_response_after_restart_deadline_remains_unknown_then_exact_cleanu
     let (mut service, runtime) = created_service(directory.path(), app_id, 1).await;
     service.config.access_mode = AppAccessMode::Kubernetes;
     let service = Arc::new(service);
+    let previous = traffic_holder(&service, app_id).await;
     let (started, release) = pause_dispatched_lease(&runtime);
     let worker_service = service.clone();
     let restart = tokio::spawn(async move {
-        worker_service
-            .restart_app_controlled(app_id, control_request(request_id))
+        Arc::new(super::restart_wait::RestartAdmission::default())
+            .scope(async {
+                worker_service.restart_admission_deadline().unwrap();
+                let observed = worker_service.prod_lock_conflict(app_id).await;
+                assert_traffic_diagnostic(
+                    &observed.operation_in_progress_data().unwrap(),
+                    &previous.operation_id,
+                );
+                previous.finish().await;
+                let result = worker_service
+                    .restart_app_controlled(app_id, control_request(request_id))
+                    .await;
+                let expired = super::restart_wait::begin_admission().unwrap_err();
+                assert!(
+                    expired
+                        .operation_in_progress_data()
+                        .unwrap()
+                        .holder_operation_id
+                        .is_none(),
+                    "a dispatched write's unknown outcome must invalidate previous diagnostics"
+                );
+                result
+            })
             .await
     });
     tokio::time::timeout(Duration::from_secs(2), started.wait())

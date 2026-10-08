@@ -322,10 +322,7 @@ impl AppService {
             let lease = loop {
                 let attempt = if let Some(deadline) = deadline {
                     if tokio::time::Instant::now() >= deadline {
-                        return Err(AppOperationError::operation_in_progress(
-                            None,
-                            shared_types::OperationInProgressData::default(),
-                        ));
+                        return Err(super::restart_wait::deadline_exhausted());
                     }
                     // Read-only checks may have yielded while the HTTP receiver
                     // disappeared. Do not start another physical lease write.
@@ -351,6 +348,7 @@ impl AppService {
                     let completed = tokio::select! {
                         result = task => result,
                         () = tokio::time::sleep_until(deadline) => {
+                            super::restart_wait::invalidate_diagnostic()?;
                             return Err(AppOperationError::Diagnostic(shared_types::WakeFailure::new(
                                 shared_types::ERR_OPERATION_OUTCOME_UNKNOWN,
                                 "operation_lease_acquire",
@@ -379,6 +377,7 @@ impl AppService {
                 };
                 match attempt {
                     Ok(acquired) => {
+                        super::restart_wait::invalidate_diagnostic()?;
                         break acquired.ok_or_else(|| {
                             AppOperationError::Backend(
                                 "Kubernetes runtime does not support application operation leases"
@@ -398,21 +397,18 @@ impl AppService {
                         detail,
                     )) => {
                         tracing::debug!(app_id, %detail, "runtime lease holder diagnostic");
+                        super::restart_wait::observe_physical_conflict(app_id, scope, &detail)?;
                         let diagnostic =
                             self.operation_lock_conflict_scoped(app_id, scope, None, Some(&detail));
                         return Err(match deadline {
-                            Some(deadline) => tokio::time::timeout_at(deadline, diagnostic)
-                                .await
-                                .unwrap_or_else(|_| {
-                                    AppOperationError::operation_in_progress(
-                                        None,
-                                        shared_types::OperationInProgressData::default(),
-                                    )
-                                }),
+                            Some(deadline) => {
+                                super::restart_wait::bounded_diagnostic(deadline, diagnostic).await
+                            }
                             None => diagnostic.await,
                         });
                     }
                     Err(error) => {
+                        super::restart_wait::invalidate_diagnostic()?;
                         return Err(if deadline.is_some() {
                             crate::utils::map_runtime_mutation_error(
                                 "operation_lease_acquire",
@@ -462,13 +458,15 @@ impl AppService {
                 Ok::<_, AppOperationError>(file)
             };
             let file = match deadline {
-                Some(deadline) => tokio::time::timeout_at(deadline, prepare_file).await
-                    .map_err(|_| AppOperationError::Backend("Restart admission file observation exceeded total wait budget before acceptance".into()))??,
+                Some(deadline) => super::restart_wait::bounded_read(deadline, prepare_file).await?,
                 None => prepare_file.await?,
             };
             loop {
                 match file.try_lock() {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        super::restart_wait::invalidate_diagnostic()?;
+                        break;
+                    }
                     Err(TryLockError::WouldBlock) if wait => {
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await
                     }
@@ -476,14 +474,9 @@ impl AppService {
                         let diagnostic =
                             self.operation_lock_conflict_scoped(app_id, scope, None, None);
                         return Err(match deadline {
-                            Some(deadline) => tokio::time::timeout_at(deadline, diagnostic)
-                                .await
-                                .unwrap_or_else(|_| {
-                                    AppOperationError::operation_in_progress(
-                                        None,
-                                        shared_types::OperationInProgressData::default(),
-                                    )
-                                }),
+                            Some(deadline) => {
+                                super::restart_wait::bounded_diagnostic(deadline, diagnostic).await
+                            }
                             None => diagnostic.await,
                         });
                     }

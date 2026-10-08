@@ -18,6 +18,7 @@ pub(crate) struct RestartAdmission {
     disconnected: AtomicBool,
     cancellation: tokio_util::sync::CancellationToken,
     deadline: std::sync::OnceLock<tokio::time::Instant>,
+    diagnostic: std::sync::Mutex<RestartDiagnostic>,
 }
 impl Default for RestartAdmission {
     fn default() -> Self {
@@ -26,9 +27,16 @@ impl Default for RestartAdmission {
             disconnected: AtomicBool::new(false),
             cancellation: tokio_util::sync::CancellationToken::new(),
             deadline: std::sync::OnceLock::new(),
+            diagnostic: std::sync::Mutex::new(RestartDiagnostic::default()),
         }
     }
 }
+#[derive(Default)]
+struct RestartDiagnostic {
+    target: Option<(String, Option<String>)>,
+    holder: Option<super::operation_progress::VerifiedHolderDiagnostic>,
+}
+
 tokio::task_local! {
     static RESTART_ADMISSION: Arc<RestartAdmission>;
 }
@@ -60,10 +68,7 @@ impl RestartAdmission {
             .get()
             .is_some_and(|deadline| tokio::time::Instant::now() >= *deadline)
         {
-            return Err(AppOperationError::operation_in_progress(
-                None,
-                shared_types::OperationInProgressData::default(),
-            ));
+            return Err(deadline_exhausted());
         }
         match self
             .phase
@@ -73,6 +78,61 @@ impl RestartAdmission {
             _ => Err(abandoned()),
         }
     }
+    fn diagnostic(&self) -> AppResult<std::sync::MutexGuard<'_, RestartDiagnostic>> {
+        self.diagnostic.lock().map_err(|_| {
+            AppOperationError::Backend("Restart admission diagnostic state is poisoned".into())
+        })
+    }
+
+    fn bind_target(&self, app_id: &str, lifecycle_id: Option<&str>) -> AppResult<()> {
+        let mut diagnostic = self.diagnostic()?;
+        if diagnostic.holder.as_ref().is_some_and(|holder| {
+            holder.app_id != app_id || lifecycle_id.is_some_and(|id| holder.lifecycle_id != id)
+        }) {
+            diagnostic.holder = None;
+        }
+        diagnostic.target = Some((app_id.into(), lifecycle_id.map(str::to_owned)));
+        Ok(())
+    }
+
+    fn remember_holder(
+        &self,
+        observation: &AppResult<super::operation_progress::HolderObservation>,
+    ) -> AppResult<()> {
+        let mut diagnostic = self.diagnostic()?;
+        // A completed unknown/foreign/change observation or real read error
+        // supersedes every previous diagnostic, even if its timeout is imminent.
+        diagnostic.holder = match observation {
+            Ok(observation) => observation.verified.clone().filter(|holder| {
+                matches!(
+                    holder.blocker.scope,
+                    UserAppOperationScope::Prod | UserAppOperationScope::Application
+                ) && diagnostic
+                    .target
+                    .as_ref()
+                    .is_none_or(|(app_id, lifecycle_id)| {
+                        holder.app_id == *app_id
+                            && lifecycle_id
+                                .as_ref()
+                                .is_none_or(|id| holder.lifecycle_id == *id)
+                    })
+            }),
+            Err(_) => None,
+        };
+        Ok(())
+    }
+
+    fn deadline_error(&self) -> AppOperationError {
+        let holder = match self.diagnostic() {
+            Ok(diagnostic) => diagnostic.holder.clone(),
+            Err(error) => return error,
+        };
+        holder.map_or_else(
+            unknown_holder,
+            super::operation_progress::VerifiedHolderDiagnostic::into_deadline_error,
+        )
+    }
+
     fn rejected(&self) {
         if self.disconnected.load(Ordering::SeqCst) {
             self.phase.store(CANCELLED, Ordering::SeqCst);
@@ -116,9 +176,7 @@ pub(crate) async fn prepare<T>(future: impl Future<Output = AppResult<T>>) -> Ap
         return future.await;
     };
     tokio::select! {
-        result = tokio::time::timeout_at(deadline, future) => {
-            result.map_err(|_| AppOperationError::operation_in_progress(None, shared_types::OperationInProgressData::default()))?
-        }
+        result = bounded_read(deadline, future) => result,
         () = context.cancellation.cancelled() => Err(abandoned()),
     }
 }
@@ -138,18 +196,128 @@ pub(crate) fn check_waiting() -> AppResult<()> {
     }
 }
 
-async fn bounded_read<T>(
+fn unknown_holder() -> AppOperationError {
+    AppOperationError::operation_in_progress(None, shared_types::OperationInProgressData::default())
+}
+
+/// Only exhaustion of a read/admission budget may use the last completed read.
+/// This does no I/O and must not be used for a dispatched mutation's unknown result.
+pub(super) fn deadline_exhausted() -> AppOperationError {
+    RESTART_ADMISSION
+        .try_with(|context| context.deadline_error())
+        .unwrap_or_else(|_| unknown_holder())
+}
+
+pub(super) fn remember_holder(
+    observation: &AppResult<super::operation_progress::HolderObservation>,
+) -> AppResult<()> {
+    RESTART_ADMISSION
+        .try_with(|context| context.remember_holder(observation))
+        .unwrap_or(Ok(()))
+}
+
+pub(super) fn invalidate_diagnostic() -> AppResult<()> {
+    retain_diagnostic(|_| false)
+}
+
+fn retain_diagnostic(
+    compatible: impl FnOnce(&super::operation_progress::VerifiedHolderDiagnostic) -> bool,
+) -> AppResult<()> {
+    RESTART_ADMISSION
+        .try_with(|context| {
+            let mut diagnostic = context.diagnostic()?;
+            if diagnostic
+                .holder
+                .as_ref()
+                .is_some_and(|holder| !compatible(holder))
+            {
+                diagnostic.holder = None;
+            }
+            Ok(())
+        })
+        .unwrap_or(Ok(()))
+}
+
+fn bind_target(app_id: &str, lifecycle_id: Option<&str>) -> AppResult<()> {
+    RESTART_ADMISSION
+        .try_with(|context| context.bind_target(app_id, lifecycle_id))
+        .unwrap_or(Ok(()))
+}
+
+/// New facts invalidate incompatible history before the next fallible read.
+/// Compatibility keeps an old diagnostic only; it does not verify a new holder.
+pub(super) fn observe_physical_conflict(
+    app_id: &str,
+    scope: UserAppOperationScope,
+    physical: &shared_types::UserAppOperationInProgress,
+) -> AppResult<()> {
+    retain_diagnostic(|holder| holder.matches_physical(app_id, scope, physical))
+}
+
+pub(super) fn observe_application(app: &shared_types::UserAppLifecycleRecord) -> AppResult<()> {
+    retain_diagnostic(|holder| holder.matches_application(app))
+}
+
+pub(super) fn observe_expected_blocker(
+    blocker: &shared_types::UserAppOperationBlocker,
+) -> AppResult<()> {
+    retain_diagnostic(|holder| holder.blocker == *blocker)
+}
+
+pub(super) fn observe_application_option(
+    app: Option<&shared_types::UserAppLifecycleRecord>,
+) -> AppResult<()> {
+    match app {
+        Some(app) => observe_application(app),
+        None => invalidate_diagnostic(),
+    }
+}
+
+pub(super) fn observe_record(
+    app_id: &str,
+    lifecycle_id: &str,
+    blocker: &shared_types::UserAppOperationBlocker,
+    revision: i64,
+) -> AppResult<()> {
+    retain_diagnostic(|holder| {
+        holder.app_id == app_id
+            && holder.lifecycle_id == lifecycle_id
+            && holder.blocker == *blocker
+            && holder.revision == revision
+    })
+}
+
+pub(super) fn observe_updated_at(updated: Option<chrono::DateTime<chrono::Utc>>) -> AppResult<()> {
+    retain_diagnostic(|holder| updated.is_some() && holder.matches_updated_at(updated))
+}
+
+pub(super) async fn bounded_diagnostic(
+    deadline: tokio::time::Instant,
+    future: impl Future<Output = AppOperationError>,
+) -> AppOperationError {
+    if tokio::time::Instant::now() >= deadline {
+        return deadline_exhausted();
+    }
+    tokio::time::timeout_at(deadline, future)
+        .await
+        .unwrap_or_else(|_| deadline_exhausted())
+}
+
+pub(super) async fn bounded_read<T>(
     deadline: tokio::time::Instant,
     future: impl Future<Output = AppResult<T>>,
 ) -> AppResult<T> {
-    tokio::time::timeout_at(deadline, future)
-        .await
-        .map_err(|_| {
-            AppOperationError::Backend(
-                "Restart admission read exceeded its total wait budget; no business was accepted"
-                    .into(),
-            )
-        })?
+    if tokio::time::Instant::now() >= deadline {
+        return Err(deadline_exhausted());
+    }
+    match tokio::time::timeout_at(deadline, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => {
+            invalidate_diagnostic()?;
+            Err(error)
+        }
+        Err(_) => Err(deadline_exhausted()),
+    }
 }
 
 impl AppService {
@@ -183,25 +351,33 @@ impl AppService {
                 blocker: Some(blocker),
                 ..
             } => Some(blocker.as_ref()),
-            AppOperationError::OperationInProgress { blocker: None, .. } => return Err(error),
+            AppOperationError::OperationInProgress { blocker: None, .. } => {
+                invalidate_diagnostic()?;
+                return Err(error);
+            }
             AppOperationError::ConflictBlocked { blocker, .. } => Some(blocker),
-            _ => return Err(error),
+            _ => {
+                invalidate_diagnostic()?;
+                return Err(error);
+            }
         };
         if error.operation_id().is_some() {
             return Err(error);
         }
+        if let Some(expected) = expected {
+            observe_expected_blocker(expected)?;
+        }
         check_waiting()?;
-        let holder = match tokio::time::timeout_at(
+        let holder = bounded_read(
             deadline,
             self.observe_operation_holder(app_id, UserAppOperationScope::Prod, expected, None),
         )
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => return Err(error),
-        };
-        if !holder.may_wait || tokio::time::Instant::now() >= deadline {
+        .await?;
+        if !holder.may_wait {
             return Err(holder.into_error());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(deadline_exhausted());
         }
         let cancel = cancellation();
         tokio::select! {
@@ -209,7 +385,7 @@ impl AppService {
             () = cancel.cancelled() => return Err(abandoned()),
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(holder.into_error());
+            return Err(deadline_exhausted());
         }
         Ok(())
     }
@@ -220,13 +396,11 @@ impl AppService {
         lifecycle_id: Option<&str>,
         deadline: tokio::time::Instant,
     ) -> AppResult<AppOperationGuard> {
+        bind_target(app_id, lifecycle_id)?;
         loop {
             check_waiting()?;
             if tokio::time::Instant::now() >= deadline {
-                return Err(AppOperationError::operation_in_progress(
-                    None,
-                    shared_types::OperationInProgressData::default(),
-                ));
+                return Err(deadline_exhausted());
             }
             bounded_read(
                 deadline,
@@ -234,11 +408,13 @@ impl AppService {
                     .validate_request_lifecycle(app_id, lifecycle_id),
             )
             .await?;
-            if let Some(app) = bounded_read(deadline, async {
+            let app = bounded_read(deadline, async {
                 Ok(self.metadata.store.get_application(app_id).await?)
             })
-            .await?
-            {
+            .await?;
+            observe_application_option(app.as_ref())?;
+            if let Some(app) = app {
+                bind_target(app_id, Some(&app.lifecycle_id))?;
                 let status = bounded_read(deadline, async {
                     Ok(self
                         .metadata
@@ -271,19 +447,11 @@ impl AppService {
                 .clone();
             let result = match lock.try_lock_owned() {
                 Ok(process) => self.operation_guard_until(app_id, process, deadline).await,
-                Err(_) => Err(
-                    tokio::time::timeout_at(deadline, self.prod_lock_conflict(app_id))
-                        .await
-                        .unwrap_or_else(|_| {
-                            AppOperationError::operation_in_progress(
-                                None,
-                                shared_types::OperationInProgressData::default(),
-                            )
-                        }),
-                ),
+                Err(_) => Err(bounded_diagnostic(deadline, self.prod_lock_conflict(app_id)).await),
             };
             match result {
                 Ok(guard) => {
+                    invalidate_diagnostic()?;
                     // Recheck after the lease acquisition, before admission;
                     // a priority intent can race both read-only checks.
                     bounded_read(
@@ -293,11 +461,12 @@ impl AppService {
                     )
                     .await?;
                     check_waiting()?;
-                    if let Some(app) = bounded_read(deadline, async {
+                    let app = bounded_read(deadline, async {
                         Ok(self.metadata.store.get_application(app_id).await?)
                     })
-                    .await?
-                    {
+                    .await?;
+                    observe_application_option(app.as_ref())?;
+                    if let Some(app) = app {
                         let status = bounded_read(deadline, async {
                             Ok(self
                                 .metadata
