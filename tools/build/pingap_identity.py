@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Read Pingap's paired source identity; parse actual executable versions exactly."""
+import argparse
 import json
 from pathlib import Path
 import re
+import sys
 
 _PRERELEASE_ID = r'(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
 _SEMVER = (r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)'
@@ -50,5 +52,24 @@ def source_identity(root=None):
     return {'version': version, 'commit': commit}
 
 
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--repo-root', type=Path)
+    parser.add_argument('--field', choices=['version', 'commit', 'pair'])
+    args = parser.parse_args()
+    try:
+        identity = source_identity(args.repo_root)
+    except (OSError, ValueError) as error:
+        print('Pingap source identity: ' + str(error), file=sys.stderr)
+        return 1
+    if args.field == 'pair':
+        print(identity['version'] + ' ' + identity['commit'])
+    elif args.field:
+        print(identity[args.field])
+    else:
+        print(json.dumps(identity, sort_keys=True))
+    return 0
+
+
 if __name__ == '__main__':
-    print(json.dumps(source_identity(), sort_keys=True))
+    raise SystemExit(main())

@@ -16,8 +16,8 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-PINGAP_VERSION = '0.15.0'
-PINGAP_COMMIT = '8270a1ebb7a238ea86fa220215714613410378bb'
+sys.path.insert(0, str(ROOT))
+from tools.build.pingap_identity import source_identity
 
 
 def prepare_context(root, destination):
@@ -31,11 +31,26 @@ def prepare_context(root, destination):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('runtime_dir', type=Path)
+    parser.add_argument('runtime_dir', type=Path, nargs='?')
     parser.add_argument('--also-runtime', action='store_true')
-    parser.add_argument('--pingap-version', default=os.environ.get('PINGAP_VERSION', PINGAP_VERSION))
-    parser.add_argument('--pingap-commit', default=os.environ.get('PINGAP_COMMIT', PINGAP_COMMIT))
+    parser.add_argument('--pingap-version', default=os.environ.get('PINGAP_VERSION'))
+    parser.add_argument('--pingap-commit', default=os.environ.get('PINGAP_COMMIT'))
+    parser.add_argument('--print-pingap-identity', action='store_true', help='只打印已解析构建身份，不下载或构建')
     args = parser.parse_args()
+    try:
+        identity = source_identity(ROOT)
+    except (OSError, ValueError) as error:
+        print('Pingap source identity: ' + str(error), file=sys.stderr)
+        return 1
+    if args.pingap_version is None:
+        args.pingap_version = identity['version']
+    if args.pingap_commit is None:
+        args.pingap_commit = identity['commit']
+    if args.print_pingap_identity:
+        print(args.pingap_version + ' ' + args.pingap_commit)
+        return 0
+    if args.runtime_dir is None:
+        parser.error('runtime_dir is required unless --print-pingap-identity is used')
     runtime = args.runtime_dir.resolve()
     status = subprocess.call([sys.executable, str(ROOT / 'k8s/scripts/pingap_version_gate.py'),
                               '--pingap-version', args.pingap_version, '--pingap-commit', args.pingap_commit])

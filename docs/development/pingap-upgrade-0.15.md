@@ -18,16 +18,34 @@ python3 k8s/scripts/pingap_version_gate.py \
 
 ## 构建仓使用准确源码
 
-在 build-agent-docker 中设置 `RCODER_SOURCE_REPO` 和完整
-`RCODER_SOURCE_COMMIT`。普通、direct 和 cluster 构建均从该 Git 对象生成
-私有上下文，并核验实际编译的版本权威。原有 `code/` 下的 clone 不会被
-checkout、覆盖或写回；脏 clone 可以保留。
+build-agent-docker 的默认版本选择只维护根 `versions.mk` 中的
+`PINGAP_VERSION`，提交号由可信发行资产清单推导。RCoder 的 Make/Python
+构建默认值直接读取本仓 app-cli 的 SDK 与运行身份契约，不重复写版本号。
+升级新版本时仍需更新并验证 SDK pin、身份与官方资产清单；仅改镜像版本
+字符串不能完成配套升级。
+
+普通、direct 和 cluster 构建无需源码变量：优先读取相邻 `rcoder` 仓库中
+与 `RCODER_BRANCH` 匹配的已提交 HEAD，否则在独立缓存中获取配置分支。
+同一轮所有镜像共用一份冻结源码；预检及实际 Docker COPY 都核验它。
+原有 `code/` 下的 clone 不会被 checkout、覆盖或写回，未提交的开发工作
+也不会自动进入默认构建。
+
+只检查默认输入，不启动镜像构建：
+
+```bash
+make runtime-preflight-all
+```
+
+需要构建某个精确提交时，可以显式选择：
 
 ```bash
 make runtime-preflight-all \
   RCODER_SOURCE_REPO=/path/to/rcoder \
   RCODER_SOURCE_COMMIT=<完整升级提交>
 ```
+
+仅传 `RCODER_SOURCE_REPO` 可选择该工作树内容。`make dev` 保留其原有
+构建及测试仓推送流程；预检通过不能替代完整镜像构建或发布验收。
 
 在每个架构上依次重建 app-runtime-base、app-runtime，以及安装 Pingap 的
 agent-runner 末层。RCoder 主镜像使用同一源码提交。记录源码摘要、官方

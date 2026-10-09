@@ -1,5 +1,7 @@
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -49,6 +51,24 @@ class PingapIdentityTests(unittest.TestCase):
             catalog.write_text(json.dumps({'repository': 'vicanso/pingap', 'releases': {'0.15.0': {'tag': 'v0.15.0', 'commit': 'b' * 40}}}))
             with self.assertRaisesRegex(ValueError, 'trusted official'):
                 source_identity(root)
+
+    def test_cli_fields_read_the_selected_source_without_building(self):
+        script = Path(__file__).resolve().parents[1] / 'build/pingap_identity.py'
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.fixture(root)
+            for field, expected in [('version', '0.15.0'), ('commit', 'a' * 40), ('pair', '0.15.0 ' + 'a' * 40)]:
+                with self.subTest(field=field):
+                    result = subprocess.run([sys.executable, str(script), '--repo-root', str(root), '--field', field], capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), expected)
+            self.assertFalse((root / '.cache').exists())
+            cargo = root / 'crates/app-cli/Cargo.toml'
+            cargo.write_text(cargo.read_text().replace('a' * 40, 'b' * 40))
+            result = subprocess.run([sys.executable, str(script), '--repo-root', str(root), '--field', 'version'], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, '')
+            self.assertIn('disagree', result.stderr)
 
     def test_version_parser_matches_whole_output(self):
         self.assertEqual(parse_pingap_version('pingap 0.15.0\n'), '0.15.0')

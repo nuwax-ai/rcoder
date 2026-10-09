@@ -1,159 +1,109 @@
 #!/usr/bin/env python3
-"""Pingap 版本一致性门禁（batch8-followup §5）。
+"""核验 Pingap 源码契约与实际构建参数。
 
-本地核对实际构建入口的 pingap 版本/commit 与 app-cli 单一事实源
-一致：
-  1. crates/app-cli/src/ 递归查找（DEFAULT_PINGAP_VERSION/COMMIT；aa07e6108 起
-     位于 src/build_deploy/devtool.rs，单一常量定义）
-  2. make/docker.mk（dev agent-runner 镜像构建注入）
-  3. docker/build-app-runtime.py（dev app-runtime 镜像 build-arg）
-  4. --cross-repo 时追加生产仓及启动脚本比较（默认不依赖另一仓）
-
-任一不一致即失败并列出全部实际值；显式允许的差异必须在此登记理由。
-用法：python3 k8s/scripts/pingap_version_gate.py [--repo-root DIR]
-退出码：0 一致 / 1 不一致或无法解析。
+默认版本由 app-cli 源码身份派生。门禁执行无副作用的 Make/Python 身份
+打印接口，核验真实默认值及环境覆盖；仅显式 --cross-repo 时读取构建仓。
 """
 import argparse
-import re
-import sys
+import os
 from pathlib import Path
+import re
+import subprocess
+import sys
 
-# 允许的差异登记（文件 → 理由）。当前为空——三平台同步后应保持为空。
-ALLOWED_DIVERGENCE: dict[str, str] = {}
-
-VERSION_RE = re.compile(
-    r'PINGAP_VERSION\s*[?:]?=\s*[\"\']?(\d+\.\d+\.\d+)"?'
-)
-COMMIT_RE = re.compile(
-    r'PINGAP_COMMIT\s*[?:]?=\s*[\"\']?([0-9a-f]{40})"?'
-)
-DEVTOOL_VERSION_RE = re.compile(r'DEFAULT_PINGAP_VERSION:\s*&str\s*=\s*"(\d+\.\d+\.\d+)"')
-DEVTOOL_COMMIT_RE = re.compile(r'DEFAULT_PINGAP_COMMIT:\s*&str\s*=\s*"([0-9a-f]{40})"')
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tools.build.pingap_identity import source_identity
 
 
-def read(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8")
-    except OSError as error:
-        print(f"FAIL: 无法读取 {path}: {error}")
-        sys.exit(1)
+def environment(defaults=False):
+    env = os.environ.copy()
+    # 子 Make 不应继承调用者的目标、-n/-j 或命令行变量。实际构建参数在下方
+    # 独立核验，默认值检查也不能被正确的显式覆盖掩盖。
+    for name in ('MAKEFLAGS', 'MFLAGS', 'MAKELEVEL', 'MAKEOVERRIDES', 'GNUMAKEFLAGS', 'MAKEFILES'):
+        env.pop(name, None)
+    if defaults:
+        for name in ('PINGAP_VERSION', 'PINGAP_COMMIT', 'PINGAP_DL_VERSION'):
+            env.pop(name, None)
+    return env
 
 
-def extract(text: str, patterns: list[re.Pattern]) -> tuple[str, ...] | None:
-    values = []
-    for pattern in patterns:
-        match = pattern.search(text)
-        if not match:
-            return None
-        values.append(match.group(1))
+def read_pair(command, root, env):
+    result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise ValueError('身份打印失败: ' + (result.stderr.strip() or result.stdout.strip()))
+    values = result.stdout.strip().split()
+    if len(values) != 2 or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', values[0]) or not re.fullmatch(r'[0-9a-f]{40}', values[1]):
+        raise ValueError('身份打印结果格式错误: ' + repr(result.stdout))
     return tuple(values)
 
 
-def find_authority(src_root: Path) -> tuple[tuple[str, str], Path] | None:
-    """递归查找 DEFAULT_PINGAP_VERSION/COMMIT 单一定义。
-
-    aa07e6108 把 devtool.rs 从 src/ 平铺移入 src/build_deploy/；改为对
-    crates/app-cli/src/ 递归查找（与 release-app-cli.yml 同法），文件再移动
-    不破坏门禁。常量消失或存在冲突定义仍 fail-fast。
-    """
-    found: dict[tuple[str, str], Path] = {}
-    for path in sorted(src_root.rglob('*.rs')):
-        pair = extract(read(path), [DEVTOOL_VERSION_RE, DEVTOOL_COMMIT_RE])
-        if pair is not None:
-            found.setdefault(tuple(pair), path)
-    if len(found) == 1:
-        pair, path = next(iter(found.items()))
-        return pair, path
-    if len(found) > 1:
-        for pair, path in found.items():
-            print(f"FAIL: DEFAULT_PINGAP_VERSION/COMMIT 存在冲突定义 {pair}：{path}")
-    return None
+def consumer_pairs(root, env):
+    return {
+        'make/docker.mk（dev agent-runner 注入）': read_pair(
+            ['make', '--no-print-directory', '-s', '-f', 'make/docker.mk', 'print-pingap-build-identity'], root, env),
+        'docker/build-app-runtime.py（dev app-runtime build-arg）': read_pair(
+            [sys.executable, str(root / 'docker/build-app-runtime.py'), '--print-pingap-identity'], root, env),
+    }
 
 
-def main() -> int:
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--repo-root",
-        type=Path,
-        default=Path(__file__).resolve().parents[2],
-        help="rcoder 仓库根（默认：脚本位置的上级上级）",
-    )
-    parser.add_argument(
-        "--build-agent-docker",
-        type=Path,
-        default=None,
-        help="build-agent-docker 仓库根",
-    )
-    parser.add_argument("--cross-repo", action="store_true", help="显式核对生产仓版本和启动脚本")
-    parser.add_argument("--pingap-version")
-    parser.add_argument("--pingap-commit")
-    parser.add_argument("--download-version")
-    parser.add_argument("--node-version")
+    parser.add_argument('--repo-root', type=Path, default=Path(__file__).resolve().parents[2])
+    parser.add_argument('--build-agent-docker', type=Path)
+    parser.add_argument('--cross-repo', action='store_true', help='显式核对构建仓版本和启动脚本')
+    parser.add_argument('--pingap-version')
+    parser.add_argument('--pingap-commit')
+    parser.add_argument('--download-version')
+    parser.add_argument('--node-version')
     args = parser.parse_args()
-    root: Path = args.repo_root
-    bad: Path = args.build_agent_docker or root.parent / "build-agent-docker"
-    if args.node_version and not re.fullmatch(r'22\.\d+\.\d+', args.node_version):
-        print(f"FAIL: Node 运行时必须保持 22，当前输入 {args.node_version}")
+    root = args.repo_root.resolve()
+    bad = (args.build_agent_docker or root.parent / 'build-agent-docker').resolve()
+    if args.node_version and not re.fullmatch(r'22\.[0-9]+\.[0-9]+', args.node_version):
+        print('FAIL: Node 运行时必须保持 22，当前输入 ' + args.node_version)
         return 1
-
-    sources: list[tuple[str, Path, list[re.Pattern]]] = [
-        ("make/docker.mk（dev agent-runner 注入）", root / "make/docker.mk",
-         [VERSION_RE, COMMIT_RE]),
-        ("docker/build-app-runtime.py（dev app-runtime build-arg）", root / "docker/build-app-runtime.py",
-         [VERSION_RE, COMMIT_RE]),
-    ]
-
-    if args.cross_repo or args.build_agent_docker:
-        sources.append(("build-agent-docker versions.mk（生产）", bad / "versions.mk", [VERSION_RE, COMMIT_RE]))
-    results: dict[str, tuple[str, str] | None] = {}
-    for label, path, patterns in sources:
-        if not path.exists():
-            print(f"FAIL: {label} 文件不存在：{path}")
-            return 1
-        results[label] = extract(read(path), patterns)
-
-    authority_found = find_authority(root / "crates" / "app-cli" / "src")
-    if authority_found is None:
-        print("FAIL: 无法在 crates/app-cli/src 递归解析唯一的 DEFAULT_PINGAP_VERSION/COMMIT")
+    try:
+        identity = source_identity(root)
+    except (OSError, ValueError) as error:
+        print('FAIL: app-cli 实际 pingap-config rev 或运行时身份不一致: ' + str(error))
         return 1
-    authority, authority_path = authority_found
-
+    authority = (identity['version'], identity['commit'])
+    try:
+        defaults = consumer_pairs(root, environment(defaults=True))
+        results = {label + '默认': value for label, value in defaults.items()}
+        actual = consumer_pairs(root, environment())
+        results.update({label + '当前环境': value for label, value in actual.items() if value != defaults[label]})
+        if args.cross_repo or args.build_agent_docker:
+            results['build-agent-docker versions.mk（生产默认）'] = read_pair(
+                [sys.executable, str(bad / 'scripts/build/pingap_config.py'), '--root', str(bad), '--field', 'pair'],
+                bad, environment(defaults=True))
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print('FAIL: 无法读取实际构建身份: ' + str(error))
+        return 1
+    if args.pingap_version is not None or args.pingap_commit is not None:
+        results['当前请求 Pingap build args'] = (args.pingap_version, args.pingap_commit)
+    if args.download_version is not None:
+        results['当前请求 Pingap 下载版本'] = (args.download_version, authority[1])
     failures = []
-    cargo = root / 'crates/app-cli/Cargo.toml'
-    dependency = re.search(r'pingap-config\s*=\s*\{[^\n]*rev\s*=\s*"([0-9a-f]{40})"', read(cargo))
-    if not dependency or dependency.group(1) != authority[1]:
-        print('FAIL: app-cli 实际 pingap-config rev 与运行时常量不一致')
-        failures.append(('pingap-config rev', dependency.group(1) if dependency else None))
-    if args.pingap_version or args.pingap_commit:
-        results["当前请求 Pingap build args"] = (args.pingap_version, args.pingap_commit)
-    if args.download_version and args.download_version != authority[0]:
-        results["当前请求 Pingap 下载版本"] = (args.download_version, authority[1])
     if args.cross_repo or args.build_agent_docker:
         for name in ('start-up.sh', 'start-up-common.sh', 'start-up-docker-extra.sh', 'start-up-k8s-extra.sh'):
             local = root / 'docker/rcoder-agent-runner' / name
             production = bad / 'build_config/rcoder-agent-runner' / name
             if not local.exists() or not production.exists() or local.read_bytes() != production.read_bytes():
-                print(f"FAIL: 构建仓启动契约不一致: {name}")
-                failures.append((name, None))
-    print(f"单一事实源（{authority_path.relative_to(root)}）：pingap {authority[0]} @ {authority[1][:12]}")
+                print('FAIL: 构建仓启动契约不一致: ' + name)
+                failures.append(name)
+    print(f'源码契约：pingap {authority[0]} @ {authority[1][:12]}')
     for label, value in results.items():
-        if label in ALLOWED_DIVERGENCE:
-            print(f"  [允许差异] {label}: {value}（理由：{ALLOWED_DIVERGENCE[label]}）")
-            continue
         if value != authority:
-            failures.append((label, value))
-            print(f"  [不一致] {label}: {value}")
+            failures.append(label)
+            print(f'  [不一致] {label}: {value}')
         else:
-            print(f"  [一致]   {label}")
-
+            print(f'  [一致]   {label}')
     if failures:
-        print(f"\nFAIL: {len(failures)} 处 pingap 版本漂移——镜像内二进制与 app-cli")
-        print("      链接的 pingap-config 序列化不一致会导致 config_hash 确认恒失败")
-        print("      （2026-09-19 第八批根因）。同步全部入口后重试。")
+        print(f'\nFAIL: {len(failures)} 处 pingap 版本漂移；构建参数必须与所选 app-cli 源码配对')
         return 1
-    print("\nOK: 全部构建入口 pingap 版本一致")
+    print('\nOK: 全部构建入口 pingap 版本一致')
     return 0
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == '__main__':
+    raise SystemExit(main())

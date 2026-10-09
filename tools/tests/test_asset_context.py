@@ -2,6 +2,8 @@ import importlib.util
 import concurrent.futures
 import json
 import hashlib
+import os
+import re
 import shutil
 from pathlib import Path
 import subprocess
@@ -164,13 +166,21 @@ class AssetContextTests(unittest.TestCase):
 
 class VersionGateTests(unittest.TestCase):
     def fixture(self, root):
-        for relative in ('make/docker.mk', 'docker/build-app-runtime.py', 'crates/app-cli/Cargo.toml', 'crates/app-cli/src/build_deploy/devtool.rs'):
+        for relative in ('make/docker.mk', 'docker/build-app-runtime.py', 'tools/build/pingap_identity.py',
+                         'tools/build/pingap-assets.json', 'crates/app-cli/Cargo.toml', 'crates/app-cli/src/build_deploy/devtool.rs'):
             target = root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes((ROOT / relative).read_bytes())
 
-    def run_gate(self, root, *extra):
-        return subprocess.run(['python3', str(ROOT / 'k8s/scripts/pingap_version_gate.py'), '--repo-root', str(root), *extra], capture_output=True, text=True)
+    def run_gate(self, root, *extra, env=None):
+        return subprocess.run(['python3', str(ROOT / 'k8s/scripts/pingap_version_gate.py'), '--repo-root', str(root), *extra], capture_output=True, text=True,
+                              env=env if env is not None else self.clean_environment())
+
+    def clean_environment(self):
+        env = os.environ.copy()
+        for name in ('PINGAP_VERSION', 'PINGAP_COMMIT', 'PINGAP_DL_VERSION', 'MAKEFLAGS', 'MFLAGS', 'GNUMAKEFLAGS', 'MAKEOVERRIDES', 'MAKEFILES'):
+            env.pop(name, None)
+        return env
 
     def test_local_is_self_contained_cross_repo_is_explicit(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -178,6 +188,35 @@ class VersionGateTests(unittest.TestCase):
             self.fixture(root)
             self.assertEqual(self.run_gate(root).returncode, 0)
             self.assertNotEqual(self.run_gate(root, '--cross-repo').returncode, 0)
+
+    def test_cross_repo_reads_dynamic_identity_and_rejects_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / 'rcoder'
+            bad = Path(temporary) / 'build-agent-docker'
+            self.fixture(root)
+            scripts = bad / 'scripts/build'
+            scripts.mkdir(parents=True)
+            # 受控外部身份提供方：版本没有 commit 字面量，门禁必须调用 CLI。
+            (bad / 'versions.mk').write_text('PINGAP_VERSION ?= 0.15.0\nPINGAP_COMMIT ?= $(shell resolve-release-metadata)\n')
+            (scripts / 'pingap_config.py').write_text(
+                'import json, sys\nfrom pathlib import Path\n'
+                'assert sys.argv[1] == "--root" and sys.argv[3:] == ["--field", "pair"]\n'
+                'identity = json.loads((Path(sys.argv[2]) / "identity.json").read_text())\n'
+                'print(identity["version"] + " " + identity["commit"])\n')
+            catalog = json.loads((root / 'tools/build/pingap-assets.json').read_text())
+            identity_path = bad / 'identity.json'
+            identity_path.write_text(json.dumps({'version': '0.15.0', 'commit': catalog['releases']['0.15.0']['commit']}))
+            for name in ('start-up.sh', 'start-up-common.sh', 'start-up-docker-extra.sh', 'start-up-k8s-extra.sh'):
+                for directory in (root / 'docker/rcoder-agent-runner', bad / 'build_config/rcoder-agent-runner'):
+                    directory.mkdir(parents=True, exist_ok=True)
+                    (directory / name).write_text('same startup contract\n')
+            result = self.run_gate(root, '--build-agent-docker', str(bad))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            identity_path.write_text(json.dumps({'version': '0.14.3', 'commit': 'b' * 40}))
+            result = self.run_gate(root, '--build-agent-docker', str(bad))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('0.14.3', result.stdout)
+            self.assertIn('versions.mk', result.stdout)
 
     def test_actual_override_and_config_revision_fail_before_build(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -192,6 +231,94 @@ class VersionGateTests(unittest.TestCase):
             result = self.run_gate(root)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('实际 pingap-config rev', result.stdout)
+
+    def test_defaults_follow_a_new_source_identity_without_consumer_edits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.fixture(root)
+            catalog_path = root / 'tools/build/pingap-assets.json'
+            catalog = json.loads(catalog_path.read_text())
+            old_version = '0.15.0'
+            old_commit = catalog['releases'][old_version]['commit']
+            new_version, new_commit = '0.16.0', 'a' * 40
+            for relative in ('crates/app-cli/Cargo.toml', 'crates/app-cli/src/build_deploy/devtool.rs'):
+                path = root / relative
+                path.write_text(path.read_text().replace(old_version, new_version).replace(old_commit, new_commit))
+            catalog['releases'][new_version] = {'tag': 'v' + new_version, 'commit': new_commit}
+            catalog_path.write_text(json.dumps(catalog))
+            result = self.run_gate(root, env=self.clean_environment())
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('pingap ' + new_version, result.stdout)
+
+    def test_wrong_defaults_are_not_hidden_by_matching_overrides(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.fixture(root)
+            import tomllib
+            commit = tomllib.loads((root / 'crates/app-cli/Cargo.toml').read_text())['dependencies']['pingap-config']['rev']
+            env = self.clean_environment()
+            env.update(PINGAP_VERSION='0.15.0', PINGAP_COMMIT=commit)
+            makefile = root / 'make/docker.mk'
+            original = makefile.read_text()
+            makefile.write_text(original.replace('PINGAP_VERSION ?= $(shell python3 tools/build/pingap_identity.py --field version)', 'PINGAP_VERSION ?= 0.1.0'))
+            result = self.run_gate(root, '--pingap-version', '0.15.0', '--pingap-commit', commit, env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('make/docker.mk', result.stdout)
+            self.assertIn('0.1.0', result.stdout)
+            makefile.write_text(original)
+            runtime = root / 'docker/build-app-runtime.py'
+            runtime.write_text(runtime.read_text().replace("args.pingap_version = identity['version']", "args.pingap_version = '0.1.0'"))
+            result = self.run_gate(root, '--pingap-version', '0.15.0', '--pingap-commit', commit, env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('docker/build-app-runtime.py', result.stdout)
+            self.assertIn('0.1.0', result.stdout)
+
+    def test_wrong_environment_override_fails_before_build(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.fixture(root)
+            env = self.clean_environment()
+            env['PINGAP_VERSION'] = '0.1.0'
+            result = self.run_gate(root, env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('当前环境', result.stdout)
+
+    def test_print_interfaces_do_not_download_or_run_docker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.fixture(root)
+            trap_bin = root / 'trap-bin'
+            trap_bin.mkdir()
+            marker = root / 'unexpected-external-call'
+            for name in ('docker', 'curl', 'wget'):
+                path = trap_bin / name
+                path.write_text('#!/bin/sh\nprintf called > "$UNEXPECTED_CALL_MARKER"\nexit 97\n')
+                path.chmod(0o755)
+            env = self.clean_environment()
+            env.update(PATH=str(trap_bin) + os.pathsep + env['PATH'], UNEXPECTED_CALL_MARKER=str(marker))
+            for command in (['make', '--no-print-directory', '-s', '-f', 'make/docker.mk', 'print-pingap-build-identity'],
+                            ['python3', str(root / 'docker/build-app-runtime.py'), '--print-pingap-identity']):
+                with self.subTest(command=command):
+                    result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertRegex(result.stdout.strip(), r'^0\.15\.0 [0-9a-f]{40}$')
+            self.assertFalse(marker.exists())
+            self.assertFalse((root / '.cache').exists())
+
+    def test_dev_deployment_inherits_builder_image_pingap_identity(self):
+        image = (ROOT / 'docker/rcoder-agent-runner/Dockerfile').read_text()
+        config = (ROOT / 'docker/config.yml').read_text()
+        compose = (ROOT / 'docker/docker-compose.yml').read_text()
+        for field in ('VERSION', 'COMMIT'):
+            # 锁写入者在 builder 中；版本必须来自构建参数烘焙的镜像环境。
+            self.assertRegex(image, re.compile(r'^ARG PINGAP_' + field + r'\s*$', re.MULTILINE))
+            self.assertIn('RCODER_PINGAP_' + field + '=${PINGAP_' + field + '}', image)
+            # 配置不能用静态值或空 env 覆盖镜像自带身份。
+            self.assertNotRegex(config, re.compile(r'^\s*RCODER_PINGAP_' + field + r'\s*:', re.MULTILINE))
+            self.assertNotRegex(compose, re.compile(r'^\s*-\s*RCODER_PINGAP_' + field + r'=', re.MULTILINE))
+        # digest 无法从 Pingap 编译身份推导，仍须独立提供给 release.lock 写入者。
+        self.assertRegex(config, re.compile(r'^\s*RCODER_RUNTIME_IMAGE_DIGEST:\s*"[^"\n]+"\s*$', re.MULTILINE))
+        self.assertRegex(compose, re.compile(r'^\s*-\s*RCODER_RUNTIME_IMAGE_DIGEST=\$\{RCODER_RUNTIME_IMAGE_DIGEST:-[^}\n]+\}\s*$', re.MULTILINE))
 
 
 if __name__ == '__main__':

@@ -232,10 +232,9 @@ docker_config:
           RUST_LOG: "debug"
           # agent_runner 进程读此 flag 启内嵌 file-server(build/文件接口入口 :60000)
           RCODER_EMBED_FILE_SERVER: "true"
-          # release lock 构建身份三元组（build 产 workspace-package 的 release.lock.toml 需要；
-          # 与 K8s 模式 env 透传、rcoder compose env 同源——值由部署环境注入）
-          RCODER_PINGAP_VERSION: "0.15.0"
-          RCODER_PINGAP_COMMIT: "8270a1ebb7a238ea86fa220215714613410378bb"
+          # release.lock 的 Pingap 身份继承 builder 镜像内的配对 ENV；
+          # 不在服务配置中覆盖，升级镜像后自动使用该镜像的身份。
+          # runtime digest 是独立部署元数据，仍由部署环境注入。
           RCODER_RUNTIME_IMAGE_DIGEST: "sha256:local-development"
         resource_limits:
           memory_limit: 8589934592 # 8GB（rust/maven 全量冷编内存峰值超 2G 会 swap 颠簸卡死——e2e 全链实测）
