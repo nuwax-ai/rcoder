@@ -1,6 +1,8 @@
 import importlib.util
 import concurrent.futures
 import json
+import hashlib
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -50,19 +52,25 @@ class AssetContextTests(unittest.TestCase):
         output = self.root / 'observed-context.txt'
         observer = self.root / 'observe-context.py'
         observer.write_text('import pathlib,sys\npathlib.Path(' + repr(str(output)) + ').write_text(sys.argv[-1])\n')
-        result = subprocess.run(['python3', str(ROOT / 'tools/build/asset_context.py'),
+        isolated = self.root / 'script-repository'
+        scripts = isolated / 'tools/build'
+        scripts.mkdir(parents=True)
+        for name in ('asset_context.py', 'runtime_assets.py'):
+            shutil.copy2(ROOT / 'tools/build' / name, scripts / name)
+        (scripts / 'pingap-assets.json').write_text(json.dumps(self.catalog))
+        result = subprocess.run(['python3', str(scripts / 'asset_context.py'),
                                  '--source', str(self.source()), '--ref-dir', str(self.root / 'refs'),
                                  '--kind', 'runtime', '--', 'python3', str(observer), '{context}'],
                                 cwd=self.root, capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         created = Path(output.read_text())
-        self.assertEqual(created.parent, ROOT / '.cache/build-contexts')
+        self.assertEqual(created.parent, (isolated / '.cache/build-contexts').resolve())
         self.assertFalse(created.exists(), 'completed private context was not cleaned')
 
     def test_snapshot_preserves_unrelated_assets_and_excludes_stale_versions(self):
         source = self.source()
         target = self.root / 'snapshot'
-        versions = context.snapshot(source, target, self.refs(), 'runtime')
+        versions = context.snapshot(source, target, self.refs(), 'runtime', trusted_catalog=self.catalog)
         self.assertEqual(versions['node'], '22.23.2')
         self.assertEqual((target / 'downloads/swagger-ui-v5.17.14.zip').read_bytes(), b'swagger')
         self.assertEqual((target / 'downloads/dbx-web-amd64').read_bytes(), b'dbx-amd64')
@@ -72,7 +80,7 @@ class AssetContextTests(unittest.TestCase):
 
     def test_agent_maps_pingap_to_downloads_without_node(self):
         target = self.root / 'snapshot'
-        context.snapshot(self.source(), target, self.refs(), 'agent')
+        context.snapshot(self.source(), target, self.refs(), 'agent', trusted_catalog=self.catalog)
         self.assertTrue((target / 'downloads/pingap-v0.14.3-linux-gnu-x86-full.tar.gz').exists())
         self.assertFalse(list((target / 'cache').glob('node-*')))
 
@@ -85,6 +93,23 @@ class AssetContextTests(unittest.TestCase):
         (Path(pointer['entry']) / 'manifest.json').write_text('{}')
         with self.assertRaisesRegex(ValueError, 'manifest changed'):
             context.snapshot(source, self.root / 'changed', refs, 'runtime')
+
+    def test_self_signed_pingap_manifest_cannot_replace_official_sha(self):
+        refs = self.refs()
+        ref = next(ref for ref in refs if ref.stem == 'pingap')
+        pointer = json.loads(ref.read_text())
+        entry = Path(pointer['entry'])
+        manifest = json.loads((entry / 'manifest.json').read_text())
+        relative = next(iter(manifest['files']))
+        (entry / relative).write_bytes(b'forged tarball')
+        checksum = assets.digest(entry / relative)
+        manifest['files'][relative] = checksum
+        manifest['identity']['trusted_release']['assets']['amd64']['sha256'] = checksum
+        assets.atomic_json(entry / 'manifest.json', manifest)
+        pointer['manifest_sha256'] = assets.digest(entry / 'manifest.json')
+        assets.atomic_json(ref, pointer)
+        with self.assertRaisesRegex(ValueError, 'trusted release identity'):
+            context.snapshot(self.source(), self.root / 'snapshot', refs, 'agent', trusted_catalog=self.catalog)
 
     def test_downloads_requires_explicit_component_contract(self):
         with self.assertRaisesRegex(ValueError, 'required components'):
@@ -161,7 +186,9 @@ class VersionGateTests(unittest.TestCase):
             self.assertNotEqual(self.run_gate(root, '--download-version', '0.1.0').returncode, 0)
             self.assertNotEqual(self.run_gate(root, '--node-version', '24.0.0').returncode, 0)
             cargo = root / 'crates/app-cli/Cargo.toml'
-            cargo.write_text(cargo.read_text().replace('cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8', '0' * 40))
+            import tomllib
+            revision = tomllib.loads(cargo.read_text())['dependencies']['pingap-config']['rev']
+            cargo.write_text(cargo.read_text().replace(revision, '0' * 40))
             result = self.run_gate(root)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('实际 pingap-config rev', result.stdout)

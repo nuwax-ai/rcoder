@@ -22,9 +22,6 @@ def artifact(release, probe, worker='import time; time.sleep(3600)', dev=False):
     original = zipfile.ZipFile(io.BytesIO(h.artifact(release, release)))
     lock = original.read('release.lock.toml').decode()
     lock = lock.replace('minimum_app_cli_version = "0.1.3"', 'minimum_app_cli_version = "0.3.9"')
-    lock = lock.replace('version = "0.14.1"', 'version = "0.14.3"')
-    lock = lock.replace('c74e4eaa44e64958cffa18c33e8bbf5995b6844f',
-                        'cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8')
     # Web health is explicit too, so supervisord must really check HTTP.
     lock = lock.replace('[services.health]', '[services.health]\nstartup_probe = "http"', 1)
     lock = lock.replace('startup_timeout_seconds = 3', 'startup_timeout_seconds = 20')

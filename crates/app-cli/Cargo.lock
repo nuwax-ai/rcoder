@@ -3081,8 +3081,8 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pingap-config"
-version = "0.14.3"
-source = "git+https://github.com/vicanso/pingap?rev=cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8#cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8"
+version = "0.15.0"
+source = "git+https://github.com/vicanso/pingap?rev=8270a1ebb7a238ea86fa220215714613410378bb#8270a1ebb7a238ea86fa220215714613410378bb"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3114,8 +3114,8 @@ dependencies = [
 
 [[package]]
 name = "pingap-core"
-version = "0.14.3"
-source = "git+https://github.com/vicanso/pingap?rev=cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8#cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8"
+version = "0.15.0"
+source = "git+https://github.com/vicanso/pingap?rev=8270a1ebb7a238ea86fa220215714613410378bb#8270a1ebb7a238ea86fa220215714613410378bb"
 dependencies = [
  "TinyUFO",
  "ahash",
@@ -3131,6 +3131,7 @@ dependencies = [
  "pingora-limits",
  "serde",
  "serde_json",
+ "sha2",
  "snafu",
  "strum 0.28.0",
  "tokio",
@@ -3139,8 +3140,8 @@ dependencies = [
 
 [[package]]
 name = "pingap-discovery"
-version = "0.14.3"
-source = "git+https://github.com/vicanso/pingap?rev=cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8#cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8"
+version = "0.15.0"
+source = "git+https://github.com/vicanso/pingap?rev=8270a1ebb7a238ea86fa220215714613410378bb#8270a1ebb7a238ea86fa220215714613410378bb"
 dependencies = [
  "async-trait",
  "bollard",
@@ -3156,8 +3157,8 @@ dependencies = [
 
 [[package]]
 name = "pingap-util"
-version = "0.14.3"
-source = "git+https://github.com/vicanso/pingap?rev=cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8#cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8"
+version = "0.15.0"
+source = "git+https://github.com/vicanso/pingap?rev=8270a1ebb7a238ea86fa220215714613410378bb#8270a1ebb7a238ea86fa220215714613410378bb"
 dependencies = [
  "aes-gcm-siv",
  "ahash",

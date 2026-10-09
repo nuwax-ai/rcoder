@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -106,7 +107,38 @@ def validate_archive(path, member, arch):
             raise ValueError('archive executable missing: ' + member)
 
 
-def verify(entry):
+def trusted_pingap_release(version, architectures, catalog=None):
+    """Resolve reviewed official checksums, independently of downloaded manifests.
+
+    Tests may explicitly supply a fixture catalog. The production CLI always
+    uses the adjacent tracked catalog; it has no untrusted environment override.
+    """
+    if catalog is None:
+        catalog = json.loads(Path(__file__).with_name('pingap-assets.json').read_text())
+    if catalog.get('protocol') != 'pingap-release-assets-v1' or catalog.get('repository') != 'vicanso/pingap':
+        raise ValueError('invalid trusted Pingap asset catalog')
+    release = catalog.get('releases', {}).get(version)
+    if not release:
+        raise ValueError('no trusted Pingap assets for version: ' + version)
+    if release.get('tag') != 'v' + version or not re.fullmatch(r'[0-9a-f]{40}', release.get('commit', '')):
+        raise ValueError('invalid trusted Pingap release identity')
+    architectures = list(architectures)
+    if not architectures or len(set(architectures)) != len(architectures):
+        raise ValueError('invalid Pingap architecture selection')
+    assets = {}
+    for arch in architectures:
+        if arch not in ('amd64', 'arm64'):
+            raise ValueError('unsupported Pingap architecture: ' + arch)
+        record = release.get('assets', {}).get(arch, {})
+        name = 'pingap-linux-gnu-' + ('x86' if arch == 'amd64' else 'aarch64') + '-full.tar.gz'
+        if record.get('name') != name or not isinstance(record.get('id'), int) or record['id'] <= 0 or not re.fullmatch(r'[0-9a-f]{64}', record.get('sha256', '')):
+            raise ValueError('invalid trusted Pingap asset: ' + arch)
+        assets[arch] = {**record, 'url': f'https://github.com/vicanso/pingap/releases/download/v{version}/{name}'}
+    return {'repository': catalog['repository'], 'tag': release['tag'],
+            'commit': release['commit'], 'assets': assets}
+
+
+def verify(entry, trusted_catalog=None):
     entry = Path(entry)
     manifest = json.loads((entry / 'manifest.json').read_text())
     if manifest.get('protocol') != 'runtime-assets-v1' or not manifest.get('files'):
@@ -115,19 +147,36 @@ def verify(entry):
         path = entry / relative
         if Path(relative).is_absolute() or '..' in Path(relative).parts or path.is_symlink() or digest(path) != checksum:
             raise ValueError('runtime asset checksum mismatch: ' + relative)
+    identity = manifest.get('identity', {})
+    if identity.get('component') == 'pingap':
+        version = identity.get('version', '')
+        inputs = identity.get('inputs', [])
+        release = trusted_pingap_release(version, [item[0] for item in inputs], trusted_catalog)
+        if identity.get('trusted_release') != release:
+            raise ValueError('Pingap manifest disagrees with trusted release identity')
+        expected = list(specs('pingap', version, release['assets']))
+        if inputs != identity_json(expected) or set(manifest['files']) != {item[1] for item in expected}:
+            raise ValueError('Pingap manifest disagrees with trusted architecture inputs')
+        for arch, relative, member, _ in expected:
+            checksum = release['assets'][arch]['sha256']
+            if manifest['files'][relative] != checksum or digest(entry / relative) != checksum:
+                raise ValueError('trusted Pingap asset checksum mismatch: ' + arch)
+            validate_archive(entry / relative, member, arch)
     return manifest
 
 
-def prepare(component, version, cache, architectures=('amd64', 'arm64'), downloader=download):
+def prepare(component, version, cache, architectures=('amd64', 'arm64'), downloader=download, trusted_catalog=None):
     cache = Path(cache).resolve() / 'v1'
     inputs = list(specs(component, version, architectures))
     identity = {'component': component, 'version': version, 'inputs': inputs, 'protocol': 'runtime-assets-v1'}
+    if component == 'pingap':
+        identity['trusted_release'] = trusted_pingap_release(version, [item[0] for item in inputs], trusted_catalog)
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     reference = cache / 'refs' / (key + '.json')
     with locked(cache / 'locks' / (key + '.lock')):
         try:
             entry = Path(json.loads(reference.read_text())['entry'])
-            if verify(entry)['identity'] == identity_json(identity):
+            if verify(entry, trusted_catalog)['identity'] == identity_json(identity):
                 return entry
         except (OSError, ValueError, KeyError, TypeError):
             pass
@@ -140,6 +189,8 @@ def prepare(component, version, cache, architectures=('amd64', 'arm64'), downloa
                 target.parent.mkdir(parents=True, exist_ok=True)
                 fetched = stage / ('download-' + arch)
                 downloader(urls, fetched)
+                if component == 'pingap' and digest(fetched) != identity['trusted_release']['assets'][arch]['sha256']:
+                    raise ValueError('trusted Pingap asset checksum mismatch: ' + arch)
                 if component == 'deno':
                     with zipfile.ZipFile(fetched) as archive:
                         if archive.testzip() is not None:
@@ -168,8 +219,8 @@ def identity_json(value):
     return json.loads(json.dumps(value))
 
 
-def distribute(entry, contexts):
-    manifest = verify(entry)
+def distribute(entry, contexts, trusted_catalog=None):
+    manifest = verify(entry, trusted_catalog)
     destinations = [(Path(context).resolve(), layout)
                     for context, layout in (value if isinstance(value, tuple) else (value, 'native')
                                             for value in contexts)]

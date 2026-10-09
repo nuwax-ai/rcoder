@@ -2,9 +2,12 @@
 import json
 from urllib.parse import quote
 from common import LABEL, digest
+import pingap_runtime_identity
 
 
-def render(c, images, password, registry_auth=None):
+def render(c, images, password, registry_auth=None, pingap_identity=None):
+    paired_source = pingap_runtime_identity.validate_receipt(pingap_identity)
+    pingap_runtime_identity.check_overrides(c, paired_source)
     import secrets as _secrets
     preview_token = _secrets.token_hex(24)
     labels = {LABEL: c.id}
@@ -114,8 +117,8 @@ def render(c, images, password, registry_auth=None):
            'RCODER_WORKSPACE_ROOT': '/app/project_workspace/apps', 'RCODER_CEPHFS_ROOT': '/app/cephfs-root',
            'RCODER_K8S_GATEWAY_NAME': 'rcoder', 'RCODER_K8S_GATEWAY_NAMESPACE': c.ns,
            'RCODER_RUNTIME_IMAGE_DIGEST': images['runtime'],
-           'RCODER_PINGAP_VERSION': c.get('PINGAP_VERSION', '0.14.1'),
-           'RCODER_PINGAP_COMMIT': c.get('PINGAP_COMMIT', 'c74e4eaa44e64958cffa18c33e8bbf5995b6844f'), 'ENABLE_TTYD': 'false', 'RUST_LOG': 'info'}
+           'RCODER_PINGAP_VERSION': paired_source['version'],
+           'RCODER_PINGAP_COMMIT': paired_source['commit'], 'ENABLE_TTYD': 'false', 'RUST_LOG': 'info'}
     if registry_auth:
         env['RCODER_K8S_IMAGE_PULL_SECRET'] = 'registry'
     mounts = [{'name': 'config', 'mountPath': '/app/config.yml', 'subPath': 'config.yml', 'readOnly': True},

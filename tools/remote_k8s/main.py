@@ -25,6 +25,7 @@ import registry
 import test_snapshot
 import build_cache
 import diagnostics
+import pingap_runtime_identity
 
 
 @contextmanager
@@ -154,6 +155,8 @@ def doctor(c):
 
 
 def build(c, expected_manifest=None):
+    pingap_source = pingap_runtime_identity.source_identity(ROOT)
+    pingap_runtime_identity.check_overrides(c, pingap_source)
     doctor(c)
     sync_start(c)
     build_started = time.monotonic()
@@ -191,6 +194,16 @@ def build(c, expected_manifest=None):
         receipt['bases'][key] = pinned
         base_args += ['--build-arg', key + '=' + pinned]
     receipt['timings']['base_resolution_ms'] = int((time.monotonic() - bases_started) * 1000)
+    try:
+        frozen_source = json.loads(c.ssh(['python3', frozen['path'] + '/tools/build/pingap_identity.py']))
+        if frozen_source != pingap_source:
+            raise ValueError('Frozen Pingap source identity differs from the selected checkout')
+        receipt['pingap_identity'] = pingap_runtime_identity.inspect_bases(c, receipt['bases'], frozen_source)
+        atomic_json(c.state / 'builds' / (build_id + '.json'), receipt)
+    except BaseException as error:
+        receipt.update(status='failed', error_type=type(error).__name__, failed_stage='pingap-base-preflight')
+        atomic_json(c.state / 'builds' / (build_id + '.json'), receipt)
+        raise
     # T06/Q03：缓存 key 锁定构建工具链实际 digest——同 tag 被 registry 更新后
     # 必须 miss。解析失败 → 本轮**完全禁用**缓存读写（不是给失败 key 加字样：
     # 稳定的失败 key 仍会命中上一轮同失败路径下写入的产物），构建继续用 tag
@@ -335,10 +348,12 @@ def outside_unchanged(c, before):
 
 
 def deploy(c):
-    baseline = outside_inventory(c)
     receipt = read_receipt(c, 'build.json')
     if receipt.get('status') != 'built' or set(receipt['images']) != {'rcoder', 'computer', 'runtime'}:
         raise RuntimeError('Incomplete build receipt')
+    pingap_runtime_identity.validate_receipt(receipt.get('pingap_identity'), receipt.get('bases'))
+    pingap_runtime_identity.check_overrides(c, receipt['pingap_identity']['source'])
+    baseline = outside_inventory(c)
     owned(c, 'namespace', c.ns, optional=True)
     secret = owned(c, 'secret', 'postgres', optional=True) if c.kube('get', 'namespace', c.ns, '--ignore-not-found').strip() else None
     if secret:
@@ -350,7 +365,7 @@ def deploy(c):
     if c.get('REGISTRY_AUTH', 'none') == 'docker':
         code = "import pathlib,json,sys;d=json.loads((pathlib.Path.home()/'.docker/config.json').read_text());a=d.get('auths',{}).get(sys.argv[1]);assert a and a.get('auth'), 'No inline Docker auth for registry';print(json.dumps({'auths':{sys.argv[1]:a}}))"
         auth = json.loads(c.ssh(['python3', '-c', code, c.get('REGISTRY').split('/')[0]]))
-    resources = render(c, receipt['images'], password, auth)
+    resources = render(c, receipt['images'], password, auth, receipt['pingap_identity'])
     # Preflight every name before performing any apply; never adopt existing foreign resources.
     for row in resources:
         if row['kind'] == 'Namespace' or 'namespace' not in row['metadata'] or c.kube('get', 'namespace', c.ns, '--ignore-not-found').strip():

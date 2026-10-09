@@ -15,8 +15,8 @@ BUILDX_BUILDER ?=
 
 # pingap 版本（单一事实源 = app-cli devtool.rs DEFAULT_PINGAP_VERSION/COMMIT；
 # k8s/scripts/pingap_version_gate.py 强制本文件与 build-app-runtime.py/生产仓一致）
-PINGAP_VERSION ?= 0.14.3
-PINGAP_COMMIT ?= cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8
+PINGAP_VERSION ?= 0.15.0
+PINGAP_COMMIT ?= 8270a1ebb7a238ea86fa220215714613410378bb
 
 # Docker 镜像构建（仅构建镜像，不编译）
 # 串行构建镜像，避免资源竞争

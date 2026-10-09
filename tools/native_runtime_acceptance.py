@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-from native_worker_smoke import alive, poll
+from native_worker_smoke import alive, poll, PINGAP_IDENTITY
 
 
 def main():
@@ -158,8 +158,8 @@ minimum_app_cli_version = "0.3.9"
 runtime_image_digest = ""
 [pingap]
 mode = "managed"
-version = "0.14.3"
-commit = "cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8"
+version = "{PINGAP_IDENTITY['version']}"
+commit = "{PINGAP_IDENTITY['commit']}"
 [[services]]
 service_id = "web"
 name = "web"

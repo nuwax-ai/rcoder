@@ -8,6 +8,7 @@
 from pathlib import Path
 import argparse
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -15,8 +16,8 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-PINGAP_VERSION = '0.14.3'
-PINGAP_COMMIT = 'cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8'
+PINGAP_VERSION = '0.15.0'
+PINGAP_COMMIT = '8270a1ebb7a238ea86fa220215714613410378bb'
 
 
 def prepare_context(root, destination):
@@ -64,8 +65,21 @@ def main():
                                   '-t', 'dev-app-runtime-base:latest', '-f', str(context / 'Dockerfile'), str(context)], cwd=ROOT)
         if status != 0 or not args.also_runtime:
             return status
+        base_spec = importlib.util.spec_from_file_location('runtime_base', ROOT / 'tools/build/runtime_base.py')
+        base = importlib.util.module_from_spec(base_spec)
+        base_spec.loader.exec_module(base)
+        try:
+            receipt = base.verify_base('dev-app-runtime-base:latest', args.pingap_version, args.pingap_commit, '22.23.2')
+            receipt['build_reference'] = base.pin_local_image(receipt['image_id'])
+        except (ValueError, OSError) as error:
+            print('runtime base validation: ' + str(error), file=sys.stderr)
+            return 1
+        print('RCoder runtime base: ' + json.dumps(receipt, sort_keys=True), flush=True)
         return subprocess.call(['docker', 'build', '--build-context', f'rcoder={source}',
-                                '--build-arg', 'BASE_IMAGE=dev-app-runtime-base:latest',
+                                '--build-arg', 'BASE_IMAGE=' + receipt['build_reference'],
+                                '--build-arg', 'PINGAP_VERSION=' + args.pingap_version,
+                                '--build-arg', 'PINGAP_COMMIT=' + args.pingap_commit,
+                                '--build-arg', 'NODE_RUNTIME_VERSION=22.23.2',
                                 '-t', 'dev-app-runtime:latest', '-f', str(context / 'Dockerfile.runtime'), str(context)], cwd=ROOT)
 
 

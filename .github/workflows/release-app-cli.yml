@@ -22,12 +22,12 @@ name: release-app-cli
 # - darwin 双架构：macos-latest native（x64 加 target 交叉）。
 # - windows x64：windows-latest native。app-cli.exe 的 aws-lc-sys（reqwest rustls）
 #   需要 protoc+nasm+cmake（cmake 预装）。
-# - pingap.exe：独立 job，从 crates/app-cli/Cargo.toml grep 出 pin 的官方 rev
-#   （单一事实源，构造性同步防漂移）→ checkout vicanso/pingap@rev →
+# - pingap.exe：独立 job，由 source_identity 核对 Cargo.toml 与 devtool 的
+#   官方版本/rev（单一事实源，漂移即失败）→ checkout vicanso/pingap@rev →
 #   `--no-default-features --features tls-rustls`（ring provider，无需 nasm/cmake；
-#   dist/ 占位已提交无需 build-web）。与 app-cli 的 pingap-config 库严格同 rev。
-# - pair-gate：windows 下用 fixture workspace 跑 `app-cli.exe gen-lock --workspace`，
-#   生成配置喂 `pingap.exe -t` —— 分发的二进制对 schema 兼容性 gate。
+#   checkout 后准备 dist/README.md，无需 build-web）。与 app-cli 的 pingap-config 库严格同 rev。
+# - pair-gate：Windows 和既有三个 Unix 随包平台实际执行 app-cli gen-lock，
+#   生成配置喂同版 Pingap -t，验证分发二进制对的 schema 兼容性。
 
 on:
   push:
@@ -140,9 +140,9 @@ jobs:
           USE_ZIG: ${{ matrix.zig }}
         run: |
           if [ "$USE_ZIG" = "true" ]; then
-            cargo zigbuild --release --target "${TARGET}.2.17"
+            cargo zigbuild --locked --release --target "${TARGET}.2.17"
           else
-            cargo build --release --target "$TARGET"
+            cargo build --locked --release --target "$TARGET"
           fi
 
       - name: Smoke test binary --version
@@ -183,9 +183,9 @@ jobs:
 
   # ── pingap.exe（Windows 专用，随 win32-x64 平台包分发）─────────────────────
   # 上游 pingap 官方无 Windows 产物。构建源 = app-cli Cargo.toml pin 的同一
-  # git rev（构造性同步：同一 commit 里 grep，漂移即 fail-fast）。
-  # rustls 变体走 ring（非 aws-lc-sys）→ 只需 protoc + MSVC；dist/ 在 tag 里
-  # 有 README 占位（rust-embed 可编译），无需 node build-web；代价是 admin
+  # git rev（统一 source_identity，漂移即 fail-fast）。
+  # rustls 变体走 ring（非 aws-lc-sys）→ 只需 protoc + MSVC；checkout 后
+  # 自建 dist/README.md（rust-embed 可编译），无需 node build-web；代价是 admin
   # web UI 为占位页（app-cli 只消费 admin JSON API，不受影响）。
   build-pingap-windows:
     needs: meta
@@ -199,17 +199,23 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Resolve pingap rev from Cargo.toml
         shell: bash
         run: |
           set -euo pipefail
-          REV=$(grep -o 'rev = "[0-9a-f]\{40\}"' crates/app-cli/Cargo.toml | head -1 | cut -d'"' -f2)
-          [ -n "$REV" ] || { echo "✗ 未在 crates/app-cli/Cargo.toml 找到 pingap-config rev"; exit 1; }
-          VER=$(grep -rh -o 'DEFAULT_PINGAP_VERSION: &str = "[0-9.]*"' crates/app-cli/src/ | head -1 | cut -d'"' -f2)
-          [ -n "$VER" ] || { echo "✗ 未在 crates/app-cli/src 找到 DEFAULT_PINGAP_VERSION"; exit 1; }
-          echo "PINGAP_REV=$REV" >> "$GITHUB_ENV"
-          echo "PINGAP_VERSION_EXPECTED=$VER" >> "$GITHUB_ENV"
-          echo "pingap rev = $REV, expect version = $VER"
+          python - <<'PY'
+          import os
+          from tools.build.pingap_identity import source_identity
+          identity = source_identity()
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('PINGAP_REV=' + identity['commit'] + '\n')
+              stream.write('PINGAP_VERSION_EXPECTED=' + identity['version'] + '\n')
+          print(identity)
+          PY
 
       - name: Disable CRLF conversion
         run: git config --global core.autocrlf false
@@ -219,6 +225,20 @@ jobs:
         with:
           repository: vicanso/pingap
           ref: ${{ env.PINGAP_REV }}
+
+      - name: Verify source and prepare JSON-only admin resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$PINGAP_REV" ] || { echo "Pingap checkout does not match pin"; exit 1; }
+          python - <<'PY'
+          import os, pathlib, tomllib
+          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
+          if version != os.environ['PINGAP_VERSION_EXPECTED']:
+              raise SystemExit('Pingap source version disagrees with paired pin')
+          pathlib.Path('dist').mkdir(exist_ok=True)
+          pathlib.Path('dist/README.md').write_text('RCoder uses the Pingap admin JSON API; management web UI is not bundled.\n')
+          PY
 
       - name: Install protoc
         shell: bash
@@ -238,7 +258,7 @@ jobs:
       # 省约一半编译时间。上游 profile lto=true + codegen-units=1，构建慢属预期。
       - name: Build pingap (tls-rustls)
         shell: bash
-        run: cargo build --release --no-default-features --features tls-rustls
+        run: cargo build --locked --release --no-default-features --features tls-rustls
 
       - name: Smoke test pingap -V
         shell: bash
@@ -247,7 +267,7 @@ jobs:
           OUT=$(./target/release/pingap.exe -V)
           echo "$OUT"
           # 版本断言：二进制版本必须与 devtool 常量（= pingap-config pin 的 tag）一致
-          echo "$OUT" | grep -F "$PINGAP_VERSION_EXPECTED" || {
+          [ "$OUT" = "pingap $PINGAP_VERSION_EXPECTED" ] || {
             echo "✗ pingap.exe 版本与 pin 的 $PINGAP_VERSION_EXPECTED 不符"; exit 1; }
 
       - name: Upload artifact
@@ -279,22 +299,43 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Resolve pingap rev from Cargo.toml
         shell: bash
         run: |
           set -euo pipefail
-          REV=$(grep -o 'rev = "[0-9a-f]\{40\}"' crates/app-cli/Cargo.toml | head -1 | cut -d'"' -f2)
-          [ -n "$REV" ] || { echo "✗ 未在 crates/app-cli/Cargo.toml 找到 pingap-config rev"; exit 1; }
-          VER=$(grep -rh -o 'DEFAULT_PINGAP_VERSION: &str = "[0-9.]*"' crates/app-cli/src/ | head -1 | cut -d'"' -f2)
-          [ -n "$VER" ] || { echo "✗ 未在 crates/app-cli/src 找到 DEFAULT_PINGAP_VERSION"; exit 1; }
-          echo "PINGAP_REV=$REV" >> "$GITHUB_ENV"
-          echo "PINGAP_VERSION_EXPECTED=$VER" >> "$GITHUB_ENV"
+          python - <<'PY'
+          import os
+          from tools.build.pingap_identity import source_identity
+          identity = source_identity()
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('PINGAP_REV=' + identity['commit'] + '\n')
+              stream.write('PINGAP_VERSION_EXPECTED=' + identity['version'] + '\n')
+          print(identity)
+          PY
 
       - name: Checkout pingap at pinned rev
         uses: actions/checkout@v4
         with:
           repository: vicanso/pingap
           ref: ${{ env.PINGAP_REV }}
+
+      - name: Verify source and prepare JSON-only admin resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$PINGAP_REV" ] || { echo "Pingap checkout does not match pin"; exit 1; }
+          python - <<'PY'
+          import os, pathlib, tomllib
+          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
+          if version != os.environ['PINGAP_VERSION_EXPECTED']:
+              raise SystemExit('Pingap source version disagrees with paired pin')
+          pathlib.Path('dist').mkdir(exist_ok=True)
+          pathlib.Path('dist/README.md').write_text('RCoder uses the Pingap admin JSON API; management web UI is not bundled.\n')
+          PY
 
       - name: Install protoc
         if: runner.os == 'Linux'
@@ -327,14 +368,14 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$USE_ZIG" = "true" ]; then
-            cargo zigbuild --release --no-default-features --features tls-rustls --target "${TARGET}.2.17"
+            cargo zigbuild --locked --release --no-default-features --features tls-rustls --target "${TARGET}.2.17"
             cp "target/${TARGET}/release/pingap" pingap-out
           elif [ "$TARGET" = "x86_64-apple-darwin" ]; then
             rustup target add x86_64-apple-darwin
-            cargo build --release --no-default-features --features tls-rustls --target x86_64-apple-darwin
+            cargo build --locked --release --no-default-features --features tls-rustls --target x86_64-apple-darwin
             cp target/x86_64-apple-darwin/release/pingap pingap-out
           else
-            cargo build --release --no-default-features --features tls-rustls
+            cargo build --locked --release --no-default-features --features tls-rustls
             cp target/release/pingap pingap-out
           fi
 
@@ -351,29 +392,18 @@ jobs:
           print("Pingap glibc baseline:", ".".join(map(str, max(required))))
           PY
 
+      - name: Install Rosetta for the x64 macOS executable gate
+        if: matrix.target == 'x86_64-apple-darwin' && runner.arch == 'ARM64'
+        run: sudo softwareupdate --install-rosetta --agree-to-license
+
       - name: Smoke test pingap -V
         shell: bash
         run: |
           set -euo pipefail
-          # 交叉产物（x86_64-apple-darwin）在 arm64 runner 上可执行（macOS
-          # Rosetta 2 常开）；失败时降级为文件存在性检查 + 版本字符串提取
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            # 原生 Linux 上必须真正可执行，不用字符串提取掩盖链接失败。
-            OUT=$(./pingap-out -V)
-          else
-            OUT=$(./pingap-out -V 2>/dev/null || strings pingap-out | grep -m1 '^${{ env.PINGAP_VERSION_EXPECTED }}' || true)
-          fi
-          if [ -n "$OUT" ]; then
-            echo "$OUT"
-            echo "$OUT" | grep -F "$PINGAP_VERSION_EXPECTED" || {
-              echo "✗ pingap 版本与 pin 的 $PINGAP_VERSION_EXPECTED 不符"; exit 1; }
-          else
-            if [ "${{ runner.os }}" = "Linux" ]; then
-              echo "✗ 原生 Linux pingap 未返回版本信息"
-              exit 1
-            fi
-            echo "（交叉产物无法在 runner 执行——跳过 -V 断言，版本由构建 rev 保证）"
-          fi
+          OUT=$(./pingap-out -V)
+          echo "$OUT"
+          [ "$OUT" = "pingap $PINGAP_VERSION_EXPECTED" ] || {
+            echo "✗ pingap 版本与 pin 的 $PINGAP_VERSION_EXPECTED 不符"; exit 1; }
 
       # merge-multiple 按文件名合并；artifact 名称不会重命名其中的文件。
       - name: Name binary by target
@@ -399,6 +429,10 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Download binaries
         uses: actions/download-artifact@v4
         with:
@@ -412,17 +446,77 @@ jobs:
           APP=dist/app-cli-x86_64-pc-windows-msvc.exe
           PINGAP=dist/pingap.exe
           ls -lh "$APP" "$PINGAP"
+          python - "$PINGAP" <<'PY'
+          import subprocess, sys
+          from tools.build.pingap_identity import parse_pingap_version, source_identity
+          observed = parse_pingap_version(subprocess.check_output([sys.argv[1], '-V'], text=True))
+          if observed != source_identity()['version']:
+              raise SystemExit('Distributed Pingap version disagrees with app-cli source')
+          PY
           WS=$(mktemp -d)/ws
           cp -r crates/app-cli/tests/fixtures/minimal-workspace "$WS"
           "$APP" gen-lock --workspace "$WS" 2>/dev/null \
             | sed -n '/──── pingap.toml ────/,/──── end ────/p' | sed '1d;$d' \
             > pingap.toml
+          [ -s pingap.toml ]
           head -5 pingap.toml
           "$PINGAP" -c pingap.toml -t
           echo "✓ pair gate passed: app-cli 生成的配置被同 rev pingap.exe 接受"
 
+  # Unix 的三个既有随包平台同样验证实际分发的二进制对。
+  pair-gate-unix:
+    needs: [meta, build, build-pingap-unix]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-apple-darwin, runner: macos-latest }
+          - { target: aarch64-apple-darwin, runner: macos-latest }
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-cli-${{ matrix.target }}
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: pingap-${{ matrix.target }}
+          path: dist
+      - name: Install Rosetta for the x64 macOS pair gate
+        if: matrix.target == 'x86_64-apple-darwin' && runner.arch == 'ARM64'
+        run: sudo softwareupdate --install-rosetta --agree-to-license
+      - name: Validate the distributed Unix pair
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          APP="dist/app-cli-$TARGET"
+          PINGAP="dist/pingap-$TARGET"
+          chmod +x "$APP" "$PINGAP"
+          python - "$PINGAP" <<'PY'
+          import subprocess, sys
+          from tools.build.pingap_identity import parse_pingap_version, source_identity
+          observed = parse_pingap_version(subprocess.check_output([sys.argv[1], '-V'], text=True))
+          if observed != source_identity()['version']:
+              raise SystemExit('Distributed Pingap version disagrees with app-cli source')
+          PY
+          WS=$(mktemp -d)/ws
+          cp -r crates/app-cli/tests/fixtures/minimal-workspace "$WS"
+          "$APP" gen-lock --workspace "$WS" 2>/dev/null \
+            | sed -n '/──── pingap.toml ────/,/──── end ────/p' | sed '1d;$d' > pingap.toml
+          [ -s pingap.toml ]
+          "$PINGAP" -c pingap.toml -t
+
   publish-npm:
-    needs: [meta, pair-gate-windows, build-pingap-unix]
+    needs: [meta, pair-gate-windows, pair-gate-unix]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -516,7 +610,7 @@ jobs:
           fi
 
   release:
-    needs: [meta, pair-gate-windows, build-pingap-unix]
+    needs: [meta, pair-gate-windows, pair-gate-unix]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts

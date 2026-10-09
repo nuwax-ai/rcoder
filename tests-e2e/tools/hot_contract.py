@@ -5,6 +5,7 @@ import http.server
 import io
 import json
 import os
+import sys
 from pathlib import Path
 import subprocess
 import stat
@@ -16,6 +17,10 @@ import uuid
 import zipfile
 
 from hot_cleanup import run_owned, cleanup as cleanup_owned
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tools.build.pingap_identity import source_identity
+PINGAP_IDENTITY = source_identity(Path(os.environ.get('E2E_SOURCE_ROOT', str(Path(__file__).resolve().parents[2]))))
 
 REPORT = Path(os.environ['E2E_REPORT_DIR']) / os.environ.get('E2E_CONTRACT_DIR', 'hot-contract')
 REPORT.mkdir(parents=True, exist_ok=True)
@@ -50,8 +55,8 @@ minimum_app_cli_version = "0.1.3"
 runtime_image_digest = "{RUNTIME_IMAGE}"
 [pingap]
 mode = "managed"
-version = "0.14.1"
-commit = "c74e4eaa44e64958cffa18c33e8bbf5995b6844f"
+version = "{PINGAP_IDENTITY['version']}"
+commit = "{PINGAP_IDENTITY['commit']}"
 [[services]]
 service_id = "web"
 name = "Web"
