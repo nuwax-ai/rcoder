@@ -333,6 +333,38 @@ mod tests {
     use super::*;
     use crate::config::ProxyConfig;
 
+    /// dev 入口恢复预算：默认 15s；配置覆盖经 clamp 收敛到 [5s, 60s]——
+    /// 配置错误不得放大等待面，也不得低于最小有效恢复窗口。
+    #[test]
+    fn dev_entry_wait_clamps_to_bounds() {
+        let service = PingoraProxyService::new(ProxyConfig::default());
+        let current = || *service.dev_entry_wait_slot.load_full();
+        assert_eq!(current(), PingoraProxyService::DEFAULT_DEV_ENTRY_WAIT);
+        assert_eq!(
+            PingoraProxyService::DEFAULT_DEV_ENTRY_WAIT,
+            std::time::Duration::from_secs(15)
+        );
+
+        service.set_dev_entry_wait(std::time::Duration::from_secs(1));
+        assert_eq!(
+            current(),
+            std::time::Duration::from_secs(5),
+            "below-minimum config must clamp up"
+        );
+        service.set_dev_entry_wait(std::time::Duration::from_secs(3600));
+        assert_eq!(
+            current(),
+            std::time::Duration::from_secs(60),
+            "above-maximum config must clamp down"
+        );
+        service.set_dev_entry_wait(std::time::Duration::from_secs(20));
+        assert_eq!(
+            current(),
+            std::time::Duration::from_secs(20),
+            "in-range config passes through"
+        );
+    }
+
     #[test]
     fn test_service_creation() {
         let config = ProxyConfig::default();

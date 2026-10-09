@@ -82,7 +82,8 @@ impl PortProxy {
 
     /// dispatch + 恢复预算约束（T4a）：存在恢复上下文时，定位/ensure 的
     /// dispatch 以 deadline 为上限——超时不取消已受理的独立创建工作
-    /// （builder 租约自有生命周期），本请求诚实 503。
+    /// （builder 租约自有生命周期），本请求按恢复终局诚实失败
+    /// （503+Retry-After，经 unavailable_response 走 wrapper 终局分支）。
     async fn dispatch_peer_with_recovery_deadline(
         &self,
         route: RouteType,
@@ -97,10 +98,42 @@ impl PortProxy {
         match deadline {
             Some(deadline) => match tokio::time::timeout_at(deadline, dispatch).await {
                 Ok(result) => result,
-                Err(_) => Err(pingora_core::Error::new(ErrorType::HTTPStatus(503))),
+                Err(_) => {
+                    warn!("upstream dispatch exceeded connection recovery deadline");
+                    if let Some(state) = ctx.app_connect_recovery.as_mut() {
+                        state.unavailable_response = true;
+                    }
+                    Err(pingora_core::Error::new(ErrorType::HTTPStatus(503)))
+                }
             },
             None => dispatch.await,
         }
+    }
+
+    /// 恢复预算对 peer 建连超时的收紧：返回 false 表示预算已尽（调用方走
+    /// 恢复终局）。首次 dispatch 与重解析后的每个 peer 都须收紧——重解析
+    /// 拿到的 peer 带默认超时（10s 建连），不收紧则最终拨号可超出 deadline。
+    fn clamp_peer_to_recovery_deadline(
+        peer: &mut HttpPeer,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        peer.options.connection_timeout = Some(
+            peer.options
+                .connection_timeout
+                .unwrap_or(remaining)
+                .min(remaining),
+        );
+        peer.options.total_connection_timeout = Some(
+            peer.options
+                .total_connection_timeout
+                .unwrap_or(remaining)
+                .min(remaining),
+        );
+        true
     }
 }
 
@@ -437,26 +470,16 @@ impl ProxyHttp for PortProxy {
         let mut peer = self
             .dispatch_peer_with_recovery_deadline(*matched.value, matched.params.clone(), ctx)
             .await?;
-        if let Some(state) = ctx.app_connect_recovery.as_mut() {
-            let remaining = state
-                .deadline
-                .saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
+        if let Some(deadline) = ctx
+            .app_connect_recovery
+            .as_ref()
+            .map(|state| state.deadline)
+            && !Self::clamp_peer_to_recovery_deadline(&mut peer, deadline)
+        {
+            if let Some(state) = ctx.app_connect_recovery.as_mut() {
                 state.unavailable_response = true;
-                return Err(pingora_core::Error::new(ErrorType::HTTPStatus(503)));
             }
-            peer.options.connection_timeout = Some(
-                peer.options
-                    .connection_timeout
-                    .unwrap_or(remaining)
-                    .min(remaining),
-            );
-            peer.options.total_connection_timeout = Some(
-                peer.options
-                    .total_connection_timeout
-                    .unwrap_or(remaining)
-                    .min(remaining),
-            );
+            return Err(pingora_core::Error::new(ErrorType::HTTPStatus(503)));
         }
         if let Some((app_id, stage, deadline, _)) = recovery {
             let recovered = if stage == crate::service::types::ConnectRecoveryStage::Dev {
@@ -488,7 +511,14 @@ impl ProxyHttp for PortProxy {
                         )
                         .await
                     {
-                        Ok(re_resolved) => peer = re_resolved,
+                        Ok(re_resolved) => {
+                            peer = re_resolved;
+                            // 重解析的 peer 带默认建连超时——同样收紧到剩余预算，
+                            // 否则循环终局返回的 peer 拨号可超出 deadline。
+                            if !Self::clamp_peer_to_recovery_deadline(&mut peer, deadline) {
+                                break;
+                            }
+                        }
                         Err(error) => {
                             warn!(%app_id, "dev re-resolve during connection wait failed: {error}");
                             break;
