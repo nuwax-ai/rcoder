@@ -235,6 +235,8 @@ pub(super) fn read_app_expose_env() -> (Option<String>, Option<String>, HttpExpo
 #[cfg(feature = "kubernetes")]
 mod agent_runtime;
 #[cfg(all(test, feature = "kubernetes"))]
+mod builder_log_identity_tests;
+#[cfg(all(test, feature = "kubernetes"))]
 mod create_lease_tests;
 #[cfg(feature = "kubernetes")]
 mod workspace_runtime;

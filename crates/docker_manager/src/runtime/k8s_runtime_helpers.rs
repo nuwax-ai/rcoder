@@ -327,7 +327,7 @@ impl KubernetesRuntime {
                 );
                 url
             },
-            workload_uid: None,
+            workload_uid: pod_info.workload_uid.clone(),
         })
     }
 }
