@@ -1,0 +1,14 @@
+[basic]
+auto_restart_check_interval = '2s'
+[servers.app]
+addr = '0.0.0.0:60000'
+locations = ['rcoder:publication']
+[locations.'rcoder:publication']
+path = '=/_pub/00000000-0000-4000-8000-000000000001'
+plugins = ['rcoder:publication']
+weight = 65535
+[plugins.'rcoder:publication']
+category = 'mock'
+status = 200
+headers = ['X-Rcoder-Publication: 00000000-0000-4000-8000-000000000001']
+data = '00000000-0000-4000-8000-000000000001'

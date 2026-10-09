@@ -152,6 +152,9 @@ pub(crate) enum ControlSignal {
 
 #[async_trait::async_trait]
 impl runtime_supervisor::WorkerControl for ServerState {
+    async fn prepare_stop(&self, deadline: tokio::time::Instant) -> Result<()> {
+        crate::supervisor::resident::publish_standby_until(deadline).await
+    }
     fn ready(&self) -> bool {
         !self.initializing()
     }
@@ -204,10 +207,45 @@ impl runtime_supervisor::WorkerControl for ServerState {
 pub(super) struct GenerationControl {
     pub(super) state: Arc<ServerState>,
     pub(super) generation: String,
+    pub(super) standby_root: std::path::PathBuf,
 }
 
 #[async_trait::async_trait]
 impl runtime_supervisor::WorkerControl for GenerationControl {
+    fn stop_prepare_budget(&self) -> std::time::Duration {
+        crate::proxy::admin_probe::CONFIRM_BUDGET
+    }
+    fn stop_error_is_uncertain(&self, error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<crate::supervisor::ShutdownUnconfirmed>()
+            .is_some()
+            || error
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some()
+    }
+    async fn prepare_stop(&self, deadline: tokio::time::Instant) -> Result<()> {
+        anyhow::ensure!(
+            self.ready(),
+            "business control generation is no longer current"
+        );
+        // This is called before the native control closes its generation gate.
+        // Do not queue another control request: the native handler owns that queue.
+        if let Some(host) = tokio::time::timeout_at(
+            deadline,
+            crate::supervisord_host::SupervisordHost::from_env(),
+        )
+        .await??
+        {
+            host.drain_entry_until(&self.standby_root, deadline).await?;
+        } else {
+            crate::supervisor::resident::publish_standby_until(deadline).await?;
+        }
+        anyhow::ensure!(
+            self.ready(),
+            "business generation changed while draining entry"
+        );
+        Ok(())
+    }
     async fn shutdown(&self) -> Result<()> {
         let _admission = self
             .state

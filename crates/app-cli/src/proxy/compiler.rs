@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use pingap_config::PingapConfig;
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use workspace_manifest::{PingapMode, ReleaseLock};
 
@@ -12,9 +13,104 @@ const MAX_CONFIG_BYTES: usize = 2 * 1024 * 1024;
 const MAX_OBJECTS_PER_CATEGORY: usize = 256;
 
 /// 编译产物：生效配置路径 + 期望 config_hash（供 admin 只读确认重载生效）。
+#[derive(Clone, Debug)]
 pub struct CompileOutcome {
     pub config_path: PathBuf,
     pub expected_hash: String,
+    pub publication_id: String,
+    pub config_digest: String,
+    pub entry_probes: Vec<ProxyProbeTarget>,
+    pub business_probes: Vec<ServiceProbeTarget>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProxyProbeTarget {
+    pub address: std::net::SocketAddr,
+    pub expected_status: u16,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServiceProbeTarget {
+    pub service_id: String,
+    pub address: std::net::SocketAddr,
+    pub path: String,
+}
+
+pub(super) const PUBLICATION_OBJECT: &str = "rcoder:publication";
+
+pub fn configuration_digest(config: &PingapConfig) -> Result<String> {
+    let mut value = serde_json::to_value(config)?;
+    value.sort_all_objects();
+    let canonical = serde_json::to_vec(&value)?;
+    Ok(hex::encode(Sha256::digest(canonical)))
+}
+
+pub(super) fn publication_config(
+    mut config: PingapConfig,
+    publication: &str,
+    status: u16,
+) -> Result<PingapConfig> {
+    anyhow::ensure!(
+        uuid::Uuid::parse_str(publication).is_ok(),
+        "invalid proxy publication UUID"
+    );
+    anyhow::ensure!(
+        !config.plugins.contains_key(PUBLICATION_OBJECT)
+            && !config.locations.contains_key(PUBLICATION_OBJECT),
+        "configuration uses the reserved platform publication name"
+    );
+    let plugin = serde_json::json!({
+        "category": "mock", "status": status, "data": publication,
+        "headers": [format!("X-Rcoder-Publication: {publication}"), "Cache-Control: no-store".to_string()]
+    });
+    config
+        .plugins
+        .insert(PUBLICATION_OBJECT.into(), serde_json::from_value(plugin)?);
+    config.locations.insert(
+        PUBLICATION_OBJECT.into(),
+        pingap_config::LocationConf {
+            path: Some(format!("= /_pub/{publication}")),
+            plugins: Some(vec![PUBLICATION_OBJECT.into()]),
+            weight: Some(u16::MAX),
+            ..Default::default()
+        },
+    );
+    for server in config.servers.values_mut() {
+        server
+            .locations
+            .get_or_insert_with(Vec::new)
+            .insert(0, PUBLICATION_OBJECT.into());
+    }
+    Ok(config)
+}
+
+fn probe_targets(config: &PingapConfig, status: u16) -> Result<Vec<ProxyProbeTarget>> {
+    let mut targets = BTreeSet::new();
+    for server in config.servers.values() {
+        for listener in server.addr.split(',') {
+            let mut address: std::net::SocketAddr = listener.trim().parse().with_context(|| {
+                format!("publication probe requires an explicit socket listener: {listener}")
+            })?;
+            if address.ip().is_unspecified() {
+                address.set_ip(match address.ip() {
+                    std::net::IpAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+                    std::net::IpAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+                });
+            }
+            targets.insert(address);
+        }
+    }
+    anyhow::ensure!(
+        !targets.is_empty(),
+        "proxy publication has no listener to verify"
+    );
+    Ok(targets
+        .into_iter()
+        .map(|address| ProxyProbeTarget {
+            address,
+            expected_status: status,
+        })
+        .collect())
 }
 
 /// 进程级「当前期望生效 config_hash」槽：业务就绪观察用它核对 admin 实际
@@ -24,6 +120,46 @@ pub struct CompileOutcome {
 /// 写入点：编排编译（builtin/supervisord）与 proxy reload 确认/回切确认——
 /// 即「平台已确认过该 hash 生效」的位置；仅编译未确认不写入。
 static EXPECTED_HASH: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static PUBLICATION_UNCERTAIN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn publication_uncertain() -> bool {
+    PUBLICATION_UNCERTAIN.load(std::sync::atomic::Ordering::Acquire)
+}
+static PUBLICATION_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub async fn publication_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    PUBLICATION_GATE.lock().await
+}
+static CONFIRMED_PUBLICATION: std::sync::Mutex<
+    Option<(CompileOutcome, super::apply_status::ConfirmedPublication)>,
+> = std::sync::Mutex::new(None);
+
+pub fn record_confirmed_publication(
+    outcome: &CompileOutcome,
+    confirmation: &super::apply_status::ConfirmedPublication,
+) -> Result<()> {
+    anyhow::ensure!(
+        outcome.publication_id == confirmation.publication_id
+            && outcome.config_digest == confirmation.config_digest
+            && super::admin_probe::hashes_match(&outcome.expected_hash, &confirmation.config_hash),
+        "proxy confirmation does not belong to this candidate"
+    );
+    *CONFIRMED_PUBLICATION
+        .lock()
+        .map_err(|_| anyhow::anyhow!("proxy publication lock poisoned"))? =
+        Some((outcome.clone(), confirmation.clone()));
+    record_expected_hash(&outcome.expected_hash);
+    PUBLICATION_UNCERTAIN.store(false, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+pub fn confirmed_publication() -> Option<(CompileOutcome, super::apply_status::ConfirmedPublication)>
+{
+    CONFIRMED_PUBLICATION
+        .lock()
+        .ok()
+        .and_then(|value| value.clone())
+}
 
 /// 记录已确认生效的期望 config_hash（空串清除）。
 pub fn record_expected_hash(hash: &str) {
@@ -71,23 +207,116 @@ pub fn active_config_path(runtime_root: &Path) -> PathBuf {
 /// 发布候选配置到 active 路径（原子：同目录 tmp + rename）。
 pub async fn publish_active(runtime_root: &Path, candidate: &Path) -> Result<PathBuf> {
     let active = active_config_path(runtime_root);
-    let parent = active
-        .parent()
-        .with_context(|| format!("active path {} has no parent", active.display()))?;
-    tokio::fs::create_dir_all(parent)
-        .await
-        .with_context(|| format!("create {}", parent.display()))?;
-    let content = tokio::fs::read(candidate)
-        .await
-        .with_context(|| format!("read candidate {}", candidate.display()))?;
-    let tmp = active.with_extension("toml.tmp");
-    tokio::fs::write(&tmp, &content)
-        .await
-        .with_context(|| format!("write {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, &active)
-        .await
-        .with_context(|| format!("publish active {}", active.display()))?;
+    publish_to_path(candidate, &active).await?;
     Ok(active)
+}
+
+pub async fn publish_active_until(
+    runtime_root: &Path,
+    candidate: &Path,
+    deadline: tokio::time::Instant,
+) -> Result<PathBuf> {
+    let active = active_config_path(runtime_root);
+    let bytes = tokio::time::timeout_at(deadline, tokio::fs::read(candidate))
+        .await
+        .context("read candidate publication deadline exhausted")??;
+    replace_config_bytes_until(&active, bytes, deadline).await?;
+    Ok(active)
+}
+
+/// Atomic and durable same-directory replacement; no unlink window and no
+/// shared temporary filename that another publisher can accidentally replace.
+pub async fn publish_to_path(candidate: &Path, target: &Path) -> Result<()> {
+    let bytes = tokio::fs::read(candidate)
+        .await
+        .context("read immutable proxy candidate")?;
+    replace_config_bytes(target, bytes).await
+}
+
+static FILE_REPLACEMENTS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Mutex::new(())));
+
+pub async fn wait_for_file_replacements() {
+    let _guard = FILE_REPLACEMENTS.clone().lock_owned().await;
+}
+
+pub fn clear_current_confirmation() -> Result<()> {
+    *CONFIRMED_PUBLICATION
+        .lock()
+        .map_err(|_| anyhow::anyhow!("proxy publication lock poisoned"))? = None;
+    record_expected_hash("");
+    PUBLICATION_UNCERTAIN.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+pub async fn replace_config_bytes(target: &Path, bytes: Vec<u8>) -> Result<()> {
+    PUBLICATION_UNCERTAIN.store(true, std::sync::atomic::Ordering::Release);
+    replace_file_bytes(target, bytes).await
+}
+
+pub async fn replace_config_bytes_until(
+    target: &Path,
+    bytes: Vec<u8>,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    let guard = tokio::time::timeout_at(deadline, FILE_REPLACEMENTS.clone().lock_owned())
+        .await
+        .context("file publication deadline exhausted before dispatch")?;
+    let target = target.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "file publication deadline exhausted before dispatch"
+        );
+        PUBLICATION_UNCERTAIN.store(true, std::sync::atomic::Ordering::Release);
+        durable_replace(&target, &bytes)
+    })
+    .await
+    .context("proxy publication task failed")?
+}
+
+/// Generic metadata writes do not change the applied configuration state.
+/// The blocking task retains its own serialization lease even when its caller
+/// is cancelled. Successor writes and owner cleanup must await that same lease.
+pub async fn replace_file_bytes(target: &Path, bytes: Vec<u8>) -> Result<()> {
+    replace_file_with(target.to_path_buf(), bytes, durable_replace).await
+}
+
+async fn replace_file_with<F>(target: PathBuf, bytes: Vec<u8>, writer: F) -> Result<()>
+where
+    F: FnOnce(&Path, &[u8]) -> Result<()> + Send + 'static,
+{
+    let guard = FILE_REPLACEMENTS.clone().lock_owned().await;
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        writer(&target, &bytes)
+    })
+    .await
+    .context("durable file replacement task failed")?
+}
+
+fn durable_replace(target: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let parent = target
+        .parent()
+        .context("file replacement target has no parent")?;
+    std::fs::create_dir_all(parent).context("create replacement directory")?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).context("allocate file temporary")?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    process_utils::atomic_file::persist(temporary, target).context("publish durable file")?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// standby 兜底配置（P1 摘流态）：全部路径 → mock 直出 503。
@@ -114,8 +343,12 @@ pub fn build_standby_from_topology(
             .context("parse active config for standby derivation")?,
         None => PingapConfig::default(),
     };
-    // 与生效配置同款热载节奏（2s 轮询）——standby 确认预算内必须可检测。
-    cfg.basic.auto_restart_check_interval = Some(std::time::Duration::from_secs(2));
+    // A live process cannot hot-reload its polling interval. Preserve all
+    // bootstrap-only fields from the confirmed topology, including Custom's
+    // explicit interval; only a genuinely new topology receives our default.
+    if active.is_none() {
+        cfg.basic.auto_restart_check_interval = Some(std::time::Duration::from_secs(2));
+    }
     if cfg.servers.is_empty() {
         cfg.servers.insert(
             "app".into(),
@@ -137,6 +370,7 @@ pub fn build_standby_from_topology(
     // mock 在 Request 阶段直出，证书只影响握手，保留与真实拓扑一致更稳）。
     cfg.locations.clear();
     cfg.upstreams.clear();
+    cfg.plugins.clear();
     cfg.locations.insert(
         "standby".into(),
         LocationConf {
@@ -163,6 +397,7 @@ pub fn build_standby_from_topology(
         .to_string(),
     )?;
     cfg.plugins.insert("standby".into(), plugin);
+    cfg = publication_config(cfg, publication_id, 503)?;
     cfg.validate().context("validate standby Pingap config")?;
     let expected_hash = cfg.hash().context("compute standby Pingap config hash")?;
     let content = toml::to_string_pretty(&cfg).context("serialize standby Pingap config")?;
@@ -176,8 +411,14 @@ pub fn build_standby_from_topology(
 /// 运行，指引走完整重配置流程），不得静默半生效。首编（active 不存在或
 /// 无法解析）跳过校验（bootstrap 建立全量拓扑）。
 pub fn validate_hot_reload_compatible(active: &Path, candidate: &str) -> Result<()> {
-    let Ok(active_content) = std::fs::read_to_string(active) else {
-        return Ok(()); // 无 active（首编）——bootstrap
+    let active_content = match std::fs::read_to_string(active) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("read active config {} before preflight", active.display())
+            });
+        }
     };
     // 与生成路径同构的宽松解析（PingapConfig::new 补全缺省段；严格
     // toml::from_str 会因缺 basic 等段拒绝合法的最小配置）。
@@ -241,6 +482,13 @@ pub fn validate_hot_reload_compatible(active: &Path, candidate: &str) -> Result<
             candidate_cfg.storages.keys().collect::<Vec<_>>(),
         );
     }
+    if serde_json::to_value(&active_cfg.certificates)?
+        != serde_json::to_value(&candidate_cfg.certificates)?
+    {
+        anyhow::bail!(
+            "resident pingap hot-reload cannot apply certificate changes; use the full reconfiguration flow"
+        );
+    }
     let basic_value = |cfg: &PingapConfig| -> Result<serde_json::Value> {
         serde_json::to_value(&cfg.basic).context("serialize basic for compare")
     };
@@ -255,22 +503,44 @@ pub fn validate_hot_reload_compatible(active: &Path, candidate: &str) -> Result<
 
 /// 编译并发布 standby 到 active（停业务前的摘流步骤）。返回期望 hash
 /// （调用方经 admin 确认热载生效后才停止业务服务）。
-pub async fn publish_standby(runtime_root: &Path, publication_id: &str) -> Result<String> {
-    let active = active_config_path(runtime_root);
-    let active_content = tokio::fs::read_to_string(&active).await.ok();
-    let (content, expected_hash) =
-        build_standby_from_topology(publication_id, active_content.as_deref())?;
-    let candidate_dir = runtime_root.join("standby");
-    tokio::fs::create_dir_all(&candidate_dir)
-        .await
-        .with_context(|| format!("create {}", candidate_dir.display()))?;
-    let candidate = candidate_dir.join("pingap.toml");
-    tokio::fs::write(&candidate, content)
-        .await
-        .with_context(|| format!("write {}", candidate.display()))?;
-    publish_active(runtime_root, &candidate).await?;
-    Ok(expected_hash)
+pub async fn publish_standby(runtime_root: &Path, publication_id: &str) -> Result<CompileOutcome> {
+    publish_standby_to_path(
+        runtime_root,
+        &active_config_path(runtime_root),
+        publication_id,
+    )
+    .await
 }
+
+pub async fn publish_standby_to_path(
+    runtime_root: &Path,
+    target: &Path,
+    publication_id: &str,
+) -> Result<CompileOutcome> {
+    let content = match tokio::fs::read_to_string(target).await {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read {} before proxy drain", target.display()));
+        }
+    };
+    let (content, expected_hash) = build_standby_from_topology(publication_id, content.as_deref())?;
+    let config =
+        PingapConfig::new(content.as_bytes(), true).context("decode standby publication")?;
+    let outcome = persist_candidate(runtime_root, &config, publication_id, 503).await?;
+    anyhow::ensure!(
+        outcome.expected_hash == expected_hash,
+        "standby changed during serialization"
+    );
+    publish_to_path(&outcome.config_path, target).await?;
+    Ok(outcome)
+}
+
+pub use super::publication::{
+    publish_confirmed, publish_standby_confirmed, publish_standby_confirmed_to_path,
+    publish_standby_confirmed_to_path_until, rollback_publication,
+};
 
 pub async fn compile_and_validate(
     workspace: &Path,
@@ -279,50 +549,178 @@ pub async fn compile_and_validate(
     release: &ReleaseLock,
     dev_profile: bool,
 ) -> Result<CompileOutcome> {
-    let runtime_layout_roots: Vec<PathBuf> = std::fs::canonicalize(runtime_root)
-        .map(|root| vec![root])
-        .unwrap_or_default();
-    let (content, expected_hash) =
-        compile_effective_config_with_roots(workspace, release, &runtime_layout_roots, dev_profile)
-            .await?;
+    compile_prepared(
+        workspace,
+        workspace,
+        runtime_root,
+        pingap_bin,
+        release,
+        dev_profile,
+    )
+    .await
+}
 
-    let target_dir = runtime_root.join(&release.release_id);
-    tokio::fs::create_dir_all(&target_dir)
+/// Freeze a completely validated publication before retiring the old execution.
+/// Configuration is read from staging, while its file references point to the
+/// execution directory that will exist after activation.
+pub async fn compile_prepared(
+    read_workspace: &Path,
+    execution_workspace: &Path,
+    runtime_root: &Path,
+    pingap_bin: &Path,
+    release: &ReleaseLock,
+    dev_profile: bool,
+) -> Result<CompileOutcome> {
+    require_application_protocol(pingap_bin).await?;
+    let layout = vec![runtime_root.to_path_buf()];
+    let (content, _) =
+        compile_effective_config_with_roots(read_workspace, release, &layout, dev_profile).await?;
+    let mut config =
+        PingapConfig::new(content.as_bytes(), true).context("decode prepared proxy graph")?;
+    let publication = uuid::Uuid::new_v4().to_string();
+    config = publication_config(config, &publication, 200)?;
+    // Plugin constructors may read directory/file resources. Validate against
+    // the immutable staged tree before activation, then freeze the exact graph
+    // using its future execution paths. HTTP match paths are never relocated.
+    let mut outcome = if read_workspace != execution_workspace {
+        let validation_id = uuid::Uuid::new_v4().to_string();
+        write_validated_candidate(runtime_root, pingap_bin, &config, &validation_id, 200).await?;
+        rebind_file_references(&mut config, read_workspace, execution_workspace)?;
+        persist_candidate(runtime_root, &config, &publication, 200).await?
+    } else {
+        write_validated_candidate(runtime_root, pingap_bin, &config, &publication, 200).await?
+    };
+    outcome.business_probes = release
+        .services
+        .iter()
+        .filter(|service| {
+            service.enabled
+                && service.kind == workspace_manifest::ProjectKind::Web
+                && service.proxy.is_some()
+        })
+        .map(|service| ServiceProbeTarget {
+            service_id: service.service_id.clone(),
+            address: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, service.port)),
+            path: if service.health.readiness_path.is_empty() {
+                "/health".into()
+            } else {
+                service.health.readiness_path.clone()
+            },
+        })
+        .collect();
+    Ok(outcome)
+}
+
+async fn require_application_protocol(binary: &Path) -> Result<()> {
+    let mut command = Command::new(binary);
+    command.arg("--apply-protocol-version");
+    let output = process_utils::guardian::output_owned(command, std::time::Duration::from_secs(5))
         .await
-        .with_context(|| format!("create Pingap runtime dir {}", target_dir.display()))?;
-    let temporary = target_dir.join("pingap.toml.tmp");
-    let target = target_dir.join("pingap.toml");
-    tokio::fs::write(&temporary, content)
-        .await
-        .with_context(|| format!("write Pingap config {}", temporary.display()))?;
-    set_private_permissions(&temporary).await?;
+        .context("inspect proxy application protocol before runtime mutation")?;
+    anyhow::ensure!(
+        output.status.success()
+            && std::str::from_utf8(&output.stdout).is_ok_and(|value| value.trim() == "1"),
+        "Pingap does not support application protocol v1; install the paired runtime binary before starting or replacing services"
+    );
+    Ok(())
+}
+
+fn rebind_file_references(
+    config: &mut PingapConfig,
+    source: &Path,
+    execution: &Path,
+) -> Result<()> {
+    let source = std::fs::canonicalize(source).context("resolve prepared source directory")?;
+    let relocate = |value: &mut String| {
+        if let Ok(relative) = Path::new(value).strip_prefix(&source) {
+            *value = execution.join(relative).to_string_lossy().into_owned();
+        }
+    };
+    for plugin in config.plugins.values_mut() {
+        let category = plugin
+            .get("category")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        for (key, value) in plugin.iter_mut() {
+            if (key.contains("file")
+                || key.contains("directory")
+                || key.contains("cert")
+                || (category == "directory" && key.contains("path")))
+                && let toml::Value::String(path) = value
+            {
+                relocate(path);
+            }
+        }
+    }
+    for path in [
+        &mut config.basic.pid_file,
+        &mut config.basic.error_log,
+        &mut config.basic.upgrade_sock,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        relocate(path);
+    }
+    Ok(())
+}
+
+async fn write_validated_candidate(
+    runtime_root: &Path,
+    pingap_bin: &Path,
+    config: &PingapConfig,
+    publication: &str,
+    status: u16,
+) -> Result<CompileOutcome> {
+    let outcome = persist_candidate(runtime_root, config, publication, status).await?;
+    let target = &outcome.config_path;
     let mut command = Command::new(pingap_bin);
-    command.arg("-t").arg("-c").arg(&temporary);
+    command.arg("-t").arg("-c").arg(target);
     let output = process_utils::guardian::output_owned(command, std::time::Duration::from_secs(30))
         .await
-        .with_context(|| format!("execute {} -t", pingap_bin.display()))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "pingap -t rejected config: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    // rename 前备份当前生效 TOML 为 pingap.toml.prev（保留上一份供 reload 失败回切）。
-    if tokio::fs::try_exists(&target)
+        .with_context(|| format!("validate {} -t", pingap_bin.display()))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "pingap -t rejected candidate: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(outcome)
+}
+
+pub(super) async fn persist_candidate(
+    runtime_root: &Path,
+    config: &PingapConfig,
+    publication: &str,
+    status: u16,
+) -> Result<CompileOutcome> {
+    let expected_hash = config.hash().context("prepared proxy hash")?;
+    let config_digest = configuration_digest(config)?;
+    let entry_probes = probe_targets(config, status)?;
+    let target_dir = runtime_root.join("publications").join(publication);
+    tokio::fs::create_dir_all(&target_dir)
         .await
-        .with_context(|| format!("stat Pingap config {}", target.display()))?
-    {
-        let backup = target_dir.join("pingap.toml.prev");
-        tokio::fs::copy(&target, &backup)
-            .await
-            .with_context(|| format!("backup Pingap config {}", backup.display()))?;
-    }
-    tokio::fs::rename(&temporary, &target)
+        .context("create immutable proxy publication directory")?;
+    let target = target_dir.join("pingap.toml");
+    let content = toml::to_string_pretty(config).context("serialize proxy publication")?;
+    // A UUID directory is single-use. Never overwrite another admitted candidate.
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)
         .await
-        .with_context(|| format!("commit Pingap config {}", target.display()))?;
+        .context("create proxy candidate")?;
+    use tokio::io::AsyncWriteExt as _;
+    file.write_all(content.as_bytes()).await?;
+    file.sync_all().await?;
+    set_private_permissions(&target).await?;
     Ok(CompileOutcome {
         config_path: target,
         expected_hash,
+        publication_id: publication.into(),
+        config_digest,
+        entry_probes,
+        business_probes: Vec::new(),
     })
 }
 
@@ -744,8 +1142,9 @@ async fn set_private_permissions(_path: &Path) -> Result<()> {
 mod tests {
     use super::super::pingap::PINGAP_PORT;
     use super::{
-        active_config_path, build_standby_config, managed_config, publish_active, publish_standby,
-        validate_hot_reload_compatible, validate_plugin_paths, validate_upstream_destination,
+        PUBLICATION_OBJECT, active_config_path, build_standby_config, managed_config,
+        publish_active, publish_standby, validate_hot_reload_compatible, validate_plugin_paths,
+        validate_upstream_destination,
     };
     use workspace_manifest::ReleaseLock;
 
@@ -1007,7 +1406,8 @@ addr = "0.0.0.0:9081"
 
     #[test]
     fn standby_config_is_valid_mock_503_with_publication_marker() {
-        let (content, hash) = build_standby_config("pub-abc123").expect("standby config");
+        let (content, hash) =
+            build_standby_config("11111111-1111-4111-8111-111111111111").expect("standby config");
         assert!(!hash.is_empty());
         let cfg: pingap_config::PingapConfig =
             toml::from_str(&content).expect("standby config parses");
@@ -1015,8 +1415,8 @@ addr = "0.0.0.0:9081"
         assert_eq!(server.addr, format!("0.0.0.0:{PINGAP_PORT}"));
         assert_eq!(
             server.locations.as_deref(),
-            Some(&["standby".to_string()][..]),
-            "standby must be the only location (covers all paths)"
+            Some(&[PUBLICATION_OBJECT.to_string(), "standby".to_string()][..]),
+            "publication marker plus catch-all standby cover all paths"
         );
         let location = cfg.locations.get("standby").expect("standby location");
         assert!(location.path.is_none(), "no path = catch-all (weight 0)");
@@ -1049,6 +1449,98 @@ addr = "0.0.0.0:9081"
             cfg.basic.auto_restart_check_interval,
             Some(std::time::Duration::from_secs(2))
         );
+    }
+
+    #[test]
+    fn standby_preserves_custom_bootstrap_settings_and_every_listener() {
+        let mut active = pingap_config::PingapConfig::default();
+        active.basic.auto_restart_check_interval = Some(std::time::Duration::from_secs(5));
+        active.basic.threads = Some(3);
+        for (name, address) in [("public", "0.0.0.0:9080"), ("internal", "127.0.0.1:19080")] {
+            active.servers.insert(
+                name.into(),
+                pingap_config::ServerConf {
+                    addr: address.into(),
+                    locations: Some(vec!["old".into()]),
+                    ..Default::default()
+                },
+            );
+        }
+        let original = toml::to_string_pretty(&active).unwrap();
+        let (standby, _) =
+            super::build_standby_from_topology(&uuid::Uuid::new_v4().to_string(), Some(&original))
+                .unwrap();
+        let standby = pingap_config::PingapConfig::new(standby.as_bytes(), true).unwrap();
+        assert_eq!(
+            serde_json::to_value(&active.basic).unwrap(),
+            serde_json::to_value(&standby.basic).unwrap()
+        );
+        assert_eq!(standby.servers.len(), 2);
+        for (name, old) in &active.servers {
+            let new = &standby.servers[name];
+            assert_eq!(new.addr, old.addr);
+            assert!(new.locations.as_ref().unwrap().contains(&"standby".into()));
+        }
+    }
+
+    #[test]
+    fn unreadable_active_configuration_is_not_treated_as_first_bootstrap() {
+        let root = tempfile::tempdir().unwrap();
+        let active_directory = root.path().join("pingap.toml");
+        std::fs::create_dir(&active_directory).unwrap();
+        let candidate = "[servers.app]\naddr='0.0.0.0:9080'\n";
+        let error =
+            super::validate_hot_reload_compatible(&active_directory, candidate).unwrap_err();
+        assert!(format!("{error:#}").contains("before preflight"));
+        assert!(active_directory.is_dir());
+    }
+
+    #[tokio::test]
+    async fn cancelled_atomic_writer_cannot_overtake_successor_or_owner_cleanup() {
+        struct Release(std::sync::mpsc::Sender<()>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let active = root.path().join("active.toml");
+        std::fs::write(&active, b"original").unwrap();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let release = Release(release);
+        let target = active.clone();
+        let first = tokio::spawn(super::replace_file_with(
+            target,
+            b"old-deferred".to_vec(),
+            move |target, bytes| {
+                let _ = entered.send(());
+                blocked.recv().unwrap();
+                super::durable_replace(target, bytes)
+            },
+        ));
+        ready.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let target = active.clone();
+        let next =
+            tokio::spawn(
+                async move { super::replace_file_bytes(&target, b"latest".to_vec()).await },
+            );
+        let cleanup = tokio::spawn(super::wait_for_file_replacements());
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            !next.is_finished(),
+            "successor must wait for a dispatched rename"
+        );
+        assert!(
+            !cleanup.is_finished(),
+            "owner cleanup must not release before pending writes finish"
+        );
+        drop(release);
+        next.await.unwrap().unwrap();
+        cleanup.await.unwrap();
+        assert_eq!(std::fs::read(active).unwrap(), b"latest");
     }
 
     /// P1：active 发布——候选内容原子替换 active，候选保留。
@@ -1092,8 +1584,10 @@ addr = "0.0.0.0:9081"
     async fn publish_standby_writes_active_and_returns_hash() {
         let root = tempfile::tempdir().unwrap();
         let runtime_root = root.path().join("pingap");
-        let hash = publish_standby(&runtime_root, "pub-t1").await.unwrap();
-        assert!(!hash.is_empty());
+        let hash = publish_standby(&runtime_root, "11111111-1111-4111-8111-111111111111")
+            .await
+            .unwrap();
+        assert!(!hash.expected_hash.is_empty());
         let active = tokio::fs::read_to_string(active_config_path(&runtime_root))
             .await
             .unwrap();

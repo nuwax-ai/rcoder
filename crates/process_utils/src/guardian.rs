@@ -14,7 +14,9 @@ use std::{
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 mod spawn_checked;
-pub use spawn_checked::{SpawnAttemptFailure, spawn_owned_checked};
+pub use spawn_checked::{
+    SpawnAttemptFailure, spawn_guarded_owner_checked_until, spawn_owned_checked,
+};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,6 +39,8 @@ struct Receipt {
     root_status: Option<i64>,
     #[serde(default)]
     diagnostic_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resident_identity: Option<crate::command_authority::ResidentIdentity>,
 }
 fn save(root: &Path, receipt: &Receipt) -> Result<()> {
     // Buffer JSON before touching the shared filesystem; otherwise each JSON
@@ -377,6 +381,16 @@ async fn register_guardian(
     } else {
         None
     };
+    register_guardian_under_admission(command, work_root, command_record, managed, admission)
+}
+
+fn register_guardian_under_admission(
+    command: tokio::process::Command,
+    work_root: &Path,
+    command_record: Option<&Path>,
+    managed: bool,
+    admission: Option<crate::command_authority::Gate>,
+) -> Result<RegisteredCommand> {
     let std = command.as_std();
     let spec = Spec {
         program: std.get_program().into(),
@@ -402,6 +416,15 @@ async fn register_guardian(
         version: 2,
         root_status: None,
         diagnostic_pid: None,
+        resident_identity: if work_root
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "resident")
+        {
+            Some(crate::command_authority::read_resident_identity(work_root)?)
+        } else {
+            None
+        },
         id: root
             .file_name()
             .context("guardian id missing")?
@@ -437,19 +460,26 @@ pub async fn spawn_guarded(
     spawn_guarded_with_declared(command, work_root, command_record, capture, declared_root).await
 }
 
-/// Owner-scoped guarded spawn（C9/常驻代理）：与 [`spawn_guarded`] 同机制，
-/// 但**不携带**当前会话声明（declared_root = None）——owner 进程为自身
-/// 长生命周期子进程（如常驻 pingap）登记时，work_root 是 owner 域而非
-/// 当前业务 generation；携带业务声明会触发"command work root differs
-/// from the supervised generation"跨域拒绝。托管判定退回 work_root 的
-/// 积极凭据（command-admission/generation.json 存在即托管），授权边界
-/// 仍是 owner 域本身的 guardian 体系——不放松、不 Direct。
+/// Owner resource spawn requires the independent owner capability. Business
+/// task-local scope is intentionally irrelevant; both registration and guardian
+/// consumption still validate the resident receipt and independent admission.
 pub async fn spawn_guarded_owner(
     command: tokio::process::Command,
-    work_root: &Path,
+    scope: &crate::command_authority::ResidentScope,
     capture: bool,
 ) -> Result<OwnedChild> {
-    spawn_guarded_with_declared(command, work_root, None, capture, None).await
+    let admission = scope
+        .require_open_until(tokio::time::Instant::now() + Duration::from_secs(3))
+        .await?;
+    drop(admission);
+    spawn_guarded_with_declared(
+        command,
+        scope.root(),
+        None,
+        capture,
+        Some(scope.root().to_path_buf()),
+    )
+    .await
 }
 
 async fn spawn_guarded_with_declared(
@@ -600,6 +630,13 @@ async fn execute_unconsumed(
         .parent()
         .and_then(Path::parent)
         .context("guardian work root missing")?;
+    if let Some(expected) = receipt.resident_identity.as_ref() {
+        ensure!(
+            &crate::command_authority::read_resident_identity(work)? == expected,
+            "resident guardian identity changed before consumption"
+        );
+        crate::command_authority::validate_resident_spawn(work)?;
+    }
     // Older proxy receipts keep their existing authority contract. New managed
     // generations use the shared gate below, never proxy-specific owner.json.
     let managed = crate::command_authority::managed_scope(work, declared_root)?;
@@ -1153,6 +1190,7 @@ mod tests {
             .unwrap();
         let original_pid = child.id();
         let receipt = Receipt {
+            resident_identity: None,
             version: 2,
             id: root.file_name().unwrap().to_str().unwrap().into(),
             instance_id: "test-instance".into(),
@@ -1194,6 +1232,7 @@ mod tests {
         let root = directory.path().join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir(&root).unwrap();
         let receipt = Receipt {
+            resident_identity: None,
             version: 2,
             id: root.file_name().unwrap().to_str().unwrap().into(),
             instance_id: "test-instance".into(),
@@ -1269,6 +1308,7 @@ mod tests {
         )
         .unwrap();
         let receipt = Receipt {
+            resident_identity: None,
             root_status: None,
             diagnostic_pid: None,
             version: 1,
@@ -1301,6 +1341,7 @@ mod tests {
         save(
             &root,
             &Receipt {
+                resident_identity: None,
                 version: 1,
                 root_status: None,
                 diagnostic_pid: None,
@@ -1488,6 +1529,7 @@ mod tests {
         save(
             &root,
             &Receipt {
+                resident_identity: None,
                 version: 1,
                 root_status: None,
                 diagnostic_pid: pid,

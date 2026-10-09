@@ -96,8 +96,17 @@ async fn ready(
             expected.display(),
             runtime_supervisor::last_snapshot(state),
             std::fs::read_to_string(state.join("identity.json")).unwrap_or_default(),
-            std::fs::read_to_string(state.parent().unwrap().parent().unwrap().join("old.stderr"))
+            format!(
+                "old={}\nnew={}",
+                std::fs::read_to_string(
+                    state.parent().unwrap().parent().unwrap().join("old.stderr")
+                )
                 .unwrap_or_default(),
+                std::fs::read_to_string(
+                    state.parent().unwrap().parent().unwrap().join("new.stderr")
+                )
+                .unwrap_or_default()
+            ),
         );
         tokio::time::sleep(Duration::from_millis(40)).await;
     }

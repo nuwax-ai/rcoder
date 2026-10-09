@@ -138,6 +138,38 @@ async fn shutdown_inner(
                 }
                 Err(_) => receipt(root, request)?,
             };
+        if snapshot.supervisor_id == before.supervisor_id
+            && snapshot.binding == before.binding
+            && snapshot.generation.is_none()
+            && before.generation.is_some()
+            && snapshot.intent == Intent::Shutdown
+            && snapshot.operation_id.as_deref() == Some(&request.request_id)
+            && matches!(
+                snapshot.phase,
+                Phase::CleanupPending | Phase::RecoveryRequired
+            )
+        {
+            // Business cleanup may finish before owner resources (resident
+            // proxy, pending publications) settle. It is still this exact
+            // Shutdown, not a replacement owner/generation. Require positive
+            // original-generation cleanup evidence and retain the same request.
+            let generation = before
+                .generation
+                .as_deref()
+                .context("captured generation missing")?;
+            let proof = crate::verify_local_quiescent(root, generation)?
+                .context("owner business cleanup belongs to another process domain")?;
+            ensure!(
+                proof.generation == generation
+                    && Some(proof.supervisor_id.as_str()) == generation_owner,
+                "captured business generation cleanup identity differs"
+            );
+            if snapshot.phase == Phase::RecoveryRequired {
+                return Err(snapshot.recovery_error());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
         unchanged(before, &snapshot)?;
         if snapshot.operation_id.as_deref() == Some(&request.request_id) {
             if snapshot.phase == Phase::RecoveryRequired {

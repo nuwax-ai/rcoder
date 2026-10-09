@@ -16,10 +16,17 @@
 use std::io::{BufRead, Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
+mod protocol_pingap;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("protocol-pingap") => {
+            if let Err(error) = protocol_pingap::run(&args[2..]) {
+                eprintln!("protocol proxy fixture: {error:#}");
+                std::process::exit(1);
+            }
+        }
         Some("hold") => {
             let port: u16 = args[2].parse().expect("hold <port>");
             let ignore_term = args.iter().any(|arg| arg == "--ignore-term");

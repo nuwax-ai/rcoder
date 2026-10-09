@@ -11,12 +11,14 @@ pub(super) async fn supervise(
     cancel: Option<tokio_util::sync::CancellationToken>,
     known_failed: Vec<String>,
 ) -> Result<()> {
-    tokio::select! {
+    let forced = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("📡 received SIGINT, shutting down");
+            true
         }
         _ = wait_sigterm() => {
             info!("📡 received SIGTERM, shutting down");
+            true
         }
         // server 形态的外部取消（热部署切换 / 容器停服级联）：与信号同路径优雅停
         () = async {
@@ -26,28 +28,42 @@ pub(super) async fn supervise(
             }
         } => {
             info!("📡 orchestration cancelled (hot deploy / shutdown), stopping services");
+            false
         }
         exited = poll_any_exit(&mut children, &known_failed) => {
             if let Some(name) = exited {
                 error!("❌ {name} exited — shutting down (supervisor will restart)");
             }
+            true
         }
-    }
-    // P1/V2-03/C11：会话收束前先 standby 摘流（常驻入口不再把请求转发到
-    // 即将停止的业务服务——裸 502 窗口）。摘流失败：业务仍必须停（安全
-    // 收束优先），但**不得静默成功**——shutdown_all 完成后返回 Err，让
-    // run_with_cancel → run_loop 将操作收束为 Failed（入口停留在旧路由
-    // 的降级窗口如实可见，由下个会话发布收敛）。直跑/入口已死为 Ok no-op。
-    let drain = super::resident::publish_standby_if_serving().await;
+    };
+    // User controls cross the drain barrier before cancelling this task. A
+    // second publication here would introduce a failure after the old Child
+    // ownership has already been surrendered. Unexpected exits and signals
+    // cannot preserve a live business execution; close an undrainable proxy.
+    let drain = if forced {
+        drain_or_close_resident().await
+    } else {
+        Ok(())
+    };
     let stopped = shutdown_all(children, shutdown_timeout_seconds).await;
-    match (&drain, stopped) {
+    match (drain, stopped) {
         (_, Err(stop_error)) => Err(stop_error),
-        (Err(drain_error), Ok(())) => Err(anyhow::anyhow!(
-            "standby drain before session shutdown failed (business stopped; \
-             entry not drained): {drain_error:#}"
-        )),
+        (Err(drain_error), Ok(())) => Err(drain_error),
         (Ok(()), Ok(())) => Ok(()),
     }
+}
+
+pub(super) async fn drain_or_close_resident() -> Result<()> {
+    if let Err(drain_error) = super::resident::publish_standby_if_serving().await {
+        super::resident::close_entry().await.map_err(|close_error| {
+            ShutdownUnconfirmed(format!(
+                "entry drain failed: {drain_error:#}; entry shutdown unconfirmed: {close_error:#}"
+            ))
+        })?;
+        warn!("entry drain failed; resident shutdown confirmed: {drain_error:#}");
+    }
+    Ok(())
 }
 
 /// A deployment cannot publish a terminal status until shutdown is confirmed.

@@ -21,6 +21,9 @@ pub(crate) struct PreparedDeploy {
 }
 
 impl PreparedDeploy {
+    pub(crate) fn validated_workspace(&self) -> &Path {
+        self.staging.path()
+    }
     /// Identity from the already validated, operation-owned staging directory.
     pub(crate) fn artifact_release_id(&self) -> Result<String> {
         Ok(crate::manifest::read_release_lock(self.staging.path())?.release_id)

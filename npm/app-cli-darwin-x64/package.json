@@ -10,7 +10,8 @@
   ],
   "files": [
     "app-cli",
-    "pingap"
+    "pingap",
+    "pingap.applied.json"
   ],
   "license": "Apache-2.0",
   "repository": {

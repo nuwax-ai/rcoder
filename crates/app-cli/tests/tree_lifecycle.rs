@@ -14,6 +14,9 @@
 
 #![cfg(unix)]
 
+#[path = "fixtures/protocol_support.rs"]
+mod protocol_support;
+
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -56,7 +59,8 @@ minimum_app_cli_version = "0.1.3"
 runtime_image_digest = "registry.example/app-runtime:0.1.140"
 
 [pingap]
-mode = "managed"
+mode = "custom"
+config = "protocol-listener.toml"
 version = "0.14.3"
 commit = "abc123"
 
@@ -95,6 +99,7 @@ TREE_FIXTURE_READY = "{}/grandchild-ready"
 "#,
         root.display()
     );
+    protocol_support::write_listener_override(&workspace, "web");
     std::fs::write(workspace.join("release.lock.toml"), lock).expect("write lock");
     workspace
 }
@@ -116,7 +121,7 @@ fn spawn_cli(
     root: &Path,
     admin_addr: &str,
     pingap_bin: &str,
-    skip_pingap_confirm: bool,
+    _skip_pingap_confirm: bool,
 ) -> OwnedCli {
     let mut command = Command::new(env!("CARGO_BIN_EXE_app-cli"));
     command
@@ -137,15 +142,16 @@ fn spawn_cli(
         .env_remove("APP_DEPLOY_GENERATION_ID")
         .env("RUST_LOG", "app_cli=info")
         .env_remove("APP_CLI_ATTACH")
+        .env(
+            "APP_CLI_PINGAP_ADMIN_PORT",
+            protocol_support::reserve_port().to_string(),
+        )
+        .env("PROTOCOL_PROXY_ADMIN_FAULT", root.join("proxy-admin-fault"))
         .env("APP_CLI_STATE_ROOT", root.join("state"))
         .env("APP_CLI_REQUIRE_PG", "0")
         .env_remove("PGUSER")
         .env_remove("PGPASSWORD")
         .env("APP_CLI_SKIP_PG_WAIT", "1");
-    if skip_pingap_confirm {
-        // fake pingap 无 admin 通道：跳过初始配置确认（配置正确性由 -t 兜底）
-        command.env("APP_CLI_SKIP_PINGAP_CONFIRM", "1");
-    }
     // 默认 pingap 运行目录 /run/app-cli/pingap 是容器路径假设（N02 待修）；
     // 原生测试经 env 覆盖到临时目录
     command.env(
@@ -164,22 +170,10 @@ fn spawn_cli(
 /// Unix fake pingap：`-t` 校验模式立即成功；运行模式常驻（被 app-cli 受管
 /// spawn，停止时随整树收束）。让成功路径走到 supervise 阶段。
 fn write_fake_pingap(root: &Path) -> String {
-    let path = root.join("fake-pingap");
-    std::fs::write(
-        &path,
-        "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"-t\" ]; then exit 0; fi\ndone\nexec sleep 300\n",
-    )
-    .expect("write fake pingap");
-    set_executable(&path);
-    path.to_str().expect("path utf8").to_string()
-}
-
-#[cfg(unix)]
-fn set_executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path).expect("stat").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms).expect("chmod");
+    protocol_support::write_pingap(root)
+        .to_str()
+        .expect("protocol fixture path")
+        .to_string()
 }
 
 /// 等端口可连接（孙进程/root 就绪信号）。
@@ -321,14 +315,16 @@ fn supervised_stop_kills_term_ignoring_grandchild_and_releases_ports() {
     wait_port_released(gc_port, second_release, "second round grandchild holder");
 }
 
-/// R01 反例（失败兜底）：pingap 编译失败 → 已启动服务整树清理，
+/// R01 反例（失败兜底）：proxy 进程启动后的协议确认失败 → 已启动服务整树清理，
 /// 失败事件保留且管理面常驻，最后向捕获的 owner 发 SIGTERM 正常退出。
 #[test]
 fn startup_failure_cleanup_converges_service_tree() {
     let root = tempfile::tempdir().expect("root tempdir");
     let (svc_port, gc_port, admin_addr) = reserve_ports();
     let workspace = fixture_workspace(root.path(), svc_port, gc_port);
-    let mut cli = spawn_cli(&workspace, root.path(), &admin_addr, "/bin/false", false);
+    let pingap = write_fake_pingap(root.path());
+    std::fs::write(root.path().join("proxy-admin-fault"), "failed").unwrap();
+    let mut cli = spawn_cli(&workspace, root.path(), &admin_addr, &pingap, false);
 
     // The fixture acknowledges the real bind before its health endpoint is
     // available. Keep that durable evidence: a fast cleanup can release the

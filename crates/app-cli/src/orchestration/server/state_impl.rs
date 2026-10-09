@@ -434,6 +434,7 @@ impl ServerState {
     pub(super) fn generation_control(
         self: &Arc<Self>,
         generation: &str,
+        log_dir: &std::path::Path,
     ) -> Result<Arc<dyn runtime_supervisor::WorkerControl>> {
         let _admission = self
             .admission
@@ -449,6 +450,7 @@ impl ServerState {
         Ok(Arc::new(super::state::GenerationControl {
             state: self.clone(),
             generation: generation.to_owned(),
+            standby_root: crate::proxy::compiler::runtime_root(log_dir),
         }))
     }
 

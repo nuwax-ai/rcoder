@@ -9,6 +9,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod resident;
+pub(crate) use resident::validate_resident_spawn;
+pub use resident::{
+    OwnerLease, ResidentIdentity, ResidentScope, read_identity as read_resident_identity,
+};
+
 pub const WORK_ROOT_ENV: &str = "RCODER_COMMAND_WORK_ROOT";
 
 #[derive(Serialize, Deserialize)]
@@ -63,9 +69,24 @@ impl Gate {
     /// Each failed observation drops its lock before waiting; a closed or invalid
     /// authority is a rejection, while a briefly missing receipt remains pending.
     pub(crate) async fn observe_open(root: &Path) -> Result<Self> {
+        Self::observe_open_until(
+            root,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(3),
+        )
+        .await
+    }
+
+    pub(crate) async fn observe_open_until(
+        root: &Path,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "command admission deadline expired"
+        );
         crate::observe::observe(
             "command admission",
-            std::time::Duration::from_secs(3),
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
             || async {
                 let gate = Self::try_acquire(root)?;
                 gate.require_open()?;

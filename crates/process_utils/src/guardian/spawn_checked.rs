@@ -6,6 +6,83 @@ pub struct SpawnAttemptFailure {
     pub child: Option<OwnedChild>,
 }
 
+/// Resident startup shares the caller's absolute budget. Even a timed-out
+/// handshake returns its exact guardian/lease for authoritative cleanup.
+pub async fn spawn_guarded_owner_checked_until(
+    command: tokio::process::Command,
+    scope: &crate::command_authority::ResidentScope,
+    capture: bool,
+    deadline: tokio::time::Instant,
+) -> std::result::Result<OwnedChild, SpawnAttemptFailure> {
+    let gate = scope
+        .require_open_until(deadline)
+        .await
+        .map_err(|error| unstarted(error, None))?;
+    let registered =
+        register_guardian_under_admission(command, scope.root(), None, true, Some(gate))
+            .map_err(|error| unstarted(error, None))?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(unstarted(
+            anyhow::anyhow!("resident startup deadline expired before OS spawn"),
+            Some(&registered.root),
+        ));
+    }
+    let executable =
+        std::env::current_exe().map_err(|error| unstarted(error.into(), Some(&registered.root)))?;
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .arg("--native-command-guardian")
+        .arg(&registered.root)
+        .env(crate::command_authority::WORK_ROOT_ENV, scope.root())
+        .stdin(Stdio::piped())
+        .stdout(if capture {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
+        .stderr(if capture {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        });
+    #[cfg(unix)]
+    command.process_group(0);
+    #[cfg(windows)]
+    command.creation_flags(0x0000_0200);
+    let mut child = command
+        .spawn()
+        .map_err(|error| unstarted(error.into(), Some(&registered.root)))?;
+    let mut lease = child.stdin.take();
+    let started = async {
+        let pipe = lease
+            .as_mut()
+            .context("resident guardian lease pipe missing")?;
+        tokio::time::timeout_at(deadline, pipe.write_all(&registered.frame))
+            .await
+            .context("resident guardian frame deadline expired")??;
+        wait_for_start(
+            &mut child,
+            &registered.root,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await
+    }
+    .await;
+    let owned = OwnedChild::Guarded {
+        child: Box::new(child),
+        lease,
+        root: registered.root,
+        receipt_unavailable_since: None,
+    };
+    match started {
+        Ok(()) => Ok(owned),
+        Err(source) => Err(SpawnAttemptFailure {
+            source,
+            child: Some(owned),
+        }),
+    }
+}
+
 /// Return the actual attempted guardian after a startup acknowledgement error.
 /// Callers must drain its pipes and confirm stop before releasing their leases.
 /// Errors without a Child occur before any OS process was started by this call.

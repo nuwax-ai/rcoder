@@ -49,6 +49,8 @@ struct ObservationFingerprint {
     business_ready_flag: bool,
     initializing: bool,
     expected_proxy_hash: Option<String>,
+    applied_publication: Option<crate::proxy::apply_status::ConfirmedPublication>,
+    publication_uncertain: bool,
     current_operation: Option<String>,
     dev_profile: Option<bool>,
 }
@@ -68,6 +70,9 @@ impl ObservationFingerprint {
             business_ready_flag: server.runtime_status().is_ready(),
             initializing: server.initializing(),
             expected_proxy_hash: crate::proxy::compiler::expected_hash(),
+            applied_publication: crate::proxy::compiler::confirmed_publication()
+                .map(|(_, confirmed)| confirmed),
+            publication_uncertain: crate::proxy::compiler::publication_uncertain(),
             current_operation: server.current_runtime_operation(),
             dev_profile: server.proxy_context().map(|context| context.dev_profile),
         }
@@ -358,14 +363,22 @@ impl BusinessReadinessObserver {
         // ── 真实探测：服务 HTTP（并发 ≤8）+ Pingap admin 快照 + 入口 TCP ──
         // 总预算由调用方 deadline 给定（探测轮内两轮共用；单项另受 2s 上限），
         // 预算耗尽的未完成项记 unknown（不折算成失败，也不从汇总集合消失）。
-        let admin_snapshot = fetch_admin_snapshot(deadline).await;
-        let entry_reachable = tokio::time::timeout(
-            item_budget(deadline),
-            tokio::net::TcpStream::connect(("127.0.0.1", crate::proxy::pingap::PINGAP_PORT)),
-        )
-        .await
-        .map(|connected| connected.is_ok())
-        .unwrap_or(false);
+        let (admin_snapshot, publication_confirmed, entry_reachable) = tokio::join!(
+            fetch_admin_snapshot(deadline),
+            verify_publication(deadline),
+            async {
+                tokio::time::timeout(
+                    item_budget(deadline),
+                    tokio::net::TcpStream::connect((
+                        "127.0.0.1",
+                        crate::proxy::pingap::PINGAP_PORT,
+                    )),
+                )
+                .await
+                .map(|connected| connected.is_ok())
+                .unwrap_or(false)
+            }
+        );
 
         let probes = futures::stream::iter(
             summary
@@ -384,8 +397,12 @@ impl BusinessReadinessObserver {
         services.sort_by(|a, b| a.service_id.cmp(&b.service_id));
 
         // 代理就绪：入口监听 + 生效 hash 匹配（upstream 健康归各服务结果）。
-        let (proxy_ready, proxy_status, proxy_reason, origin_contract) =
-            derive_proxy(admin_snapshot.as_ref(), entry_reachable, phase.clone());
+        let (proxy_ready, proxy_status, proxy_reason, origin_contract) = derive_proxy(
+            admin_snapshot.as_ref(),
+            entry_reachable,
+            phase.clone(),
+            publication_confirmed,
+        );
 
         let target_release_id = target_release_hint(server, &release.release_id);
 
@@ -557,6 +574,27 @@ async fn static_entry_available(port: u16) -> bool {
 }
 
 /// Pingap admin 只读快照（未注册端点/不可达返回 None——推导层归类）。
+async fn verify_publication(deadline: tokio::time::Instant) -> bool {
+    if crate::proxy::compiler::publication_uncertain() {
+        return false;
+    }
+    let Some((outcome, expected)) = crate::proxy::compiler::confirmed_publication() else {
+        return false;
+    };
+    let Some(endpoint) = admin_probe::admin_endpoint() else {
+        return false;
+    };
+    match admin_probe::wait_for_publication(endpoint, &outcome, item_budget(deadline)).await {
+        Ok(actual) => {
+            actual.process_id == expected.process_id && actual.instance_id == expected.instance_id
+        }
+        Err(error) => {
+            tracing::debug!("business readiness: complete publication unconfirmed: {error:#}");
+            false
+        }
+    }
+}
+
 async fn fetch_admin_snapshot(
     deadline: tokio::time::Instant,
 ) -> Option<admin_probe::AdminBasicSnapshot> {
@@ -585,6 +623,7 @@ fn derive_proxy(
     admin: Option<&admin_probe::AdminBasicSnapshot>,
     entry_reachable: bool,
     phase: ServerPhase,
+    publication_confirmed: bool,
 ) -> (
     bool,
     UserAppReadinessStatus,
@@ -644,6 +683,14 @@ fn derive_proxy(
             false,
             UserAppReadinessStatus::Degraded,
             Some(UserAppReadinessReason::ProxyConfigMismatch),
+            None,
+        );
+    }
+    if !publication_confirmed {
+        return (
+            false,
+            UserAppReadinessStatus::Unknown,
+            Some(UserAppReadinessReason::ObserveIncomplete),
             None,
         );
     }
@@ -924,20 +971,31 @@ mod tests {
     }
 
     /// 假 admin `/api/basic`：返回与 `expected_hash` 匹配的 hash + upstream 健康。
-    fn spawn_fake_admin(listener: std::net::TcpListener, expected_hash: String) {
+    fn spawn_fake_admin(
+        listener: std::net::TcpListener,
+        expected_hash: String,
+        apply_status: String,
+    ) {
         std::thread::spawn(move || {
             for socket in listener.incoming() {
                 let Ok(mut socket) = socket else { continue };
                 let expected_hash = expected_hash.clone();
+                let apply_status = apply_status.clone();
                 std::thread::spawn(move || {
                     use std::io::{Read, Write};
                     let mut buf = [0u8; 4096];
                     if socket.read(&mut buf).is_err() {
                         return;
                     }
-                    let body = format!(
-                        r#"{{"config_hash":"{expected_hash}","upstream_healthy_status":{{"web":{{"healthy":1,"total":1}}}}}}"#
-                    );
+                    let body = if String::from_utf8_lossy(&buf)
+                        .starts_with("GET /api/apply-status ")
+                    {
+                        apply_status
+                    } else {
+                        format!(
+                            r#"{{"config_hash":"{expected_hash}","upstream_healthy_status":{{"web":{{"healthy":1,"total":1}}}}}}"#
+                        )
+                    };
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -1013,20 +1071,67 @@ path = "/"
         // 固定端口：入口 9080（accept-all）与 admin 3018（进程内假 admin）。
         let entry =
             std::net::TcpListener::bind("127.0.0.1:9080").expect("bind fake pingap entry 9080");
+        let publication_id = uuid::Uuid::new_v4().to_string();
+        let process_instance_id = uuid::Uuid::new_v4().to_string();
+        let marker = publication_id.clone();
         std::thread::spawn(move || {
             for socket in entry.incoming() {
-                drop(socket);
+                let Ok(mut socket) = socket else {
+                    continue;
+                };
+                use std::io::{Read, Write};
+                let mut request = [0u8; 2048];
+                if socket.read(&mut request).is_err() {
+                    continue;
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nX-Rcoder-Publication: {marker}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{marker}",
+                    marker.len()
+                );
+                let _ = socket.write_all(response.as_bytes());
             }
         });
         let admin = std::net::TcpListener::bind("127.0.0.1:3018").expect("bind fake admin 3018");
         let expected_hash = "COMBOHASH01".to_string();
-        spawn_fake_admin(admin, expected_hash.clone());
+        let outcome = crate::proxy::compiler::CompileOutcome {
+            config_path: "unused-component-candidate.toml".into(),
+            expected_hash: expected_hash.clone(),
+            publication_id: publication_id.clone(),
+            config_digest: "a".repeat(64),
+            entry_probes: vec![crate::proxy::compiler::ProxyProbeTarget {
+                address: "127.0.0.1:9080".parse().unwrap(),
+                expected_status: 200,
+            }],
+            business_probes: vec![],
+        };
+        let applied = crate::proxy::apply_status::ApplyStatus {
+            schema_version: 1,
+            process_id: std::process::id(),
+            process_instance_id,
+            applied: Some(crate::proxy::apply_status::AppliedPublication {
+                attempt_id: 1,
+                operation_id: Some(publication_id),
+                config_hash: expected_hash.clone(),
+                config_digest: outcome.config_digest.clone(),
+                applied_at_unix_ms: 1,
+            }),
+            last_attempt: None,
+        };
+        crate::proxy::compiler::record_confirmed_publication(
+            &outcome,
+            &applied.current_publication().unwrap(),
+        )
+        .unwrap();
+        spawn_fake_admin(
+            admin,
+            expected_hash,
+            serde_json::to_string(&applied).unwrap(),
+        );
         crate::proxy::admin_probe::register_admin_endpoint(
             "127.0.0.1:3018".into(),
             "combo".into(),
             "combo".into(),
         );
-        crate::proxy::compiler::record_expected_hash(&expected_hash);
 
         // 业务服务：先保留端口不监听（connect refused = starting）。
         let service_listener =

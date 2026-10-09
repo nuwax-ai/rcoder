@@ -83,7 +83,12 @@ pub async fn owner_serve(
 ) -> Result<()> {
     let normalized = args.for_management()?;
     let args = &normalized;
-    let _ = application_id;
+    session.register_resident_application(&application_id)?;
+    session.set_owner_cleanup(Arc::new(OwnerResidentCleanup {
+        session: Arc::downgrade(&session),
+        args: args.clone(),
+        application_id: application_id.clone(),
+    }))?;
     let api_listener = crate::api::bind_listener(&args.admin_addr).await?;
     let ready = RuntimeStatusService::default();
     let state = Arc::new(ServerState::new(ready));
@@ -291,7 +296,8 @@ pub async fn owner_serve(
                 // Restart 在 run 形态下同样被消费；差异只在会话重启策略
                 //（run 的 restart_on_exit=false，前台退出码语义）。
                 let launch_generation = launch.generation.clone();
-                let control = factory_state.generation_control(&launch_generation)?;
+                let control =
+                    factory_state.generation_control(&launch_generation, &args.log_dir)?;
                 // RV05：业务会话根任务捕获本代次的不可变命令范围——
                 // 进程级会话范围随后被换代/卸下时，会话内（含显式派生的
                 // 执行子任务）仍向旧（已闭门）范围登记，不进入 Direct
@@ -331,6 +337,17 @@ pub async fn owner_serve(
         ))
         .await;
 
+    // Foreground completion and an abnormal owner-loop exit must also close
+    // owner resources. Native Shutdown already ran this before its terminal;
+    // the same physical cleanup is idempotent and remains evidence-based.
+    if let Err(error) = crate::services::supervisor::resident::shutdown().await {
+        state.begin_failure(
+            format!("owner resident shutdown unconfirmed: {error:#}"),
+            true,
+        );
+        return Err(error).context("owner resident cleanup remains protected");
+    }
+
     api_handle.abort();
     if let Ok(slot) = api_failure.lock()
         && let Some(api_error) = slot.as_ref()
@@ -350,6 +367,35 @@ pub async fn owner_serve(
         anyhow::bail!("unified owner exited with code {exit}");
     }
     Ok(())
+}
+
+struct OwnerResidentCleanup {
+    session: std::sync::Weak<runtime_supervisor::OwnerSession>,
+    args: RuntimeArgs,
+    application_id: String,
+}
+
+#[async_trait::async_trait]
+impl runtime_supervisor::OwnerCleanup for OwnerResidentCleanup {
+    async fn shutdown(&self) -> Result<()> {
+        let _publication = crate::proxy::compiler::publication_guard().await;
+        crate::proxy::compiler::wait_for_file_replacements().await;
+        if crate::services::supervisor::resident::owner_scope_root()?.is_none() {
+            let session = self
+                .session
+                .upgrade()
+                .context("resident owner session unavailable")?;
+            let scope = session.resident_scope(&self.application_id).await?;
+            crate::services::supervisor::resident::bind_owner(scope, &self.args)?;
+        }
+        if let Some(host) = SupervisordHost::detect().await? {
+            let scope = crate::services::supervisor::resident::owner_scope()?
+                .context("supervisord owner cleanup capability missing")?;
+            let runtime_root = crate::proxy::compiler::runtime_root(&self.args.log_dir);
+            host.shutdown_owner_entry(&runtime_root, &scope).await?;
+        }
+        crate::services::supervisor::resident::shutdown().await
+    }
 }
 
 /// 业务会话失败时确保管理面离开 initializing（R3）。成功路径由
@@ -431,6 +477,16 @@ async fn business_session_inner(
     //（deploy/status 503 → file-server 预检 90s 超时）——失败即降级开放
     // 管理查询（phase=Failed 承载原因），Stop/身份仍可用。
     let _degrade_on_error = DegradeManagementOnDrop(&state);
+    if crate::services::supervisor::resident::owner_scope_root()?.is_none() {
+        let application_id = state
+            .runtime_kernel()
+            .context("resident requires runtime identity")?
+            .identity()
+            .application_id
+            .clone();
+        let scope = session.resident_scope(&application_id).await?;
+        crate::services::supervisor::resident::bind_owner(scope, &args)?;
+    }
     // RV04：停止交接状态在 admission 线性化点内探测（durable intent +
     // operation_id；phase 由 launch 保留 Stopped 终态），不再用会话外
     // 的相位快照授权取消接力——Stop 落在旧快照与 token renew 之间不再
@@ -913,7 +969,6 @@ async fn business_session_inner(
         // P1：owner 退出前收束常驻 pingap（owner 域进程随 owner 生死；
         // 槽空为 no-op）。放在代际清理前——generation 清理要求 guardians
         // 静默，常驻进程的 lease 不释放会卡住收束确认。
-        crate::services::supervisor::resident::shutdown().await;
         match driver_result {
             Ok(()) => match tokio::time::timeout_at(
                 shutdown_deadline,

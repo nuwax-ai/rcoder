@@ -111,6 +111,12 @@ pub struct BusinessRun {
 
 pub type BusinessFactory = Box<dyn FnMut(BusinessLaunch) -> Result<BusinessRun> + Send>;
 
+/// Owner resources must settle before native Shutdown publishes success.
+#[async_trait::async_trait]
+pub trait OwnerCleanup: Send + Sync + 'static {
+    async fn shutdown(&self) -> Result<()>;
+}
+
 struct ActiveBusiness {
     generation: String,
     value: record::Generation,
@@ -154,6 +160,10 @@ struct SessionCore {
     /// 的无驱动 Stop 看门狗判定"会话静止"——RunState 归 run 循环私有，
     /// 外部任务只能经此原子位观察清理是否仍挂起。
     cleanup_in_flight: std::sync::atomic::AtomicBool,
+    owner_cleanup: Mutex<Option<Arc<dyn OwnerCleanup>>>,
+    resident_application: Mutex<Option<String>>,
+    authorized_previous_binding: Option<control::Binding>,
+    resident_rebind_confirmed: std::sync::atomic::AtomicBool,
 }
 
 impl SessionCore {
@@ -335,6 +345,7 @@ pub struct OwnerSession {
     core: Arc<SessionCore>,
     _owner: Owner,
     run: Mutex<Option<RunState>>,
+    resident: tokio::sync::Mutex<Option<crate::ResidentScope>>,
 }
 
 impl OwnerSession {
@@ -364,6 +375,7 @@ impl OwnerSession {
             .map(|old| old.snapshot.binding.clone())
             .filter(|binding| binding != &options.binding);
         let pending_binding = previous_binding.as_ref().map(|_| options.binding.clone());
+        let authorized_previous_binding = previous_binding.clone();
         let current = crate::domain::PhysicalDomain::from_env()
             .context("read execution domain before supervisor launch")?;
         if let Some(old) = &mut old {
@@ -432,6 +444,10 @@ impl OwnerSession {
             restarts: Mutex::new(VecDeque::new()),
             management_ready: Mutex::new(None),
             cleanup_in_flight: std::sync::atomic::AtomicBool::new(false),
+            owner_cleanup: Mutex::new(None),
+            resident_application: Mutex::new(None),
+            authorized_previous_binding,
+            resident_rebind_confirmed: std::sync::atomic::AtomicBool::new(false),
         });
         let (tx, incoming) = mpsc::channel::<Incoming>(32);
         let run = RunState {
@@ -446,11 +462,15 @@ impl OwnerSession {
             first_launch: !recovery_launch,
             restart_on_exit: options.restart_on_exit,
             shutdown: options.shutdown,
+            preparing: None,
+            owner_cleanup_task: None,
+            next_owner_cleanup: tokio::time::Instant::now(),
         };
         Ok(Self {
             core,
             _owner: owner,
             run: Mutex::new(Some(run)),
+            resident: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -520,6 +540,74 @@ impl OwnerSession {
         self.core.snapshot()
     }
 
+    pub fn register_resident_application(&self, application_id: &str) -> Result<()> {
+        anyhow::ensure!(
+            !application_id.trim().is_empty(),
+            "resident application identity missing"
+        );
+        let mut slot = self
+            .core
+            .resident_application
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resident application identity lock poisoned"))?;
+        anyhow::ensure!(
+            slot.as_deref()
+                .is_none_or(|existing| existing == application_id),
+            "resident application identity changed"
+        );
+        *slot = Some(application_id.to_owned());
+        Ok(())
+    }
+
+    /// Bind one independent resident range to this held owner lease. Old
+    /// guardians must prove quiescence before this owner receives admission.
+    pub async fn resident_scope(&self, application_id: &str) -> Result<crate::ResidentScope> {
+        self.register_resident_application(application_id)?;
+        let mut slot = self.resident.lock().await;
+        if let Some(scope) = slot.as_ref() {
+            anyhow::ensure!(
+                scope.identity().application_id == application_id,
+                "resident application identity changed"
+            );
+            return Ok(scope.clone());
+        }
+        let snapshot = self.snapshot();
+        let domain = crate::domain::PhysicalDomain::from_env()?;
+        let identity = process_utils::command_authority::ResidentIdentity {
+            application_id: application_id.to_owned(),
+            binding: serde_json::to_value(snapshot.binding)?,
+            owner_instance: snapshot.supervisor_id,
+            physical_domain: domain.map(serde_json::to_value).transpose()?,
+            process_epoch: epoch::current(),
+        };
+        let previous = self
+            .core
+            .resident_rebind_confirmed
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then_some(self.core.authorized_previous_binding.as_ref())
+            .flatten();
+        let scope = crate::resident::initialize_recovered(
+            &self.core.root,
+            self._owner.lease(),
+            identity,
+            previous,
+        )
+        .await?;
+        *slot = Some(scope.clone());
+        Ok(scope)
+    }
+
+    pub fn set_owner_cleanup(&self, cleanup: Arc<dyn OwnerCleanup>) -> Result<()> {
+        let mut slot = self
+            .core
+            .owner_cleanup
+            .lock()
+            .map_err(|_| anyhow::anyhow!("owner cleanup lock poisoned"))?;
+        anyhow::ensure!(slot.is_none(), "owner cleanup already installed");
+        *slot = Some(cleanup);
+        Ok(())
+    }
+
     /// Guard that publishes management readiness for the current generation.
     pub fn ready_guard(self: &Arc<Self>, generation: &str) -> BusinessReadyGuard {
         BusinessReadyGuard {
@@ -540,7 +628,7 @@ impl OwnerSession {
                 .take()
                 .context("owner session run slot poisoned mid-start")?,
         };
-        state.seed_fence()?;
+        state.seed_fence().await?;
         loop {
             if state.business.is_none() {
                 match state.drive_idle(&mut factory).await? {
@@ -576,6 +664,7 @@ enum BusinessEvent {
     StopDeadline,
     Request(Incoming),
     ShutdownToken,
+    PreparationTick,
 }
 
 /// A background cleanup for one generation, foreign (startup fence) or the
@@ -610,19 +699,169 @@ struct RunState {
     first_launch: bool,
     restart_on_exit: bool,
     shutdown: CancellationToken,
+    preparing: Option<PreparingStop>,
+    owner_cleanup_task: Option<AbortOnDrop<Result<()>>>,
+    next_owner_cleanup: tokio::time::Instant,
+}
+
+struct PreparingStop {
+    request: control::Request,
+    previous: Snapshot,
+    intent: Intent,
+    task: AbortOnDrop<Result<()>>,
 }
 
 impl RunState {
+    fn abandon_preparation(&mut self, reason: &str) -> Result<()> {
+        let Some(slot) = self.preparing.take() else {
+            return Ok(());
+        };
+        // Dropping this exact task closes an actor reply. Undispatched commands
+        // are revoked; an in-flight mutation remains an explicitly unknown
+        // original request, never a later generation's Ready/Stopped result.
+        self.core.with_discovery(|discovery| {
+            discovery.snapshot.phase = Phase::RecoveryRequired;
+            discovery.snapshot.operation_id = None;
+            discovery.snapshot.error = Some(reason.to_owned());
+            discovery.snapshot.problem = Some(Problem {
+                code: FailureCode::CleanupUnconfirmed,
+                message: reason.to_owned(),
+            });
+            if let Some((_, saved)) = discovery
+                .requests
+                .iter_mut()
+                .find(|(request, _)| request.request_id == slot.request.request_id)
+            {
+                *saved = discovery.snapshot.clone();
+            }
+            Ok(())
+        })
+    }
+    async fn poll_preparation(&mut self) -> Result<()> {
+        if !self
+            .preparing
+            .as_ref()
+            .is_some_and(|slot| slot.task.0.is_finished())
+        {
+            return Ok(());
+        }
+        let Some(mut slot) = self.preparing.take() else {
+            return Ok(());
+        };
+        let result = (&mut slot.task.0)
+            .await
+            .context("business drain preparation task failed")
+            .and_then(|result| result);
+        match result {
+            Ok(()) if self.core.snapshot().generation == slot.previous.generation => {
+                self.begin_stop(slot.intent)?;
+            }
+            result => {
+                let uncertain = result.as_ref().err().is_some_and(|error| {
+                    error
+                        .downcast_ref::<tokio::time::error::Elapsed>()
+                        .is_some()
+                        || self
+                            .business
+                            .as_ref()
+                            .is_some_and(|business| business.control.stop_error_is_uncertain(error))
+                });
+                let message = match result {
+                    Err(error) => format!("business drain failed; business retained: {error:#}"),
+                    Ok(()) => "business identity changed during drain preparation".into(),
+                };
+                self.core.with_discovery(|discovery| {
+                    discovery.snapshot.phase = if uncertain {
+                        Phase::RecoveryRequired
+                    } else {
+                        slot.previous.phase
+                    };
+                    discovery.snapshot.intent = slot.previous.intent;
+                    discovery.snapshot.operation_id = None;
+                    discovery.snapshot.error = Some(message.clone());
+                    discovery.snapshot.problem = Some(Problem {
+                        code: FailureCode::CleanupUnconfirmed,
+                        message: message.clone(),
+                    });
+                    // The failed request retains its own identity and error.
+                    // A later operation cannot overwrite this terminal refusal.
+                    if let Some((_, recorded)) = discovery
+                        .requests
+                        .iter_mut()
+                        .find(|(request, _)| request.request_id == slot.request.request_id)
+                    {
+                        *recorded = discovery.snapshot.clone();
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn owner_resources_quiescent(&mut self) -> Result<bool> {
+        if let Some(task) = self.owner_cleanup_task.as_ref() {
+            if !task.0.is_finished() {
+                return Ok(false);
+            }
+            let mut task = self
+                .owner_cleanup_task
+                .take()
+                .context("owner cleanup task vanished")?;
+            let result = (&mut task.0)
+                .await
+                .context("owner cleanup task failed")
+                .and_then(|result| result);
+            return match result {
+                Ok(()) => Ok(true),
+                Err(error) => {
+                    self.next_owner_cleanup = tokio::time::Instant::now() + Duration::from_secs(1);
+                    self.core.with_discovery(|discovery| {
+                        discovery.snapshot.phase = Phase::RecoveryRequired;
+                        discovery.snapshot.error =
+                            Some(format!("owner resource cleanup unconfirmed: {error:#}"));
+                        discovery.snapshot.problem = Some(Problem {
+                            code: FailureCode::CleanupUnconfirmed,
+                            message: format!("owner resource cleanup unconfirmed: {error:#}"),
+                        });
+                        Ok(())
+                    })?;
+                    Ok(false)
+                }
+            };
+        }
+        if tokio::time::Instant::now() < self.next_owner_cleanup {
+            return Ok(false);
+        }
+        let cleanup = self
+            .core
+            .owner_cleanup
+            .lock()
+            .map_err(|_| anyhow::anyhow!("owner cleanup lock poisoned"))?
+            .clone();
+        match cleanup {
+            Some(cleanup) => {
+                self.owner_cleanup_task = Some(AbortOnDrop(tokio::spawn(async move {
+                    cleanup.shutdown().await
+                })));
+                Ok(false)
+            }
+            None => Ok(true),
+        }
+    }
+
     /// One initial synchronous reconcile so callers observe the startup fence
     /// immediately; retries continue while idle.
-    fn seed_fence(&mut self) -> Result<()> {
+    async fn seed_fence(&mut self) -> Result<()> {
         let instance = self.core.snapshot().supervisor_id;
         match record::reconcile_foreign(&self.core.root, &instance) {
-            Ok(None) => {
-                self.finish_binding_recovery()?;
-                self.core.set_fence(FenceState::Clear);
-                Ok(())
-            }
+            Ok(None) => match self.finish_binding_recovery().await {
+                Ok(()) => {
+                    self.core.set_fence(FenceState::Clear);
+                    Ok(())
+                }
+                Err(error) => self.core.record_problem(&error),
+            },
             Ok(Some(target)) => {
                 self.core.mark_pending_cleanup(format!(
                     "verifying abandoned generation {} command and engine cleanup",
@@ -635,10 +874,29 @@ impl RunState {
         }
     }
 
-    fn finish_binding_recovery(&mut self) -> Result<()> {
+    async fn finish_binding_recovery(&mut self) -> Result<()> {
         let Some(binding) = self.pending_binding.as_ref() else {
             return Ok(());
         };
+        if self.core.intent() != Intent::Shutdown && self.core.root.join("resident").try_exists()? {
+            let application_id = self
+                .core
+                .resident_application
+                .lock()
+                .map_err(|_| anyhow::anyhow!("resident application identity lock poisoned"))?
+                .clone()
+                .context("authorized resident rebind requires the adapter application identity")?;
+            let original = self.core.snapshot();
+            let domain = crate::domain::PhysicalDomain::from_env()?;
+            let identity = process_utils::command_authority::ResidentIdentity {
+                application_id,
+                binding: serde_json::to_value(&original.binding)?,
+                owner_instance: original.supervisor_id,
+                physical_domain: domain.map(serde_json::to_value).transpose()?,
+                process_epoch: epoch::current(),
+            };
+            crate::resident::reconcile_prior(&self.core.root, &identity, None).await?;
+        }
         let rebound = self.core.with_discovery(|discovery| {
             // Cleanup is confirmed, but captured Shutdown still owns the old
             // binding. Cancel this pending rebind so its exact receipt can finish
@@ -655,7 +913,10 @@ impl RunState {
             Ok(true)
         })?;
         if rebound {
-            tracing::info!(resource = %binding.resource.display(), "managed owner binding recovered after cleanup");
+            self.core
+                .resident_rebind_confirmed
+                .store(true, std::sync::atomic::Ordering::Release);
+            tracing::info!(resource = %binding.resource.display(), "managed owner binding recovered after business and original resident cleanup");
         } else {
             tracing::info!("pending managed binding deferred until captured Shutdown exits");
         }
@@ -728,7 +989,7 @@ impl RunState {
                             if matches!(
                                 discovery.snapshot.phase,
                                 Phase::CleanupPending | Phase::RecoveryRequired | Phase::Stopping
-                            ) && matches!(intent, Intent::Stopped | Intent::Shutdown)
+                            ) && intent == Intent::Stopped
                             {
                                 // 终态只在清理成功后发布（R2.2）：受理的
                                 // Stop/Shutdown 以确认的清理回执收尾，同请求
@@ -740,6 +1001,11 @@ impl RunState {
                                 discovery.snapshot.operation_id = None;
                                 discovery.snapshot.problem = None;
                                 discovery.snapshot.error = None;
+                            } else if intent == Intent::Shutdown {
+                                // Resident/owner resources still need their
+                                // own cleanup before Shutdown can be terminal.
+                                discovery.snapshot.phase = Phase::CleanupPending;
+                                discovery.snapshot.problem = None;
                             } else if matches!(
                                 discovery.snapshot.phase,
                                 Phase::CleanupPending | Phase::RecoveryRequired
@@ -804,10 +1070,10 @@ impl RunState {
         }
         let instance = self.core.snapshot().supervisor_id;
         match record::reconcile_foreign(&self.core.root, &instance) {
-            Ok(None) => {
-                self.finish_binding_recovery()?;
-                self.core.set_fence(FenceState::Clear);
-            }
+            Ok(None) => match self.finish_binding_recovery().await {
+                Ok(()) => self.core.set_fence(FenceState::Clear),
+                Err(error) => self.core.record_problem(&error)?,
+            },
             Ok(Some(target)) => {
                 self.core.mark_pending_cleanup(format!(
                     "verifying abandoned generation {} command and engine cleanup",
@@ -856,12 +1122,17 @@ impl RunState {
             //（R2.2：不因进程退出把未确认清理写成 Stopped）。
             let owner_shutdown =
                 self.shutdown.is_cancelled() || self.core.intent() == Intent::Shutdown;
-            if owner_shutdown && !self.cleanup_pending() && self.fence_cleared() {
+            if owner_shutdown
+                && !self.cleanup_pending()
+                && self.fence_cleared()
+                && self.owner_resources_quiescent().await?
+            {
                 self.core.with_discovery(|discovery| {
                     if discovery.snapshot.intent != Intent::Shutdown {
                         discovery.snapshot.intent = Intent::Shutdown;
                     }
                     discovery.snapshot.phase = Phase::Stopped;
+                    discovery.snapshot.operation_id = None;
                     discovery.snapshot.problem = None;
                     discovery.snapshot.error = None;
                     Ok(())
@@ -896,6 +1167,7 @@ impl RunState {
             };
             match event {
                 IdleEvent::Tick => {
+                    self.poll_preparation().await?;
                     if tokio::time::Instant::now() >= self.next_discovery_check {
                         self.repair_discovery()?;
                         self.next_discovery_check =
@@ -1067,6 +1339,8 @@ impl RunState {
     /// Business-active loop: native requests, cooperative stop deadlines and
     /// driver completion. Returns `Some(exit)` when the process should exit.
     async fn drive_business(&mut self) -> Result<Option<i32>> {
+        let mut preparation_tick = tokio::time::interval(Duration::from_millis(100));
+        preparation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             if self.shutdown.is_cancelled() && self.core.intent() != Intent::Shutdown {
                 self.begin_stop(Intent::Shutdown)?;
@@ -1092,6 +1366,7 @@ impl RunState {
                     outcome = driver => BusinessEvent::Driver(outcome),
                     _ = &mut stopping_sleep => BusinessEvent::StopDeadline,
                     Some(incoming) = self.incoming.recv() => BusinessEvent::Request(incoming),
+                    _ = preparation_tick.tick(), if self.preparing.is_some() => BusinessEvent::PreparationTick,
                     // R2.6：shutdown 令牌直接唤醒本 select——业务 future
                     // 长期 pending 时不再依赖外部偶合驱动停止。guard 防止
                     // 已取消令牌对 select 的分支饥饿（每次立即就绪会饿死
@@ -1108,6 +1383,7 @@ impl RunState {
                 BusinessEvent::StopDeadline => {
                     self.stop_deadline_exceeded()?;
                 }
+                BusinessEvent::PreparationTick => self.poll_preparation().await?,
                 BusinessEvent::Request(incoming) => {
                     self.handle_incoming(incoming)?;
                 }
@@ -1126,6 +1402,11 @@ impl RunState {
     /// snapshots are published only from the confirmed cleanup result
     ///（poll_cleanup）, never from here.
     async fn business_ended(&mut self, outcome: Result<Option<i32>>) -> Result<Option<i32>> {
+        // Driver exit supersedes any reversible stop preparation. Its exact
+        // task cannot later cancel a replacement generation.
+        self.abandon_preparation(
+            "business ended during stop preparation; original drain result unknown",
+        )?;
         let exit = match outcome {
             Ok(code) => code,
             Err(error) => {
@@ -1242,6 +1523,13 @@ impl RunState {
     }
 
     fn begin_stop(&mut self, intent: Intent) -> Result<()> {
+        // Forced owner shutdown supersedes a reversible drain; cancel that
+        // exact task before closing the business admission boundary.
+        if intent == Intent::Shutdown {
+            self.abandon_preparation(
+                "owner shutdown superseded stop preparation; original drain result unknown",
+            )?;
+        }
         self.core.with_discovery(|discovery| {
             discovery.snapshot.intent = intent;
             discovery.snapshot.phase = Phase::Stopping;
@@ -1355,6 +1643,12 @@ impl RunState {
                     }
                     .into());
                 }
+                if recorded.intent != Intent::Stopped
+                    && let Some(problem) = recorded.problem.as_ref()
+                    && recorded.operation_id.is_none()
+                {
+                    return Err(problem.clone().into());
+                }
                 return Ok(recorded);
             }
         }
@@ -1383,12 +1677,21 @@ impl RunState {
             control::Action::Shutdown => Intent::Shutdown,
             control::Action::Status => return Ok(snapshot),
         };
+        let preparation = matches!(
+            request.action,
+            control::Action::StopWork | control::Action::Recover
+        ) && self
+            .business
+            .as_ref()
+            .is_some_and(|business| business.stopping.is_none());
         self.core.with_discovery(|discovery| {
             discovery.snapshot.operation_id = Some(request.request_id.clone());
             discovery
                 .requests
                 .push((request.clone(), discovery.snapshot.clone()));
-            discovery.snapshot.intent = intent;
+            if !preparation {
+                discovery.snapshot.intent = intent;
+            }
             discovery.snapshot.phase = Phase::Stopping;
             Ok(())
         })?;
@@ -1396,7 +1699,26 @@ impl RunState {
             restarts.clear();
         }
         self.next_cleanup = tokio::time::Instant::now();
-        self.begin_stop(intent)?;
+        if preparation {
+            let business = self
+                .business
+                .as_ref()
+                .context("stop preparation requires active business")?;
+            let control = business.control.clone();
+            let deadline = tokio::time::Instant::now() + control.stop_prepare_budget();
+            self.preparing = Some(PreparingStop {
+                request: request.clone(),
+                previous: snapshot,
+                intent,
+                task: AbortOnDrop(tokio::spawn(async move {
+                    tokio::time::timeout_at(deadline, control.prepare_stop(deadline))
+                        .await
+                        .context("business drain confirmation timed out; business retained")?
+                })),
+            });
+        } else {
+            self.begin_stop(intent)?;
+        }
         // An idle owner may be parked after a business initialization failure.
         // With all generations reconciled and no cleanup task outstanding,
         // Stop has no execution left to drain; do not wait for a new business
@@ -1563,7 +1885,7 @@ mod tests {
             "old proof still needs its original binding"
         );
         let mut driver = restored.run.lock().unwrap().take().unwrap();
-        driver.seed_fence().unwrap();
+        driver.seed_fence().await.unwrap();
         assert_eq!(
             record::generation(&work).unwrap().phase,
             record::GenerationPhase::Quiescent
@@ -1780,7 +2102,7 @@ mod tests {
         .await
         .unwrap();
         let mut next_driver = successor.run.lock().unwrap().take().unwrap();
-        next_driver.seed_fence().unwrap();
+        next_driver.seed_fence().await.unwrap();
         assert_eq!(successor.snapshot().binding, desired);
         assert_eq!(successor.snapshot().intent, Intent::Stopped);
         assert!(next_driver.fence_cleared());
@@ -1832,7 +2154,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let session = session(root.path()).await;
         let mut state = session.run.lock().unwrap().take().unwrap();
-        state.seed_fence().unwrap();
+        state.seed_fence().await.unwrap();
         let id = uuid::Uuid::new_v4().to_string();
         let work = record::work_root(root.path(), &id).unwrap();
         std::fs::create_dir_all(&work).unwrap();
@@ -1899,7 +2221,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let session = session(root.path()).await;
         let mut state = session.run.lock().unwrap().take().unwrap();
-        state.seed_fence().unwrap();
+        state.seed_fence().await.unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
         let (attempted, mut observed) = mpsc::unbounded_channel();
         let retry_session = session.clone();
@@ -2058,7 +2380,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let session = session(root.path()).await;
         let mut state = session.run.lock().unwrap().take().unwrap();
-        state.seed_fence().unwrap();
+        state.seed_fence().await.unwrap();
         session
             .core
             .with_discovery(|discovery| {
@@ -2101,7 +2423,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let session = session(root.path()).await;
         let mut state = session.run.lock().unwrap().take().unwrap();
-        state.seed_fence().unwrap();
+        state.seed_fence().await.unwrap();
         // Business initialization exhausted its retry budget, but there is no
         // remaining execution and the cleanup fence is already clear.
         session
@@ -2237,5 +2559,370 @@ mod tests {
             .unwrap();
         let error = state.handle_request(&envelope()).unwrap_err();
         assert_eq!(Problem::from_error(&error).code, FailureCode::Busy);
+    }
+    struct RefusedDrain {
+        shutdowns: Arc<std::sync::atomic::AtomicUsize>,
+        entered: Arc<tokio::sync::Notify>,
+        released: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl WorkerControl for RefusedDrain {
+        async fn probe(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn prepare_stop(&self, _deadline: tokio::time::Instant) -> Result<()> {
+            self.entered.notify_one();
+            self.released.notified().await;
+            anyhow::bail!("fixture applied/entry drain refused")
+        }
+        async fn shutdown(&self) -> Result<()> {
+            self.shutdowns
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn native_stop_drain_failure_keeps_admission_business_and_request_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let owner = session(root.path()).await;
+        let mut driver = owner.run.lock().unwrap().take().unwrap();
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let released = Arc::new(tokio::sync::Notify::new());
+        let control = Arc::new(RefusedDrain {
+            shutdowns: shutdowns.clone(),
+            entered: entered.clone(),
+            released: released.clone(),
+        });
+        let mut factory: BusinessFactory = Box::new(move |_| {
+            Ok(BusinessRun {
+                control: control.clone(),
+                end: Box::pin(std::future::pending()),
+            })
+        });
+        driver.seed_fence().await.unwrap();
+        assert!(driver.launch(&mut factory).unwrap());
+        let generation = owner.snapshot().generation.unwrap();
+        owner.ready_guard(&generation).mark_ready().unwrap();
+        let discovery = owner.core.discovery.lock().unwrap().clone();
+        let request = Envelope {
+            version: control::CONTROL_VERSION,
+            instance: discovery.instance.clone(),
+            token: discovery.token.clone(),
+            request: Request::new(Action::StopWork),
+        };
+        let accepted = driver.handle_request(&request).unwrap();
+        assert_eq!(
+            accepted.intent,
+            Intent::Run,
+            "drain cannot commit Stop intent"
+        );
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        let status_request = Envelope {
+            version: request.version,
+            instance: request.instance.clone(),
+            token: request.token.clone(),
+            request: Request::new(Action::Status),
+        };
+        assert_eq!(
+            driver.handle_request(&status_request).unwrap().intent,
+            Intent::Run,
+            "native Status remains available while drain awaits network"
+        );
+        let work = record::work_root(root.path(), &generation).unwrap();
+        process_utils::command_authority::Gate::try_acquire(&work)
+            .unwrap()
+            .require_open()
+            .unwrap();
+        assert_eq!(shutdowns.load(Ordering::Relaxed), 0);
+        released.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                driver.poll_preparation().await.unwrap();
+                if driver.preparing.is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(owner.snapshot().phase, Phase::Ready);
+        assert_eq!(owner.snapshot().intent, Intent::Run);
+        assert!(owner.snapshot().operation_id.is_none());
+        assert!(driver.business.as_ref().unwrap().stopping.is_none());
+        process_utils::command_authority::Gate::try_acquire(&work)
+            .unwrap()
+            .require_open()
+            .unwrap();
+        assert_eq!(shutdowns.load(Ordering::Relaxed), 0);
+        let failed = driver.handle_request(&request).unwrap_err();
+        assert_eq!(
+            Problem::from_error(&failed).code,
+            FailureCode::CleanupUnconfirmed
+        );
+        let saved = crate::saved_request_snapshot(root.path(), &request.request)
+            .unwrap()
+            .unwrap();
+        assert!(saved.problem.is_some());
+        let fresh = Envelope {
+            request: Request::new(Action::StopWork),
+            ..request
+        };
+        assert!(
+            driver.handle_request(&fresh).is_ok(),
+            "failed drain must not permanently block another request"
+        );
+    }
+    struct TimedDrain {
+        dispatched: Arc<std::sync::atomic::AtomicBool>,
+        shutdowns: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl WorkerControl for TimedDrain {
+        async fn probe(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn prepare_stop(&self, _deadline: tokio::time::Instant) -> Result<()> {
+            self.dispatched
+                .store(true, std::sync::atomic::Ordering::Release);
+            std::future::pending().await
+        }
+        fn stop_prepare_budget(&self) -> Duration {
+            Duration::from_millis(20)
+        }
+        async fn shutdown(&self) -> Result<()> {
+            self.shutdowns
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatched_prepare_timeout_retains_business_and_unknown_until_explicit_control() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let owner = session(root.path()).await;
+        let mut driver = owner.run.lock().unwrap().take().unwrap();
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let control = Arc::new(TimedDrain {
+            dispatched: dispatched.clone(),
+            shutdowns: shutdowns.clone(),
+        });
+        let mut factory: BusinessFactory = Box::new(move |_| {
+            Ok(BusinessRun {
+                control: control.clone(),
+                end: Box::pin(std::future::pending()),
+            })
+        });
+        driver.seed_fence().await.unwrap();
+        assert!(driver.launch(&mut factory).unwrap());
+        let generation = owner.snapshot().generation.unwrap();
+        owner.ready_guard(&generation).mark_ready().unwrap();
+        let discovery = owner.core.discovery.lock().unwrap().clone();
+        let request = Envelope {
+            version: control::CONTROL_VERSION,
+            instance: discovery.instance.clone(),
+            token: discovery.token.clone(),
+            request: Request::new(Action::StopWork),
+        };
+        driver.handle_request(&request).unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        driver.poll_preparation().await.unwrap();
+        assert!(dispatched.load(Ordering::Acquire));
+        assert_eq!(owner.snapshot().intent, Intent::Run);
+        assert_eq!(
+            owner.snapshot().phase,
+            Phase::RecoveryRequired,
+            "dispatched timeout cannot restore Ready"
+        );
+        assert!(owner.snapshot().problem.is_some());
+        assert!(driver.business.as_ref().unwrap().stopping.is_none());
+        let work = record::work_root(root.path(), &generation).unwrap();
+        process_utils::command_authority::Gate::try_acquire(&work)
+            .unwrap()
+            .require_open()
+            .unwrap();
+        assert_eq!(shutdowns.load(Ordering::Relaxed), 0);
+        let saved = crate::saved_request_snapshot(root.path(), &request.request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.phase, Phase::RecoveryRequired);
+        assert!(driver.handle_request(&request).is_err());
+        let shutdown = Envelope {
+            version: control::CONTROL_VERSION,
+            instance: discovery.instance,
+            token: discovery.token,
+            request: Request::new(Action::Shutdown),
+        };
+        driver.handle_request(&shutdown).unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(owner.snapshot().intent, Intent::Shutdown);
+        assert!(driver.business.as_ref().unwrap().stopping.is_some());
+    }
+    #[tokio::test]
+    async fn preparing_request_is_not_replaced_by_later_generation_readiness() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = session(root.path()).await;
+        let mut driver = owner.run.lock().unwrap().take().unwrap();
+        let control = Arc::new(RefusedDrain {
+            shutdowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            released: Arc::new(tokio::sync::Notify::new()),
+        });
+        let mut factory: BusinessFactory = Box::new(move |_| {
+            Ok(BusinessRun {
+                control: control.clone(),
+                end: Box::pin(std::future::pending()),
+            })
+        });
+        driver.seed_fence().await.unwrap();
+        driver.launch(&mut factory).unwrap();
+        let original_generation = owner.snapshot().generation.unwrap();
+        owner
+            .ready_guard(&original_generation)
+            .mark_ready()
+            .unwrap();
+        let discovery = owner.core.discovery.lock().unwrap().clone();
+        let request = Envelope {
+            version: control::CONTROL_VERSION,
+            instance: discovery.instance,
+            token: discovery.token,
+            request: Request::new(Action::StopWork),
+        };
+        driver.handle_request(&request).unwrap();
+        driver
+            .business_ended(Err(anyhow::anyhow!("actual driver exited during drain")))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while driver.cleanup.is_some() {
+                driver.poll_cleanup().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(driver.launch(&mut factory).unwrap());
+        let replacement = owner.snapshot().generation.unwrap();
+        assert_ne!(replacement, original_generation);
+        owner.ready_guard(&replacement).mark_ready().unwrap();
+        let saved = crate::saved_request_snapshot(root.path(), &request.request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.generation.as_deref(),
+            Some(original_generation.as_str())
+        );
+        assert_eq!(saved.phase, Phase::RecoveryRequired);
+        assert!(saved.problem.is_some());
+        assert!(
+            driver.handle_request(&request).is_err(),
+            "late Ready replaced the original unknown stop"
+        );
+    }
+    async fn resident_rebind_case(unknown_tree: bool) {
+        use crate::Binding;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().canonicalize().unwrap();
+        let state_root = source.join("state");
+        let previous = Binding {
+            component: "app-cli".into(),
+            resource: source.join("code"),
+        };
+        let desired = Binding {
+            resource: source.clone(),
+            ..previous.clone()
+        };
+        let options = |binding: Binding| SessionOptions {
+            binding,
+            policy: crate::Policy::default(),
+            cleanup_adapter: None,
+            restart_on_exit: true,
+            shutdown: CancellationToken::new(),
+        };
+        let old = Arc::new(
+            OwnerSession::start(
+                Owner::try_acquire(&state_root).unwrap().unwrap(),
+                options(previous.clone()),
+            )
+            .await
+            .unwrap(),
+        );
+        let old_scope = old.resident_scope("managed-application").await.unwrap();
+        let old_scope_root = old_scope.root().to_path_buf();
+        let identity_before = std::fs::read(old_scope_root.join("resident-scope.json")).unwrap();
+        if unknown_tree {
+            let id = uuid::Uuid::new_v4().to_string();
+            let root = old_scope_root.join("guardians").join(&id);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("receipt.json"), serde_json::to_vec(&serde_json::json!({
+                "version":2,"id":id,"instance_id":old_scope.identity().owner_instance,"phase":"Running",
+                "command_record":null,"command_digest":"fixture","root_status":null,"diagnostic_pid":null,
+            })).unwrap()).unwrap();
+        }
+        drop(old_scope);
+        drop(old);
+        let next = Arc::new(
+            OwnerSession::start_recovering_binding(
+                Owner::try_acquire(&state_root).unwrap().unwrap(),
+                options(desired.clone()),
+                Some(previous.clone()),
+            )
+            .await
+            .unwrap(),
+        );
+        next.register_resident_application("managed-application")
+            .unwrap();
+        assert_eq!(
+            next.snapshot().binding,
+            previous,
+            "new binding published before original resident was reconciled"
+        );
+        let mut driver = next.run.lock().unwrap().take().unwrap();
+        driver.seed_fence().await.unwrap();
+        assert_eq!(
+            std::fs::read(old_scope_root.join("resident-scope.json")).unwrap(),
+            identity_before,
+            "rebind rewrote original resident identity evidence"
+        );
+        if unknown_tree {
+            assert_eq!(next.snapshot().binding, previous);
+            assert_eq!(next.snapshot().phase, Phase::RecoveryRequired);
+            assert!(matches!(next.fence(), FenceState::Fenced { .. }));
+            assert!(Owner::try_acquire(&state_root).unwrap().is_none());
+        } else {
+            assert_eq!(next.snapshot().binding, desired);
+            assert!(driver.fence_cleared());
+            assert!(
+                process_utils::command_authority::Gate::try_acquire(&old_scope_root)
+                    .unwrap()
+                    .require_open()
+                    .is_err()
+            );
+            let current = next.resident_scope("managed-application").await.unwrap();
+            assert_eq!(
+                current.identity().binding,
+                serde_json::to_value(&desired).unwrap()
+            );
+            assert!(next.resident_scope("foreign-application").await.is_err());
+            current.close().unwrap();
+            current.record_quiescent().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn authorized_binding_recovery_reconciles_original_resident_before_rebinding() {
+        resident_rebind_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_original_resident_keeps_old_binding_and_management_fence() {
+        resident_rebind_case(true).await;
     }
 }

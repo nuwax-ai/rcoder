@@ -8,6 +8,19 @@
 
 # 使用本地基础镜像
 ARG BASE_IMAGE=rcoder-agent-base:latest
+
+# asset_context.py 注入 reviewed helper/patch，官方 downloads catalog 保持原状。
+FROM rust:1.98.1-bookworm AS pingap-applied-builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 git pkg-config libssl-dev protobuf-compiler cmake libclang-dev && \
+    rm -rf /var/lib/apt/lists/*
+COPY pingap-applied/ /build/pingap-applied/
+ARG PINGAP_VERSION
+ARG PINGAP_COMMIT
+RUN python3 -c 'import json,os; m=json.load(open("/build/pingap-applied/manifest.json")); assert m["version"] == os.environ["PINGAP_VERSION"] and m["base_commit"] == os.environ["PINGAP_COMMIT"]' && \
+    CARGO_BUILD_JOBS=2 python3 /build/pingap-applied/build.py --fetch --source /build/pingap-source \
+        --full --output /build/output/pingap
+
 FROM ${BASE_IMAGE}
 
 # 设置工作目录
@@ -140,6 +153,12 @@ RUN case "$(dpkg --print-architecture)" in \
     chmod +x /usr/local/bin/pingap && \
     rm -rf /tmp/pingap && \
     /usr/local/bin/pingap --version
+
+# 覆盖旧官方 binary，保留独立 RCoder patch/binary 证明，拒绝 hash-only 的旧协议。
+COPY --from=pingap-applied-builder /build/output/pingap /usr/local/bin/pingap
+COPY --from=pingap-applied-builder /build/output/pingap.applied.json /usr/local/share/rcoder/pingap-applied.json
+RUN test "$(/usr/local/bin/pingap --apply-protocol-version)" = "1" && \
+    test "$(/usr/local/bin/pingap -V)" = "pingap ${PINGAP_VERSION}"
 
 # 安装 dbx-web（DBX 数据库 Web GUI，supervisor conf.d/dbx.conf 托管 :4224；
 # 对齐生产 L358-365——二进制从 build_config downloads/ 分发，本地直接 COPY）

@@ -27,6 +27,13 @@ def prepare_context(root, destination):
         shutil.copy2(root / filename, destination / filename)
     for directory in ['crates', 'tests-e2e']:
         shutil.copytree(root / directory, destination / directory, ignore=ignored)
+    # The paired Pingap builder runs inside this named context. Include only
+    # reviewed build helpers and source identity/catalog, never runtime secrets.
+    build_tools = destination / 'tools/build'
+    build_tools.mkdir(parents=True)
+    for filename in ['pingap_identity.py', 'pingap-assets.json']:
+        shutil.copy2(root / 'tools/build' / filename, build_tools / filename)
+    shutil.copytree(root / 'tools/build/pingap-applied', build_tools / 'pingap-applied', ignore=ignored)
 
 
 def main():

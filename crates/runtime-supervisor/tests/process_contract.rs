@@ -898,3 +898,102 @@ async fn failed_cleanup_attempt_can_be_retried_without_losing_original_failure()
     shutdown(&root, &mut parent).await;
     result.unwrap();
 }
+
+#[tokio::test]
+async fn resident_owner_scope_survives_native_stop_and_shutdown_waits_for_exact_cleanup() {
+    use runtime_supervisor::{Intent, Owner, Phase};
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let mut parent = tokio::process::Command::new(env!("CARGO_BIN_EXE_supervision-fixture"))
+        .arg("--resident-owner")
+        .arg(&root)
+        // The fixture floods inherited stdout and stderr past pipe capacity.
+        // A hidden piped capture in resident spawn would hang before Ready.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let result = async {
+        until(&root, |s| s.phase == Phase::Ready).await?;
+        let initial_pid = std::fs::read_to_string(root.join("resident-pid"))?;
+        let address = std::fs::read_to_string(root.join("resident-address"))?;
+        ensure!(
+            std::fs::read_to_string(root.join("flood-complete"))? == "drained",
+            "inherited output flood blocked resident guardian"
+        );
+        ensure!(
+            tokio::net::TcpStream::connect(&address).await.is_ok(),
+            "resident entry never listened"
+        );
+        let stopped = control(&root, Request::new(Action::StopWork)).await?;
+        until(&root, |s| {
+            s.intent == Intent::Stopped && matches!(s.phase, Phase::Ready | Phase::Stopped)
+        })
+        .await?;
+        if let Some(generation) = stopped.generation {
+            let receipt: serde_json::Value = serde_json::from_slice(&std::fs::read(
+                root.join("work").join(generation).join("generation.json"),
+            )?)?;
+            ensure!(
+                receipt["phase"] == "Quiescent",
+                "business generation cleanup blocked by resident"
+            );
+        }
+        ensure!(
+            std::fs::read_to_string(root.join("resident-pid"))? == initial_pid,
+            "native Stop replaced resident PID"
+        );
+        ensure!(
+            tokio::net::TcpStream::connect(&address).await.is_ok(),
+            "native Stop killed resident"
+        );
+
+        std::fs::write(root.join("pause-resident-cleanup"), "retain owner")?;
+        let request = Request::new(Action::Shutdown);
+        control(&root, request.clone()).await?;
+        let blocked = until(&root, |s| {
+            s.intent == Intent::Shutdown && s.phase == Phase::RecoveryRequired
+        })
+        .await?;
+        ensure!(
+            blocked.operation_id.as_deref() == Some(request.request_id.as_str()),
+            "owner cleanup failure lost Shutdown identity"
+        );
+        ensure!(
+            blocked.problem.is_some(),
+            "owner cleanup failure manufactured success"
+        );
+        ensure!(
+            Owner::try_acquire(&root)?.is_none(),
+            "unknown resident cleanup released owner lock"
+        );
+        ensure!(
+            parent.try_wait()?.is_none(),
+            "unknown resident cleanup exited owner"
+        );
+        ensure!(
+            tokio::net::TcpStream::connect(&address).await.is_ok(),
+            "unknown cleanup discarded exact resident Child"
+        );
+        std::fs::remove_file(root.join("pause-resident-cleanup"))?;
+        tokio::time::timeout(Duration::from_secs(15), parent.wait()).await??;
+        ensure!(
+            tokio::net::TcpStream::connect(&address).await.is_err(),
+            "confirmed owner Shutdown left resident alive"
+        );
+        let final_snapshot = runtime_supervisor::saved_request_snapshot(&root, &request)?
+            .context("Shutdown receipt missing")?;
+        ensure!(
+            final_snapshot.phase == Phase::Stopped && final_snapshot.intent == Intent::Shutdown,
+            "Shutdown did not settle after resident cleanup"
+        );
+        ensure!(
+            Owner::try_acquire(&root)?.is_some(),
+            "confirmed cleanup retained owner lock"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    shutdown(&root, &mut parent).await;
+    result.unwrap();
+}

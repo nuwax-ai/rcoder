@@ -15,40 +15,34 @@ class PingapReleaseWorkflowTests(unittest.TestCase):
     def step(self, job, name):
         return next(step for step in WORKFLOW['jobs'][job]['steps'] if step.get('name') == name)
 
-    def prepare(self, job, version='0.15.0', actual_commit=None):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        root = Path(temporary.name)
-        (root / 'Cargo.toml').write_text('[package]\nname="pingap"\nversion="' + version + '"\n')
-        binary = root / 'bin'
-        binary.mkdir()
-        (binary / 'python').symlink_to(sys.executable)
-        (binary / 'git').write_text('#!/bin/sh\nif [ "$*" != "rev-parse HEAD" ]; then exit 9; fi\nprintf "%s\\n" "$FIXTURE_COMMIT"\n')
-        (binary / 'git').chmod(0o755)
-        environment = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
-                           PINGAP_REV='a' * 40, FIXTURE_COMMIT=actual_commit or 'a' * 40,
-                           PINGAP_VERSION_EXPECTED='0.15.0')
-        result = subprocess.run(['bash', '-c', self.step(job, 'Verify source and prepare JSON-only admin resources')['run']],
-                                cwd=root, env=environment, capture_output=True, text=True, timeout=10)
-        return root, result
-
-    def test_both_checkout_jobs_prepare_absent_dist_without_node(self):
+    def test_both_checkout_jobs_apply_reviewed_patch_before_build(self):
         for job in ('build-pingap-windows', 'build-pingap-unix'):
             with self.subTest(job=job):
-                root, result = self.prepare(job)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn('admin JSON API', (root / 'dist/README.md').read_text())
-                step = self.step(job, 'Verify source and prepare JSON-only admin resources')['run']
-                self.assertNotIn('npm', step)
-                self.assertNotIn('node ', step)
+                steps = WORKFLOW['jobs'][job]['steps']
+                upstream = next(step for step in steps if step.get('with', {}).get('repository') == 'vicanso/pingap')
+                self.assertEqual(upstream['with']['path'], '.pingap-source')
+                applying = self.step(job, 'Apply reviewed paired Pingap protocol patch')
+                building = self.step(job, 'Build pingap (tls-rustls)')
+                self.assertIn('apply.py --source .pingap-source --repo-root .', applying['run'])
+                self.assertIn('--already-applied --tls rustls', building['run'])
+                self.assertLess(steps.index(applying), steps.index(building))
+                self.assertNotIn('npm', applying['run'])
 
-    def test_wrong_source_version_or_commit_fails_before_placeholder_publication(self):
-        for job in ('build-pingap-windows', 'build-pingap-unix'):
-            for version, commit in [('0.14.3', 'a' * 40), ('0.15.0', 'b' * 40)]:
-                with self.subTest(job=job, version=version, commit=commit):
-                    root, result = self.prepare(job, version, commit)
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertFalse((root / 'dist').exists())
+    def test_paired_protocol_and_default_full_gates_block_publication(self):
+        jobs = WORKFLOW['jobs']
+        for job in ('pair-gate-windows', 'pair-gate-unix'):
+            self.assertIn('gate-pingap-applied', jobs[job]['needs'])
+        gate = jobs['gate-pingap-applied']
+        self.assertEqual(gate['env']['RUSTUP_TOOLCHAIN'], '1.98.1')
+        default = self.step('gate-pingap-applied', 'Default feature tests and strict Clippy')['run']
+        full = self.step('gate-pingap-applied', 'Full feature tests and strict Clippy')['run']
+        self.assertIn('--features serde_json/preserve_order', default)
+        self.assertIn('cargo test --locked', default)
+        self.assertIn('--features full', full)
+        for script in (default, full):
+            self.assertIn('--no-fail-fast', script)
+            self.assertIn('--all-targets', script)
+            self.assertIn('-- -D warnings', script)
 
     def test_all_cargo_release_builds_are_locked(self):
         for job in ('build', 'build-pingap-windows', 'build-pingap-unix'):
@@ -67,13 +61,31 @@ class PingapReleaseWorkflowTests(unittest.TestCase):
                           ('pair-gate-unix', 'Validate the distributed Unix pair')]:
             script = self.step(job, step)['run']
             self.assertIn('parse_pingap_version', script)
+            self.assertIn('--apply-protocol-version', script)
             self.assertIn('[ -s pingap.toml ]', script)
             self.assertIn('"$PINGAP" -c pingap.toml -t', script)
+
+    def test_reviewed_patch_bytes_are_kept_lf_on_windows(self):
+        attrs = (ROOT / 'tools/build/pingap-applied/.gitattributes').read_text()
+        self.assertIn('* text eol=lf', attrs)
+        script = self.step('build-pingap-windows', 'Disable CRLF conversion')['run']
+        self.assertIn('core.autocrlf false', script)
+
+    def test_paired_receipts_are_included_in_each_bundled_platform_package(self):
+        import json
+        for name in ('app-cli-linux-x64', 'app-cli-darwin-x64', 'app-cli-darwin-arm64', 'app-cli-windows-x64'):
+            data = json.loads((ROOT / 'npm' / name / 'package.json').read_text())
+            receipt = 'pingap.exe.applied.json' if name.endswith('windows-x64') else 'pingap.applied.json'
+            self.assertIn(receipt, data['files'])
+        scripts = '\n'.join(step.get('run', '') for step in WORKFLOW['jobs']['publish-npm']['steps'])
+        self.assertIn('dist/pingap.exe.applied.json', scripts)
+        self.assertIn('dist/pingap-x86_64-unknown-linux-gnu.applied.json', scripts)
 
     def test_smoke_version_comparison_is_exact_and_never_uses_strings_fallback(self):
         for job in ('build-pingap-windows', 'build-pingap-unix'):
             script = self.step(job, 'Smoke test pingap -V')['run']
             self.assertIn('[ "$OUT" = "pingap $PINGAP_VERSION_EXPECTED" ]', script)
+            self.assertIn('--apply-protocol-version', script)
             self.assertNotIn('strings ', script)
             self.assertNotIn('|| true', script)
 

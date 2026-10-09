@@ -4,7 +4,7 @@ use super::*;
 pub(super) enum Next {
     /// 回外层等待（Failed/服务退出保持等待，可再部署）。
     Wait,
-    Redeploy(InitialAction),
+    Redeploy(Box<InitialAction>),
     Exit,
 }
 
@@ -13,6 +13,7 @@ pub(super) struct PreparedActivation {
     workspace: std::path::PathBuf,
     target: Option<ExecutionTarget>,
     pg: Option<shared_types::StartPgCredential>,
+    proxy: Option<crate::supervisor::PreparedProxy>,
 }
 
 /// 状态机主循环：初始动作（env 部署 / 卷上既有版本直接编排 / 空容器挂 Idle）→
@@ -23,6 +24,8 @@ pub(super) enum InitialAction {
     Prepared(PreparedActivation),
     /// Explicit Source switches back from .run to the canonical source root.
     Source,
+    SourcePrepared(crate::supervisor::PreparedProxy),
+    ExistingPrepared(crate::supervisor::PreparedProxy),
     /// 卷上既有 release.lock（Pod 重建恢复/激活目录复用）：跳过下载直接
     /// 编排。携带确认的执行目录——artifact 目标可能与当前执行目录不同
     ///（源码态 owner 切回 `.run`），编排必须落在该目录上。
@@ -100,21 +103,182 @@ pub(super) async fn signal_operation_already_settled(
 pub(super) async fn preflight_hot_reload_compat(
     args: &crate::RuntimeArgs,
     dev_profile: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<crate::supervisor::PreparedProxy> {
     let release = crate::manifest::read_release_lock(&args.workspace)
         .context("read release lock for hot-reload preflight")?;
-    let (candidate, _) =
-        crate::proxy::compiler::compile_effective_config(&args.workspace, &release, dev_profile)
-            .await
-            .context("compile candidate for hot-reload preflight")?;
     let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+    let outcome = crate::proxy::compiler::compile_and_validate(
+        &args.workspace,
+        &runtime_root,
+        &args.pingap_bin,
+        &release,
+        dev_profile,
+    )
+    .await
+    .context("compile and validate candidate before stopping predecessor")?;
     let active = crate::proxy::compiler::active_config_path(&runtime_root);
-    crate::proxy::compiler::validate_hot_reload_compatible(&active, &candidate)
+    let candidate = tokio::fs::read_to_string(&outcome.config_path)
+        .await
+        .context("read validated proxy candidate")?;
+    crate::proxy::compiler::validate_hot_reload_compatible(&active, &candidate)?;
+    Ok(crate::supervisor::PreparedProxy {
+        workspace: args.workspace.clone(),
+        release,
+        dev_profile,
+        outcome,
+    })
+}
+
+async fn prepare_source_control(
+    owner_args: &RuntimeArgs,
+    state: &ServerState,
+    signal: &ControlSignal,
+) -> anyhow::Result<Option<crate::supervisor::PreparedProxy>> {
+    let ControlSignal::OrchestrateSource { dev_profile, .. } = signal else {
+        return Ok(None);
+    };
+    let mut source_args = owner_args.clone();
+    source_args.workspace =
+        resolved_execution_workspace(&owner_args.workspace, Some(ExecutionTarget::Source), state)?;
+    preflight_hot_reload_compat(&source_args, *dev_profile)
+        .await
+        .map(Some)
+}
+
+async fn reject_live_control(state: &ServerState, signal: &ControlSignal, error: &anyhow::Error) {
+    let operation_id = match signal {
+        ControlSignal::OrchestrateSource { operation_id, .. }
+        | ControlSignal::StopBusiness { operation_id } => operation_id,
+    };
+    let unknown = error
+        .downcast_ref::<supervisor::ShutdownUnconfirmed>()
+        .is_some();
+    if let Err(persist_error) = state
+        .finish_runtime_operation_by_id(
+            operation_id,
+            if unknown {
+                shared_types::RuntimeOperationState::RecoveryRequired
+            } else {
+                shared_types::RuntimeOperationState::Failed
+            },
+            Some(("entry_preflight_failed".into(), format!("{error:#}"))),
+        )
+        .await
+    {
+        state.begin_failure(
+            format!("entry preflight rejection could not be recorded: {persist_error}"),
+            true,
+        );
+    }
+    if unknown {
+        state.ready.set_ready(false);
+        state.begin_failure(
+            format!("entry restoration unknown; business retained: {error:#}"),
+            true,
+        );
+    }
+    // Preserve the existing driver, execution directory and readiness. The
+    // rejected operation must not route a second request through Idle.
+}
+
+async fn reject_live_deployment(
+    state: &ServerState,
+    error: anyhow::Error,
+    predecessor_ready: bool,
+) {
+    if error
+        .downcast_ref::<supervisor::ShutdownUnconfirmed>()
+        .is_some()
+    {
+        if let Err(persist) = state
+            .finish_current_runtime_operation(
+                shared_types::RuntimeOperationState::RecoveryRequired,
+                Some((
+                    shared_types::ERR_RECOVERY_REQUIRED.into(),
+                    format!("{error:#}"),
+                )),
+            )
+            .await
+        {
+            tracing::error!(%persist, "unknown entry result could not be persisted");
+        }
+        state.ready.set_ready(false);
+        state.begin_failure(
+            format!("entry restoration unknown; business retained: {error:#}"),
+            true,
+        );
+    } else {
+        fail_preparation(state, format!("entry drain: {error:#}")).await;
+        state.set_phase(ServerPhase::Running);
+        state.ready.set_ready(predecessor_ready);
+    }
+}
+
+async fn claim_live_source_control(state: &ServerState, signal: &ControlSignal) -> bool {
+    match signal {
+        ControlSignal::OrchestrateSource { operation_id, .. } => {
+            !state.settle_cancelled_before_execution(operation_id).await
+                && !signal_operation_already_settled(state, operation_id).await
+        }
+        ControlSignal::StopBusiness { operation_id } => match state.runtime_kernel() {
+            None => true,
+            Some(kernel) => match kernel.get(operation_id).await {
+                Ok(Some(view)) => {
+                    !view.state.is_terminal()
+                        && view.state != shared_types::RuntimeOperationState::RecoveryRequired
+                }
+                _ => false,
+            },
+        },
+    }
+}
+
+async fn source_cancelled_after_preflight(state: &ServerState, signal: &ControlSignal) -> bool {
+    match signal {
+        ControlSignal::OrchestrateSource { operation_id, .. } => {
+            state.settle_cancelled_before_execution(operation_id).await
+        }
+        _ => false,
+    }
+}
+
+fn restore_running_predecessor(state: &ServerState, ready: bool) {
+    let protected = state.runtime_recovery_hold_active()
+        || state
+            .deploy_status()
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.recovery.as_ref())
+            .is_some_and(|recovery| recovery.status == "pending");
+    if !protected && !state.is_cancelled() {
+        state.set_phase(ServerPhase::Running);
+        state.ready.set_ready(ready);
+    }
+}
+
+async fn settled_prepared_control(
+    state: &ServerState,
+    signal: ControlSignal,
+    prepared: Option<crate::supervisor::PreparedProxy>,
+) -> InitialAction {
+    let action = settle_control_signal_inner(state, signal, true).await;
+    match (action, prepared) {
+        (InitialAction::Source, Some(proxy)) => InitialAction::SourcePrepared(proxy),
+        (action, _) => action,
+    }
 }
 
 pub(super) async fn settle_control_signal(
     state: &ServerState,
     signal: ControlSignal,
+) -> InitialAction {
+    settle_control_signal_inner(state, signal, false).await
+}
+
+async fn settle_control_signal_inner(
+    state: &ServerState,
+    signal: ControlSignal,
+    source_consumed: bool,
 ) -> InitialAction {
     match signal {
         ControlSignal::OrchestrateSource {
@@ -125,12 +289,12 @@ pub(super) async fn settle_control_signal(
             // R03/R04 取消检查点：派发排队期间被取消 → 按自身 ID 收束
             // Cancelled 后零动作返回——不编排、不派发 Stop（取消收束变成
             // Stop 执行会用 Succeeded 覆盖 Cancelled 并停止无关运行实例）
-            if state.settle_cancelled_before_execution(&operation_id).await {
+            if !source_consumed && state.settle_cancelled_before_execution(&operation_id).await {
                 return InitialAction::Settled;
             }
             // RV01：会话交接/取代路径已收束的操作不执行（旧信号不能执行
             // 已失败/已取消/已恢复保护的请求）。
-            if signal_operation_already_settled(state, &operation_id).await {
+            if !source_consumed && signal_operation_already_settled(state, &operation_id).await {
                 return InitialAction::Settled;
             }
             state.set_current_runtime_operation(Some(operation_id.clone()));
@@ -210,6 +374,7 @@ pub(super) async fn next_prepared(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<DeployRequest>,
 ) -> Option<InitialAction> {
     loop {
+        let predecessor_ready = state.ready.is_ready();
         let request = rx.recv().await?;
         if let Some(id) = &request.runtime_operation_id
             && signal_operation_already_settled(state, id).await
@@ -232,6 +397,7 @@ pub(super) async fn next_prepared(
             Ok(workspace) => workspace,
             Err(error) => {
                 fail_preparation(state, format!("resolve deployment workspace: {error:#}")).await;
+                restore_running_predecessor(state, predecessor_ready);
                 continue;
             }
         };
@@ -248,6 +414,21 @@ pub(super) async fn next_prepared(
             .await
         {
             Ok(Some(prepared)) => {
+                let proxy = match prepare_artifact_proxy(
+                    owner_args,
+                    prepared.validated_workspace(),
+                    &workspace,
+                    target == Some(ExecutionTarget::Source),
+                )
+                .await
+                {
+                    Ok(proxy) => proxy,
+                    Err(error) => {
+                        fail_preparation(state, format!("proxy preflight: {error:#}")).await;
+                        restore_running_predecessor(state, predecessor_ready);
+                        continue;
+                    }
+                };
                 if state.current_operation_cancelled() {
                     drop(prepared);
                     if let Err(error) = state.fail_operation(
@@ -260,6 +441,7 @@ pub(super) async fn next_prepared(
                     if let Some(id) = state.current_runtime_operation() {
                         state.settle_cancelled_before_execution(&id).await;
                     }
+                    restore_running_predecessor(state, predecessor_ready);
                     continue;
                 }
                 // Prepared content is not activated yet. The execution loop
@@ -269,6 +451,7 @@ pub(super) async fn next_prepared(
                     workspace,
                     target,
                     pg,
+                    proxy: Some(proxy),
                 }));
             }
             Ok(None) => match crate::manifest::read_release_lock(&workspace) {
@@ -283,6 +466,22 @@ pub(super) async fn next_prepared(
                     // must re-orchestrate on that directory, not record a
                     // no-op success while something else keeps serving.
                     if pg.is_some() || current_workspace != workspace {
+                        let mut target_args = owner_args.clone();
+                        target_args.workspace = workspace.clone();
+                        let proxy = match preflight_hot_reload_compat(
+                            &target_args,
+                            target == Some(ExecutionTarget::Source),
+                        )
+                        .await
+                        {
+                            Ok(proxy) => proxy,
+                            Err(error) => {
+                                fail_preparation(state, format!("proxy preflight: {error:#}"))
+                                    .await;
+                                restore_running_predecessor(state, predecessor_ready);
+                                continue;
+                            }
+                        };
                         if let Err(error) = state.complete_stage() {
                             fail_preparation(
                                 state,
@@ -293,7 +492,7 @@ pub(super) async fn next_prepared(
                         }
                         state.set_pending_dev_profile(target == Some(ExecutionTarget::Source));
                         state.set_pending_run_config(pg);
-                        return Some(InitialAction::Existing { workspace });
+                        return Some(InitialAction::ExistingPrepared(proxy));
                     }
                     if let Err(error) = state
                         .complete_stage()
@@ -304,12 +503,46 @@ pub(super) async fn next_prepared(
                     }
                 }
                 Err(error) => {
-                    fail_preparation(state, format!("read unchanged release: {error:#}")).await
+                    fail_preparation(state, format!("read unchanged release: {error:#}")).await;
+                    restore_running_predecessor(state, predecessor_ready);
                 }
             },
-            Err(error) => fail_preparation(state, format!("prepare: {error:#}")).await,
+            Err(error) => {
+                fail_preparation(state, format!("prepare: {error:#}")).await;
+                restore_running_predecessor(state, predecessor_ready);
+            }
         }
     }
+}
+
+async fn prepare_artifact_proxy(
+    owner_args: &RuntimeArgs,
+    read_workspace: &std::path::Path,
+    execution_workspace: &std::path::Path,
+    dev_profile: bool,
+) -> anyhow::Result<crate::supervisor::PreparedProxy> {
+    let release = crate::manifest::read_release_lock(read_workspace)?;
+    let root = crate::proxy::compiler::runtime_root(&owner_args.log_dir);
+    let outcome = crate::proxy::compiler::compile_prepared(
+        read_workspace,
+        execution_workspace,
+        &root,
+        &owner_args.pingap_bin,
+        &release,
+        dev_profile,
+    )
+    .await?;
+    let candidate = tokio::fs::read_to_string(&outcome.config_path).await?;
+    crate::proxy::compiler::validate_hot_reload_compatible(
+        &crate::proxy::compiler::active_config_path(&root),
+        &candidate,
+    )?;
+    Ok(crate::supervisor::PreparedProxy {
+        workspace: execution_workspace.into(),
+        release,
+        dev_profile,
+        outcome,
+    })
 }
 
 pub(super) async fn fail_preparation(state: &ServerState, error: String) {
@@ -546,6 +779,69 @@ pub(super) async fn commit_running_barrier(state: &ServerState) -> BarrierOutcom
     }
 }
 
+async fn wait_supervisord_running(
+    owner_args: &RuntimeArgs,
+    args: &RuntimeArgs,
+    state: &Arc<ServerState>,
+    host: &SupervisordHost,
+    hot_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DeployRequest>,
+    standby_root: &std::path::Path,
+) -> Result<Option<InitialAction>> {
+    let mut control_rx = state.control_rx.lock().await;
+    loop {
+        let predecessor_ready = state.ready.is_ready();
+        let mut drained = false;
+        let next = tokio::select! {
+            maybe = next_prepared(owner_args, &args.workspace, state, hot_rx) => match maybe {
+                Some(action) => Next::Redeploy(Box::new(action)),
+                None => Next::Exit,
+            },
+            signal = control_rx.recv() => match signal {
+                Some(signal) => {
+                    if !claim_live_source_control(state, &signal).await { continue; }
+                    let prepared = match prepare_source_control(owner_args, state, &signal).await {
+                        Ok(prepared) => prepared,
+                        Err(error) => { reject_live_control(state, &signal, &error).await; continue; }
+                    };
+                    if source_cancelled_after_preflight(state, &signal).await { continue; }
+                    if let Err(error) = host.drain_entry(standby_root).await {
+                        reject_live_control(state, &signal, &error).await;
+                        continue;
+                    }
+                    drained = true;
+                    let action = settled_prepared_control(state, signal, prepared).await;
+                    if matches!(action, InitialAction::Settled) { continue; }
+                    Next::Redeploy(Box::new(action))
+                }
+                None => Next::Wait,
+            },
+            () = async { state.cancel_token().cancelled().await } => Next::Exit,
+        };
+        match next {
+            Next::Exit => {
+                host.finish_business_session(Some(standby_root)).await?;
+                return Ok(None);
+            }
+            Next::Wait => continue,
+            Next::Redeploy(action) => {
+                // Hot Deploy and control signals share the same barrier.
+                // Failed standby preparation keeps this Running driver.
+                if !drained && let Err(error) = host.drain_entry(standby_root).await {
+                    reject_live_deployment(state, error, predecessor_ready).await;
+                    continue;
+                }
+                state.ready.set_ready(false);
+                if let Err(error) = host.stop_business().await {
+                    hold_unconfirmed(state, format!("stop before activation failed: {error:#}"))
+                        .await;
+                    return Ok(None);
+                }
+                return Ok(Some(*action));
+            }
+        }
+    }
+}
+
 pub(super) async fn server_loop(
     owner_args: &RuntimeArgs,
     state: &Arc<ServerState>,
@@ -555,6 +851,9 @@ pub(super) async fn server_loop(
 ) -> Result<()> {
     // P1：所有业务停止路径统一先发布 standby 摘流（runtime_root 固定）。
     let standby_root = crate::proxy::compiler::runtime_root(&owner_args.log_dir);
+    if let Some(host) = host.as_ref() {
+        host.prepare_entry_baseline(&standby_root).await?;
+    }
 
     let mut pending = first;
     let mut active_args = if pending.is_none() {
@@ -717,8 +1016,12 @@ pub(super) async fn server_loop(
         }
         let deployment_attempt = matches!(
             action,
-            InitialAction::Deploy(_) | InitialAction::Prepared(_) | InitialAction::Source
+            InitialAction::Deploy(_)
+                | InitialAction::Prepared(_)
+                | InitialAction::Source
+                | InitialAction::SourcePrepared(_)
         );
+        let mut prepared_proxy = None;
         let prepared = match action {
             InitialAction::StopBusiness { .. } | InitialAction::Settled => {
                 unreachable!("handled above")
@@ -772,6 +1075,7 @@ pub(super) async fn server_loop(
                         workspace,
                         target,
                         pg,
+                        proxy: None,
                     }),
                     Ok(None) => {
                         // A release/hash cache hit skips file activation, not
@@ -812,6 +1116,18 @@ pub(super) async fn server_loop(
                     hold_unconfirmed(state, format!("persist source switch: {error:#}")).await;
                     continue;
                 }
+                None
+            }
+            InitialAction::SourcePrepared(proxy) => {
+                args.workspace = proxy.workspace.clone();
+                state.record_prepared_artifact(proxy.release.release_id.clone())?;
+                state.persist_boundary(Boundary::Switching)?;
+                prepared_proxy = Some(proxy);
+                None
+            }
+            InitialAction::ExistingPrepared(proxy) => {
+                args.workspace = proxy.workspace.clone();
+                prepared_proxy = Some(proxy);
                 None
             }
             InitialAction::Existing { workspace } => {
@@ -858,6 +1174,7 @@ pub(super) async fn server_loop(
             args.workspace = prepared.workspace;
             state.set_pending_dev_profile(prepared.target == Some(ExecutionTarget::Source));
             state.set_pending_run_config(prepared.pg);
+            prepared_proxy = prepared.proxy;
             if let Err(error) = crate::deploy::activate(&args.workspace, prepared.prepared).await {
                 pending = fail_activation(args, state, format!("activate: {error:#}")).await;
                 continue;
@@ -865,7 +1182,11 @@ pub(super) async fn server_loop(
         }
 
         // ── Orchestrating：读 lock → 编排（migrate → services → pingap → readiness）──
-        match crate::manifest::read_release_lock(&args.workspace) {
+        match prepared_proxy
+            .as_ref()
+            .map(|proxy| Ok(proxy.release.clone()))
+            .unwrap_or_else(|| crate::manifest::read_release_lock(&args.workspace))
+        {
             Ok(release) => {
                 state.set_release(release);
                 if deployment_attempt && let Err(error) = state.complete_stage() {
@@ -915,6 +1236,7 @@ pub(super) async fn server_loop(
                     run_migrations,
                     dev_profile: run_dev_profile,
                     pg: run_pg,
+                    prepared_proxy: prepared_proxy.clone(),
                 },
                 &orchestration_cancel,
             );
@@ -963,7 +1285,7 @@ pub(super) async fn server_loop(
                 continue;
             }
             if state.is_cancelled() {
-                host.stop_all(Some(&standby_root)).await?;
+                host.finish_business_session(Some(&standby_root)).await?;
                 if let Err(error) = outcome
                     && error
                         .downcast_ref::<supervisor::ShutdownUnconfirmed>()
@@ -974,23 +1296,34 @@ pub(super) async fn server_loop(
                 }
                 return Ok(());
             }
+            let mut preflight_rejected = false;
             if let Err(e) = outcome {
-                tracing::error!("server: orchestration failed: {e:#}");
-                if let Err(stop_error) = host.stop_all(Some(&standby_root)).await {
-                    hold_unconfirmed(state, format!("orchestrate: {e:#}; stop: {stop_error:#}"))
+                if e.downcast_ref::<supervisor::PreflightRejected>().is_some() {
+                    fail_preparation(state, format!("proxy preflight: {e:#}")).await;
+                    state.set_phase(ServerPhase::Running);
+                    preflight_rejected = true;
+                } else {
+                    tracing::error!("server: orchestration failed: {e:#}");
+                    if let Err(stop_error) = host.finish_business_session(Some(&standby_root)).await
+                    {
+                        hold_unconfirmed(
+                            state,
+                            format!("orchestrate: {e:#}; stop: {stop_error:#}"),
+                        )
                         .await;
-                    return Ok(());
+                        return Ok(());
+                    }
+                    if e.downcast_ref::<supervisor::ShutdownUnconfirmed>()
+                        .is_some()
+                    {
+                        hold_unconfirmed(state, format!("orchestrate: {e:#}")).await;
+                        return Ok(());
+                    }
+                    pending = fail_activation(args, state, format!("orchestrate: {e:#}")).await;
+                    continue;
                 }
-                if e.downcast_ref::<supervisor::ShutdownUnconfirmed>()
-                    .is_some()
-                {
-                    hold_unconfirmed(state, format!("orchestrate: {e:#}")).await;
-                    return Ok(());
-                }
-                pending = fail_activation(args, state, format!("orchestrate: {e:#}")).await;
-                continue;
             }
-            if let Err(error) = state.complete_running() {
+            if !preflight_rejected && let Err(error) = state.complete_running() {
                 if let Err(stop_error) = host.stop_all(Some(&standby_root)).await {
                     hold_unconfirmed(
                         state,
@@ -1005,7 +1338,11 @@ pub(super) async fn server_loop(
             // V02：取消观察并入提交屏障（内核锁内检查，消除外层检查与提交
             // 之间的竞争窗口）——Cancelled/Superseded 都必须**先停服确认**
             // 再按 ID 收束 Cancelled；清理未知走 hold_unconfirmed。
-            match commit_running_barrier(state).await {
+            match if preflight_rejected {
+                BarrierOutcome::Passed
+            } else {
+                commit_running_barrier(state).await
+            } {
                 BarrierOutcome::Passed => {}
                 BarrierOutcome::CancelledByRequest | BarrierOutcome::Superseded => {
                     let reason = if commit_running_barrier_reason_cancelled(state) {
@@ -1040,101 +1377,11 @@ pub(super) async fn server_loop(
             }
             // R01：supervisord Running 等待也消费运行控制信号（Stop/重启编排
             // 不再只能等 Idle）。锁序与 Idle 分支一致：deploy 先、control 后。
-            let mut control_rx = state.control_rx.lock().await;
-            let next = tokio::select! {
-                maybe = next_prepared(owner_args, &args.workspace, state, &mut hot_rx) => match maybe {
-                    Some(action) => Next::Redeploy(action),
-                    None => Next::Exit,
-                },
-                signal = control_rx.recv() => match signal {
-                    Some(signal) => {
-                        // R04：排队期已取消的启动/重启——零副作用收束，不停
-                        // 在跑业务（取消收束不得变成 Stop 执行）
-                        if let ControlSignal::OrchestrateSource { operation_id, .. } = &signal
-                            && state
-                                .runtime_kernel()
-                                .is_some_and(|kernel| kernel.is_cancelled(operation_id))
-                        {
-                            state.settle_cancelled_before_execution(operation_id).await;
-                            Next::Wait
-                        } else {
-                            // C4：Source 重编排先做热载兼容预检——不兼容在
-                            // 停旧之前拒绝（旧业务继续服务），操作按自身 ID
-                            // 收束 Failed；Stop 信号无新候选，直接走摘流。
-                            let dev_profile = match &signal {
-                                ControlSignal::OrchestrateSource { dev_profile, .. } => {
-                                    Some(*dev_profile)
-                                }
-                                _ => None,
-                            };
-                            let mut rejected: Option<String> = None;
-                            if let Some(dev_profile) = dev_profile
-                                && let Err(error) =
-                                    preflight_hot_reload_compat(args, dev_profile).await
-                            {
-                                rejected = Some(format!("hot-reload preflight rejected: {error:#}"));
-                            }
-                            match rejected {
-                                Some(message) => {
-                                    tracing::error!("{message}");
-                                    if let ControlSignal::OrchestrateSource { operation_id, .. } =
-                                        &signal
-                                        && let Err(settle_error) = state
-                                            .finish_runtime_operation_by_id(
-                                                operation_id,
-                                                shared_types::RuntimeOperationState::Failed,
-                                                Some(("hot_reload_preflight".into(), message.clone())),
-                                            )
-                                            .await
-                                    {
-                                        tracing::error!(
-                                            "{settle_error}; preflight rejection unrecorded"
-                                        );
-                                    }
-                                    Next::Wait
-                                }
-                                None => {
-                                    state.ready.set_ready(false);
-                                    if let Err(error) = host.stop_all(Some(&standby_root)).await {
-                                        record_uncertain_control(state, &signal, &format!("stop before runtime control failed: {error:#}")).await;
-                                        hold_unconfirmed(
-                                            state,
-                                            format!("stop before runtime control failed: {error:#}"),
-                                        )
-                                        .await;
-                                        return Ok(());
-                                    }
-                                    // B01：动作整体交回主循环——Existing 重编排、
-                                    // StopBusiness{ID} 由 loop-top 唯一收束路径按
-                                    // ID 完成（stop_all 幂等，重复执行无害）。
-                                    Next::Redeploy(settle_control_signal(state, signal).await)
-                                }
-                            }
-                        }
-                    }
-                    None => Next::Wait,
-                },
-                () = async { state.cancel_token().cancelled().await } => Next::Exit,
-            };
-            drop(control_rx);
-            match next {
-                Next::Exit => {
-                    host.stop_all(Some(&standby_root)).await?;
-                    return Ok(());
-                }
-                Next::Wait => {}
-                Next::Redeploy(action) => {
-                    state.ready.set_ready(false);
-                    if let Err(error) = host.stop_all(Some(&standby_root)).await {
-                        hold_unconfirmed(
-                            state,
-                            format!("stop before activation failed: {error:#}"),
-                        )
-                        .await;
-                        return Ok(());
-                    }
-                    pending = Some(action);
-                }
+            pending =
+                wait_supervisord_running(owner_args, args, state, host, &mut hot_rx, &standby_root)
+                    .await?;
+            if pending.is_none() {
+                return Ok(());
             }
             continue;
         }
@@ -1155,6 +1402,7 @@ pub(super) async fn server_loop(
                 run_migrations,
                 dev_profile: run_dev_profile,
                 pg: run_pg,
+                prepared_proxy,
             },
         ));
         let mut sup_joined = false;
@@ -1258,36 +1506,43 @@ pub(super) async fn server_loop(
             }},
             maybe = next_prepared(owner_args, &args.workspace, state, &mut hot_rx) => match maybe {
                 Some(action) => {
-                    tracing::info!("server: hot deploy received, stopping current services");
+                    let predecessor_ready = state.ready.is_ready();
+                    if let Err(error) = supervisor::resident::publish_standby_if_serving().await {
+                        reject_live_deployment(state, error, predecessor_ready).await;
+                        continue;
+                    }
                     state.ready.set_ready(false);
                     cancel.cancel();
-                    match join_supervisor(&mut sup, &mut sup_joined).await {
-                        Ok(()) => {},
-                        Err(error) => {
-                            hold_unconfirmed(state, format!("stop before activation failed: {error:#}")).await;
-                            return Ok(());
-                        }
+                    if let Err(error) = join_supervisor(&mut sup, &mut sup_joined).await {
+                        hold_unconfirmed(state, format!("stop before activation failed: {error:#}")).await;
+                        return Ok(());
                     }
-                    Next::Redeploy(action)
+                    Next::Redeploy(Box::new(action))
                 }
                 None => Next::Exit,
             },
             // R01：builtin Running 等待也消费运行控制信号（先停本组服务再收束）
             signal = builtin_control.recv() => match signal {
                 Some(signal) => {
-                    if let ControlSignal::OrchestrateSource { operation_id, .. } = &signal
-                        && state.settle_cancelled_before_execution(operation_id).await {
+                    if !claim_live_source_control(state, &signal).await { continue; }
+                    let prepared = match prepare_source_control(owner_args, state, &signal).await {
+                        Ok(prepared) => prepared,
+                        Err(error) => { reject_live_control(state, &signal, &error).await; continue; }
+                    };
+                    if source_cancelled_after_preflight(state, &signal).await { continue; }
+                    if let Err(error) = supervisor::resident::publish_standby_if_serving().await {
+                        reject_live_control(state, &signal, &error).await;
                         continue;
                     }
+                    let action = settled_prepared_control(state, signal, prepared).await;
+                    if matches!(action, InitialAction::Settled) { continue; }
                     state.ready.set_ready(false);
                     cancel.cancel();
                     if let Err(error) = join_supervisor(&mut sup, &mut sup_joined).await {
-                        record_uncertain_control(state, &signal, &format!("stop before runtime control failed: {error:#}")).await;
                         hold_unconfirmed(state, format!("stop before runtime control failed: {error:#}")).await;
                         return Ok(());
                     }
-                    // B01：同 supervisord 分支——动作整体交回主循环唯一收束路径
-                    Next::Redeploy(settle_control_signal(state, signal).await)
+                    Next::Redeploy(Box::new(action))
                 }
                 None => Next::Wait,
             },
@@ -1321,7 +1576,7 @@ pub(super) async fn server_loop(
                 let reason = stopped.err().map(|error| format!("startup interrupted: {error:#}"))
                     .unwrap_or_else(|| "startup interrupted by runtime control".into());
                 match signal {
-                    Some(signal) => Next::Redeploy(settle_stopped_startup(args, state, signal, reason).await),
+                    Some(signal) => Next::Redeploy(Box::new(settle_stopped_startup(args, state, signal, reason).await)),
                     None => Next::Exit,
                 }
             },
@@ -1338,7 +1593,7 @@ pub(super) async fn server_loop(
                 return Ok(());
             }
             Next::Wait => {}
-            Next::Redeploy(action) => pending = Some(action),
+            Next::Redeploy(action) => pending = Some(*action),
         }
     }
 }
@@ -1386,4 +1641,256 @@ pub(super) fn bridge_event_fields(json: &str) -> Option<BridgeEvent> {
         event_name,
         payload,
     })
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    // A real child process supplies the predecessor HTTP/PID evidence. The
+    // supervisor control socket is a protocol fixture, not deployment evidence.
+    #[test]
+    #[ignore = "subprocess fixture, launched by repeated_source_rejection_keeps_running_driver_and_http"]
+    fn http_service_fixture() {
+        let Some(path) = std::env::var_os("APP_CLI_P1_HTTP_FIXTURE") else {
+            return;
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std::fs::write(path, listener.local_addr().unwrap().to_string()).unwrap();
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut request = [0; 4096];
+            if stream.read(&mut request).unwrap() == 0 {
+                continue;
+            }
+            let body = format!("old-pid={}", std::process::id());
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        }
+    }
+
+    fn custom_release(id: &str) -> ReleaseLock {
+        toml::from_str(&format!(
+            r#"
+            schema_version = 1
+            release_id = "{id}"
+            workspace_name = "fixture"
+            minimum_app_cli_version = "0.1.3"
+            runtime_image_digest = "fixture"
+            [pingap]
+            mode = "custom"
+            config = "proxy.toml"
+            version = "0.15.0"
+            commit = "fixture"
+            [[services]]
+            service_id = "web"
+            name = "Web"
+            dir = "web"
+            type = "node"
+            kind = "web"
+            enabled = true
+            port = 4200
+            logs = []
+            [services.run]
+            command = ["node", "server.js"]
+            migrate = []
+            depends_on = []
+            shutdown_timeout_seconds = 3
+            [services.health]
+            startup_path = "/health"
+            readiness_path = "/ready"
+            liveness_path = "/health"
+            [services.env]
+        "#
+        ))
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_source_rejection_keeps_running_driver_and_http() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("workspace");
+        let current = source.join(".run");
+        std::fs::create_dir_all(&current).unwrap();
+        let release = custom_release("source-b");
+        std::fs::write(
+            source.join("release.lock.toml"),
+            toml::to_string(&release).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            current.join("release.lock.toml"),
+            toml::to_string(&custom_release("artifact-a")).unwrap(),
+        )
+        .unwrap();
+        let config = |port| format!("[servers.app]\naddr = \"127.0.0.1:{port}\"\n");
+        std::fs::write(source.join("proxy.toml"), config(19082)).unwrap();
+        std::fs::write(current.join("proxy.toml"), config(19081)).unwrap();
+        let log_dir = root.path().join("logs");
+        let runtime_root = crate::proxy::compiler::runtime_root(&log_dir);
+        let active = crate::proxy::compiler::active_config_path(&runtime_root);
+        std::fs::create_dir_all(active.parent().unwrap()).unwrap();
+        std::fs::write(&active, config(19081)).unwrap();
+        let marker = root.path().join("http-address");
+        let mut business = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("orchestration::server::run_loop::lifecycle_tests::http_service_fixture")
+            .arg("--nocapture")
+            .env("APP_CLI_P1_HTTP_FIXTURE", &marker)
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = business.id().unwrap();
+        let address = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Ok(address) = std::fs::read_to_string(&marker) {
+                    break address;
+                }
+                assert!(
+                    business.try_wait().unwrap().is_none(),
+                    "HTTP fixture exited before listen"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let pingap = root.path().join("pingap");
+        std::fs::write(
+            &pingap,
+            "#!/bin/sh\nif [ \"$1\" = '--apply-protocol-version' ]; then echo 1; fi\nexit 0\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pingap, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let owner_args = RuntimeArgs {
+            workspace: source.clone(),
+            log_dir,
+            pingap_bin: pingap,
+            ..Default::default()
+        };
+        let mut active_args = owner_args.clone();
+        active_args.workspace = current.clone();
+        let state = Arc::new(ServerState::new(RuntimeStatusService::default()));
+        state.set_phase(ServerPhase::Running);
+        state.ready.set_ready(true);
+        let kernel = Arc::new(crate::runtime_kernel::RuntimeKernel::new(
+            crate::runtime_kernel::RuntimeStore::open_with_root(root.path().join("state"), &source)
+                .unwrap(),
+            shared_types::RuntimeIdentityView {
+                application_id: "p1app".into(),
+                workspace_id: "p1ws".into(),
+                service_family: "userapp-dev".into(),
+                source_root: source.to_string_lossy().into_owned(),
+                runtime_instance_id: "instance".into(),
+                deployment_generation_id: "generation".into(),
+                protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+                capabilities: vec![],
+            },
+            Box::new(|_| {}),
+        ));
+        state.set_runtime_kernel(kernel.clone());
+        let host = SupervisordHost::protocol_fixture(
+            root.path().join("unavailable-supervisor.sock"),
+            root.path().join("dynamic.conf"),
+        );
+        let (_hot, mut hot_rx) = tokio::sync::mpsc::unbounded_channel();
+        let driver_state = state.clone();
+        let driver_args = owner_args.clone();
+        let task = tokio::spawn(async move {
+            wait_supervisord_running(
+                &driver_args,
+                &active_args,
+                &driver_state,
+                &host,
+                &mut hot_rx,
+                &runtime_root,
+            )
+            .await
+        });
+        for id in ["rejectone", "rejecttwo"] {
+            let revision = kernel.store().load_desired().unwrap().1;
+            kernel
+                .admit(shared_types::RuntimeOperationRequest {
+                    operation_id: id.into(),
+                    expected_runtime_instance_id: "instance".into(),
+                    expected_revision: revision,
+                    workspace_id: "p1ws".into(),
+                    kind: shared_types::RuntimeOperationKind::Start,
+                    profile: shared_types::RunProfileInput::Source {
+                        workspace_id: "p1ws".into(),
+                    },
+                    run_config: None,
+                    request_context: None,
+                })
+                .await
+                .unwrap();
+            state
+                .control_tx
+                .send(ControlSignal::OrchestrateSource {
+                    operation_id: id.into(),
+                    dev_profile: true,
+                    pg: None,
+                })
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(4), async {
+                loop {
+                    if kernel.get(id).await.unwrap().unwrap().state
+                        == shared_types::RuntimeOperationState::Failed
+                    {
+                        break;
+                    }
+                    assert!(
+                        !task.is_finished(),
+                        "rejection must keep the Running driver alive"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                kernel
+                    .get(id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .error_message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("server")),
+                "the source listener change must be the rejection reason"
+            );
+            assert_eq!(state.phase(), ServerPhase::Running);
+            assert!(state.ready.is_ready());
+            assert_eq!(std::fs::read_to_string(&active).unwrap(), config(19081));
+            assert!(business.try_wait().unwrap().is_none());
+            assert_eq!(business.id(), Some(pid));
+            let mut stream = tokio::net::TcpStream::connect(&address).await.unwrap();
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"));
+            assert!(response.ends_with(&format!("old-pid={pid}")));
+        }
+        task.abort();
+        let _ = task.await;
+        business.kill().await.unwrap();
+        business.wait().await.unwrap();
+    }
 }

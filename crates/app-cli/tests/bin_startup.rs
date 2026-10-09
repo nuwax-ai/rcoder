@@ -2,14 +2,17 @@
 //! 或 pingap 失败仍非零退出、保留原失败 Done 和独立管理 owner。
 //!
 //! 走真实二进制（`CARGO_BIN_EXE_app-cli`）+ 受控 workspace / 端口 / pingap
-//! 注入，不依赖 PG（`APP_CLI_SKIP_PG_WAIT`）与真实 pingap（`--pingap-bin
-//! /bin/false`）。对应 tasks.md A01/A02/A04 的 bin 层覆盖（组件级）。
+//! 注入，不依赖 PG。预检失败用 /bin/false；启动后的终局保护使用支持
+//! 完整预检、鉴权与应用结果的受控协议进程，不作为真实 Pingap 部署证据。
 #![cfg(unix)]
 
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
+
+#[path = "fixtures/protocol_support.rs"]
+mod protocol_support;
 
 /// 最小合法 release.lock（node web 服务：spawn 失败走容错路径，不阻塞到达
 /// start_pingap；pingap 注入 /bin/false 使编译阶段确定失败）。
@@ -66,6 +69,22 @@ fn free_port_address() -> String {
 }
 
 fn base_command(subcommand: &str, workspace: &Path, logs: &Path, admin_addr: &str) -> Command {
+    base_command_with_proxy(
+        subcommand,
+        workspace,
+        logs,
+        admin_addr,
+        Path::new("/bin/false"),
+    )
+}
+
+fn base_command_with_proxy(
+    subcommand: &str,
+    workspace: &Path,
+    logs: &Path,
+    admin_addr: &str,
+    proxy: &Path,
+) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_app-cli"));
     command
         .args([
@@ -77,7 +96,7 @@ fn base_command(subcommand: &str, workspace: &Path, logs: &Path, admin_addr: &st
             "--admin-addr",
             admin_addr,
             "--pingap-bin",
-            "/bin/false",
+            proxy.to_str().expect("proxy fixture path"),
         ])
         .env_remove("APP_DEPLOY_URL")
         .env_remove("APP_RELEASE_ID")
@@ -288,19 +307,42 @@ fn corrupted_lock_is_rebuilt_and_real_startup_failure_exits_non_zero() {
     assert_eq!(done_event_count(&output.stdout), 1);
 }
 
-/// A02/A04 失败终局事件：pingap 编译失败（--pingap-bin /bin/false）→
-/// 兜底路径补发**恰好一次** orchestration_done（含 orchestrator 自身条目与
-/// 服务失败清单），客户端非零退出，管理面保留。
+/// A02/A04：配置完整预检通过，真实协议进程启动后拒绝本次 publication。
+/// 终局保留 orchestrator 与真实服务 spawn 失败，Done 恰好一次、客户端
+/// 非零退出；管理 owner 保留且最终精确清理代理。
 #[test]
 fn pingap_failure_emits_single_done_and_exits_non_zero() {
-    let (_dir, workspace) = temp_workspace();
+    let (directory, workspace) = temp_workspace();
     write_lock(&workspace, MINIMAL_LOCK);
+    std::fs::write(workspace.join("workspace.manifest.toml"), "schema_version=1\n[workspace]\nname='bin-startup'\n[pingap]\nmode='custom'\nconfig='protocol-listener.toml'\n").unwrap();
+    protocol_support::write_listener_override(&workspace, "web");
+    let missing_service = directory.path().join("intentionally-missing-service");
+    std::fs::write(workspace.join("web/project.manifest.toml"), format!("schema_version=1\n[project]\nservice_id='web'\nname='Web'\ntype='node'\n[build]\ncommand=['true']\nartifact='unused.zip'\n[run]\ncommand=[{:?}]\nshutdown_timeout_seconds=1\n[health]\nstartup_timeout_seconds=2\n[proxy]\npath='/'\n", missing_service.to_string_lossy())).unwrap();
+    let proxy = protocol_support::write_pingap(directory.path());
+    let executable = env!("CARGO_BIN_EXE_tree-fixture").replace('\'', "'\"'\"'");
+    // The witness is written only for a real serving launch, never for either
+    // preflight command. Unix exec preserves this exact child PID.
+    std::fs::write(&proxy,format!("#!/bin/sh\nfor arg in \"$@\"; do\ncase \"$arg\" in --apply-protocol-version|-t) exec '{executable}' protocol-pingap \"$@\";; esac\ndone\nprintf '%s\\n' \"$$\" > \"$PROTOCOL_PROXY_STARTED_FILE\"\nexec '{executable}' protocol-pingap \"$@\"\n")).unwrap();
+    let fault = directory.path().join("proxy-admin-fault");
+    std::fs::write(&fault, "failed").unwrap();
+    let started = directory.path().join("proxy-started-pid");
+    let proxy_identity = directory.path().join("proxy-identity.json");
     let address = free_port_address();
     let logs = workspace.parent().unwrap().join("logs");
-    let (output, management_alive) = run_to_exit(
-        base_command("run", &workspace, &logs, &address),
-        Duration::from_secs(60),
-    );
+    let mut command = base_command_with_proxy("run", &workspace, &logs, &address, &proxy);
+    command
+        .env("PROTOCOL_PROXY_ADMIN_FAULT", &fault)
+        .env("PROTOCOL_PROXY_STARTED_FILE", &started)
+        .env("PROTOCOL_PROXY_PID_FILE", &proxy_identity)
+        .env(
+            "APP_CLI_PINGAP_ADMIN_PORT",
+            protocol_support::reserve_port().to_string(),
+        )
+        .env(
+            "APP_CLI_SUPERVISOR_SOCKET",
+            directory.path().join("no-supervisor.sock"),
+        );
+    let (output, management_alive) = run_to_exit(command, Duration::from_secs(60));
     assert!(
         management_alive,
         "business failure cannot terminate management"
@@ -308,7 +350,7 @@ fn pingap_failure_emits_single_done_and_exits_non_zero() {
     let combined = String::from_utf8_lossy(&output.stdout);
     assert!(
         !output.status.success(),
-        "pingap compile failure must exit non-zero; combined output: {combined}"
+        "post-spawn protocol failure must exit non-zero; combined output: {combined}"
     );
     assert_eq!(
         done_event_count(&output.stdout),
@@ -323,7 +365,60 @@ fn pingap_failure_emits_single_done_and_exits_non_zero() {
         done_line.contains("orchestrator"),
         "orchestrator stage error must be reported in failed list: {done_line}"
     );
-    // 服务 spawn 失败（node server.js 不存在）的容错清单也保留在同一 Done。
+    let event: serde_json::Value = serde_json::from_str(
+        done_line
+            .split_once("APP-CLI-EVT ")
+            .expect("real orchestration event prefix")
+            .1,
+    )
+    .unwrap();
+    let failed = event["failed"].as_array().expect("structured failure list");
+    assert_eq!(
+        failed.len(),
+        2,
+        "one service spawn failure and one publication failure must be retained: {done_line}"
+    );
+    let service_failure = failed
+        .iter()
+        .find(|entry| entry["service"] == "web")
+        .expect("web failure entry");
+    assert!(
+        service_failure["error"]
+            .as_str()
+            .unwrap()
+            .contains("intentionally-missing-service"),
+        "the service failure must be the real missing executable: {done_line}"
+    );
+    let publication_failure = failed
+        .iter()
+        .find(|entry| entry["service"] == "orchestrator")
+        .expect("orchestrator failure entry");
+    assert!(
+        publication_failure["error"]
+            .as_str()
+            .unwrap()
+            .contains("controlled post-spawn application failure"),
+        "the terminal must retain the application protocol rejection: {done_line}"
+    );
+    assert!(
+        combined.contains("controlled post-spawn application failure"),
+        "the compiled candidate must reach the actual admin failure: {combined}"
+    );
+    let proxy_pid: u32 = std::fs::read_to_string(&started)
+        .expect("proxy was really launched after preflight")
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(proxy_pid > 0);
+    if let Ok(bytes) = std::fs::read(&proxy_identity) {
+        let identity: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(identity["pid"].as_u64(), Some(u64::from(proxy_pid)));
+    }
+    assert!(
+        std::net::TcpStream::connect("127.0.0.1:9080").is_err(),
+        "captured owner shutdown must leave no public proxy listener"
+    );
+    // An intentionally missing executable deterministically fails service spawn.
     assert!(
         done_line.contains("web"),
         "service-level failures must be preserved in the same Done: {done_line}"

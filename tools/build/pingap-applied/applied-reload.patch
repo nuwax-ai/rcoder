@@ -1,0 +1,3165 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 84da5792..9f9402c3 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3973,6 +3973,7 @@ dependencies = [
+  "tracing",
+  "url",
+  "urlencoding",
++ "uuid",
+  "vergen",
+  "vergen-git2",
+ ]
+@@ -4081,6 +4082,7 @@ dependencies = [
+  "etcd-client",
+  "glob",
+  "hcl-rs",
++ "hex",
+  "humantime-serde",
+  "kdl",
+  "nanoid",
+@@ -4093,6 +4095,7 @@ dependencies = [
+  "serde",
+  "serde_json",
+  "serde_qs",
++ "sha2",
+  "snafu",
+  "strum 0.28.0",
+  "tempfile",
+@@ -4360,6 +4363,7 @@ name = "pingap-proxy"
+ version = "0.15.0"
+ dependencies = [
+  "ahash",
++ "arc-swap",
+  "async-trait",
+  "bstr",
+  "bytes",
+diff --git a/Cargo.toml b/Cargo.toml
+index 9763a69c..f5f83948 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -103,6 +103,7 @@ sha2 = { workspace = true }
+ snafu = { workspace = true }
+ substring = { workspace = true }
+ tokio = { workspace = true }
++uuid = { workspace = true }
+ toml = { workspace = true }
+ tracing = { workspace = true }
+ url = { workspace = true }
+diff --git a/README.md b/README.md
+index 4f359ee1..a81465c6 100644
+--- a/README.md
++++ b/README.md
+@@ -152,7 +152,7 @@ combined with these flags.
+ 
+ Pingap is designed to adapt to configuration changes without downtime.
+ 
+-Hot Reload (--autoreload): For most changes—like updating upstreams, locations, or plugins—Pingap applies the new configuration within 10 seconds without a restart. This is the recommended mode for containerized environments.
++Hot Reload (--autoreload): Pingap prepares plugins, locations, upstreams and existing server.locations before publishing one complete request graph. Failed or unsupported candidates retain the previous graph; basic, certificate, storage and listener changes require restart. `-t` rejects unknown, compiled-out or invalid plugins. [Applied status and the read-only admin API](docs/applied-reload.md) describe confirmation and the complete SHA256 digest.
+ 
+ Graceful Restart (-a or --autorestart): For fundamental changes (like modifying server listen ports), this mode performs a full, zero-downtime restart, ensuring no requests are dropped.
+ 
+@@ -324,3 +324,5 @@ Our current MSRV is 1.96
+ ## 📄 License
+ 
+ This project is Licensed under [Apache License, Version 2.0](./LICENSE).
++
++`pingap --apply-protocol-version` prints `1` and exits without loading configuration. Older binaries that lack this query must be rejected before changing business services.
+diff --git a/README_zh.md b/README_zh.md
+index f334b3a5..b54b8891 100644
+--- a/README_zh.md
++++ b/README_zh.md
+@@ -139,7 +139,7 @@ pingap --domain=pingap.io --upstream=192.168.1.1:3000 --cert=/etc/ssl/pingap.io
+ 
+ Pingap 的设计旨在无需停机即可适应配置变更。
+ 
+-热更新 (--autoreload)：对于大多数变更——如更新上游服务、路由或插件——Pingap 会在10秒内应用新配置，无需重启。这是容器化环境的推荐模式。
++热更新 (--autoreload)：先完整准备 plugins、locations、upstreams 及既有 server.locations，再一次原子发布请求图。失败或不支持的候选保留旧图；basic、证书、存储和 listener 变化需要重启。`-t` 严格拒绝未知、未编译或无效插件。完整 SHA256 与只读管理接口的契约见[实际生效状态](docs/zh/guide/applied-reload.md)。
+ 
+ 平滑重启 (-a 或 --autorestart)：对于基础性变更（如修改服务器监听端口），此模式会执行一次完整的、零停机的重启，确保不丢失任何请求。
+ 
+@@ -277,3 +277,5 @@ Transfer/sec:     19.24MB
+ ## 📄 开源协议
+ 
+ 本项目采用 [Apache License, Version 2.0](./LICENSE) 开源协议。
++
++`pingap --apply-protocol-version` 仅输出 `1` 并退出，不加载配置。缺少该查询能力的旧二进制应在操作业务服务之前拒绝。
+diff --git a/docs/zh/README.md b/docs/zh/README.md
+index 485633a2..7ffb178f 100644
+--- a/docs/zh/README.md
++++ b/docs/zh/README.md
+@@ -180,9 +180,11 @@ zstd_level = 3
+ 
+ ## 动态配置
+ 
+-- **热更新（`--autoreload`）**：多数变更（upstream、location、插件等）约 10 秒内就地生效，无需重启。容器环境推荐。
++- **热更新（`--autoreload`）**：完整准备 plugins、locations、upstreams 和既有 server.locations 后一次原子发布；失败及不支持的候选保留旧图。basic、证书、存储和 listener 变化需要重启。`-t` 严格拒绝未知、未编译及无效插件。见[实际生效状态](guide/applied-reload.md)。
+ - **平滑重启（`-a` / `--autorestart`）**：监听端口等基础变更时做零停机优雅重启。
+ 
+ ## 许可证
+ 
+ Apache-2.0。见 [LICENSE](https://github.com/vicanso/pingap/blob/main/LICENSE)。
++
++`pingap --apply-protocol-version` 仅输出 `1` 并退出，不加载配置。缺少该查询能力的旧二进制应在操作业务服务之前拒绝。
+diff --git a/docs/zh/plugins/cache.md b/docs/zh/plugins/cache.md
+index 27a976b6..82ef4633 100644
+--- a/docs/zh/plugins/cache.md
++++ b/docs/zh/plugins/cache.md
+@@ -85,6 +85,14 @@ curl -X PURGE http://127.0.0.1:6188/*
+ ## 使用说明
+ 
+ - **`eviction` 需要有界后端。** 仅在后端报告非零 `max_size` 时接线，文件后端没有——因此 `eviction` 实际仅对内存有效。文件缓存条目由 inactive 扫描回收（`?inactive=…`）。
+-- **每个进程只有一个内存后端。** 第一个请求内存缓存的 `cache` 插件创建进程级单例；第二个声明不同 `max_size` 或 `mode` 时会静默复用第一个。用 `namespace` 分隔内容，不要再声明第二个 `directory`。
++- **每个进程只有一个内存后端。** 第一个请求内存缓存的 `cache` 插件创建进程级单例；第二个声明不同 `max_size` 或归一化 `mode` 时会明确拒绝，需要重启进程。用 `namespace` 分隔内容，不要再声明第二个 `directory`。
+ - 每个不同的 `lock` 时长会在进程生命周期内分配一把共享锁，因此重要的是不同取值的数量，而不是插件实例数。
+ - 按 `Accept-Encoding` 缓存时请搭配 [`accept_encoding`](accept_encoding.md)，否则变体数量会爆炸。
++
++## 热更新边界
++
++内存缓存 backend 为进程级 singleton。热更新会明确拒绝修改实际已注册 backend 的容量/模式参数，此类修改需要重启。
++standby 移除插件后可以按同一参数恢复，不要求保留配置锚点。既有内存缓存插件的
++`max_ttl`、namespace 和 headers 等请求级选项可以热更新；失败候选保留完整旧图。
++
++文件缓存不支持 `eviction`，配置该选项时构造器明确返回错误，`-t` 同样失败。
+diff --git a/pingap-cache/src/lib.rs b/pingap-cache/src/lib.rs
+index 794bcdde..91451da2 100644
+--- a/pingap-cache/src/lib.rs
++++ b/pingap-cache/src/lib.rs
+@@ -73,7 +73,12 @@ fn new_file_cache(dir: &str) -> Result<HttpCache> {
+ static BACKENDS: LazyLock<Mutex<HashMap<String, &'static HttpCache>>> =
+     LazyLock::new(|| Mutex::new(HashMap::new()));
+ 
+-static MEMORY_BACKEND: OnceLock<HttpCache> = OnceLock::new();
++struct MemoryBackend {
++    cache: HttpCache,
++    max_size: Option<MaxSize>,
++    mode: CacheMode,
++}
++static MEMORY_BACKEND: OnceLock<MemoryBackend> = OnceLock::new();
+ 
+ const MAX_MEMORY_SIZE: usize = 1024 * 1024 * 1024;
+ 
+@@ -165,8 +170,8 @@ impl MemoryCacheParams {
+ fn try_init_memory_backend(
+     params: MemoryCacheParams,
+     cache_mode: CacheMode,
+-) -> &'static HttpCache {
+-    MEMORY_BACKEND.get_or_init(|| {
++) -> Result<&'static HttpCache> {
++    let backend = MEMORY_BACKEND.get_or_init(|| {
+         let available_memory =
+             AVAILABLE_MEMORY.load(Ordering::Relaxed) as usize;
+         let max_memory = if available_memory > 0 {
+@@ -188,8 +193,36 @@ fn try_init_memory_backend(
+             cache_mode = ?cache_mode,
+             "init memory cache backend success"
+         );
+-        new_tiny_ufo_cache(cache_mode, size)
+-    })
++        MemoryBackend {
++            cache: new_tiny_ufo_cache(cache_mode, size),
++            max_size: params.max_size,
++            mode: cache_mode,
++        }
++    });
++    check_memory_backend(backend, params.max_size, cache_mode)?;
++    Ok(&backend.cache)
++}
++
++fn check_memory_backend(
++    backend: &MemoryBackend,
++    max_size: Option<MaxSize>,
++    mode: CacheMode,
++) -> Result<()> {
++    if backend.max_size != max_size || backend.mode != mode {
++        return Err(Error::Invalid { message: "memory cache backend capacity/mode is already initialized with different parameters; restart is required".into() });
++    }
++    Ok(())
++}
++
++/// Check the actually registered process-wide memory resource, independently
++/// of whether the current request graph still references a cache plugin.
++pub fn validate_memory_cache_backend(directory: &str) -> Result<()> {
++    let params = MemoryCacheParams::try_from(directory)?;
++    let mode = params.cache_mode()?;
++    if let Some(backend) = MEMORY_BACKEND.get() {
++        check_memory_backend(backend, params.max_size, mode)?;
++    }
++    Ok(())
+ }
+ 
+ /// Returns the backend for `directory`: the process-wide memory backend for
+@@ -202,7 +235,7 @@ pub fn new_cache_backend(directory: &str) -> Result<&'static HttpCache> {
+     if directory.is_empty() || directory.starts_with("memory://") {
+         let params = MemoryCacheParams::try_from(directory)?;
+         let cache_mode = params.cache_mode()?;
+-        return Ok(try_init_memory_backend(params, cache_mode));
++        return try_init_memory_backend(params, cache_mode);
+     }
+     let mut cache_backends = BACKENDS.lock().map_err(|e| Error::Invalid {
+         message: e.to_string(),
+diff --git a/pingap-cache/src/tiny.rs b/pingap-cache/src/tiny.rs
+index 13a372f0..185d3939 100644
+--- a/pingap-cache/src/tiny.rs
++++ b/pingap-cache/src/tiny.rs
+@@ -39,7 +39,7 @@ pub(crate) struct MemoryCache {
+ 
+ /// TinyUFO variant. `normal` (also `default`) is the lock-free index,
+ /// `compact` trades some speed for a smaller footprint.
+-#[derive(Debug, Clone, Copy, Default, EnumString)]
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, EnumString)]
+ #[strum(ascii_case_insensitive)]
+ pub enum CacheMode {
+     #[default]
+diff --git a/pingap-config/Cargo.toml b/pingap-config/Cargo.toml
+index 2ad6798d..d020678b 100644
+--- a/pingap-config/Cargo.toml
++++ b/pingap-config/Cargo.toml
+@@ -24,6 +24,7 @@ diff = { workspace = true }
+ etcd-client = { workspace = true }
+ glob = { workspace = true }
+ humantime-serde = { workspace = true }
++hex = { workspace = true }
+ pingap-core = { workspace = true }
+ pingap-discovery = { workspace = true }
+ pingap-util = { workspace = true }
+@@ -31,6 +32,7 @@ regex = { workspace = true }
+ rustls-pki-types = { workspace = true }
+ serde = { workspace = true }
+ serde_json = { workspace = true }
++sha2 = { workspace = true }
+ serde_qs = { workspace = true }
+ snafu = { workspace = true }
+ strum = { workspace = true }
+diff --git a/pingap-config/src/common.rs b/pingap-config/src/common.rs
+index f0920da0..c02690ba 100644
+--- a/pingap-config/src/common.rs
++++ b/pingap-config/src/common.rs
+@@ -21,6 +21,7 @@ use regex::Regex;
+ use rustls_pki_types::pem::PemObject;
+ use serde::de::DeserializeOwned;
+ use serde::{Deserialize, Serialize, Serializer};
++use sha2::{Digest, Sha256};
+ use std::collections::HashSet;
+ use std::fs::File;
+ use std::hash::{DefaultHasher, Hash, Hasher};
+@@ -1657,6 +1658,22 @@ impl PingapConfig {
+         let hash = crc32fast::hash(lines.join("\n").as_bytes());
+         Ok(format!("{hash:X}"))
+     }
++    /// SHA256 of the complete resolved configuration. The canonical bytes are
++    /// `serde_json::to_value`, recursive object sorting and `serde_json::to_vec`,
++    /// including certificate
++    /// and storage contents rather than the legacy CRC32 descriptions.
++    pub fn digest(&self) -> Result<String> {
++        let mut value =
++            serde_json::to_value(self).map_err(|error| Error::Invalid {
++                message: format!("serialize complete configuration: {error}"),
++            })?;
++        value.sort_all_objects();
++        let canonical =
++            serde_json::to_vec(&value).map_err(|error| Error::Invalid {
++                message: format!("serialize canonical configuration: {error}"),
++            })?;
++        Ok(hex::encode(Sha256::digest(&canonical)))
++    }
+     /// Whether `name` in `category` can be removed: an upstream, location or
+     /// plugin still referenced by another entry cannot.
+     pub fn check_removable(&self, category: &str, name: &str) -> Result<()> {
+diff --git a/pingap-core/src/ctx.rs b/pingap-core/src/ctx.rs
+index dfd272b8..bb2d5103 100644
+--- a/pingap-core/src/ctx.rs
++++ b/pingap-core/src/ctx.rs
+@@ -438,6 +438,9 @@ pub enum CtxLogField {
+ /// including connection details, caching information, and upstream server interactions.
+ #[derive(Default)]
+ pub struct Ctx {
++    /// An immutable provider snapshot captured at request creation. Its
++    /// concrete type belongs to the proxy layer, avoiding a dependency cycle.
++    pub runtime_snapshot: Option<Arc<dyn std::any::Any + Send + Sync>>,
+     /// Information about the client connection.
+     pub conn: ConnectionInfo,
+     /// Information about the upstream server.
+diff --git a/pingap-plugin/docs/cache.md b/pingap-plugin/docs/cache.md
+index 60ffb58f..d3ae68e9 100644
+--- a/pingap-plugin/docs/cache.md
++++ b/pingap-plugin/docs/cache.md
+@@ -115,12 +115,16 @@ in a multi-instance deployment, issue the request on every node.
+ 
+ - **`eviction` needs a bounded backend.** It is only wired up when the backend
+   reports a non-zero `max_size`, which the file backend does not — so `eviction`
+-  is memory-only, and setting it on a file cache logs an error and is ignored.
++  is memory-only, and setting it on a file cache is rejected at construction.
+   File cache entries are reclaimed by the inactive sweep instead (`?inactive=…`).
+ - **One memory backend per process.** The memory cache is a process-wide
+   singleton created by the first `cache` plugin that asks for it; a second
+-  declaration with a different `max_size` or `mode` silently reuses the first
+-  one. Use `namespace` to separate content, not a second `directory`.
++  declaration with a different `max_size` or normalized `mode` is rejected and
++  requires process restart. Use `namespace` to separate content, not a second `directory`.
++- **Memory backend changes need restart.** Hot reload rejects changing the registered memory backend capacity/mode.
++  Removing cache plugins for standby and restoring the same parameters is supported. Existing memory cache
++  request options such as `max_ttl`, namespace and headers can be reloaded;
++  failed candidates leave the previous request graph active.
+ - Each distinct `lock` duration allocates one shared lock for the lifetime of
+   the process, so the number of distinct values matters, not the number of
+   plugin instances.
+diff --git a/pingap-plugin/src/cache.rs b/pingap-plugin/src/cache.rs
+index 0e50cebe..30bf17bc 100644
+--- a/pingap-plugin/src/cache.rs
++++ b/pingap-plugin/src/cache.rs
+@@ -187,6 +187,18 @@ impl TryFrom<&PluginConf> for Cache {
+     fn try_from(value: &PluginConf) -> Result<Self> {
+         let hash_value = get_hash_key(value);
+         let directory = get_str_conf(value, "directory");
++        let eviction_enabled = get_bool_conf(value, "eviction");
++        if eviction_enabled
++            && !directory.is_empty()
++            && !directory.starts_with("memory://")
++        {
++            return Err(Error::Invalid {
++                category: "cache".into(),
++                message:
++                    "eviction is only supported by the memory cache backend"
++                        .into(),
++            });
++        }
+ 
+         let cache = new_cache_backend(directory.as_str()).map_err(|e| {
+             Error::Invalid {
+@@ -196,7 +208,7 @@ impl TryFrom<&PluginConf> for Cache {
+         })?;
+         let cache_max_size = cache.max_size;
+ 
+-        let eviction = if value.contains_key("eviction") {
++        let eviction = if eviction_enabled {
+             if cache_max_size > 0 {
+                 let eviction = get_eviction_manager(cache_max_size);
+                 Some(eviction as &'static (dyn EvictionManager + Sync))
+@@ -204,11 +216,12 @@ impl TryFrom<&PluginConf> for Cache {
+                 // Eviction needs a bounded backend to evict against. The file
+                 // backend does not report a size, so say so instead of leaving
+                 // the operator believing the cache is capped.
+-                error!(
+-                    directory,
+-                    "eviction is only supported by the memory cache backend, ignoring it"
+-                );
+-                None
++                return Err(Error::Invalid {
++                    category: "cache".into(),
++                    message:
++                        "eviction is only supported by the memory cache backend"
++                            .into(),
++                });
+             }
+         } else {
+             None
+diff --git a/pingap-proxy/Cargo.toml b/pingap-proxy/Cargo.toml
+index 49432b12..9abd9aad 100644
+--- a/pingap-proxy/Cargo.toml
++++ b/pingap-proxy/Cargo.toml
+@@ -37,6 +37,7 @@ tokio = { workspace = true, features = ["io-util", "time"] }
+ tracing = { workspace = true }
+ 
+ [dev-dependencies]
++arc-swap = { workspace = true }
+ pretty_assertions = { workspace = true }
+ tempfile = { workspace = true }
+ tokio-test = { workspace = true }
+diff --git a/pingap-proxy/src/lib.rs b/pingap-proxy/src/lib.rs
+index 5fee7a00..f3095dcf 100644
+--- a/pingap-proxy/src/lib.rs
++++ b/pingap-proxy/src/lib.rs
+@@ -35,7 +35,21 @@ pub(crate) use tracing::*;
+ 
+ pub use pingap_location::ServerLocationRoute;
+ 
++/// All hot-reloadable providers from one configuration generation. Retained
++/// by the request through routing, plugins and every upstream retry.
++pub struct RequestProviders {
++    pub server_locations: Arc<dyn ServerLocationsProvider>,
++    pub locations: Arc<dyn pingap_location::LocationProvider>,
++    pub upstreams: Arc<dyn pingap_upstream::UpstreamProvider>,
++    pub plugins: Arc<dyn pingap_core::PluginProvider>,
++}
++
+ pub trait ServerLocationsProvider: Send + Sync {
++    /// Mutable implementations should return an immutable complete snapshot.
++    /// Static providers can retain the default, for backwards compatibility.
++    fn snapshot(&self) -> Option<Arc<RequestProviders>> {
++        None
++    }
+     /// Get the weight-ordered locations and host index for a server.
+     ///
+     /// # Arguments
+diff --git a/pingap-proxy/src/server.rs b/pingap-proxy/src/server.rs
+index e8c27fc8..c72f935a 100644
+--- a/pingap-proxy/src/server.rs
++++ b/pingap-proxy/src/server.rs
+@@ -18,8 +18,8 @@ use super::tracing::{
+     set_otel_upstream_attrs,
+ };
+ use super::{ErrorTemplate, LOG_TARGET, ServerConf, set_append_proxy_headers};
+-use crate::ServerLocationsProvider;
+ use crate::ja4::{Ja4Collector, Ja4Store};
++use crate::{RequestProviders, ServerLocationsProvider};
+ use ahash::AHashMap;
+ use async_trait::async_trait;
+ use bstr::ByteSlice;
+@@ -652,7 +652,13 @@ impl Server {
+         session: &mut Session,
+         ctx: &mut Ctx,
+     ) -> pingora::Result<bool> {
+-        if let Some(plugin) = self.plugin_provider.get("pingap:admin") {
++        let snapshot = request_providers(ctx);
++        let plugins = snapshot
++            .as_ref()
++            .map_or(self.plugin_provider.as_ref(), |snapshot| {
++                snapshot.plugins.as_ref()
++            });
++        if let Some(plugin) = plugins.get("pingap:admin") {
+             let result = plugin
+                 .handle_request(PluginStep::Request, session, ctx)
+                 .await?;
+@@ -743,7 +749,18 @@ impl Server {
+         let path = header.uri.path();
+ 
+         // locations not found
+-        let Some(route) = self.server_locations_provider.get(&self.name) else {
++        let snapshot = request_providers(ctx);
++        let routes = snapshot
++            .as_ref()
++            .map_or(self.server_locations_provider.as_ref(), |snapshot| {
++                snapshot.server_locations.as_ref()
++            });
++        let locations = snapshot
++            .as_ref()
++            .map_or(self.location_provider.as_ref(), |snapshot| {
++                snapshot.locations.as_ref()
++            });
++        let Some(route) = routes.get(&self.name) else {
+             return Ok(());
+         };
+ 
+@@ -755,7 +772,7 @@ impl Server {
+             .into_iter()
+             .find_map(|idx| {
+                 let name = route.ordered.get(idx)?;
+-                let location = self.location_provider.get(name)?;
++                let location = locations.get(name)?;
+                 let (matched, captures) = location.match_host_path(host, path);
+                 if matched && location.match_conditions(header) {
+                     Some((location, captures))
+@@ -825,7 +842,12 @@ impl Server {
+         // initialize plugins and execute. A plugin answering here is
+         // honoured by `request_filter`, which is where pingora first lets
+         // the request stop; the flag is the response itself.
+-        ctx.plugins = location.plugins_for(self.plugin_provider.as_ref());
++        let plugins = snapshot
++            .as_ref()
++            .map_or(self.plugin_provider.as_ref(), |snapshot| {
++                snapshot.plugins.as_ref()
++            });
++        ctx.plugins = location.plugins_for(plugins);
+         let _ = self
+             .handle_request_plugin(PluginStep::EarlyRequest, session, ctx)
+             .await?;
+@@ -1185,6 +1207,15 @@ impl Server {
+     }
+ }
+ 
++#[inline]
++fn request_providers(ctx: &Ctx) -> Option<Arc<RequestProviders>> {
++    ctx.runtime_snapshot
++        .as_ref()?
++        .clone()
++        .downcast::<RequestProviders>()
++        .ok()
++}
++
+ #[inline]
+ fn get_upstream_with_variables(
+     upstream: &str,
+@@ -1203,7 +1234,12 @@ impl ProxyHttp for Server {
+     type CTX = Ctx;
+     fn new_ctx(&self) -> Self::CTX {
+         debug!(target: LOG_TARGET, "new ctx");
+-        Ctx::new()
++        let mut ctx = Ctx::new();
++        ctx.runtime_snapshot = self
++            .server_locations_provider
++            .snapshot()
++            .map(|snapshot| snapshot as Arc<dyn std::any::Any + Send + Sync>);
++        ctx
+     }
+     fn init_downstream_modules(&self, modules: &mut HttpModules) {
+         debug!(target: LOG_TARGET, "--> init downstream modules");
+@@ -1341,6 +1377,12 @@ impl ProxyHttp for Server {
+             )
+         };
+         let location = ctx.upstream.location_instance.clone();
++        let snapshot = request_providers(ctx);
++        let upstreams = snapshot
++            .as_ref()
++            .map_or(self.upstream_provider.as_ref(), |snapshot| {
++                snapshot.upstreams.as_ref()
++            });
+         let upstream = location.as_ref().and_then(|location| {
+             let name = if ctx.upstream.name.is_empty() {
+                 location.upstream()
+@@ -1348,11 +1390,7 @@ impl ProxyHttp for Server {
+                 // override upstream by other plugin
+                 &ctx.upstream.name
+             };
+-            get_upstream_with_variables(
+-                name,
+-                ctx,
+-                self.upstream_provider.as_ref(),
+-            )
++            get_upstream_with_variables(name, ctx, upstreams)
+         });
+         let Some(upstream) = upstream else {
+             return Err(no_available_upstream(ctx));
+@@ -2206,6 +2244,74 @@ value = 'proxy_set_headers = ["name:value"]'
+         new_server_with(None)
+     }
+ 
++    #[tokio::test]
++    async fn request_keeps_snapshot_across_route_plugin_and_upstream_changes() {
++        struct SwitchingRoutes {
++            current: arc_swap::ArcSwap<RequestProviders>,
++        }
++        impl ServerLocationsProvider for SwitchingRoutes {
++            fn get(
++                &self,
++                name: &str,
++            ) -> Option<Arc<crate::ServerLocationRoute>> {
++                self.current.load().server_locations.get(name)
++            }
++            fn snapshot(&self) -> Option<Arc<RequestProviders>> {
++                Some(self.current.load_full())
++            }
++        }
++        fn providers(server: &Server) -> Arc<RequestProviders> {
++            Arc::new(RequestProviders {
++                server_locations: server.server_locations_provider.clone(),
++                locations: server.location_provider.clone(),
++                plugins: server.plugin_provider.clone(),
++                upstreams: server.upstream_provider.clone(),
++            })
++        }
++        let (mut server, old_calls, _) = new_server_counting();
++        let (replacement, new_calls, _) = new_server_counting();
++        let old_location = server.location_provider.get("lo").unwrap();
++        let old_upstream = server.upstream_provider.get("charts").unwrap();
++        let old_plugin = server.plugin_provider.get("stats").unwrap();
++        let switching = Arc::new(SwitchingRoutes {
++            current: arc_swap::ArcSwap::from(providers(&server)),
++        });
++        server.server_locations_provider = switching.clone();
++        let mut ctx = server.new_ctx();
++        switching.current.store(providers(&replacement));
++        // Poison the live fallback providers too: every request stage must use
++        // the captured snapshot rather than any of these new objects.
++        server.location_provider = replacement.location_provider;
++        server.plugin_provider = replacement.plugin_provider;
++        server.upstream_provider = replacement.upstream_provider;
++        let mock = Builder::new()
++            .read(b"GET /vicanso/pingap HTTP/1.1\r\n\r\n")
++            .build();
++        let mut session = Session::new_h1(Box::new(mock));
++        session.read_request().await.unwrap();
++        server
++            .early_request_filter(&mut session, &mut ctx)
++            .await
++            .unwrap();
++        let old_location: Arc<dyn pingap_core::LocationInstance> = old_location;
++        assert!(Arc::ptr_eq(
++            ctx.upstream.location_instance.as_ref().unwrap(),
++            &old_location
++        ));
++        assert!(Arc::ptr_eq(
++            &ctx.plugins.as_ref().unwrap()[0].1,
++            &old_plugin
++        ));
++        assert!(old_calls.load(Ordering::SeqCst) > 0);
++        assert_eq!(new_calls.load(Ordering::SeqCst), 0);
++        // Backend availability is outside this fixture; selection always pins
++        // its upstream instance before attempting to select a backend.
++        let _ = server.upstream_peer(&mut session, &mut ctx).await;
++        let instance = ctx.upstream.upstream_instance.as_ref().unwrap();
++        let old_instance: Arc<dyn pingap_core::UpstreamInstance> = old_upstream;
++        assert!(Arc::ptr_eq(instance, &old_instance));
++    }
++
+     /// The two halves of an in-memory connection carrying `request`, for
+     /// the paths that write a response. The `tokio_test` mock used
+     /// elsewhere panics on any write it was not told to expect, which is
+diff --git a/scripts/build-website.sh b/scripts/build-website.sh
+index 59ac8fa5..414a275b 100755
+--- a/scripts/build-website.sh
++++ b/scripts/build-website.sh
+@@ -180,6 +180,9 @@ build_en() {
+   append_source_footer "${EN}/guide/modules.md" "docs/modules.md" \
+     "https://github.com/vicanso/pingap/blob/main/docs/modules.md"
+ 
++  cp "${ROOT}/docs/applied-reload.md" "${EN}/guide/applied-reload.md"
++  rewrite_links "${EN}/guide/applied-reload.md" guide
++
+   cp "${ROOT}/docs/acme_chart.md" "${EN}/guide/acme-flow.md"
+   rewrite_links "${EN}/guide/acme-flow.md" guide
+   append_source_footer "${EN}/guide/acme-flow.md" "docs/acme_chart.md" \
+@@ -253,7 +256,7 @@ features:
+   - title: High performance
+     details: Built in Rust on Cloudflare Pingora. HTTP/1.1, HTTP/2 and gRPC-Web with low latency and memory safety.
+   - title: Hot reload
+-    details: Apply most config changes without downtime via --autoreload, or graceful restart with --autorestart.
++    details: Atomically publish plugins, locations, upstreams and existing server locations; failed candidates retain the previous graph.
+   - title: Plugin gateway
+     details: JWT, rate limit, cache, CORS, static files, IP/UA restrictions and more — attach per location.
+   - title: Service discovery
+@@ -322,6 +325,7 @@ Listens on `0.0.0.0:443` (override with `--addr`); `--upstream` and `--domain` t
+ | [Crates](/crates/) | Workspace crate reference |
+ | [Examples](/guide/examples) | API gateway, gRPC-Web, static serve, and more |
+ | [ACME flow](/guide/acme-flow) | Certificate issuance sequence diagrams |
++| [Applied reload status](/guide/applied-reload) | Atomic request graphs and read-only publication confirmation |
+ 
+ ## Configuration sketch
+ 
+@@ -355,6 +359,8 @@ zstd_level = 3
+ 
+ Supports **TOML**, **HCL** and **KDL**. Details in [pingap-config](/crates/config).
+ 
++Query the applied protocol without loading configuration: `pingap --apply-protocol-version` prints `1`.
++
+ ## Request lifecycle
+ 
+ | Step | When | Typical use |
+@@ -544,6 +550,7 @@ pingap --domain=pingap.io --upstream=192.168.1.1:3000 --cert=/etc/ssl/pingap.io
+ | [组件](/zh/crates/) | 工作区 crate 参考 |
+ | [示例](/zh/guide/examples) | API 网关、gRPC-Web、静态站点等 |
+ | [ACME 流程](/zh/guide/acme-flow) | 证书签发时序图 |
++| [实际生效状态](/zh/guide/applied-reload) | 原子请求图与只读发布确认 |
+ 
+ 中文源文件维护在仓库 [`docs/zh/`](https://github.com/vicanso/pingap/tree/main/docs/zh)。
+ EOF
+diff --git a/src/locations.rs b/src/locations.rs
+index 3cd136bf..9fefac7c 100644
+--- a/src/locations.rs
++++ b/src/locations.rs
+@@ -12,72 +12,33 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
+-use ahash::AHashMap;
+-use arc_swap::ArcSwap;
+-use pingap_config::Error;
+-use pingap_config::{Hashable, LocationConf};
+-use pingap_location::{Location, LocationProvider, LocationStats, Locations};
++use pingap_config::{Error, LocationConf, PingapConfig};
++use pingap_location::LocationProvider;
+ use std::collections::HashMap;
+ use std::sync::Arc;
+-use std::sync::LazyLock;
+ 
+ type Result<T> = std::result::Result<T, Error>;
+ 
+-struct Provider {
+-    locations: ArcSwap<Locations>,
+-}
+-
+-impl Provider {
+-    fn store(&self, data: Locations) {
+-        self.locations.store(Arc::new(data));
+-    }
+-}
+-
+-impl LocationProvider for Provider {
+-    fn get(&self, name: &str) -> Option<Arc<Location>> {
+-        if name.is_empty() {
+-            return None;
+-        }
+-        self.locations.load().get(name).cloned()
+-    }
+-    fn stats(&self) -> HashMap<String, LocationStats> {
+-        let mut stats = HashMap::new();
+-        self.locations.load().iter().for_each(|(k, v)| {
+-            stats.insert(k.to_string(), v.stats());
+-        });
+-        stats
+-    }
+-}
+-
+-static LOCATION_PROVIDER: LazyLock<Arc<Provider>> = LazyLock::new(|| {
+-    Arc::new(Provider {
+-        locations: ArcSwap::from_pointee(AHashMap::new()),
+-    })
+-});
+ pub fn new_location_provider() -> Arc<dyn LocationProvider> {
+-    LOCATION_PROVIDER.clone()
++    Arc::new(crate::runtime_graph::LiveProvider)
+ }
+ 
+-/// Initializes or updates the global location configurations
+-/// Returns list of location names that were updated
++/// Startup initialization; runtime updates prepare the complete graph.
+ pub fn try_init_locations(
+-    location_configs: &HashMap<String, LocationConf>,
++    configs: &HashMap<String, LocationConf>,
+ ) -> Result<Vec<String>> {
+-    let mut locations = AHashMap::new();
+-    let mut updated_locations = vec![];
+-    for (name, conf) in location_configs.iter() {
+-        if let Some(found) = LOCATION_PROVIDER.get(name)
+-            && found.key == conf.hash_key()
+-        {
+-            locations.insert(name.to_string(), found);
+-            continue;
+-        }
+-        updated_locations.push(name.clone());
+-        let lo = Location::new(name, conf).map_err(|e| Error::Invalid {
+-            message: e.to_string(),
+-        })?;
+-        locations.insert(name.to_string(), Arc::new(lo));
+-    }
+-    LOCATION_PROVIDER.store(locations);
+-    Ok(updated_locations)
++    let config = PingapConfig {
++        locations: configs.clone(),
++        ..Default::default()
++    };
++    let locations = crate::runtime_graph::prepare_locations(
++        &config,
++        &crate::runtime_graph::graph(),
++    )
++    .map_err(|error| Error::Invalid {
++        message: error.to_string(),
++    })?;
++    let names = configs.keys().cloned().collect();
++    crate::runtime_graph::initialize_part(|graph| graph.locations = locations);
++    Ok(names)
+ }
+diff --git a/src/main.rs b/src/main.rs
+index d2dc78e0..e47ffeae 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -76,7 +76,7 @@ use std::sync::Arc;
+ use std::time::Duration;
+ use sysinfo::System;
+ 
+-use tracing::{error, info, warn};
++use tracing::{error, info};
+ 
+ mod certificates;
+ mod config_manager;
+@@ -84,6 +84,7 @@ mod locations;
+ mod plugin;
+ mod process;
+ mod quick_start;
++mod runtime_graph;
+ mod server_locations;
+ mod upstreams;
+ mod webhook;
+@@ -141,7 +142,7 @@ static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
+ #[command(author, version, about, long_version = LONG_VERSION.as_str(), long_about = None)]
+ struct Args {
+     /// The config file or directory path
+-    #[arg(short, long, required_unless_present = "upstream")]
++    #[arg(short, long, required_unless_present_any = ["upstream", "apply_protocol_version"])]
+     conf: Option<String>,
+     /// Upstream addresses ("host:port", comma separated). Starts a proxy
+     /// straight from the command line, without a config file
+@@ -192,6 +193,9 @@ struct Args {
+     /// Output template configuration
+     #[arg(long)]
+     template: bool,
++    /// Print the supported applied-status protocol version without loading config
++    #[arg(long)]
++    apply_protocol_version: bool,
+     /// Convert configuration to HCL format and output
+     #[arg(long)]
+     to_hcl: bool,
+@@ -416,16 +420,14 @@ fn run_admin_node(args: Args) -> Result<(), Box<dyn Error>> {
+     pingap_logger::logger_try_init(pingap_logger::LoggerParams {
+         ..Default::default()
+     })?;
+-    let (server_conf, name, proxy_plugin_info) =
++    let (server_conf, _, _) =
+         plugin::parse_admin_plugin(&args.admin.unwrap_or_default())?;
+-
+-    let (_, error) =
+-        plugin::try_init_plugins(&HashMap::from([(name, proxy_plugin_info)]));
+-    if !error.is_empty() {
+-        error!(error, "init plugins fail",);
+-    }
+     let config_manager =
+         try_init_config_manager(&args.conf.clone().unwrap_or_default())?;
++    let (_, error) = plugin::try_init_plugins(&HashMap::new());
++    if !error.is_empty() {
++        return Err(format!("init admin plugins fail: {error}").into());
++    }
+     tokio::runtime::Runtime::new()?
+         .block_on(migrate_config_layout(&config_manager));
+     let opt = Opt {
+@@ -539,34 +541,21 @@ fn parse_arguments() -> Args {
+     args
+ }
+ 
+-/// Dry-runs each configured plugin through the factory so `--test` reports bad
+-/// plugin configs, which `PingapConfig::validate` cannot check (the factory
+-/// lives in a higher layer). A category this build does not know — e.g. a
+-/// feature-gated plugin that was compiled out — is only warned about, matching
+-/// runtime behaviour; any other construction error is treated as fatal.
++/// Dry-runs every configured plugin. Unknown categories, disabled features and
++/// constructor failures reject both `--test` and runtime startup.
+ fn validate_plugins(config: &PingapConfig) -> Result<(), Box<dyn Error>> {
+-    let factory = pingap_plugin::get_plugin_factory();
+-    for (name, conf) in config.plugins.iter() {
+-        match factory.create(conf) {
+-            Ok(_) => {},
+-            Err(pingap_plugin::Error::NotFound { category }) => {
+-                warn!(
+-                    target: LOG_TARGET,
+-                    name = %name,
+-                    category = %category,
+-                    "plugin category is unavailable in this build, skipping validation"
+-                );
+-            },
+-            Err(e) => {
+-                return Err(format!("plugin \"{name}\" is invalid: {e}").into());
+-            },
+-        }
+-    }
++    let plugins =
++        plugin::prepare_plugins(&config.plugins, &ahash::AHashMap::new())?;
++    runtime_graph::validate_plugin_references(config, &plugins)?;
+     Ok(())
+ }
+ 
+ fn run() -> Result<(), Box<dyn Error>> {
+     let args = parse_arguments();
++    if args.apply_protocol_version {
++        println!("1");
++        return Ok(());
++    }
+ 
+     // Handle template output request
+     if args.template {
+@@ -686,6 +675,7 @@ fn run() -> Result<(), Box<dyn Error>> {
+     // so set the current conf first
+     // pingap_config::set_current_config(&conf);
+     config.validate()?;
++    validate_plugins(&config)?;
+     // Reject per-server TLS version/cipher settings the active backend cannot
+     // apply (rustls fixes 1.2/1.3 + default suites). Must run for `--test` too.
+     validate_servers_tls_for_backend(&config.servers)?;
+@@ -874,7 +864,7 @@ fn run() -> Result<(), Box<dyn Error>> {
+     );
+     let (_, error) = plugin::try_init_plugins(&config.plugins);
+     if !error.is_empty() {
+-        error!(target: LOG_TARGET, error, "init plugins fail",);
++        return Err(format!("init plugins fail: {error}").into());
+     }
+ 
+     let mut server_conf_list: Vec<ServerConf> = parse_from_conf(config.clone());
+@@ -978,9 +968,11 @@ fn run() -> Result<(), Box<dyn Error>> {
+         );
+     }
+     if !errors.is_empty() {
+-        error!(target: LOG_TARGET, error = errors, "parse certificate fail");
++        return Err(format!("parse certificate fail: {errors}").into());
+     }
+ 
++    runtime_graph::record_bootstrap(&config)?;
++
+     // no server listen 80 and lets encrypt domains is not empty
+     if !exits_80_server && enabled_http_challenge {
+         server_conf_list.push(ServerConf {
+@@ -1134,3 +1126,42 @@ fn main() {
+         std::process::exit(1);
+     }
+ }
++
++#[cfg(test)]
++mod applied_regression_tests {
++    #[test]
++    fn apply_protocol_query_does_not_require_config() {
++        use clap::Parser;
++        let args =
++            super::Args::try_parse_from(["pingap", "--apply-protocol-version"])
++                .unwrap();
++        assert!(args.apply_protocol_version);
++        assert!(args.conf.is_none());
++    }
++    #[cfg(not(feature = "imageoptim"))]
++    #[test]
++    fn compiled_out_plugin_is_rejected() {
++        let config = pingap_config::PingapConfig::new(
++            b"[plugins.image]\ncategory='image_optim'\n",
++            true,
++        )
++        .unwrap();
++        assert!(super::validate_plugins(&config).is_err());
++    }
++
++    #[test]
++    fn plugin_constructor_failure_is_rejected() {
++        let config = pingap_config::PingapConfig::new(b"[plugins.auth]\ncategory='basic_auth'\nauthorizations=['not-base64!']\n", true).unwrap();
++        assert!(super::validate_plugins(&config).is_err());
++    }
++
++    #[test]
++    fn applied_regression_unknown_plugin_is_rejected() {
++        let config = pingap_config::PingapConfig::new(
++            b"[plugins.invalid]\ncategory = 'does-not-exist'\n",
++            true,
++        )
++        .unwrap();
++        assert!(super::validate_plugins(&config).is_err());
++    }
++}
+diff --git a/src/plugin/admin.rs b/src/plugin/admin.rs
+index c582e1ef..0c27e8e6 100644
+--- a/src/plugin/admin.rs
++++ b/src/plugin/admin.rs
+@@ -556,8 +556,13 @@ async fn handle_request_admin(
+ 
+     let header = session.req_header_mut();
+     let path = header.uri.path();
+-    let mut new_path =
+-        path.substring(plugin.path.len(), path.len()).to_string();
++    // Root mounting must keep the leading slash used by the API router.
++    let prefix_len = if plugin.path == "/" {
++        0
++    } else {
++        plugin.path.len()
++    };
++    let mut new_path = path.substring(prefix_len, path.len()).to_string();
+     if plugin.path.len() > 1 && new_path.is_empty() {
+         new_path = format!("{path}/");
+         if let Some(query) = header.uri.query() {
+@@ -667,6 +672,14 @@ async fn handle_request_admin(
+             "history": history,
+         }))
+         .unwrap_or(HttpResponse::unknown_error("Json serde fail"))
++    } else if path == "/apply-status" {
++        if method != Method::GET {
++            return Ok(Some(HttpResponse {
++                status: StatusCode::METHOD_NOT_ALLOWED,
++                ..Default::default()
++            }));
++        }
++        HttpResponse::try_from_json(&crate::runtime_graph::status())?
+     } else if path == "/basic" {
+         let current_config = plugin.load_config(true).await?;
+         let info = get_process_system_info();
+@@ -935,6 +948,58 @@ mod tests {
+         assert_eq!(false, auth_skipped("/api/basic"));
+     }
+ 
++    #[tokio::test]
++    async fn apply_status_is_authenticated_and_read_only() {
++        let file = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
++        try_init_config_manager(&file.path().to_string_lossy()).unwrap();
++        let admin = AdminServe::try_from(
++            &toml::from_str::<PluginConf>(
++                r#"
++category = "admin"
++path = "/"
++authorizations = ["YWRtaW46MTIzMTIz"]
++"#,
++            )
++            .unwrap(),
++        )
++        .unwrap();
++        use sha2::{Digest, Sha256};
++        let timestamp = pingap_core::now_sec();
++        let token = hex::encode(Sha256::digest(
++            format!("admin:123123:{timestamp}").as_bytes(),
++        ));
++        let authorized = format!("Authorization: {token}:{timestamp}\r\n");
++        for (method, authorization, expected_status) in [
++            ("GET", "", 401),
++            ("POST", authorized.as_str(), 405),
++            ("GET", authorized.as_str(), 200),
++        ] {
++            let input = format!(
++                "{method} /api/apply-status HTTP/1.1\r\n{authorization}\r\n"
++            );
++            let mock = Builder::new().read(input.as_bytes()).build();
++            let mut session = Session::new_h1(Box::new(mock));
++            session.read_request().await.unwrap();
++            let response =
++                handle_request_admin(&admin, &mut session, &mut Ctx::default())
++                    .await
++                    .unwrap()
++                    .unwrap();
++            assert_eq!(response.status.as_u16(), expected_status);
++            if expected_status == 200 {
++                let json: serde_json::Value =
++                    serde_json::from_slice(&response.body).unwrap();
++                assert_eq!(json["schema_version"], 1);
++                assert_eq!(json["process_id"], std::process::id());
++                assert!(
++                    !json["process_instance_id"].as_str().unwrap().is_empty()
++                );
++                assert!(json.get("applied").is_some());
++                assert!(json.get("last_attempt").is_some());
++            }
++        }
++    }
++
+     /// Regression: `/config-history/{category}` without the trailing name used
+     /// to index past the end of the split url and panic the request task.
+     #[tokio::test]
+diff --git a/src/plugin/mod.rs b/src/plugin/mod.rs
+index 942f7c1f..2adb74ee 100644
+--- a/src/plugin/mod.rs
++++ b/src/plugin/mod.rs
+@@ -14,9 +14,8 @@
+ 
+ use crate::process::get_admin_addr;
+ use ahash::AHashMap;
+-use arc_swap::ArcSwap;
+ use pingap_config::PluginConf;
+-use pingap_core::{Plugin, PluginProvider, PluginStep, Plugins};
++use pingap_core::{Plugin, PluginProvider, Plugins};
+ use pingap_plugin::get_plugin_factory;
+ // Reuse the canonical plugin-config helpers instead of keeping a second copy.
+ // `get_hash_key` in particular MUST stay byte-identical to the one plugins use
+@@ -31,9 +30,7 @@ use snafu::Snafu;
+ use std::collections::HashMap;
+ use std::str::FromStr;
+ use std::sync::Arc;
+-use std::sync::LazyLock;
+-use std::sync::atomic::{AtomicU64, Ordering};
+-use tracing::{error, info};
++use tracing::error;
+ 
+ mod admin;
+ mod stats;
+@@ -208,39 +205,8 @@ remark = "Adjust the accept encoding order and choose one encoding"
+     ]
+ }
+ 
+-struct Provider {
+-    plugins: ArcSwap<Plugins>,
+-    /// Bumped on every `store`, so locations drop the plugin lists they
+-    /// resolved against the previous set.
+-    version: AtomicU64,
+-}
+-
+-impl Provider {
+-    fn store(&self, data: Plugins) {
+-        self.plugins.store(Arc::new(data));
+-        self.version.fetch_add(1, Ordering::Release);
+-    }
+-}
+-
+-static PLUGIN_PROVIDER: LazyLock<Arc<Provider>> = LazyLock::new(|| {
+-    Arc::new(Provider {
+-        plugins: ArcSwap::from_pointee(AHashMap::new()),
+-        version: AtomicU64::new(0),
+-    })
+-});
+-
+-impl PluginProvider for Provider {
+-    fn get(&self, name: &str) -> Option<Arc<dyn Plugin>> {
+-        self.plugins.load().get(name).cloned()
+-    }
+-
+-    fn version(&self) -> u64 {
+-        self.version.load(Ordering::Acquire)
+-    }
+-}
+-
+ pub fn new_plugin_provider() -> Arc<dyn PluginProvider> {
+-    PLUGIN_PROVIDER.clone()
++    Arc::new(crate::runtime_graph::LiveProvider)
+ }
+ 
+ /// Parses plugin configurations and instantiates plugin instances.
+@@ -299,86 +265,63 @@ pub fn parse_plugins(
+     (plugins, errors)
+ }
+ 
+-/// Initializes or updates plugins based on configuration.
+-///
+-/// # Arguments
+-/// * `plugins` - HashMap of plugin names to configurations
+-///
+-/// # Returns
+-/// Vector of plugin names that were created or updated
+-///
+-/// # Errors
+-/// Returns Error if plugin initialization fails
+-pub fn try_init_plugins(
+-    plugins: &HashMap<String, PluginConf>,
+-) -> (Vec<String>, String) {
+-    let mut plugin_configs: Vec<(String, PluginConf)> = plugins
+-        .iter()
+-        .map(|(name, value)| (name.to_string(), value.clone()))
+-        .collect();
+-
+-    // add admin plugin
+-    let mut errors = vec![];
+-    if let Some(addr) = &get_admin_addr() {
+-        match parse_admin_plugin(addr) {
+-            Ok((_, name, proxy_plugin_info)) => {
+-                plugin_configs.push((name, proxy_plugin_info));
+-            },
+-            Err(e) => {
+-                errors.push(e);
+-            },
++/// Build the entire plugin set without publishing partial results. Unknown
++/// categories and feature-gated plugins are errors just like constructor failures.
++pub(crate) fn prepare_plugins(
++    configs: &HashMap<String, PluginConf>,
++    _previous: &Plugins,
++) -> Result<Plugins> {
++    let builtins = get_builtin_proxy_plugins();
++    for name in configs.keys() {
++        if name == ADMIN_SERVER_PLUGIN
++            || builtins.iter().any(|(builtin, _)| builtin == name)
++        {
++            return Err(Error::Invalid {
++                category: "plugins".into(),
++                message: format!("plugin name {name} is reserved"),
++            });
+         }
+     }
+-
+-    plugin_configs.extend(get_builtin_proxy_plugins());
+-
+-    let mut updated_plugins = vec![];
+-    let mut plugins = AHashMap::new();
+-    let plugin_configs: Vec<(String, PluginConf)> = plugin_configs
+-        .into_iter()
+-        .filter(|(name, conf)| {
+-            let conf_hash_key = get_hash_key(conf);
+-            let mut exists = false;
+-            if let Some(plugin) = PLUGIN_PROVIDER.get(name) {
+-                exists = true;
+-                // exists plugin with same config
+-                if plugin.config_key() == conf_hash_key {
+-                    plugins.insert(name.to_string(), plugin);
+-                    return false;
+-                }
+-            }
+-            let step = get_step_conf(conf, PluginStep::Request).to_string();
+-            let category = if let Some(value) = conf.get("category") {
+-                value.as_str().unwrap_or_default().to_string()
+-            } else {
+-                "".to_string()
+-            };
+-            if exists {
+-                info!(target: LOG_TARGET, name, step, category, "plugin will be reloaded");
+-            } else {
+-                info!(target: LOG_TARGET, name, step, category, "plugin will be created");
+-            }
+-            updated_plugins.push(name.to_string());
+-            true
+-        })
++    let mut configs: Vec<_> = configs
++        .iter()
++        .map(|(name, config)| (name.clone(), config.clone()))
+         .collect();
+-    let (new_plugins, new_errors) = parse_plugins(plugin_configs);
+-    plugins.extend(new_plugins);
+-    errors.extend(new_errors);
+-    PLUGIN_PROVIDER.store(plugins);
+-    let error = if !errors.is_empty() {
+-        let error = errors
+-            .iter()
+-            .map(|e| e.to_string())
+-            .collect::<Vec<_>>()
+-            .join(";");
+-        error!(target: LOG_TARGET, error, "parse plugins failed");
+-        error
+-    } else {
+-        "".to_string()
+-    };
++    if let Some(addr) = get_admin_addr() {
++        let (_, name, conf) = parse_admin_plugin(&addr)?;
++        configs.push((name, conf));
++    }
++    configs.extend(builtins);
++    let (plugins, errors) = parse_plugins(configs);
++    if !errors.is_empty() {
++        return Err(Error::Invalid {
++            category: "plugins".into(),
++            message: errors
++                .iter()
++                .map(ToString::to_string)
++                .collect::<Vec<_>>()
++                .join(";"),
++        });
++    }
++    Ok(plugins)
++}
+ 
+-    (updated_plugins, error)
++/// Startup initialization only; runtime reload publishes the complete graph.
++pub fn try_init_plugins(
++    configs: &HashMap<String, PluginConf>,
++) -> (Vec<String>, String) {
++    match prepare_plugins(configs, &crate::runtime_graph::graph().plugins) {
++        Ok(plugins) => {
++            let names = configs.keys().cloned().collect();
++            crate::runtime_graph::initialize_part(|graph| {
++                graph.plugins = plugins
++            });
++            (names, String::new())
++        },
++        Err(error) => {
++            error!(target: LOG_TARGET, error = %error, "parse plugins failed");
++            (Vec::new(), error.to_string())
++        },
++    }
+ }
+ 
+ #[test]
+diff --git a/src/process/auto_restart.rs b/src/process/auto_restart.rs
+index d9b58444..8961ca86 100644
+--- a/src/process/auto_restart.rs
++++ b/src/process/auto_restart.rs
+@@ -13,21 +13,11 @@
+ // limitations under the License.
+ 
+ use super::restart;
+-use crate::certificates::try_update_certificates;
+-use crate::locations::try_init_locations;
+-use crate::plugin;
+-use crate::server_locations::try_init_server_locations;
+-use crate::upstreams::try_update_upstreams;
+-use crate::webhook::{
+-    get_webhook_sender, reload_webhook_notification_sender, send_notification,
+-};
++use crate::runtime_graph::{self, ApplyFailure};
++use crate::webhook::send_notification;
+ use arc_swap::{ArcSwap, ArcSwapOption};
+ use async_trait::async_trait;
+-use pingap_certificate::validate_servers_tls_for_backend;
+-use pingap_config::{
+-    CATEGORY_CERTIFICATE, CATEGORY_LOCATION, CATEGORY_PLUGIN,
+-    CATEGORY_UPSTREAM, ConfigManager, PingapConfig, PingapTomlConfig,
+-};
++use pingap_config::{ConfigManager, PingapConfig, PingapTomlConfig};
+ use pingap_core::{
+     BackgroundTask, BackgroundTaskService, Error as ServiceError,
+     NotificationData, NotificationLevel,
+@@ -84,16 +74,46 @@ async fn diff_and_update_config(
+     config_manager: Arc<ConfigManager>,
+     hot_reload_only: bool,
+ ) -> Result<Option<PingapConfig>, Box<dyn std::error::Error>> {
+-    let raw = config_manager.load_all_raw().await?;
++    let _apply_guard = runtime_graph::APPLY_LOCK.lock().await;
++    let raw = match config_manager.load_all_raw().await {
++        Ok(raw) => raw,
++        Err(error) => {
++            let id = runtime_graph::begin_attempt(None)?;
++            runtime_graph::failed_attempt(
++                id,
++                "failed",
++                ApplyFailure::new("storage", &error),
++            );
++            return Err(error.into());
++        },
++    };
+     let hash = raw_hash(&raw);
+-    if should_skip(LAST_SEEN.load().as_deref(), hash, hot_reload_only) {
++    let settled = runtime_graph::status()
++        .last_attempt
++        .is_some_and(|attempt| attempt.state == "applied");
++    if settled
++        && should_skip(LAST_SEEN.load().as_deref(), hash, hot_reload_only)
++    {
+         debug!(target: LOG_TARGET, "config is unchanged");
+         return Ok(None);
+     }
+-    let new_config =
+-        PingapTomlConfig::from_toml(&raw)?.to_pingap_config(true)?;
++    let new_config = match PingapTomlConfig::from_toml(&raw)
++        .and_then(|config| config.to_pingap_config(true))
++    {
++        Ok(config) => config,
++        Err(error) => {
++            let id = runtime_graph::begin_attempt(None)?;
++            runtime_graph::failed_attempt(
++                id,
++                "failed",
++                ApplyFailure::new("validation", &error),
++            );
++            return Err(error.into());
++        },
++    };
+     let restart_requested =
+-        apply_config(config_manager, &new_config, hot_reload_only).await?;
++        apply_config_locked(config_manager, &new_config, hot_reload_only)
++            .await?;
+     // Recorded only after a pass that finished. An error - the document
+     // does not parse, an address does not resolve - is retried on the next
+     // tick, and a pass that asked for a restart is repeated by the next
+@@ -102,339 +122,89 @@ async fn diff_and_update_config(
+         hash,
+         restart_eligible: !hot_reload_only && !restart_requested,
+     })));
+-    Ok(Some(new_config))
++    // Restart-only settings have not taken effect in this process. In
++    // particular, do not let the separate logger reload apply them early.
++    Ok(if restart_requested {
++        None
++    } else {
++        Some(new_config)
++    })
+ }
+ 
+-/// Compares configurations and handles updates through hot reload or full restart
+-///
+-/// This function:
+-/// 1. Validates the new configuration
+-/// 2. Compares it with current config to find differences
+-/// 3. Attempts hot reload for supported changes:
+-///    - Server locations
+-///    - Upstream configurations
+-///    - Location definitions
+-///    - Plugin configurations
+-///    - Certificates (except ACME/Let's Encrypt)
+-///    - Webhook settings (`webhook`, `webhook_type`, `webhook_notifications`,
+-///      `webhook_batch_window`, `webhook_batch_max_events`)
+-/// 4. Sends notifications for successful updates
+-/// 5. If hot_reload_only=false and there are non-hot-reloadable changes,
+-///    triggers a full server restart
+-///
+-/// Returns whether a restart was requested.
++/// Prepare the complete supported candidate and publish one immutable graph.
++/// Unsupported changes leave the active graph intact and require a restart.
++#[cfg(test)]
+ async fn apply_config(
+     config_manager: Arc<ConfigManager>,
+     new_config: &PingapConfig,
+     hot_reload_only: bool,
+ ) -> Result<bool, Box<dyn std::error::Error>> {
+-    new_config.validate()?;
+-    validate_servers_tls_for_backend(&new_config.servers)?;
+-    let current_config: PingapConfig =
+-        config_manager.get_current_config().as_ref().clone();
+-
+-    let (updated_category_list, original_diff_result) =
+-        current_config.diff(new_config);
+-    debug!(
+-        target: LOG_TARGET,
+-        updated_category_list = updated_category_list.join(","),
+-        original_diff_result = original_diff_result.join("\n"),
+-        "current config diff from new config"
+-    );
+-    // no update config
+-    if original_diff_result.is_empty() {
+-        return Ok(false);
+-    }
++    let _apply_guard = runtime_graph::APPLY_LOCK.lock().await;
++    apply_config_locked(config_manager, new_config, hot_reload_only).await
++}
+ 
+-    let mut reload_fail_messages = vec![];
+-    let mut hot_reload_config = current_config.clone();
++async fn apply_config_locked(
++    config_manager: Arc<ConfigManager>,
++    new_config: &PingapConfig,
++    hot_reload_only: bool,
++) -> Result<bool, Box<dyn std::error::Error>> {
++    let current = config_manager.get_current_config();
++    if current.digest()? == new_config.digest()?
++        && runtime_graph::status().applied.is_some()
+     {
+-        // hot reload first,
+-        // only validate server.locations, locations, upstreams and plugins
+-        let mut should_reload_server_location = false;
+-        let mut should_reload_upstream = false;
+-        let mut should_reload_location = false;
+-        let mut should_reload_plugin = false;
+-        let mut should_reload_certificate = false;
+-
+-        // The webhook goes first, so the notifications for everything else
+-        // this change reloads already go out with the new settings.
+-        if reload_webhook_notification_sender(
+-            &mut hot_reload_config.basic,
+-            &new_config.basic,
+-        ) {
+-            info!(target: LOG_TARGET, "reload webhook success");
+-            send_notification(NotificationData {
+-                category: "reload_config".to_string(),
+-                level: NotificationLevel::Info,
+-                message: "Webhook is modified".to_string(),
+-                ..Default::default()
+-            })
+-            .await;
+-        }
+-
+-        // update the values which can be hot reload
+-        // set server locations
+-        for (name, server) in new_config.servers.iter() {
+-            if let Some(clone_server_conf) =
+-                hot_reload_config.servers.get_mut(name)
+-                && server.locations != clone_server_conf.locations
+-            {
+-                clone_server_conf.locations.clone_from(&server.locations);
+-                should_reload_server_location = true;
+-            }
+-        }
+-
+-        // set upstream, location and plugin value
+-        hot_reload_config.upstreams = new_config.upstreams.clone();
+-        hot_reload_config.locations = new_config.locations.clone();
+-        hot_reload_config.plugins = new_config.plugins.clone();
+-
+-        // acme will create a let's encrypt service
+-        // so it can't be reloaded.
+-        let mut exists_acme = false;
+-        for cert in new_config.certificates.values() {
+-            if cert.acme.is_some() {
+-                exists_acme = true;
+-            }
+-        }
+-        if !exists_acme {
+-            hot_reload_config.certificates = new_config.certificates.clone();
+-        }
+-
+-        // new_config.certificates
+-
+-        for category in updated_category_list {
+-            match category.as_str() {
+-                CATEGORY_LOCATION => should_reload_location = true,
+-                CATEGORY_UPSTREAM => should_reload_upstream = true,
+-                CATEGORY_PLUGIN => should_reload_plugin = true,
+-                // acme should be reload by let's encrypt service
+-                CATEGORY_CERTIFICATE if !exists_acme => {
+-                    should_reload_certificate = true;
+-                },
+-                _ => {},
+-            };
+-        }
+-
+-        let format_message = |name: &str, list: Vec<String>| -> String {
+-            if list.is_empty() {
+-                return format!("{name} is removed",);
+-            }
+-            if list.len() > 1 {
+-                return format!("{name}s({}) are modified", list.join(","));
+-            }
+-            format!("{name}({}) is modified", list.join(","))
+-        };
+-
+-        if should_reload_upstream {
+-            match try_update_upstreams(
+-                &new_config.upstreams,
+-                get_webhook_sender(),
+-            )
+-            .await
+-            {
+-                Err(e) => {
+-                    let error = e.to_string();
+-                    reload_fail_messages
+-                        .push(format!("upstream reload fail: {error}"));
+-                    error!(
+-                        target: LOG_TARGET,
+-                        error, "reload upstream fail"
+-                    );
+-                },
+-                Ok(updated_upstreams) => {
+-                    info!(target: LOG_TARGET, "reload upstream success");
+-                    send_notification(NotificationData {
+-                        category: "reload_config".to_string(),
+-                        level: NotificationLevel::Info,
+-                        message: format_message("Upstream", updated_upstreams),
+-                        ..Default::default()
+-                    })
+-                    .await;
+-                },
+-            };
+-        }
+-        if should_reload_location {
+-            match try_init_locations(&new_config.locations) {
+-                Err(e) => {
+-                    let error = e.to_string();
+-                    reload_fail_messages
+-                        .push(format!("location reload fail: {error}",));
+-                    error!(
+-                        target: LOG_TARGET,
+-                        error, "reload location fail"
+-                    );
+-                },
+-                Ok(updated_locations) => {
+-                    info!(target: LOG_TARGET, "reload location success");
+-                    send_notification(NotificationData {
+-                        category: "reload_config".to_string(),
+-                        level: NotificationLevel::Info,
+-                        message: format_message("Location", updated_locations),
+-                        ..Default::default()
+-                    })
+-                    .await;
+-                },
+-            };
+-        }
+-        if should_reload_plugin {
+-            let (updated_plugins, error) =
+-                plugin::try_init_plugins(&new_config.plugins);
+-            if !updated_plugins.is_empty() {
+-                info!(target: LOG_TARGET, "reload plugin success");
+-                send_notification(NotificationData {
+-                    category: "reload_config".to_string(),
+-                    level: NotificationLevel::Info,
+-                    message: format_message("Plugin", updated_plugins),
+-                    ..Default::default()
+-                })
+-                .await;
+-            }
+-            if !error.is_empty() {
+-                error!(target: LOG_TARGET, error, "reload plugin fail");
+-                send_notification(NotificationData {
+-                    category: "reload_config_fail".to_string(),
+-                    level: NotificationLevel::Error,
+-                    message: error,
+-                    ..Default::default()
+-                })
+-                .await;
+-            }
+-        }
+-        if should_reload_certificate {
+-            let (updated_certificates, errors) =
+-                try_update_certificates(&new_config.certificates);
+-            info!(target: LOG_TARGET, "reload certificate success");
+-            send_notification(NotificationData {
+-                category: "reload_config".to_string(),
+-                level: NotificationLevel::Info,
+-                message: format_message("Certificate", updated_certificates),
+-                ..Default::default()
+-            })
+-            .await;
+-            if !errors.is_empty() {
+-                error!(
+-                    target: LOG_TARGET,
+-                    error = errors,
+-                    "parse certificate fail"
+-                );
+-                send_notification(NotificationData {
+-                    category: "parse_certificate_fail".to_string(),
+-                    level: NotificationLevel::Error,
+-                    message: errors,
+-                    ..Default::default()
+-                })
+-                .await;
+-            }
+-        }
+-        if should_reload_server_location {
+-            match try_init_server_locations(
+-                &new_config.servers,
+-                &new_config.locations,
+-            ) {
+-                Err(e) => {
+-                    let error = e.to_string();
+-                    reload_fail_messages
+-                        .push(format!("server reload fail: {error}"));
+-                    error!(
+-                        target: LOG_TARGET,
+-                        error, "reload server fail"
+-                    );
+-                },
+-                Ok(updated_servers) => {
+-                    info!(
+-                        target: LOG_TARGET,
+-                        "reload server location success"
+-                    );
+-                    send_notification(NotificationData {
+-                        category: "reload_config".to_string(),
+-                        level: NotificationLevel::Info,
+-                        message: format_message(
+-                            "Server Location",
+-                            updated_servers,
+-                        ),
+-                        ..Default::default()
+-                    })
+-                    .await;
+-                },
+-            };
+-        }
+-    }
+-
+-    let reload_fail_message = reload_fail_messages.join(";");
+-
+-    if hot_reload_only {
+-        let (updated_category_list, original_diff_result) =
+-            current_config.diff(&hot_reload_config);
+-        debug!(
+-            target: LOG_TARGET,
+-            updated_category_list = updated_category_list.join(","),
+-            original_diff_result = original_diff_result.join("\n"),
+-            "current config diff from hot reload config"
+-        );
+-        // no update config
+-        if original_diff_result.is_empty() {
+-            return Ok(false);
+-        }
+-        // update current config to be hot reload config
+-        config_manager.set_current_config(hot_reload_config);
+-        if !original_diff_result.is_empty() {
+-            send_notification(NotificationData {
+-                category: "diff_config".to_string(),
+-                message: original_diff_result.join("\n").trim().to_string(),
+-                ..Default::default()
+-            })
+-            .await;
+-            if !reload_fail_message.is_empty() {
+-                send_notification(NotificationData {
+-                    category: "reload_config_fail".to_string(),
+-                    message: reload_fail_message.clone(),
+-                    ..Default::default()
+-                })
+-                .await;
+-            }
++        // Restoring an unchanged active configuration after a rejected
++        // candidate is a new, successful observation. Do not leave the failed
++        // candidate as the latest attempt and make rollback unconfirmable.
++        let status = runtime_graph::status();
++        if !status
++            .last_attempt
++            .is_some_and(|attempt| attempt.state == "applied")
++        {
++            let attempt_id = runtime_graph::begin_attempt(Some(new_config))?;
++            runtime_graph::publish(attempt_id, runtime_graph::graph())?;
+         }
+         return Ok(false);
+     }
+-    // restart mode
+-    // update current config to be hot reload config
+-    config_manager.set_current_config(hot_reload_config.clone());
+-
+-    // diff hot reload config and new config
+-    let (_, new_config_result) = hot_reload_config.diff(new_config);
+-    debug!(
+-        target: LOG_TARGET,
+-        new_config_result = new_config_result.join("\n"),
+-        "hot reload config diff from new config"
+-    );
+-
+-    let mut should_restart = true;
+-    // no update other config update except hot reload config
+-    if new_config_result.is_empty() {
+-        should_restart = false;
+-    }
+-
+-    if !original_diff_result.is_empty() {
+-        send_notification(NotificationData {
+-            category: "diff_config".to_string(),
+-            message: original_diff_result.join("\n").trim().to_string(),
+-            ..Default::default()
+-        })
+-        .await;
+-        if !reload_fail_message.is_empty() {
+-            send_notification(NotificationData {
+-                category: "reload_config_fail".to_string(),
+-                message: reload_fail_message.clone(),
+-                ..Default::default()
+-            })
+-            .await;
++    let attempt_id = runtime_graph::begin_attempt(Some(new_config))?;
++    if let Err(error) = runtime_graph::check_supported(&current, new_config) {
++        let state = if hot_reload_only {
++            "failed"
++        } else {
++            "restart_required"
++        };
++        runtime_graph::failed_attempt(attempt_id, state, error.clone());
++        if hot_reload_only {
++            return Err(error.into());
+         }
+-    }
+-    if should_restart {
+         restart().await;
++        return Ok(true);
+     }
+-    Ok(should_restart)
++    let base = runtime_graph::graph();
++    let version = base.version.checked_add(1).ok_or_else(|| {
++        ApplyFailure::new("validation", "runtime generation exhausted")
++    })?;
++    let prepared = match runtime_graph::prepare(new_config, base, version).await
++    {
++        Ok(prepared) => prepared,
++        Err(error) => {
++            runtime_graph::failed_attempt(attempt_id, "failed", error.clone());
++            return Err(error.into());
++        },
++    };
++    // No await or fallible operation between graph publication and the legacy
++    // current-config mirror. Applied metadata and request providers swap together.
++    runtime_graph::publish(attempt_id, prepared)?;
++    config_manager.set_current_config(new_config.clone());
++    send_notification(NotificationData {
++        category: "reload_config".into(),
++        level: NotificationLevel::Info,
++        message: format!(
++            "Complete configuration applied (attempt {attempt_id})"
++        ),
++        ..Default::default()
++    })
++    .await;
++    Ok(false)
+ }
+ 
+ /// AutoRestart service manages configuration updates on a schedule
+@@ -701,6 +471,128 @@ mod tests {
+     use super::{LastSeen, should_skip};
+     use pretty_assertions::assert_eq;
+ 
++    #[tokio::test]
++    async fn applied_regression_failed_plugin_keeps_current_config() {
++        let manager = std::sync::Arc::new(
++            pingap_config::new_memory_config_manager("", None),
++        );
++        let old = pingap_config::PingapConfig::default();
++        manager.set_current_config(old.clone());
++        let mut candidate = old.clone();
++        candidate.plugins.insert(
++            "invalid".into(),
++            toml::from_str("category='does-not-exist'").unwrap(),
++        );
++        let result =
++            super::apply_config(manager.clone(), &candidate, true).await;
++        assert!(
++            result.is_err(),
++            "a failed plugin must reject the complete candidate"
++        );
++        assert_eq!(
++            manager.get_current_config().hash().unwrap(),
++            old.hash().unwrap()
++        );
++    }
++
++    #[tokio::test]
++    async fn applied_regression_host_change_rebuilds_route() {
++        let manager = std::sync::Arc::new(
++            pingap_config::new_memory_config_manager("", None),
++        );
++        let old = pingap_config::PingapConfig::new(
++            br#"
++[servers.app]
++addr = '127.0.0.1:6011'
++locations = ['app']
++[locations.app]
++host = 'old.example.com'
++"#,
++            true,
++        )
++        .unwrap();
++        manager.set_current_config(old.clone());
++        crate::locations::try_init_locations(&old.locations).unwrap();
++        crate::server_locations::try_init_server_locations(
++            &old.servers,
++            &old.locations,
++        )
++        .unwrap();
++        let mut candidate = old;
++        candidate.locations.get_mut("app").unwrap().host =
++            Some("new.example.com".into());
++        super::apply_config(manager, &candidate, true)
++            .await
++            .unwrap();
++        let route = crate::server_locations::new_server_locations_provider()
++            .get("app")
++            .unwrap();
++        assert_eq!(
++            route.host_index.candidate_names("new.example.com"),
++            vec!["app"]
++        );
++        assert!(
++            route
++                .host_index
++                .candidate_names("old.example.com")
++                .is_empty()
++        );
++    }
++
++    #[tokio::test]
++    async fn restore_active_config_after_failure_records_new_applied_attempt() {
++        let manager = std::sync::Arc::new(
++            pingap_config::new_memory_config_manager("", None),
++        );
++        let old = pingap_config::PingapConfig::new(
++            br#"
++[plugins.'rcoder:publication']
++category = 'mock'
++data = 'old-operation'
++"#,
++            true,
++        )
++        .unwrap();
++        manager.set_current_config(pingap_config::PingapConfig::default());
++        super::apply_config(manager.clone(), &old, true)
++            .await
++            .unwrap();
++        let first = crate::runtime_graph::status().applied.unwrap().attempt_id;
++        let old_graph = crate::runtime_graph::graph();
++        let mut candidate = old.clone();
++        candidate.plugins.insert(
++            "bad".into(),
++            toml::from_str("category='does-not-exist'").unwrap(),
++        );
++        assert!(
++            super::apply_config(manager.clone(), &candidate, true)
++                .await
++                .is_err()
++        );
++        assert_eq!(
++            crate::runtime_graph::status().last_attempt.unwrap().state,
++            "failed"
++        );
++        super::apply_config(manager.clone(), &old, true)
++            .await
++            .unwrap();
++        let restored = crate::runtime_graph::status();
++        assert_eq!(restored.last_attempt.as_ref().unwrap().state, "applied");
++        assert_eq!(
++            restored.applied.as_ref().unwrap().operation_id.as_deref(),
++            Some("old-operation")
++        );
++        assert!(restored.applied.as_ref().unwrap().attempt_id > first);
++        assert!(std::sync::Arc::ptr_eq(
++            &old_graph,
++            &crate::runtime_graph::graph()
++        ));
++        assert_eq!(
++            manager.get_current_config().digest().unwrap(),
++            old.digest().unwrap()
++        );
++    }
++
+     #[test]
+     fn test_should_skip() {
+         // Nothing seen yet: every pass runs.
+diff --git a/src/server_locations.rs b/src/server_locations.rs
+index 5696b6de..89103ee2 100644
+--- a/src/server_locations.rs
++++ b/src/server_locations.rs
+@@ -12,88 +12,38 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
+-use crate::locations::new_location_provider;
+-use ahash::AHashMap;
+-use arc_swap::ArcSwap;
++use pingap_config::PingapConfig;
+ use pingap_core::Error;
+-use pingap_location::ServerLocationRoute;
+-use pingap_proxy::{ServerLocations, ServerLocationsProvider};
++use pingap_proxy::ServerLocationsProvider;
+ use std::collections::HashMap;
+ use std::sync::Arc;
+-use std::sync::LazyLock;
+ 
+ type Result<T> = std::result::Result<T, Error>;
+ 
+-struct Provider {
+-    server_locations: ArcSwap<ServerLocations>,
+-}
+-
+-impl Provider {
+-    fn store(&self, data: ServerLocations) {
+-        self.server_locations.store(Arc::new(data));
+-    }
+-}
+-
+-impl ServerLocationsProvider for Provider {
+-    fn get(&self, name: &str) -> Option<Arc<ServerLocationRoute>> {
+-        self.server_locations.load().get(name).cloned()
+-    }
+-}
+-
+-static SERVER_LOCATIONS_PROVIDER: LazyLock<Arc<Provider>> =
+-    LazyLock::new(|| {
+-        Arc::new(Provider {
+-            server_locations: ArcSwap::from_pointee(AHashMap::new()),
+-        })
+-    });
+-
+-/// Creates a new instance of the server locations provider
+-///
+-/// # Returns
+-/// * `Arc<dyn ServerLocationsProvider>` - The server locations provider
+ pub fn new_server_locations_provider() -> Arc<dyn ServerLocationsProvider> {
+-    SERVER_LOCATIONS_PROVIDER.clone()
++    Arc::new(crate::runtime_graph::LiveProvider)
+ }
+ 
++/// Startup initialization; runtime reload prepares candidate routes off-line.
+ pub fn try_init_server_locations(
+     servers: &HashMap<String, pingap_config::ServerConf>,
+     locations: &HashMap<String, pingap_config::LocationConf>,
+ ) -> Result<Vec<String>> {
+-    // get the location weight
+-    let mut location_weights = HashMap::new();
+-    for (name, item) in locations.iter() {
+-        location_weights.insert(name.to_string(), item.get_weight());
+-    }
+-    let location_provider = new_location_provider();
+-    let mut server_locations = AHashMap::new();
+-    let mut updated_servers = vec![];
+-    for (name, server) in servers.iter() {
+-        if let Some(items) = &server.locations {
+-            let mut items = items.clone();
+-            // sort the location by weight
+-            items.sort_by_key(|item| {
+-                let weight = location_weights
+-                    .get(item.as_str())
+-                    .map(|value| value.to_owned())
+-                    .unwrap_or_default();
+-                std::cmp::Reverse(weight)
+-            });
+-            let mut not_modified = false;
+-            if let Some(current) = SERVER_LOCATIONS_PROVIDER.get(name)
+-                && current.ordered.as_slice() == items.as_slice()
+-            {
+-                not_modified = true;
+-            }
+-            if !not_modified {
+-                updated_servers.push(name.to_string());
+-            }
+-
+-            let route = ServerLocationRoute::build(items, |loc_name| {
+-                location_provider.get(loc_name)
+-            });
+-            server_locations.insert(name.to_string(), Arc::new(route));
+-        }
+-    }
+-    SERVER_LOCATIONS_PROVIDER.store(server_locations);
+-    Ok(updated_servers)
++    let config = PingapConfig {
++        servers: servers.clone(),
++        locations: locations.clone(),
++        ..Default::default()
++    };
++    let routes = crate::runtime_graph::prepare_routes(
++        &config,
++        &crate::runtime_graph::graph().locations,
++    )
++    .map_err(|error| Error::Invalid {
++        message: error.to_string(),
++    })?;
++    let names = servers.keys().cloned().collect();
++    crate::runtime_graph::initialize_part(|graph| {
++        graph.server_locations = routes
++    });
++    Ok(names)
+ }
+diff --git a/src/upstreams.rs b/src/upstreams.rs
+index 30aa0cef..37c038e1 100644
+--- a/src/upstreams.rs
++++ b/src/upstreams.rs
+@@ -12,107 +12,28 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
+-use ahash::AHashMap;
+-use arc_swap::ArcSwap;
+ use pingap_config::UpstreamConf;
+ use pingap_core::{Error, NotificationSender};
+-use pingap_upstream::{
+-    Upstream, UpstreamProvider, Upstreams, new_ahash_upstreams,
+-};
++use pingap_upstream::{UpstreamProvider, new_ahash_upstreams};
+ use std::collections::HashMap;
+ use std::sync::Arc;
+-use std::sync::LazyLock;
+-use tracing::error;
+ 
+-static LOG_TARGET: &str = "main::upstreams";
+-
+-type Result<T, E = Error> = std::result::Result<T, E>;
+-
+-struct Provider {
+-    upstreams: ArcSwap<Upstreams>,
+-}
+-
+-impl Provider {
+-    fn store(&self, data: Upstreams) {
+-        self.upstreams.store(Arc::new(data));
+-    }
+-}
+-
+-impl UpstreamProvider for Provider {
+-    fn get(&self, name: &str) -> Option<Arc<Upstream>> {
+-        self.upstreams.load().get(name).cloned()
+-    }
+-
+-    fn list(&self) -> Vec<(String, Arc<Upstream>)> {
+-        self.upstreams
+-            .load()
+-            .iter()
+-            .map(|(k, v)| (k.to_string(), v.clone()))
+-            .collect()
+-    }
+-}
+-
+-static UPSTREAM_PROVIDER: LazyLock<Arc<Provider>> = LazyLock::new(|| {
+-    Arc::new(Provider {
+-        upstreams: ArcSwap::from_pointee(AHashMap::new()),
+-    })
+-});
++type Result<T> = std::result::Result<T, Error>;
+ 
+ pub fn new_upstream_provider() -> Arc<dyn UpstreamProvider> {
+-    UPSTREAM_PROVIDER.clone()
++    Arc::new(crate::runtime_graph::LiveProvider)
+ }
+ 
+-/// Initialize the upstreams
+-///
+-/// # Arguments
+-/// * `upstream_configs` - The upstream configurations
+-/// * `sender` - The notification sender
+-///
+-/// # Returns
++/// Startup initialization; runtime reload prepares candidate backends off-line.
+ pub fn try_init_upstreams(
+-    upstream_configs: &HashMap<String, UpstreamConf>,
++    configs: &HashMap<String, UpstreamConf>,
+     sender: Option<Arc<NotificationSender>>,
+ ) -> Result<()> {
+-    let (upstreams, _) = new_ahash_upstreams(
+-        upstream_configs,
+-        UPSTREAM_PROVIDER.clone(),
+-        sender,
+-    )
+-    .map_err(|e| Error::Invalid {
+-        message: e.to_string(),
+-    })?;
+-
+-    UPSTREAM_PROVIDER.store(upstreams);
++    let (upstreams, _) =
++        new_ahash_upstreams(configs, crate::runtime_graph::graph(), sender)
++            .map_err(|error| Error::Invalid {
++                message: error.to_string(),
++            })?;
++    crate::runtime_graph::initialize_part(|graph| graph.upstreams = upstreams);
+     Ok(())
+ }
+-
+-pub async fn try_update_upstreams(
+-    upstream_configs: &HashMap<String, UpstreamConf>,
+-    sender: Option<Arc<NotificationSender>>,
+-) -> Result<Vec<String>> {
+-    let (upstreams, updated_upstreams) = new_ahash_upstreams(
+-        upstream_configs,
+-        UPSTREAM_PROVIDER.clone(),
+-        sender,
+-    )
+-    .map_err(|e| Error::Invalid {
+-        message: e.to_string(),
+-    })?;
+-    for (name, up) in upstreams.iter() {
+-        // no need to run health check if not new upstream
+-        if !updated_upstreams.contains(name) {
+-            continue;
+-        }
+-        // run health check before switch to new upstream
+-        if let Err(e) = up.run_health_check().await {
+-            error!(
+-                target: LOG_TARGET,
+-                error = %e,
+-                upstream = name,
+-                "update upstream health check fail"
+-            );
+-        }
+-    }
+-    UPSTREAM_PROVIDER.store(upstreams);
+-    Ok(updated_upstreams)
+-}
+diff --git a/src/webhook.rs b/src/webhook.rs
+index 780a3fa1..dd9a95a2 100644
+--- a/src/webhook.rs
++++ b/src/webhook.rs
+@@ -31,8 +31,7 @@ static LOG_TARGET: &str = "main::webhook";
+ /// must not hold the process up for the whole HTTP timeout.
+ const EXIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+ 
+-/// The webhook in effect. Replaced as a whole when any `webhook*` setting
+-/// changes, so a hot reload applies them. A batch
++/// The webhook in effect. Basic settings require process restart. A batch
+ /// the replaced webhook was still collecting goes out with the settings it
+ /// was collected under.
+ static WEBHOOK: LazyLock<ArcSwap<WebhookNotificationSender>> =
+@@ -81,6 +80,8 @@ pub fn set_webhook_notification_sender(basic: &BasicConf) {
+ 
+ /// Brings the webhook settings in `current` up to those in `new` and puts
+ /// them into effect. Returns `false`, changing nothing, if they already match.
++/// Test setup for exercising retained notification handles across replacement.
++#[cfg(test)]
+ pub fn reload_webhook_notification_sender(
+     current: &mut BasicConf,
+     new: &BasicConf,
+diff --git a/docs/applied-reload.md b/docs/applied-reload.md
+new file mode 100644
+index 00000000..ed8b712a
+--- /dev/null
++++ b/docs/applied-reload.md
+@@ -0,0 +1,96 @@
++# Atomic hot reload and applied status
++
++`--autoreload` supports changes to plugins, locations, upstreams and the
++`locations` list of an existing server. Each candidate is validated and all
++request providers are prepared before one atomic publication. Every request
++captures the complete generation when its context is created and uses it for
++routing, plugins, upstream selection and retries. Host and weight changes rebuild
++server indexes even when the server's location names have not changed.
++
++A failed candidate keeps the complete previous request graph and the previous
++`current_config`. Unknown plugin categories, plugins compiled out of the binary,
++missing plugin references and plugin constructor failures are errors. `-t` rejects
++these errors as well. Built-in plugin names and `pingap:admin` are reserved.
++
++The memory cache backend is a process-wide singleton. Changing the already registered memory backend capacity/mode requires restart;
++request-level settings on an existing memory cache plugin remain reloadable.
++
++Changes to basic settings, certificates, storage or server settings other than
++`locations`, and adding/removing servers, require a restart. `--autoreload`
++rejects the whole candidate with category `unsupported`; it does not apply a
++supported subset. `--autorestart` records `restart_required` and requests the
++existing graceful restart while the previous graph continues serving.
++
++## Read-only admin API
++
++`GET /api/apply-status` uses the same timestamped admin authorization as the
++existing admin APIs. A custom admin mount prefixes the path. Other methods return
++405, and unauthorized calls return 401. The endpoint does not trigger a reload.
++Existing `/api/basic` and configuration APIs remain available.
++
++```json
++{
++  "schema_version": 1,
++  "process_id": 1234,
++  "process_instance_id": "019b0aaa-bbbb-7ccc-8ddd-eeeeeeeeeeee",
++  "applied": {
++    "attempt_id": 7,
++    "operation_id": "00000000-0000-4000-8000-000000000001",
++    "config_hash": "AB12CD34",
++    "config_digest": "64 lowercase hexadecimal SHA256 characters",
++    "applied_at_unix_ms": 123456789
++  },
++  "last_attempt": {
++    "attempt_id": 8,
++    "operation_id": "00000000-0000-4000-8000-000000000002",
++    "config_hash": "CD34AB12",
++    "config_digest": "64 lowercase hexadecimal SHA256 characters",
++    "state": "failed",
++    "failure": { "category": "plugins", "message": "constructor failed" }
++  }
++}
++```
++
++`applied` and `last_attempt` are nullable before initialization. An attempt's state
++is `preparing`, `applied`, `failed` or `restart_required`. Its failure is nullable;
++categories include `validation`, `storage`, `plugins`, `locations`, `upstreams`,
++`server_locations` and `unsupported`. A document that cannot be parsed has null
++operation/hash/digest fields. `applied` is only updated in the same atomic swap as
++the complete request graph. Preparing and failed attempts retain the previous
++applied identity. Obsolete attempt completions cannot publish or overwrite a
++newer attempt. IDs increase within each process, including failed attempts.
++
++`process_id` is the serving process's actual PID, including daemon mode.
++`process_instance_id` is a fresh UUID, renewed if a daemon fork changes PID, so
++PID reuse does not reuse an identity. A caller confirming an owned publication must match its
++retained child PID, process instance, operation, full digest and attempt state.
++
++`config_hash` is the existing CRC32 configuration description hash and is retained
++for compatibility. `config_digest` is SHA256 over the complete resolved
++configuration serialized as canonical JSON:
++
++```rust
++let mut value = serde_json::to_value(&resolved_config)?;
++value.sort_all_objects();
++let canonical = serde_json::to_vec(&value)?;
++let digest = hex::encode(sha2::Sha256::digest(&canonical));
++```
++
++Object keys are explicitly sorted recursively, including when `preserve_order` is enabled, arrays
++retain their order, and no formatting whitespace is added. The digest includes
++all serialized fields, including null defaults, certificate data and storage
++secrets; it does not use the masked CRC32 descriptions. `PingapConfig::digest()`
++implements this contract. The paired TOML/JSON/SHA256 fixture is in
++`pingap-config/tests/fixtures/applied-config.*`.
++
++## Operation marker
++
++An orchestrator can place a UUID in the `data` field of a mock plugin named
++`rcoder:publication`; this existing configuration shape supplies `operation_id`.
++Use an exact, highest-priority `/_pub/<UUID>` location on each existing listener,
++referencing only this mock plugin, to return the UUID in both the response body
++and `X-Rcoder-Publication`. No new configuration field is introduced. Confirm the
++marker through actual HTTP requests on every listener in addition to checking
++admin applied status; graph publication alone does not prove listener reachability.
++
++`pingap --apply-protocol-version` prints `1` and exits without loading configuration. Older binaries that lack this query must be rejected before changing business services.
+diff --git a/docs/zh/guide/applied-reload.md b/docs/zh/guide/applied-reload.md
+new file mode 100644
+index 00000000..5dbaa547
+--- /dev/null
++++ b/docs/zh/guide/applied-reload.md
+@@ -0,0 +1,57 @@
++# 原子热更新与实际生效状态
++
++`--autoreload` 支持修改 plugins、locations、upstreams 及既有 server 的
++`locations` 列表。系统先校验并准备完整候选请求图，再一次原子发布。每个请求
++创建上下文时捕获完整代次，路由匹配、插件、上游选择和重试均使用这张图。即使
++server 的 location 名单没有变化，Host 或权重变化也会重建路由索引。
++
++候选失败时保留完整旧请求图和旧 `current_config`。未知插件类型、当前二进制未
++编译的插件、缺失插件引用及插件构造失败均返回错误；`-t` 同样拒绝这些配置。
++内置插件名称和 `pingap:admin` 为保留名称。
++
++内存缓存 backend 是进程级 singleton；修改实际已注册的容量/模式参数需要重启。
++standby 移除插件后可按同一 backend 参数恢复，无需保留配置锚点；请求级选项可以热更新。
++
++basic、certificates、storages、server 除 `locations` 外的字段以及 server 增删
++需要重启。`--autoreload` 以 `unsupported` 类别拒绝整个候选，不应用其中一部分。
++`--autorestart` 记录 `restart_required` 并请求既有平滑重启流程，旧图继续服务。
++
++## 只读管理接口
++
++`GET /api/apply-status` 沿用既有管理接口的时间戳鉴权；自定义管理路径需要加上
++对应前缀。其他方法返回 405，未授权返回 401。调用该接口不会触发配置加载。
++原 `/api/basic` 和配置接口保留。
++
++响应契约为 `schema_version: 1`、实际进程 PID `process_id`、防 PID 复用的
++`process_instance_id`、可空的 `applied` 和可空的 `last_attempt`。`applied` 包含
++`attempt_id`、可空 `operation_id`、旧 CRC32 `config_hash`、完整 SHA256
++`config_digest` 和 `applied_at_unix_ms`。`last_attempt` 包含相同身份字段、
++`state` 及可空 `failure: {category, message}`。
++
++状态为 `preparing`、`applied`、`failed` 或 `restart_required`。错误类别包括
++`validation`、`storage`、`plugins`、`locations`、`upstreams`、`server_locations`
++和 `unsupported`。无法解析的文档中 operation/hash/digest 为 null。完整请求图和
++`applied` 在同一次原子交换中更新；准备中或失败的 attempt 保留旧 applied 身份。
++过时 attempt 的完成结果不能发布或覆盖新的 attempt。attempt 编号在进程内递增，
++失败也消耗编号。
++
++`process_id` 来自实际服务进程，包括 daemon fork 后的 PID；
++`process_instance_id` 为纯 UUID，daemon fork 改变 PID 后会更新为新的 UUID。确认归属发布时，调用者应匹配
++保留的子进程 PID、进程实例、操作 UUID、完整 digest 及 attempt 状态。
++
++完整 digest 算法为 `serde_json::to_value(&resolved_config)` 后调用
++`sort_all_objects()` 递归排序，再执行 `serde_json::to_vec`，再对所得字节计算 SHA256，返回 64 位小写十六进制。
++对象键显式递归排序，不依赖 preserve_order feature，数组保持顺序，不加格式空白；包括所有序列化字段、
++null 默认值、证书和存储 secret，不能用旧 hash 中遮罩后的 CRC32 描述替代。
++`PingapConfig::digest()` 提供该实现，跨实现固定样例在
++`pingap-config/tests/fixtures/applied-config.*`。
++
++## 操作标记
++
++编排方可使用名为 `rcoder:publication` 的 mock 插件，将 UUID 放在既有 `data`
++字段；接口以此作为 `operation_id`。每个既有 listener 挂载最高优先级、精确路径
++`/_pub/<UUID>`，仅引用此 mock 插件，在响应正文及 `X-Rcoder-Publication` 返回
++同一 UUID。无需新增配置字段。除管理状态外，还应实际请求每个 listener 的标记
++路径，确认数据面响应；请求图发布本身不能证明 listener 可达。
++
++`pingap --apply-protocol-version` 仅输出 `1` 并退出，不加载配置。缺少该查询能力的旧二进制应在操作业务服务之前拒绝。
+diff --git a/pingap-config/tests/applied_digest.rs b/pingap-config/tests/applied_digest.rs
+new file mode 100644
+index 00000000..eab3dfff
+--- /dev/null
++++ b/pingap-config/tests/applied_digest.rs
+@@ -0,0 +1,23 @@
++use pingap_config::PingapConfig;
++
++#[test]
++fn complete_digest_canonical_json_golden() {
++    let config =
++        PingapConfig::new(include_bytes!("fixtures/applied-config.toml"), true)
++            .unwrap();
++    let mut value = serde_json::to_value(&config).unwrap();
++    value.sort_all_objects();
++    let canonical = serde_json::to_vec(&value).unwrap();
++    assert_eq!(canonical, include_bytes!("fixtures/applied-config.json"));
++    assert_eq!(
++        config.digest().unwrap(),
++        include_str!("fixtures/applied-config.sha256").trim()
++    );
++    let mut changed = config.clone();
++    changed
++        .plugins
++        .get_mut("rcoder:publication")
++        .unwrap()
++        .insert("data".into(), toml::Value::String("new-operation".into()));
++    assert_ne!(config.digest().unwrap(), changed.digest().unwrap());
++}
+diff --git a/pingap-config/tests/fixtures/applied-config.json b/pingap-config/tests/fixtures/applied-config.json
+new file mode 100644
+index 00000000..b2038f7d
+--- /dev/null
++++ b/pingap-config/tests/fixtures/applied-config.json
+@@ -0,0 +1 @@
++{"basic":{"auto_restart_check_interval":"2s","downstream_tls_offload_thread_per_pool":null,"downstream_tls_offload_threadpools":null,"error_log":null,"error_template":null,"grace_period":null,"graceful_shutdown_timeout":null,"group":null,"listener_tasks_per_fd":null,"log_buffered_size":null,"log_compress_algorithm":null,"log_compress_days_ago":null,"log_compress_level":null,"log_compress_time_point_hour":null,"log_format_json":null,"log_level":null,"max_blocking_threads":null,"name":null,"pid_file":null,"pyroscope":null,"restart_ready_timeout":null,"sentry":null,"threads":null,"trusted_proxies":null,"upgrade_sock":null,"upstream_connect_offload_thread_per_pool":null,"upstream_connect_offload_threadpools":null,"upstream_keepalive_pool_size":null,"user":null,"webhook":null,"webhook_batch_max_events":null,"webhook_batch_window":null,"webhook_notifications":null,"webhook_type":null,"work_stealing":null,"working_directory":null},"certificates":{},"locations":{"rcoder:publication":{"client_max_body_size":null,"enable_reverse_proxy_headers":null,"grpc_web":null,"host":null,"includes":null,"match_cookies":null,"match_headers":null,"match_query":null,"max_processing":null,"max_retries":null,"max_retry_window":null,"path":"=/_pub/00000000-0000-4000-8000-000000000001","plugins":["rcoder:publication"],"proxy_add_headers":null,"proxy_set_headers":null,"remark":null,"rewrite":null,"upstream":null,"weight":65535}},"plugins":{"rcoder:publication":{"category":"mock","data":"00000000-0000-4000-8000-000000000001","headers":["X-Rcoder-Publication: 00000000-0000-4000-8000-000000000001"],"status":200}},"servers":{"app":{"access_log":null,"addr":"0.0.0.0:60000","downstream_read_timeout":null,"downstream_write_timeout":null,"enable_server_timing":null,"enabled_h2":null,"global_certificates":null,"h1_pipelining":null,"h2_idle_timeout":null,"h2_initial_connection_window_size":null,"h2_initial_window_size":null,"h2_max_concurrent_streams":null,"h2_max_header_list_size":null,"includes":null,"ja4":null,"locations":["rcoder:publication"],"modules":null,"otlp_exporter":null,"prometheus_metrics":null,"remark":null,"reuse_port":null,"tcp_fastopen":null,"tcp_idle":null,"tcp_interval":null,"tcp_probe_count":null,"tcp_user_timeout":null,"threads":null,"tls_cipher_list":null,"tls_ciphersuites":null,"tls_max_version":null,"tls_min_version":null}},"storages":{},"upstreams":{}}
+\ No newline at end of file
+diff --git a/pingap-config/tests/fixtures/applied-config.sha256 b/pingap-config/tests/fixtures/applied-config.sha256
+new file mode 100644
+index 00000000..21174135
+--- /dev/null
++++ b/pingap-config/tests/fixtures/applied-config.sha256
+@@ -0,0 +1 @@
++9b66298fbb1c74264c4618c044d0c88a080ff74ed72aca229f8da4ba880de0a4
+diff --git a/pingap-config/tests/fixtures/applied-config.toml b/pingap-config/tests/fixtures/applied-config.toml
+new file mode 100644
+index 00000000..5ec94925
+--- /dev/null
++++ b/pingap-config/tests/fixtures/applied-config.toml
+@@ -0,0 +1,14 @@
++[basic]
++auto_restart_check_interval = '2s'
++[servers.app]
++addr = '0.0.0.0:60000'
++locations = ['rcoder:publication']
++[locations.'rcoder:publication']
++path = '=/_pub/00000000-0000-4000-8000-000000000001'
++plugins = ['rcoder:publication']
++weight = 65535
++[plugins.'rcoder:publication']
++category = 'mock'
++status = 200
++headers = ['X-Rcoder-Publication: 00000000-0000-4000-8000-000000000001']
++data = '00000000-0000-4000-8000-000000000001'
+diff --git a/src/runtime_graph.rs b/src/runtime_graph.rs
+new file mode 100644
+index 00000000..20b3cf52
+--- /dev/null
++++ b/src/runtime_graph.rs
+@@ -0,0 +1,831 @@
++//! Complete request configuration, prepared off-line and published in one swap.
++use ahash::AHashMap;
++use arc_swap::ArcSwap;
++use pingap_config::{Hashable, PingapConfig};
++use pingap_core::{Plugin, PluginProvider, Plugins};
++use pingap_location::{
++    Location, LocationProvider, LocationStats, Locations, ServerLocationRoute,
++};
++use pingap_proxy::{
++    RequestProviders, ServerLocations, ServerLocationsProvider,
++};
++use pingap_upstream::{Upstream, UpstreamProvider, Upstreams};
++use serde::Serialize;
++use std::collections::HashMap;
++use std::sync::{Arc, LazyLock};
++
++#[derive(Clone, Default)]
++pub(crate) struct RuntimeGraph {
++    pub plugins: Plugins,
++    pub locations: Locations,
++    pub upstreams: Upstreams,
++    pub server_locations: ServerLocations,
++    pub version: u64,
++}
++
++impl PluginProvider for RuntimeGraph {
++    fn get(&self, name: &str) -> Option<Arc<dyn Plugin>> {
++        self.plugins.get(name).cloned()
++    }
++    fn version(&self) -> u64 {
++        self.version
++    }
++}
++impl LocationProvider for RuntimeGraph {
++    fn get(&self, name: &str) -> Option<Arc<Location>> {
++        self.locations.get(name).cloned()
++    }
++    fn stats(&self) -> HashMap<String, LocationStats> {
++        self.locations
++            .iter()
++            .map(|(name, item)| (name.clone(), item.stats()))
++            .collect()
++    }
++}
++impl UpstreamProvider for RuntimeGraph {
++    fn get(&self, name: &str) -> Option<Arc<Upstream>> {
++        self.upstreams.get(name).cloned()
++    }
++    fn list(&self) -> Vec<(String, Arc<Upstream>)> {
++        self.upstreams
++            .iter()
++            .map(|(name, item)| (name.clone(), item.clone()))
++            .collect()
++    }
++}
++impl ServerLocationsProvider for RuntimeGraph {
++    fn get(&self, name: &str) -> Option<Arc<ServerLocationRoute>> {
++        self.server_locations.get(name).cloned()
++    }
++}
++
++/// The marker is a real mock response plugin; no additional config key is needed.
++fn operation_id(config: &PingapConfig) -> Option<String> {
++    config.plugins.get("rcoder:publication").and_then(|plugin| {
++        (plugin.get("category").and_then(|v| v.as_str()) == Some("mock"))
++            .then(|| {
++                plugin
++                    .get("data")
++                    .and_then(|v| v.as_str())
++                    .map(str::to_string)
++            })
++            .flatten()
++    })
++}
++
++#[derive(Clone, Debug, Serialize)]
++pub(crate) struct AppliedConfig {
++    pub attempt_id: u64,
++    pub operation_id: Option<String>,
++    pub config_hash: String,
++    pub config_digest: String,
++    pub applied_at_unix_ms: u64,
++}
++#[derive(Clone, Debug, Serialize)]
++pub(crate) struct ApplyFailure {
++    pub category: String,
++    pub message: String,
++}
++impl std::fmt::Display for ApplyFailure {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(formatter, "{}: {}", self.category, self.message)
++    }
++}
++impl std::error::Error for ApplyFailure {}
++impl ApplyFailure {
++    pub fn new(category: &str, error: impl std::fmt::Display) -> Self {
++        Self {
++            category: category.into(),
++            message: error.to_string(),
++        }
++    }
++}
++#[derive(Clone, Debug, Serialize)]
++pub(crate) struct ApplyAttempt {
++    pub attempt_id: u64,
++    pub operation_id: Option<String>,
++    pub config_hash: Option<String>,
++    pub config_digest: Option<String>,
++    pub state: String,
++    pub failure: Option<ApplyFailure>,
++}
++#[derive(Clone, Debug, Serialize)]
++pub(crate) struct ApplyStatus {
++    pub schema_version: u32,
++    pub process_id: u32,
++    pub process_instance_id: String,
++    pub applied: Option<AppliedConfig>,
++    pub last_attempt: Option<ApplyAttempt>,
++}
++impl Default for ApplyStatus {
++    fn default() -> Self {
++        Self {
++            schema_version: 1,
++            process_id: 0,
++            process_instance_id: String::new(),
++            applied: None,
++            last_attempt: None,
++        }
++    }
++}
++#[derive(Clone, Default)]
++struct RuntimeState {
++    graph: Arc<RuntimeGraph>,
++    status: ApplyStatus,
++}
++static STATE: LazyLock<ArcSwap<RuntimeState>> =
++    LazyLock::new(|| ArcSwap::from_pointee(RuntimeState::default()));
++struct ProcessIdentity {
++    pid: u32,
++    instance_id: String,
++}
++static PROCESS_IDENTITY: LazyLock<ArcSwap<ProcessIdentity>> =
++    LazyLock::new(|| {
++        ArcSwap::from_pointee(ProcessIdentity {
++            pid: std::process::id(),
++            instance_id: uuid::Uuid::now_v7().to_string(),
++        })
++    });
++
++fn process_identity() -> Arc<ProcessIdentity> {
++    let previous = PROCESS_IDENTITY.load_full();
++    let pid = std::process::id();
++    if previous.pid == pid {
++        return previous;
++    }
++    // A daemon fork can inherit a previously initialized identity. Publish one
++    // fresh UUID for the child; concurrent first readers share the CAS winner.
++    let fresh = Arc::new(ProcessIdentity {
++        pid,
++        instance_id: uuid::Uuid::now_v7().to_string(),
++    });
++    let replaced = PROCESS_IDENTITY.compare_and_swap(&previous, fresh.clone());
++    if Arc::ptr_eq(&previous, &replaced) {
++        fresh
++    } else {
++        PROCESS_IDENTITY.load_full()
++    }
++}
++/// Serializes polling and observers through preparation and publication.
++pub(crate) static APPLY_LOCK: tokio::sync::Mutex<()> =
++    tokio::sync::Mutex::const_new(());
++
++pub(crate) fn status() -> ApplyStatus {
++    let mut status = STATE.load().status.clone();
++    let identity = process_identity();
++    status.process_id = identity.pid;
++    // PID is read after daemon fork; the nonce also distinguishes PID reuse.
++    status.process_instance_id = identity.instance_id.clone();
++    status
++}
++pub(crate) fn graph() -> Arc<RuntimeGraph> {
++    STATE.load().graph.clone()
++}
++
++/// Startup-only replacement, before request services are running.
++pub(crate) fn initialize_part(update: impl FnOnce(&mut RuntimeGraph)) {
++    let mut state = (**STATE.load()).clone();
++    let mut graph = (*state.graph).clone();
++    update(&mut graph);
++    graph.version += 1;
++    state.graph = Arc::new(graph);
++    STATE.store(Arc::new(state));
++}
++
++pub(crate) fn begin_attempt(
++    config: Option<&PingapConfig>,
++) -> Result<u64, ApplyFailure> {
++    let mut state = (**STATE.load()).clone();
++    let previous = state
++        .status
++        .last_attempt
++        .as_ref()
++        .map_or(0, |attempt| attempt.attempt_id);
++    let attempt_id = previous.checked_add(1).ok_or_else(|| {
++        ApplyFailure::new("validation", "attempt identity exhausted")
++    })?;
++    let (operation_id, config_hash, config_digest) =
++        match config {
++            Some(config) => {
++                (
++                    operation_id(config),
++                    Some(config.hash().map_err(|error| {
++                        ApplyFailure::new("validation", error)
++                    })?),
++                    Some(config.digest().map_err(|error| {
++                        ApplyFailure::new("validation", error)
++                    })?),
++                )
++            },
++            None => (None, None, None),
++        };
++    state.status.last_attempt = Some(ApplyAttempt {
++        attempt_id,
++        operation_id,
++        config_hash,
++        config_digest,
++        state: "preparing".into(),
++        failure: None,
++    });
++    STATE.store(Arc::new(state));
++    Ok(attempt_id)
++}
++pub(crate) fn failed_attempt(
++    attempt_id: u64,
++    state_name: &str,
++    failure: ApplyFailure,
++) {
++    let mut state = (**STATE.load()).clone();
++    if let Some(attempt) = &mut state.status.last_attempt
++        && attempt.attempt_id == attempt_id
++    {
++        attempt.state = state_name.into();
++        attempt.failure = Some(failure);
++        STATE.store(Arc::new(state));
++    }
++}
++
++pub(crate) fn publish(
++    attempt_id: u64,
++    graph: impl Into<Arc<RuntimeGraph>>,
++) -> Result<(), ApplyFailure> {
++    let mut state = (**STATE.load()).clone();
++    let attempt = state.status.last_attempt.as_mut().ok_or_else(|| {
++        ApplyFailure::new("validation", "missing apply attempt")
++    })?;
++    if attempt.attempt_id != attempt_id {
++        return Err(ApplyFailure::new("validation", "obsolete apply attempt"));
++    }
++    let config_hash = attempt.config_hash.clone().ok_or_else(|| {
++        ApplyFailure::new("validation", "missing candidate hash")
++    })?;
++    let config_digest = attempt.config_digest.clone().ok_or_else(|| {
++        ApplyFailure::new("validation", "missing candidate digest")
++    })?;
++    attempt.state = "applied".into();
++    attempt.failure = None;
++    state.status.applied = Some(AppliedConfig {
++        attempt_id,
++        operation_id: attempt.operation_id.clone(),
++        config_hash,
++        config_digest,
++        applied_at_unix_ms: pingap_core::now_ms(),
++    });
++    state.graph = graph.into();
++    STATE.store(Arc::new(state));
++    Ok(())
++}
++
++pub(crate) fn record_bootstrap(
++    config: &PingapConfig,
++) -> Result<(), ApplyFailure> {
++    let attempt_id = begin_attempt(Some(config))?;
++    publish(attempt_id, graph())
++}
++
++pub(crate) fn check_supported(
++    current: &PingapConfig,
++    candidate: &PingapConfig,
++) -> Result<(), ApplyFailure> {
++    check_memory_cache_compatible(candidate)?;
++    let mut supported = current.clone();
++    supported.plugins = candidate.plugins.clone();
++    supported.locations = candidate.locations.clone();
++    supported.upstreams = candidate.upstreams.clone();
++    for (name, server) in &candidate.servers {
++        if let Some(existing) = supported.servers.get_mut(name) {
++            existing.locations = server.locations.clone();
++        }
++    }
++    if supported
++        .digest()
++        .map_err(|error| ApplyFailure::new("validation", error))?
++        != candidate
++            .digest()
++            .map_err(|error| ApplyFailure::new("validation", error))?
++    {
++        return Err(ApplyFailure::new(
++            "unsupported",
++            "hot reload supports plugins, locations, upstreams and existing server.locations only; other changes require restart",
++        ));
++    }
++    Ok(())
++}
++
++/// Memory cache resources survive removal from a request graph (standby), so
++/// compatibility must use the actual process registration rather than config names.
++fn check_memory_cache_compatible(
++    candidate: &PingapConfig,
++) -> Result<(), ApplyFailure> {
++    for (name, config) in &candidate.plugins {
++        if config.get("category").and_then(|value| value.as_str())
++            != Some("cache")
++        {
++            continue;
++        }
++        let directory = config
++            .get("directory")
++            .and_then(|value| value.as_str())
++            .unwrap_or_default();
++        if directory.is_empty() || directory.starts_with("memory://") {
++            pingap_cache::validate_memory_cache_backend(directory).map_err(
++                |error| {
++                    ApplyFailure::new(
++                        "unsupported",
++                        format!("cache plugin {name}: {error}"),
++                    )
++                },
++            )?;
++        }
++    }
++    Ok(())
++}
++
++pub(crate) fn prepare_locations(
++    config: &PingapConfig,
++    base: &RuntimeGraph,
++) -> Result<Locations, ApplyFailure> {
++    let mut locations = AHashMap::new();
++    for (name, conf) in &config.locations {
++        let location = match base.locations.get(name) {
++            Some(location) if location.key == conf.hash_key() => {
++                location.clone()
++            },
++            _ => Arc::new(
++                Location::new(name, conf)
++                    .map_err(|error| ApplyFailure::new("locations", error))?,
++            ),
++        };
++        locations.insert(name.clone(), location);
++    }
++    Ok(locations)
++}
++pub(crate) fn prepare_routes(
++    config: &PingapConfig,
++    locations: &Locations,
++) -> Result<ServerLocations, ApplyFailure> {
++    let mut routes = AHashMap::new();
++    for (name, server) in &config.servers {
++        let Some(ordered) = &server.locations else {
++            continue;
++        };
++        let mut ordered = ordered.clone();
++        for location_name in &ordered {
++            if !locations.contains_key(location_name) {
++                return Err(ApplyFailure::new(
++                    "server_locations",
++                    format!(
++                        "server {name} references missing location {location_name}"
++                    ),
++                ));
++            }
++        }
++        ordered.sort_by_key(|name| {
++            std::cmp::Reverse(
++                config
++                    .locations
++                    .get(name)
++                    .map_or(0, |conf| conf.get_weight()),
++            )
++        });
++        // Always rebuild from candidate Locations: host/weight changes affect the index
++        // even when the server's list of location names is unchanged.
++        routes.insert(
++            name.clone(),
++            Arc::new(ServerLocationRoute::build(ordered, |name| {
++                locations.get(name).cloned()
++            })),
++        );
++    }
++    Ok(routes)
++}
++
++pub(crate) async fn prepare(
++    config: &PingapConfig,
++    base: Arc<RuntimeGraph>,
++    version: u64,
++) -> Result<RuntimeGraph, ApplyFailure> {
++    config
++        .validate()
++        .map_err(|error| ApplyFailure::new("validation", error))?;
++    pingap_certificate::validate_servers_tls_for_backend(&config.servers)
++        .map_err(|error| ApplyFailure::new("validation", error))?;
++    let plugins =
++        crate::plugin::prepare_plugins(&config.plugins, &base.plugins)
++            .map_err(|error| ApplyFailure::new("plugins", error))?;
++    let locations = prepare_locations(config, &base)?;
++    let server_locations = prepare_routes(config, &locations)?;
++    validate_plugin_references(config, &plugins)?;
++    let (upstreams, changed) = pingap_upstream::new_ahash_upstreams(
++        &config.upstreams,
++        base,
++        crate::webhook::get_webhook_sender(),
++    )
++    .map_err(|error| ApplyFailure::new("upstreams", error))?;
++    for name in changed {
++        if let Some(upstream) = upstreams.get(&name) {
++            upstream.run_health_check().await.map_err(|error| {
++                ApplyFailure::new(
++                    "upstreams",
++                    format!("prepare {name}: {error}"),
++                )
++            })?;
++        }
++    }
++    Ok(RuntimeGraph {
++        plugins,
++        locations,
++        server_locations,
++        upstreams,
++        version,
++    })
++}
++
++pub(crate) fn validate_plugin_references(
++    config: &PingapConfig,
++    plugins: &Plugins,
++) -> Result<(), ApplyFailure> {
++    for (name, location) in &config.locations {
++        for plugin_name in location.plugins.iter().flatten() {
++            if !plugins.contains_key(plugin_name) {
++                return Err(ApplyFailure::new(
++                    "plugins",
++                    format!(
++                        "location {name} references missing plugin {plugin_name}"
++                    ),
++                ));
++            }
++        }
++    }
++    Ok(())
++}
++
++/// Live providers are used by admin metrics and health tasks; request processing
++/// captures a concrete immutable RuntimeGraph instead.
++pub(crate) struct LiveProvider;
++impl PluginProvider for LiveProvider {
++    fn get(&self, name: &str) -> Option<Arc<dyn Plugin>> {
++        graph().plugins.get(name).cloned()
++    }
++    fn version(&self) -> u64 {
++        graph().version
++    }
++}
++impl LocationProvider for LiveProvider {
++    fn get(&self, name: &str) -> Option<Arc<Location>> {
++        graph().locations.get(name).cloned()
++    }
++    fn stats(&self) -> HashMap<String, LocationStats> {
++        LocationProvider::stats(graph().as_ref())
++    }
++}
++impl UpstreamProvider for LiveProvider {
++    fn get(&self, name: &str) -> Option<Arc<Upstream>> {
++        graph().upstreams.get(name).cloned()
++    }
++    fn list(&self) -> Vec<(String, Arc<Upstream>)> {
++        UpstreamProvider::list(graph().as_ref())
++    }
++}
++impl ServerLocationsProvider for LiveProvider {
++    fn get(&self, name: &str) -> Option<Arc<ServerLocationRoute>> {
++        graph().server_locations.get(name).cloned()
++    }
++    fn snapshot(&self) -> Option<Arc<RequestProviders>> {
++        let graph = graph();
++        Some(Arc::new(RequestProviders {
++            server_locations: graph.clone(),
++            locations: graph.clone(),
++            upstreams: graph.clone(),
++            plugins: graph,
++        }))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn marker_config(value: &str) -> PingapConfig {
++        PingapConfig::new(
++            format!(
++                r#"
++[servers.app]
++addr = '127.0.0.1:6011'
++locations = ['marker']
++[locations.marker]
++path = '/_pub/{value}'
++plugins = ['rcoder:publication']
++[plugins.'rcoder:publication']
++category = 'mock'
++data = '{value}'
++"#
++            )
++            .as_bytes(),
++            true,
++        )
++        .unwrap()
++    }
++
++    #[tokio::test]
++    async fn applied_metadata_failure_and_obsolete_attempt_preserve_graph() {
++        let _guard = APPLY_LOCK.lock().await;
++        let old = marker_config("old-operation");
++        let old_graph = prepare(&old, Arc::new(RuntimeGraph::default()), 100)
++            .await
++            .unwrap();
++        let old_attempt = begin_attempt(Some(&old)).unwrap();
++        publish(old_attempt, old_graph).unwrap();
++        let old_graph = graph();
++        let candidate = marker_config("new-operation");
++        let candidate_attempt = begin_attempt(Some(&candidate)).unwrap();
++        let preparing = status();
++        assert_eq!(preparing.process_id, std::process::id());
++        assert!(uuid::Uuid::parse_str(&preparing.process_instance_id).is_ok());
++        assert_eq!(
++            preparing.applied.as_ref().unwrap().operation_id.as_deref(),
++            Some("old-operation")
++        );
++        assert_eq!(
++            preparing
++                .last_attempt
++                .as_ref()
++                .unwrap()
++                .operation_id
++                .as_deref(),
++            Some("new-operation")
++        );
++        failed_attempt(
++            candidate_attempt,
++            "failed",
++            ApplyFailure::new("plugins", "injected constructor failure"),
++        );
++        let failed = status();
++        assert!(Arc::ptr_eq(&old_graph, &graph()));
++        assert_eq!(
++            failed.applied.as_ref().unwrap().config_digest,
++            old.digest().unwrap()
++        );
++        assert_eq!(
++            failed
++                .last_attempt
++                .as_ref()
++                .unwrap()
++                .config_digest
++                .as_deref(),
++            Some(candidate.digest().unwrap().as_str())
++        );
++        assert_eq!(
++            failed
++                .last_attempt
++                .as_ref()
++                .unwrap()
++                .failure
++                .as_ref()
++                .unwrap()
++                .category,
++            "plugins"
++        );
++        assert!(publish(old_attempt, RuntimeGraph::default()).is_err());
++        failed_attempt(
++            old_attempt,
++            "failed",
++            ApplyFailure::new("validation", "obsolete result"),
++        );
++        assert_eq!(
++            status().last_attempt.as_ref().unwrap().attempt_id,
++            candidate_attempt
++        );
++        assert!(Arc::ptr_eq(&old_graph, &graph()));
++    }
++
++    #[tokio::test]
++    async fn failed_candidate_never_publishes_valid_sibling_components() {
++        let old = marker_config("old-operation");
++        let old_graph = Arc::new(
++            prepare(&old, Arc::new(RuntimeGraph::default()), 101)
++                .await
++                .unwrap(),
++        );
++        let mut candidate = marker_config("new-operation");
++        candidate.plugins.insert(
++            "bad".into(),
++            toml::from_str(
++                "category='basic_auth'\nauthorizations=['not-base64!']",
++            )
++            .unwrap(),
++        );
++        let error = prepare(&candidate, old_graph.clone(), 102)
++            .await
++            .err()
++            .unwrap();
++        assert_eq!(error.category, "plugins");
++        assert_eq!(
++            old_graph.server_locations["app"].ordered.as_slice(),
++            &["marker"]
++        );
++        assert!(
++            old_graph.locations["marker"]
++                .match_host_path("", "/_pub/old-operation")
++                .0
++        );
++        assert!(
++            !old_graph.locations["marker"]
++                .match_host_path("", "/_pub/new-operation")
++                .0
++        );
++    }
++
++    #[tokio::test]
++    async fn missing_plugin_and_reserved_name_reject_candidate() {
++        let mut config = marker_config("test-operation");
++        config.locations.get_mut("marker").unwrap().plugins =
++            Some(vec!["missing".into()]);
++        assert_eq!(
++            prepare(&config, Arc::new(RuntimeGraph::default()), 1)
++                .await
++                .err()
++                .unwrap()
++                .category,
++            "plugins"
++        );
++        config.plugins.insert(
++            "pingap:ping".into(),
++            toml::from_str("category='mock'\ndata='silently overridden'")
++                .unwrap(),
++        );
++        assert!(crate::validate_plugins(&config).is_err());
++    }
++
++    #[test]
++    fn unsupported_fields_reject_entire_candidate() {
++        let old = marker_config("old-operation");
++        let candidate = marker_config("new-operation");
++        assert!(check_supported(&old, &candidate).is_ok());
++        let mut changed = candidate.clone();
++        changed.basic.log_level = Some("debug".into());
++        assert_eq!(
++            check_supported(&old, &changed).unwrap_err().category,
++            "unsupported"
++        );
++        let mut changed = candidate.clone();
++        changed.servers.get_mut("app").unwrap().addr = "127.0.0.1:6012".into();
++        assert!(check_supported(&old, &changed).is_err());
++        let mut changed = candidate.clone();
++        changed.servers.remove("app");
++        assert!(check_supported(&old, &changed).is_err());
++        let mut changed = candidate;
++        changed.storages.insert(
++            "new-storage".into(),
++            pingap_config::StorageConf::default(),
++        );
++        assert!(check_supported(&old, &changed).is_err());
++    }
++
++    #[tokio::test]
++    async fn memory_cache_restores_after_standby_without_a_config_anchor() {
++        let current = PingapConfig::new(
++            br#"
++[plugins.cache]
++category = 'cache'
++max_ttl = '1m'
++"#,
++            true,
++        )
++        .unwrap();
++        let cache = pingap_cache::new_cache_backend("").unwrap();
++        let mut candidate = current.clone();
++        candidate
++            .plugins
++            .get_mut("cache")
++            .unwrap()
++            .insert("max_ttl".into(), toml::Value::String("2m".into()));
++        assert!(check_supported(&current, &candidate).is_ok());
++        let standby = PingapConfig::default();
++        assert!(check_supported(&standby, &candidate).is_ok());
++        let _prepared =
++            prepare(&candidate, Arc::new(RuntimeGraph::default()), 1)
++                .await
++                .unwrap();
++        assert!(std::ptr::eq(
++            cache,
++            pingap_cache::new_cache_backend("").unwrap()
++        ));
++        candidate.plugins.get_mut("cache").unwrap().insert(
++            "directory".into(),
++            toml::Value::String("memory://?mode=compact".into()),
++        );
++        assert_eq!(
++            check_supported(&standby, &candidate).unwrap_err().category,
++            "unsupported"
++        );
++    }
++
++    #[tokio::test]
++    async fn weight_change_reorders_same_server_location_names() {
++        let old = PingapConfig::new(
++            br#"
++[servers.app]
++addr = '127.0.0.1:6011'
++locations = ['first', 'second']
++[locations.first]
++weight = 20
++[locations.second]
++weight = 10
++"#,
++            true,
++        )
++        .unwrap();
++        let old_graph = Arc::new(
++            prepare(&old, Arc::new(RuntimeGraph::default()), 1)
++                .await
++                .unwrap(),
++        );
++        assert_eq!(
++            old_graph.server_locations["app"].ordered.as_slice(),
++            &["first", "second"]
++        );
++        let mut candidate = old;
++        candidate.locations.get_mut("second").unwrap().weight = Some(30);
++        let new_graph =
++            prepare(&candidate, old_graph.clone(), 2).await.unwrap();
++        assert_eq!(
++            new_graph.server_locations["app"].ordered.as_slice(),
++            &["second", "first"]
++        );
++        assert_eq!(
++            old_graph.server_locations["app"].ordered.as_slice(),
++            &["first", "second"]
++        );
++    }
++
++    #[tokio::test]
++    async fn concurrent_snapshot_readers_observe_one_complete_generation() {
++        use std::sync::atomic::{AtomicBool, Ordering};
++        let old = Arc::new(
++            prepare(
++                &marker_config("old"),
++                Arc::new(RuntimeGraph::default()),
++                1,
++            )
++            .await
++            .unwrap(),
++        );
++        let new = Arc::new(
++            prepare(&marker_config("new"), old.clone(), 2)
++                .await
++                .unwrap(),
++        );
++        let old_key = crate::plugin::get_hash_key(
++            &marker_config("old").plugins["rcoder:publication"],
++        );
++        let new_key = crate::plugin::get_hash_key(
++            &marker_config("new").plugins["rcoder:publication"],
++        );
++        let live = Arc::new(ArcSwap::from(old.clone()));
++        let stop = Arc::new(AtomicBool::new(false));
++        let readers: Vec<_> = (0..4)
++            .map(|_| {
++                let live = live.clone();
++                let stop = stop.clone();
++                let old_key = old_key.clone();
++                let new_key = new_key.clone();
++                std::thread::spawn(move || {
++                    let mut observations = 0;
++                    while !stop.load(Ordering::Acquire) || observations < 1000 {
++                        let graph = live.load_full();
++                        let (operation, key) = if graph.version == 1 {
++                            ("old", &old_key)
++                        } else {
++                            ("new", &new_key)
++                        };
++                        let location = &graph.locations["marker"];
++                        assert!(
++                            location
++                                .match_host_path(
++                                    "",
++                                    &format!("/_pub/{operation}")
++                                )
++                                .0
++                        );
++                        let resolved =
++                            location.plugins_for(graph.as_ref()).unwrap();
++                        assert_eq!(resolved[0].1.config_key().as_ref(), key);
++                        assert_eq!(
++                            graph.server_locations["app"].ordered.as_slice(),
++                            &["marker"]
++                        );
++                        observations += 1;
++                    }
++                })
++            })
++            .collect();
++        for i in 0..1000 {
++            live.store(if i % 2 == 0 { new.clone() } else { old.clone() });
++        }
++        stop.store(true, Ordering::Release);
++        for reader in readers {
++            reader.join().unwrap();
++        }
++    }
++}

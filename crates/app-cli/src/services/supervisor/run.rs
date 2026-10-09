@@ -11,7 +11,38 @@ pub struct RunProfile {
     pub dev_profile: bool,
     /// R08 每操作 PG 凭据（owner 复用时平台传入；注入服务进程 env）。
     pub pg: Option<shared_types::StartPgCredential>,
+    /// Validated before the predecessor's drain/stop barrier. The executor
+    /// consumes this exact candidate instead of rereading a different directory.
+    pub prepared_proxy: Option<PreparedProxy>,
 }
+
+#[derive(Clone)]
+pub struct PreparedProxy {
+    pub workspace: std::path::PathBuf,
+    pub release: crate::manifest::ReleaseLock,
+    pub dev_profile: bool,
+    pub outcome: crate::proxy::compiler::CompileOutcome,
+}
+
+impl std::fmt::Debug for PreparedProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedProxy")
+            .field("workspace", &self.workspace)
+            .field("release_id", &self.release.release_id)
+            .field("dev_profile", &self.dev_profile)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreflightRejected(pub String);
+
+impl std::fmt::Display for PreflightRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for PreflightRejected {}
 
 /// run 前台会话的档位：migrate 恒执行、dev 由 env 信号、无操作级凭据。
 pub fn legacy_run_profile() -> RunProfile {
@@ -19,6 +50,7 @@ pub fn legacy_run_profile() -> RunProfile {
         run_migrations: true,
         dev_profile: dev_run_profile(),
         pg: None,
+        prepared_proxy: None,
     }
 }
 
@@ -63,10 +95,20 @@ pub(super) async fn run_inner(
         run_migrations,
         dev_profile,
         pg,
+        prepared_proxy,
     } = profile;
     let pg = resolve_run_pg(pg)?;
     // 1. 自动发现子项目 + 组装服务清单
-    let release = manifest::read_release_lock(&args.workspace).context("load release lock")?;
+    let release = match &prepared_proxy {
+        Some(prepared) => {
+            anyhow::ensure!(
+                prepared.workspace == args.workspace && prepared.dev_profile == dev_profile,
+                "prepared proxy does not belong to this execution target"
+            );
+            prepared.release.clone()
+        }
+        None => manifest::read_release_lock(&args.workspace).context("load release lock")?,
+    };
     validate_runtime_compatibility(&release)?;
     // 防御过滤：release.lock 正常不含 disabled 服务，此为防御手工篡改/未来锁语义变化；
     // 一处过滤覆盖后续 migrate/start/readiness/shutdown 全循环（对齐 log/service.rs 先例）。
@@ -91,6 +133,33 @@ pub(super) async fn run_inner(
     // 路由注入同源 workspace_index::index_port_if_eligible）。
     let workspace_index_port =
         crate::workspace_index::index_port_if_eligible(&args.workspace, &specs);
+
+    let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+    let outcome = match prepared_proxy {
+        Some(prepared) => prepared.outcome,
+        None => {
+            compile_and_validate(
+                &args.workspace,
+                &runtime_root,
+                &args.pingap_bin,
+                &release,
+                dev_profile,
+            )
+            .await?
+        }
+    };
+    info!(
+        "📝 effective pingap config → {}",
+        outcome.config_path.display()
+    );
+    // 常驻在服务时先校验热载兼容（server 拓扑变化 Fail Fast 保旧服务）
+    if super::resident::is_serving().await {
+        let active = crate::proxy::compiler::active_config_path(&runtime_root);
+        let candidate = tokio::fs::read_to_string(&outcome.config_path)
+            .await
+            .with_context(|| format!("read candidate {}", outcome.config_path.display()))?;
+        crate::proxy::compiler::validate_hot_reload_compatible(&active, &candidate)?;
+    }
 
     // 2. Wait for the declared PostgreSQL dependency before starting services.
     // RCoder 容器通过 APP_CLI_REQUIRE_PG=1 启用；宿主机独立运行默认不探测。
@@ -268,33 +337,13 @@ pub(super) async fn run_inner(
         // - 直跑形态：无 owner 作用域，常驻进程会在 run() 返回后成为孤儿——
         //   维持业务会话树托管（R01）。代理失败时 workspace 不得进入 ready。
         let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
-        let outcome = compile_and_validate(
-            &args.workspace,
-            &runtime_root,
-            &args.pingap_bin,
-            &release,
-            dev_profile,
-        )
-        .await?;
-        info!(
-            "📝 effective pingap config → {}",
-            outcome.config_path.display()
-        );
-        // 常驻在服务时先校验热载兼容（server 拓扑变化 Fail Fast 保旧服务）
-        if super::resident::is_serving().await {
-            let active = crate::proxy::compiler::active_config_path(&runtime_root);
-            let candidate = tokio::fs::read_to_string(&outcome.config_path)
-                .await
-                .with_context(|| format!("read candidate {}", outcome.config_path.display()))?;
-            crate::proxy::compiler::validate_hot_reload_compatible(&active, &candidate)?;
-        }
         crate::proxy::compiler::publish_active(&runtime_root, &outcome.config_path).await?;
         // serve 形态判定：run_loop 恒传 on_running（相位回执）；直跑形态
         //（main.rs 的 run 子命令与 run()）恒为 None——即便直跑进程处于原生
         // 监督下，单次编排的进程域仍走会话树（树外进程会在 run 返回后孤儿化）。
         let serve_form = on_running.is_some();
-        if serve_form && super::resident::owner_scope_root().is_some() {
-            super::resident::ensure_resident(args, &outcome.expected_hash).await?;
+        if serve_form && super::resident::owner_scope_root()?.is_some() {
+            super::resident::ensure_resident(args, &outcome).await?;
         } else {
             super::pingap::spawn_pingap_into_session_tree(
                 &outcome,
@@ -360,6 +409,11 @@ pub(super) async fn run_inner(
     };
     if let Err(mut error) = startup.await {
         error!("❌ startup failed, shutting down already-started children: {error:#}");
+        // Includes cancellation during proxy confirmation or bridge readiness.
+        // A normal route must not outlive the business roots it forwards to.
+        if let Err(entry_error) = super::supervise::drain_or_close_resident().await {
+            error = supervisor_cleanup_unknown(error, entry_error);
+        }
         // P1-02：清理错误并入 cause 链，不覆盖原始启动错误（组合后仍可溯因）。
         if let Err(cleanup_error) = shutdown_all(std::mem::take(&mut children), 5).await {
             error = error.context(format!(
@@ -433,9 +487,12 @@ pub(super) async fn run_inner(
         None => match wait_for_bridge(&release, &specs, cancel.as_ref()).await {
             Ok(ready) => ready,
             Err(error) => {
-                shutdown_all(std::mem::take(&mut children), 5)
-                    .await
-                    .context("cleanup after bridge observation interrupted")?;
+                let entry = super::supervise::drain_or_close_resident().await;
+                let stopped = shutdown_all(std::mem::take(&mut children), 5).await;
+                if let Err(cleanup) = entry {
+                    return Err(supervisor_cleanup_unknown(error, cleanup));
+                }
+                stopped.context("cleanup after bridge observation interrupted")?;
                 return Err(error);
             }
         },
@@ -462,6 +519,13 @@ pub(super) async fn run_inner(
     supervise(children, shutdown_timeout, cancel, known_failed).await?;
     runtime_status.set_ready(false);
     Ok(())
+}
+
+fn supervisor_cleanup_unknown(error: anyhow::Error, cleanup: anyhow::Error) -> anyhow::Error {
+    super::supervise::ShutdownUnconfirmed(format!(
+        "startup failed: {error:#}; entry cleanup: {cleanup:#}"
+    ))
+    .into()
 }
 
 pub(super) fn record_startup_check(

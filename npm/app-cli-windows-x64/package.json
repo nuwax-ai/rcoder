@@ -1,7 +1,7 @@
 {
   "name": "@nuwax-ai/app-cli-windows-x64",
   "version": "0.0.0",
-  "description": "app-cli binary for win32-x64 (bundled with self-built rustls pingap.exe — upstream pingap ships no Windows builds)",
+  "description": "app-cli binary for win32-x64 (bundled with self-built rustls pingap.exe \u2014 upstream pingap ships no Windows builds)",
   "os": [
     "win32"
   ],
@@ -10,7 +10,8 @@
   ],
   "files": [
     "app-cli.exe",
-    "pingap.exe"
+    "pingap.exe",
+    "pingap.exe.applied.json"
   ],
   "license": "Apache-2.0",
   "repository": {

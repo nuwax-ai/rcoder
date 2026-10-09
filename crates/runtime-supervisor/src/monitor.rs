@@ -76,11 +76,15 @@ impl Options {
 pub struct Owner {
     _lock: Arc<File>,
     root: PathBuf,
+    resident_lease: process_utils::command_authority::OwnerLease,
 }
 impl Owner {
     /// Canonical scope root this owner lock protects.
     pub(crate) fn scope_root(&self) -> &Path {
         &self.root
+    }
+    pub(crate) fn lease(&self) -> &process_utils::command_authority::OwnerLease {
+        &self.resident_lease
     }
     /// Resolve an offline target while holding its owner lock. If discovery was
     /// lost or damaged, publish a nonterminal identity before a caller persists
@@ -248,21 +252,13 @@ impl Owner {
         Ok(discovery.snapshot)
     }
     pub fn try_acquire(root: &Path) -> Result<Option<Self>> {
-        process_utils::command_context::create_durable_directory(root)?;
-        let file = File::options()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(root.join("owner.lock"))?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(Self {
-                _lock: Arc::new(file),
-                root: std::fs::canonicalize(root).context("canonicalize supervisor scope")?,
-            })),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+        Ok(
+            process_utils::command_authority::OwnerLease::try_acquire(root)?.map(|lease| Self {
+                _lock: lease.retained_file(),
+                root: lease.root().to_path_buf(),
+                resident_lease: lease,
+            }),
+        )
     }
 
     /// Discovery locates the management endpoint; generation receipts prove

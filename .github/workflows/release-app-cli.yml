@@ -23,9 +23,9 @@ name: release-app-cli
 # - windows x64：windows-latest native。app-cli.exe 的 aws-lc-sys（reqwest rustls）
 #   需要 protoc+nasm+cmake（cmake 预装）。
 # - pingap.exe：独立 job，由 source_identity 核对 Cargo.toml 与 devtool 的
-#   官方版本/rev（单一事实源，漂移即失败）→ checkout vicanso/pingap@rev →
-#   `--no-default-features --features tls-rustls`（ring provider，无需 nasm/cmake；
-#   checkout 后准备 dist/README.md，无需 build-web）。与 app-cli 的 pingap-config 库严格同 rev。
+#   官方版本/rev（单一事实源，漂移即失败）→ checkout exact pin → 校验并应用配对 patch →
+#   `--no-default-features --features tls-rustls`（aws-lc provider，需 nasm/cmake；
+#   checkout 后准备 dist/index.html，无需 build-web）。与 app-cli 的 pingap-config 库严格同 rev。
 # - pair-gate：Windows 和既有三个 Unix 随包平台实际执行 app-cli gen-lock，
 #   生成配置喂同版 Pingap -t，验证分发二进制对的 schema 兼容性。
 
@@ -181,11 +181,64 @@ jobs:
           path: crates/app-cli/app-cli-${{ matrix.target }}*
           retention-days: 7
 
+  gate-pingap-applied:
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: "1.98.1"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Resolve the paired exact source pin
+        run: |
+          python3 - <<'PY'
+          import os
+          from tools.build.pingap_identity import source_identity
+          identity = source_identity()
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('PINGAP_REV=' + identity['commit'] + '\n')
+          PY
+      - uses: actions/checkout@v4
+        with:
+          repository: vicanso/pingap
+          ref: ${{ env.PINGAP_REV }}
+          path: .pingap-source
+      - name: Install native build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev pkg-config cmake
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: clippy,rustfmt
+      - name: Apply paired source and provide admin informational page
+        run: |
+          python3 tools/build/pingap-applied/apply.py --source .pingap-source --repo-root .
+          mkdir -p .pingap-source/dist
+          printf '%s\n' '<!doctype html><title>RCoder Pingap JSON API</title>' > .pingap-source/dist/index.html
+      - name: Default feature tests and strict Clippy
+        working-directory: .pingap-source
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked -p pingap --bin pingap --no-fail-fast -- --test-threads=1
+          cargo test --locked -p pingap-cache -p pingap-plugin -p pingap-core -p pingap-proxy --lib --no-fail-fast -- --test-threads=1
+          cargo test --locked -p pingap-config --test applied_digest --features serde_json/preserve_order
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Full feature tests and strict Clippy
+        working-directory: .pingap-source
+        run: |
+          cargo test --locked -p pingap --bin pingap --features full --no-fail-fast -- --test-threads=1
+          cargo test --locked -p pingap -p pingap-cache -p pingap-plugin -p pingap-core -p pingap-proxy --lib --features full --no-fail-fast -- --test-threads=1
+          cargo clippy --locked --workspace --all-targets --features full -- -D warnings
+
   # ── pingap.exe（Windows 专用，随 win32-x64 平台包分发）─────────────────────
   # 上游 pingap 官方无 Windows 产物。构建源 = app-cli Cargo.toml pin 的同一
   # git rev（统一 source_identity，漂移即 fail-fast）。
-  # rustls 变体走 ring（非 aws-lc-sys）→ 只需 protoc + MSVC；checkout 后
-  # 自建 dist/README.md（rust-embed 可编译），无需 node build-web；代价是 admin
+  # rustls 变体使用 aws-lc-sys → protoc + MSVC + nasm/cmake；checkout 后
+  # 自建 dist/index.html（rust-embed 可编译），无需 node build-web；代价是 admin
   # web UI 为占位页（app-cli 只消费 admin JSON API，不受影响）。
   build-pingap-windows:
     needs: meta
@@ -225,25 +278,16 @@ jobs:
         with:
           repository: vicanso/pingap
           ref: ${{ env.PINGAP_REV }}
+          path: .pingap-source
 
-      - name: Verify source and prepare JSON-only admin resources
+      - name: Apply reviewed paired Pingap protocol patch
         shell: bash
-        run: |
-          set -euo pipefail
-          [ "$(git rev-parse HEAD)" = "$PINGAP_REV" ] || { echo "Pingap checkout does not match pin"; exit 1; }
-          python - <<'PY'
-          import os, pathlib, tomllib
-          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
-          if version != os.environ['PINGAP_VERSION_EXPECTED']:
-              raise SystemExit('Pingap source version disagrees with paired pin')
-          pathlib.Path('dist').mkdir(exist_ok=True)
-          pathlib.Path('dist/README.md').write_text('RCoder uses the Pingap admin JSON API; management web UI is not bundled.\n')
-          PY
+        run: python tools/build/pingap-applied/apply.py --source .pingap-source --repo-root .
 
       - name: Install protoc
         shell: bash
         run: |
-          choco install protoc -y --no-progress
+          choco install protoc nasm cmake -y --no-progress
           echo 'C:\ProgramData\chocolatey\bin' >> "$GITHUB_PATH"
 
       # job 环境使上游 checkout 的 toolchain 配置不能覆盖本轮 stable。
@@ -258,14 +302,15 @@ jobs:
       # 省约一半编译时间。上游 profile lto=true + codegen-units=1，构建慢属预期。
       - name: Build pingap (tls-rustls)
         shell: bash
-        run: cargo build --locked --release --no-default-features --features tls-rustls
+        run: python tools/build/pingap-applied/build.py --source .pingap-source --repo-root . --already-applied --tls rustls --output pingap.exe
 
       - name: Smoke test pingap -V
         shell: bash
         run: |
           set -euo pipefail
-          OUT=$(./target/release/pingap.exe -V)
+          OUT=$(./pingap.exe -V)
           echo "$OUT"
+          [ "$(./pingap.exe --apply-protocol-version)" = "1" ]
           # 版本断言：二进制版本必须与 devtool 常量（= pingap-config pin 的 tag）一致
           [ "$OUT" = "pingap $PINGAP_VERSION_EXPECTED" ] || {
             echo "✗ pingap.exe 版本与 pin 的 $PINGAP_VERSION_EXPECTED 不符"; exit 1; }
@@ -274,7 +319,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pingap-x86_64-pc-windows-msvc
-          path: target/release/pingap.exe
+          path: |
+            pingap.exe
+            pingap.exe.applied.json
           retention-days: 7
 
   # ── pingap（Unix 随包）：N04——普通 Mac/Linux 用户仅装包即可运行完整链 ────
@@ -322,20 +369,11 @@ jobs:
         with:
           repository: vicanso/pingap
           ref: ${{ env.PINGAP_REV }}
+          path: .pingap-source
 
-      - name: Verify source and prepare JSON-only admin resources
+      - name: Apply reviewed paired Pingap protocol patch
         shell: bash
-        run: |
-          set -euo pipefail
-          [ "$(git rev-parse HEAD)" = "$PINGAP_REV" ] || { echo "Pingap checkout does not match pin"; exit 1; }
-          python - <<'PY'
-          import os, pathlib, tomllib
-          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
-          if version != os.environ['PINGAP_VERSION_EXPECTED']:
-              raise SystemExit('Pingap source version disagrees with paired pin')
-          pathlib.Path('dist').mkdir(exist_ok=True)
-          pathlib.Path('dist/README.md').write_text('RCoder uses the Pingap admin JSON API; management web UI is not bundled.\n')
-          PY
+        run: python tools/build/pingap-applied/apply.py --source .pingap-source --repo-root .
 
       - name: Install protoc
         if: runner.os == 'Linux'
@@ -368,15 +406,12 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$USE_ZIG" = "true" ]; then
-            cargo zigbuild --locked --release --no-default-features --features tls-rustls --target "${TARGET}.2.17"
-            cp "target/${TARGET}/release/pingap" pingap-out
+            python3 tools/build/pingap-applied/build.py --source .pingap-source --repo-root . --already-applied --tls rustls --target "$TARGET" --zig-glibc 2.17 --output pingap-out
           elif [ "$TARGET" = "x86_64-apple-darwin" ]; then
             rustup target add x86_64-apple-darwin
-            cargo build --locked --release --no-default-features --features tls-rustls --target x86_64-apple-darwin
-            cp target/x86_64-apple-darwin/release/pingap pingap-out
+            python3 tools/build/pingap-applied/build.py --source .pingap-source --repo-root . --already-applied --tls rustls --target "$TARGET" --output pingap-out
           else
-            cargo build --locked --release --no-default-features --features tls-rustls
-            cp target/release/pingap pingap-out
+            python3 tools/build/pingap-applied/build.py --source .pingap-source --repo-root . --already-applied --tls rustls --output pingap-out
           fi
 
       - name: Verify Linux Pingap glibc baseline
@@ -402,19 +437,24 @@ jobs:
           set -euo pipefail
           OUT=$(./pingap-out -V)
           echo "$OUT"
+          [ "$(./pingap-out --apply-protocol-version)" = "1" ]
           [ "$OUT" = "pingap $PINGAP_VERSION_EXPECTED" ] || {
             echo "✗ pingap 版本与 pin 的 $PINGAP_VERSION_EXPECTED 不符"; exit 1; }
 
       # merge-multiple 按文件名合并；artifact 名称不会重命名其中的文件。
       - name: Name binary by target
         shell: bash
-        run: mv pingap-out "pingap-${{ matrix.target }}"
+        run: |
+          mv pingap-out "pingap-${{ matrix.target }}"
+          mv pingap-out.applied.json "pingap-${{ matrix.target }}.applied.json"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: pingap-${{ matrix.target }}
-          path: pingap-${{ matrix.target }}
+          path: |
+            pingap-${{ matrix.target }}
+            pingap-${{ matrix.target }}.applied.json
           if-no-files-found: error
           retention-days: 7
 
@@ -422,7 +462,7 @@ jobs:
   # fixture workspace 跑 gen-lock（纯函数生成配置）→ 提取 pingap.toml →
   # pingap.exe -t 校验。本地（darwin）已验证过该链路，CI 在目标平台复验。
   pair-gate-windows:
-    needs: [meta, build, build-pingap-windows]
+    needs: [meta, build, build-pingap-windows, gate-pingap-applied]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -449,6 +489,8 @@ jobs:
           python - "$PINGAP" <<'PY'
           import subprocess, sys
           from tools.build.pingap_identity import parse_pingap_version, source_identity
+          if subprocess.check_output([sys.argv[1], '--apply-protocol-version'], text=True).strip() != '1':
+              raise SystemExit('Distributed Pingap lacks applied-status protocol 1')
           observed = parse_pingap_version(subprocess.check_output([sys.argv[1], '-V'], text=True))
           if observed != source_identity()['version']:
               raise SystemExit('Distributed Pingap version disagrees with app-cli source')
@@ -465,7 +507,7 @@ jobs:
 
   # Unix 的三个既有随包平台同样验证实际分发的二进制对。
   pair-gate-unix:
-    needs: [meta, build, build-pingap-unix]
+    needs: [meta, build, build-pingap-unix, gate-pingap-applied]
     strategy:
       fail-fast: false
       matrix:
@@ -504,6 +546,8 @@ jobs:
           python - "$PINGAP" <<'PY'
           import subprocess, sys
           from tools.build.pingap_identity import parse_pingap_version, source_identity
+          if subprocess.check_output([sys.argv[1], '--apply-protocol-version'], text=True).strip() != '1':
+              raise SystemExit('Distributed Pingap lacks applied-status protocol 1')
           observed = parse_pingap_version(subprocess.check_output([sys.argv[1], '-V'], text=True))
           if observed != source_identity()['version']:
               raise SystemExit('Distributed Pingap version disagrees with app-cli source')
@@ -575,6 +619,10 @@ jobs:
           # win32 包双件套：app-cli.exe + 自建 pingap.exe（serve 反代依赖）
           cp dist/app-cli-x86_64-pc-windows-msvc.exe npm/app-cli-windows-x64/app-cli.exe
           cp dist/pingap.exe                          npm/app-cli-windows-x64/pingap.exe
+          cp dist/pingap-x86_64-apple-darwin.applied.json npm/app-cli-darwin-x64/pingap.applied.json
+          cp dist/pingap-aarch64-apple-darwin.applied.json npm/app-cli-darwin-arm64/pingap.applied.json
+          cp dist/pingap-x86_64-unknown-linux-gnu.applied.json npm/app-cli-linux-x64/pingap.applied.json
+          cp dist/pingap.exe.applied.json              npm/app-cli-windows-x64/pingap.exe.applied.json
           chmod +x npm/app-cli-*/app-cli npm/app-cli-*/pingap npm/app-cli-windows-x64/*.exe
 
           # 冒烟：runner(x64 linux, glibc ≥ 2.17) 直接跑二进制验证可执行
@@ -636,3 +684,7 @@ jobs:
             dist/pingap-x86_64-apple-darwin
             dist/pingap-aarch64-apple-darwin
             dist/pingap-x86_64-unknown-linux-gnu
+            dist/pingap.exe.applied.json
+            dist/pingap-x86_64-apple-darwin.applied.json
+            dist/pingap-aarch64-apple-darwin.applied.json
+            dist/pingap-x86_64-unknown-linux-gnu.applied.json

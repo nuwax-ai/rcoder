@@ -41,6 +41,27 @@ fn main() -> Result<()> {
 }
 async fn run() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|a| a == "--resident-owner") {
+        return resident_owner(PathBuf::from(
+            args.get(1).context("resident owner root missing")?,
+        ))
+        .await;
+    }
+    if args.first().is_some_and(|a| a == "--output-flood") {
+        use std::io::Write;
+        let chunk = vec![b'x'; 8192];
+        let mut out = std::io::stdout().lock();
+        let mut err = std::io::stderr().lock();
+        for _ in 0..256 {
+            out.write_all(&chunk)?;
+            err.write_all(&chunk)?;
+        }
+        std::fs::write(
+            PathBuf::from(args.get(1).context("output marker missing")?),
+            "drained",
+        )?;
+        return Ok(());
+    }
     if args.first().is_some_and(|a| a == "--cleanup") {
         let _cleanup = runtime_supervisor::verify_cleanup_callback()?;
         let scope = PathBuf::from(args.get(1).context("cleanup scope missing")?);
@@ -120,5 +141,109 @@ async fn run() -> Result<()> {
     });
     let code = owner.run(options).await?;
     anyhow::ensure!(code == 0, "fixture exit {code}");
+    Ok(())
+}
+
+struct ResidentCleanup {
+    scope: runtime_supervisor::ResidentScope,
+    child: Arc<tokio::sync::Mutex<process_utils::guardian::OwnedChild>>,
+    root: PathBuf,
+}
+#[async_trait::async_trait]
+impl runtime_supervisor::OwnerCleanup for ResidentCleanup {
+    async fn shutdown(&self) -> Result<()> {
+        self.scope.close()?;
+        if self.root.join("pause-resident-cleanup").exists() {
+            self.scope
+                .record_unknown("fixture owner cleanup intentionally paused")?;
+            anyhow::bail!("fixture owner cleanup intentionally paused");
+        }
+        let outcome = self
+            .child
+            .lock()
+            .await
+            .stop(Duration::from_millis(100))
+            .await;
+        anyhow::ensure!(
+            outcome != process_utils::managed_tree::StopOutcome::Unconfirmed,
+            "fixture resident cleanup unknown"
+        );
+        self.scope.record_quiescent()
+    }
+}
+
+async fn resident_owner(root: PathBuf) -> Result<()> {
+    use runtime_supervisor::{Binding, BusinessRun, OwnerSession, SessionOptions};
+    let owner = Owner::try_acquire(&root)?.context("resident fixture owner already active")?;
+    let binding = Binding {
+        component: "resident-fixture".into(),
+        resource: std::fs::canonicalize(&root)?,
+    };
+    let session = Arc::new(
+        OwnerSession::start(
+            owner,
+            SessionOptions {
+                binding,
+                policy: runtime_supervisor::Policy::default(),
+                cleanup_adapter: None,
+                restart_on_exit: true,
+                shutdown: CancellationToken::new(),
+            },
+        )
+        .await?,
+    );
+    let scope = session.resident_scope("fixture-app").await?;
+    anyhow::ensure!(
+        session.resident_scope("foreign-app").await.is_err(),
+        "foreign application acquired resident"
+    );
+    let mut command = tokio::process::Command::new(std::env::current_exe()?);
+    command.arg("--leaf").arg(root.join("resident-address"));
+    let child = process_utils::guardian::spawn_guarded_owner(command, &scope, false).await?;
+    std::fs::write(
+        root.join("resident-pid"),
+        child.id().context("resident PID missing")?.to_string(),
+    )?;
+    let child = Arc::new(tokio::sync::Mutex::new(child));
+    session.set_owner_cleanup(Arc::new(ResidentCleanup {
+        scope: scope.clone(),
+        child,
+        root: root.clone(),
+    }))?;
+    let business_session = session.clone();
+    let code = session
+        .run(Box::new(move |launch| {
+            let token = CancellationToken::new();
+            let control = Arc::new(Adapter {
+                scope: root.clone(),
+                cancel: token.clone(),
+            });
+            let ready = business_session.ready_guard(&launch.generation);
+            let resident_scope = scope.clone();
+            let root = root.clone();
+            Ok(BusinessRun {
+                control,
+                end: Box::pin(async move {
+                    // Exercise resident registration while business current_scope is
+                    // installed, including flood output inherited instead of piped.
+                    let mut probe = tokio::process::Command::new(std::env::current_exe()?);
+                    probe.arg("--output-flood").arg(root.join("flood-complete"));
+                    let mut probe =
+                        process_utils::guardian::spawn_guarded_owner(probe, &resident_scope, false)
+                            .await?;
+                    tokio::time::timeout(Duration::from_secs(10), probe.wait_root()).await??;
+                    anyhow::ensure!(
+                        probe.stop(Duration::ZERO).await
+                            != process_utils::managed_tree::StopOutcome::Unconfirmed,
+                        "output flood guardian unconfirmed"
+                    );
+                    ready.mark_ready()?;
+                    token.cancelled().await;
+                    Ok(None)
+                }),
+            })
+        }))
+        .await?;
+    anyhow::ensure!(code == 0, "resident fixture owner exit {code}");
     Ok(())
 }

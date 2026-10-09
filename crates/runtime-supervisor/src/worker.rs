@@ -15,6 +15,19 @@ use tokio::net::TcpListener;
 #[async_trait::async_trait]
 pub trait WorkerControl: Send + Sync + 'static {
     async fn probe(&self) -> Result<()>;
+    /// Reversible drain before native StopWork/Recover closes admission or
+    /// cancels the business. Owner Shutdown deliberately bypasses this check.
+    async fn prepare_stop(&self, _deadline: tokio::time::Instant) -> Result<()> {
+        Ok(())
+    }
+    fn stop_error_is_uncertain(&self, error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+    }
+    fn stop_prepare_budget(&self) -> Duration {
+        self.shutdown_grace()
+    }
     async fn shutdown(&self) -> Result<()>;
     /// Management initialization/cleanup readiness, never business readiness.
     fn ready(&self) -> bool {

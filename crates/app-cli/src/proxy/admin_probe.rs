@@ -42,16 +42,16 @@ pub struct AdminEndpoint {
 
 static ADMIN_ENDPOINT: OnceLock<AdminEndpoint> = OnceLock::new();
 
-/// 解析 admin 端口：env `APP_CLI_PINGAP_ADMIN_PORT` 覆盖，非法值退回默认。
-pub fn admin_port() -> u16 {
+/// Explicit invalid configuration is never silently replaced by another port.
+pub fn admin_port() -> Result<u16> {
     match std::env::var(ADMIN_PORT_ENV) {
-        Ok(value) => value.parse().unwrap_or_else(|_| {
-            tracing::warn!(
-                "⚠️  invalid {ADMIN_PORT_ENV}={value}, falling back to {DEFAULT_ADMIN_PORT}"
-            );
-            DEFAULT_ADMIN_PORT
-        }),
-        Err(_) => DEFAULT_ADMIN_PORT,
+        Ok(value) => {
+            let port = value.parse::<u16>().context("invalid proxy admin port")?;
+            anyhow::ensure!(port != 0, "proxy admin port must not be zero");
+            Ok(port)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_ADMIN_PORT),
+        Err(error) => Err(error).context("read proxy admin port"),
     }
 }
 
@@ -73,75 +73,128 @@ pub fn register_admin_endpoint(
 ///（standby 确认/hash 确认）；无常驻 spec 时生成随机凭证并注册（后续调用
 /// 复用，凭证生命周期绑定 app-cli 进程——supervisord 托管下 pingap program
 /// 崩溃重启由 supervisord 用同一 spec/凭证拉起，probe 侧无需刷新）。
-pub fn ensure_admin_endpoint() -> &'static AdminEndpoint {
-    ADMIN_ENDPOINT.get_or_init(|| {
-        if let Some(endpoint) = endpoint_from_resident_spec() {
+pub fn ensure_admin_endpoint() -> Result<&'static AdminEndpoint> {
+    if let Some(endpoint) = ADMIN_ENDPOINT.get() {
+        validate_endpoint(endpoint)?;
+        return Ok(endpoint);
+    }
+    let endpoint = match endpoint_from_resident_spec()? {
+        Some(endpoint) => {
             tracing::info!(
                 addr = %endpoint.addr,
                 "admin endpoint inherited from resident pingap spec"
             );
-            return endpoint;
+            endpoint
         }
-        let user = uuid::Uuid::new_v4().simple().to_string();
-        let password = uuid::Uuid::new_v4().simple().to_string();
-        AdminEndpoint {
-            addr: format!("127.0.0.1:{}", admin_port()),
-            user,
-            password,
+        None => {
+            let user = uuid::Uuid::new_v4().simple().to_string();
+            let password = uuid::Uuid::new_v4().simple().to_string();
+            AdminEndpoint {
+                addr: format!("127.0.0.1:{}", admin_port()?),
+                user,
+                password,
+            }
         }
-    })
+    };
+    validate_endpoint(&endpoint)?;
+    Ok(ADMIN_ENDPOINT.get_or_init(|| endpoint))
 }
 
 /// 常驻 spec（`resident/pingap.toml`，0600）中的 admin 凭证恢复。
 /// 解析失败/文件缺失返回 None（生成新凭证——后续首个常驻编排会覆写 spec）。
-fn endpoint_from_resident_spec() -> Option<AdminEndpoint> {
-    for release_id in spec_candidate_directories() {
-        let Ok(spec) = crate::svc_spec::ServiceSpecFile::load(&release_id, "pingap") else {
-            continue;
-        };
-        if let Some(endpoint) = endpoint_from_spec_env(&spec.env) {
-            return Some(endpoint);
-        }
+fn endpoint_from_resident_spec() -> Result<Option<AdminEndpoint>> {
+    let path = crate::svc_spec::spec_root()
+        .join(crate::svc_spec::RESIDENT_SPEC_ID)
+        .join("pingap.toml");
+    match std::fs::metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("observe resident proxy credential record"),
+        Ok(metadata) => anyhow::ensure!(metadata.is_file(), "resident proxy record is not a file"),
     }
-    None
+    let spec = crate::svc_spec::ServiceSpecFile::load(crate::svc_spec::RESIDENT_SPEC_ID, "pingap")?;
+    verify_proxy_spec(&spec)?;
+    endpoint_from_spec_env(&spec.env).map(Some)
 }
 
 /// 凭证候选目录（C3 迁移：resident 优先；缺失时任意代际的
 /// `*/pingap.toml` 同含 admin 凭证——同容器旧版升级后存活的 pingap 仍持
 /// 旧代凭证，新 owner 必须恢复同一组）。字典序确定遍历。
-fn spec_candidate_directories() -> Vec<String> {
-    let root = crate::svc_spec::spec_root();
-    let mut names: Vec<String> = std::fs::read_dir(&root)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|entry| {
-                    entry
-                        .file_type()
-                        .ok()
-                        .filter(|kind| kind.is_dir())
-                        .map(|_| entry.file_name().to_string_lossy().into_owned())
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    names.sort();
-    names.retain(|name| name != crate::svc_spec::RESIDENT_SPEC_ID);
-    names.insert(0, crate::svc_spec::RESIDENT_SPEC_ID.to_string());
-    names
+fn verify_proxy_spec(spec: &crate::svc_spec::ServiceSpecFile) -> Result<()> {
+    anyhow::ensure!(
+        spec.service_id == "pingap" && spec.port.is_none(),
+        "not a platform proxy credential record"
+    );
+    let binary = spec.argv.first().context("proxy spec executable missing")?;
+    anyhow::ensure!(
+        std::path::Path::new(binary)
+            .file_name()
+            .is_some_and(|name| name == "pingap" || name == "pingap.exe"),
+        "credential record belongs to a business command"
+    );
+    anyhow::ensure!(
+        spec.argv.len() == 4
+            && spec.argv[1] == "-c"
+            && spec.argv[3] == "--autoreload"
+            && std::path::Path::new(&spec.argv[2]).is_absolute(),
+        "proxy specification command does not match its launch contract"
+    );
+    Ok(())
 }
 
 fn endpoint_from_spec_env(
     env: &std::collections::BTreeMap<String, String>,
-) -> Option<AdminEndpoint> {
-    let addr = env.get("PINGAP_ADMIN_ADDR")?;
-    let user = env.get("PINGAP_ADMIN_USER")?;
-    let password = env.get("PINGAP_ADMIN_PASSWORD")?;
-    Some(AdminEndpoint {
+) -> Result<AdminEndpoint> {
+    let addr = env
+        .get("PINGAP_ADMIN_ADDR")
+        .context("proxy credential address missing")?;
+    let user = env
+        .get("PINGAP_ADMIN_USER")
+        .context("proxy credential user missing")?;
+    let password = env
+        .get("PINGAP_ADMIN_PASSWORD")
+        .context("proxy credential password missing")?;
+    let endpoint = AdminEndpoint {
         addr: addr.clone(),
         user: user.clone(),
         password: password.clone(),
-    })
+    };
+    validate_endpoint(&endpoint)?;
+    Ok(endpoint)
+}
+
+fn validate_endpoint(endpoint: &AdminEndpoint) -> Result<()> {
+    let address: std::net::SocketAddr = endpoint
+        .addr
+        .parse()
+        .context("invalid proxy admin socket address")?;
+    anyhow::ensure!(
+        address.ip().is_loopback() && address.port() != 0,
+        "proxy admin must bind a loopback socket"
+    );
+    anyhow::ensure!(
+        !endpoint.user.is_empty() && !endpoint.password.is_empty(),
+        "proxy admin requires nonempty credentials"
+    );
+    Ok(())
+}
+
+/// Called only after the host has bound the legacy program PID/start/argv to
+/// this exact spec. Directory order and business service names grant no trust.
+pub(crate) fn register_verified_legacy_endpoint(
+    spec: &crate::svc_spec::ServiceSpecFile,
+) -> Result<&'static AdminEndpoint> {
+    verify_proxy_spec(spec)?;
+    let endpoint = endpoint_from_spec_env(&spec.env)?;
+    if let Some(existing) = ADMIN_ENDPOINT.get() {
+        anyhow::ensure!(
+            existing.addr == endpoint.addr
+                && existing.user == endpoint.user
+                && existing.password == endpoint.password,
+            "proxy credentials changed during owner lifetime"
+        );
+        return Ok(existing);
+    }
+    Ok(ADMIN_ENDPOINT.get_or_init(|| endpoint))
 }
 
 pub fn admin_endpoint() -> Option<&'static AdminEndpoint> {
@@ -261,8 +314,158 @@ pub async fn fetch_config_hash(addr: &str, user: &str, password: &str) -> Result
     fetch_with_client(&client, addr, user, password).await
 }
 
+pub async fn fetch_apply_status(
+    endpoint: &AdminEndpoint,
+) -> Result<super::apply_status::ApplyStatus> {
+    validate_endpoint(endpoint)?;
+    let client = build_probe_client()?;
+    fetch_application(&client, endpoint).await
+}
+
+async fn fetch_application(
+    client: &reqwest::Client,
+    endpoint: &AdminEndpoint,
+) -> Result<super::apply_status::ApplyStatus> {
+    let url = format!("http://{}/api/apply-status", endpoint.addr);
+    let response = client
+        .get(&url)
+        .header(
+            "Authorization",
+            authorization_header(&endpoint.user, &endpoint.password, now_unix_seconds()?),
+        )
+        .send()
+        .await
+        .context("read proxy application result")?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "proxy does not provide an authenticated application result (HTTP {})",
+        response.status()
+    );
+    let bytes = response
+        .bytes()
+        .await
+        .context("read proxy application result body")?;
+    serde_json::from_slice(&bytes).context("decode proxy application result")
+}
+
+/// One total deadline covers the application result and every listener probe.
+/// The hash is only a consistency field; an Applied graph, UUID and process
+/// identity must match before the data plane can confirm this operation.
+pub async fn wait_for_publication(
+    endpoint: &AdminEndpoint,
+    expected: &super::compiler::CompileOutcome,
+    budget: Duration,
+) -> Result<super::apply_status::ConfirmedPublication> {
+    validate_endpoint(endpoint)?;
+    let deadline = tokio::time::Instant::now() + budget;
+    let client = build_probe_client()?;
+    let mut instance: Option<(u32, String)> = None;
+    let mut last = "publication has not been observed".to_string();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "proxy publication {} was not confirmed: {last}",
+                expected.publication_id
+            );
+        }
+        let observed =
+            match tokio::time::timeout_at(deadline, fetch_application(&client, endpoint)).await {
+                Ok(Ok(observed)) => observed,
+                Ok(Err(error)) => {
+                    last = format!("{error:#}");
+                    tokio::time::sleep(PROBE_INTERVAL.min(remaining)).await;
+                    continue;
+                }
+                Err(_) => anyhow::bail!(
+                    "proxy publication observation exceeded its total deadline: {last}"
+                ),
+            };
+        let current = (observed.process_id, observed.process_instance_id.clone());
+        if let Some(ref first) = instance {
+            anyhow::ensure!(
+                *first == current,
+                "proxy instance changed while confirming publication"
+            );
+        } else {
+            instance = Some(current);
+        }
+        if let Some(confirmed) = observed.confirmed(expected)? {
+            for target in &expected.entry_probes {
+                let url = format!("http://{}/_pub/{}", target.address, expected.publication_id);
+                let response = tokio::time::timeout_at(deadline, client.get(&url).send())
+                    .await
+                    .context("proxy listener verification deadline exhausted")?
+                    .with_context(|| format!("verify proxy listener {}", target.address))?;
+                anyhow::ensure!(
+                    response.status().as_u16() == target.expected_status,
+                    "proxy publication listener status mismatch"
+                );
+                anyhow::ensure!(
+                    response
+                        .headers()
+                        .get("X-Rcoder-Publication")
+                        .and_then(|value| value.to_str().ok())
+                        == Some(&expected.publication_id),
+                    "proxy listener returned another publication"
+                );
+                let bytes = tokio::time::timeout_at(deadline, response.bytes())
+                    .await
+                    .context("proxy publication body deadline exhausted")??;
+                anyhow::ensure!(
+                    bytes.as_ref() == expected.publication_id.as_bytes(),
+                    "proxy listener did not execute this publication marker"
+                );
+            }
+            // A marker can execute while a declared backend is unavailable.
+            // Serving confirmation requires the release's real HTTP contract.
+            for target in &expected.business_probes {
+                let url = format!("http://{}{}", target.address, target.path);
+                let response = tokio::time::timeout_at(deadline, client.get(&url).send())
+                    .await
+                    .context("business HTTP verification deadline exhausted")?
+                    .with_context(|| format!("verify business service {}", target.service_id))?;
+                anyhow::ensure!(
+                    response.status().is_success(),
+                    "business service {} failed its HTTP contract (HTTP {})",
+                    target.service_id,
+                    response.status()
+                );
+            }
+            // A listener marker cannot authorize a response from another process
+            // that replaced the authenticated admin during the HTTP observations.
+            let after = tokio::time::timeout_at(deadline, fetch_application(&client, endpoint))
+                .await
+                .context("proxy final application observation deadline exhausted")??;
+            anyhow::ensure!(
+                after.process_id == confirmed.process_id
+                    && after.process_instance_id == confirmed.instance_id,
+                "proxy instance changed after listener verification"
+            );
+            anyhow::ensure!(
+                after.confirmed(expected)?.is_some(),
+                "proxy application changed after listener verification"
+            );
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "proxy confirmation completed after its deadline"
+            );
+            return Ok(confirmed);
+        }
+        last = "current Applied graph belongs to another publication".into();
+        tokio::time::sleep(
+            PROBE_INTERVAL.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+        )
+        .await;
+    }
+}
+
 fn build_probe_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
+        // Credentials and local observations must never use OS/environment
+        // proxies. Discovering a system proxy also consumes the local deadline.
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .build()
@@ -350,13 +553,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("APP_CLI_SPEC_DIR", dir.path()) };
         // 无常驻 spec：恢复 None（走生成路径）
-        assert!(endpoint_from_resident_spec().is_none());
+        assert!(endpoint_from_resident_spec().unwrap().is_none());
 
         let spec = crate::svc_spec::ServiceSpecFile {
             release_id: crate::svc_spec::RESIDENT_SPEC_ID.into(),
             service_id: "pingap".into(),
             cwd: "/".into(),
-            argv: vec!["pingap".into()],
+            argv: vec![
+                "/usr/local/bin/pingap".into(),
+                "-c".into(),
+                "/app/logs/pingap/active/pingap.toml".into(),
+                "--autoreload".into(),
+            ],
             env: [
                 (
                     "PINGAP_ADMIN_ADDR".to_string(),
@@ -370,7 +578,9 @@ mod tests {
             port: None,
         };
         spec.write().unwrap();
-        let endpoint = endpoint_from_resident_spec().expect("recover from resident spec");
+        let endpoint = endpoint_from_resident_spec()
+            .unwrap()
+            .expect("recover from resident spec");
         assert_eq!(endpoint.addr, "127.0.0.1:19086");
         assert_eq!(endpoint.user, "u-prev");
         assert_eq!(endpoint.password, "p-prev");

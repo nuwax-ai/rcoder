@@ -24,7 +24,7 @@ WORKDIR /build
 RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
         --source mirrors.aliyun.com --protocol https --use-intranet-source false \
         --install-epel false --backup false --upgrade-software false --clean-cache true --ignore-backup-tips && \
-    apt-get update && apt-get install -y --no-install-recommends cmake libclang-dev protobuf-compiler && rm -rf /var/lib/apt/lists/*
+    apt-get update && apt-get install -y --no-install-recommends cmake libclang-dev protobuf-compiler python3 git pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 COPY --from=rcoder / .
 ARG RCODER_SOURCE_COMMIT
 ARG RCODER_SOURCE_BRANCH
@@ -34,6 +34,9 @@ ARG RCODER_SOURCE_BRANCH
 RUN rm -f rust-toolchain.toml
 # 配置 cargo 源(国内 rsproxy 加速)。文件在 .cargo/config.toml,查阅/修改方便。
 COPY .cargo/config.toml /usr/local/cargo/config.toml
+# 同 exact pin + reviewed patch 构建配对 Applied 协议 binary；旧官方资产保留在 base。
+RUN CARGO_BUILD_JOBS=2 python3 tools/build/pingap-applied/build.py --fetch --source /build/pingap-applied-source \
+    --repo-root /build --full --output /build/pingap-applied/pingap
 RUN cd crates/app-cli && cargo build --release
 # 容器内文件服务单件（RBD 卷形态·容器中心化，file-server-proxy 0.2.0 起）：file-server-proxy
 # default feature 自带 file-server lib 进程内直连（60000 AllRust，无独立 8086 进程/端口）。
@@ -77,3 +80,9 @@ ENV DBX_WEB_URL=http://localhost:4224
 # 空值=多 app 开发语义，无害。
 COPY --from=app-cli-builder /build/crates/app-cli/target/release/app-cli /usr/local/bin/app-cli
 COPY --from=app-cli-builder /build/target/release/file-server-proxy /usr/local/bin/file-server-proxy
+
+# 最终覆盖必须是配对 Applied binary；此 hash/provenance 与官方 release catalog 分开。
+COPY --from=app-cli-builder /build/pingap-applied/pingap /usr/local/bin/pingap
+COPY --from=app-cli-builder /build/pingap-applied/pingap.applied.json /usr/local/share/rcoder/pingap-applied.json
+RUN test "$(/usr/local/bin/pingap --apply-protocol-version)" = "1" && \
+    test "$(/usr/local/bin/pingap -V)" = "pingap ${PINGAP_VERSION}"

@@ -2,6 +2,9 @@
 //! protocol stand-in; this does not validate Pingap routing, containers or AI.
 #![cfg(unix)]
 
+#[path = "fixtures/protocol_support.rs"]
+mod protocol_support;
+
 use serde_json::{Value, json};
 use std::{
     path::PathBuf,
@@ -27,14 +30,7 @@ impl Fixture {
         let source = directory.path().canonicalize().unwrap().join(&app);
         let state = directory.path().join("state").join(&app);
         std::fs::create_dir_all(source.join("web")).unwrap();
-        let pingap = source.join("protocol-pingap");
-        std::fs::write(
-            &pingap,
-            "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = -t ] && exit 0; done\nexec sleep 300\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&pingap, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pingap = protocol_support::write_pingap(&source);
         let fixture = Self {
             _directory: directory,
             source,
@@ -81,9 +77,10 @@ impl Fixture {
     fn write_manifests(&self, command: toml::Value, name: &str, startup_timeout: u64) {
         std::fs::write(
             self.source.join("workspace.manifest.toml"),
-            "schema_version=1\n[workspace]\nname='run-source-owner'\n",
+            "schema_version=1\n[workspace]\nname='run-source-owner'\n[pingap]\nmode='custom'\nconfig='protocol-listener.toml'\n",
         )
         .unwrap();
+        protocol_support::write_listener_override(&self.source, &self.app);
         std::fs::write(self.source.join("web/project.manifest.toml"), format!("schema_version=1\n[project]\nservice_id={:?}\nname='{name}'\ntype='rust'\n[build]\ncommand=['true']\nartifact='unused.zip'\n[run]\ncommand={command}\nshutdown_timeout_seconds=3\n[devrun]\ncommand={command}\n[health]\nstartup_timeout_seconds={startup_timeout}\nreadiness_path='/'\n[proxy]\npath='/'\n", self.app)).unwrap();
     }
 
@@ -124,8 +121,11 @@ impl Fixture {
             command.env_remove(key);
         }
         command.env("PROJECT_ID", &self.app).env("APP_CLI_STATE_ROOT", &self.state)
-            .env("APP_CLI_REQUIRE_PG", "0").env("APP_CLI_SKIP_PINGAP_CONFIRM", "1")
-            .env("APP_CLI_PINGAP_RUNTIME_DIR", self.source.join("pingap-runtime"))
+            .env("APP_CLI_REQUIRE_PG", "0")
+            .env("PROTOCOL_PROXY_PID_FILE", self.source.join("proxy-process.json"))
+            .env("PROTOCOL_PROXY_ADMIN_FAULT", self.source.join("proxy-admin-fault"))
+            .env("APP_CLI_PINGAP_ADMIN_PORT", protocol_support::reserve_port().to_string())
+        .env("APP_CLI_PINGAP_RUNTIME_DIR", self.source.join("pingap-runtime"))
             .env("APP_CLI_RUN_PROFILE", "dev").env("RCODER_PINGAP_VERSION", "0.14.3")
             .env("RCODER_PINGAP_COMMIT", "cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8")
             .env("RCODER_RUNTIME_IMAGE_DIGEST", "native-test-fixture")
@@ -612,6 +612,10 @@ async fn environment_artifact_run_preserves_original_ids_and_replays_without_exe
         (
             "web/project.manifest.toml",
             std::fs::read_to_string(fixture.source.join("web/project.manifest.toml")).unwrap(),
+        ),
+        (
+            "protocol-listener.toml",
+            std::fs::read_to_string(fixture.source.join("protocol-listener.toml")).unwrap(),
         ),
         ("web/artifact-receipt", built_release.clone()),
     ] {
@@ -1448,4 +1452,147 @@ async fn stop_before_commit_yields_single_failure_done() {
         "the cancelled foreground Start must exit nonzero: {final_view}, exit {exit}"
     );
     fixture.same_owner(&client, &base, &identity, &native).await;
+}
+
+/// Real owner/guardian/Child lifecycle with an explicit protocol stand-in.
+/// Applied/route engine correctness remains a separate paired Pingap gate.
+#[tokio::test]
+async fn resident_exact_kill_recovers_latest_confirmed_graph_without_owner_requests() {
+    let mut fixture = Fixture::new();
+    assert!(
+        fixture
+            .command("gen-lock", "resident-gen-lock")
+            .status()
+            .unwrap()
+            .success()
+    );
+    fixture.spawn_run("resident-first");
+    let client = client();
+    let (base, identity, native) = fixture.ready(&client).await;
+    fixture.http(&client, "first").await;
+    let source_config = pingap_config::PingapConfig::new(
+        &std::fs::read(fixture.source.join("protocol-listener.toml")).unwrap(),
+        true,
+    )
+    .unwrap();
+    let address = source_config.servers["app"]
+        .addr
+        .split(',')
+        .next_back()
+        .unwrap()
+        .trim()
+        .to_string();
+    let entry = format!("http://{address}/");
+    let pid_file = fixture.source.join("proxy-process.json");
+    let active = fixture.source.join("pingap-runtime/active/pingap.toml");
+
+    async fn wait_entry(client: &reqwest::Client, entry: &str, expected: &str) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Ok(response) = client.get(entry).send().await
+                    && let Ok(body) = response.text().await
+                    && body == expected
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        })
+        .await
+        .expect("protocol proxy did not forward the current real backend");
+    }
+    wait_entry(&client, &entry, "first").await;
+    let first: Value = serde_json::from_slice(&std::fs::read(&pid_file).unwrap()).unwrap();
+    let first_pid = first["pid"].as_u64().unwrap();
+    assert!(first_pid > 1);
+
+    fixture.manifests("latest");
+    fixture
+        .operation(&client, &base, &identity, "restart")
+        .await;
+    fixture.http(&client, "latest").await;
+    wait_entry(&client, &entry, "latest").await;
+    let before: Value = serde_json::from_slice(&std::fs::read(&pid_file).unwrap()).unwrap();
+    assert_eq!(
+        before["pid"].as_u64(),
+        Some(first_pid),
+        "business Restart replaced resident"
+    );
+    let confirmed_graph = std::fs::read(&active).unwrap();
+
+    // Admin failures cannot authorize a duplicate spawn or discard a live Child.
+    std::fs::write(fixture.source.join("proxy-admin-fault"), "401").unwrap();
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    wait_entry(&client, &entry, "latest").await;
+    let during_fault: Value = serde_json::from_slice(&std::fs::read(&pid_file).unwrap()).unwrap();
+    assert_eq!(
+        during_fault["pid"], before["pid"],
+        "admin 401 caused a respawn"
+    );
+    std::fs::remove_file(fixture.source.join("proxy-admin-fault")).unwrap();
+
+    // Match the fixture's diagnostic PID to this exact owner resident receipt
+    // before using a signal as test fault injection.
+    let guardians = fixture
+        .state
+        .join("resident")
+        .join(&native.supervisor_id)
+        .join("guardians");
+    assert!(
+        std::fs::read_dir(guardians).unwrap().any(|entry| {
+            let path = entry.unwrap().path().join("receipt.json");
+            let receipt: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            receipt["diagnostic_pid"].as_u64() == Some(first_pid)
+                && receipt["resident_identity"]["application_id"] == fixture.app
+                && receipt["resident_identity"]["owner_instance"] == native.supervisor_id
+        }),
+        "target PID was not registered under the captured owner resident domain"
+    );
+    assert!(
+        Command::new("kill")
+            .args(["-KILL", &first_pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Only filesystem/public entry observations follow the kill. No management
+    // request can trigger ensure_resident and hide a missing death watchdog.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(bytes) = std::fs::read(&pid_file)
+                && let Ok(proxy) = serde_json::from_slice::<Value>(&bytes)
+                && proxy["pid"].as_u64().is_some_and(|pid| pid != first_pid)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .expect("precise resident death was not recovered without owner requests");
+    wait_entry(&client, &entry, "latest").await;
+    assert_eq!(
+        std::fs::read(&active).unwrap(),
+        confirmed_graph,
+        "watchdog restored a stale or unconfirmed candidate"
+    );
+    let after: Value = serde_json::from_slice(&std::fs::read(&pid_file).unwrap()).unwrap();
+    assert_ne!(
+        after["instance"], before["instance"],
+        "new Child reused the old process nonce"
+    );
+    fixture.same_owner(&client, &base, &identity, &native).await;
+    fixture.operation(&client, &base, &identity, "stop").await;
+    let response = client.get(&entry).send().await.unwrap();
+    assert_eq!(
+        response.status().as_u16(),
+        503,
+        "normal Stop left a business route"
+    );
+    let stopped: Value = serde_json::from_slice(&std::fs::read(&pid_file).unwrap()).unwrap();
+    assert_eq!(
+        stopped["pid"], after["pid"],
+        "normal Stop killed resident instead of preserving standby"
+    );
 }

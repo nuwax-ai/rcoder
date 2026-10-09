@@ -6,6 +6,9 @@
 //!    绝不出现"瞬时 completed 而无执行证据"。
 #![cfg(unix)]
 
+#[path = "fixtures/protocol_support.rs"]
+mod protocol_support;
+
 use std::{
     net::TcpListener,
     path::Path,
@@ -29,7 +32,7 @@ fn failing_workspace(root: &Path) -> std::path::PathBuf {
     std::fs::create_dir_all(workspace.join("svc")).expect("svc dir");
     std::fs::write(
         workspace.join("workspace.manifest.toml"),
-        "schema_version = 1\n\n[workspace]\nname = \"retry-probe\"\n",
+        "schema_version = 1\n\n[workspace]\nname = \"retry-probe\"\n[pingap]\nmode='custom'\nconfig='protocol-listener.toml'\n",
     )
     .expect("ws manifest");
     std::fs::write(
@@ -37,6 +40,7 @@ fn failing_workspace(root: &Path) -> std::path::PathBuf {
         "schema_version = 1\n\n[project]\nservice_id = \"svc\"\nname = \"Failing\"\ntype = \"node\"\nkind = \"web\"\nenabled = true\n\n[build]\ncommand = [\"true\"]\nartifact = \"out.txt\"\n\n[run]\ncommand = [\"/bin/sh\", \"-c\", \"exit 7\"]\n\n[health]\nstartup_timeout_seconds = 1\nreadiness_path = \"/ready\"\n\n[proxy]\npath = \"/api/svc/\"\nstrip_prefix = true\n",
     )
     .expect("svc manifest");
+    protocol_support::write_listener_override(&workspace, "svc");
     workspace
 }
 
@@ -44,14 +48,7 @@ fn spawn_owner(workspace: &Path, logs: &Path, token: &str) -> (OwnedServer, Stri
     let listener = TcpListener::bind("127.0.0.1:0").expect("reserve admin");
     let address = listener.local_addr().expect("test address");
     drop(listener);
-    let pingap = logs.join("fake-pingap");
-    std::fs::write(
-        &pingap,
-        "#!/bin/sh\nfor arg in \"$@\"; do [ \"$arg\" = -t ] && exit 0; done\nexec sleep 300\n",
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&pingap, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let pingap = protocol_support::write_pingap(logs);
     let child = Command::new(env!("CARGO_BIN_EXE_app-cli"))
         .args([
             "serve",
@@ -64,8 +61,11 @@ fn spawn_owner(workspace: &Path, logs: &Path, token: &str) -> (OwnedServer, Stri
         ])
         .arg("--pingap-bin")
         .arg(&pingap)
+        .env(
+            "APP_CLI_PINGAP_ADMIN_PORT",
+            protocol_support::reserve_port().to_string(),
+        )
         .env("APP_CLI_PINGAP_RUNTIME_DIR", logs.join("pingap-runtime"))
-        .env("APP_CLI_SKIP_PINGAP_CONFIRM", "1")
         .env("APP_CLI_DEPLOY_TOKEN", token)
         .env("RUST_LOG", "info")
         .stderr(Stdio::from(
@@ -220,26 +220,47 @@ async fn poll_terminal(
     }
 }
 
-async fn event_count(base: &str, token: &str, operation_id: &str) -> usize {
+async fn terminal_event_count(base: &str, token: &str, operation_id: &str) -> usize {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(800))
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
         .build()
         .unwrap();
-    let Ok(response) = client
-        .get(format!(
-            "{base}/v1/runtime/operations/{operation_id}/events"
-        ))
-        .header("x-deploy-token", token)
-        .send()
-        .await
-    else {
-        return 0;
-    };
-    let value: serde_json::Value = response.json().await.unwrap_or_default();
-    value["data"]["events"]
-        .as_array()
-        .map(|events| events.len())
-        .unwrap_or(0)
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let response = client
+            .get(format!(
+                "{base}/v1/runtime/operations/{operation_id}/events"
+            ))
+            .header("x-deploy-token", token)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let value: serde_json::Value = response.json().await.unwrap();
+        let events = value["data"]["events"]
+            .as_array()
+            .expect("runtime events array");
+        // Operation persistence precedes its terminal event append. Wait for the
+        // stream's actual closure before asserting that replay adds nothing.
+        let terminal_count = events
+            .iter()
+            .filter(|event| event["stage"] == "terminal")
+            .count();
+        if terminal_count > 0 {
+            assert_eq!(
+                terminal_count, 1,
+                "operation must have exactly one terminal event"
+            );
+            return events.len();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "operation terminal event never committed: {value}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
@@ -282,7 +303,7 @@ async fn retry_after_startup_failure_reexecutes_and_replay_returns_original() {
         state == "failed" || state == "recovery_required",
         "injected failure must surface as a real terminal (not instant success): {view}"
     );
-    let first_events = event_count(&base, token, "op-fail-1").await;
+    let first_events = terminal_event_count(&base, token, "op-fail-1").await;
     assert!(first_events >= 2, "first run must have execution evidence");
 
     // ① 同操作 ID 重放：返回原 Failed 结果（幂等），不重新执行
@@ -295,7 +316,7 @@ async fn retry_after_startup_failure_reexecutes_and_replay_returns_original() {
         "replay must return the original terminal state: {replay}"
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let replay_events = event_count(&base, token, "op-fail-1").await;
+    let replay_events = terminal_event_count(&base, token, "op-fail-1").await;
     assert_eq!(
         replay_events, first_events,
         "replay must not append new execution events"
@@ -317,7 +338,7 @@ async fn retry_after_startup_failure_reexecutes_and_replay_returns_original() {
                 state2, "succeeded",
                 "second run must reach a real terminal (fail/recovery), not success: {view2}"
             );
-            let second_events = event_count(&base, token, "op-fail-2").await;
+            let second_events = terminal_event_count(&base, token, "op-fail-2").await;
             assert!(
                 second_events >= 2,
                 "second run must have its own execution evidence: {second_events}"

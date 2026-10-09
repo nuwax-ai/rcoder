@@ -204,6 +204,59 @@ pub(crate) fn has_confirmed_exit(root: &Path, value: &record::Generation) -> Res
     Ok(true)
 }
 
+/// An existing platform retirement may cover resident commands too: it proves
+/// the original physical domain cannot execute again, not merely one business
+/// process. Bind it to the resident's original owner and exact workspace before
+/// using it; a successor's local epoch alone never retires another Pod.
+pub(crate) fn has_confirmed_resident_exit(
+    scope: &Path,
+    identity: &process_utils::command_authority::ResidentIdentity,
+    current: Option<&PhysicalDomain>,
+) -> Result<bool> {
+    let Some(original) = identity.physical_domain.as_ref() else {
+        return Ok(false);
+    };
+    let original: PhysicalDomain = serde_json::from_value(original.clone())
+        .context("decode original resident physical domain")?;
+    original.validate()?;
+    let Some(current) = current else {
+        return Ok(false);
+    };
+    current.validate()?;
+    if current.authority != original.authority
+        || current.volume != original.volume
+        || current.instance == original.instance
+    {
+        return Ok(false);
+    }
+    let binding: Binding = serde_json::from_value(identity.binding.clone())
+        .context("decode original resident workspace binding")?;
+    ensure!(
+        crate::last_snapshot(scope)?.binding == binding,
+        "resident retirement workspace binding differs"
+    );
+    let work = scope.join("work");
+    if !work.try_exists()? {
+        return Ok(false);
+    }
+    for entry in std::fs::read_dir(work)? {
+        let root = entry?.path();
+        if !root.join("generation.json").try_exists()? {
+            continue;
+        }
+        let generation = record::generation(&root)?;
+        if generation.supervisor != identity.owner_instance
+            || generation.physical_domain.as_ref() != Some(&original)
+        {
+            continue;
+        }
+        if has_confirmed_exit(&root, &generation)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

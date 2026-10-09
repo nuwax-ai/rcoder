@@ -36,7 +36,9 @@ mod cases {
     async fn delayed_generation_shutdown_does_not_cancel_its_successor() {
         let state = Arc::new(state());
         state.set_generation("artifactdeployment".into());
-        let old = state.generation_control("nativeold").unwrap();
+        let old = state
+            .generation_control("nativeold", std::path::Path::new("/tmp/app-cli-test-logs"))
+            .unwrap();
         state.begin_business_session("nativeold".into(), true, || false);
         state.mark_initialized();
         assert_eq!(state.generation_value(), "artifactdeployment");
@@ -49,7 +51,9 @@ mod cases {
             wait.await.unwrap();
             old.shutdown().await.unwrap();
         });
-        let current = state.generation_control("nativenew").unwrap();
+        let current = state
+            .generation_control("nativenew", std::path::Path::new("/tmp/app-cli-test-logs"))
+            .unwrap();
         state.begin_business_session("nativenew".into(), false, || false);
         assert_eq!(state.generation_value(), "artifactdeployment");
         let token = state.cancel_token();

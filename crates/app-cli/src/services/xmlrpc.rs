@@ -24,7 +24,9 @@ impl std::fmt::Display for RpcFault {
 impl std::error::Error for RpcFault {}
 
 pub(crate) fn is_confirmed_fault(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<RpcFault>().is_some()
+    error
+        .downcast_ref::<RpcFault>()
+        .is_some_and(RpcFault::is_complete)
 }
 
 impl RpcFault {
@@ -55,6 +57,38 @@ impl RpcFault {
 /// supervisord `getAllProcessInfo` 行（XML-RPC struct → 类型化字段；
 /// 未知字段忽略，缺失字段保持 None——supervisord 版本差异不因此失败）。
 /// name/pid/description 保留为诊断锚点（日志/后续监控消费）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum SupervisorProcessState {
+    Stopped,
+    Starting,
+    Running,
+    Backoff,
+    Stopping,
+    Exited,
+    Fatal,
+    Unknown,
+}
+
+impl SupervisorProcessState {
+    fn code(self) -> i64 {
+        match self {
+            Self::Stopped => 0,
+            Self::Starting => 10,
+            Self::Running => 20,
+            Self::Backoff => 30,
+            Self::Stopping => 40,
+            Self::Exited => 100,
+            Self::Fatal => 200,
+            Self::Unknown => 1000,
+        }
+    }
+
+    pub(crate) fn is_transitional(self) -> bool {
+        matches!(self, Self::Starting | Self::Backoff | Self::Stopping)
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct SupervisordProcessInfo {
     pub group: String,
@@ -63,9 +97,13 @@ pub(crate) struct SupervisordProcessInfo {
     /// 进程状态名（RUNNING/STOPPED/STARTING/BACKOFF/STOPPING/EXITED/FATAL/
     /// UNKNOWN/SHUTDOWN）；supervisord 文档固定大写。
     #[serde(default)]
-    pub statename: Option<String>,
+    pub statename: Option<SupervisorProcessState>,
+    #[serde(default)]
+    pub state: Option<i64>,
     #[serde(default)]
     pub pid: Option<i64>,
+    #[serde(default)]
+    pub start: Option<i64>,
     #[serde(default)]
     pub description: Option<String>,
 }
@@ -81,7 +119,9 @@ impl SupervisordProcessInfo {
             self.group,
             self.name.as_deref().unwrap_or("?"),
             self.pid.unwrap_or(0),
-            self.statename.as_deref().unwrap_or("?")
+            self.statename
+                .map(|state| format!("{state:?}"))
+                .unwrap_or_else(|| "?".into())
         );
         match self.description.as_deref() {
             Some(desc) if !desc.is_empty() => format!("{base} ({desc})"),
@@ -92,11 +132,77 @@ impl SupervisordProcessInfo {
 
 impl SupervisordProcessInfo {
     /// 组内是否有一个 RUNNING 的进程（组行 state=RUNNING）。
-    pub fn is_running(&self) -> bool {
-        self.statename
-            .as_deref()
-            .is_some_and(|state| state.eq_ignore_ascii_case("RUNNING"))
+    pub fn checked_state(&self, name: &str) -> Result<SupervisorProcessState> {
+        anyhow::ensure!(
+            self.group == name && self.name.as_deref() == Some(name),
+            "supervisord program identity mismatch for {name}"
+        );
+        let state = self
+            .statename
+            .context("supervisord process has no statename")?;
+        anyhow::ensure!(
+            self.state == Some(state.code()),
+            "supervisord state fields disagree for {name}"
+        );
+        anyhow::ensure!(
+            state != SupervisorProcessState::Unknown,
+            "supervisord state UNKNOWN for {name}"
+        );
+        if state == SupervisorProcessState::Running {
+            self.running_identity()?;
+        }
+        Ok(state)
     }
+
+    pub fn running_identity(&self) -> Result<RunningProcess> {
+        let pid = self
+            .pid
+            .filter(|pid| *pid > 0)
+            .context("running supervisord program has no PID")?;
+        let started = self
+            .start
+            .filter(|started| *started > 0)
+            .context("running supervisord program has no start identity")?;
+        Ok(RunningProcess { pid, started })
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReloadChanges {
+    pub added: Vec<String>,
+    pub changed: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+fn decode_reload_changes(value: serde_json::Value) -> Result<ReloadChanges> {
+    let outer = value
+        .as_array()
+        .context("reloadConfig returned non-array")?;
+    anyhow::ensure!(outer.len() == 1, "reloadConfig must return one change set");
+    let sets = outer[0]
+        .as_array()
+        .context("reloadConfig change set is not an array")?;
+    anyhow::ensure!(
+        sets.len() == 3,
+        "reloadConfig must return added, changed and removed groups"
+    );
+    let decode = |index: usize| -> Result<Vec<String>> {
+        sets[index]
+            .as_array()
+            .context("reloadConfig group list is not an array")?
+            .iter()
+            .map(|name| {
+                name.as_str()
+                    .map(str::to_string)
+                    .context("reloadConfig group name is not a string")
+            })
+            .collect()
+    };
+    Ok(ReloadChanges {
+        added: decode(0)?,
+        changed: decode(1)?,
+        removed: decode(2)?,
+    })
 }
 
 pub(crate) struct SupervisorClient {
@@ -104,7 +210,7 @@ pub(crate) struct SupervisorClient {
 }
 
 /// Evidence for the instance launched into a newly added program group.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RunningProcess {
     pub pid: i64,
     pub started: i64,
@@ -127,35 +233,36 @@ impl SupervisorClient {
     }
 
     /// reloadConfig（即 supervisorctl reread）：返回变更组列表
-    /// `[[name, change_code, description], ...]`。
-    pub(crate) async fn reload_config(&self) -> Result<Vec<(String, String)>> {
+    /// `[[added, changed, removed]]`；reread 本身不会更新运行中的组。
+    pub(crate) async fn reload_config(&self) -> Result<ReloadChanges> {
         let value = self.call("supervisor.reloadConfig", &[]).await?;
-        let mut changes = Vec::new();
-        if let Some(items) = value.as_array() {
-            // 响应结构：[[[["name","code","desc"],...]]]（外层 struct 含 added/changed/removed）
-            for item in items {
-                if let Some(triples) = item.as_array() {
-                    for triple in triples {
-                        if let Some(fields) = triple.as_array()
-                            && fields.len() >= 2
-                            && let (Some(name), Some(code)) =
-                                (fields[0].as_str(), fields[1].as_str())
-                        {
-                            changes.push((name.to_string(), code.to_string()));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(changes)
+        decode_reload_changes(value)
     }
 
     /// addProcessGroup：把 reloadConfig 发现的新组加入托管（返回 false=已存在）。
     pub(crate) async fn add_process_group(&self, group: &str) -> Result<bool> {
-        let value = self
+        let value = match self
             .call("supervisor.addProcessGroup", &[group.into()])
-            .await?;
-        Ok(value.as_bool().unwrap_or(false))
+            .await
+        {
+            Ok(value) => value,
+            Err(error)
+                if error.downcast_ref::<RpcFault>().is_some_and(|fault| {
+                    fault.is_complete()
+                        && fault.0.get("faultCode").and_then(serde_json::Value::as_i64) == Some(90)
+                }) =>
+            {
+                let info = self.process_info(group).await?;
+                info.checked_state(group)?;
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        anyhow::ensure!(
+            value.as_bool() == Some(true),
+            "supervisord did not confirm adding {group}"
+        );
+        Ok(true)
     }
 
     /// stopProcessGroup + removeProcessGroup：停并摘除托管（幂等，组不存在容忍）。
@@ -192,29 +299,20 @@ impl SupervisorClient {
     }
 
     pub(crate) async fn running_process(&self, name: &str) -> Result<RunningProcess> {
-        let value = self
-            .call("supervisor.getProcessInfo", &[name.into()])
-            .await?;
+        let info = self.process_info(name).await?;
         anyhow::ensure!(
-            value.get("name").and_then(|v| v.as_str()) == Some(name)
-                && value.get("group").and_then(|v| v.as_str()) == Some(name),
-            "supervisord program identity mismatch for {name}"
-        );
-        anyhow::ensure!(
-            value.get("state").and_then(|v| v.as_i64()) == Some(20),
+            info.checked_state(name)? == SupervisorProcessState::Running,
             "supervisord program {name} is not RUNNING"
         );
-        let pid = value
-            .get("pid")
-            .and_then(|v| v.as_i64())
-            .filter(|v| *v > 0)
-            .context("running supervisord program has no PID")?;
-        let started = value
-            .get("start")
-            .and_then(|v| v.as_i64())
-            .filter(|v| *v > 0)
-            .context("running supervisord program has no start identity")?;
-        Ok(RunningProcess { pid, started })
+        info.running_identity()
+    }
+
+    pub(crate) async fn process_info(&self, name: &str) -> Result<SupervisordProcessInfo> {
+        serde_json::from_value(
+            self.call("supervisor.getProcessInfo", &[name.into()])
+                .await?,
+        )
+        .context("decode supervisord process identity")
     }
 
     /// getAllProcessInfo：每组一行状态（类型化 [`SupervisordProcessInfo`]，
@@ -273,10 +371,9 @@ impl SupervisorClient {
                 "supervisor.getVersion"
                     | "supervisor.getAllProcessInfo"
                     | "supervisor.getProcessInfo"
-            ) || (method == "supervisor.startProcess"
-                && error
-                    .downcast_ref::<RpcFault>()
-                    .is_some_and(RpcFault::is_complete))
+            ) || (error
+                .downcast_ref::<RpcFault>()
+                .is_some_and(RpcFault::is_complete))
             {
                 // A rejected start may already have run child processes. The caller must
                 // still stop and confirm all dynamic groups before restoring directories.
@@ -603,7 +700,8 @@ mod tests {
         let stop = client.stop_remove_group("app-svc-web").await.unwrap_err();
         assert!(
             stop.downcast_ref::<crate::supervisor::ShutdownUnconfirmed>()
-                .is_some()
+                .is_none(),
+            "a complete stop fault is a rejection, not a lost response"
         );
         let read = client.running_process("app-svc-worker").await.unwrap_err();
         assert!(
@@ -654,5 +752,105 @@ mod r11_tests {
         assert!(!is_no_such_process(
             &RpcFault(serde_json::Value::Null).into()
         ));
+    }
+}
+
+#[cfg(test)]
+mod process_contract_tests {
+    use super::*;
+
+    #[test]
+    fn complete_state_contract_rejects_missing_unknown_and_conflicting_identity() {
+        let mut row = serde_json::json!({"group":"app-pingap", "name":"app-pingap", "statename":"RUNNING", "state":20, "pid":42, "start":123});
+        for (state, code) in [
+            ("STOPPED", 0),
+            ("STARTING", 10),
+            ("RUNNING", 20),
+            ("BACKOFF", 30),
+            ("STOPPING", 40),
+            ("EXITED", 100),
+            ("FATAL", 200),
+        ] {
+            row["statename"] = state.into();
+            row["state"] = code.into();
+            let info: SupervisordProcessInfo = serde_json::from_value(row.clone()).unwrap();
+            assert_eq!(info.checked_state("app-pingap").unwrap().code(), code);
+        }
+        for field in ["name", "statename", "state", "pid", "start"] {
+            let mut invalid = serde_json::json!({"group":"app-pingap", "name":"app-pingap", "statename":"RUNNING", "state":20, "pid":42, "start":123});
+            invalid.as_object_mut().unwrap().remove(field);
+            let info: SupervisordProcessInfo = serde_json::from_value(invalid).unwrap();
+            assert!(
+                info.checked_state("app-pingap").is_err(),
+                "missing {field} cannot prove running identity"
+            );
+        }
+        row["statename"] = "UNKNOWN".into();
+        row["state"] = 1000.into();
+        assert!(
+            serde_json::from_value::<SupervisordProcessInfo>(row.clone())
+                .unwrap()
+                .checked_state("app-pingap")
+                .is_err()
+        );
+        row["statename"] = "unexpected".into();
+        assert!(serde_json::from_value::<SupervisordProcessInfo>(row).is_err());
+    }
+
+    #[test]
+    fn reload_config_decodes_supervisors_actual_added_changed_removed_shape() {
+        let changes =
+            decode_reload_changes(serde_json::json!([[["new"], ["app-pingap"], ["old"]]])).unwrap();
+        assert_eq!(changes.added, ["new"]);
+        assert_eq!(changes.changed, ["app-pingap"]);
+        assert_eq!(changes.removed, ["old"]);
+        for malformed in [
+            serde_json::json!([]),
+            serde_json::json!([[[]]]),
+            serde_json::json!([[[1], [], []]]),
+            serde_json::json!([[[], [], []], [[], [], []]]),
+        ] {
+            assert!(decode_reload_changes(malformed).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_complete_already_added_for_the_exact_program_is_idempotent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("rpc.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            for body in [
+                r#"<fault><value><struct><member><name>faultCode</name><value><int>90</int></value></member><member><name>faultString</name><value><string>ALREADY_ADDED</string></value></member></struct></value></fault>"#,
+                r#"<params><param><value><struct><member><name>group</name><value><string>other</string></value></member><member><name>name</name><value><string>other</string></value></member><member><name>statename</name><value><string>STOPPED</string></value></member><member><name>state</name><value><int>0</int></value></member></struct></value></param></params>"#,
+                r#"<fault><value><struct><member><name>faultCode</name><value><int>50</int></value></member><member><name>faultString</name><value><string>ALREADY_ADDED wording but SPAWN_ERROR code</string></value></member></struct></value></fault>"#,
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                let body = format!("<methodResponse>{body}</methodResponse>");
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let client = SupervisorClient::new(socket);
+        assert!(
+            client
+                .add_process_group("app-pingap")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("identity mismatch")
+        );
+        assert!(
+            client
+                .add_process_group("app-pingap")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("SPAWN_ERROR")
+        );
+        server.await.unwrap();
     }
 }

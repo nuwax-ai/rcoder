@@ -11,6 +11,7 @@ mod monitor;
 mod owner_handover;
 mod record;
 mod recovery;
+mod resident;
 mod session;
 mod worker;
 
@@ -21,6 +22,7 @@ pub use control::{
 };
 pub use monitor::{Options, Owner, Policy};
 pub use owner_handover::{completed_shutdown_for, shutdown_captured_owner};
+pub use process_utils::command_authority::ResidentScope;
 pub use record::{
     Intent, Quiescence, verify_live, verify_local_quiescent, verify_local_quiescent_for_supervisor,
     verify_quiescent,
@@ -31,8 +33,8 @@ pub use recovery::{
     stop_work_with_cleanup,
 };
 pub use session::{
-    BusinessFactory, BusinessLaunch, BusinessRun, FenceState, OwnerSession, SessionOptions,
-    SessionScope, current_scope,
+    BusinessFactory, BusinessLaunch, BusinessRun, FenceState, OwnerCleanup, OwnerSession,
+    SessionOptions, SessionScope, current_scope,
 };
 pub use worker::{Worker, WorkerControl};
 

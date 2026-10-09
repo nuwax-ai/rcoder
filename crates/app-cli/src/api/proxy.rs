@@ -1,13 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use anyhow::Context;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Response;
 use serde::Serialize;
 use serde_json::{Value, json};
-use tracing::{info, warn};
 
 use crate::proxy::admin_probe;
 use crate::proxy::compiler::{CompileOutcome, compile_and_validate};
@@ -32,8 +30,10 @@ pub(super) struct ProxyValidateData {
 pub(super) struct ProxyReloadData {
     /// 是否已写入生效配置
     pub reloaded: bool,
-    /// 是否经 pingap admin config_hash 确认生效（false 不出现——未确认会回切并走错误信封）
+    /// 完整 Applied 回执、进程身份和各监听 HTTP 标记均已确认
     pub verified: bool,
+    pub publication_id: String,
+    pub process_instance_id: String,
     /// 生效配置内容 hash
     pub config_hash: String,
     /// 当前部署代标识（boot_id）
@@ -51,6 +51,9 @@ pub(super) struct ProxyStatusData {
     pub mode: String,
     /// 生效配置文件是否已落盘
     pub configured: bool,
+    /// Confirmed complete graph for this process and publication (including standby).
+    pub applied: bool,
+    pub publication_id: Option<String>,
     /// 生效配置落盘路径
     pub effective_config_path: String,
     /// pingap 版本（idle 态为 null）
@@ -97,41 +100,23 @@ pub(super) async fn validate(
     {
         return envelope::error(StatusCode::FORBIDDEN, "DEPLOY_FORBIDDEN", message);
     }
-    // The existing compiler publishes the validated config atomically, so this
-    // endpoint is also a writer and must participate in runtime admission and unknown-result protection.
+    // Validation only creates an immutable candidate; it never changes active.
+    // The auxiliary gate freezes the orchestration profile during compilation.
     let mut writer = match state.server.begin_auxiliary_write() {
         Ok(writer) => writer,
         Err(error) => return proxy_error(error),
     };
-    let target = effective_path(&state);
-    let previous_bytes = match read_effective_snapshot(&target).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            // No compiler or write has run yet.
-            writer.confirm();
-            return proxy_error(error);
-        }
-    };
-    match compile(&state).await {
-        Ok(outcome) => {
-            writer.confirm();
-            envelope::ok(
-                StatusCode::OK,
-                ProxyValidateData {
-                    valid: true,
-                    effective_config_path: outcome.config_path.to_string_lossy().to_string(),
-                },
-            )
-        }
-        Err(error) => {
-            if read_effective_snapshot(&target)
-                .await
-                .is_ok_and(|current| current == previous_bytes)
-            {
-                writer.confirm();
-            }
-            proxy_error(error)
-        }
+    let result = compile(&state).await;
+    writer.confirm();
+    match result {
+        Ok(outcome) => envelope::ok(
+            StatusCode::OK,
+            ProxyValidateData {
+                valid: true,
+                effective_config_path: outcome.config_path.to_string_lossy().into_owned(),
+            },
+        ),
+        Err(error) => proxy_error(error),
     }
 }
 
@@ -141,7 +126,7 @@ pub(super) async fn validate(
     params(("x-deploy-token" = Option<String>, Header, description = "Required when the runtime control token is configured")),
     responses(
         (status = 403, description = "Runtime control token missing or invalid"),
-        (status = 200, body = HttpResult<ProxyReloadData>, description = "Effective config atomically updated and confirmed live via read-only admin config_hash"),
+        (status = 200, body = HttpResult<ProxyReloadData>, description = "Active config updated; complete Applied graph, process identity and listener HTTP markers confirmed"),
         (status = 400, body = HttpResult<String>, description = "Compile failed or reload verification timed out (rolled back to previous config)")
     ),
     tag = "Runtime Proxy"
@@ -173,89 +158,74 @@ pub(super) async fn reload(
         Err(error) => return proxy_error(error),
     };
     let target = effective_path(&state);
-    let previous_bytes = match read_effective_snapshot(&target).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            // No compiler or write has run yet.
-            writer.confirm();
-            return proxy_error(error);
-        }
-    };
-    // 先读旧生效配置 hash：超时回切后用于 best-effort 二次确认。
-    let previous_hash = read_effective_hash(&target).await;
-
     let outcome = match compile(&state).await {
         Ok(outcome) => outcome,
         Err(error) => {
-            if read_effective_snapshot(&target)
-                .await
-                .is_ok_and(|current| current == previous_bytes)
-            {
-                writer.confirm();
-            }
+            writer.confirm();
             return proxy_error(error);
         }
     };
-    match admin_probe::wait_for_config_hash(
-        endpoint,
-        &outcome.expected_hash,
-        admin_probe::CONFIRM_BUDGET,
-    )
-    .await
-    {
-        Ok(()) => {
+    let candidate = match tokio::fs::read_to_string(&outcome.config_path).await {
+        Ok(content) => content,
+        Err(error) => {
             writer.confirm();
-            // 已确认生效：业务就绪观察以此核对 admin 实际 hash。
-            crate::proxy::compiler::record_expected_hash(&outcome.expected_hash);
+            return proxy_error(error.into());
+        }
+    };
+    if let Err(error) = crate::proxy::compiler::validate_hot_reload_compatible(&target, &candidate)
+    {
+        writer.confirm();
+        return proxy_error(error);
+    }
+    let result = async {
+        if let Some(host) = crate::supervisord_host::SupervisordHost::from_env().await? {
+            let previous = admin_probe::fetch_apply_status(endpoint)
+                .await?
+                .current_publication()?;
+            host.verify_entry_confirmation(&previous).await?;
+            let confirmed = crate::proxy::compiler::publish_confirmed(
+                &crate::proxy::compiler::runtime_root(&state.log_dir),
+                &target,
+                &outcome,
+                endpoint,
+            )
+            .await?;
+            host.verify_entry_confirmation(&confirmed)
+                .await
+                .map_err(|error| {
+                    anyhow::Error::from(crate::supervisor::ShutdownUnconfirmed(format!(
+                        "proxy physical identity became unknown after reload: {error:#}"
+                    )))
+                })?;
+            Ok(confirmed)
+        } else {
+            crate::supervisor::resident::reload(&outcome).await
+        }
+    }
+    .await;
+    match result {
+        Ok(confirmed) => {
+            writer.confirm();
             envelope::ok(
                 StatusCode::OK,
                 ProxyReloadData {
                     reloaded: true,
                     verified: true,
                     config_hash: outcome.expected_hash,
+                    publication_id: confirmed.publication_id,
+                    process_instance_id: confirmed.instance_id,
                     release_id: state.server.boot_id(),
-                    effective_config_path: outcome.config_path.to_string_lossy().to_string(),
+                    effective_config_path: target.to_string_lossy().into_owned(),
                 },
             )
         }
         Err(error) => {
-            // 超时/不匹配 → 回切 pingap.toml.prev。语义说明：basic/storages/server addr
-            // 类变更在 --autoreload 下本就热更不生效 → hash 永不匹配 → 超时+回切是
-            // 正确的 fail-safe（宁可回退也不让未确认的新配置留在生效位）。
-            match rollback_to_previous(&target).await {
-                Ok(()) => warn!(
-                    "⚠️  reload verification failed, rolled back to previous config: {error:#}"
-                ),
-                Err(rollback_error) => warn!(
-                    "⚠️  reload verification failed and rollback failed too: \
-                     verification={error:#} rollback={rollback_error:#}"
-                ),
+            // A confirmed rollback is an ordinary failed request. Unknown
+            // physical/application outcome retains the existing writer fence.
+            if !error.is::<crate::supervisor::ShutdownUnconfirmed>() {
+                writer.confirm();
             }
-            // best-effort 二次确认旧 hash 重新生效；失败仅 warn，不影响错误返回。
-            if let Some(previous_hash) = previous_hash {
-                match admin_probe::wait_for_config_hash(
-                    endpoint,
-                    &previous_hash,
-                    admin_probe::ROLLBACK_CONFIRM_BUDGET,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        writer.confirm();
-                        // 回切后的实际生效配置是旧 hash——观察期望同步回切。
-                        crate::proxy::compiler::record_expected_hash(&previous_hash);
-                        info!("✅ rollback confirmed: previous config_hash live again");
-                    }
-                    Err(verify_error) => {
-                        warn!("⚠️  rollback verification failed (non-fatal): {verify_error:#}")
-                    }
-                }
-            }
-            proxy_error(
-                error.context(
-                    "reload took effect verification failed; rolled back to previous config",
-                ),
-            )
+            proxy_error(error)
         }
     }
 }
@@ -268,25 +238,47 @@ pub(super) async fn reload(
 )]
 pub(super) async fn status(State(state): State<AppState>) -> Response {
     let path = effective_path(&state);
-    let data = match state.server.release() {
-        Some(release) => {
-            let configured = tokio::fs::metadata(&path)
-                .await
-                .map(|m| m.is_file())
-                .unwrap_or(false);
-            ProxyStatusData {
-                release_id: Some(release.release_id),
-                mode: format!("{:?}", release.pingap.mode).to_ascii_lowercase(),
-                configured,
-                effective_config_path: path.to_string_lossy().to_string(),
-                pingap_version: Some(release.pingap.version),
-                pingap_commit: Some(release.pingap.commit),
-            }
+    let configured = match tokio::fs::metadata(&path).await {
+        Ok(metadata) => metadata.is_file(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return proxy_error(anyhow::anyhow!(
+                "observe active proxy configuration: {error}"
+            ));
         }
+    };
+    let expected = crate::proxy::compiler::confirmed_publication();
+    let applied = !crate::proxy::compiler::publication_uncertain()
+        && match (&expected, admin_probe::admin_endpoint()) {
+            (Some((outcome, receipt)), Some(endpoint)) => admin_probe::wait_for_publication(
+                endpoint,
+                outcome,
+                std::time::Duration::from_secs(3),
+            )
+            .await
+            .is_ok_and(|actual| {
+                actual.process_id == receipt.process_id && actual.instance_id == receipt.instance_id
+            }),
+            _ => false,
+        };
+    let publication_id = expected.map(|(outcome, _)| outcome.publication_id);
+    let data = match state.server.release() {
+        Some(release) => ProxyStatusData {
+            release_id: Some(release.release_id),
+            mode: format!("{:?}", release.pingap.mode).to_ascii_lowercase(),
+            configured,
+            applied,
+            publication_id,
+            effective_config_path: path.to_string_lossy().to_string(),
+            pingap_version: Some(release.pingap.version),
+            pingap_commit: Some(release.pingap.commit),
+        },
         None => ProxyStatusData {
             release_id: None,
             mode: "idle".to_string(),
-            configured: false,
+            configured,
+            applied,
+            publication_id,
             effective_config_path: path.to_string_lossy().to_string(),
             pingap_version: None,
             pingap_commit: None,
@@ -363,45 +355,16 @@ async fn compile(state: &AppState) -> anyhow::Result<CompileOutcome> {
     .await
 }
 
-async fn read_effective_snapshot(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
-    match tokio::fs::read(path).await {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).context("read effective proxy configuration before mutation"),
-    }
-}
-
-/// 读当前生效 TOML 并计算其 config_hash（best-effort，失败返 None）。
-async fn read_effective_hash(path: &Path) -> Option<String> {
-    let bytes = tokio::fs::read(path).await.ok()?;
-    let config = pingap_config::PingapConfig::new(&bytes, true).ok()?;
-    config.hash().ok()
-}
-
-/// 回切：把 pingap.toml.prev 还原为 pingap.toml（autoreload 会自动感知文件变更）。
-async fn rollback_to_previous(target: &Path) -> anyhow::Result<()> {
-    let backup = target.with_file_name("pingap.toml.prev");
-    if !tokio::fs::try_exists(&backup).await.unwrap_or(false) {
-        anyhow::bail!(
-            "no previous config backup {} to roll back to",
-            backup.display()
-        );
-    }
-    tokio::fs::rename(&backup, target)
-        .await
-        .with_context(|| format!("roll back Pingap config {}", target.display()))
-}
-
 fn effective_path(state: &AppState) -> PathBuf {
-    crate::proxy::compiler::runtime_root(&state.log_dir)
-        .join(state.server.boot_id())
-        .join("pingap.toml")
+    crate::proxy::compiler::active_config_path(&crate::proxy::compiler::runtime_root(
+        &state.log_dir,
+    ))
 }
 
 fn proxy_error(error: anyhow::Error) -> Response {
     envelope::error(
         StatusCode::BAD_REQUEST,
         "PINGAP_CONFIG_INVALID",
-        error.to_string(),
+        format!("{error:#}"),
     )
 }
