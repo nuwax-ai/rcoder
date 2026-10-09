@@ -37,8 +37,18 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
 
 
-def run(arguments, **kwargs):
-    result = subprocess.run([str(arg) for arg in arguments], check=False,
+def run(arguments, stream=False, **kwargs):
+    command = [str(arg) for arg in arguments]
+    if stream:
+        # Long tasks (buildx build / git fetch / docker pull) stream straight to the
+        # terminal so progress is live; callers must not parse stdout of streamed
+        # commands. Failure output is already visible above when this raises.
+        result = subprocess.run(command, check=False, **kwargs)
+        if result.returncode:
+            raise CacheError(
+                f'{arguments[0]} failed (exit {result.returncode}); streamed output above')
+        return ''
+    result = subprocess.run(command, check=False,
                             capture_output=True, text=True, **kwargs)
     if result.returncode:
         # Command lines can contain credential-bearing registry URLs. Report
@@ -92,11 +102,11 @@ def source_snapshot(args, work):
         if not mirror.exists():
             run(['git', 'init', '--bare', mirror])
         try:
-            run(['git', '-C', mirror, 'fetch', '--depth', '1', args.fetch_repo, args.ref])
+            run(['git', '-C', mirror, 'fetch', '--depth', '1', args.fetch_repo, args.ref], stream=True)
         except CacheError:
             if args.fetch_repo == args.repo:
                 raise
-            run(['git', '-C', mirror, 'fetch', '--depth', '1', args.repo, args.ref])
+            run(['git', '-C', mirror, 'fetch', '--depth', '1', args.repo, args.ref], stream=True)
         commit = run(['git', '-C', mirror, 'rev-parse', 'FETCH_HEAD^{commit}'])
         if not re.fullmatch(r'[0-9a-f]{40,64}', commit):
             raise CacheError('source commit is not a full Git identity')
@@ -308,7 +318,8 @@ def build_images(args, source, work, artifacts, key):
         run(['docker', 'buildx', 'build', '--builder', args.builder,
              '--platform', 'linux/' + arch, '--file', 'deploy/Dockerfile',
              '--tag', tag, '--iidfile', iid,
-             '--build-arg', 'PIP_INDEX_URL=' + args.pip_index, '--load', '.'], cwd=source)
+             '--build-arg', 'PIP_INDEX_URL=' + args.pip_index, '--load', '.'],
+            cwd=source, stream=True)
         image = iid.read_text().strip()
         if not re.fullmatch(r'sha256:[0-9a-f]{64}', image):
             raise CacheError('BuildKit did not return an exact image identity')
@@ -422,7 +433,7 @@ def official(args):
                 artifacts = Path(temporary) / 'artifacts'
                 artifacts.mkdir()
                 for arch in ARCHES:
-                    run(['docker', 'pull', '--platform', 'linux/' + arch, image])
+                    run(['docker', 'pull', '--platform', 'linux/' + arch, image], stream=True)
                     extract_image(image, arch, artifacts, arch == ARCHES[0])
                 files = validate_assets(artifacts, require_fork=False)
                 atomic_json(artifacts / 'manifest.json', {
