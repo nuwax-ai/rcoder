@@ -53,6 +53,10 @@ tracing-opentelemetry = { workspace = true }
 futures-util = { workspace = true }
 uuid = { workspace = true }
 
+[dev-dependencies]
+# 仅测试构造 ContainerBasicInfo 时间字段；工作区图内既有依赖，不新增外部面
+chrono = { workspace = true }
+
 [features]
 default = []
 # deploy-host 宿主机运行形态（dial_addr 统一出口）

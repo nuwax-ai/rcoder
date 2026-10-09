@@ -265,7 +265,7 @@ impl ProxyHttp for ProxyServiceWrapper {
             self.inner.metrics.dec_active();
             ctx.prod_metrics_counted = false;
         }
-        let recoverable_connect_error = ctx.prod_connect_recovery.is_some()
+        let recoverable_connect_error = ctx.app_connect_recovery.is_some()
             && matches!(
                 error.etype(),
                 pingora_core::ErrorType::ConnectRefused
@@ -274,7 +274,7 @@ impl ProxyHttp for ProxyServiceWrapper {
             );
         let should_report_unavailable = recoverable_connect_error
             || ctx
-                .prod_connect_recovery
+                .app_connect_recovery
                 .as_ref()
                 .is_some_and(|state| state.unavailable_response);
         if should_report_unavailable {

@@ -16,6 +16,8 @@ pub mod ttyd_params;
 pub mod vnc;
 
 #[cfg(test)]
+mod dev_terminal_tests;
+#[cfg(test)]
 mod preview_forward_tests;
 #[cfg(test)]
 mod ttyd_tests;

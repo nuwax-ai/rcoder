@@ -37,6 +37,61 @@ pub trait UserappDevLocator: Send + Sync {
     async fn dev_container_alive(&self, app_id: &str) -> Result<bool, String>;
 }
 
+/// dev builder 权威实例视图（F1 地址绑定核验用）。
+///
+/// 来源是运行时权威观测（非内存注册表）：`address` 是当前实例真实地址，
+/// 供代理与注册表候选比对或直接使用；`container_id` 为物理身份锚点。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevBuilderInstance {
+    /// 当前实例 IP（权威运行时观测值；Pending 等无地址场景为空串）。
+    pub address: String,
+    /// 物理容器 ID（诊断与日志对账锚点）。
+    pub container_id: String,
+}
+
+/// dev 定位/ensure 的类型化失败（engine 产生，代理按族映射 HTTP——不按字符串猜原因）。
+///
+/// 语义约定：`ObserveFailed` 表示权威查询失败、不可据以判定存在性，
+/// 调用方不得回退端口探测，也不得借 ensure 绕过保护。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DevEnsureError {
+    /// builder 确认不存在（未创建工作区/已删除）——调用方可走 ensure 创建。
+    BuilderAbsent { app_id: String },
+    /// 存在在途操作或围栏保护，ensure/接管被拒（detail 含 holder 操作身份）。
+    OperationInFlight { app_id: String, detail: String },
+    /// 权威运行时查询失败——存在性不可判定，不得当作不存在处理。
+    ObserveFailed { app_id: String, detail: String },
+    /// builder 存在但尚无可用地址/不在运行态（如 Pending、重启中）。
+    NotReady { app_id: String, detail: String },
+    /// ensure 执行失败（运行时/存储故障）。
+    EnsureFailed { app_id: String, detail: String },
+}
+
+impl DevEnsureError {
+    pub fn app_id(&self) -> &str {
+        match self {
+            Self::BuilderAbsent { app_id }
+            | Self::OperationInFlight { app_id, .. }
+            | Self::ObserveFailed { app_id, .. }
+            | Self::NotReady { app_id, .. }
+            | Self::EnsureFailed { app_id, .. } => app_id,
+        }
+    }
+
+    /// 面向日志/诊断的一行描述（不含内部地址与凭据）。
+    pub fn brief(&self) -> String {
+        match self {
+            Self::BuilderAbsent { .. } => "builder absent".into(),
+            Self::OperationInFlight { detail, .. } => {
+                format!("operation in flight: {detail}")
+            }
+            Self::ObserveFailed { detail, .. } => format!("observe failed: {detail}"),
+            Self::NotReady { detail, .. } => format!("builder not ready: {detail}"),
+            Self::EnsureFailed { detail, .. } => format!("ensure failed: {detail}"),
+        }
+    }
+}
+
 /// UserappBuilder 开发容器懒启动回调（rcoder-proxy 终端代理消费）。
 ///
 /// 终端代理（ttyd/vnc/audio/ime/dbx 的 dev 族）是使用语义：开发容器不在时
@@ -44,17 +99,21 @@ pub trait UserappDevLocator: Send + Sync {
 /// （URL 的用户占位段不参与定位）。
 #[async_trait]
 pub trait UserappDevEnsure: Send + Sync {
-    /// ensure（幂等，探活自愈）开发容器并返回容器信息（`container_ip`
-    /// 供代理拨流）。错误返回面向日志的描述串（调用方映射 404/502）。
-    async fn ensure_dev_container(&self, app_id: &str)
-    -> Result<crate::ContainerBasicInfo, String>;
+    /// 权威定位当前 dev builder（只读、无副作用、不刷新活跃）。
+    ///
+    /// `Ok(None)` = 确认不存在（调用方可走 [`Self::ensure_dev_container`]）；
+    /// `Err(ObserveFailed)` = 查询失败不可判定——不得当作不存在，不得以
+    /// 端口探测替代身份核验；`Ok(Some)` 的地址为权威当前值，注册表候选
+    /// 与其不一致时以本值为准。
+    async fn locate_dev_builder(
+        &self,
+        app_id: &str,
+    ) -> Result<Option<DevBuilderInstance>, DevEnsureError>;
 
-    /// 注册表命中值的类型化身份核验：按 app 身份键查运行时确认 builder
-    /// 物理存在。内存 lookup 表不随容器删除失效，且容器 IP 可被其他应用
-    /// 的 builder 复用（端口探测通过≠身份正确）；代理 fast path 接受注册
-    /// IP 前必须经此核验。默认 false——未实现时调用方走 miss→ensure。
-    async fn dev_builder_exists(&self, app_id: &str) -> Result<bool, String> {
-        let _ = app_id;
-        Ok(false)
-    }
+    /// ensure（幂等，探活自愈）开发容器并返回容器信息（`container_ip`
+    /// 供代理拨流）。失败为类型化 [`DevEnsureError`]，调用方按族映射。
+    async fn ensure_dev_container(
+        &self,
+        app_id: &str,
+    ) -> Result<crate::ContainerBasicInfo, DevEnsureError>;
 }

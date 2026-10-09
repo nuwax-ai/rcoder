@@ -16,7 +16,7 @@ use tracing::{debug, error, warn};
 
 use crate::router::RouteType;
 
-use super::{PortProxy, ProdConnectRecovery, TrackingCtx, utils};
+use super::{AppConnectRecovery, PortProxy, TrackingCtx, utils};
 
 const CONNECT_RECOVERY_RETRY_DELAY: Duration = Duration::from_millis(250);
 const CONNECT_RECOVERY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -119,10 +119,27 @@ impl ProxyHttp for PortProxy {
                 });
             }
         }
-        if let Some((app_id, touch)) = classify_wake_target(&self.router, path) {
-            // ① 访问追踪（仅业务流量）
+        if let Some((app_id, touch, stage)) = classify_wake_target(&self.router, path) {
+            // ① 访问追踪（仅 prod 业务流量）
             if touch && let Some(ref tracker) = self.access_tracker {
                 let _ = tracker.touch(&app_id).await;
+            }
+            if stage == crate::service::types::ConnectRecoveryStage::Dev {
+                // ② dev 连接恢复：独立装配，不依赖 wake_control（dev 无唤醒
+                //    语义——流量只 ensure 容器，服务编排由显式操作驱动）。
+                //    拒连/超时在 deadline 内重试并等待端口就绪；重试路径仅
+                //    重解析地址（find_dev_container 权威定位），不做 wake 检查。
+                //    deadline 为入口等待总预算（默认 15s，T4 起自请求受理起算
+                //    并纳入配置）。
+                ctx.app_connect_recovery = Some(AppConnectRecovery {
+                    app_id,
+                    stage,
+                    deadline: tokio::time::Instant::now() + self.dev_entry_wait(),
+                    retry_requested: false,
+                    runtime_checked: true,
+                    unavailable_response: false,
+                });
+                return Ok(false);
             }
             // ② 流量唤醒（stopped/starting app 触发；手动 stop 与闲置回收统一——
             //    有请求即唤醒，见 AppWakeControl::ensure_running 语义）。
@@ -130,8 +147,9 @@ impl ProxyHttp for PortProxy {
             //    remote_wake_pending 兜底查集群真实状态（TTL 缓存节流）。
             if let Some(ref wc) = self.wake_control {
                 let deadline = tokio::time::Instant::now() + wc.wake_timeout();
-                ctx.prod_connect_recovery = Some(ProdConnectRecovery {
+                ctx.app_connect_recovery = Some(AppConnectRecovery {
                     app_id: app_id.clone(),
+                    stage,
                     deadline,
                     retry_requested: false,
                     runtime_checked: false,
@@ -297,47 +315,62 @@ impl ProxyHttp for PortProxy {
             pingora_core::Error::new(ErrorType::HTTPStatus(404))
         })?;
 
-        let recovery = ctx.prod_connect_recovery.as_mut().and_then(|state| {
+        let recovery = ctx.app_connect_recovery.as_mut().and_then(|state| {
             if state.retry_requested {
                 state.retry_requested = false;
                 let check_runtime = !state.runtime_checked;
                 state.runtime_checked = true;
-                Some((state.app_id.clone(), state.deadline, check_runtime))
+                Some((
+                    state.app_id.clone(),
+                    state.stage,
+                    state.deadline,
+                    check_runtime,
+                ))
             } else {
                 None
             }
         });
-        if let Some((app_id, deadline, check_runtime)) = &recovery {
-            let Some(wc) = self.wake_control.as_ref() else {
-                return Err(pingora_core::Error::new(ErrorType::HTTPStatus(503)));
-            };
-            if *check_runtime {
-                let state =
-                    tokio::time::timeout_at(*deadline, wc.remote_wake_state_fresh(app_id)).await;
-                match state {
-                    Ok(RemoteWakeState::WakePending) => {
-                        match tokio::time::timeout_at(*deadline, wc.ensure_running(app_id)).await {
-                            Ok(
-                                shared_types::WakeOutcome::Ready
-                                | shared_types::WakeOutcome::AlreadyRunning,
-                            ) => {}
-                            _ => {
-                                if let Some(ctx_state) = ctx.prod_connect_recovery.as_mut() {
-                                    ctx_state.unavailable_response = true;
+        if let Some((app_id, stage, deadline, check_runtime)) = &recovery {
+            // dev 无唤醒语义：跳过 wake control（重解析地址发生在 dispatch
+            // 阶段的 find_dev_container；本块仅等待端口就绪）。prod 首次重试
+            // 前核对集群真实运行态并按需 ensure_running。
+            if *stage == crate::service::types::ConnectRecoveryStage::Prod {
+                let Some(wc) = self.wake_control.as_ref() else {
+                    return Err(pingora_core::Error::new(ErrorType::HTTPStatus(503)));
+                };
+                if *check_runtime {
+                    let state =
+                        tokio::time::timeout_at(*deadline, wc.remote_wake_state_fresh(app_id))
+                            .await;
+                    match state {
+                        Ok(RemoteWakeState::WakePending) => {
+                            match tokio::time::timeout_at(*deadline, wc.ensure_running(app_id))
+                                .await
+                            {
+                                Ok(
+                                    shared_types::WakeOutcome::Ready
+                                    | shared_types::WakeOutcome::AlreadyRunning,
+                                ) => {}
+                                _ => {
+                                    if let Some(ctx_state) = ctx.app_connect_recovery.as_mut() {
+                                        ctx_state.unavailable_response = true;
+                                    }
+                                    return Err(pingora_core::Error::new(ErrorType::HTTPStatus(
+                                        503,
+                                    )));
                                 }
-                                return Err(pingora_core::Error::new(ErrorType::HTTPStatus(503)));
                             }
                         }
-                    }
-                    Ok(RemoteWakeState::Running) => {}
-                    Ok(RemoteWakeState::Unavailable) => {
-                        return Err(pingora_core::Error::new(ErrorType::HTTPStatus(502)));
-                    }
-                    Err(_) => {
-                        if let Some(ctx_state) = ctx.prod_connect_recovery.as_mut() {
-                            ctx_state.unavailable_response = true;
+                        Ok(RemoteWakeState::Running) => {}
+                        Ok(RemoteWakeState::Unavailable) => {
+                            return Err(pingora_core::Error::new(ErrorType::HTTPStatus(502)));
                         }
-                        return Err(pingora_core::Error::new(ErrorType::HTTPStatus(503)));
+                        Err(_) => {
+                            if let Some(ctx_state) = ctx.app_connect_recovery.as_mut() {
+                                ctx_state.unavailable_response = true;
+                            }
+                            return Err(pingora_core::Error::new(ErrorType::HTTPStatus(503)));
+                        }
                     }
                 }
             }
@@ -345,7 +378,7 @@ impl ProxyHttp for PortProxy {
         let mut peer = self
             .dispatch_upstream_peer(*matched.value, matched.params, ctx)
             .await?;
-        if let Some(state) = ctx.prod_connect_recovery.as_mut() {
+        if let Some(state) = ctx.app_connect_recovery.as_mut() {
             let remaining = state
                 .deadline
                 .saturating_duration_since(tokio::time::Instant::now());
@@ -366,11 +399,11 @@ impl ProxyHttp for PortProxy {
                     .min(remaining),
             );
         }
-        if let Some((app_id, deadline, _)) = recovery
+        if let Some((app_id, _stage, deadline, _)) = recovery
             && !wait_for_peer_connection(&peer, deadline).await
         {
-            warn!(%app_id, "Prod UserApp Service connection did not recover before wake deadline");
-            if let Some(state) = ctx.prod_connect_recovery.as_mut() {
+            warn!(%app_id, "UserApp service connection did not recover before wait deadline");
+            if let Some(state) = ctx.app_connect_recovery.as_mut() {
                 state.unavailable_response = true;
             }
             return Err(pingora_core::Error::new(ErrorType::HTTPStatus(503)));
@@ -428,7 +461,7 @@ impl ProxyHttp for PortProxy {
         ctx: &mut Self::CTX,
         mut error: Box<pingora_core::Error>,
     ) -> Box<pingora_core::Error> {
-        if let Some(state) = ctx.prod_connect_recovery.as_mut()
+        if let Some(state) = ctx.app_connect_recovery.as_mut()
             && matches!(
                 error.etype(),
                 ErrorType::ConnectRefused | ErrorType::ConnectNoRoute | ErrorType::ConnectTimedout
@@ -458,7 +491,7 @@ impl ProxyHttp for PortProxy {
         digest: Option<&Digest>,
         ctx: &mut Self::CTX,
     ) -> PingoraResult<()> {
-        ctx.prod_connect_recovery = None;
+        ctx.app_connect_recovery = None;
         // 记录连接是否被重用
         ctx.connection_reused = reused;
 
@@ -644,7 +677,7 @@ impl PortProxy {
         // 失败路径剩余预算（无唤醒上下文时用短上限——诊断绝不延长已耗尽的
         // 代理等待）
         let budget = ctx
-            .prod_connect_recovery
+            .app_connect_recovery
             .as_ref()
             .map(|recovery| {
                 recovery
@@ -792,7 +825,7 @@ impl PortProxy {
             && let Some(route) = ctx.userapp_route.clone()
         {
             let budget = ctx
-                .prod_connect_recovery
+                .app_connect_recovery
                 .as_ref()
                 .map(|recovery| {
                     recovery
@@ -888,26 +921,38 @@ fn default_error_status(error: &pingora::Error) -> u16 {
     }
 }
 
-/// 唤醒目标分类：路径 → `(app_id, touch)`。
+/// 唤醒/连接恢复目标分类：路径 → `(app_id, touch, stage)`。
 ///
-/// - `/api/v1/userapp/proxy/app/prod/...` 应用业务流量 → touch=true（闲置回收信号源）；
+/// - `/api/v1/userapp/proxy/app/prod/...` 应用业务流量 → touch=true（闲置回收信号源）、Prod；
 /// - `/api/v1/userapp/proxy/{ttyd,dbx}/prod/{app_id}` 工具族 → touch=false（终端/DB
-///   连接不算业务活跃，不刷新闲置计时——挂终端不阻止回收，回收后下次连接再唤醒）；
-/// - 其余路由 → None（不触发唤醒）。
-fn classify_wake_target(router: &matchit::Router<RouteType>, path: &str) -> Option<(String, bool)> {
+///   连接不算业务活跃，不刷新闲置计时——挂终端不阻止回收，回收后下次连接再唤醒）、Prod；
+/// - dev 三族（app/dbx/ttyd）→ 连接恢复覆盖（P0），touch=false 且 Dev 阶段
+///   （dev 访问追踪信号尚未按 stage 对接正确的回收器，不冒充业务活跃）；
+/// - 其余路由 → None（不触发唤醒/恢复）。
+fn classify_wake_target(
+    router: &matchit::Router<RouteType>,
+    path: &str,
+) -> Option<(String, bool, crate::service::types::ConnectRecoveryStage)> {
+    use crate::service::types::ConnectRecoveryStage;
     if !path.starts_with("/api/v1/userapp/proxy/") {
         return None;
     }
-    match router.at(path) {
-        Ok(m) => match m.value {
-            RouteType::ProdAppProxy => m.params.get("app_id").map(|s| (s.to_string(), true)),
-            RouteType::RuntimeTtydProxy | RouteType::ProdDbxProxy => {
-                m.params.get("app_id").map(|s| (s.to_string(), false))
-            }
-            _ => None,
-        },
-        Err(_) => None,
-    }
+    let matched = router.at(path).ok()?;
+    let stage = match matched.value {
+        RouteType::ProdAppProxy | RouteType::RuntimeTtydProxy | RouteType::ProdDbxProxy => {
+            ConnectRecoveryStage::Prod
+        }
+        RouteType::DevAppProxy | RouteType::DevDbxProxy | RouteType::DevTtydProxy => {
+            ConnectRecoveryStage::Dev
+        }
+        _ => return None,
+    };
+    let touch =
+        stage == ConnectRecoveryStage::Prod && matches!(matched.value, RouteType::ProdAppProxy);
+    matched
+        .params
+        .get("app_id")
+        .map(|s| (s.to_string(), touch, stage))
 }
 
 /// dbx 入口无尾斜杠 → 307 目标（原路径 + `/`，query 原样保留；相对 Location，
@@ -1035,10 +1080,15 @@ mod tests {
             "/api/v1/userapp/proxy/ttyd/prod/u1/app-1/token.js",
             "/api/v1/userapp/proxy/dbx/prod/u1/app-1",
         ] {
-            let (app_id, touch) =
+            let (app_id, touch, stage) =
                 classify_wake_target(&router, path).unwrap_or_else(|| panic!("{path} unmatched"));
             assert_eq!(app_id, "app-1", "{path}");
             assert!(!touch, "tool traffic must not refresh idle timer: {path}");
+            assert_eq!(
+                stage,
+                crate::service::types::ConnectRecoveryStage::Prod,
+                "prod tool family: {path}"
+            );
         }
     }
 
@@ -1046,24 +1096,47 @@ mod tests {
     #[test]
     fn app_traffic_wakes_with_touch() {
         let router = test_router();
-        let (app_id, touch) =
+        let (app_id, touch, stage) =
             classify_wake_target(&router, "/api/v1/userapp/proxy/app/prod/u1/app-1/x")
                 .expect("app proxy route must match");
         assert_eq!(app_id, "app-1");
         assert!(touch);
+        assert_eq!(stage, crate::service::types::ConnectRecoveryStage::Prod);
     }
 
-    /// 非唤醒路由与 dev 工具族不触发。
+    /// 非唤醒路由不触发。
     #[test]
     fn other_routes_do_not_wake() {
         let router = test_router();
         assert!(classify_wake_target(&router, "/api/v1/userapp/build").is_none());
         assert!(classify_wake_target(&router, "/web/ttyd/u1").is_none());
-        // dev 工具族走 builder 注册表定位，不在 prod 唤醒范围
-        assert!(classify_wake_target(&router, "/api/v1/userapp/proxy/ttyd/dev/u1/app-1").is_none());
         // 旧路径形态（前缀统一前）不再命中任何 userApp 路由
         assert!(classify_wake_target(&router, "/userapp/proxy/ttyd/u1/app-1").is_none());
         assert!(classify_wake_target(&router, "/proxy/userapp/proxy/1/app-1/x").is_none());
+    }
+
+    /// P0：dev 三族纳入连接恢复（touch=false，Dev 阶段）。
+    #[test]
+    fn dev_families_enter_recovery_without_touch() {
+        let router = test_router();
+        for path in [
+            "/api/v1/userapp/proxy/app/dev/u1/app-1/x",
+            "/api/v1/userapp/proxy/dbx/dev/u1/app-1",
+            "/api/v1/userapp/proxy/ttyd/dev/u1/app-1",
+        ] {
+            let (app_id, touch, stage) =
+                classify_wake_target(&router, path).unwrap_or_else(|| panic!("{path} unmatched"));
+            assert_eq!(app_id, "app-1", "{path}");
+            assert!(
+                !touch,
+                "dev traffic must not feed prod idle signals: {path}"
+            );
+            assert_eq!(
+                stage,
+                crate::service::types::ConnectRecoveryStage::Dev,
+                "dev family must classify as Dev: {path}"
+            );
+        }
     }
 
     /// dbx 入口无尾斜杠：307 到同路径 + `/`（query 原样保留），dev/prod 双阶段。

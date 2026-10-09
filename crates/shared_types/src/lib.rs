@@ -58,7 +58,9 @@ pub use userapp::dev_cleanup::{
     BuilderCollaboratorDeletionReceipt, BuilderDeletionSnapshot, BuilderRegistryIdentity,
     DeletionInspection, UserappDevCleanup, UserappDevDeletion, UserappDevDeletionReceipt,
 };
-pub use userapp::dev_locator::{UserappDevEnsure, UserappDevLocator};
+pub use userapp::dev_locator::{
+    DevBuilderInstance, DevEnsureError, UserappDevEnsure, UserappDevLocator,
+};
 pub use userapp::forward_contract::{
     APP_ID_HEADER, APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, ComputerServiceKind,
     SERVICE_TYPE_HEADER, SERVICE_TYPE_NORMAL_PROJECT, SERVICE_TYPE_PAGE_APP,

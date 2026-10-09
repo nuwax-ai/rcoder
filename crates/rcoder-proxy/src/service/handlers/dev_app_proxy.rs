@@ -89,13 +89,7 @@ pub async fn handle_dev_app_upstream(
     deps.metrics
         .record_request_port(shared_types::APP_ENTRY_PORT);
 
-    let dev_container_ip = find_dev_container(
-        deps.container_lookup,
-        deps.dev_ensure,
-        app_id,
-        shared_types::APP_ENTRY_PORT,
-    )
-    .await?;
+    let dev_container_ip = find_dev_container(deps.dev_ensure, app_id).await?;
 
     // inc_active 放在 peer 构造前（成功路径）：lookup 失败的 502 不会进
     // response_filter（dec_active 只在那里执行），提前 inc 会造成 gauge 单调虚增

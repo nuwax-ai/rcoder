@@ -94,6 +94,10 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
         &mut config.userapp_recycle.wake_timeout_seconds,
     );
     env_override_u64(
+        "RCODER_USERAPP_DEV_ENTRY_WAIT_SECONDS",
+        &mut config.userapp_recycle.dev_entry_wait_timeout_seconds,
+    );
+    env_override_u64(
         "RCODER_USERAPP_PROTECTION_SECONDS",
         &mut config.userapp_recycle.protection_seconds,
     );

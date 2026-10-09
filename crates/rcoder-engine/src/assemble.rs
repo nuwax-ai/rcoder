@@ -300,6 +300,13 @@ pub async fn assemble(
         pingora_service.set_dev_ensure(userapp_builder::dev_ensure_for_proxy(Arc::downgrade(
             &state,
         )));
+        // dev 入口恢复总预算（P0）：配置驱动（默认 15s，clamp 5-60）。
+        pingora_service.set_dev_entry_wait(std::time::Duration::from_secs(
+            bootstrap_result
+                .config
+                .userapp_recycle
+                .dev_entry_wait_timeout_seconds,
+        ));
     }
 
     // UserApp 错误页呈现器回填：与 Axum 管理面共享同一页面服务实例（唯一

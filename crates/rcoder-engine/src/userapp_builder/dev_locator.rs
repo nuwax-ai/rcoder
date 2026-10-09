@@ -87,23 +87,109 @@ impl shared_types::UserappDevLocator for UserappDevLocator {
 /// 创建。应用共享：按 app_id 定位（URL 用户占位段不参与）。
 #[async_trait::async_trait]
 impl shared_types::UserappDevEnsure for UserappDevLocator {
+    async fn locate_dev_builder(
+        &self,
+        app_id: &str,
+    ) -> Result<Option<shared_types::DevBuilderInstance>, shared_types::DevEnsureError> {
+        let state = self
+            .state()
+            .map_err(|error| shared_types::DevEnsureError::ObserveFailed {
+                app_id: app_id.to_string(),
+                detail: error,
+            })?;
+        let found = state
+            .runtime()
+            .find_container(app_id, &ServiceType::UserappBuilder)
+            .await
+            .map_err(|error| shared_types::DevEnsureError::ObserveFailed {
+                app_id: app_id.to_string(),
+                detail: format!("find UserappBuilder: {error}"),
+            })?;
+        let Some(info) = found else {
+            return Ok(None);
+        };
+        if info.container_ip.is_empty() {
+            // 权威存在但无地址（Pending/重启窗口）：不可拨流也不可 ensure 绕过，
+            // 交调用方等待语义（P0 总预算内重试）。
+            return Err(shared_types::DevEnsureError::NotReady {
+                app_id: app_id.to_string(),
+                detail: format!("builder present without address (status {:?})", info.status),
+            });
+        }
+        Ok(Some(shared_types::DevBuilderInstance {
+            address: info.container_ip,
+            container_id: info.container_id,
+        }))
+    }
+
     async fn ensure_dev_container(
         &self,
         app_id: &str,
-    ) -> Result<shared_types::ContainerBasicInfo, String> {
-        let state = self.state()?;
+    ) -> Result<shared_types::ContainerBasicInfo, shared_types::DevEnsureError> {
+        let state = self
+            .state()
+            .map_err(|error| shared_types::DevEnsureError::EnsureFailed {
+                app_id: app_id.to_string(),
+                detail: error,
+            })?;
         let (info, created) = ensure_userapp_builder_probed(&state, app_id)
             .await
-            .map_err(|e| format!("ensure UserappBuilder (app {app_id}): {e:#}"))?;
+            .map_err(|error| classify_ensure_error(app_id, &error))?;
         if created {
             tracing::info!("[USERAPP_DEV_LOCATOR] builder ensured on demand: app_id={app_id}");
         }
         Ok(info)
     }
+}
 
-    async fn dev_builder_exists(&self, app_id: &str) -> Result<bool, String> {
-        // 与 dev_container_alive 同一类型化事实源：find_container 按身份键
-        // 匹配——容器被删/被他人 IP 复用时恒 false。
-        shared_types::UserappDevLocator::dev_container_alive(self, app_id).await
+/// ensure 链 anyhow 错误 → 类型化失败。以链上保留的 `AppOperationError`
+/// 类型根判别（非字符串猜测）；未识别的根按执行故障兜底。
+fn classify_ensure_error(app_id: &str, error: &anyhow::Error) -> shared_types::DevEnsureError {
+    use app_manager::models::AppOperationError;
+    let app_id = app_id.to_string();
+    if let Some(operation_error) = error.downcast_ref::<AppOperationError>() {
+        return classify_app_operation_error(app_id, operation_error);
+    }
+    shared_types::DevEnsureError::EnsureFailed {
+        app_id,
+        detail: format!("{error:#}"),
+    }
+}
+
+fn classify_app_operation_error(
+    app_id: String,
+    error: &app_manager::models::AppOperationError,
+) -> shared_types::DevEnsureError {
+    use app_manager::models::AppOperationError;
+    match error {
+        AppOperationError::NotFound(_) => shared_types::DevEnsureError::BuilderAbsent { app_id },
+        AppOperationError::Conflict(_)
+        | AppOperationError::ConflictBlocked { .. }
+        | AppOperationError::OperationInProgress { .. } => {
+            shared_types::DevEnsureError::OperationInFlight {
+                app_id,
+                detail: error.to_string(),
+            }
+        }
+        // 受理回执包一层操作身份后内嵌原始拒绝——递归按内层判别。
+        AppOperationError::Operation { source, .. } => classify_app_operation_error(app_id, source),
+        AppOperationError::Diagnostic(wake_failure) => {
+            // wake 准入被 blocker 阻塞视作围栏；其余 wake 失败按执行故障。
+            if wake_failure.blocker.is_some() {
+                shared_types::DevEnsureError::OperationInFlight {
+                    app_id,
+                    detail: wake_failure.to_string(),
+                }
+            } else {
+                shared_types::DevEnsureError::EnsureFailed {
+                    app_id,
+                    detail: wake_failure.to_string(),
+                }
+            }
+        }
+        _ => shared_types::DevEnsureError::EnsureFailed {
+            app_id,
+            detail: error.to_string(),
+        },
     }
 }

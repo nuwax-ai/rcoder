@@ -85,6 +85,10 @@ pub struct PingoraProxyService {
     /// Pingap 来源确认用。None = 无证据，一律通用文案 + 不替换上游正文）
     pub(crate) failure_advisor_slot:
         Arc<ArcSwapOption<Arc<dyn crate::error_page::UserAppProxyFailureAdvisor>>>,
+    /// dev 入口连接恢复总预算（P0）：拒连/超时重试与端口等待的 deadline。
+    /// 共享槽——engine 配置装配后经 [`Self::set_dev_entry_wait`] 覆盖，
+    /// PortProxy 共享同槽实时见。
+    dev_entry_wait_slot: Arc<ArcSwap<std::time::Duration>>,
 }
 
 /// 为了兼容现有接口，我们保留原来的 PortProxyService 别名
@@ -129,6 +133,15 @@ pub struct PortProxy {
     /// UserApp 失败诊断顾问槽（与 PingoraProxyService 共享同一 Arc）
     pub(crate) failure_advisor_slot:
         Arc<ArcSwapOption<Arc<dyn crate::error_page::UserAppProxyFailureAdvisor>>>,
+    /// dev 入口恢复预算槽（与 PingoraProxyService 共享同一 Arc）
+    pub(crate) dev_entry_wait_slot: Arc<ArcSwap<std::time::Duration>>,
+}
+
+impl PortProxy {
+    /// dev 入口恢复总预算（共享槽实时值）。
+    pub(crate) fn dev_entry_wait(&self) -> std::time::Duration {
+        *self.dev_entry_wait_slot.load_full()
+    }
 }
 
 impl PingoraProxyService {
@@ -157,7 +170,21 @@ impl PingoraProxyService {
             preview_slot: Arc::new(ArcSwapOption::from(None)),
             error_pages_slot: Arc::new(ArcSwapOption::from(None)),
             failure_advisor_slot: Arc::new(ArcSwapOption::from(None)),
+            dev_entry_wait_slot: Arc::new(ArcSwap::from_pointee(Self::DEFAULT_DEV_ENTRY_WAIT)),
         }
+    }
+
+    /// dev 入口恢复默认预算（15s，clamp 区间 5-60s；配置接线见 engine 侧）。
+    pub(crate) const DEFAULT_DEV_ENTRY_WAIT: std::time::Duration =
+        std::time::Duration::from_secs(15);
+
+    /// 覆盖 dev 入口恢复预算（engine 配置装配后调用；越界值 clamp 到
+    /// [5s, 60s]——配置错误不得放大等待面；PortProxy 共享槽实时见）。
+    pub fn set_dev_entry_wait(&self, wait: std::time::Duration) {
+        const MIN: std::time::Duration = std::time::Duration::from_secs(5);
+        const MAX: std::time::Duration = std::time::Duration::from_secs(60);
+        self.dev_entry_wait_slot
+            .store(Arc::new(wait.clamp(MIN, MAX)));
     }
 
     /// 回填 UserApp 失败诊断顾问（engine 装配后调用；PortProxy 共享槽）。
@@ -270,6 +297,7 @@ impl PingoraProxyService {
             preview_slot: Arc::clone(&self.preview_slot),
             error_pages_slot: Arc::clone(&self.error_pages_slot),
             failure_advisor_slot: Arc::clone(&self.failure_advisor_slot),
+            dev_entry_wait_slot: Arc::clone(&self.dev_entry_wait_slot),
         })
     }
 }
@@ -295,6 +323,7 @@ impl Clone for PingoraProxyService {
             preview_slot: Arc::clone(&self.preview_slot),
             error_pages_slot: Arc::clone(&self.error_pages_slot),
             failure_advisor_slot: Arc::clone(&self.failure_advisor_slot),
+            dev_entry_wait_slot: Arc::clone(&self.dev_entry_wait_slot),
         }
     }
 }

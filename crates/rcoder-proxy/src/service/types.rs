@@ -205,11 +205,25 @@ pub struct HealthInfo {
 }
 
 /// 请求追踪上下文
+/// 连接恢复的目标阶段——两阶段恢复语义不同：
+/// - `Prod`：走 wake control（stopped/starting 触发 ensure_running 等待拉起）；
+/// - `Dev`：无唤醒语义（流量只 ensure 容器，服务编排由显式操作驱动），
+///   仅重解析地址 + 等待端口就绪。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectRecoveryStage {
+    Dev,
+    Prod,
+}
+
+/// UserApp 连接恢复上下文（dev/prod 共用结构，按 [`ConnectRecoveryStage`]
+/// 分支恢复行为）：拒连/超时在 deadline 内重试；上游建连成功即清除。
 #[derive(Clone)]
-pub struct ProdConnectRecovery {
+pub struct AppConnectRecovery {
     pub app_id: String,
+    pub stage: ConnectRecoveryStage,
     pub deadline: tokio::time::Instant,
     pub retry_requested: bool,
+    /// prod：首次重试前核对集群真实运行态（wake）；dev 恒 true（无该环节）。
     pub runtime_checked: bool,
     pub unavailable_response: bool,
 }
@@ -272,7 +286,7 @@ pub struct TrackingCtx {
     /// 替换正文是否已输出（body filter 只发一次）
     pub error_replacement_emitted: bool,
     /// Request-scoped deadline and retry state for prod UserApp connections.
-    pub prod_connect_recovery: Option<ProdConnectRecovery>,
+    pub app_connect_recovery: Option<AppConnectRecovery>,
     /// Keep prod app request counting stable across retries, including route failures.
     pub prod_request_recorded: bool,
     /// Only one handler metric increment and active gauge increment per request.
@@ -307,7 +321,7 @@ impl TrackingCtx {
             preview_internal_token: None,
             preview_forward_port: None,
             preview_origin_port: None,
-            prod_connect_recovery: None,
+            app_connect_recovery: None,
             prod_request_recorded: false,
             prod_metrics_counted: false,
         }

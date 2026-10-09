@@ -78,13 +78,7 @@ pub async fn handle_dev_dbx_upstream(
 ) -> PingoraResult<Box<HttpPeer>> {
     let app_id = require_app_id(&params)?;
     accept_placeholder_user_id(&params)?;
-    let container_addr = find_dev_container(
-        deps.container_lookup,
-        deps.dev_ensure,
-        &app_id,
-        shared_types::DBX_PORT,
-    )
-    .await?;
+    let container_addr = find_dev_container(deps.dev_ensure, &app_id).await?;
 
     deps.metrics.record_request();
     deps.metrics.inc_active();

@@ -40,19 +40,22 @@ pub struct DevProxyDeps<'a> {
     pub dev_ensure: &'a arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
 }
 
-/// 懒启动：注册表 miss 时经 `UserappDevEnsure` 回调自动 ensure 创建（开终端是
-/// 使用语义；owner 走 metadata 链——浏览器终端 URL 无入参携带能力），
-/// ensure 失败或回调未注入才 404（指引先建工作区）。
+/// 权威定位 + 懒启动：经 `UserappDevEnsure` 解析该 app 开发容器当前地址。
 ///
-/// `probe_port`：注册表命中后的死值探测——内存 lookup 表（rcoder-storage）
-/// 不随容器物理删除失效（hit 恒返旧 IP），TCP connect 该端口失败即视为
-/// 死值，落入 ensure 懒启动自愈（ensure 幂等：容器真在则复用，探测误判
-/// 只是多一次幂等调用）。
+/// F1 语义（V2-01 fail-closed）：
+/// - **权威定位优先**——运行时观测的当前地址是唯一可信值，内存注册表
+///   候选不再参与（残影/IP 被其他应用复用的跨应用污染形态由权威值淘汰，
+///   也不再用 TCP 端口探测替代身份核验）；端口级可用性交由调用方的
+///   连接恢复（P0）处理，本函数只保证"地址正确"。
+/// - **依赖未注入即暂不可用**（装配窗口 `AppState` 晚于 Pingora 启动）：
+///   返回 503，绝不回退注册表+端口探测。
+/// - 权威查询失败（`ObserveFailed`）重试一次后诚实失败——不当作不存在、
+///   不借 ensure 绕过保护；仅确认不存在（`Ok(None)`）才走懒启动 ensure。
+/// - ensure 失败为类型化 [`shared_types::DevEnsureError`]，按三族合同映射
+///   （`BuilderAbsent`→404 指引，围栏/未就绪/故障→503 带原因）。
 pub(crate) async fn find_dev_container(
-    container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
     dev_ensure: &arc_swap::ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>,
     app_id: &str,
-    probe_port: u16,
 ) -> Result<String, Box<pingora_core::Error>> {
     if let Err(e) = shared_types::validate_identifier(app_id, "app_id") {
         warn!("[DEV_TERMINAL] invalid app_id: {}", e);
@@ -60,43 +63,39 @@ pub(crate) async fn find_dev_container(
             pingora_core::ErrorType::HTTPStatus(400),
         ));
     }
-    // 应用共享（R07）：定位键 = 纯 app_id。URL 的用户占位段不提取、不校验、
-    // 不参与定位（UserApp 去绑定 spec §2.3——同 app 任意非空占位段到同实例）。
-    let instance = Some(app_id.to_string());
-    if let Some(ip) = instance
-        .as_deref()
-        .and_then(|key| {
-            container_lookup.as_ref().and_then(|lookup| {
-                lookup.find_by_project_id(key, &shared_types::ServiceType::UserappBuilder)
-            })
-        })
-        .filter(|ip| !ip.is_empty())
-    {
-        // 注册表 IP 是内存残影：不随容器删除失效，且 IP 可被其他应用的
-        // builder 复用（端口探测通过≠身份正确——跨应用污染形态）。接受该
-        // IP 前先经类型化身份核验（按复合身份键查运行时）；核验不可用
-        // （回调未注入）时退回端口探测旧语义。
-        let identity_ok = match dev_ensure.load_full() {
-            Some(ensurer) => match ensurer.dev_builder_exists(app_id).await {
-                Ok(exists) => exists,
-                Err(e) => {
-                    warn!("[DEV_TERMINAL] builder identity check failed: app_id={app_id}: {e}");
-                    false
-                }
-            },
-            None => true,
-        };
-        if identity_ok && utils::tcp_port_reachable(&ip, probe_port).await {
-            return Ok(ip);
+    let Some(ensurer) = dev_ensure.load_full() else {
+        warn!("[DEV_TERMINAL] dev ensure callback not injected: app_id={app_id}");
+        return Err(dev_unavailable_error(
+            app_id,
+            "dev dependency is not ready (assembly window); retry shortly",
+        ));
+    };
+    let mut locate = ensurer.locate_dev_builder(app_id).await;
+    if matches!(
+        locate,
+        Err(shared_types::DevEnsureError::ObserveFailed { .. })
+    ) {
+        locate = ensurer.locate_dev_builder(app_id).await;
+    }
+    match locate {
+        Ok(None) => ensure_dev_address(&ensurer, app_id).await,
+        Ok(Some(instance)) => Ok(instance.address),
+        Err(error) => {
+            warn!(
+                "[DEV_TERMINAL] locate dev container failed: app_id={app_id}: {}",
+                error.brief()
+            );
+            Err(map_dev_ensure_error(app_id, &error))
         }
     }
-    // miss（或命中死值——容器被外部删除后内存表残留旧 IP，探测失败）
-    // → 懒启动（应用共享：按 app_id 定位，URL 用户占位段不参与）。
-    // 槽未回填（AppState 就绪前）视为未注入，维持 404 指引。
-    let Some(ensurer) = dev_ensure.load_full() else {
-        info!("[DEV_TERMINAL] dev container not found: app_id={app_id} (create workspace first)");
-        return Err(not_found_error(app_id));
-    };
+}
+
+/// 确认不存在后的懒启动（开终端是使用语义；owner 走 metadata 链——
+/// 浏览器终端 URL 无入参携带能力）。
+async fn ensure_dev_address(
+    ensurer: &Arc<dyn shared_types::UserappDevEnsure>,
+    app_id: &str,
+) -> Result<String, Box<pingora_core::Error>> {
     match ensurer.ensure_dev_container(app_id).await {
         Ok(info) if !info.container_ip.is_empty() => {
             info!("[DEV_TERMINAL] dev container ensured on demand: app_id={app_id}");
@@ -104,15 +103,42 @@ pub(crate) async fn find_dev_container(
         }
         Ok(info) => {
             warn!("[DEV_TERMINAL] ensured dev container has no ip: app_id={app_id}, info={info:?}");
-            Err(not_found_error(app_id))
+            Err(dev_unavailable_error(
+                app_id,
+                "ensured dev container has no address yet",
+            ))
         }
-        Err(e) => {
+        Err(error) => {
             warn!(
-                "[DEV_TERMINAL] ensure dev container failed: app_id={app_id}: {e} (create workspace first)"
+                "[DEV_TERMINAL] ensure dev container failed: app_id={app_id}: {}",
+                error.brief()
             );
-            Err(not_found_error(app_id))
+            Err(map_dev_ensure_error(app_id, &error))
         }
     }
+}
+
+/// 类型化失败 → HTTP（三族合同的中期形态：T5 引入用户面分档页前的
+/// 统一映射；真实语义不吞不改——404 指引/503 带原因）。
+fn map_dev_ensure_error(
+    app_id: &str,
+    error: &shared_types::DevEnsureError,
+) -> Box<pingora_core::Error> {
+    match error {
+        shared_types::DevEnsureError::BuilderAbsent { .. } => not_found_error(app_id),
+        shared_types::DevEnsureError::OperationInFlight { .. }
+        | shared_types::DevEnsureError::NotReady { .. }
+        | shared_types::DevEnsureError::ObserveFailed { .. }
+        | shared_types::DevEnsureError::EnsureFailed { .. } => {
+            dev_unavailable_error(app_id, &error.brief())
+        }
+    }
+}
+
+fn dev_unavailable_error(app_id: &str, reason: &str) -> Box<pingora_core::Error> {
+    pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(503)).more_context(format!(
+        "userapp dev container for app {app_id} unavailable: {reason}"
+    ))
 }
 
 fn not_found_error(app_id: &str) -> Box<pingora_core::Error> {
@@ -215,13 +241,7 @@ pub async fn handle_dev_ttyd_upstream(
 ) -> PingoraResult<Box<HttpPeer>> {
     let app_id = require_app_id(&params)?;
     accept_placeholder_user_id(&params)?;
-    let container_ip = find_dev_container(
-        deps.container_lookup,
-        deps.dev_ensure,
-        &app_id,
-        shared_types::WS_TERMINAL_PORT,
-    )
-    .await?;
+    let container_ip = find_dev_container(deps.dev_ensure, &app_id).await?;
 
     deps.metrics.record_request();
     deps.metrics.inc_active();
@@ -274,13 +294,7 @@ pub async fn handle_dev_vnc_upstream(
 ) -> PingoraResult<Box<HttpPeer>> {
     let app_id = require_app_id(&params)?;
     accept_placeholder_user_id(&params)?;
-    let container_ip = find_dev_container(
-        deps.container_lookup,
-        deps.dev_ensure,
-        &app_id,
-        shared_types::NOVNC_PORT,
-    )
-    .await?;
+    let container_ip = find_dev_container(deps.dev_ensure, &app_id).await?;
 
     deps.metrics.record_request();
     deps.metrics.inc_active();
@@ -327,10 +341,7 @@ pub async fn handle_dev_audio_request(
     };
 
     accept_placeholder_user_id(&params)?;
-    // audio 传 0 跳过命中探测：builder 容器无音频服务（svc 亦不声明
-    // 6089/6090），探测恒超时只增每请求延迟
-    let container_ip =
-        find_dev_container(deps.container_lookup, deps.dev_ensure, &app_id, 0).await?;
+    let container_ip = find_dev_container(deps.dev_ensure, &app_id).await?;
     deps.metrics.record_request();
     deps.metrics.record_request_port(target_port);
     ctx.target_port = Some(target_port);
@@ -386,13 +397,7 @@ pub async fn handle_dev_ime_request(
     accept_placeholder_user_id(&params)?;
     let target_path = target_path_of(&params);
 
-    let container_ip = find_dev_container(
-        deps.container_lookup,
-        deps.dev_ensure,
-        &app_id,
-        shared_types::IME_PORT,
-    )
-    .await?;
+    let container_ip = find_dev_container(deps.dev_ensure, &app_id).await?;
     deps.metrics.record_request();
     deps.metrics.record_request_port(shared_types::IME_PORT);
     ctx.target_port = Some(shared_types::IME_PORT);

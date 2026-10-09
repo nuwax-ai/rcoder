@@ -208,6 +208,10 @@ pub struct UserAppRecycleConfig {
     /// 流量唤醒 hold-and-wait 上限（秒），默认 60；超时返回 503+Retry-After
     #[serde(default = "default_userapp_wake_timeout_seconds")]
     pub wake_timeout_seconds: u64,
+    /// dev 入口连接恢复总预算（秒），默认 15，clamp 5-60：dev 域名流量对
+    /// 拒连/超时在预算内重试并等待端口就绪（服务重启窗口）；不含 wake 语义
+    #[serde(default = "default_userapp_dev_entry_wait_timeout_seconds")]
+    pub dev_entry_wait_timeout_seconds: u64,
     /// 新建 app 最小保护期（秒），默认 300；龄期小于此值不回收
     #[serde(default = "default_userapp_protection_seconds")]
     pub protection_seconds: u64,
@@ -229,6 +233,10 @@ fn default_userapp_scan_interval_seconds() -> u64 {
 
 fn default_userapp_wake_timeout_seconds() -> u64 {
     60
+}
+
+fn default_userapp_dev_entry_wait_timeout_seconds() -> u64 {
+    15
 }
 
 fn default_userapp_protection_seconds() -> u64 {
@@ -266,6 +274,7 @@ impl Default for UserAppRecycleConfig {
             idle_timeout_seconds: default_userapp_idle_timeout_seconds(),
             scan_interval_seconds: default_userapp_scan_interval_seconds(),
             wake_timeout_seconds: default_userapp_wake_timeout_seconds(),
+            dev_entry_wait_timeout_seconds: default_userapp_dev_entry_wait_timeout_seconds(),
             protection_seconds: default_userapp_protection_seconds(),
         }
     }
