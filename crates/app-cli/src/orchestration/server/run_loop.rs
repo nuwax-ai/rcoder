@@ -1733,7 +1733,13 @@ mod lifecycle_tests {
             toml::to_string(&custom_release("artifact-a")).unwrap(),
         )
         .unwrap();
-        let config = |port| format!("[servers.app]\naddr = \"127.0.0.1:{port}\"\n");
+        // 候选配置必须满足平台入口契约（0.0.0.0:9080），否则会在编译校验处
+        // 被拒，到不了本测试要验证的「server 拓扑变化拒绝」判定。
+        let config = |port| {
+            format!(
+                "[basic]\n\n[servers.entry]\naddr = \"0.0.0.0:9080\"\n\n[servers.app]\naddr = \"127.0.0.1:{port}\"\n"
+            )
+        };
         std::fs::write(source.join("proxy.toml"), config(19082)).unwrap();
         std::fs::write(current.join("proxy.toml"), config(19081)).unwrap();
         let log_dir = root.path().join("logs");

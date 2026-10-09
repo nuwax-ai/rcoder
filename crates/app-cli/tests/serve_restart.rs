@@ -215,6 +215,45 @@ async fn replaced_container_consumes_deploy_declaration_env() {
     first.0.kill().unwrap();
     first.0.wait().unwrap();
 
+    // 平台域回收契约：resident 所有权守卫要求跨实例接管必须持有原域的
+    // 平台退出证据（平台"确认原物理域不可再运行"后发布）。模拟平台观察到
+    // 旧容器消亡：按 pending 退休提案的口径把 physical-exit.json 写进原
+    // generation 工作目录（与 supervision physical-domain-recovery confirm 等价）。
+    let dead = runtime_supervisor::last_snapshot(&scope).unwrap();
+    let generation_id = dead
+        .generation
+        .clone()
+        .expect("ready supervisor owns a generation");
+    let work = scope.join("work");
+    let mut evidence_written = false;
+    for entry in std::fs::read_dir(&work).unwrap() {
+        let path = entry.unwrap().path();
+        let record = path.join("generation.json");
+        if !record.is_file() {
+            continue;
+        }
+        let generation: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+        if generation["id"].as_str() != Some(generation_id.as_str()) {
+            continue;
+        }
+        let proof = serde_json::json!({
+            "binding": {
+                "component": dead.binding.component,
+                "resource": dead.binding.resource,
+            },
+            "generation": generation_id,
+            "supervisor_id": generation["supervisor"],
+            "domain": generation["physical_domain"],
+        });
+        std::fs::write(path.join("physical-exit.json"), proof.to_string()).unwrap();
+        evidence_written = true;
+    }
+    assert!(
+        evidence_written,
+        "physical exit evidence was never published for the dead container"
+    );
+
     let operation_id = "replaced-deploy-op-1";
     let mut envs = domain_envs("container-b");
     envs.push((
