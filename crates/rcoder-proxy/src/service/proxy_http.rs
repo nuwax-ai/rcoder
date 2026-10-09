@@ -20,6 +20,8 @@ use super::{AppConnectRecovery, PortProxy, TrackingCtx, utils};
 
 const CONNECT_RECOVERY_RETRY_DELAY: Duration = Duration::from_millis(250);
 const CONNECT_RECOVERY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+/// dev 等待期重解析切片：每片等待后重新权威解析一次地址（Pod 换 IP 跟进）。
+const DEV_RE_RESOLVE_SLICE: Duration = Duration::from_secs(1);
 
 /// Probe only after Pingora's real first connection failed. This uses the same
 /// destination as the request but sends no HTTP bytes; Pingora retries the
@@ -46,6 +48,31 @@ async fn wait_for_peer_connection(peer: &HttpPeer, deadline: tokio::time::Instan
                 .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
         )
         .await;
+    }
+}
+
+impl PortProxy {
+    /// dispatch + 恢复预算约束（T4a）：存在恢复上下文时，定位/ensure 的
+    /// dispatch 以 deadline 为上限——超时不取消已受理的独立创建工作
+    /// （builder 租约自有生命周期），本请求诚实 503。
+    async fn dispatch_peer_with_recovery_deadline(
+        &self,
+        route: RouteType,
+        params: matchit::Params<'_, '_>,
+        ctx: &mut TrackingCtx,
+    ) -> PingoraResult<Box<HttpPeer>> {
+        let deadline = ctx
+            .app_connect_recovery
+            .as_ref()
+            .map(|state| state.deadline);
+        let dispatch = self.dispatch_upstream_peer(route, params, ctx);
+        match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, dispatch).await {
+                Ok(result) => result,
+                Err(_) => Err(pingora_core::Error::new(ErrorType::HTTPStatus(503))),
+            },
+            None => dispatch.await,
+        }
     }
 }
 
@@ -375,8 +402,10 @@ impl ProxyHttp for PortProxy {
                 }
             }
         }
+        // T4a：定位/ensure 纳入恢复总预算——超时不取消已受理的独立创建
+        // 工作（builder 租约自有生命周期），本请求诚实失败、后续请求受益。
         let mut peer = self
-            .dispatch_upstream_peer(*matched.value, matched.params, ctx)
+            .dispatch_peer_with_recovery_deadline(*matched.value, matched.params.clone(), ctx)
             .await?;
         if let Some(state) = ctx.app_connect_recovery.as_mut() {
             let remaining = state
@@ -399,14 +428,50 @@ impl ProxyHttp for PortProxy {
                     .min(remaining),
             );
         }
-        if let Some((app_id, _stage, deadline, _)) = recovery
-            && !wait_for_peer_connection(&peer, deadline).await
-        {
-            warn!(%app_id, "UserApp service connection did not recover before wait deadline");
-            if let Some(state) = ctx.app_connect_recovery.as_mut() {
-                state.unavailable_response = true;
+        if let Some((app_id, stage, deadline, _)) = recovery {
+            let recovered = if stage == crate::service::types::ConnectRecoveryStage::Dev {
+                // T4b：dev 周期重解析等待——等待期间 Pod 换 IP 时跟进权威
+                // 新地址（重解析经 dispatch 的 locate；metrics 由 ctx 守卫
+                // 每请求只计一次）。
+                let mut recovered = false;
+                loop {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let slice_deadline = (now + DEV_RE_RESOLVE_SLICE).min(deadline);
+                    if wait_for_peer_connection(&peer, slice_deadline).await {
+                        recovered = true;
+                        break;
+                    }
+                    // 切片等待未就绪：预算内重解析一次（ensure 的独立受理
+                    // 工作不受本请求等待影响）。
+                    match self
+                        .dispatch_peer_with_recovery_deadline(
+                            *matched.value,
+                            matched.params.clone(),
+                            ctx,
+                        )
+                        .await
+                    {
+                        Ok(re_resolved) => peer = re_resolved,
+                        Err(error) => {
+                            warn!(%app_id, "dev re-resolve during connection wait failed: {error}");
+                            break;
+                        }
+                    }
+                }
+                recovered
+            } else {
+                wait_for_peer_connection(&peer, deadline).await
+            };
+            if !recovered {
+                warn!(%app_id, "UserApp service connection did not recover before wait deadline");
+                if let Some(state) = ctx.app_connect_recovery.as_mut() {
+                    state.unavailable_response = true;
+                }
+                return Err(pingora_core::Error::new(ErrorType::HTTPStatus(503)));
             }
-            return Err(pingora_core::Error::new(ErrorType::HTTPStatus(503)));
         }
         Ok(peer)
     }
@@ -561,6 +626,7 @@ impl ProxyHttp for PortProxy {
         // 减少活跃连接数
         self.metrics.dec_active();
         ctx.prod_metrics_counted = false;
+        ctx.dev_metrics_counted = false;
 
         // 记录上游状态码：upstream_response_body_filter 据此收集 4xx/5xx 错误体
         ctx.upstream_status = Some(status.as_u16());

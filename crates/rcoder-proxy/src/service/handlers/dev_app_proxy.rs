@@ -85,15 +85,21 @@ pub async fn handle_dev_app_upstream(
     })?;
 
     ctx.target_port = Some(shared_types::APP_ENTRY_PORT);
-    deps.metrics.record_request();
-    deps.metrics
-        .record_request_port(shared_types::APP_ENTRY_PORT);
+    if !ctx.dev_request_recorded {
+        deps.metrics.record_request();
+        deps.metrics
+            .record_request_port(shared_types::APP_ENTRY_PORT);
+        ctx.dev_request_recorded = true;
+    }
 
     let dev_container_ip = find_dev_container(deps.dev_ensure, app_id).await?;
 
     // inc_active 放在 peer 构造前（成功路径）：lookup 失败的 502 不会进
     // response_filter（dec_active 只在那里执行），提前 inc 会造成 gauge 单调虚增
-    deps.metrics.inc_active();
+    if !ctx.dev_metrics_counted {
+        deps.metrics.inc_active();
+        ctx.dev_metrics_counted = true;
+    }
 
     debug!(
         "dev app route: user_id={}, app_id={}, {}:{}",

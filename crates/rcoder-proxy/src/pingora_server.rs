@@ -265,6 +265,10 @@ impl ProxyHttp for ProxyServiceWrapper {
             self.inner.metrics.dec_active();
             ctx.prod_metrics_counted = false;
         }
+        if ctx.dev_metrics_counted {
+            self.inner.metrics.dec_active();
+            ctx.dev_metrics_counted = false;
+        }
         let recoverable_connect_error = ctx.app_connect_recovery.is_some()
             && matches!(
                 error.etype(),

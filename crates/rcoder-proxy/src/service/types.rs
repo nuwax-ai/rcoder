@@ -291,6 +291,10 @@ pub struct TrackingCtx {
     pub prod_request_recorded: bool,
     /// Only one handler metric increment and active gauge increment per request.
     pub prod_metrics_counted: bool,
+    /// dev 族同款守卫：连接恢复的重试/周期重解析会重跑 upstream handler，
+    /// 请求计数与活跃 gauge 每请求只计一次。
+    pub dev_request_recorded: bool,
+    pub dev_metrics_counted: bool,
 }
 
 impl Default for TrackingCtx {
@@ -324,6 +328,8 @@ impl TrackingCtx {
             app_connect_recovery: None,
             prod_request_recorded: false,
             prod_metrics_counted: false,
+            dev_request_recorded: false,
+            dev_metrics_counted: false,
         }
     }
 }

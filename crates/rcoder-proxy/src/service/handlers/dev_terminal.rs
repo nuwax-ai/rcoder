@@ -243,8 +243,14 @@ pub async fn handle_dev_ttyd_upstream(
     accept_placeholder_user_id(&params)?;
     let container_ip = find_dev_container(deps.dev_ensure, &app_id).await?;
 
-    deps.metrics.record_request();
-    deps.metrics.inc_active();
+    if !ctx.dev_request_recorded {
+        deps.metrics.record_request();
+        ctx.dev_request_recorded = true;
+    }
+    if !ctx.dev_metrics_counted {
+        deps.metrics.inc_active();
+        ctx.dev_metrics_counted = true;
+    }
     ctx.vnc_target_ip = Some(container_ip.clone());
     debug!(
         "[DEV_TTYD] app_id={} -> {}:{}",
@@ -296,8 +302,14 @@ pub async fn handle_dev_vnc_upstream(
     accept_placeholder_user_id(&params)?;
     let container_ip = find_dev_container(deps.dev_ensure, &app_id).await?;
 
-    deps.metrics.record_request();
-    deps.metrics.inc_active();
+    if !ctx.dev_request_recorded {
+        deps.metrics.record_request();
+        ctx.dev_request_recorded = true;
+    }
+    if !ctx.dev_metrics_counted {
+        deps.metrics.inc_active();
+        ctx.dev_metrics_counted = true;
+    }
     ctx.vnc_target_ip = Some(container_ip.clone());
     debug!(
         "[DEV_VNC] app_id={} -> {}:{}",
@@ -365,7 +377,7 @@ pub async fn handle_dev_audio_request(
 
 /// 音频上游（由 request 阶段写入的 ctx.upstream_host 直连；音频流可持续数小时）。
 pub async fn handle_dev_audio_upstream(
-    ctx: &TrackingCtx,
+    ctx: &mut TrackingCtx,
     metrics: &Arc<ProxyMetrics>,
 ) -> PingoraResult<Box<HttpPeer>> {
     let host = ctx.upstream_host.clone().ok_or_else(|| {
@@ -376,7 +388,10 @@ pub async fn handle_dev_audio_upstream(
         error!("[DEV_AUDIO] parse upstream_host {host}: {e}");
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(502))
     })?;
-    metrics.inc_active();
+    if !ctx.dev_metrics_counted {
+        metrics.inc_active();
+        ctx.dev_metrics_counted = true;
+    }
 
     let mut peer = HttpPeer::new(addr, false, "".to_string());
     super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
@@ -423,7 +438,7 @@ pub async fn handle_dev_ime_request(
 
 /// IME 上游（WebSocket，由 ctx.upstream_host 直连）。
 pub async fn handle_dev_ime_upstream(
-    ctx: &TrackingCtx,
+    ctx: &mut TrackingCtx,
     metrics: &Arc<ProxyMetrics>,
 ) -> PingoraResult<Box<HttpPeer>> {
     let host = ctx.upstream_host.clone().ok_or_else(|| {
@@ -434,7 +449,10 @@ pub async fn handle_dev_ime_upstream(
         error!("[DEV_IME] parse upstream_host {host}: {e}");
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(502))
     })?;
-    metrics.inc_active();
+    if !ctx.dev_metrics_counted {
+        metrics.inc_active();
+        ctx.dev_metrics_counted = true;
+    }
 
     let mut peer = HttpPeer::new(addr, false, "".to_string());
     super::streaming_peer_options(&mut peer, Duration::from_secs(3600));

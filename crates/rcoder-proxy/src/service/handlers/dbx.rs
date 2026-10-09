@@ -80,8 +80,14 @@ pub async fn handle_dev_dbx_upstream(
     accept_placeholder_user_id(&params)?;
     let container_addr = find_dev_container(deps.dev_ensure, &app_id).await?;
 
-    deps.metrics.record_request();
-    deps.metrics.inc_active();
+    if !ctx.dev_request_recorded {
+        deps.metrics.record_request();
+        ctx.dev_request_recorded = true;
+    }
+    if !ctx.dev_metrics_counted {
+        deps.metrics.inc_active();
+        ctx.dev_metrics_counted = true;
+    }
     ctx.vnc_target_ip = Some(container_addr.clone());
     debug!(
         "[DEV_DBX] app_id={} -> {}:{}",
