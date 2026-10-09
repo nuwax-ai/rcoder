@@ -93,6 +93,25 @@ pub(super) async fn signal_operation_already_settled(
 
 /// 控制信号在服务已停止后的收束（R01）：Reorchestrate 占据执行身份由外层
 /// 重编排；Stopped 按信号自身 ID 收束（不触碰在执行的其他操作）。
+/// C4：热载兼容**预检**——新候选对 active 的 server 拓扑兼容性在任何摘流/
+/// 停旧之前判定（orchestrate 内部的同名校验仍保留为纵深防御）。不兼容 =
+/// 操作受理后即拒：旧业务保持运行（standby 都不发——那是拆流，会中断
+/// 服务），操作按 Failed 收束，走完整重配置流程。
+pub(super) async fn preflight_hot_reload_compat(
+    args: &crate::RuntimeArgs,
+    dev_profile: bool,
+) -> anyhow::Result<()> {
+    let release = crate::manifest::read_release_lock(&args.workspace)
+        .context("read release lock for hot-reload preflight")?;
+    let (candidate, _) =
+        crate::proxy::compiler::compile_effective_config(&args.workspace, &release, dev_profile)
+            .await
+            .context("compile candidate for hot-reload preflight")?;
+    let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+    let active = crate::proxy::compiler::active_config_path(&runtime_root);
+    crate::proxy::compiler::validate_hot_reload_compatible(&active, &candidate)
+}
+
 pub(super) async fn settle_control_signal(
     state: &ServerState,
     signal: ControlSignal,
@@ -1039,20 +1058,58 @@ pub(super) async fn server_loop(
                             state.settle_cancelled_before_execution(operation_id).await;
                             Next::Wait
                         } else {
-                            state.ready.set_ready(false);
-                            if let Err(error) = host.stop_all(Some(&standby_root)).await {
-                                record_uncertain_control(state, &signal, &format!("stop before runtime control failed: {error:#}")).await;
-                                hold_unconfirmed(
-                                    state,
-                                    format!("stop before runtime control failed: {error:#}"),
-                                )
-                                .await;
-                                return Ok(());
+                            // C4：Source 重编排先做热载兼容预检——不兼容在
+                            // 停旧之前拒绝（旧业务继续服务），操作按自身 ID
+                            // 收束 Failed；Stop 信号无新候选，直接走摘流。
+                            let dev_profile = match &signal {
+                                ControlSignal::OrchestrateSource { dev_profile, .. } => {
+                                    Some(*dev_profile)
+                                }
+                                _ => None,
+                            };
+                            let mut rejected: Option<String> = None;
+                            if let Some(dev_profile) = dev_profile
+                                && let Err(error) =
+                                    preflight_hot_reload_compat(args, dev_profile).await
+                            {
+                                rejected = Some(format!("hot-reload preflight rejected: {error:#}"));
                             }
-                            // B01：动作整体交回主循环——Existing 重编排、
-                            // StopBusiness{ID} 由 loop-top 唯一收束路径按 ID 完成
-                            //（stop_all 幂等，重复执行无害）。
-                            Next::Redeploy(settle_control_signal(state, signal).await)
+                            match rejected {
+                                Some(message) => {
+                                    tracing::error!("{message}");
+                                    if let ControlSignal::OrchestrateSource { operation_id, .. } =
+                                        &signal
+                                        && let Err(settle_error) = state
+                                            .finish_runtime_operation_by_id(
+                                                operation_id,
+                                                shared_types::RuntimeOperationState::Failed,
+                                                Some(("hot_reload_preflight".into(), message.clone())),
+                                            )
+                                            .await
+                                    {
+                                        tracing::error!(
+                                            "{settle_error}; preflight rejection unrecorded"
+                                        );
+                                    }
+                                    Next::Wait
+                                }
+                                None => {
+                                    state.ready.set_ready(false);
+                                    if let Err(error) = host.stop_all(Some(&standby_root)).await {
+                                        record_uncertain_control(state, &signal, &format!("stop before runtime control failed: {error:#}")).await;
+                                        hold_unconfirmed(
+                                            state,
+                                            format!("stop before runtime control failed: {error:#}"),
+                                        )
+                                        .await;
+                                        return Ok(());
+                                    }
+                                    // B01：动作整体交回主循环——Existing 重编排、
+                                    // StopBusiness{ID} 由 loop-top 唯一收束路径按
+                                    // ID 完成（stop_all 幂等，重复执行无害）。
+                                    Next::Redeploy(settle_control_signal(state, signal).await)
+                                }
+                            }
                         }
                     }
                     None => Next::Wait,

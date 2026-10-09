@@ -33,14 +33,21 @@ pub(super) async fn supervise(
             }
         }
     }
-    // P1/V2-03：会话收束前先 standby 摘流（常驻入口不再把请求转发到即将
-    // 停止的业务服务——裸 502 窗口）。发布/确认失败记警告不阻塞停机：
-    // 业务停止本身仍有 shutdown_all 的强收束证据；入口路由停留在旧配置
-    // 的窗口由下个会话的发布收敛。直跑形态槽空为 no-op。
-    if let Err(error) = super::resident::publish_standby_if_serving().await {
-        tracing::warn!("standby drain before session shutdown failed: {error:#}");
+    // P1/V2-03/C11：会话收束前先 standby 摘流（常驻入口不再把请求转发到
+    // 即将停止的业务服务——裸 502 窗口）。摘流失败：业务仍必须停（安全
+    // 收束优先），但**不得静默成功**——shutdown_all 完成后返回 Err，让
+    // run_with_cancel → run_loop 将操作收束为 Failed（入口停留在旧路由
+    // 的降级窗口如实可见，由下个会话发布收敛）。直跑/入口已死为 Ok no-op。
+    let drain = super::resident::publish_standby_if_serving().await;
+    let stopped = shutdown_all(children, shutdown_timeout_seconds).await;
+    match (&drain, stopped) {
+        (_, Err(stop_error)) => Err(stop_error),
+        (Err(drain_error), Ok(())) => Err(anyhow::anyhow!(
+            "standby drain before session shutdown failed (business stopped; \
+             entry not drained): {drain_error:#}"
+        )),
+        (Ok(()), Ok(())) => Ok(()),
     }
-    shutdown_all(children, shutdown_timeout_seconds).await
 }
 
 /// A deployment cannot publish a terminal status until shutdown is confirmed.

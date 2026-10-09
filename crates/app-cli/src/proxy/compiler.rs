@@ -97,18 +97,46 @@ pub async fn publish_active(runtime_root: &Path, candidate: &Path) -> Result<Pat
 /// `/_pub/<id>` 探测路由前的过渡标记）。与生效配置同 hash 算法，供
 /// admin 只读确认。
 pub fn build_standby_config(publication_id: &str) -> Result<(String, String)> {
+    build_standby_from_topology(publication_id, None)
+}
+
+/// C5：standby 从**当前 active 的真实拓扑**派生——保留全部 server 名字/
+/// 监听地址/非 locations 字段（Custom 多 listener/自定义参数全部覆盖），
+/// 仅把每个 server 的 locations 替换为兜底 mock。无 active（首编前的
+/// 窗口）时退回单 listener 默认拓扑。
+pub fn build_standby_from_topology(
+    publication_id: &str,
+    active: Option<&str>,
+) -> Result<(String, String)> {
     use pingap_config::{LocationConf, PluginConf, ServerConf};
-    let mut cfg = PingapConfig::default();
+    let mut cfg = match active {
+        Some(content) => PingapConfig::new(content.as_bytes(), true)
+            .context("parse active config for standby derivation")?,
+        None => PingapConfig::default(),
+    };
     // 与生效配置同款热载节奏（2s 轮询）——standby 确认预算内必须可检测。
     cfg.basic.auto_restart_check_interval = Some(std::time::Duration::from_secs(2));
-    cfg.servers.insert(
-        "app".into(),
-        ServerConf {
-            addr: format!("0.0.0.0:{PINGAP_PORT}"),
-            locations: Some(vec!["standby".into()]),
-            ..Default::default()
-        },
-    );
+    if cfg.servers.is_empty() {
+        cfg.servers.insert(
+            "app".into(),
+            ServerConf {
+                addr: format!("0.0.0.0:{PINGAP_PORT}"),
+                locations: Some(vec!["standby".into()]),
+                ..Default::default()
+            },
+        );
+    } else {
+        // 每个既有 server 全部 locations → 单一 standby 兜底（清空业务
+        // 路由：高权重前缀与兜底都被接管，无残留路径可旁路到死 upstream）。
+        for server in cfg.servers.values_mut() {
+            server.locations = Some(vec!["standby".into()]);
+        }
+    }
+    // 清空业务 locations/upstreams/certificates 引用（standby 无 upstream；
+    // certificates 属 TLS 终结配置——保留会让部分路径继续按旧证书服务？不：
+    // mock 在 Request 阶段直出，证书只影响握手，保留与真实拓扑一致更稳）。
+    cfg.locations.clear();
+    cfg.upstreams.clear();
     cfg.locations.insert(
         "standby".into(),
         LocationConf {
@@ -156,48 +184,82 @@ pub fn validate_hot_reload_compatible(active: &Path, candidate: &str) -> Result<
     let active_cfg = PingapConfig::new(active_content.as_bytes(), true)
         .with_context(|| format!("parse active config {}", active.display()))?;
     let candidate_cfg = PingapConfig::new(candidate.as_bytes(), true).context("parse candidate")?;
-    let active_servers: BTreeMap<String, String> = active_cfg
-        .servers
-        .iter()
-        .map(|(name, server)| (name.clone(), server.addr.clone()))
-        .collect();
-    let candidate_servers: BTreeMap<String, String> = candidate_cfg
-        .servers
-        .iter()
-        .map(|(name, server)| (name.clone(), server.addr.clone()))
-        .collect();
-    if active_servers == candidate_servers {
-        return Ok(());
+    // C7：pin（0.15.0）热载支持 = 既有 server 的 locations 变化 + plugins +
+    // upstreams。其余全部逐项比较：server 名单/监听/非 locations 字段、
+    // storages、basic（热载语义未承诺的段落变化一律 Fail Fast）。
+    // locations/upstreams/plugins 的**内容**差异放行（受支持类别）。
+    // pingap-config 0.15.0 的 conf 类型未 derive PartialEq——经 serde 序列化
+    // 成 serde_json::Value 比较（值语义等价，天然忽略 None vs 缺省差异）。
+    let strip_locations = |mut server: pingap_config::ServerConf| {
+        server.locations = None;
+        server
+    };
+    let server_value = |server: &pingap_config::ServerConf| -> Result<serde_json::Value> {
+        serde_json::to_value(strip_locations(server.clone()))
+            .context("serialize server conf for compare")
+    };
+    let mut active_servers: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for (name, server) in &active_cfg.servers {
+        active_servers.insert(name.clone(), server_value(server)?);
     }
-    let added: Vec<_> = candidate_servers
-        .keys()
-        .filter(|name| !active_servers.contains_key(*name))
-        .collect();
-    let removed: Vec<_> = active_servers
-        .keys()
-        .filter(|name| !candidate_servers.contains_key(*name))
-        .collect();
-    let moved: Vec<_> = candidate_servers
-        .iter()
-        .filter(|(name, addr)| {
-            active_servers
-                .get(*name)
-                .is_some_and(|old| old != addr.as_str())
-        })
-        .map(|(name, _)| name.clone())
-        .collect();
-    anyhow::bail!(
-        "resident pingap hot-reload cannot apply this configuration change \
-         (server topology differs: added={added:?} removed={removed:?} \
-         addr-changed={moved:?}); restart the container or use the full \
-         reconfiguration flow instead of hot deploy"
-    );
+    let mut candidate_servers: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for (name, server) in &candidate_cfg.servers {
+        candidate_servers.insert(name.clone(), server_value(server)?);
+    }
+    if active_servers != candidate_servers {
+        let added: Vec<_> = candidate_servers
+            .keys()
+            .filter(|name| !active_servers.contains_key(*name))
+            .collect();
+        let removed: Vec<_> = active_servers
+            .keys()
+            .filter(|name| !candidate_servers.contains_key(*name))
+            .collect();
+        let changed: Vec<_> = candidate_servers
+            .iter()
+            .filter(|(name, conf)| active_servers.get(*name).is_some_and(|old| old != *conf))
+            .map(|(name, _)| name.clone())
+            .collect();
+        anyhow::bail!(
+            "resident pingap hot-reload cannot apply this configuration change \
+             (server topology differs: added={added:?} removed={removed:?} \
+             conf-changed={changed:?}); use the full reconfiguration flow \
+             instead of hot deploy"
+        );
+    }
+    // storages / basic：整段比较。basic 里我们自己恒写
+    // auto_restart_check_interval=2s，两侧同值不影响相等性；其余 basic
+    // 字段（线程数/日志等）变化未承诺热载。
+    let storages_value = |cfg: &PingapConfig| -> Result<serde_json::Value> {
+        serde_json::to_value(&cfg.storages).context("serialize storages for compare")
+    };
+    if storages_value(&active_cfg)? != storages_value(&candidate_cfg)? {
+        anyhow::bail!(
+            "resident pingap hot-reload cannot apply storages changes \
+             ({:?} -> {:?}); use the full reconfiguration flow",
+            active_cfg.storages.keys().collect::<Vec<_>>(),
+            candidate_cfg.storages.keys().collect::<Vec<_>>(),
+        );
+    }
+    let basic_value = |cfg: &PingapConfig| -> Result<serde_json::Value> {
+        serde_json::to_value(&cfg.basic).context("serialize basic for compare")
+    };
+    if basic_value(&active_cfg)? != basic_value(&candidate_cfg)? {
+        anyhow::bail!(
+            "resident pingap hot-reload cannot apply basic changes; \
+             use the full reconfiguration flow"
+        );
+    }
+    Ok(())
 }
 
 /// 编译并发布 standby 到 active（停业务前的摘流步骤）。返回期望 hash
 /// （调用方经 admin 确认热载生效后才停止业务服务）。
 pub async fn publish_standby(runtime_root: &Path, publication_id: &str) -> Result<String> {
-    let (content, expected_hash) = build_standby_config(publication_id)?;
+    let active = active_config_path(runtime_root);
+    let active_content = tokio::fs::read_to_string(&active).await.ok();
+    let (content, expected_hash) =
+        build_standby_from_topology(publication_id, active_content.as_deref())?;
     let candidate_dir = runtime_root.join("standby");
     tokio::fs::create_dir_all(&candidate_dir)
         .await
@@ -939,7 +1001,7 @@ addr = "0.0.0.0:9081"
             validate_hot_reload_compatible(&active, moved)
                 .unwrap_err()
                 .to_string()
-                .contains("addr-changed=[\"app\"]")
+                .contains("conf-changed=[\"app\"]")
         );
     }
 

@@ -52,6 +52,53 @@ impl RpcFault {
 }
 
 /// supervisord 控制客户端（unix socket）。
+/// supervisord `getAllProcessInfo` 行（XML-RPC struct → 类型化字段；
+/// 未知字段忽略，缺失字段保持 None——supervisord 版本差异不因此失败）。
+/// name/pid/description 保留为诊断锚点（日志/后续监控消费）。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct SupervisordProcessInfo {
+    pub group: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// 进程状态名（RUNNING/STOPPED/STARTING/BACKOFF/STOPPING/EXITED/FATAL/
+    /// UNKNOWN/SHUTDOWN）；supervisord 文档固定大写。
+    #[serde(default)]
+    pub statename: Option<String>,
+    #[serde(default)]
+    pub pid: Option<i64>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+// 诊断字段（name/pid/description）当前无代码消费——保留供日志与后续
+// 监控读取，显式豁免而非删除（wire 契约完整性优先）。
+#[allow(dead_code)]
+impl SupervisordProcessInfo {
+    /// 诊断摘要（日志用）：`group/name pid=N state=S`。
+    pub fn brief(&self) -> String {
+        let base = format!(
+            "{}/{} pid={} state={}",
+            self.group,
+            self.name.as_deref().unwrap_or("?"),
+            self.pid.unwrap_or(0),
+            self.statename.as_deref().unwrap_or("?")
+        );
+        match self.description.as_deref() {
+            Some(desc) if !desc.is_empty() => format!("{base} ({desc})"),
+            _ => base,
+        }
+    }
+}
+
+impl SupervisordProcessInfo {
+    /// 组内是否有一个 RUNNING 的进程（组行 state=RUNNING）。
+    pub fn is_running(&self) -> bool {
+        self.statename
+            .as_deref()
+            .is_some_and(|state| state.eq_ignore_ascii_case("RUNNING"))
+    }
+}
+
 pub(crate) struct SupervisorClient {
     socket: std::path::PathBuf,
 }
@@ -170,13 +217,17 @@ impl SupervisorClient {
         Ok(RunningProcess { pid, started })
     }
 
-    /// getAllProcessInfo：每组一行状态（name/group/statename/description/...）。
-    pub(crate) async fn get_all_process_info(&self) -> Result<Vec<serde_json::Value>> {
+    /// getAllProcessInfo：每组一行状态（类型化 [`SupervisordProcessInfo`]，
+    /// 传输边界解析——消费方不按字符串键掏 Value）。
+    pub(crate) async fn get_all_process_info(&self) -> Result<Vec<SupervisordProcessInfo>> {
         let value = self.call("supervisor.getAllProcessInfo", &[]).await?;
-        value
+        let rows = value
             .as_array()
             .cloned()
-            .ok_or_else(|| anyhow!("getAllProcessInfo returned non-array: {value}"))
+            .ok_or_else(|| anyhow!("getAllProcessInfo returned non-array: {value}"))?;
+        rows.into_iter()
+            .map(|row| serde_json::from_value(row).context("decode supervisord process info"))
+            .collect()
     }
 
     /// 执行一次 XML-RPC 调用（HTTP/1.1 POST /RPC2 over unix socket）。

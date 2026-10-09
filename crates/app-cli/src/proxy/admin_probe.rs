@@ -95,11 +95,48 @@ pub fn ensure_admin_endpoint() -> &'static AdminEndpoint {
 /// 常驻 spec（`resident/pingap.toml`，0600）中的 admin 凭证恢复。
 /// 解析失败/文件缺失返回 None（生成新凭证——后续首个常驻编排会覆写 spec）。
 fn endpoint_from_resident_spec() -> Option<AdminEndpoint> {
-    let spec =
-        crate::svc_spec::ServiceSpecFile::load(crate::svc_spec::RESIDENT_SPEC_ID, "pingap").ok()?;
-    let addr = spec.env.get("PINGAP_ADMIN_ADDR")?;
-    let user = spec.env.get("PINGAP_ADMIN_USER")?;
-    let password = spec.env.get("PINGAP_ADMIN_PASSWORD")?;
+    for release_id in spec_candidate_directories() {
+        let Ok(spec) = crate::svc_spec::ServiceSpecFile::load(&release_id, "pingap") else {
+            continue;
+        };
+        if let Some(endpoint) = endpoint_from_spec_env(&spec.env) {
+            return Some(endpoint);
+        }
+    }
+    None
+}
+
+/// 凭证候选目录（C3 迁移：resident 优先；缺失时任意代际的
+/// `*/pingap.toml` 同含 admin 凭证——同容器旧版升级后存活的 pingap 仍持
+/// 旧代凭证，新 owner 必须恢复同一组）。字典序确定遍历。
+fn spec_candidate_directories() -> Vec<String> {
+    let root = crate::svc_spec::spec_root();
+    let mut names: Vec<String> = std::fs::read_dir(&root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    entry
+                        .file_type()
+                        .ok()
+                        .filter(|kind| kind.is_dir())
+                        .map(|_| entry.file_name().to_string_lossy().into_owned())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names.retain(|name| name != crate::svc_spec::RESIDENT_SPEC_ID);
+    names.insert(0, crate::svc_spec::RESIDENT_SPEC_ID.to_string());
+    names
+}
+
+fn endpoint_from_spec_env(
+    env: &std::collections::BTreeMap<String, String>,
+) -> Option<AdminEndpoint> {
+    let addr = env.get("PINGAP_ADMIN_ADDR")?;
+    let user = env.get("PINGAP_ADMIN_USER")?;
+    let password = env.get("PINGAP_ADMIN_PASSWORD")?;
     Some(AdminEndpoint {
         addr: addr.clone(),
         user: user.clone(),

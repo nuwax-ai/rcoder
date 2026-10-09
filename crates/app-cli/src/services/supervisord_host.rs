@@ -215,15 +215,25 @@ impl SupervisordHost {
     /// 拆除/换代清理路径（入口保持当前配置，由接管方发布新 active）。
     pub(crate) async fn stop_all(&self, standby_root: Option<&Path>) -> Result<()> {
         if let Some(runtime_root) = standby_root {
-            let publication = uuid::Uuid::new_v4().simple().to_string();
-            let expected = crate::proxy::compiler::publish_standby(runtime_root, &publication)
-                .await
-                .context("publish standby before stopping business services")?;
-            let endpoint = admin_probe::ensure_admin_endpoint();
-            admin_probe::wait_for_config_hash(endpoint, &expected, admin_probe::CONFIRM_BUDGET)
-                .await
-                .context("confirm standby hot-reload before stopping business services")?;
-            info!("🛑 standby confirmed (publication {publication}); stopping business services");
+            // C1/C2：以进程 state=RUNNING 为准（TCP 失败不证明入口已死，
+            // 组已配置也不证明在服务）。入口未运行 = 无流量可摘，跳过
+            // standby——干净首启/STOPPED/FATAL/入口已死都走此分支，不会
+            // 卡在等待不存在的 admin；在运行则必须摘流成功才许停业务。
+            if !self.resident_entry_running().await? {
+                info!("🛑 resident entry not RUNNING; skipping standby drain before stop");
+            } else {
+                let endpoint = admin_probe::ensure_admin_endpoint();
+                let publication = uuid::Uuid::new_v4().simple().to_string();
+                let expected = crate::proxy::compiler::publish_standby(runtime_root, &publication)
+                    .await
+                    .context("publish standby before stopping business services")?;
+                admin_probe::wait_for_config_hash(endpoint, &expected, admin_probe::CONFIRM_BUDGET)
+                    .await
+                    .context("confirm standby hot-reload before stopping business services")?;
+                info!(
+                    "🛑 standby confirmed (publication {publication}); stopping business services"
+                );
+            }
         }
         // Remove the restart source before stopping the live groups. Keeping the
         // old fragment after removeProcessGroup lets a supervisord restart or a
@@ -285,16 +295,21 @@ impl SupervisordHost {
         let infos = self.client.get_all_process_info().await?;
         let mut groups = std::collections::BTreeSet::new();
         for info in infos {
-            let group = info
-                .get("group")
-                .and_then(|group| group.as_str())
-                .filter(|group| !group.is_empty())
-                .context("supervisord process info has no group identity")?;
-            if group.starts_with(SVC_PROGRAM_PREFIX) || group == PINGAP_PROGRAM {
-                groups.insert(group.to_owned());
+            if info.group.starts_with(SVC_PROGRAM_PREFIX) || info.group == PINGAP_PROGRAM {
+                groups.insert(info.group);
             }
         }
         Ok(groups.into_iter().collect())
+    }
+
+    /// 常驻入口是否**实际运行**（C2：组已配置 ≠ 在运行——autostart=false
+    /// 下 supervisord 重启/STOPPED/FATAL 的组仍在进程表但 state 非 RUNNING，
+    /// 不得据此跳过 startProcess）。证据 = 该组的 statename 字段。
+    async fn resident_entry_running(&self) -> Result<bool> {
+        let infos = self.client.get_all_process_info().await?;
+        Ok(infos
+            .iter()
+            .any(|info| info.group == PINGAP_PROGRAM && info.is_running()))
     }
 
     /// 编排：migrate → 写 specs/conf → reload → 旧组摘除 → 依赖序启动 →
@@ -336,13 +351,12 @@ impl SupervisordHost {
         }
 
         // 记录旧代组（换代码前——reload 后按新集合差量摘除）与常驻入口
-        // 是否正在服务（在服务 → 本次为 Restart 语义，需先 standby 摘流）。
+        // 是否**实际在服务**（C2/C1：以进程 state=RUNNING 为准——组已配置
+        // 但 STOPPED/FATAL/未启动不构成"在服务"，不得跳过 startProcess，
+        // 也不触发 standby 摘流；首编/入口已死 → 无流量可摘）。
         anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
         let previous_groups = self.dynamic_groups().await?;
-        let entry_serving = self
-            .managed_groups()
-            .await?
-            .contains(&PINGAP_PROGRAM.to_string());
+        let entry_serving = self.resident_entry_running().await?;
 
         // 1. 应用迁移失败为诊断；物理清理和父意图取消仍保护启动边界。
         for spec in &specs {
@@ -551,16 +565,14 @@ impl SupervisordHost {
         crate::proxy::compiler::publish_active(&runtime_root, &pingap_outcome.config_path)
             .await
             .context("publish active pingap config")?;
-        let resident_running = self
-            .managed_groups()
-            .await?
-            .contains(&PINGAP_PROGRAM.to_string());
-        if resident_running {
-            info!(
-                "🛰️  resident {PINGAP_PROGRAM} already managed; relying on autoreload for active config"
-            );
+        // C2：以进程 state=RUNNING 为准——STOPPED/FATAL/已配置未启动的组
+        // 必须走 startProcess（addProcessGroup 对已存在组幂等成功）。
+        if self.resident_entry_running().await? {
+            info!("🛰️  resident {PINGAP_PROGRAM} running; relying on autoreload for active config");
         } else {
-            mutation_result(self.client.add_process_group(PINGAP_PROGRAM).await)?;
+            // 组可能已存在（STOPPED/FATAL/supervisord 重启后 autostart=false）：
+            // addProcessGroup 幂等，随后显式 startProcess。
+            let _ = mutation_result(self.client.add_process_group(PINGAP_PROGRAM).await);
             anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
             mutation_result(self.client.start_process_wait(PINGAP_PROGRAM).await)
                 .context("start app-pingap")?;

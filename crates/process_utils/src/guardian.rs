@@ -434,6 +434,31 @@ pub async fn spawn_guarded(
     capture: bool,
 ) -> Result<OwnedChild> {
     let declared_root = crate::command_authority::current_root();
+    spawn_guarded_with_declared(command, work_root, command_record, capture, declared_root).await
+}
+
+/// Owner-scoped guarded spawn（C9/常驻代理）：与 [`spawn_guarded`] 同机制，
+/// 但**不携带**当前会话声明（declared_root = None）——owner 进程为自身
+/// 长生命周期子进程（如常驻 pingap）登记时，work_root 是 owner 域而非
+/// 当前业务 generation；携带业务声明会触发"command work root differs
+/// from the supervised generation"跨域拒绝。托管判定退回 work_root 的
+/// 积极凭据（command-admission/generation.json 存在即托管），授权边界
+/// 仍是 owner 域本身的 guardian 体系——不放松、不 Direct。
+pub async fn spawn_guarded_owner(
+    command: tokio::process::Command,
+    work_root: &Path,
+    capture: bool,
+) -> Result<OwnedChild> {
+    spawn_guarded_with_declared(command, work_root, None, capture, None).await
+}
+
+async fn spawn_guarded_with_declared(
+    command: tokio::process::Command,
+    work_root: &Path,
+    command_record: Option<&Path>,
+    capture: bool,
+    declared_root: Option<PathBuf>,
+) -> Result<OwnedChild> {
     let RegisteredCommand {
         root,
         frame,
