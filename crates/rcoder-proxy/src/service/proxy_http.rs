@@ -52,6 +52,34 @@ async fn wait_for_peer_connection(peer: &HttpPeer, deadline: tokio::time::Instan
 }
 
 impl PortProxy {
+    /// dev 失败分档证据采集（一次性）：等待窗口内以剩余预算（≤1.5s）问询
+    /// 顾问，快照状态存入恢复上下文；已采集或无顾问时零开销跳过。
+    async fn collect_dev_evidence_once(
+        &self,
+        ctx: &mut TrackingCtx,
+        app_id: &str,
+        deadline: tokio::time::Instant,
+    ) {
+        if ctx
+            .app_connect_recovery
+            .as_ref()
+            .is_some_and(|state| state.dev_evidence_status.is_some())
+        {
+            return;
+        }
+        let Some(advisor) = self.failure_advisor_slot.load_full() else {
+            return;
+        };
+        let budget = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(Duration::from_millis(1500));
+        if let Some(hint) = advisor.advise(app_id, "dev", budget).await
+            && let Some(state) = ctx.app_connect_recovery.as_mut()
+        {
+            state.dev_evidence_status = hint.readiness_status;
+        }
+    }
+
     /// dispatch + 恢复预算约束（T4a）：存在恢复上下文时，定位/ensure 的
     /// dispatch 以 deadline 为上限——超时不取消已受理的独立创建工作
     /// （builder 租约自有生命周期），本请求诚实 503。
@@ -165,6 +193,7 @@ impl ProxyHttp for PortProxy {
                     retry_requested: false,
                     runtime_checked: true,
                     unavailable_response: false,
+                    dev_evidence_status: None,
                 });
                 return Ok(false);
             }
@@ -181,6 +210,7 @@ impl ProxyHttp for PortProxy {
                     retry_requested: false,
                     runtime_checked: false,
                     unavailable_response: false,
+                    dev_evidence_status: None,
                 });
                 let wake_pending = if wc.is_stopped(&app_id) {
                     true
@@ -444,6 +474,10 @@ impl ProxyHttp for PortProxy {
                         recovered = true;
                         break;
                     }
+                    // 首个失败切片后提前采集失败分档证据（V2-08：预算内、
+                    // 终局只读不再加管理面等待——deadline 耗尽时顾问拿不到
+                    // 预算，证据必须在等待窗口内落进恢复上下文）。
+                    self.collect_dev_evidence_once(ctx, &app_id, deadline).await;
                     // 切片等待未就绪：预算内重解析一次（ensure 的独立受理
                     // 工作不受本请求等待影响）。
                     match self

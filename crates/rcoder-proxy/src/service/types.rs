@@ -226,6 +226,10 @@ pub struct AppConnectRecovery {
     /// prod：首次重试前核对集群真实运行态（wake）；dev 恒 true（无该环节）。
     pub runtime_checked: bool,
     pub unavailable_response: bool,
+    /// dev 失败分档证据（V2-08：等待期内提前采集，终局只读不再加管理面
+    /// 等待）：app-cli 业务快照状态，Starting → starting 文案，其余/无 →
+    /// Generic。操作 kind 白名单级证据随 P1 的 app-cli 快照扩展收窄。
+    pub dev_evidence_status: Option<shared_types::UserAppReadinessStatus>,
 }
 
 /// UserApp app 代理路由上下文（URI 改写前捕获；失败出口/响应阶段读取，

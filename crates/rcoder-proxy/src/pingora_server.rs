@@ -283,13 +283,33 @@ impl ProxyHttp for ProxyServiceWrapper {
                 .is_some_and(|state| state.unavailable_response);
         if should_report_unavailable {
             // 恢复期上游不可用：503 + Retry-After（有呈现器时带友好正文——
-            // 真实状态与恢复预算不变）
+            // 真实状态与恢复预算不变）。dev 路由按等待窗口内提前采集的
+            // 证据分档（V2-08：终局只读，不再加管理面等待）：快照 Starting
+            // → starting 文案；无证据/其余 → Generic（不凭连接失败虚报启动
+            // 中）。操作 kind 白名单级证据随 P1 的 app-cli 快照扩展收窄；
+            // prod 维持既有 Generic 表示不变。
+            let mut cause = crate::error_page::ErrorPageCause::Generic;
+            if ctx
+                .userapp_route
+                .as_ref()
+                .is_some_and(|route| route.stage == "dev")
+                && let Some(status) = ctx
+                    .app_connect_recovery
+                    .as_ref()
+                    .and_then(|state| state.dev_evidence_status)
+            {
+                cause = crate::error_page::UserAppProxyFailureHint {
+                    readiness_status: Some(status),
+                    error_origin_confirmed: false,
+                }
+                .page_cause();
+            }
             self.inner
                 .respond_userapp_error(
                     session,
                     ctx,
                     503,
-                    crate::error_page::ErrorPageCause::Generic,
+                    cause,
                     "upstream unavailable during connection recovery",
                     Some(15),
                     &format!("connect error: {error}"),
@@ -1124,5 +1144,125 @@ mod implementation_probe_timeout_tests {
         assert!(response.starts_with("HTTP/1.1 504"), "{response}");
         assert!(response.contains("ERR_RUNTIME_TIMEOUT"), "{response}");
         assert!(response.contains("wake_runtime_probe"), "{response}");
+    }
+
+    /// dev 定位 stub：恒返回一个关闭端口地址——dispatch 成功、建连拒连，
+    /// 走完 dev 连接恢复（等待预算内重试/重解析）后 503 终局。
+    struct DeadEndpointDevEnsure;
+
+    #[async_trait::async_trait]
+    impl shared_types::UserappDevEnsure for DeadEndpointDevEnsure {
+        async fn locate_dev_builder(
+            &self,
+            _app_id: &str,
+        ) -> Result<Option<shared_types::DevBuilderInstance>, shared_types::DevEnsureError>
+        {
+            let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+            let port = reservation.local_addr().expect("addr").port();
+            drop(reservation);
+            Ok(Some(shared_types::DevBuilderInstance {
+                address: "127.0.0.1".into(),
+                container_id: format!("dead-port-{port}"),
+            }))
+        }
+
+        async fn ensure_dev_container(
+            &self,
+            app_id: &str,
+        ) -> Result<shared_types::ContainerBasicInfo, shared_types::DevEnsureError> {
+            Err(shared_types::DevEnsureError::EnsureFailed {
+                app_id: app_id.to_string(),
+                detail: "dead endpoint stub".into(),
+            })
+        }
+    }
+
+    /// 顾问 stub：恒返回 Starting 快照（dev 分档证据源）。
+    struct StartingHintAdvisor;
+
+    #[async_trait::async_trait]
+    impl crate::error_page::UserAppProxyFailureAdvisor for StartingHintAdvisor {
+        async fn advise(
+            &self,
+            _app_id: &str,
+            _stage: &str,
+            _budget: std::time::Duration,
+        ) -> Option<crate::error_page::UserAppProxyFailureHint> {
+            Some(crate::error_page::UserAppProxyFailureHint {
+                readiness_status: Some(shared_types::UserAppReadinessStatus::Starting),
+                error_origin_confirmed: false,
+            })
+        }
+    }
+
+    /// P0 T5：dev 恢复终局按等待窗口内采集的证据分档——快照 Starting →
+    /// starting 文案（503+Retry-After）；无顾问证据 → Generic 暂不可用。
+    /// 真实 Pingora 栈；文档导航形态断言 HTML 档位。
+    #[tokio::test]
+    async fn dev_recovery_timeout_selects_cause_by_advisor_evidence() {
+        use std::time::Duration;
+        // deploy-host feature 下 dial_peer 走 published reach 解析——注册
+        // 回环直连，保证全 feature 组合下地址解析确定性。
+        #[cfg(feature = "deploy-host")]
+        shared_types::published::register_direct(
+            "127.0.0.1",
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        );
+        for (with_advisor, marker) in [(true, "应用正在启动"), (false, "应用暂时无法访问")]
+        {
+            let proxy_reservation =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("reserve proxy port");
+            let proxy_port = proxy_reservation
+                .local_addr()
+                .expect("proxy address")
+                .port();
+            drop(proxy_reservation);
+            let mut manager = PingoraServerManager::new(ProxyConfig::with_listen_port(proxy_port));
+            manager
+                .service
+                .set_dev_ensure(Arc::new(DeadEndpointDevEnsure));
+            // 最小预算 5s（clamp 下限）压缩用例时长；等待期重解析验证同一地址。
+            manager.service.set_dev_entry_wait(Duration::from_secs(5));
+            if with_advisor {
+                manager
+                    .service
+                    .set_failure_advisor(Arc::new(StartingHintAdvisor));
+            }
+            manager
+                .service
+                .set_error_pages(Arc::new(crate::error_page::ErrorPageRenderer::new(None)));
+            let (stop, rx) = oneshot::channel();
+            let task = tokio::spawn(async move { manager.start(rx).await });
+            for _ in 0..100 {
+                if tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            let request = "GET /api/v1/userapp/proxy/app/dev/u1/stubapp/ HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Dest: document\r\nAccept: text/html\r\nAccept-Language: zh-CN\r\nConnection: close\r\n\r\n";
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+                .await
+                .expect("connect proxy");
+            stream.write_all(request.as_bytes()).await.expect("send");
+            let mut bytes = Vec::new();
+            tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut bytes))
+                .await
+                .expect("response deadline")
+                .expect("response");
+            stop.send(()).expect("stop isolated proxy");
+            task.await.expect("join proxy").expect("proxy shutdown");
+
+            let response = String::from_utf8_lossy(&bytes);
+            assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+            assert!(
+                response.to_ascii_lowercase().contains("retry-after"),
+                "recovery terminal must carry Retry-After: {response}"
+            );
+            assert!(response.contains(marker), "{response}");
+        }
     }
 }
