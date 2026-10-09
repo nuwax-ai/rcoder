@@ -1161,7 +1161,7 @@ mod implementation_probe_timeout_tests {
             let port = reservation.local_addr().expect("addr").port();
             drop(reservation);
             Ok(Some(shared_types::DevBuilderInstance {
-                address: "127.0.0.1".into(),
+                address: "127.0.0.2".into(),
                 container_id: format!("dead-port-{port}"),
             }))
         }
@@ -1205,8 +1205,10 @@ mod implementation_probe_timeout_tests {
         // 回环直连，保证全 feature 组合下地址解析确定性。
         #[cfg(feature = "deploy-host")]
         shared_types::published::register_direct(
-            "127.0.0.1",
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            "127.0.0.2",
+            "127.0.0.2"
+                .parse::<std::net::IpAddr>()
+                .expect("loopback alias"),
         );
         for (with_advisor, marker) in [(true, "应用正在启动"), (false, "应用暂时无法访问")]
         {
@@ -1264,5 +1266,78 @@ mod implementation_probe_timeout_tests {
             );
             assert!(response.contains(marker), "{response}");
         }
+    }
+
+    /// P0 T6：工具族（dev dbx）恢复终局——503+Retry-After 与 DevApp 同形态
+    /// （呈现器配置时带页），但**不做证据分档**：即使顾问给出 Starting 快照，
+    /// 工具族终局仍为 Generic 文案（cause 恒 Generic，无 userapp_route）。
+    #[tokio::test]
+    async fn dev_tool_family_recovery_terminal_is_not_evidence_tiered() {
+        use std::time::Duration;
+        #[cfg(feature = "deploy-host")]
+        shared_types::published::register_direct(
+            "127.0.0.2",
+            "127.0.0.2"
+                .parse::<std::net::IpAddr>()
+                .expect("loopback alias"),
+        );
+        let proxy_reservation =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("reserve proxy port");
+        let proxy_port = proxy_reservation
+            .local_addr()
+            .expect("proxy address")
+            .port();
+        drop(proxy_reservation);
+        let mut manager = PingoraServerManager::new(ProxyConfig::with_listen_port(proxy_port));
+        manager
+            .service
+            .set_dev_ensure(Arc::new(DeadEndpointDevEnsure));
+        manager.service.set_dev_entry_wait(Duration::from_secs(5));
+        // 顾问恒报 Starting：若工具族误走证据分档，页文案会变成"应用正在启动"。
+        manager
+            .service
+            .set_failure_advisor(Arc::new(StartingHintAdvisor));
+        manager
+            .service
+            .set_error_pages(Arc::new(crate::error_page::ErrorPageRenderer::new(None)));
+        let (stop, rx) = oneshot::channel();
+        let task = tokio::spawn(async move { manager.start(rx).await });
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let request = "GET /api/v1/userapp/proxy/dbx/dev/u1/stubapp/ HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Dest: document\r\nAccept: text/html\r\nAccept-Language: zh-CN\r\nConnection: close\r\n\r\n";
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+            .await
+            .expect("connect proxy");
+        stream.write_all(request.as_bytes()).await.expect("send");
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut bytes))
+            .await
+            .expect("response deadline")
+            .expect("response");
+        stop.send(()).expect("stop isolated proxy");
+        task.await.expect("join proxy").expect("proxy shutdown");
+
+        let response = String::from_utf8_lossy(&bytes);
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(
+            response.to_ascii_lowercase().contains("retry-after"),
+            "tool family terminal keeps Retry-After: {response}"
+        );
+        assert!(
+            !response.contains("应用正在启动"),
+            "tool family must not be evidence-tiered: {response}"
+        );
+        assert!(
+            response.contains("应用暂时无法访问"),
+            "tool family terminal stays Generic: {response}"
+        );
     }
 }
