@@ -2,9 +2,11 @@
 name = "file-server-proxy"
 # 独立版本号: 支持 file-server-proxy 单独打 tag (file-server-proxy-v*) 经 CI 发
 # npm/OSS, 与 rcoder 主版本解耦 (与 crates/file-server 同款纪律)。
+# 0.3.0: N06 跨进程实例锁 + N07 独立入口令牌认证、受管声明默认值与 env 三态优先
+# （破坏性：public_bind_declared 默认 true）+ owner 控制加固；0.2.x 见 git 历史
 # 0.2.2: 独立双文件日志+日志目录本机回退（用户指正：proxy 要有独立日志方便排查）
 # 0.2.1 子项见 git 历史
-version = "0.2.3"
+version = "0.3.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
