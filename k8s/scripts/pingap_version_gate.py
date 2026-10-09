@@ -70,7 +70,12 @@ def main():
     try:
         defaults = consumer_pairs(root, environment(defaults=True))
         results = {label + '默认': value for label, value in defaults.items()}
-        actual = consumer_pairs(root, environment())
+        actual_env = environment()
+        if args.pingap_version is not None and args.pingap_commit is not None:
+            # 调用方已按 CLI/环境优先级解析实际参数；打印接口须消费同一对
+            # 参数，不能再被继承的旧环境否决。默认扫描仍独立清除覆盖值。
+            actual_env.update(PINGAP_VERSION=args.pingap_version, PINGAP_COMMIT=args.pingap_commit)
+        actual = consumer_pairs(root, actual_env)
         results.update({label + '当前环境': value for label, value in actual.items() if value != defaults[label]})
         if args.cross_repo or args.build_agent_docker:
             results['build-agent-docker versions.mk（生产默认）'] = read_pair(
