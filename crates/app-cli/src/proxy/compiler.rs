@@ -141,6 +141,59 @@ pub fn build_standby_config(publication_id: &str) -> Result<(String, String)> {
     Ok((content, expected_hash))
 }
 
+/// 常驻热载兼容校验（P1 T15）：对比当前 active 与新候选的 server 拓扑。
+///
+/// pin（0.15.0）热载支持既有 server 的 locations/upstreams/plugins 更新；
+/// **server 增删/改名/监听地址变化不可热载**——受理前 Fail Fast（保旧服务
+/// 运行，指引走完整重配置流程），不得静默半生效。首编（active 不存在或
+/// 无法解析）跳过校验（bootstrap 建立全量拓扑）。
+pub fn validate_hot_reload_compatible(active: &Path, candidate: &str) -> Result<()> {
+    let Ok(active_content) = std::fs::read_to_string(active) else {
+        return Ok(()); // 无 active（首编）——bootstrap
+    };
+    // 与生成路径同构的宽松解析（PingapConfig::new 补全缺省段；严格
+    // toml::from_str 会因缺 basic 等段拒绝合法的最小配置）。
+    let active_cfg = PingapConfig::new(active_content.as_bytes(), true)
+        .with_context(|| format!("parse active config {}", active.display()))?;
+    let candidate_cfg = PingapConfig::new(candidate.as_bytes(), true).context("parse candidate")?;
+    let active_servers: BTreeMap<String, String> = active_cfg
+        .servers
+        .iter()
+        .map(|(name, server)| (name.clone(), server.addr.clone()))
+        .collect();
+    let candidate_servers: BTreeMap<String, String> = candidate_cfg
+        .servers
+        .iter()
+        .map(|(name, server)| (name.clone(), server.addr.clone()))
+        .collect();
+    if active_servers == candidate_servers {
+        return Ok(());
+    }
+    let added: Vec<_> = candidate_servers
+        .keys()
+        .filter(|name| !active_servers.contains_key(*name))
+        .collect();
+    let removed: Vec<_> = active_servers
+        .keys()
+        .filter(|name| !candidate_servers.contains_key(*name))
+        .collect();
+    let moved: Vec<_> = candidate_servers
+        .iter()
+        .filter(|(name, addr)| {
+            active_servers
+                .get(*name)
+                .is_some_and(|old| old != addr.as_str())
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    anyhow::bail!(
+        "resident pingap hot-reload cannot apply this configuration change \
+         (server topology differs: added={added:?} removed={removed:?} \
+         addr-changed={moved:?}); restart the container or use the full \
+         reconfiguration flow instead of hot deploy"
+    );
+}
+
 /// 编译并发布 standby 到 active（停业务前的摘流步骤）。返回期望 hash
 /// （调用方经 admin 确认热载生效后才停止业务服务）。
 pub async fn publish_standby(runtime_root: &Path, publication_id: &str) -> Result<String> {
@@ -630,7 +683,7 @@ mod tests {
     use super::super::pingap::PINGAP_PORT;
     use super::{
         active_config_path, build_standby_config, managed_config, publish_active, publish_standby,
-        validate_plugin_paths, validate_upstream_destination,
+        validate_hot_reload_compatible, validate_plugin_paths, validate_upstream_destination,
     };
     use workspace_manifest::ReleaseLock;
 
@@ -834,6 +887,62 @@ format = "text"
     }
 
     /// P1：standby 兜底配置——全部路径 mock 直出 503 + 发布标记 + 2s 热载轮询。
+    /// P1 T15：热载兼容校验——server 拓扑变化 Fail Fast，业务变化放行。
+    #[test]
+    fn hot_reload_guard_rejects_server_topology_change_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("active.toml");
+
+        // 无 active（首编 bootstrap）：放行
+        let candidate = r#"[basic]
+
+[servers.app]
+addr = "0.0.0.0:9080"
+"#;
+        assert!(validate_hot_reload_compatible(&active, candidate).is_ok());
+
+        // 建立 active（单 server app）
+        std::fs::write(&active, candidate).unwrap();
+        // 同拓扑（仅 plugins 类别差异）：放行
+        let same_topology = r#"[basic]
+
+[servers.app]
+addr = "0.0.0.0:9080"
+
+[plugins.extra]
+category = "mock"
+"#;
+        let ok = validate_hot_reload_compatible(&active, same_topology);
+        assert!(ok.is_ok(), "{ok:?}");
+
+        // server 改名/删除：拒绝
+        let renamed = r#"[basic]
+
+[servers.app2]
+addr = "0.0.0.0:9080"
+"#;
+        let error = validate_hot_reload_compatible(&active, renamed)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("added=[\"app2\"]") && error.contains("removed=[\"app\"]"),
+            "error must name the topology diff: {error}"
+        );
+
+        // 监听地址变化：拒绝
+        let moved = r#"[basic]
+
+[servers.app]
+addr = "0.0.0.0:9081"
+"#;
+        assert!(
+            validate_hot_reload_compatible(&active, moved)
+                .unwrap_err()
+                .to_string()
+                .contains("addr-changed=[\"app\"]")
+        );
+    }
+
     #[test]
     fn standby_config_is_valid_mock_503_with_publication_marker() {
         let (content, hash) = build_standby_config("pub-abc123").expect("standby config");

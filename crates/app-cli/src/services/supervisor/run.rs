@@ -280,6 +280,14 @@ pub(super) async fn run_inner(
             "📝 effective pingap config → {}",
             outcome.config_path.display()
         );
+        // 常驻在服务时先校验热载兼容（server 拓扑变化 Fail Fast 保旧服务）
+        if super::resident::is_serving().await {
+            let active = crate::proxy::compiler::active_config_path(&runtime_root);
+            let candidate = tokio::fs::read_to_string(&outcome.config_path)
+                .await
+                .with_context(|| format!("read candidate {}", outcome.config_path.display()))?;
+            crate::proxy::compiler::validate_hot_reload_compatible(&active, &candidate)?;
+        }
         crate::proxy::compiler::publish_active(&runtime_root, &outcome.config_path).await?;
         // serve 形态判定：run_loop 恒传 on_running（相位回执）；直跑形态
         //（main.rs 的 run 子命令与 run()）恒为 None——即便直跑进程处于原生

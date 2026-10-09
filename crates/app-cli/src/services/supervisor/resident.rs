@@ -94,6 +94,15 @@ pub(super) async fn ensure_resident(args: &RuntimeArgs, expected_hash: &str) -> 
     Ok(())
 }
 
+/// 常驻是否在服务（槽位在 + admin 可达）——编排侧重载兼容校验的门条件。
+pub(crate) async fn is_serving() -> bool {
+    let serving = {
+        let slot = RESIDENT.lock().await;
+        slot.is_some()
+    };
+    serving && admin_reachable(admin_probe::ensure_admin_endpoint()).await
+}
+
 /// owner 退出收束：TERM（宽限内）→ 超时 KILL 常驻进程并清空槽位。
 /// 幂等（槽空 no-op——直跑形态/未编排过）。Unconfirmed 记警告不阻塞退出。
 pub(crate) async fn shutdown() {

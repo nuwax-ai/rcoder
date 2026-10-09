@@ -372,9 +372,17 @@ impl SupervisordHost {
         let pingap_outcome = compile_pingap(args, release, dev_profile).await?;
         let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
         let endpoint = admin_probe::ensure_admin_endpoint();
-        // Restart 摘流：常驻入口正在服务旧路由时，先切 standby 并确认热载
-        // 生效（mock 503 直出），再进入停旧/起新；首编（入口未起）跳过。
+        // Restart 摘流：常驻入口正在服务旧路由时，先校验热载兼容（server
+        // 拓扑变化 Fail Fast 保旧服务），再切 standby 并确认热载生效
+        // （mock 503 直出），然后停旧起新；首编（入口未起）跳过。
         if entry_serving {
+            let active = crate::proxy::compiler::active_config_path(&runtime_root);
+            let candidate = tokio::fs::read_to_string(&pingap_outcome.config_path)
+                .await
+                .with_context(|| {
+                    format!("read candidate {}", pingap_outcome.config_path.display())
+                })?;
+            crate::proxy::compiler::validate_hot_reload_compatible(&active, &candidate)?;
             anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
             let publication = uuid::Uuid::new_v4().simple().to_string();
             let standby_hash = crate::proxy::compiler::publish_standby(&runtime_root, &publication)
