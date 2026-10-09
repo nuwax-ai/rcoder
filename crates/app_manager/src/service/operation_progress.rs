@@ -10,6 +10,44 @@ const STALE_RUNNING_SECS: i64 = 300;
 const TRAFFIC_RETRY_SECS: u64 = 20;
 const DEPLOY_RETRY_SECS: u64 = 45;
 
+/// Positive evidence that one rejected ordinary admission's exact blocker
+/// finished. The caller must reacquire its guard and atomically admit again.
+pub(super) struct ReleasedAdmissionBlocker;
+
+#[cfg(test)]
+tokio::task_local! {
+    static DIAGNOSTIC_READ_PAUSE: std::sync::Arc<DiagnosticReadPause>;
+}
+#[cfg(test)]
+pub(super) struct DiagnosticReadPause {
+    pub entered: tokio::sync::Barrier,
+    pub release: tokio::sync::Barrier,
+    armed: std::sync::atomic::AtomicBool,
+}
+#[cfg(test)]
+impl DiagnosticReadPause {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            entered: tokio::sync::Barrier::new(2),
+            release: tokio::sync::Barrier::new(2),
+            armed: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+    pub async fn scope<F: Future>(self: std::sync::Arc<Self>, future: F) -> F::Output {
+        DIAGNOSTIC_READ_PAUSE.scope(self, future).await
+    }
+}
+#[cfg(test)]
+async fn pause_diagnostic_read() {
+    let pause = DIAGNOSTIC_READ_PAUSE.try_with(std::sync::Arc::clone).ok();
+    if let Some(pause) = pause
+        && pause.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        pause.entered.wait().await;
+        pause.release.wait().await;
+    }
+}
+
 pub(super) struct HolderObservation {
     pub blocker: Option<UserAppOperationBlocker>,
     pub data: OperationInProgressData,
@@ -264,6 +302,8 @@ async fn enrich_store_blocker_inner(
         super::restart_wait::invalidate_diagnostic()?;
         return Ok(HolderObservation::unknown());
     };
+    #[cfg(test)]
+    pause_diagnostic_read().await;
     super::restart_wait::observe_application(&app)?;
     if app.active_operations.slot(blocker.scope) == Some(&blocker.operation_id) {
         let Some(record) = store.get_operation(app_id, &blocker.operation_id).await? else {
@@ -366,6 +406,90 @@ async fn enrich_store_blocker_inner(
 }
 
 impl AppService {
+    pub(super) async fn observe_released_admission_blocker(
+        &self,
+        captured: &super::restart_wait::CapturedAdmissionBlocker,
+    ) -> AppResult<Option<ReleasedAdmissionBlocker>> {
+        let store = self.metadata.store.as_ref();
+        let Some(app) = store.get_application(&captured.app_id).await? else {
+            return Ok(None);
+        };
+        let free = |app: &shared_types::UserAppLifecycleRecord| {
+            app.app_id == captured.app_id
+                && app.lifecycle_id == captured.lifecycle_id
+                && app.state == shared_types::UserAppLifecycleState::Active
+                && app.active_operations.application.is_none()
+                && app.active_operations.prod.is_none()
+        };
+        if !free(&app)
+            || captured.blocker.scope != Scope::Prod
+            || captured.blocker.state == State::RecoveryRequired
+            || captured.blocker.state.is_terminal()
+        {
+            return Ok(None);
+        }
+        let Some(record) = store
+            .get_operation(&captured.app_id, &captured.blocker.operation_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let waitable = (record.kind == Kind::Start
+            && matches!(
+                record.command,
+                Some(shared_types::UserAppControlCommand::Start { traffic: true })
+            ))
+            || matches!(
+                record.kind,
+                Kind::StartDeployment | Kind::RestartDeployment | Kind::HotDeploy | Kind::Restart
+            );
+        if record.app_id != captured.app_id
+            || record.lifecycle_id != captured.lifecycle_id
+            || record.operation_id != captured.blocker.operation_id
+            || record.scope != captured.blocker.scope
+            || record.kind != captured.blocker.kind
+            || !record.state.is_terminal()
+            || !waitable
+        {
+            return Ok(None);
+        }
+        let status = store
+            .read_compute_status(&captured.app_id, &captured.lifecycle_id, Scope::Prod)
+            .await?;
+        if !captured
+            .compute
+            .compatible(&super::restart_wait::AdmissionComputeFence::from(&status))
+            || status
+                .operation
+                .as_ref()
+                .is_some_and(|control| !control.state.is_terminal())
+        {
+            return Ok(None);
+        }
+        let current = store.get_application(&captured.app_id).await?;
+        let latest = store
+            .get_operation(&captured.app_id, &record.operation_id)
+            .await?;
+        let compute = store
+            .read_compute_status(&captured.app_id, &captured.lifecycle_id, Scope::Prod)
+            .await?;
+        if current.as_ref().is_none_or(|current| !free(current))
+            || latest.as_ref().is_none_or(|latest| {
+                latest.revision != record.revision || !latest.state.is_terminal()
+            })
+            || !captured
+                .compute
+                .compatible(&super::restart_wait::AdmissionComputeFence::from(&compute))
+            || compute
+                .operation
+                .as_ref()
+                .is_some_and(|control| !control.state.is_terminal())
+        {
+            return Ok(None);
+        }
+        Ok(Some(ReleasedAdmissionBlocker))
+    }
+
     pub(super) fn observe_operation_holder<'a>(
         &'a self,
         app_id: &'a str,

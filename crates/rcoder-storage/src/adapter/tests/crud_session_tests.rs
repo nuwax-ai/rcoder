@@ -540,3 +540,54 @@ fn conditional_remove_preserves_changed_container_identity() {
             .is_some()
     );
 }
+
+#[test]
+fn same_physical_container_refreshes_endpoint_without_replacing_shared_arc_or_weakening_identity() {
+    let adapter = make_adapter();
+    let mut original = create_test_info_with_container("endpoint-project", "endpoint-container");
+    let mut basic = original.container_info().unwrap();
+    basic.workload_uid = Some("stable-workload".into());
+    original.set_container(Some(basic.clone()));
+    adapter
+        .insert("endpoint-project".into(), Arc::new(original.clone()))
+        .unwrap();
+    let held = adapter.get("endpoint-project").unwrap();
+    let shared_arc = held.container().unwrap().clone();
+    let mut refreshed = basic.clone();
+    refreshed.container_ip = "10.0.0.99".into();
+    refreshed.service_url = "http://10.0.0.99:60000".into();
+    original.set_container(Some(refreshed.clone()));
+    adapter
+        .insert("endpoint-project".into(), Arc::new(original.clone()))
+        .unwrap();
+    assert_eq!(held.container_info().unwrap(), refreshed);
+    let updated = adapter.get("endpoint-project").unwrap();
+    assert!(Arc::ptr_eq(updated.container().unwrap(), &shared_arc));
+    assert_eq!(
+        adapter
+            .container_id_to_key
+            .get(&basic.container_id)
+            .unwrap()
+            .value(),
+        &basic.container_name
+    );
+    for invalid_workload in [None, Some("foreign-workload".into())] {
+        let mut invalid = refreshed.clone();
+        invalid.workload_uid = invalid_workload;
+        invalid.container_ip = "10.0.0.100".into();
+        original.set_container(Some(invalid));
+        assert!(
+            adapter
+                .insert("endpoint-project".into(), Arc::new(original.clone()))
+                .is_err()
+        );
+        assert_eq!(
+            adapter
+                .get("endpoint-project")
+                .unwrap()
+                .container_info()
+                .unwrap(),
+            refreshed
+        );
+    }
+}

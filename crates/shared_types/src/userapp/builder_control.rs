@@ -364,9 +364,10 @@ pub struct BuilderCreationEvidence {
     pub registration_predecessor: Option<BuilderCreationPredecessor>,
 }
 impl BuilderCreationEvidence {
-    /// Registration-only repair for an acknowledged older controlled upgrade.
-    /// This does not prove historical volume preservation or authorize another
-    /// container write. The runtime creator receipt must carry its own binding.
+    /// Registration-only confirmation of a succeeded EnsureBuilder. A private
+    /// completion receipt can acknowledge a resource created by an earlier
+    /// operation; it never proves historical volume preservation or authorizes
+    /// another runtime write. Storage verifies any existing canonical binding.
     pub fn validate_registration_replacement(
         &self,
         operation: &crate::UserAppOperationRecord,
@@ -374,26 +375,28 @@ impl BuilderCreationEvidence {
     ) -> Result<(), String> {
         self.validate_operation(operation)?;
         if operation.state != crate::UserAppOperationState::Succeeded {
-            return Err("Builder registration requires the succeeded original operation".into());
-        }
-        if let Some(source) = &self.registration_predecessor {
-            return source.validate_replacement(&self.target, volumes);
+            return Err("Builder registration requires a succeeded EnsureBuilder operation".into());
         }
         let workload = self
             .target
             .workload
             .as_ref()
-            .ok_or("Builder creator workload missing")?;
-        let binding = self
-            .target
-            .resource_binding
-            .as_ref()
-            .ok_or("Original builder replacement receipt has no creator binding")?;
-        binding.validate(&self.target.context, &workload.uid)?;
+            .ok_or("Builder completion workload missing")?;
+        if let Some(binding) = &self.target.resource_binding {
+            binding.validate(&self.target.context, &workload.uid)?;
+            if binding.service_type != crate::ServiceType::UserappBuilder {
+                return Err("Builder completion binding has the wrong resource family".into());
+            }
+        }
+        if let Some(source) = &self.registration_predecessor {
+            return source.validate_replacement(&self.target, volumes);
+        }
         if workload.kind != crate::AppResourceKind::StatefulSet
-            || binding.service_type != crate::ServiceType::UserappBuilder
-            || binding.adopted_by_operation != operation.operation_id
-            || self.container.workload_uid.as_deref() != Some(workload.uid.as_str())
+            || self
+                .container
+                .workload_uid
+                .as_deref()
+                .is_some_and(|uid| uid != workload.uid)
             || volumes.is_empty()
             || volumes.iter().any(|volume| {
                 volume.kind != crate::AppResourceKind::PersistentVolumeClaim
@@ -408,8 +411,7 @@ impl BuilderCreationEvidence {
                 != volumes.len()
         {
             return Err(
-                "Original builder replacement receipt or current volume identity is incomplete"
-                    .into(),
+                "Builder completion receipt or current volume identity is incomplete".into(),
             );
         }
         Ok(())
@@ -423,6 +425,12 @@ impl BuilderCreationEvidence {
         let context = &self.target.context;
         if !self.creation_lease_released
             || operation.kind != crate::UserAppOperationKind::EnsureBuilder
+            || operation.scope != crate::UserAppOperationScope::Dev
+            || self
+                .target
+                .resource_binding
+                .as_ref()
+                .is_some_and(|binding| binding.service_type != crate::ServiceType::UserappBuilder)
             || context.app_id != operation.app_id
             || context.lifecycle_id != operation.lifecycle_id
             || context.operation_id != operation.operation_id
@@ -436,8 +444,15 @@ impl BuilderCreationEvidence {
             .workload
             .as_ref()
             .ok_or("Builder completion workload missing")?;
-        if workload.kind == crate::AppResourceKind::StatefulSet && self.target.pod.is_none() {
-            return Err("Builder completion pod identity missing".into());
+        if workload.kind == crate::AppResourceKind::StatefulSet
+            && (self.target.pod.is_none()
+                || self
+                    .container
+                    .workload_uid
+                    .as_deref()
+                    .is_some_and(|uid| uid != workload.uid))
+        {
+            return Err("Builder completion pod or workload identity missing".into());
         }
         let physical = self
             .target
@@ -459,5 +474,182 @@ impl BuilderCreationEvidence {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod registration_confirmation_tests {
+    use super::*;
+    use crate::*;
+
+    fn completed() -> (
+        UserAppOperationRecord,
+        BuilderCreationEvidence,
+        Vec<AppResourceIdentity>,
+    ) {
+        let context = UserAppExecutionContext {
+            app_id: "app".into(),
+            lifecycle_id: "life".into(),
+            operation_id: "confirmation".into(),
+            executor_id: "worker".into(),
+            request_fingerprint: "a".repeat(64),
+        };
+        let container = ContainerBasicInfo {
+            container_id: "pod".into(),
+            container_name: "builder".into(),
+            container_ip: "10.0.0.8".into(),
+            internal_port: 60000,
+            external_port: 0,
+            project_id: "app".into(),
+            status: "Running".into(),
+            created_at: chrono::Utc::now(),
+            service_url: "http://10.0.0.8:60000".into(),
+            workload_uid: Some("sts".into()),
+        };
+        let operation = UserAppOperationRecord {
+            runtime_policy_on_success: None,
+            command: None,
+            admitted_metadata: None,
+            operation_id: context.operation_id.clone(),
+            app_id: context.app_id.clone(),
+            lifecycle_id: context.lifecycle_id.clone(),
+            request_id: None,
+            request_fingerprint: context.request_fingerprint.clone(),
+            kind: UserAppOperationKind::EnsureBuilder,
+            scope: UserAppOperationScope::Dev,
+            state: UserAppOperationState::Succeeded,
+            revision: 3,
+            executor_id: Some("worker".into()),
+            step: "builder_ready_confirmed".into(),
+            checkpoint: serde_json::to_value(&container).unwrap(),
+            error_code: None,
+            error_message: None,
+            created_at: container.created_at,
+        };
+        let evidence = BuilderCreationEvidence {
+            creation_lease_released: true,
+            container,
+            registration_predecessor: None,
+            target: BuilderControlTarget {
+                resource_binding: None,
+                context,
+                workload: Some(AppResourceIdentity {
+                    kind: AppResourceKind::StatefulSet,
+                    name: "builder".into(),
+                    uid: "sts".into(),
+                    resource_version: Some("1".into()),
+                }),
+                pod: Some(BuilderPodIdentity {
+                    name: "builder-0".into(),
+                    uid: "pod".into(),
+                    resource_version: "1".into(),
+                }),
+                restart_image: None,
+                restart_runtime_workspace: None,
+            },
+        };
+        let volumes = vec![AppResourceIdentity {
+            kind: AppResourceKind::PersistentVolumeClaim,
+            name: "workspace".into(),
+            uid: "pvc".into(),
+            resource_version: None,
+        }];
+        (operation, evidence, volumes)
+    }
+
+    #[test]
+    fn succeeded_confirmation_with_null_binding_and_legacy_uid_is_not_historical_creation() {
+        let (operation, mut evidence, volumes) = completed();
+        evidence
+            .validate_registration_replacement(&operation, &volumes)
+            .unwrap();
+        assert!(evidence.registration_predecessor.is_none());
+        // The mandatory target already pins the STS and Pod. Old responses
+        // omitted only this redundant container field; contradictory Some does not pass.
+        evidence.container.workload_uid = None;
+        evidence
+            .validate_registration_replacement(&operation, &volumes)
+            .unwrap();
+        evidence.container.workload_uid = Some("different-sts".into());
+        assert!(
+            evidence
+                .validate_registration_replacement(&operation, &volumes)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn existing_canonical_binding_can_belong_to_an_earlier_confirmation_but_never_another_resource()
+    {
+        let (operation, mut evidence, volumes) = completed();
+        let binding = UserAppResourceBinding {
+            app_id: "app".into(),
+            lifecycle_id: "life".into(),
+            service_type: ServiceType::UserappBuilder,
+            physical_uid: "sts".into(),
+            adopted_by_operation: "earlier-confirmation".into(),
+        };
+        evidence.target.resource_binding = Some(binding.clone());
+        evidence
+            .validate_registration_replacement(&operation, &volumes)
+            .unwrap();
+        for field in ["application", "lifecycle", "physical", "family", "adoption"] {
+            let mut invalid = binding.clone();
+            match field {
+                "application" => invalid.app_id = "foreign".into(),
+                "lifecycle" => invalid.lifecycle_id = "old".into(),
+                "physical" => invalid.physical_uid = "old-sts".into(),
+                "family" => invalid.service_type = ServiceType::Userapp,
+                _ => invalid.adopted_by_operation.clear(),
+            }
+            evidence.target.resource_binding = Some(invalid);
+            assert!(
+                evidence
+                    .validate_registration_replacement(&operation, &volumes)
+                    .is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn registration_requires_succeeded_exact_dev_ensure_and_unique_nonempty_pvcs() {
+        let (operation, evidence, volumes) = completed();
+        for field in ["state", "kind", "scope", "executor", "fingerprint"] {
+            let mut invalid = operation.clone();
+            match field {
+                "state" => invalid.state = UserAppOperationState::Failed,
+                "kind" => invalid.kind = UserAppOperationKind::StopBuilder,
+                "scope" => invalid.scope = UserAppOperationScope::Prod,
+                "executor" => invalid.executor_id = Some("foreign".into()),
+                _ => invalid.request_fingerprint = "b".repeat(64),
+            }
+            assert!(
+                evidence
+                    .validate_registration_replacement(&invalid, &volumes)
+                    .is_err(),
+                "{field}"
+            );
+        }
+        assert!(
+            evidence
+                .validate_registration_replacement(&operation, &[])
+                .is_err()
+        );
+        assert!(
+            evidence
+                .validate_registration_replacement(
+                    &operation,
+                    &[volumes[0].clone(), volumes[0].clone()]
+                )
+                .is_err()
+        );
+        let mut wrong = volumes.clone();
+        wrong[0].uid.clear();
+        assert!(
+            evidence
+                .validate_registration_replacement(&operation, &wrong)
+                .is_err()
+        );
     }
 }

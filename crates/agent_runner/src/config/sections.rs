@@ -275,8 +275,42 @@ impl Default for ProxyConfig {
 /// 加载配置
 #[cfg(test)]
 mod tests {
-    use super::super::{CliArgs, load_config_with_args};
+    use super::super::{AppConfig, CliArgs, load_config_with_args};
     use super::*;
+
+    fn with_isolated_config_dir(test_name: &str, assertions: impl FnOnce()) {
+        const CHILD_TEST: &str = "RCODER_AGENT_CONFIG_TEST_CHILD";
+        if std::env::var(CHILD_TEST).is_ok_and(|child_test| child_test == test_name) {
+            assert!(
+                !std::path::Path::new("config.yml").exists(),
+                "isolated loader must start without a config file"
+            );
+            assertions();
+            return;
+        }
+
+        // nextest 隔离进程但共享 package CWD。首启生成 config.yml 的两个测试
+        // 必须各用独立目录；只设置子进程 CWD，不修改测试进程的全局工作目录。
+        let dir = tempfile::tempdir().expect("isolated config directory");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", test_name, "--nocapture"])
+            .current_dir(dir.path())
+            .env(CHILD_TEST, test_name)
+            .output()
+            .expect("run isolated config test");
+        assert!(
+            output.status.success(),
+            "child {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let generated = std::fs::read_to_string(dir.path().join("config.yml"))
+            .expect("real loader must create the default config file");
+        let parsed: AppConfig =
+            serde_yaml::from_str(&generated).expect("generated config must be complete YAML");
+        assert_eq!(parsed, AppConfig::default());
+    }
 
     #[test]
     fn test_agent_cleanup_default_values() {
@@ -375,35 +409,45 @@ mod tests {
 
     #[test]
     fn proxy_default_backend_port_uses_final_cli_port() {
-        let config = load_config_with_args(CliArgs {
-            port: Some(8286),
-            projects_dir: None,
-            enable_proxy: true,
-            proxy_port: Some(8089),
-            default_backend_port: None,
-        })
-        .expect("load config");
+        with_isolated_config_dir(
+            "config::sections::tests::proxy_default_backend_port_uses_final_cli_port",
+            || {
+                let config = load_config_with_args(CliArgs {
+                    port: Some(8286),
+                    projects_dir: None,
+                    enable_proxy: true,
+                    proxy_port: Some(8089),
+                    default_backend_port: None,
+                })
+                .expect("load config");
 
-        let proxy_config = config.proxy_config.expect("proxy config");
-        assert_eq!(config.port, 8286);
-        assert_eq!(proxy_config.listen_port, 8089);
-        assert_eq!(proxy_config.default_backend_port, 8286);
+                let proxy_config = config.proxy_config.expect("proxy config");
+                assert_eq!(config.port, 8286);
+                assert_eq!(proxy_config.listen_port, 8089);
+                assert_eq!(proxy_config.default_backend_port, 8286);
+            },
+        );
     }
 
     #[test]
     fn proxy_default_backend_port_keeps_explicit_cli_value() {
-        let config = load_config_with_args(CliArgs {
-            port: Some(8286),
-            projects_dir: None,
-            enable_proxy: true,
-            proxy_port: Some(8089),
-            default_backend_port: Some(9000),
-        })
-        .expect("load config");
+        with_isolated_config_dir(
+            "config::sections::tests::proxy_default_backend_port_keeps_explicit_cli_value",
+            || {
+                let config = load_config_with_args(CliArgs {
+                    port: Some(8286),
+                    projects_dir: None,
+                    enable_proxy: true,
+                    proxy_port: Some(8089),
+                    default_backend_port: Some(9000),
+                })
+                .expect("load config");
 
-        let proxy_config = config.proxy_config.expect("proxy config");
-        assert_eq!(config.port, 8286);
-        assert_eq!(proxy_config.listen_port, 8089);
-        assert_eq!(proxy_config.default_backend_port, 9000);
+                let proxy_config = config.proxy_config.expect("proxy config");
+                assert_eq!(config.port, 8286);
+                assert_eq!(proxy_config.listen_port, 8089);
+                assert_eq!(proxy_config.default_backend_port, 9000);
+            },
+        );
     }
 }

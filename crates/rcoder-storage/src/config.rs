@@ -126,6 +126,85 @@ impl PostgresConfig {
         Ok(format!("postgres://{auth}{host}:{port}/{database}"))
     }
 
+    /// Positively identify the same SQL connection scope without connecting or
+    /// logging credentials. Unknown endpoints and DNS aliases are not proof of
+    /// a shared database. Authentication roles and server options stay in the
+    /// identity because they can select different SQL namespaces.
+    pub fn shares_connection_scope(&self, other: &Self) -> bool {
+        #[cfg(feature = "pg")]
+        {
+            #[derive(PartialEq, Eq)]
+            struct Scope {
+                host: Option<tokio_postgres::config::Host>,
+                hostaddr: Option<std::net::IpAddr>,
+                port: u16,
+                user: String,
+                database: String,
+                options: Option<String>,
+            }
+
+            let scope = |source: &Self| -> Option<Scope> {
+                let config = source
+                    .to_dsn()
+                    .ok()?
+                    .parse::<tokio_postgres::Config>()
+                    .ok()?;
+                let user = config.get_user().filter(|value| !value.is_empty())?;
+                let database = config.get_dbname().unwrap_or(user);
+                if database.is_empty()
+                    || config.get_hosts().len() > 1
+                    || config.get_hostaddrs().len() > 1
+                {
+                    // A failover/load-balanced list can select independent
+                    // servers for the two stores; equality is insufficient.
+                    return None;
+                }
+                let host = config.get_hosts().first().cloned();
+                let hostaddr = config.get_hostaddrs().first().copied();
+                if host.is_none() && hostaddr.is_none() {
+                    return None;
+                }
+                match &host {
+                    Some(tokio_postgres::config::Host::Tcp(host)) if host.is_empty() => {
+                        return None;
+                    }
+                    #[cfg(unix)]
+                    Some(tokio_postgres::config::Host::Unix(path))
+                        if path.as_os_str().is_empty() =>
+                    {
+                        return None;
+                    }
+                    _ => {}
+                }
+                let port = match config.get_ports() {
+                    [] => DEFAULT_PG_PORT,
+                    [port] if *port != 0 => *port,
+                    _ => return None,
+                };
+                Some(Scope {
+                    host,
+                    hostaddr,
+                    port,
+                    user: user.to_owned(),
+                    database: database.to_owned(),
+                    options: config
+                        .get_options()
+                        .filter(|options| !options.trim().is_empty())
+                        .map(str::to_owned),
+                })
+            };
+            match (scope(self), scope(other)) {
+                (Some(left), Some(right)) => left == right,
+                _ => false,
+            }
+        }
+        #[cfg(not(feature = "pg"))]
+        {
+            let _ = other;
+            false
+        }
+    }
+
     /// 连接池大小（带默认值兜底）
     pub fn max_connections(&self) -> u32 {
         self.max_connections.unwrap_or(DEFAULT_PG_MAX_CONNECTIONS)
@@ -189,6 +268,119 @@ fn non_empty_field(v: &Option<String>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "pg")]
+    fn connection_scope_config(url: &str) -> PostgresConfig {
+        PostgresConfig {
+            url: Some(url.into()),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "pg")]
+    #[test]
+    fn connection_scope_recognizes_dsn_spellings_and_discrete_fields() {
+        let discrete = PostgresConfig {
+            host: Some("db".into()),
+            username: Some("rcoder".into()),
+            database: Some("control".into()),
+            password: Some("different-password".into()),
+            ..Default::default()
+        };
+        for dsn in [
+            "postgres://rcoder@db/control",
+            "postgresql://rcoder:password@db:5432/control?sslmode=disable",
+            "host=db user=rcoder dbname=control port=5432 password=password",
+        ] {
+            let url = connection_scope_config(dsn);
+            assert!(discrete.shares_connection_scope(&url));
+            assert!(url.shares_connection_scope(&discrete));
+        }
+        assert!(
+            connection_scope_config("postgres://rcoder@db")
+                .shares_connection_scope(&connection_scope_config("postgres://rcoder@db/rcoder"))
+        );
+    }
+
+    #[cfg(feature = "pg")]
+    #[test]
+    fn connection_scope_ignores_password_pool_and_transport_settings() {
+        let first = connection_scope_config(
+            "postgres://rcoder:first@db/control?sslmode=disable&connect_timeout=3",
+        );
+        let mut second = connection_scope_config(
+            "postgresql://rcoder:second@db:5432/control?sslmode=require&application_name=other",
+        );
+        second.max_connections = Some(50);
+        second.min_connections = Some(0);
+        second.max_lifetime_secs = Some(15);
+        second.statement_timeout_secs = Some(20);
+        assert!(first.shares_connection_scope(&second));
+        assert!(second.shares_connection_scope(&first));
+    }
+
+    #[cfg(feature = "pg")]
+    #[test]
+    fn connection_scope_rejects_other_database_role_and_search_path() {
+        let first = connection_scope_config("postgres://rcoder@db/control");
+        for dsn in [
+            "postgres://rcoder@db/other",
+            "postgres://other@db/control",
+            "postgres://rcoder@db-alias/control",
+            "postgres://rcoder@db:5433/control",
+            "host=db user=rcoder dbname=control options='-c search_path=other'",
+            "host=db hostaddr=192.0.2.1 user=rcoder dbname=control",
+        ] {
+            let second = connection_scope_config(dsn);
+            assert!(!first.shares_connection_scope(&second));
+            assert!(!second.shares_connection_scope(&first));
+        }
+        let options = "host=db user=rcoder dbname=control options='-c search_path=control'";
+        assert!(
+            connection_scope_config(options)
+                .shares_connection_scope(&connection_scope_config(options))
+        );
+        assert!(!connection_scope_config(options).shares_connection_scope(&first));
+    }
+
+    #[cfg(feature = "pg")]
+    #[test]
+    fn connection_scope_unknown_or_multihost_settings_are_not_positive_evidence() {
+        for dsn in [
+            "not-a-valid-connection-string",
+            "user=rcoder dbname=control",
+            "host=db dbname=control",
+            "postgres://rcoder@db,another-db/control",
+            "host=db,another-db user=rcoder dbname=control",
+            "host=db port=0 user=rcoder dbname=control",
+        ] {
+            let unknown = connection_scope_config(dsn);
+            assert!(!unknown.shares_connection_scope(&unknown));
+        }
+        assert!(!PostgresConfig::default().shares_connection_scope(&PostgresConfig::default()));
+        assert!(
+            connection_scope_config("hostaddr=192.0.2.1 user=rcoder dbname=control")
+                .shares_connection_scope(&connection_scope_config(
+                    "hostaddr=192.0.2.1 user=rcoder dbname=control port=5432"
+                ))
+        );
+        assert!(
+            !connection_scope_config("host=db hostaddr=192.0.2.1 user=rcoder dbname=control")
+                .shares_connection_scope(&connection_scope_config(
+                    "host=db hostaddr=192.0.2.2 user=rcoder dbname=control"
+                ))
+        );
+    }
+
+    #[cfg(not(feature = "pg"))]
+    #[test]
+    fn connection_scope_without_pg_feature_never_claims_shared_transaction_capability() {
+        let configured = PostgresConfig {
+            url: Some("postgres://rcoder@db/control".into()),
+            ..Default::default()
+        };
+        assert!(!configured.shares_connection_scope(&configured));
+    }
 
     #[test]
     fn connection_uri_encodes_identity_and_brackets_ipv6() {
