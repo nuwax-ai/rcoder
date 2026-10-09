@@ -163,6 +163,12 @@ pub async fn get_app_readiness(
 - `success=true` 表示查询完成；`data.ready` 才表示 DBX 可用。
 - `status` 为 `ready` / `starting` / `stopped` / `unknown`；`reason_code` 为稳定原因码，
   `message` 为可选诊断信息。无法观察不等于服务停止。
+- `container` 与 `/readiness` 同源同口径（存储控制意图 + 运行时观察双源合并）：
+  `status` 为 missing / starting / restarting / stopping / running / stopped / failed /
+  recovery_required / unknown，`operation` 为当前控制操作回执（含错误码）。
+  与 DBX 探测成败解耦——容器 running 不代表 DBX 已应答，反之探测失败不代表容器停止。
+  前端据 `container.status` 分支（stopped→启动引导、stopping→停止中、
+  recovery_required→异常提示）；旧响应缺该字段视为 unknown。
 - 总预算为 3 秒，覆盖存储、运行时定位、HTTP/exec 探测及实例复核；耗尽返回 `unknown`。
 - 容器部署使用实例 IP；宿主机使用 DBX 的实际发布端口或捕获实例的只读 exec。
 - 查询本身不触发唤醒；需要打开 DBX 时沿用既有 DBX 访问入口。

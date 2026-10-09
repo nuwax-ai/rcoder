@@ -51,8 +51,8 @@ pub use userapp::db_align::{
 };
 pub use userapp::db_password::*;
 pub use userapp::dbx_readiness::{
-    DbxReadinessObservation, DbxReadinessProber, DbxReadinessReason, DbxReadinessResponse,
-    DbxReadinessStatus,
+    DbxComputeFact, DbxReadinessObservation, DbxReadinessProber, DbxReadinessReason,
+    DbxReadinessResponse, DbxReadinessStatus,
 };
 pub use userapp::dev_cleanup::{
     BuilderCollaboratorDeletionReceipt, BuilderDeletionSnapshot, BuilderRegistryIdentity,

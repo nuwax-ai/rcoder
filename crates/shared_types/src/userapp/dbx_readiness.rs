@@ -4,7 +4,7 @@
 //! `data.ready` 决定 DB 面板呈现；容器唤醒由 dbx 代理路径的"有请求即唤醒"
 //! 自然承担。语义对齐业务 readiness 族（查询成功恒 200，`ready` 才是可用）。
 
-use crate::UserappStage;
+use crate::{UserAppContainerReadiness, UserAppNoComputeState, UserappStage};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use utoipa::ToSchema;
@@ -41,8 +41,19 @@ pub enum DbxReadinessReason {
     ProbeProtocolInvalid,
 }
 
+/// 探测器对计算资源的定位事实（内部透出给容器状态推导；与 4224 探测成败解耦）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbxComputeFact {
+    /// 实例定位且复核稳定——容器物理在跑（不代表 DBX 已应答）。
+    Located,
+    /// 运行时报告无计算资源（保留六态细节，供 `/readiness` 同款容器推导）。
+    NotRunning(UserAppNoComputeState),
+    /// 定位前预算耗尽/定位失败，本次观察无计算资源事实。
+    Unobserved,
+}
+
 /// `GET /api/v1/userapp/{app_id}/{app_stage}/dbx/readiness` 响应体。
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct DbxReadinessResponse {
     /// 前端直接消费的布尔（= `status == Ready`）。
     pub ready: bool,
@@ -59,6 +70,11 @@ pub struct DbxReadinessResponse {
     /// 可选诊断详情；程序分支应使用 reason_code。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// 与 `/readiness` 同源的容器物理状态与控制操作回执（存储控制意图 + 运行时观察
+    /// 双源合并）。与 DBX 探测成败解耦：容器 running 不代表 DBX 已应答。
+    /// 旧响应缺该字段 = unknown（与 `UserAppReadinessResponse.container` 同款兼容约定）。
+    #[serde(default)]
+    pub container: UserAppContainerReadiness,
 }
 
 /// 内部观察结果；输出 ready 时统一从 status 派生，避免两个字段矛盾。
@@ -67,6 +83,7 @@ pub struct DbxReadinessObservation {
     pub status: DbxReadinessStatus,
     pub reason_code: Option<DbxReadinessReason>,
     pub message: Option<String>,
+    pub compute: DbxComputeFact,
 }
 
 impl DbxReadinessObservation {
@@ -75,6 +92,7 @@ impl DbxReadinessObservation {
             status,
             reason_code,
             message: None,
+            compute: DbxComputeFact::Unobserved,
         }
     }
 
@@ -82,15 +100,20 @@ impl DbxReadinessObservation {
         self.message = Some(message.into());
         self
     }
-}
 
-impl From<DbxReadinessObservation> for DbxReadinessResponse {
-    fn from(observation: DbxReadinessObservation) -> Self {
-        Self {
-            ready: observation.status == DbxReadinessStatus::Ready,
-            status: observation.status,
-            reason_code: observation.reason_code,
-            message: observation.message,
+    pub fn with_compute_fact(mut self, compute: DbxComputeFact) -> Self {
+        self.compute = compute;
+        self
+    }
+
+    /// 组装响应（容器字段由调用方按存储控制意图推导后传入；`From` 拿不到控制侧输入）。
+    pub fn into_response(self, container: UserAppContainerReadiness) -> DbxReadinessResponse {
+        DbxReadinessResponse {
+            ready: self.status == DbxReadinessStatus::Ready,
+            status: self.status,
+            reason_code: self.reason_code,
+            message: self.message,
+            container,
         }
     }
 }
@@ -106,4 +129,54 @@ pub trait DbxReadinessProber: Send + Sync {
         stage: UserappStage,
         budget: Duration,
     ) -> Result<DbxReadinessObservation, String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// wire 兼容锁：旧响应（无 container 字段）必须可解码，容器视作 unknown——
+    /// 与 `UserAppReadinessResponse.container` 的缺省语义同款。
+    #[test]
+    fn legacy_response_without_container_decodes_as_unknown() {
+        let legacy = serde_json::json!({
+            "ready": false,
+            "status": "stopped",
+            "reason_code": "COMPUTE_STOPPED",
+            "message": "diag",
+        });
+        let response: DbxReadinessResponse = serde_json::from_value(legacy).unwrap();
+        assert!(!response.ready);
+        assert_eq!(response.status, DbxReadinessStatus::Stopped);
+        assert_eq!(
+            response.container.status,
+            crate::UserAppContainerStatus::Unknown
+        );
+        assert!(response.container.operation.is_none());
+        // 新响应序列化包含 container，且可无损往返。
+        let value = serde_json::to_value(&response).unwrap();
+        assert!(value.get("container").is_some());
+        let back: DbxReadinessResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(back, response);
+    }
+
+    /// 观察构造默认无计算事实；builder 显式覆盖。
+    #[test]
+    fn observation_compute_fact_defaults_and_builder() {
+        let observation = DbxReadinessObservation::new(DbxReadinessStatus::Starting, None);
+        assert_eq!(observation.compute, DbxComputeFact::Unobserved);
+        let observation = observation
+            .with_compute_fact(DbxComputeFact::NotRunning(UserAppNoComputeState::Stopped))
+            .with_message("m");
+        assert_eq!(
+            observation.compute,
+            DbxComputeFact::NotRunning(UserAppNoComputeState::Stopped)
+        );
+        let response = observation.into_response(Default::default());
+        assert_eq!(response.message.as_deref(), Some("m"));
+        assert_eq!(
+            response.container.status,
+            crate::UserAppContainerStatus::Unknown
+        );
+    }
 }

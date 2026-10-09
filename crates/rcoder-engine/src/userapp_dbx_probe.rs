@@ -10,8 +10,9 @@ use container_runtime_api::{
     UserAppRuntimeReadiness,
 };
 use shared_types::{
-    DbxReadinessObservation as Observation, DbxReadinessProber, DbxReadinessReason as Reason,
-    DbxReadinessStatus as Status, UserAppNoComputeState, UserAppReadinessChannel, UserappStage,
+    DbxComputeFact, DbxReadinessObservation as Observation, DbxReadinessProber,
+    DbxReadinessReason as Reason, DbxReadinessStatus as Status, UserAppNoComputeState,
+    UserAppReadinessChannel, UserappStage,
 };
 use tokio::time::Instant;
 
@@ -102,7 +103,8 @@ async fn probe_runtime(
                 continue;
             }
             if let Some(observation) = fetched {
-                return observation;
+                // 定位且复核稳定：容器物理在跑（探测成败与此事实解耦）。
+                return observation.with_compute_fact(DbxComputeFact::Located);
             }
         }
         unknown(Reason::InstanceChanged)
@@ -125,7 +127,7 @@ fn no_compute(state: UserAppNoComputeState) -> Observation {
         UserAppNoComputeState::Failed => (Status::Unknown, Reason::ComputeFailed),
         UserAppNoComputeState::Unknown => (Status::Unknown, Reason::ComputeUnknown),
     };
-    Observation::new(status, Some(reason))
+    Observation::new(status, Some(reason)).with_compute_fact(DbxComputeFact::NotRunning(state))
 }
 
 async fn fetch(
@@ -332,6 +334,7 @@ mod tests {
             server.abort();
         }
         assert_eq!(observation.status, Status::Ready, "{observation:?}");
+        assert_eq!(observation.compute, DbxComputeFact::Located);
         server
             .await
             .expect("the controlled DBX HTTP server must complete");
@@ -425,6 +428,11 @@ mod tests {
                 (observation.status, observation.reason_code),
                 (status, Some(reason))
             );
+            assert_eq!(
+                observation.compute,
+                DbxComputeFact::NotRunning(state),
+                "no-compute facts must survive for container derivation"
+            );
             assert!(runtime.commands.lock().unwrap().is_empty());
         }
     }
@@ -451,6 +459,11 @@ mod tests {
             (observation.status, observation.reason_code),
             (Status::Unknown, Some(Reason::InstanceChanged))
         );
+        assert_eq!(
+            observation.compute,
+            DbxComputeFact::Unobserved,
+            "a churning instance never confirms a stable location"
+        );
         assert_eq!(*runtime.commands.lock().unwrap(), vec![original, restarted]);
     }
 
@@ -467,6 +480,11 @@ mod tests {
             assert_eq!(
                 (observation.status, observation.reason_code),
                 (Status::Unknown, Some(Reason::ObserveIncomplete))
+            );
+            assert_eq!(
+                observation.compute,
+                DbxComputeFact::Unobserved,
+                "budget exhaustion must not fabricate a compute fact"
             );
         }
     }
