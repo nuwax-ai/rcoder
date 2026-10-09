@@ -335,9 +335,14 @@ impl SupervisordHost {
             supervisor::wait_for_pg(&specs, pg.as_ref(), Some(cancel)).await?;
         }
 
-        // 记录旧代组（换代码前——reload 后按新集合差量摘除）
+        // 记录旧代组（换代码前——reload 后按新集合差量摘除）与常驻入口
+        // 是否正在服务（在服务 → 本次为 Restart 语义，需先 standby 摘流）。
         anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
         let previous_groups = self.dynamic_groups().await?;
+        let entry_serving = self
+            .managed_groups()
+            .await?
+            .contains(&PINGAP_PROGRAM.to_string());
 
         // 1. 应用迁移失败为诊断；物理清理和父意图取消仍保护启动边界。
         for spec in &specs {
@@ -359,16 +364,27 @@ impl SupervisordHost {
             anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
         }
 
-        // 2. pingap 配置编译（生成/校验/原子提交；未就绪前不启动）+
-        //    发布到 active（P1：release 目录为候选，active 为常驻 -c 目标；
-        //    已运行的常驻 pingap 由 --autoreload 周期轮询拾取）。
+        // 2. pingap 配置编译（生成/校验/原子提交——release 目录为候选）。
+        //    active 的发布推迟到新服务就绪之后（V2-03 Restart 顺序：先
+        //    standby 摘流 → 停旧 → 起新 → 发布正常路由并确认；提前发布
+        //    会让新路由指向未启动的服务，切换窗口 502）。
         anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
         let pingap_outcome = compile_pingap(args, release, dev_profile).await?;
         let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
-        crate::proxy::compiler::publish_active(&runtime_root, &pingap_outcome.config_path)
-            .await
-            .context("publish active pingap config")?;
         let endpoint = admin_probe::ensure_admin_endpoint();
+        // Restart 摘流：常驻入口正在服务旧路由时，先切 standby 并确认热载
+        // 生效（mock 503 直出），再进入停旧/起新；首编（入口未起）跳过。
+        if entry_serving {
+            anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
+            let publication = uuid::Uuid::new_v4().simple().to_string();
+            let standby_hash = crate::proxy::compiler::publish_standby(&runtime_root, &publication)
+                .await
+                .context("publish standby before switching services")?;
+            admin_probe::wait_for_config_hash(endpoint, &standby_hash, admin_probe::CONFIRM_BUDGET)
+                .await
+                .context("confirm standby hot-reload before switching services")?;
+            info!("🛑 standby confirmed for restart (publication {publication})");
+        }
 
         // 2.5 workspace 首页静态服务（幂等；判定与 pingap 编译的兜底路由注入
         // 同源 index_port_if_eligible——路由注入了就必须有服务承接，否则根路径
@@ -521,10 +537,12 @@ impl SupervisordHost {
             started.push(name);
         }
 
-        // 7. 常驻 pingap 就绪 + 配置 hash 确认（与 builtin 的 start_pingap
-        //    确认语义一致）。组已存在（跨编排代次存活或 supervisord 重启
-        //    复原）则跳过 add/start——active 已发布，--autoreload 拾取。
+        // 7. 新服务已就绪：发布正常路由到 active（常驻 -c 目标；已运行的
+        //    常驻 pingap 由 --autoreload 拾取）→ 确保常驻组在 → hash 确认。
         anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
+        crate::proxy::compiler::publish_active(&runtime_root, &pingap_outcome.config_path)
+            .await
+            .context("publish active pingap config")?;
         let resident_running = self
             .managed_groups()
             .await?

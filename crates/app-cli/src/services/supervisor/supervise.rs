@@ -33,6 +33,13 @@ pub(super) async fn supervise(
             }
         }
     }
+    // P1/V2-03：会话收束前先 standby 摘流（常驻入口不再把请求转发到即将
+    // 停止的业务服务——裸 502 窗口）。发布/确认失败记警告不阻塞停机：
+    // 业务停止本身仍有 shutdown_all 的强收束证据；入口路由停留在旧配置
+    // 的窗口由下个会话的发布收敛。直跑形态槽空为 no-op。
+    if let Err(error) = super::resident::publish_standby_if_serving().await {
+        tracing::warn!("standby drain before session shutdown failed: {error:#}");
+    }
     shutdown_all(children, shutdown_timeout_seconds).await
 }
 

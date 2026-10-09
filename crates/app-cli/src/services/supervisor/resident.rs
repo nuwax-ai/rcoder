@@ -75,6 +75,9 @@ pub(super) async fn ensure_resident(args: &RuntimeArgs, expected_hash: &str) -> 
             "🛰️  resident pingap spawned under owner scope (config {})",
             active.display()
         );
+        if let Some(parent) = active.parent().and_then(Path::parent) {
+            *STATE_RUNTIME_ROOT.lock().unwrap() = Some(parent.to_path_buf());
+        }
         *slot = Some(ResidentProxy { child });
     }
     // 无论复用或新拉：确认本次发布的配置生效（2s 轮询 + CONFIRM_BUDGET）。
@@ -107,6 +110,45 @@ pub(crate) async fn shutdown() {
         }
     }
 }
+
+/// 会话收束前的 standby 摘流（builtin 引擎）：常驻在服务时发布 standby
+/// 并确认热载。supervisord 引擎的等价逻辑在 `stop_all`；两处语义一致——
+/// 发布/确认失败由调用方决定（会话收束记警告不阻塞；Stop 语义整体失败）。
+pub(crate) async fn publish_standby_if_serving() -> Result<()> {
+    let endpoint = admin_probe::ensure_admin_endpoint().clone();
+    {
+        let slot = RESIDENT.lock().await;
+        if slot.is_none() {
+            return Ok(()); // 槽空（直跑形态/未编排）——无入口可摘流
+        }
+        if !admin_reachable(&endpoint).await {
+            return Ok(()); // 入口已死——无服务可摘
+        }
+    }
+    let publication = uuid::Uuid::new_v4().simple().to_string();
+    // runtime_root 无法从这里获得（槽内未存）——经全局 log 目录推导：
+    // 与 ensure_resident 的调用方使用同一 runtime_root 解析（env 覆盖一致）。
+    let runtime_root = current_runtime_root()?;
+    let hash = crate::proxy::compiler::publish_standby(&runtime_root, &publication).await?;
+    admin_probe::wait_for_config_hash(&endpoint, &hash, admin_probe::CONFIRM_BUDGET)
+        .await
+        .context("confirm standby hot-reload")?;
+    tracing::info!("🛑 standby confirmed for builtin session shutdown (publication {publication})");
+    Ok(())
+}
+
+fn current_runtime_root() -> Result<PathBuf> {
+    // 与编排调用方同源的 runtime_root 解析；serve 进程内 log 目录经全局槽
+    // 不可得——由 ensure_resident 在拉起时记录，供此处复用。
+    match STATE_RUNTIME_ROOT.lock().unwrap().clone() {
+        Some(root) => Ok(root),
+        None => Err(anyhow::anyhow!(
+            "resident runtime root unrecorded (ensure_resident never ran)"
+        )),
+    }
+}
+
+static STATE_RUNTIME_ROOT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
 /// admin 端口 TCP 可达（进程存活判定；协议层健康由 hash 确认把关）。
 async fn admin_reachable(endpoint: &admin_probe::AdminEndpoint) -> bool {
