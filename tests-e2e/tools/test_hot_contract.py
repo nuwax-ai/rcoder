@@ -1,4 +1,7 @@
 import os
+import io
+import tomllib
+import zipfile
 from pathlib import Path
 import runpy
 import subprocess
@@ -34,6 +37,16 @@ class DockerDiagnosticTests(unittest.TestCase):
 
 
 class DeploymentIdentityTests(unittest.TestCase):
+    def test_artifact_identity_matches_the_current_source_authority(self):
+        with tempfile.TemporaryDirectory() as report:
+            with patch.dict(os.environ, {'E2E_REPORT_DIR': report, 'E2E_RUN_ID': 'pingap-identity-test'}):
+                module = runpy.run_path(str(Path(__file__).with_name('hot_contract.py')))
+            artifact = module['artifact']('identity-A', 'real fixture body')
+            with zipfile.ZipFile(io.BytesIO(artifact)) as archive:
+                lock = tomllib.loads(archive.read('release.lock.toml').decode())
+            self.assertEqual(lock['pingap']['version'], module['PINGAP_IDENTITY']['version'])
+            self.assertEqual(lock['pingap']['commit'], module['PINGAP_IDENTITY']['commit'])
+
     def test_success_requires_complete_matching_operation(self):
         with tempfile.TemporaryDirectory() as report:
             with patch.dict(os.environ, {'E2E_REPORT_DIR': report, 'E2E_RUN_ID': 'identity-test'}):

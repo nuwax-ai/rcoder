@@ -19,6 +19,10 @@ import urllib.error
 import urllib.request
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tools.build.pingap_identity import source_identity
+PINGAP_IDENTITY = source_identity()
+
 
 def poll(read, timeout=45):
     deadline = time.monotonic() + timeout
@@ -161,8 +165,8 @@ minimum_app_cli_version = "0.3.9"
 runtime_image_digest = ""
 [pingap]
 mode = "managed"
-version = "0.14.3"
-commit = "cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8"
+version = "{PINGAP_IDENTITY['version']}"
+commit = "{PINGAP_IDENTITY['commit']}"
 [[services]]
 service_id = "web"
 name = "web"

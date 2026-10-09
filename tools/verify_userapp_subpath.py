@@ -16,10 +16,13 @@ import re
 import secrets
 import shutil
 import socket
+import struct
 import subprocess
 import tempfile
 import time
 import tomllib
+
+OBSERVATIONS = []
 
 
 def require(condition, message):
@@ -36,7 +39,13 @@ def request(port, path, payload=None, token=None):
     try:
         connection.request("GET" if payload is None else "POST", path, body, headers)
         response = connection.getresponse()
-        return response.status, response.getheader("Content-Type", ""), response.read()
+        data = response.read()
+        content_type = response.getheader("Content-Type", "")
+        OBSERVATIONS.append({"kind": "http", "port": port, "path": path,
+                             "method": "GET" if payload is None else "POST",
+                             "status": response.status, "content_type": content_type,
+                             "body_sha256": hashlib.sha256(data).hexdigest(), "body_bytes": len(data)})
+        return response.status, content_type, data
     finally:
         connection.close()
 
@@ -69,17 +78,56 @@ def check_prefix_redirect(prefix):
         for method in ("GET", "HEAD"):
             connection.request(method, prefix + "?probe=bare-prefix", headers={"Accept": "text/html"})
             response = connection.getresponse()
-            response.read()
+            data = response.read()
+            OBSERVATIONS.append({"kind": "http", "port": 9080, "path": prefix + "?probe=bare-prefix",
+                                 "method": method, "status": response.status,
+                                 "location": response.getheader("Location"),
+                                 "body_sha256": hashlib.sha256(data).hexdigest(), "body_bytes": len(data)})
             require(response.status == 302 and response.getheader("Location") == prefix + "/?probe=bare-prefix",
                     f"{prefix}: {method} must redirect to the trailing slash and preserve the query")
     finally:
         connection.close()
 
 
-def check_hmr(prefix, client_js):
+class FrameReader:
+    def __init__(self, sock, pending=b""):
+        self.sock, self.pending = sock, pending
+
+    def exact(self, size):
+        while len(self.pending) < size:
+            chunk = self.sock.recv(65536)
+            require(chunk, "Vite HMR websocket closed before a complete frame")
+            self.pending += chunk
+        data, self.pending = self.pending[:size], self.pending[size:]
+        return data
+
+    def json(self):
+        while True:
+            first, second = self.exact(2)
+            require(first & 0x80, "fragmented Vite HMR frame is not supported by this probe")
+            require(not second & 0x80, "server HMR frame must not be masked")
+            size = second & 0x7f
+            if size == 126:
+                size = struct.unpack("!H", self.exact(2))[0]
+            elif size == 127:
+                size = struct.unpack("!Q", self.exact(8))[0]
+            require(size < 2 * 1024 * 1024, "HMR frame exceeds bounded probe payload")
+            payload = self.exact(size)
+            opcode = first & 0x0f
+            if opcode == 9:
+                mask = secrets.token_bytes(4)
+                self.sock.sendall(bytes([0x8a, 0x80 | len(payload)]) + mask +
+                                  bytes(value ^ mask[index % 4] for index, value in enumerate(payload)))
+                continue
+            require(opcode == 1, f"expected Vite JSON text event, got opcode {opcode}")
+            return json.loads(payload)
+
+
+def check_hmr(prefix, client_js, source, component):
     # Vite versions with websocket-token protection embed the token in the client.
     match = re.search(rb'const wsToken\s*=\s*["\']([^"\']+)', client_js)
-    path = prefix + "/" + ("?token=" + match[1].decode() if match else "")
+    require(match is not None, f"{prefix}: real Vite client did not expose websocket-token protection")
+    path = prefix + "/?token=" + match[1].decode()
     key = base64.b64encode(secrets.token_bytes(16)).decode()
     with socket.create_connection(("127.0.0.1", 9080), timeout=10) as sock:
         sock.sendall((f"GET {path} HTTP/1.1\r\nHost: localhost:9080\r\n"
@@ -97,6 +145,51 @@ def check_hmr(prefix, client_js):
             (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
         require(expected.lower() in response.split(b"\r\n\r\n", 1)[0].lower(),
                 f"{prefix}: invalid websocket handshake")
+        require(b"sec-websocket-protocol: vite-hmr" in response.lower(),
+                f"{prefix}: Vite subprotocol missing")
+        reader = FrameReader(sock, response.split(b"\r\n\r\n", 1)[1])
+        connected = reader.json()
+        require(connected.get("type") == "connected", f"{prefix}: not a real Vite connected event: {connected}")
+        module_path = prefix + "/src/" + component
+        check_module(module_path)
+        marker = "pingap-hmr-" + secrets.token_hex(8)
+        before = source.read_text()
+        if source.suffix == ".vue":
+            changed = before.replace("<router-view />", f'<router-view /><span data-pingap-hmr="{marker}" />')
+            require(changed != before, f"{prefix}: Vue fixture does not have a route outlet")
+        else:
+            changed = before + f'\nconsole.info("{marker}");\n'
+        source.write_text(changed)
+        deadline = time.monotonic() + 20
+        update = None
+        events = [connected]
+        try:
+            while time.monotonic() < deadline:
+                event = reader.json()
+                events.append(event)
+                require(event.get("type") != "error", f"{prefix}: Vite compilation error: {event}")
+                if event.get("type") == "update":
+                    for candidate in event.get("updates", []):
+                        allowed = {"/src/" + component, module_path}
+                        if candidate.get("path") in allowed:
+                            require(candidate.get("type") == "js-update", f"{prefix}: not JavaScript HMR: {candidate}")
+                            require(candidate.get("acceptedPath") in allowed, f"{prefix}: wrong accepted module: {candidate}")
+                            require(isinstance(candidate.get("timestamp"), int), f"{prefix}: timestamp missing: {candidate}")
+                            update = candidate
+                            break
+                if update:
+                    break
+            require(update is not None, f"{prefix}: file change did not produce its Vite HMR update: {events}")
+            transformed = check_module(module_path + "?t=" + str(update["timestamp"]))
+            require(marker.encode() in transformed, f"{prefix}: updated module was not served through Pingap")
+            OBSERVATIONS.append({"kind": "real-vite-hmr", "prefix": prefix,
+                                 "websocket_path": prefix + "/?token=<redacted>",
+                                 "token_sha256": hashlib.sha256(match[1]).hexdigest(),
+                                 "origin": "http://localhost:9080", "status": 101,
+                                 "component": component, "events": events, "update": update,
+                                 "updated_module_marker": marker, "updated_module_served": True})
+        finally:
+            source.write_text(before)
 
 
 @contextlib.contextmanager
@@ -153,6 +246,9 @@ def verify(args, root):
         # pnpm may repair/install on `run`. Keep each generated project's tree
         # separate: two Vue instances must not mutate one shared node_modules.
         shutil.copytree(dependencies, workspace / name / "node_modules", symlinks=True)
+        lockfile = args.templates / template / "pnpm-lock.yaml"
+        if lockfile.is_file():
+            shutil.copy2(lockfile, workspace / name / "pnpm-lock.yaml")
         page = workspace / name / "index.html"
         page.write_text(page.read_text().replace("</head>", f'<meta name="route-probe" content="{name}"></head>'))
         source = workspace / name / "src" / entry
@@ -192,8 +288,9 @@ def verify(args, root):
             status, content_type, body = request(9080, prefix + "/health")
             require(status == 200 and "application/json" in content_type and json.loads(body)["status"] == "ok",
                     f"{prefix}: health returned a fallback page")
-            check_hmr(prefix, client_js)
-            print(f"PASS dev {name}: document, modules, health, HMR upgrade", flush=True)
+            component = "App.tsx" if entry.endswith(".tsx") else "App.vue"
+            check_hmr(prefix, client_js, workspace / name / "src" / component, component)
+            print(f"PASS dev {name}: document, modules, health, real Vite token + connected + file-change js-update", flush=True)
         status, _, body = request(port, "/v1/proxy/reload", {}, token)
         require(status == 200 and json.loads(body)["data"]["verified"], f"reload failed: {body!r}")
         for _, _, prefix, entry in services:
@@ -234,6 +331,7 @@ def main():
     parser.add_argument("--app-cli", required=True, type=Path)
     parser.add_argument("--pingap", required=True, type=Path)
     parser.add_argument("--templates", required=True, type=Path)
+    parser.add_argument("--output", type=Path, help="保留请求和真实Vite事件的证据目录")
     args = parser.parse_args()
     for field in ("app_cli", "pingap", "templates"):
         setattr(args, field, getattr(args, field).resolve(strict=True))
@@ -241,10 +339,27 @@ def main():
     for port in (9080, 9081, 3018):
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", port))
-    root = Path(tempfile.mkdtemp(prefix="rcoder-subpath-"))
+    root = args.output.resolve() if args.output else Path(tempfile.mkdtemp(prefix="rcoder-subpath-"))
+    if args.output:
+        root.mkdir(parents=True, exist_ok=False)
     print(f"Evidence directory: {root}", flush=True)
-    verify(args, root)
-    print("PASS UserApp dev/prod subpath routing (HMR handshake; no browser rendering claim)")
+    status = "fail"
+    error = None
+    try:
+        verify(args, root)
+        status = "pass"
+    except Exception as failure:
+        error = str(failure)
+        raise
+    finally:
+        (root / "report.json").write_text(json.dumps({"status": status, "error": error,
+            "app_cli_sha256": hashlib.sha256(args.app_cli.read_bytes()).hexdigest(),
+            "pingap_sha256": hashlib.sha256(args.pingap.read_bytes()).hexdigest(),
+            "node_version": subprocess.check_output(["node", "--version"], text=True).strip(),
+            "http_requests_executed": sum(row["kind"] == "http" for row in OBSERVATIONS),
+            "real_vite_hmr_sequences_passed": sum(row["kind"] == "real-vite-hmr" for row in OBSERVATIONS),
+            "observations": OBSERVATIONS, "browser_rendering_executed": False}, indent=2) + "\n")
+    print("PASS UserApp dev/prod subpath routing (real Vite token, connected and file-change update; no browser rendering claim)")
 
 
 if __name__ == "__main__":

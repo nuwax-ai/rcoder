@@ -3,6 +3,9 @@
 import argparse
 import hashlib
 import json
+import importlib.util
+import io
+import tarfile
 import os
 from pathlib import Path
 import re
@@ -12,7 +15,6 @@ import tempfile
 import unittest
 
 LOCAL = Path(__file__).resolve().parents[1]
-COMMIT = 'cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8'
 
 
 class ProductionBuildTests(unittest.TestCase):
@@ -26,8 +28,10 @@ class ProductionBuildTests(unittest.TestCase):
             for name in names:
                 self.assertTrue((self.peer / 'scripts' / group / name).is_file())
                 self.assertFalse((self.peer / 'scripts' / name).exists())
-        for name in ['dbx_cache.py', 'runtime_assets.py', 'asset_context.py', 'production_preflight.py']:
-            production_name = 'runtime_preflight.py' if name == 'production_preflight.py' else name
+        # Asset trust is shared. Source-freezing/preflight implementations may differ
+        # by repository and are checked through actual Make behavior below.
+        for name in ['dbx_cache.py', 'runtime_assets.py', 'pingap-assets.json', 'runtime_base.py']:
+            production_name = name
             self.assertEqual((LOCAL / 'tools/build' / name).read_bytes(),
                              (self.peer / 'scripts/build' / production_name).read_bytes())
 
@@ -61,12 +65,29 @@ class ProductionBuildTests(unittest.TestCase):
         (root / 'versions.mk').write_text(configuration)
         pingap_version = re.search(r'^PINGAP_VERSION\s*\?=\s*(\S+)', configuration, re.MULTILINE).group(1)
         pingap_commit = re.search(r'^PINGAP_COMMIT\s*\?=\s*(\S+)', configuration, re.MULTILINE).group(1)
-        shutil.copy2(LOCAL / 'tools/build/production_preflight.py', scripts / 'runtime_preflight.py')
-        shutil.copy2(LOCAL / 'tools/build/asset_context.py', scripts / 'asset_context.py')
+        for name in ('runtime_preflight.py', 'asset_context.py', 'rcoder_source.py', 'runtime_context.py', 'runtime_assets.py', 'pingap-assets.json', 'runtime_base.py'):
+            shutil.copy2(self.peer / 'scripts/build' / name, scripts / name)
+        catalog_path = scripts / 'pingap-assets.json'
+        catalog = json.loads(catalog_path.read_text())
+        spec = importlib.util.spec_from_file_location('fixture_assets', scripts / 'runtime_assets.py')
+        fixture_assets = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture_assets)
+        pingap_archives = {}
+        for arch, cpu, machine in [('amd64', 'x86', 62), ('arm64', 'aarch64', 183)]:
+            output = io.BytesIO()
+            data = bytearray(64); data[:6] = b'\x7fELF\x02\x01'; data[18:20] = machine.to_bytes(2, 'little')
+            with tarfile.open(fileobj=output, mode='w:gz') as archive:
+                member = tarfile.TarInfo('pingap-linux-gnu-' + cpu + '-full')
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+            pingap_archives[f'cache/pingap-v{pingap_version}-linux-gnu-{cpu}-full.tar.gz'] = output.getvalue()
+            catalog['releases'][pingap_version]['assets'][arch]['sha256'] = hashlib.sha256(output.getvalue()).hexdigest()
+        catalog_path.write_text(json.dumps(catalog))
         for name in ['agent', 'runtime', 'rcoder', 'mcp']:
             context = root / name
             source = context / 'code/rcoder'
             (source / 'crates/app-cli/src').mkdir(parents=True)
+            (source / 'source-id.txt').write_text(name)
             (source / 'crates/app-cli/src/devtool.rs').write_text(
                 f'const DEFAULT_PINGAP_VERSION: &str = "{pingap_version}";\n'
                 f'const DEFAULT_PINGAP_COMMIT: &str = "{pingap_commit}";\n')
@@ -90,7 +111,7 @@ class ProductionBuildTests(unittest.TestCase):
             entry = root / 'entries' / component
             entry.mkdir(parents=True)
             paths = ({'dbx-web-amd64': b'fixture amd64', 'dbx-web-arm64': b'fixture arm64', 'dbx-static/index.html': b'fixture frontend'} if component == 'dbx' else
-                     {f'cache/pingap-v{version}-linux-gnu-x86-full.tar.gz': b'fixture pingap amd64', f'cache/pingap-v{version}-linux-gnu-aarch64-full.tar.gz': b'fixture pingap arm64'} if component == 'pingap' else
+                     pingap_archives if component == 'pingap' else
                      {f'downloads/ttyd-{arch}': b'fixture ttyd' for arch in ['amd64', 'arm64']} if component == 'ttyd' else
                      {f'cache/node-v{version}-linux-{cpu}.tar.gz': b'fixture node' for cpu in ['x64', 'arm64']} if component == 'node' else
                      {f'cache/go{version}.linux-{arch}.tar.gz': b'fixture go' for arch in ['amd64', 'arm64']} if component == 'go' else
@@ -104,6 +125,9 @@ class ProductionBuildTests(unittest.TestCase):
                 manifest = {'protocol': 2, 'inputs': {}, 'files': {name: {'sha256': checksum, 'size': len(paths[name]), 'mode': 0o755} for name, checksum in files.items()}}
             else:
                 manifest = {'protocol': 'runtime-assets-v1', 'identity': {'component': component, 'version': version}, 'files': files}
+            if component == 'pingap':
+                manifest['identity']['inputs'] = fixture_assets.identity_json(list(fixture_assets.specs('pingap', version, ['amd64', 'arm64'])))
+                manifest['identity']['trusted_release'] = fixture_assets.trusted_pingap_release(version, ['amd64', 'arm64'], catalog)
             content = json.dumps(manifest).encode()
             (entry / 'manifest.json').write_bytes(content)
             reference = {'entry': str(entry), 'manifest_sha256': hashlib.sha256(content).hexdigest()}
@@ -124,8 +148,15 @@ if args[:2] == ['buildx','build']:
     manifests=json.loads((context/'asset-manifest.json').read_text())
     profile=(context/'profile.txt').read_text()
     base=pathlib.Path(args[args.index('-f')+1]).name == 'Dockerfile.base'
-    expected=({'node','ttyd','go'} if base else {'dbx','pingap'}) if profile == 'agent' else {'node','ttyd'} if profile == 'rcoder' else {'node','deno'} if profile == 'mcp' else {'dbx','pingap','node','ttyd','go','deno'}
+    expected=({'node','ttyd','go'} if base else {'dbx','pingap'}) if profile == 'agent' else ({'node','ttyd'} if base else set()) if profile == 'rcoder' else {'node','deno'} if profile == 'mcp' else {'dbx','pingap','node','ttyd','go','deno'}
     assert {manifest['component'] for manifest in manifests} == expected, 'wrong declared snapshot components'
+    if not base and profile in ('agent','rcoder'):
+        assert (context/'source-manifest.json').is_file(), 'missing actual selected source identity'
+        assert (context/'code/rcoder/source-id.txt').read_text() == os.environ.get('EXPECTED_SOURCE_ID',profile), 'COPY consumed old vendor'
+        if 'EXPECTED_SOURCE_COMMIT' in os.environ:
+            assert json.loads((context/'source-manifest.json').read_text())['commit'] == os.environ['EXPECTED_SOURCE_COMMIT']
+            assert 'RCODER_SOURCE_COMMIT='+os.environ['EXPECTED_SOURCE_COMMIT'] in args
+            assert 'RCODER_SOURCE_BRANCH=frozen' in args
     if 'node' in expected:
         node_version=next(part.split('=',1)[1] for part in reversed(args) if part.startswith('NODE_RUNTIME_VERSION='))
         node_file=context/('cache' if profile == 'runtime' else 'downloads')/('node-v'+node_version+'-linux-x64.tar.gz')
@@ -147,11 +178,12 @@ else:
                 'download-bun-amd64', 'download-bun-arm64', 'download-libreoffice-amd64', 'download-libreoffice-arm64',
                 'download-ffmpeg', 'download-gh-amd64', 'download-gh-arm64', 'download-novnc', 'download-pcmflux',
                 'prepare-agent-runner-maven-settings', 'ensure-buildx-builder', 'download-ttyd',
-                'cluster-init', 'cluster-gen-config', 'init-dirs', 'setup']
+                'cluster-init', 'cluster-gen-config', 'init-dirs', 'setup',
+                'download-pgdg', 'download-pgdg-amd64', 'download-pgdg-arm64']
         makefile = (
             f'PROJECT_ROOT := {root}\nBUILD_CONFIG_DIR := {root}/build_config\n'
             f'AGENT_RUNNER_CONFIG_PATH := {root}/agent\nAGENT_RUNNER_SRC_PATH := {root}/agent/code/rcoder\n'
-            f'RCODER_CONFIG_PATH := {root}/rcoder\nMCP_PROXY_CONFIG_PATH := {root}/mcp\nMCP_PROXY_SRC_PATH := {root}/mcp/code\n'
+            f'RCODER_CONFIG_PATH := {root}/rcoder\nRCODER_SRC_PATH := {root}/rcoder/code/rcoder\nMCP_PROXY_CONFIG_PATH := {root}/mcp\nMCP_PROXY_SRC_PATH := {root}/mcp/code\n'
             f'RCODER_SOURCE_DIR := {root}/runtime/code/rcoder\nASSET_REF_DIR := {ref_dir}\n'
             f'ASSET_CONTEXT_TOOL := {scripts}/asset_context.py\nTTYD_VERSION := 1.7.7\n'
             'BUILDX_LOCAL_BUILDER := fixture\nBUILDX_OUTPUT := --load\nVERSION := fixture\nRCODER_VERSION := fixture\n'
@@ -202,6 +234,25 @@ else:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(sum(call.startswith('docker-build ') for call in calls), 1)
         self.assertTrue(any(call.startswith('build-dbx-fork') for call in calls))
+
+    def test_shared_exact_source_commit_is_actual_master_and_agent_copy(self):
+        root, environment = self.fixture()
+        selected = root / 'common source'
+        shutil.copytree(root / 'agent/code/rcoder', selected)
+        (selected / 'source-id.txt').write_text('common approved source')
+        def git(*args):
+            return subprocess.check_output(['git', '-C', str(selected), *args], text=True).strip()
+        git('init', '-q'); git('config', 'user.name', 'Source Contract'); git('config', 'user.email', 'source@example.invalid')
+        git('add', '.'); git('commit', '-qm', 'paired source')
+        commit = git('rev-parse', 'HEAD')
+        (selected / 'source-id.txt').write_text('unrelated dirty edit')
+        environment.update(EXPECTED_SOURCE_ID='common approved source', EXPECTED_SOURCE_COMMIT=commit)
+        for target in ('build-agent-runner-amd64', 'build-rcoder-amd64'):
+            with self.subTest(target=target):
+                result = subprocess.run(['make', target, 'RCODER_SOURCE_REPO=' + str(selected), 'RCODER_SOURCE_COMMIT=' + commit],
+                                        cwd=root, env=environment, capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((selected / 'source-id.txt').read_text(), 'unrelated dirty edit')
 
     def test_runtime_base_build_uses_snapshot_and_exact_runtime_args(self):
         result, calls = self.build('build-app-runtime-base-amd64')

@@ -13,6 +13,7 @@ import main
 import manifests
 import snapshot
 import tenant_isolation
+import pingap_runtime_identity
 
 
 class WorkflowTests(unittest.TestCase):
@@ -22,11 +23,23 @@ class WorkflowTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             return Config(file)
 
+    def paired_identity(self):
+        source = pingap_runtime_identity.source_identity()
+        bases = {key: 'example/' + key.lower() + '@sha256:' + 'b' * 64
+                 for key in pingap_runtime_identity.BASES}
+        class Observed:
+            def ssh(self, args, **kwargs):
+                if args[args.index('--entrypoint') + 1] == 'node':
+                    return 'v22.23.2'
+                return ('pingap ' + source['version'] + ' (' + source['commit'] + ', tls=openssl)'
+                        if args[-1] == '--version' else 'pingap ' + source['version'])
+        return pingap_runtime_identity.inspect_bases(Observed(), bases, source)
+
     def test_render_isolated_and_retains_storage(self):
         with tempfile.TemporaryDirectory() as temp:
             c = self.config(temp)
             images = {x: 'example/' + x + '@sha256:' + 'a' * 64 for x in ['rcoder', 'computer', 'runtime']}
-            rows = manifests.render(c, images, 'test-only')
+            rows = manifests.render(c, images, 'test-only', pingap_identity=self.paired_identity())
             for row in rows:
                 self.assertEqual(row['metadata']['labels'][LABEL], c.id)
                 if 'namespace' in row['metadata']:
@@ -75,6 +88,14 @@ class WorkflowTests(unittest.TestCase):
                     return 'rcoder-' + c.id
                 if args[:4] == ['docker', 'buildx', 'imagetools', 'inspect']:
                     return 'Digest: ' + resolved
+                if args[:1] == ['python3'] and args[1].endswith('/tools/build/pingap_identity.py'):
+                    return json.dumps(pingap_runtime_identity.source_identity())
+                if args[:2] == ['docker', 'run']:
+                    source = pingap_runtime_identity.source_identity()
+                    if args[args.index('--entrypoint') + 1] == 'node':
+                        return 'v22.23.2'
+                    return ('pingap ' + source['version'] + ' (' + source['commit'] + ', tls=openssl)'
+                            if args[-1] == '--version' else 'pingap ' + source['version'])
                 if args[0] == 'cat':
                     return json.dumps({'containerimage.digest': 'sha256:' + 'a' * 64})
                 self.fail('unexpected remote command: ' + repr(args))
@@ -191,7 +212,7 @@ class WorkflowTests(unittest.TestCase):
             c = self.config(temp)
             images = {x: 'example/' + x + '@sha256:' + 'a' * 64 for x in ['rcoder', 'computer', 'runtime']}
             auth = {'auths': {'example': {'auth': 'FAKE_TEST_ONLY'}}}
-            rows = manifests.render(c, images, 'test-only', auth)
+            rows = manifests.render(c, images, 'test-only', auth, self.paired_identity())
             for row in rows:
                 if 'FAKE_TEST_ONLY' in json.dumps(row):
                     self.assertEqual((row['kind'], row['metadata']['name']), ('Secret', 'registry'))

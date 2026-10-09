@@ -234,8 +234,8 @@ docker_config:
           RCODER_EMBED_FILE_SERVER: "true"
           # release lock 构建身份三元组（build 产 workspace-package 的 release.lock.toml 需要；
           # 与 K8s 模式 env 透传、rcoder compose env 同源——值由部署环境注入）
-          RCODER_PINGAP_VERSION: "0.14.3"
-          RCODER_PINGAP_COMMIT: "local-development"
+          RCODER_PINGAP_VERSION: "0.15.0"
+          RCODER_PINGAP_COMMIT: "8270a1ebb7a238ea86fa220215714613410378bb"
           RCODER_RUNTIME_IMAGE_DIGEST: "sha256:local-development"
         resource_limits:
           memory_limit: 8589934592 # 8GB（rust/maven 全量冷编内存峰值超 2G 会 swap 颠簸卡死——e2e 全链实测）

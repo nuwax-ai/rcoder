@@ -3,6 +3,7 @@
 import argparse
 import fnmatch
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -17,7 +18,7 @@ def digest(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def snapshot(source, target, references, kind, required=None):
+def snapshot(source, target, references, kind, required=None, trusted_catalog=None):
     fixed = {'agent': {'dbx', 'pingap'}, 'runtime': {'dbx', 'pingap', 'ttyd', 'node', 'go', 'deno'}}
     known = {'dbx', 'pingap', 'ttyd', 'node', 'go', 'deno'}
     if kind == 'downloads':
@@ -61,10 +62,17 @@ def snapshot(source, target, references, kind, required=None):
         manifest = json.loads((entry / 'manifest.json').read_text())
         is_dbx = pointer.get('protocol') == 2
         component = 'dbx' if is_dbx else manifest['identity']['component']
-        if kind == 'downloads' and component != named_component:
+        if component != named_component:
             raise ValueError('asset reference component does not match its identity: ' + str(ref))
         if kind == 'agent' and component not in ('dbx', 'pingap'):
             continue
+        if component == 'pingap':
+            # This module is also loaded via importlib by the public build script.
+            # Load only the reviewed sibling, independent of caller sys.path.
+            spec = importlib.util.spec_from_file_location('runtime_assets', Path(__file__).with_name('runtime_assets.py'))
+            assets = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(assets)
+            manifest = assets.verify(entry, trusted_catalog)
         components.add(component)
         if not is_dbx:
             version = manifest['identity']['version']
