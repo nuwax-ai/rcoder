@@ -99,5 +99,5 @@ mod tests;
 
 pub(super) use fence::*;
 pub(super) use observe::*;
-pub(super) use registration::repair_live_registration;
+pub(super) use registration::{BuilderRegistrationConfirmationRequired, repair_live_registration};
 pub(super) use spawn::*;

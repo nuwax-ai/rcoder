@@ -4,6 +4,405 @@ use super::super::restart_wait;
 use super::*;
 
 #[derive(Clone, Copy, Debug)]
+enum DiagnosticReleaseRace {
+    Released,
+    RecoveryRequired,
+    ReplacementStop,
+    ReplacementDelete,
+    PriorityStop,
+    TerminalStopIntent,
+}
+
+#[tokio::test]
+async fn restart_rechecks_exact_rejected_holder_when_it_finishes_during_diagnostics() {
+    for race in [
+        DiagnosticReleaseRace::Released,
+        DiagnosticReleaseRace::RecoveryRequired,
+        DiagnosticReleaseRace::ReplacementStop,
+        DiagnosticReleaseRace::ReplacementDelete,
+        DiagnosticReleaseRace::PriorityStop,
+        DiagnosticReleaseRace::TerminalStopIntent,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let app_id = "diagnosticrelease";
+        let request_id = "restart-release-original";
+        let (service, runtime) = created_service(directory.path(), app_id, 2).await;
+        let mut holder = traffic_holder(&service, app_id).await;
+        holder.release_physical_guard().await;
+        let original = service
+            .metadata
+            .store
+            .get_operation(app_id, &holder.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let pause = super::super::operation_progress::DiagnosticReadPause::new();
+        let restart = pause
+            .clone()
+            .scope(service.restart_app_controlled(app_id, control_request(request_id)));
+        tokio::pin!(restart);
+        tokio::select! {
+            _ = pause.entered.wait() => {}
+            result = restart.as_mut() => panic!("restart ended before diagnostic read: {result:?}"),
+        }
+        assert_not_admitted(&service, app_id, request_id).await;
+        assert_no_restart_mutation(&runtime);
+        if matches!(race, DiagnosticReleaseRace::RecoveryRequired) {
+            holder
+                .operation
+                .fail(&AppOperationError::Backend(
+                    "the original wake result remains uncertain".into(),
+                ))
+                .await
+                .unwrap();
+        } else {
+            holder.finish().await;
+        }
+        let mut replacement = None;
+        match race {
+            DiagnosticReleaseRace::Released | DiagnosticReleaseRace::RecoveryRequired => {}
+            DiagnosticReleaseRace::ReplacementStop | DiagnosticReleaseRace::ReplacementDelete => {
+                let kind = if matches!(race, DiagnosticReleaseRace::ReplacementStop) {
+                    UserAppOperationKind::Stop
+                } else {
+                    UserAppOperationKind::DeleteApplication
+                };
+                replacement = Some(
+                    OwnedOperation::admit(
+                        service.metadata.store.clone(),
+                        UserAppAdmission {
+                            runtime_policy_on_success: None,
+                            command: None,
+                            app_id: app_id.into(),
+                            lifecycle_id: Some(original.lifecycle_id.clone()),
+                            operation_id: uuid::Uuid::new_v4().to_string(),
+                            request_id: Some("later-priority-operation".into()),
+                            request_fingerprint: "d".repeat(64),
+                            kind,
+                            metadata: None,
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                );
+            }
+            DiagnosticReleaseRace::PriorityStop | DiagnosticReleaseRace::TerminalStopIntent => {
+                let control = service
+                    .metadata
+                    .store
+                    .admit_compute_control(&ComputeControlRequest {
+                        app_id: app_id.into(),
+                        lifecycle_id: original.lifecycle_id.clone(),
+                        scope: UserAppOperationScope::Prod,
+                        operation_id: uuid::Uuid::new_v4().to_string(),
+                        request_id: "later-stop-intent".into(),
+                        request_fingerprint: "f".repeat(64),
+                        action: ComputeControlAction::Stop,
+                        restart_image_roll: false,
+                    })
+                    .await
+                    .unwrap();
+                if matches!(race, DiagnosticReleaseRace::TerminalStopIntent) {
+                    let identity = ComputeExecutorIdentity {
+                        app_id: app_id.into(),
+                        lifecycle_id: original.lifecycle_id.clone(),
+                        scope: UserAppOperationScope::Prod,
+                        operation_id: control.operation_id,
+                        generation: control.generation,
+                        executor_id: uuid::Uuid::new_v4().to_string(),
+                    };
+                    let claimed = service
+                        .metadata
+                        .store
+                        .claim_compute_control(&identity, control.revision)
+                        .await
+                        .unwrap();
+                    service
+                        .metadata
+                        .store
+                        .advance_compute_control(&shared_types::ComputeControlProgress {
+                            identity,
+                            expected_revision: claimed.revision,
+                            state: shared_types::ComputeControlState::Failed,
+                            stage: shared_types::ComputeControlStage::DrainingPrevious,
+                            checkpoint: serde_json::Value::Null,
+                            error_code: Some("ERR_RUNTIME_UNAVAILABLE".into()),
+                            error_message: Some("read-only stop preparation failed".into()),
+                        })
+                        .await
+                        .unwrap();
+                    let status = service
+                        .metadata
+                        .store
+                        .read_compute_status(
+                            app_id,
+                            &original.lifecycle_id,
+                            UserAppOperationScope::Prod,
+                        )
+                        .await
+                        .unwrap();
+                    assert!(status.desired_stopped);
+                    assert!(status.operation.unwrap().state.is_terminal());
+                }
+            }
+        }
+        let (result, _) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(restart, pause.release.wait())
+        })
+        .await
+        .expect("the original admission budget must bound the diagnostic race");
+        if matches!(race, DiagnosticReleaseRace::Released) {
+            result.unwrap();
+            let accepted = service
+                .metadata
+                .store
+                .get_operation_by_request(app_id, request_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(accepted.request_id.as_deref(), Some(request_id));
+            assert_eq!(accepted.lifecycle_id, original.lifecycle_id);
+            assert_eq!(accepted.kind, UserAppOperationKind::Restart);
+            assert_eq!(accepted.state, UserAppOperationState::Succeeded);
+            assert_ne!(accepted.operation_id, original.operation_id);
+            assert_eq!(runtime.restart_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(result.is_err(), "later priority work must fence {race:?}");
+            assert_not_admitted(&service, app_id, request_id).await;
+            assert_no_restart_mutation(&runtime);
+        }
+        if replacement.is_some() {
+            let preserved = service
+                .metadata
+                .store
+                .get_operation_by_request(app_id, "later-priority-operation")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(preserved.state, UserAppOperationState::Running);
+            assert_eq!(
+                service
+                    .get_lifecycle(app_id)
+                    .await
+                    .unwrap()
+                    .active_operations
+                    .slot(preserved.scope),
+                Some(&preserved.operation_id),
+                "the rejected waiting Restart must preserve the later operation's ownership"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn released_admission_observation_requires_exact_terminal_waitable_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let app_id = "releaseproof";
+    let (service, runtime) = created_service(directory.path(), app_id, 2).await;
+    let mut holder = traffic_holder(&service, app_id).await;
+    holder.release_physical_guard().await;
+    let original = service
+        .metadata
+        .store
+        .get_operation(app_id, &holder.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let status = service
+        .metadata
+        .store
+        .read_compute_status(app_id, &original.lifecycle_id, UserAppOperationScope::Prod)
+        .await
+        .unwrap();
+    let captured = restart_wait::CapturedAdmissionBlocker {
+        app_id: app_id.into(),
+        lifecycle_id: original.lifecycle_id.clone(),
+        blocker: original.blocker(),
+        compute: restart_wait::AdmissionComputeFence::from(&status),
+    };
+    assert!(
+        service
+            .observe_released_admission_blocker(&captured)
+            .await
+            .unwrap()
+            .is_none(),
+        "a live durable holder is not released merely because its physical guard ended"
+    );
+    holder.finish().await;
+    assert!(
+        service
+            .observe_released_admission_blocker(&captured)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let mut unknown = captured.clone();
+    unknown.blocker.operation_id = "missing-holder".into();
+    assert!(
+        service
+            .observe_released_admission_blocker(&unknown)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut foreign = captured.clone();
+    foreign.lifecycle_id = "different-lifecycle".into();
+    assert!(
+        service
+            .observe_released_admission_blocker(&foreign)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut wrong_kind = captured;
+    let mut recovery = wrong_kind.clone();
+    recovery.blocker.state = UserAppOperationState::RecoveryRequired;
+    assert!(
+        service
+            .observe_released_admission_blocker(&recovery)
+            .await
+            .unwrap()
+            .is_none(),
+        "an initially uncertain holder cannot gain queue permission from later terminal evidence"
+    );
+    wrong_kind.blocker.kind = UserAppOperationKind::Stop;
+    assert!(
+        service
+            .observe_released_admission_blocker(&wrong_kind)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_no_restart_mutation(&runtime);
+}
+
+#[tokio::test]
+async fn waiting_restart_allows_original_business_restart_to_consume_old_stop_intent() {
+    let directory = tempfile::tempdir().unwrap();
+    let app_id = "restartresumemarker";
+    let request_id = "waiting-restart-after-business-resume";
+    let (service, runtime) = created_service(directory.path(), app_id, 2).await;
+    let lifecycle = service.get_lifecycle(app_id).await.unwrap();
+    let control = service
+        .metadata
+        .store
+        .admit_compute_control(&ComputeControlRequest {
+            app_id: app_id.into(),
+            lifecycle_id: lifecycle.lifecycle_id.clone(),
+            scope: UserAppOperationScope::Prod,
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            request_id: "old-terminal-stop-intent".into(),
+            request_fingerprint: "e".repeat(64),
+            action: ComputeControlAction::Stop,
+            restart_image_roll: false,
+        })
+        .await
+        .unwrap();
+    let identity = ComputeExecutorIdentity {
+        app_id: app_id.into(),
+        lifecycle_id: lifecycle.lifecycle_id.clone(),
+        scope: UserAppOperationScope::Prod,
+        operation_id: control.operation_id,
+        generation: control.generation,
+        executor_id: uuid::Uuid::new_v4().to_string(),
+    };
+    let claimed = service
+        .metadata
+        .store
+        .claim_compute_control(&identity, control.revision)
+        .await
+        .unwrap();
+    service
+        .metadata
+        .store
+        .advance_compute_control(&shared_types::ComputeControlProgress {
+            identity,
+            expected_revision: claimed.revision,
+            state: shared_types::ComputeControlState::Failed,
+            stage: shared_types::ComputeControlStage::DrainingPrevious,
+            checkpoint: serde_json::Value::Null,
+            error_code: Some("ERR_RUNTIME_UNAVAILABLE".into()),
+            error_message: Some("old stop preparation ended before physical mutation".into()),
+        })
+        .await
+        .unwrap();
+    let before = service
+        .metadata
+        .store
+        .read_compute_status(app_id, &lifecycle.lifecycle_id, UserAppOperationScope::Prod)
+        .await
+        .unwrap();
+    assert!(before.desired_stopped);
+    assert!(before.operation.as_ref().unwrap().state.is_terminal());
+    let mut holder = operation_holder(
+        &service,
+        app_id,
+        UserAppOperationKind::Restart,
+        Some(UserAppControlCommand::Restart),
+        "business_restart_admitted",
+    )
+    .await;
+    holder.release_physical_guard().await;
+    let holder_id = holder.operation_id.clone();
+    let pause = super::super::operation_progress::DiagnosticReadPause::new();
+    let request = control_request(request_id);
+    let restart = pause
+        .clone()
+        .scope(service.restart_app_controlled(app_id, request.clone()));
+    tokio::pin!(restart);
+    tokio::select! {
+        _ = pause.entered.wait() => {}
+        result = restart.as_mut() => panic!("restart ended before diagnostic read: {result:?}"),
+    }
+    assert_not_admitted(&service, app_id, request_id).await;
+    assert_no_restart_mutation(&runtime);
+    // The original business Restart legitimately does this after its admission.
+    // It clears the old marker while keeping the same compute generation.
+    service
+        .metadata
+        .store
+        .check_compute_access(app_id, UserAppOperationScope::Prod, true)
+        .await
+        .unwrap();
+    let resumed = service
+        .metadata
+        .store
+        .read_compute_status(app_id, &lifecycle.lifecycle_id, UserAppOperationScope::Prod)
+        .await
+        .unwrap();
+    assert_eq!(resumed.generation, before.generation);
+    assert!(!resumed.desired_stopped);
+    assert!(resumed.operation.is_none());
+    holder.finish().await;
+    let (result, _) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(restart, pause.release.wait())
+    })
+    .await
+    .expect("same-generation business resume must keep the original wait budget");
+    result.unwrap();
+    let accepted = service
+        .metadata
+        .store
+        .get_operation_by_request(app_id, request_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.request_id.as_deref(), Some(request_id));
+    assert_eq!(accepted.lifecycle_id, lifecycle.lifecycle_id);
+    assert_ne!(accepted.operation_id, holder_id);
+    assert_eq!(accepted.state, UserAppOperationState::Succeeded);
+    assert_eq!(runtime.restart_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
+    service
+        .restart_app_controlled(app_id, request)
+        .await
+        .unwrap();
+    assert_eq!(runtime.restart_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 1);
+}
+
+#[derive(Clone, Copy, Debug)]
 enum DiagnosticDeadlineExit {
     Read,
     NextAttempt,

@@ -104,6 +104,7 @@ impl OwnedOperation {
                 // This transaction definitively rejected admission. An HTTP
                 // disconnect that raced ADMITTING must now cancel the waiter.
                 super::restart_wait::rejected_before_admission();
+                super::restart_wait::capture_rejected_blocker(&request.app_id, &blocker)?;
                 return Err(super::restart_wait::prepare(
                     super::operation_progress::enrich_store_blocker(
                         store.as_ref(),

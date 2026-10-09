@@ -64,15 +64,40 @@ pub(crate) async fn bind_completed_builder_registration(
         current == *operation,
         "Builder completion operation changed before registration"
     );
-    if let Some(predecessor) = &evidence.registration_predecessor {
-        let stored = current
-            .checkpoint
-            .get("builder_creation_evidence")
-            .context("Completed builder registration evidence missing")?;
+    if let Some(stored) = current.checkpoint.get("builder_creation_evidence") {
+        let mut captured: BuilderCreationEvidence = serde_json::from_value(stored.clone())
+            .context("Decode completed builder registration evidence")?;
+        // Runtime inspection may refresh only routing observations for this
+        // exact physical result. Lease, context and predecessor proof remain
+        // immutable in the successful operation's checkpoint.
+        captured.container.container_ip = evidence.container.container_ip.clone();
+        captured.container.internal_port = evidence.container.internal_port;
+        captured.container.external_port = evidence.container.external_port;
+        captured.container.status = evidence.container.status.clone();
+        captured.container.service_url = evidence.container.service_url.clone();
         ensure!(
-            *stored == serde_json::to_value(evidence)?,
+            serde_json::to_value(captured)? == serde_json::to_value(evidence)?,
             "Builder registration evidence differs from the durable operation"
         );
+    } else {
+        ensure!(
+            evidence.registration_predecessor.is_none(),
+            "Completed builder registration predecessor evidence missing"
+        );
+    }
+    // Both legacy completions and recorded creation evidence must agree with
+    // the durable result. A later confirmation cannot substitute another Pod.
+    let stored: ContainerBasicInfo = serde_json::from_value(current.checkpoint.clone())
+        .context("Decode completed builder result for registration recovery")?;
+    ensure!(
+        stored.project_id == operation.app_id
+            && stored.container_id == evidence.container.container_id
+            && stored.workload_uid == evidence.container.workload_uid
+            && stored.container_name == evidence.container.container_name
+            && stored.created_at == evidence.container.created_at,
+        "Completed builder result differs from its runtime acknowledgement"
+    );
+    if let Some(predecessor) = &evidence.registration_predecessor {
         let source = predecessor
             .target
             .workload
@@ -89,31 +114,36 @@ pub(crate) async fn bind_completed_builder_registration(
             old.validate(&evidence.target.context, &source.uid)
                 .map_err(anyhow::Error::msg)?;
         }
-    } else {
-        ensure!(
-            current
-                .checkpoint
-                .get("builder_creation_evidence")
-                .is_none(),
-            "Legacy registration recovery cannot discard a recorded predecessor proof"
-        );
-        // Older success checkpoints contain the returned resource only. The
-        // original runtime receipt supplies the creator binding; no old PVC or
-        // exit witness is manufactured during this registration-only repair.
-        let stored: ContainerBasicInfo = serde_json::from_value(current.checkpoint.clone())
-            .context("Decode original builder result for registration recovery")?;
-        ensure!(
-            stored.container_id == evidence.container.container_id
-                && stored.workload_uid == evidence.container.workload_uid
-                && stored.container_name == evidence.container.container_name,
-            "Original builder result differs from its runtime creator receipt"
-        );
     }
     let workload = evidence
         .target
         .workload
         .as_ref()
         .context("Builder replacement workload missing")?;
+    let existing = ops::get_resource_binding(
+        tx,
+        Backend::Postgres,
+        &ServiceType::UserappBuilder,
+        &workload.uid,
+    )
+    .await?;
+    if let Some(existing) = existing {
+        existing
+            .validate(&evidence.target.context, &workload.uid)
+            .map_err(anyhow::Error::msg)?;
+        ensure!(
+            existing.service_type == ServiceType::UserappBuilder
+                && evidence
+                    .target
+                    .resource_binding
+                    .as_ref()
+                    .is_none_or(|claimed| *claimed == existing),
+            "Builder completion binding differs from the canonical lifecycle binding"
+        );
+        // Multiple successful EnsureBuilder confirmations may acknowledge the
+        // same workload. Keep the original canonical adoption operation.
+        return Ok(());
+    }
     let binding = UserAppResourceBinding {
         app_id: operation.app_id.clone(),
         lifecycle_id: operation.lifecycle_id.clone(),
@@ -121,6 +151,14 @@ pub(crate) async fn bind_completed_builder_registration(
         physical_uid: workload.uid.clone(),
         adopted_by_operation: operation.operation_id.clone(),
     };
+    ensure!(
+        evidence
+            .target
+            .resource_binding
+            .as_ref()
+            .is_none_or(|claimed| *claimed == binding),
+        "Unpersisted builder binding claims another creator operation"
+    );
     toasty::sql::statement("INSERT INTO userapp_resource_bindings(service_type,physical_uid,app_id,lifecycle_id,adopted_by_operation,created_at_us) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(service_type,physical_uid) DO NOTHING")
         .bind(binding.service_type.to_string()).bind(&binding.physical_uid)
         .bind(&binding.app_id).bind(&binding.lifecycle_id).bind(&binding.adopted_by_operation)

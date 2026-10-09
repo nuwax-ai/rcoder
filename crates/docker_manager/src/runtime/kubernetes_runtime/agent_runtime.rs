@@ -99,13 +99,14 @@ impl AgentContainerRuntime for KubernetesRuntime {
         let Some(receipt) = receipt else {
             return Ok(None);
         };
+        let container = receipt.registration_container()?;
         self.release_captured_application_operation(context, &receipt.lease)
             .await?;
         Ok(Some(shared_types::BuilderCreationEvidence {
             registration_predecessor: None,
             creation_lease_released: true,
             target: receipt.target,
-            container: receipt.container,
+            container,
         }))
     }
 

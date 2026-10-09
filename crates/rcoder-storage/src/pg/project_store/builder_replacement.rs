@@ -151,7 +151,7 @@ impl PgStore {
             let mut tx = db.transaction().await?;
             let result = async {
                 crate::userapp_lifecycle::commit_builder_registration_adoption(&mut tx, &target, &expected_source_uid, &progress).await?;
-                rebind_rows(&mut tx, &target.context, &target, &container, None, Some(&expected)).await
+                rebind_rows(&mut tx, &target.context, &target, &container, None, &[], Some(&expected)).await
             }.await;
             match result {
                 Ok(info) => { tx.commit().await?; Ok(info) }
@@ -178,16 +178,17 @@ impl PgStore {
         let current = self.inner.get(committed.project_id());
         if current.as_ref().is_some_and(|current| {
             current.persistence_identity().generation == committed.persistence_identity().generation
+                && current.persistence_identity().revision
+                    >= committed.persistence_identity().revision
                 && current
                     .persistence_identity()
                     .container
                     .as_ref()
-                    .map(|identity| &identity.generation)
-                    == committed
-                        .persistence_identity()
-                        .container
-                        .as_ref()
-                        .map(|identity| &identity.generation)
+                    .zip(committed.persistence_identity().container.as_ref())
+                    .is_some_and(|(current, committed)| {
+                        current.generation == committed.generation
+                            && current.revision >= committed.revision
+                    })
                 && current
                     .container_info()
                     .zip(committed.container_info())
@@ -236,15 +237,58 @@ pub(super) async fn rebind(
     // This root CAS is also the competition point for deletion and Stop/Restart.
     crate::userapp_lifecycle::bind_completed_builder_registration(tx, operation, evidence, volumes)
         .await?;
+    let recorded_predecessors = recorded_registration_predecessors(tx, evidence, volumes).await?;
     rebind_rows(
         tx,
         &evidence.target.context,
         &evidence.target,
         &evidence.container,
         evidence.registration_predecessor.as_ref(),
+        &recorded_predecessors,
         None,
     )
     .await
+}
+
+async fn recorded_registration_predecessors(
+    tx: &mut dyn Executor,
+    evidence: &BuilderCreationEvidence,
+    volumes: &[AppResourceIdentity],
+) -> Result<Vec<shared_types::BuilderCreationPredecessor>> {
+    let workload = evidence
+        .target
+        .workload
+        .as_ref()
+        .context("Builder completion workload missing")?;
+    let candidates = crate::userapp_lifecycle::completed_builder_registration_candidates(
+        tx,
+        &evidence.target.context.app_id,
+        &evidence.target.context.lifecycle_id,
+        &evidence.container.container_id,
+        &workload.uid,
+    )
+    .await?;
+    let mut predecessors = Vec::new();
+    for candidate in candidates {
+        if let Some(recorded) = candidate.checkpoint.get("builder_creation_evidence") {
+            let recorded: BuilderCreationEvidence = serde_json::from_value(recorded.clone())
+                .context("Decode recorded builder replacement proof")?;
+            recorded
+                .validate_registration_replacement(&candidate, volumes)
+                .map_err(anyhow::Error::msg)?;
+            ensure!(
+                recorded.container.container_id == evidence.container.container_id
+                    && recorded.container.workload_uid == evidence.container.workload_uid
+                    && recorded.container.container_name == evidence.container.container_name
+                    && recorded.container.project_id == evidence.container.project_id,
+                "Recorded builder proof differs from its completed physical result"
+            );
+            if let Some(predecessor) = recorded.registration_predecessor {
+                predecessors.push(predecessor);
+            }
+        }
+    }
+    Ok(predecessors)
 }
 
 async fn rebind_rows(
@@ -253,6 +297,7 @@ async fn rebind_rows(
     target: &shared_types::BuilderControlTarget,
     basic: &shared_types::ContainerBasicInfo,
     predecessor: Option<&shared_types::BuilderCreationPredecessor>,
+    recorded_predecessors: &[shared_types::BuilderCreationPredecessor],
     expected_registry: Option<&ProjectAndContainerInfo>,
 ) -> Result<ProjectAndContainerInfo> {
     let source = predecessor.and_then(|source| source.target.workload.as_ref());
@@ -263,9 +308,11 @@ async fn rebind_rows(
     ensure!(
         basic.project_id == context.app_id
             && basic.workload_uid.as_deref() == Some(replacement.uid.as_str())
-            && target.pod.as_ref().is_some_and(
-                |pod| pod.uid == basic.container_id && pod.name == basic.container_name
-            ),
+            && basic.container_name == replacement.name
+            && target
+                .pod
+                .as_ref()
+                .is_some_and(|pod| pod.uid == basic.container_id),
         "Builder registry identity differs from the captured replacement"
     );
     // Use the registry's existing lock namespace/order. These locks protect only
@@ -368,62 +415,128 @@ async fn rebind_rows(
             previous.logical_id == context.app_id,
             "Builder container is registered to another project"
         );
-        if previous.workload_uid.as_deref() == Some(replacement.uid.as_str()) {
-            ensure!(
-                previous.container_id.as_deref() == Some(basic.container_id.as_str()),
-                "Completed builder Pod was replaced before registration retry"
-            );
-            ensure!(
-                old.container_info()
-                    .is_some_and(|info| info.container_id == basic.container_id),
-                "Builder replacement registry reference is missing"
-            );
-            return Ok(old);
-        }
-        if let Some(source) = source {
-            ensure!(
-                previous.workload_uid.as_deref() == Some(source.uid.as_str()),
-                "Builder predecessor workload differs from the current registry"
-            );
-        } else {
-            let source_uid = previous
-                .workload_uid
-                .as_deref()
-                .context("Legacy builder registry has no workload identity")?;
-            let old = models::ResourceBinding::filter_by_service_type_and_physical_uid(
-                ServiceType::UserappBuilder.to_string(),
-                source_uid,
-            )
-            .first()
-            .exec(tx)
-            .await?
-            .context("Legacy builder registry has no original lifecycle binding")?;
-            ensure!(
-                old.app_id == context.app_id && old.lifecycle_id == context.lifecycle_id,
-                "Legacy builder registry belongs to another lifecycle"
-            );
-        }
-        // A UserApp builder is dedicated to its app. Do not detach an unexpected
-        // project's references while handling this app's completed operation.
+        // Even an idempotent retry cannot accept another project's shared
+        // reference. A dedicated builder registration must remain exclusive.
         let rows = toasty::sql::query("SELECT project_id FROM projects WHERE container_name=$1 AND container_generation=$2 AND project_id<>$3")
             .bind(&previous.container_name).bind(&previous.container_generation).bind(&context.app_id).exec(tx).await?;
         ensure!(
             rows.is_empty(),
             "Builder registry has unrelated project references"
         );
+        let same_pod = previous.container_id.as_deref() == Some(basic.container_id.as_str());
+        ensure!(
+            !same_pod
+                || previous
+                    .workload_uid
+                    .as_ref()
+                    .is_none_or(|uid| uid == &replacement.uid),
+            "The same builder Pod has a conflicting recorded workload identity"
+        );
+        let source_uid = match previous.workload_uid.as_deref() {
+            Some(uid) => uid.to_owned(),
+            // The checked current completion acknowledges this exact Pod and
+            // STS. Fill an absent historical controller column without retiring
+            // the still-live physical Pod or its registration generation.
+            None if same_pod => replacement.uid.clone(),
+            None => verify_legacy_registration_history(tx, context, previous, None).await?,
+        };
+        let same_workload = source_uid == replacement.uid;
+        if !same_workload {
+            // A null-predecessor confirmation must not bypass an earlier
+            // durable replacement proof for this same current resource.
+            for recorded in recorded_predecessors {
+                let workload = recorded
+                    .target
+                    .workload
+                    .as_ref()
+                    .context("Recorded builder predecessor workload missing")?;
+                let pod = recorded
+                    .target
+                    .pod
+                    .as_ref()
+                    .context("Recorded builder predecessor Pod missing")?;
+                ensure!(
+                    source_uid == workload.uid
+                        && previous.container_id.as_deref() == Some(pod.uid.as_str())
+                        && previous.container_name == workload.name,
+                    "Recorded builder predecessor differs from the current registry"
+                );
+            }
+        }
+        if same_workload && same_pod {
+            let registered = old
+                .container_info()
+                .context("Builder replacement registry reference is missing")?;
+            if registered == *basic {
+                return Ok(old);
+            }
+            // A completed confirmation can refresh the address of the same
+            // physical Pod without retiring its generation/physical identity.
+        } else if let Some(source) = source {
+            ensure!(
+                source_uid == source.uid
+                    && predecessor
+                        .and_then(|proof| proof.target.pod.as_ref())
+                        .is_some_and(|pod| previous.container_id.as_deref()
+                            == Some(pod.uid.as_str())
+                            && previous.container_name == source.name),
+                "Builder predecessor workload or Pod differs from the current registry"
+            );
+        } else {
+            let binding = models::ResourceBinding::filter_by_service_type_and_physical_uid(
+                ServiceType::UserappBuilder.to_string(),
+                &source_uid,
+            )
+            .first()
+            .exec(tx)
+            .await?;
+            if let Some(binding) = &binding {
+                // A conflicting binding can never be bypassed with history.
+                ensure!(
+                    binding.app_id == context.app_id
+                        && binding.lifecycle_id == context.lifecycle_id,
+                    "Legacy builder registry belongs to another lifecycle"
+                );
+            }
+            if binding.is_none() || same_workload {
+                // Pre-binding deployments still have durable successful Ensure
+                // results. Match the exact old Pod, STS and name, in this root-
+                // locked transaction. This proves registration ownership only;
+                // it does not invent a historical runtime creator receipt.
+                verify_legacy_registration_history(tx, context, previous, Some(&source_uid))
+                    .await?;
+            }
+        }
     }
     let mut identity = old.persistence_identity().clone();
     identity.revision = identity
         .revision
         .checked_add(1)
         .context("Project revision exhausted")?;
-    identity.container = Some(ContainerPersistenceIdentity {
-        generation: crate::pg::uuid_generation(),
-        revision: 1,
-        physical_uid: Some(basic.container_id.clone()),
-        predecessor: previous.as_ref().map(|c| c.container_generation.clone()),
-        predecessor_revision: previous.as_ref().map(|c| c.row_revision),
-    });
+    identity.container = Some(
+        match previous.as_ref().filter(|previous| {
+            (previous.workload_uid.is_none() || previous.workload_uid == basic.workload_uid)
+                && previous.container_id.as_deref() == Some(basic.container_id.as_str())
+        }) {
+            Some(previous) => ContainerPersistenceIdentity {
+                generation: previous.container_generation.clone(),
+                revision: previous
+                    .row_revision
+                    .checked_add(1)
+                    .context("Container revision exhausted")?,
+                physical_uid: Some(basic.container_id.clone()),
+                predecessor: None,
+                predecessor_revision: None,
+            },
+            None => ContainerPersistenceIdentity {
+                generation: crate::pg::uuid_generation(),
+                revision: 1,
+                physical_uid: Some(basic.container_id.clone()),
+                predecessor: previous.as_ref().map(|c| c.container_generation.clone()),
+                predecessor_revision: previous.as_ref().map(|c| c.row_revision),
+            },
+        },
+    );
     old.set_container(Some(basic.clone()));
     old.set_persistence_identity(identity);
     let container = ContainerSnapshot::from_info(
@@ -448,6 +561,56 @@ async fn rebind_rows(
     Ok(old)
 }
 
+async fn verify_legacy_registration_history(
+    tx: &mut dyn Executor,
+    context: &shared_types::UserAppExecutionContext,
+    previous: &repo::ContainerRow,
+    expected_workload_uid: Option<&str>,
+) -> Result<String> {
+    let pod_uid = previous
+        .container_id
+        .as_deref()
+        .context("Legacy builder registry has no Pod identity")?;
+    let rows = toasty::sql::query("SELECT checkpoint_json FROM userapp_operations WHERE app_id=$1 AND lifecycle_id=$2 AND kind='ensure_builder' AND state='succeeded' AND checkpoint_json::jsonb->>'container_id'=$3 AND checkpoint_json::jsonb->>'container_name'=$4")
+        .bind(&context.app_id).bind(&context.lifecycle_id).bind(pod_uid).bind(&previous.container_name).exec(tx).await?;
+    let mut identities = std::collections::BTreeSet::new();
+    for row in rows {
+        let toasty_core::stmt::Value::Record(row) = row else {
+            anyhow::bail!("Invalid historical builder ownership result row");
+        };
+        let [toasty_core::stmt::Value::String(checkpoint)] = row.fields.as_slice() else {
+            anyhow::bail!("Invalid historical builder ownership result column");
+        };
+        let stored: shared_types::ContainerBasicInfo = serde_json::from_str(checkpoint)
+            .context("Decode historical builder registration ownership result")?;
+        ensure!(
+            stored.project_id == context.app_id
+                && stored.container_id == pod_uid
+                && stored.container_name == previous.container_name,
+            "Historical builder ownership result differs from the registry"
+        );
+        identities.insert(
+            stored
+                .workload_uid
+                .filter(|uid| !uid.is_empty())
+                .context("Historical builder result has no workload UID")?,
+        );
+    }
+    ensure!(
+        identities.len() == 1,
+        "Legacy builder registry has no unique successful lifecycle history"
+    );
+    let identity = identities
+        .into_iter()
+        .next()
+        .context("Builder historical workload identity missing")?;
+    ensure!(
+        expected_workload_uid.is_none_or(|expected| expected == identity),
+        "Historical builder workload differs from the registry"
+    );
+    Ok(identity)
+}
+
 fn clone_container_row(row: &repo::ContainerRow) -> repo::ContainerRow {
     repo::ContainerRow {
         container_name: row.container_name.clone(),
@@ -464,6 +627,10 @@ fn clone_container_row(row: &repo::ContainerRow) -> repo::ContainerRow {
         created_at: row.created_at,
     }
 }
+
+#[cfg(test)]
+#[path = "builder_registration_tests.rs"]
+mod receipt_recovery_tests;
 
 #[cfg(test)]
 mod tests {
@@ -577,7 +744,7 @@ mod tests {
             let pod_after = format!("after{}", uuid::Uuid::new_v4().simple());
             let basic = |pod_uid: &str, workload_uid: &str| ContainerBasicInfo {
                 container_id: pod_uid.into(),
-                container_name: format!("builder-{app_id}-0"),
+                container_name: format!("builder-{app_id}"),
                 container_ip: "10.42.0.9".into(),
                 internal_port: 60000,
                 external_port: 0,

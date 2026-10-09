@@ -212,16 +212,27 @@ impl ProjectAdapter {
                 // info 回指同一权威 Arc——后续 containers[name] 的刷新 info 自动可见。
                 if let Some(existing_ref) = self.containers.get(&key) {
                     let existing_arc = Arc::clone(&*existing_ref);
-                    let old_cid = existing_ref.info().container_id;
-                    let new_cid = temp_entry.info().container_id;
-                    if old_cid != new_cid {
+                    let previous = existing_ref.info();
+                    let replacement = temp_entry.info();
+                    let old_cid = &previous.container_id;
+                    let new_cid = &replacement.container_id;
+                    if old_cid == new_cid {
+                        anyhow::ensure!(
+                            previous
+                                .workload_uid
+                                .as_ref()
+                                .is_none_or(|uid| replacement.workload_uid.as_ref() == Some(uid)),
+                            "The same physical container cannot change or discard its workload identity"
+                        );
+                    }
+                    if previous != replacement {
                         // 注册表恒存族代表值（防御归一——st 虽经 facade setter
                         // 已归一，此权威 Arc 刷新点保持同一约定）
-                        existing_ref.update(temp_entry.info(), st.family_representative());
+                        existing_ref.update(replacement.clone(), st.family_representative());
                     }
                     drop(existing_ref); // 释放读锁后再操作其他 map
                     if old_cid != new_cid {
-                        self.container_id_to_key.remove(&old_cid);
+                        self.container_id_to_key.remove(old_cid);
                     }
                     Arc::make_mut(&mut info).set_container_arc(Some(existing_arc));
                 }

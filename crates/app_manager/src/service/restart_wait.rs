@@ -35,6 +35,48 @@ impl Default for RestartAdmission {
 struct RestartDiagnostic {
     target: Option<(String, Option<String>)>,
     holder: Option<super::operation_progress::VerifiedHolderDiagnostic>,
+    compute: Option<AdmissionComputeFence>,
+    rejected: Option<CapturedAdmissionBlocker>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct AdmissionComputeFence {
+    generation: i64,
+    desired_stopped: bool,
+    operation_id: Option<String>,
+}
+impl From<&shared_types::UserAppComputeStatus> for AdmissionComputeFence {
+    fn from(status: &shared_types::UserAppComputeStatus) -> Self {
+        Self {
+            generation: status.generation,
+            desired_stopped: status.desired_stopped,
+            operation_id: status
+                .operation
+                .as_ref()
+                .map(|control| control.operation_id.clone()),
+        }
+    }
+}
+impl AdmissionComputeFence {
+    /// Explicit business Start/Restart consumes a stopped marker without
+    /// admitting a new physical control. Every new control changes generation.
+    pub(super) fn compatible(&self, current: &Self) -> bool {
+        self == current
+            || (self.generation == current.generation
+                && self.desired_stopped
+                && !current.desired_stopped
+                && current.operation_id.is_none())
+    }
+}
+
+/// A definitively rejected store admission while this request owned its guard.
+/// It is diagnostic evidence only, never authority to bypass another admission.
+#[derive(Clone)]
+pub(super) struct CapturedAdmissionBlocker {
+    pub app_id: String,
+    pub lifecycle_id: String,
+    pub blocker: shared_types::UserAppOperationBlocker,
+    pub compute: AdmissionComputeFence,
 }
 
 tokio::task_local! {
@@ -70,6 +112,7 @@ impl RestartAdmission {
         {
             return Err(deadline_exhausted());
         }
+        self.diagnostic()?.rejected = None;
         match self
             .phase
             .compare_exchange(WAITING, ADMITTING, Ordering::SeqCst, Ordering::SeqCst)
@@ -182,6 +225,55 @@ pub(crate) async fn prepare<T>(future: impl Future<Output = AppResult<T>>) -> Ap
 }
 pub(crate) fn rejected_before_admission() {
     let _ = RESTART_ADMISSION.try_with(|context| context.rejected());
+}
+
+pub(super) fn capture_rejected_blocker(
+    app_id: &str,
+    blocker: &shared_types::UserAppOperationBlocker,
+) -> AppResult<()> {
+    RESTART_ADMISSION
+        .try_with(|context| {
+            let mut diagnostic = context.diagnostic()?;
+            diagnostic.rejected = match (&diagnostic.target, &diagnostic.compute) {
+                (Some((target, Some(lifecycle))), Some(compute)) if target == app_id => {
+                    Some(CapturedAdmissionBlocker {
+                        app_id: app_id.into(),
+                        lifecycle_id: lifecycle.clone(),
+                        blocker: blocker.clone(),
+                        compute: compute.clone(),
+                    })
+                }
+                _ => None,
+            };
+            Ok(())
+        })
+        .unwrap_or(Ok(()))
+}
+
+fn take_rejected_blocker() -> AppResult<Option<CapturedAdmissionBlocker>> {
+    RESTART_ADMISSION
+        .try_with(|context| Ok(context.diagnostic()?.rejected.take()))
+        .unwrap_or(Ok(None))
+}
+
+fn observe_compute_intent(status: &shared_types::UserAppComputeStatus) -> AppResult<()> {
+    RESTART_ADMISSION
+        .try_with(|context| {
+            let mut diagnostic = context.diagnostic()?;
+            let current = AdmissionComputeFence::from(status);
+            match &diagnostic.compute {
+                Some(previous) if !previous.compatible(&current) => {
+                    Err(AppOperationError::Conflict(
+                        "Compute intent changed while Restart was waiting before admission".into(),
+                    ))
+                }
+                _ => {
+                    diagnostic.compute = Some(current);
+                    Ok(())
+                }
+            }
+        })
+        .unwrap_or(Ok(()))
 }
 pub(super) fn cancellation() -> tokio_util::sync::CancellationToken {
     RESTART_ADMISSION
@@ -346,6 +438,7 @@ impl AppService {
         error: AppOperationError,
         deadline: tokio::time::Instant,
     ) -> AppResult<()> {
+        let captured = take_rejected_blocker()?.filter(|captured| captured.app_id == app_id);
         let expected = match error.root_cause() {
             AppOperationError::OperationInProgress {
                 blocker: Some(blocker),
@@ -353,7 +446,10 @@ impl AppService {
             } => Some(blocker.as_ref()),
             AppOperationError::OperationInProgress { blocker: None, .. } => {
                 invalidate_diagnostic()?;
-                return Err(error);
+                match captured.as_ref() {
+                    Some(captured) => Some(&captured.blocker),
+                    None => return Err(error),
+                }
             }
             AppOperationError::ConflictBlocked { blocker, .. } => Some(blocker),
             _ => {
@@ -374,6 +470,21 @@ impl AppService {
         )
         .await?;
         if !holder.may_wait {
+            if holder.blocker.is_none()
+                && let Some(captured) = captured.as_ref().filter(|captured| {
+                    expected.is_some_and(|expected| {
+                        expected.operation_id == captured.blocker.operation_id
+                            && expected.scope == captured.blocker.scope
+                            && expected.kind == captured.blocker.kind
+                    })
+                })
+                && bounded_read(deadline, self.observe_released_admission_blocker(captured))
+                    .await?
+                    .is_some()
+            {
+                check_waiting()?;
+                return Ok(());
+            }
             return Err(holder.into_error());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -423,10 +534,10 @@ impl AppService {
                         .await?)
                 })
                 .await?;
-                if let Some(control) = status.operation
+                if let Some(control) = status.operation.as_ref()
                     && !control.state.is_terminal()
                 {
-                    let blocker = super::operation_progress::compute_blocker(&control);
+                    let blocker = super::operation_progress::compute_blocker(control);
                     let holder = bounded_read(
                         deadline,
                         self.observe_operation_holder(
@@ -439,6 +550,7 @@ impl AppService {
                     .await?;
                     return Err(holder.into_error());
                 }
+                observe_compute_intent(&status)?;
             }
             let lock = self
                 .release_locks
@@ -479,10 +591,10 @@ impl AppService {
                                 .await?)
                         })
                         .await?;
-                        if let Some(control) = status.operation
+                        if let Some(control) = status.operation.as_ref()
                             && !control.state.is_terminal()
                         {
-                            let blocker = super::operation_progress::compute_blocker(&control);
+                            let blocker = super::operation_progress::compute_blocker(control);
                             guard.finish_unadmitted(deadline).await?;
                             let holder = bounded_read(
                                 deadline,
@@ -495,6 +607,10 @@ impl AppService {
                             )
                             .await?;
                             return Err(holder.into_error());
+                        }
+                        if let Err(error) = observe_compute_intent(&status) {
+                            guard.finish_unadmitted(deadline).await?;
+                            return Err(error);
                         }
                     }
                     return Ok(guard);

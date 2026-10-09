@@ -462,8 +462,16 @@ async fn verify_registration(
     if !publish {
         return Ok(Some(updated));
     }
-    if creation::repair_live_registration(state, app_id, instance, &updated).await? {
-        return Ok(Some(updated));
+    match creation::repair_live_registration(state, app_id, instance, &updated).await {
+        Ok(true) => return Ok(Some(updated)),
+        Ok(false) => {}
+        Err(error) if error.is::<creation::BuilderRegistrationConfirmationRequired>() => {
+            // A controller may recreate its Pod without a corresponding ensure
+            // result. Read-side observation grants no registration authority;
+            // return to admitted creation to confirm the new physical identity.
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
     }
     if let Some(mut project) = state.get_project(instance).map(|p| (*p).clone()) {
         project.set_service_type(Some(ServiceType::UserappBuilder));
@@ -637,12 +645,17 @@ async fn registered_or_discovered_builder(
         status: String::from(actual.status),
         created_at: actual.created_at,
         service_url: format!("http://{}:{}", actual.container_ip, AGENT_FILE_SERVER_PORT),
-        workload_uid: None,
+        workload_uid: actual.workload_uid,
     };
     adoption::verify_live_builder(state, instance, instance, &info.container_id).await?;
     state.runtime().refresh_container_reach(&info).await?;
-    if !creation::repair_live_registration(state, instance, instance, &info).await? {
-        register_builder(state, instance, &info)?;
+    match creation::repair_live_registration(state, instance, instance, &info).await {
+        Ok(true) => {}
+        Ok(false) => register_builder(state, instance, &info)?,
+        Err(error) if error.is::<creation::BuilderRegistrationConfirmationRequired>() => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
     }
     Ok(Some(info))
 }
