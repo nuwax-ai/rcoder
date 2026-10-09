@@ -7,8 +7,10 @@ import re
 import shutil
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from tools.tests import test_runtime_assets as fixtures
 assets = fixtures.assets
@@ -263,14 +265,14 @@ class VersionGateTests(unittest.TestCase):
             makefile.write_text(original.replace('PINGAP_VERSION ?= $(shell python3 tools/build/pingap_identity.py --field version)', 'PINGAP_VERSION ?= 0.1.0'))
             result = self.run_gate(root, '--pingap-version', '0.15.0', '--pingap-commit', commit, env=env)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn('make/docker.mk', result.stdout)
+            self.assertIn('[不一致] make/docker.mk（dev agent-runner 注入）默认', result.stdout)
             self.assertIn('0.1.0', result.stdout)
             makefile.write_text(original)
             runtime = root / 'docker/build-app-runtime.py'
             runtime.write_text(runtime.read_text().replace("args.pingap_version = identity['version']", "args.pingap_version = '0.1.0'"))
             result = self.run_gate(root, '--pingap-version', '0.15.0', '--pingap-commit', commit, env=env)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn('docker/build-app-runtime.py', result.stdout)
+            self.assertIn('[不一致] docker/build-app-runtime.py（dev app-runtime build-arg）默认', result.stdout)
             self.assertIn('0.1.0', result.stdout)
 
     def test_wrong_environment_override_fails_before_build(self):
@@ -282,6 +284,65 @@ class VersionGateTests(unittest.TestCase):
             result = self.run_gate(root, env=env)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('当前环境', result.stdout)
+
+    def test_explicit_build_pair_overrides_stale_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.fixture(root)
+            catalog = json.loads((root / 'tools/build/pingap-assets.json').read_text())
+            commit = catalog['releases']['0.15.0']['commit']
+            env = self.clean_environment()
+            env.update(PINGAP_VERSION='0.14.3', PINGAP_COMMIT='b' * 40)
+            result = self.run_gate(root, '--pingap-version', '0.15.0', '--pingap-commit', commit, env=env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('[一致]   当前请求 Pingap build args', result.stdout)
+
+    def test_runtime_cli_overrides_stale_environment_before_asset_preparation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.fixture(root)
+            gate = root / 'k8s/scripts/pingap_version_gate.py'
+            gate.parent.mkdir(parents=True)
+            gate.write_bytes((ROOT / 'k8s/scripts/pingap_version_gate.py').read_bytes())
+            catalog = json.loads((root / 'tools/build/pingap-assets.json').read_text())
+            commit = catalog['releases']['0.15.0']['commit']
+            env = self.clean_environment()
+            env.update(PINGAP_VERSION='0.14.3', PINGAP_COMMIT='b' * 40)
+            spec = importlib.util.spec_from_file_location('runtime_build', root / 'docker/build-app-runtime.py')
+            runtime = importlib.util.module_from_spec(spec)
+            with mock.patch.object(sys, 'path', sys.path.copy()):
+                spec.loader.exec_module(runtime)
+                with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+                    sys, 'argv', [str(root / 'docker/build-app-runtime.py'), str(root / 'runtime'),
+                                  '--pingap-version', '0.15.0', '--pingap-commit', commit]
+                ), mock.patch.object(
+                    runtime.importlib.util, 'spec_from_file_location',
+                    side_effect=RuntimeError('gate accepted before asset import')
+                ):
+                    # 实际 main + 子进程 gate；在资产加载边界中止，不准备资产或调用 Docker。
+                    with self.assertRaisesRegex(RuntimeError, 'gate accepted before asset import'):
+                        runtime.main()
+            self.assertFalse((root / '.cache').exists())
+
+    def test_explicit_build_pair_cannot_hide_invalid_actual_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.fixture(root)
+            catalog = json.loads((root / 'tools/build/pingap-assets.json').read_text())
+            commit = catalog['releases']['0.15.0']['commit']
+            env = self.clean_environment()
+            env.update(PINGAP_VERSION='0.15.0', PINGAP_COMMIT=commit)
+            for arguments in (
+                ['--pingap-version', '0.14.3', '--pingap-commit', commit],
+                ['--pingap-version', '0.15.0', '--pingap-commit', 'b' * 40],
+                ['--pingap-version', '0.15.0'],
+                ['--pingap-commit', commit],
+                ['--pingap-version', '0.15.0', '--pingap-commit', commit, '--download-version', '0.14.3'],
+                ['--pingap-version', '0.15.0', '--pingap-commit', commit, '--node-version', '24.0.0'],
+            ):
+                with self.subTest(arguments=arguments):
+                    result = self.run_gate(root, *arguments, env=env)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_print_interfaces_do_not_download_or_run_docker(self):
         with tempfile.TemporaryDirectory() as temporary:
