@@ -2925,4 +2925,115 @@ mod tests {
     async fn unknown_original_resident_keeps_old_binding_and_management_fence() {
         resident_rebind_case(true).await;
     }
+    struct BusinessCancellation(CancellationToken);
+    #[async_trait::async_trait]
+    impl WorkerControl for BusinessCancellation {
+        async fn probe(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn shutdown(&self) -> Result<()> {
+            self.0.cancel();
+            Ok(())
+        }
+    }
+    struct PendingOwnerResource {
+        entered: Arc<tokio::sync::Notify>,
+        released: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl OwnerCleanup for PendingOwnerResource {
+        async fn shutdown(&self) -> Result<()> {
+            self.entered.notify_one();
+            self.released.notified().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn captured_shutdown_waits_for_owner_resources_after_original_generation_is_quiescent() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = session(directory.path()).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let released = Arc::new(tokio::sync::Notify::new());
+        owner
+            .set_owner_cleanup(Arc::new(PendingOwnerResource {
+                entered: entered.clone(),
+                released: released.clone(),
+            }))
+            .unwrap();
+        let factory_owner = owner.clone();
+        let running_owner = owner.clone();
+        let running = tokio::spawn(async move {
+            running_owner
+                .run(Box::new(move |launch| {
+                    let cancel = CancellationToken::new();
+                    factory_owner.ready_guard(&launch.generation).mark_ready()?;
+                    Ok(BusinessRun {
+                        control: Arc::new(BusinessCancellation(cancel.clone())),
+                        end: Box::pin(async move {
+                            cancel.cancelled().await;
+                            Ok(None)
+                        }),
+                    })
+                }))
+                .await
+        });
+        let before = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = owner.snapshot();
+                if state.phase == Phase::Ready {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut request = Request::new(Action::Shutdown);
+        request.capture_generation(before.generation.as_deref());
+        let root = directory.path().to_path_buf();
+        let original = before.clone();
+        let original_request = request.clone();
+        let handover = tokio::spawn(async move {
+            crate::shutdown_captured_owner(
+                &root,
+                &original,
+                &original_request,
+                Duration::from_secs(5),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let pending = owner.snapshot();
+        assert!(pending.generation.is_none());
+        assert_eq!(pending.phase, Phase::CleanupPending);
+        assert_eq!(
+            pending.operation_id.as_deref(),
+            Some(request.request_id.as_str())
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !handover.is_finished(),
+            "same owner resource drain was mistaken for IdentityChanged"
+        );
+        released.notify_one();
+        running.await.unwrap().unwrap();
+        drop(owner);
+        tokio::time::timeout(Duration::from_secs(2), handover)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let result = crate::saved_request_snapshot(directory.path(), &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.phase, Phase::Stopped);
+        assert_eq!(result.intent, Intent::Shutdown);
+        assert_eq!(
+            result.operation_id.as_deref(),
+            Some(request.request_id.as_str())
+        );
+    }
 }
