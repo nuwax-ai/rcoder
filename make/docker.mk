@@ -13,10 +13,10 @@ PUSH_IMAGE ?= false
 # 用法: make dev-restart BUILDX_BUILDER=nuwax-clusters
 BUILDX_BUILDER ?=
 
-# pingap 版本（单一事实源 = app-cli devtool.rs DEFAULT_PINGAP_VERSION/COMMIT；
-# k8s/scripts/pingap_version_gate.py 强制本文件与 build-app-runtime.py/生产仓一致）
-PINGAP_VERSION ?= 0.15.0
-PINGAP_COMMIT ?= 8270a1ebb7a238ea86fa220215714613410378bb
+# 默认从本次 app-cli 源码契约读取，不重复维护镜像版本。
+# 显式构建参数仍由版本门禁核验，不允许覆盖成不配对的二进制。
+PINGAP_VERSION ?= $(shell python3 tools/build/pingap_identity.py --field version)
+PINGAP_COMMIT ?= $(shell python3 tools/build/pingap_identity.py --field commit)
 
 # Docker 镜像构建（仅构建镜像，不编译）
 # 串行构建镜像，避免资源竞争
@@ -154,6 +154,11 @@ download-pingap-cache:
 	@python3 tools/build/runtime_assets.py pingap --version "$(PINGAP_DL_VERSION)" --cache "$(RUNTIME_ASSET_CACHE)" --context docker/app-runtime-base --download-context docker/rcoder-agent-runner --output-ref "$(ASSET_REF_DIR)/pingap.ref"
 
 .PHONY: asset-preflight docker-build-agent-assets docker-build-runtime-assets check-build-contracts
+# 门禁读取实际展开值；只打印身份，不准备资产或构建镜像。
+.PHONY: print-pingap-build-identity
+print-pingap-build-identity:
+	@printf '%s %s\n' "$(PINGAP_VERSION)" "$(PINGAP_COMMIT)"
+
 asset-preflight:
 	@python3 k8s/scripts/pingap_version_gate.py --pingap-version "$(PINGAP_VERSION)" --pingap-commit "$(PINGAP_COMMIT)" --download-version "$(PINGAP_DL_VERSION)" --node-version "$(NODE_RUNTIME_VERSION)"
 
@@ -167,8 +172,7 @@ docker-build-runtime-assets: asset-preflight
 	@$(MAKE) build-dbx-fork download-pingap-cache download-ttyd download-node download-go-cache download-deno
 
 # 构建 agent-runner 镜像（基于基础镜像，快速构建）
-# pingap 版本说明（构建注入，单一来源 = app-cli devtool.rs DEFAULT_PINGAP_VERSION/COMMIT，
-# 与生产 build_config 16-app-runtime.mk 同值；三处同步改）
+# pingap 构建参数从 app-cli 源码契约派生，并在准备资产前核验。
 docker-build-agent-runner: docker-build-agent-assets
 	@echo "🐳 构建 rcoder-agent-runner 镜像（本地开发用 dev-rcoder-agent-runner）..."
 	@echo "📍 镜像名称: dev-rcoder-agent-runner:latest"
