@@ -37,6 +37,7 @@ pub(crate) const ORCHESTRATOR_FAILURE_SERVICE: &str = "orchestrator";
 mod migration;
 mod pg_wait;
 mod pingap;
+pub(crate) mod resident;
 mod run;
 mod start;
 mod supervise;
@@ -49,7 +50,6 @@ mod tests;
 // pub(super) 项仍限 supervisor 子树。
 pub(crate) use migration::*;
 pub(crate) use pg_wait::*;
-use pingap::*;
 pub use run::*;
 pub use start::*;
 pub(crate) use supervise::*;

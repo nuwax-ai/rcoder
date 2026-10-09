@@ -1,41 +1,24 @@
 use super::*;
+use crate::proxy::compiler::CompileOutcome;
 
 // ── pingap 启动 ─────────────────────────────────────────────────────────────────
 
-/// 编译用户权威配置到只读运行目录，`pingap -t` 成功后再启动，
-/// 并经 loopback admin 只读通道确认初始配置实际生效。
-pub(super) async fn start_pingap(
-    ws_root: &Path,
-    log_root: &Path,
+/// 直跑形态（无 owner 会话作用域）：pingap 进**业务会话树**（R01 受管
+/// 停止/收束链——run() 返回时整组收束，无孤儿）。serve 形态的常驻入口
+/// 见 [`super::resident`]。编译/发布 active 由调用方完成。
+pub(super) async fn spawn_pingap_into_session_tree(
+    outcome: &CompileOutcome,
     pingap_bin: &Path,
-    release: &workspace_manifest::ReleaseLock,
+    active_config: &Path,
     children: &mut ManagedChildren,
-    dev_profile: bool,
 ) -> Result<()> {
-    // N02：运行目录默认不假设容器 /run（原生 Windows/macOS 不可写）——
-    // env 显式优先（平台注入容器布局），缺省挂 log_dir 子目录（用户可写、
-    // 稳定、非系统临时目录；配置每次启动重生成，随日志卷持久无害）。
-    let runtime_root = crate::proxy::compiler::runtime_root(log_root);
-    let outcome =
-        compile_and_validate(ws_root, &runtime_root, pingap_bin, release, dev_profile).await?;
-    info!(
-        "📝 effective pingap config → {}",
-        outcome.config_path.display()
-    );
-
     // admin 仅启用为 loopback 只读确认通道；TOML 仍是唯一配置权威；永不通过 admin 写配置。
-    // 凭证每次启动随机生成，经 env 注入（不进命令行，避免 ps 泄露；不落盘不进日志）。
-    let admin_addr = format!("127.0.0.1:{}", admin_probe::admin_port());
-    let endpoint = admin_probe::register_admin_endpoint(
-        admin_addr,
-        uuid::Uuid::new_v4().to_string(),
-        uuid::Uuid::new_v4().to_string(),
-    );
+    let endpoint = admin_probe::ensure_admin_endpoint();
 
     // R01：pingap 受管进程树 spawn（与业务服务同一停止/收束链）。
     let mut cmd = Command::new(pingap_bin);
     cmd.arg("-c")
-        .arg(&outcome.config_path)
+        .arg(active_config)
         .arg("--autoreload")
         // pingap 的 env override 规则：`get_from_env(key)` 读 `PINGAP_{key}` 全大写
         //（pingap src/main.rs parse_arguments 的闭包），故必须用 PINGAP_ADMIN_* 而非 admin_*。

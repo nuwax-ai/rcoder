@@ -262,16 +262,40 @@ pub(super) async fn run_inner(
             !cancel.as_ref().is_some_and(|token| token.is_cancelled()),
             "Orchestration cancelled"
         );
-        // 编译、完整验证并启动 Pingap；代理失败时 workspace 不得进入 ready。
-        start_pingap(
+        // 编译、完整验证、发布 active 并确保入口（P1 常驻语义）：
+        // - serve 形态（有 owner 会话作用域）：常驻 pingap——业务代次重建
+        //   不再杀/拉入口，active 发布由 --autoreload 拾取；
+        // - 直跑形态：无 owner 作用域，常驻进程会在 run() 返回后成为孤儿——
+        //   维持业务会话树托管（R01）。代理失败时 workspace 不得进入 ready。
+        let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+        let outcome = compile_and_validate(
             &args.workspace,
-            &args.log_dir,
+            &runtime_root,
             &args.pingap_bin,
             &release,
-            &mut children,
             dev_profile,
         )
         .await?;
+        info!(
+            "📝 effective pingap config → {}",
+            outcome.config_path.display()
+        );
+        crate::proxy::compiler::publish_active(&runtime_root, &outcome.config_path).await?;
+        // serve 形态判定：run_loop 恒传 on_running（相位回执）；直跑形态
+        //（main.rs 的 run 子命令与 run()）恒为 None——即便直跑进程处于原生
+        // 监督下，单次编排的进程域仍走会话树（树外进程会在 run 返回后孤儿化）。
+        let serve_form = on_running.is_some();
+        if serve_form && super::resident::owner_scope_root().is_some() {
+            super::resident::ensure_resident(args, &outcome.expected_hash).await?;
+        } else {
+            super::pingap::spawn_pingap_into_session_tree(
+                &outcome,
+                &args.pingap_bin,
+                &crate::proxy::compiler::active_config_path(&runtime_root),
+                &mut children,
+            )
+            .await?;
+        }
         // Explicit startup contracts cover the complete startup commit, including
         // bridge observation. Do not emit a successful terminal before this wait.
         if specs.iter().any(|spec| spec.health.startup_probe.is_some()) {

@@ -910,6 +910,10 @@ async fn business_session_inner(
                 (result, deadline)
             },
         };
+        // P1：owner 退出前收束常驻 pingap（owner 域进程随 owner 生死；
+        // 槽空为 no-op）。放在代际清理前——generation 清理要求 guardians
+        // 静默，常驻进程的 lease 不释放会卡住收束确认。
+        crate::services::supervisor::resident::shutdown().await;
         match driver_result {
             Ok(()) => match tokio::time::timeout_at(
                 shutdown_deadline,

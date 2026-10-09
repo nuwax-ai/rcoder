@@ -33,6 +33,7 @@ pub const CONFIRM_BUDGET: Duration = Duration::from_secs(25);
 pub const ROLLBACK_CONFIRM_BUDGET: Duration = Duration::from_secs(10);
 
 /// admin 端点凭证。每次进程启动随机生成；密码不落盘、不进日志。
+#[derive(Clone)]
 pub struct AdminEndpoint {
     pub addr: String,
     pub user: String,
