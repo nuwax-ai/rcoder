@@ -7,6 +7,9 @@
 mod dbx;
 mod merge;
 
+#[cfg(test)]
+mod dbx_query_tests;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,7 +78,7 @@ impl AppService {
             app_id,
             app_stage,
             DBX_READINESS_QUERY_BUDGET,
-            self.read_readiness_control(app_id, app_stage),
+            || self.read_readiness_control(app_id, app_stage),
             prober,
         )
         .await

@@ -5,65 +5,136 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use shared_types::{UserAppContainerReadiness, UserappStage};
+use shared_types::{DbxReadinessObservation, DbxReadinessReason, DbxReadinessStatus, UserappStage};
 use tokio::time::Instant;
 
 use crate::error::AppOperationError;
 use crate::models::AppResult;
 
-use super::merge::{ReadinessControl, container_readiness, dbx_container_observation};
+use super::merge::{
+    ControlIntent, ReadinessControl, container_readiness, dbx_container_observation,
+};
 
 /// Poll the authoritative read inside the same deadline as the runtime query.
-/// Keeping the read as a future also permits a stalled-store regression without
+/// Keeping a read factory also permits stalled-store regressions without
 /// replacing the production lifecycle store or changing its mutation contract.
-pub(super) async fn query_dbx_with_budget(
+pub(super) async fn query_dbx_with_budget<F>(
     app_id: &str,
     stage: UserappStage,
     budget: Duration,
-    control: impl Future<Output = AppResult<ReadinessControl>>,
+    mut read_control: impl FnMut() -> F,
     prober: Option<Arc<dyn shared_types::DbxReadinessProber>>,
-) -> AppResult<shared_types::DbxReadinessResponse> {
-    use shared_types::{DbxReadinessObservation, DbxReadinessReason, DbxReadinessStatus};
+) -> AppResult<shared_types::DbxReadinessResponse>
+where
+    F: Future<Output = AppResult<ReadinessControl>>,
+{
     let deadline = Instant::now() + budget;
+    let mut latest_control = ReadinessControl::ordinary(None);
     let observe = async {
         // 存储控制读取复用 /readiness 的 read_readiness_control（含 404 语义）：
         // 在途 Stop/Restart 回执与 desired_stopped 参与 container 推导。
-        let control = control.await?;
+        let mut before = read_control().await?;
+        latest_control = before.clone();
+        if Instant::now() >= deadline {
+            return Ok(timed_out(&latest_control));
+        }
         let prober = prober.ok_or_else(|| {
             AppOperationError::Backend("dbx prober is not wired (host assembly missing)".into())
         })?;
-        let observation = match prober
-            .probe(
-                app_id,
-                stage,
-                deadline.saturating_duration_since(Instant::now()),
-            )
-            .await
-        {
-            Ok(observation) => observation,
-            Err(error) => {
-                tracing::warn!(app_id, %error, "DBX readiness observation failed");
-                DbxReadinessObservation::new(
-                    DbxReadinessStatus::Unknown,
-                    Some(DbxReadinessReason::ObservationFailed),
-                )
-                .with_message(error)
+        for attempt in 0..2 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(timed_out(&latest_control));
             }
-        };
-        let container = container_readiness(&control, &dbx_container_observation(&observation));
-        Ok(observation.into_response(container))
+            let observation = match prober.probe(app_id, stage, remaining).await {
+                Ok(observation) => observation,
+                Err(error) => {
+                    tracing::warn!(app_id, %error, "DBX readiness observation failed");
+                    DbxReadinessObservation::new(
+                        DbxReadinessStatus::Unknown,
+                        Some(DbxReadinessReason::ObservationFailed),
+                    )
+                    .with_message(error)
+                }
+            };
+            if Instant::now() >= deadline {
+                return Ok(timed_out(&latest_control));
+            }
+            // A stable physical UID cannot prove that Stop/Restart was not
+            // admitted during the probe. Recheck the same scope's durable facts.
+            let after = read_control().await?;
+            latest_control = after.clone();
+            if Instant::now() >= deadline {
+                return Ok(timed_out(&latest_control));
+            }
+            if before.lifecycle_id != after.lifecycle_id {
+                return Ok(merge_dbx_observation(&after, instance_changed()));
+            }
+            if before == after {
+                return Ok(merge_dbx_observation(&after, observation));
+            }
+            if after.intent == ControlIntent::StopAccepted {
+                return Ok(merge_dbx_observation(
+                    &after,
+                    DbxReadinessObservation::new(
+                        DbxReadinessStatus::Unknown,
+                        Some(DbxReadinessReason::ComputeStopping),
+                    ),
+                ));
+            }
+            if attempt == 1 {
+                return Ok(merge_dbx_observation(&after, instance_changed()));
+            }
+            before = after;
+        }
+        Ok(merge_dbx_observation(&before, instance_changed()))
     };
-    tokio::time::timeout_at(deadline, observe)
-        .await
-        .unwrap_or_else(|_| {
-            // 预算耗尽时存储读取可能未完成（无控制事实）：容器按 unknown 收场，
-            // 与 /readiness 的 TimedOut 语义一致。
-            Ok(DbxReadinessObservation::new(
-                DbxReadinessStatus::Unknown,
-                Some(DbxReadinessReason::ObserveIncomplete),
-            )
-            .into_response(UserAppContainerReadiness::default()))
-        })
+    match tokio::time::timeout_at(deadline, observe).await {
+        Ok(result) => result,
+        Err(_) => Ok(timed_out(&latest_control)),
+    }
+}
+
+fn instance_changed() -> DbxReadinessObservation {
+    // Discard both the old HTTP reply and its Located fact when control or
+    // lifecycle identity changes. It cannot describe the new instance.
+    DbxReadinessObservation::new(
+        DbxReadinessStatus::Unknown,
+        Some(DbxReadinessReason::InstanceChanged),
+    )
+}
+
+fn timed_out(control: &ReadinessControl) -> shared_types::DbxReadinessResponse {
+    let observation = DbxReadinessObservation::new(
+        DbxReadinessStatus::Unknown,
+        Some(DbxReadinessReason::ObserveIncomplete),
+    );
+    let container = container_readiness(control, &dbx_container_observation(&observation));
+    observation.into_response(container)
+}
+
+fn merge_dbx_observation(
+    control: &ReadinessControl,
+    mut observation: DbxReadinessObservation,
+) -> shared_types::DbxReadinessResponse {
+    let container = container_readiness(control, &dbx_container_observation(&observation));
+    if container.status == shared_types::UserAppContainerStatus::RecoveryRequired {
+        observation.status = DbxReadinessStatus::Unknown;
+        observation.reason_code = Some(DbxReadinessReason::ObserveIncomplete);
+    } else if observation.reason_code != Some(DbxReadinessReason::InstanceChanged) {
+        match control.intent {
+            ControlIntent::StopAccepted => {
+                observation.status = DbxReadinessStatus::Unknown;
+                observation.reason_code = Some(DbxReadinessReason::ComputeStopping);
+            }
+            ControlIntent::Restarting => {
+                observation.status = DbxReadinessStatus::Starting;
+                observation.reason_code = Some(DbxReadinessReason::ComputeStarting);
+            }
+            ControlIntent::None | ControlIntent::Starting => {}
+        }
+    }
+    observation.into_response(container)
 }
 
 #[cfg(test)]
@@ -85,16 +156,15 @@ mod tests {
                 _: &str,
                 _: UserappStage,
                 _: Duration,
-            ) -> Result<shared_types::DbxReadinessObservation, String> {
+            ) -> Result<DbxReadinessObservation, String> {
                 match self.0.load(Ordering::SeqCst) {
-                    0 => Ok(shared_types::DbxReadinessObservation::new(
-                        shared_types::DbxReadinessStatus::Ready,
-                        None,
-                    )
-                    .with_compute_fact(shared_types::DbxComputeFact::Located)),
-                    1 => Ok(shared_types::DbxReadinessObservation::new(
-                        shared_types::DbxReadinessStatus::Stopped,
-                        Some(shared_types::DbxReadinessReason::ComputeStopped),
+                    0 => Ok(
+                        DbxReadinessObservation::new(DbxReadinessStatus::Ready, None)
+                            .with_compute_fact(shared_types::DbxComputeFact::Located),
+                    ),
+                    1 => Ok(DbxReadinessObservation::new(
+                        DbxReadinessStatus::Stopped,
+                        Some(DbxReadinessReason::ComputeStopped),
                     )
                     .with_compute_fact(
                         shared_types::DbxComputeFact::NotRunning(UserAppNoComputeState::Stopped),
@@ -126,7 +196,7 @@ mod tests {
             .await
             .unwrap();
         assert!(response.ready);
-        assert_eq!(response.status, shared_types::DbxReadinessStatus::Ready);
+        assert_eq!(response.status, DbxReadinessStatus::Ready);
         assert!(response.reason_code.is_none());
         // 实例定位稳定 → container 与 dbx 探测同轮一致为 running。
         assert_eq!(response.container.status, UserAppContainerStatus::Running);
@@ -139,7 +209,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!response.ready);
-        assert_eq!(response.status, shared_types::DbxReadinessStatus::Stopped);
+        assert_eq!(response.status, DbxReadinessStatus::Stopped);
         assert_eq!(response.container.status, UserAppContainerStatus::Stopped);
 
         service
@@ -150,10 +220,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!response.ready);
-        assert_eq!(response.status, shared_types::DbxReadinessStatus::Unknown);
+        assert_eq!(response.status, DbxReadinessStatus::Unknown);
         assert_eq!(
             response.reason_code,
-            Some(shared_types::DbxReadinessReason::ObservationFailed)
+            Some(DbxReadinessReason::ObservationFailed)
         );
         assert_eq!(response.message.as_deref(), Some("probe transport blew up"));
         // 探测系统失败无计算事实 → container unknown，不伪装 stopped。
@@ -210,6 +280,12 @@ mod tests {
                 revision: 1,
                 operation: Some(record),
             };
+            if !state.is_terminal() {
+                control.intent = match action {
+                    ComputeControlAction::Stop => ControlIntent::StopAccepted,
+                    ComputeControlAction::Restart => ControlIntent::Restarting,
+                };
+            }
             control
         }
 
@@ -239,7 +315,10 @@ mod tests {
                 "dbx1",
                 UserappStage::Prod,
                 Duration::from_secs(2),
-                async move { Ok::<_, AppOperationError>(control) },
+                move || {
+                    let control = control.clone();
+                    async move { Ok::<_, AppOperationError>(control) }
+                },
                 Some(Arc::new(Fixed(observation))),
             )
             .await
@@ -252,7 +331,11 @@ mod tests {
             stopped_observation(),
         )
         .await;
-        assert_eq!(response.status, DbxReadinessStatus::Stopped);
+        assert_eq!(response.status, DbxReadinessStatus::Unknown);
+        assert_eq!(
+            response.reason_code,
+            Some(DbxReadinessReason::ComputeStopping)
+        );
         assert_eq!(response.container.status, UserAppContainerStatus::Stopping);
         let receipt = response.container.operation.expect("receipt present");
         assert_eq!(receipt.operation_id, "op-Running");
@@ -277,6 +360,43 @@ mod tests {
             receipt.error_message.as_deref(),
             Some("stop cleanup unconfirmed")
         );
+
+        let response = query(
+            compute_record(
+                ComputeControlAction::Stop,
+                ComputeControlState::RecoveryRequired,
+            ),
+            DbxReadinessObservation::new(DbxReadinessStatus::Ready, None)
+                .with_compute_fact(DbxComputeFact::Located),
+        )
+        .await;
+        assert!(!response.ready);
+        assert_eq!(response.status, DbxReadinessStatus::Unknown);
+        assert_eq!(
+            response.reason_code,
+            Some(DbxReadinessReason::ObserveIncomplete)
+        );
+        assert_eq!(
+            response.container.status,
+            UserAppContainerStatus::RecoveryRequired
+        );
+
+        // Historical terminal controls keep their receipt without masking a live DBX.
+        for state in [
+            ComputeControlState::Succeeded,
+            ComputeControlState::Failed,
+            ComputeControlState::Superseded,
+        ] {
+            let response = query(
+                compute_record(ComputeControlAction::Stop, state),
+                DbxReadinessObservation::new(DbxReadinessStatus::Ready, None)
+                    .with_compute_fact(DbxComputeFact::Located),
+            )
+            .await;
+            assert!(response.ready);
+            assert_eq!(response.container.status, UserAppContainerStatus::Running);
+            assert_eq!(response.container.operation.unwrap().state, state);
+        }
 
         // 实例在、4224 未应答：容器 running + dbx 顶层 starting（事故形态的精准区分）。
         let response = query(
@@ -334,7 +454,7 @@ mod tests {
                 _: &str,
                 _: UserappStage,
                 _: Duration,
-            ) -> Result<shared_types::DbxReadinessObservation, String> {
+            ) -> Result<DbxReadinessObservation, String> {
                 panic!("A stalled authoritative read must not reach the runtime");
             }
         }
@@ -345,7 +465,7 @@ mod tests {
                 "dbx1",
                 UserappStage::Prod,
                 Duration::from_millis(20),
-                std::future::pending(),
+                std::future::pending,
                 Some(Arc::new(MustNotProbe)),
             ),
         )
@@ -353,10 +473,10 @@ mod tests {
         .expect("the whole query must be bounded")
         .unwrap();
         assert!(!response.ready);
-        assert_eq!(response.status, shared_types::DbxReadinessStatus::Unknown);
+        assert_eq!(response.status, DbxReadinessStatus::Unknown);
         assert_eq!(
             response.reason_code,
-            Some(shared_types::DbxReadinessReason::ObserveIncomplete)
+            Some(DbxReadinessReason::ObserveIncomplete)
         );
         // 预算在存储读取阶段耗尽：无控制事实，容器不得伪造计算状态。
         assert_eq!(response.container.status, UserAppContainerStatus::Unknown);

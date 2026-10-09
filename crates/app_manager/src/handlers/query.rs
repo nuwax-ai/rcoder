@@ -163,6 +163,8 @@ pub async fn get_app_readiness(
 - `success=true` 表示查询完成；`data.ready` 才表示 DBX 可用。
 - `status` 为 `ready` / `starting` / `stopped` / `unknown`；`reason_code` 为稳定原因码，
   `message` 为可选诊断信息。无法观察不等于服务停止。
+- 启停、重启或恢复尚未确认完成时，不能用旧 DBX 应答宣布 `ready=true`。
+  探测前后复核控制状态；总预算耗尽仍保留本次已读取的控制操作回执。
 - `container` 与 `/readiness` 同源同口径（存储控制意图 + 运行时观察双源合并）：
   `status` 为 missing / starting / restarting / stopping / running / stopped / failed /
   recovery_required / unknown，`operation` 为当前控制操作回执（含错误码）。
