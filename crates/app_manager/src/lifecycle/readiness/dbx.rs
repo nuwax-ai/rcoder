@@ -358,6 +358,9 @@ mod tests {
             response.reason_code,
             Some(shared_types::DbxReadinessReason::ObserveIncomplete)
         );
+        // 预算在存储读取阶段耗尽：无控制事实，容器不得伪造计算状态。
+        assert_eq!(response.container.status, UserAppContainerStatus::Unknown);
+        assert!(response.container.operation.is_none());
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
