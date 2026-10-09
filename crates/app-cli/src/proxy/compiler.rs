@@ -59,6 +59,104 @@ pub(crate) fn runtime_root(log_root: &Path) -> PathBuf {
         .unwrap_or_else(|| log_root.join("pingap"))
 }
 
+/// owner 生命周期固定的 active 配置路径（P1 常驻代理的 `-c` 目标）。
+///
+/// release 目录只保存候选/历史配置；发布 = 原子替换 active 内容。常驻
+/// pingap（`--autoreload`）监视 active 路径，新 release 发布即热载——
+/// 不再随会话重建进程。
+pub fn active_config_path(runtime_root: &Path) -> PathBuf {
+    runtime_root.join("active").join("pingap.toml")
+}
+
+/// 发布候选配置到 active 路径（原子：同目录 tmp + rename）。
+pub async fn publish_active(runtime_root: &Path, candidate: &Path) -> Result<PathBuf> {
+    let active = active_config_path(runtime_root);
+    let parent = active
+        .parent()
+        .with_context(|| format!("active path {} has no parent", active.display()))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("create {}", parent.display()))?;
+    let content = tokio::fs::read(candidate)
+        .await
+        .with_context(|| format!("read candidate {}", candidate.display()))?;
+    let tmp = active.with_extension("toml.tmp");
+    tokio::fs::write(&tmp, &content)
+        .await
+        .with_context(|| format!("write {}", tmp.display()))?;
+    tokio::fs::rename(&tmp, &active)
+        .await
+        .with_context(|| format!("publish active {}", active.display()))?;
+    Ok(active)
+}
+
+/// standby 兜底配置（P1 摘流态）：全部路径 → mock 直出 503。
+///
+/// 停业务前发布并确认 standby——常驻入口不再把请求转发到已死 upstream
+/// 产生裸 502。`publication_id` 进响应头与正文（诊断锚点；T11 引入
+/// `/_pub/<id>` 探测路由前的过渡标记）。与生效配置同 hash 算法，供
+/// admin 只读确认。
+pub fn build_standby_config(publication_id: &str) -> Result<(String, String)> {
+    use pingap_config::{LocationConf, PluginConf, ServerConf};
+    let mut cfg = PingapConfig::default();
+    // 与生效配置同款热载节奏（2s 轮询）——standby 确认预算内必须可检测。
+    cfg.basic.auto_restart_check_interval = Some(std::time::Duration::from_secs(2));
+    cfg.servers.insert(
+        "app".into(),
+        ServerConf {
+            addr: format!("0.0.0.0:{PINGAP_PORT}"),
+            locations: Some(vec!["standby".into()]),
+            ..Default::default()
+        },
+    );
+    cfg.locations.insert(
+        "standby".into(),
+        LocationConf {
+            // 不写 path：默认权重 0 兜底，接管全部请求
+            plugins: Some(vec!["standby".into()]),
+            ..Default::default()
+        },
+    );
+    // mock（Request 阶段直出，无 upstream）：status/headers/data
+    let body =
+        format!("service stopped or restarting (publication {publication_id}); retry shortly");
+    let plugin: PluginConf = serde_json::from_str(
+        &serde_json::json!({
+            "category": "mock",
+            "status": 503,
+            "headers": [
+                "Retry-After: 2",
+                "Content-Type: text/plain; charset=utf-8",
+                "Cache-Control: no-store",
+                "X-Rcoder-Publication: ".to_string() + publication_id,
+            ],
+            "data": body,
+        })
+        .to_string(),
+    )?;
+    cfg.plugins.insert("standby".into(), plugin);
+    cfg.validate().context("validate standby Pingap config")?;
+    let expected_hash = cfg.hash().context("compute standby Pingap config hash")?;
+    let content = toml::to_string_pretty(&cfg).context("serialize standby Pingap config")?;
+    Ok((content, expected_hash))
+}
+
+/// 编译并发布 standby 到 active（停业务前的摘流步骤）。返回期望 hash
+/// （调用方经 admin 确认热载生效后才停止业务服务）。
+pub async fn publish_standby(runtime_root: &Path, publication_id: &str) -> Result<String> {
+    let (content, expected_hash) = build_standby_config(publication_id)?;
+    let candidate_dir = runtime_root.join("standby");
+    tokio::fs::create_dir_all(&candidate_dir)
+        .await
+        .with_context(|| format!("create {}", candidate_dir.display()))?;
+    let candidate = candidate_dir.join("pingap.toml");
+    tokio::fs::write(&candidate, content)
+        .await
+        .with_context(|| format!("write {}", candidate.display()))?;
+    publish_active(runtime_root, &candidate).await?;
+    Ok(expected_hash)
+}
+
 pub async fn compile_and_validate(
     workspace: &Path,
     runtime_root: &Path,
@@ -529,7 +627,11 @@ async fn set_private_permissions(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{managed_config, validate_plugin_paths, validate_upstream_destination};
+    use super::super::pingap::PINGAP_PORT;
+    use super::{
+        active_config_path, build_standby_config, managed_config, publish_active, publish_standby,
+        validate_plugin_paths, validate_upstream_destination,
+    };
     use workspace_manifest::ReleaseLock;
 
     /// 无 index.html 的临时 workspace（兜底路由不注入的基线形态）。
@@ -729,6 +831,102 @@ format = "text"
         assert!(validate_plugin_paths("dir-ok", &ok).is_ok());
         let bad = serde_json::json!({"category": "directory", "path": "/etc/passwd"});
         assert!(validate_plugin_paths("dir-bad", &bad).is_err());
+    }
+
+    /// P1：standby 兜底配置——全部路径 mock 直出 503 + 发布标记 + 2s 热载轮询。
+    #[test]
+    fn standby_config_is_valid_mock_503_with_publication_marker() {
+        let (content, hash) = build_standby_config("pub-abc123").expect("standby config");
+        assert!(!hash.is_empty());
+        let cfg: pingap_config::PingapConfig =
+            toml::from_str(&content).expect("standby config parses");
+        let server = cfg.servers.get("app").expect("server app");
+        assert_eq!(server.addr, format!("0.0.0.0:{PINGAP_PORT}"));
+        assert_eq!(
+            server.locations.as_deref(),
+            Some(&["standby".to_string()][..]),
+            "standby must be the only location (covers all paths)"
+        );
+        let location = cfg.locations.get("standby").expect("standby location");
+        assert!(location.path.is_none(), "no path = catch-all (weight 0)");
+        assert!(location.upstream.is_none(), "standby has no upstream");
+        let plugin = cfg.plugins.get("standby").expect("standby plugin");
+        assert_eq!(
+            plugin.get("category").and_then(|v| v.as_str()),
+            Some("mock")
+        );
+        assert_eq!(
+            plugin.get("status").and_then(|v| v.as_integer()),
+            Some(503),
+            "standby must return 503, not a bare 502 from dead upstream"
+        );
+        let headers = plugin
+            .get("headers")
+            .and_then(|v| v.as_array())
+            .expect("headers array");
+        let joined = format!("{headers:?}");
+        assert!(
+            joined.contains("Retry-After"),
+            "Retry-After required: {joined}"
+        );
+        assert!(
+            joined.contains("X-Rcoder-Publication"),
+            "publication marker required: {joined}"
+        );
+        // pin（0.15.0 文件模式）周期轮询默认 90s——必须收紧到确认预算内
+        assert_eq!(
+            cfg.basic.auto_restart_check_interval,
+            Some(std::time::Duration::from_secs(2))
+        );
+    }
+
+    /// P1：active 发布——候选内容原子替换 active，候选保留。
+    #[tokio::test]
+    async fn publish_active_replaces_content_atomically_and_keeps_candidate() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_root = root.path().join("pingap");
+        let candidate_dir = runtime_root.join("rel-1");
+        tokio::fs::create_dir_all(&candidate_dir).await.unwrap();
+        let candidate = candidate_dir.join("pingap.toml");
+        tokio::fs::write(&candidate, "# release 1").await.unwrap();
+
+        let active = publish_active(&runtime_root, &candidate).await.unwrap();
+        assert_eq!(active, active_config_path(&runtime_root));
+        assert_eq!(
+            tokio::fs::read_to_string(&active).await.unwrap(),
+            "# release 1"
+        );
+        assert!(
+            candidate.exists(),
+            "release candidate must be preserved as history"
+        );
+
+        // 二次发布（release 2）原子替换
+        let candidate2 = runtime_root.join("rel-2").join("pingap.toml");
+        tokio::fs::create_dir_all(candidate2.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&candidate2, "# release 2").await.unwrap();
+        publish_active(&runtime_root, &candidate2).await.unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(active_config_path(&runtime_root))
+                .await
+                .unwrap(),
+            "# release 2"
+        );
+    }
+
+    /// P1：publish_standby——编译 standby + 发布 active，返回可确认的 hash。
+    #[tokio::test]
+    async fn publish_standby_writes_active_and_returns_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_root = root.path().join("pingap");
+        let hash = publish_standby(&runtime_root, "pub-t1").await.unwrap();
+        assert!(!hash.is_empty());
+        let active = tokio::fs::read_to_string(active_config_path(&runtime_root))
+            .await
+            .unwrap();
+        assert!(active.contains("mock"), "active must be the standby config");
     }
 
     #[test]

@@ -46,6 +46,11 @@ pub fn build_pingap_config(
 
     let mut cfg = PingapConfig::default();
 
+    // P1 常驻热载节奏：pin（0.14.3 文件模式）按周期轮询检测配置变化，
+    // 默认 90s——远大于发布确认预算（25s）。显式收紧到 2s：active 发布后
+    // 的 hash 确认/standby 确认才能在预算内完成。
+    cfg.basic.auto_restart_check_interval = Some(std::time::Duration::from_secs(2));
+
     // [servers.app]
     let mut location_names: Vec<String> = entries
         .iter()

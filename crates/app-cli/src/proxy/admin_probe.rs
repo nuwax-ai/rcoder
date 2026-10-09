@@ -67,12 +67,20 @@ pub fn register_admin_endpoint(
     })
 }
 
-/// 进程级 ensure：首次调用生成随机凭证并注册（loopback admin addr），后续调用
-/// 复用既有端点（凭证生命周期绑定 app-cli 进程——supervisord 托管下 pingap
-/// program 崩溃重启由 supervisord 用同一 spec/凭证拉起，probe 侧无需刷新；
-/// 同进程换代编排也复用，避免 OnceLock 重写限制）。
+/// 进程级 ensure：优先从常驻 spec（P1 常驻代理）继承凭证——跨 owner 进程
+/// 存活的 pingap 仍持有首任凭证，新 owner 必须用同一凭证才能探 admin
+///（standby 确认/hash 确认）；无常驻 spec 时生成随机凭证并注册（后续调用
+/// 复用，凭证生命周期绑定 app-cli 进程——supervisord 托管下 pingap program
+/// 崩溃重启由 supervisord 用同一 spec/凭证拉起，probe 侧无需刷新）。
 pub fn ensure_admin_endpoint() -> &'static AdminEndpoint {
     ADMIN_ENDPOINT.get_or_init(|| {
+        if let Some(endpoint) = endpoint_from_resident_spec() {
+            tracing::info!(
+                addr = %endpoint.addr,
+                "admin endpoint inherited from resident pingap spec"
+            );
+            return endpoint;
+        }
         let user = uuid::Uuid::new_v4().simple().to_string();
         let password = uuid::Uuid::new_v4().simple().to_string();
         AdminEndpoint {
@@ -80,6 +88,21 @@ pub fn ensure_admin_endpoint() -> &'static AdminEndpoint {
             user,
             password,
         }
+    })
+}
+
+/// 常驻 spec（`resident/pingap.toml`，0600）中的 admin 凭证恢复。
+/// 解析失败/文件缺失返回 None（生成新凭证——后续首个常驻编排会覆写 spec）。
+fn endpoint_from_resident_spec() -> Option<AdminEndpoint> {
+    let spec =
+        crate::svc_spec::ServiceSpecFile::load(crate::svc_spec::RESIDENT_SPEC_ID, "pingap").ok()?;
+    let addr = spec.env.get("PINGAP_ADMIN_ADDR")?;
+    let user = spec.env.get("PINGAP_ADMIN_USER")?;
+    let password = spec.env.get("PINGAP_ADMIN_PASSWORD")?;
+    Some(AdminEndpoint {
+        addr: addr.clone(),
+        user: user.clone(),
+        password: password.clone(),
     })
 }
 
@@ -278,6 +301,43 @@ pub async fn wait_for_config_hash(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// P1：常驻 spec 存在时优先恢复其凭证（跨 owner 存活的 pingap 仍持有
+    /// 首任凭证；新 owner 生成新凭证将无法探 admin）。spec 路径受
+    /// APP_CLI_SPEC_DIR 控制，与其它 spec 测试同锁串行。
+    #[test]
+    fn endpoint_recovery_prefers_resident_spec_credentials() {
+        let _guard = crate::svc_spec::SPEC_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("APP_CLI_SPEC_DIR", dir.path()) };
+        // 无常驻 spec：恢复 None（走生成路径）
+        assert!(endpoint_from_resident_spec().is_none());
+
+        let spec = crate::svc_spec::ServiceSpecFile {
+            release_id: crate::svc_spec::RESIDENT_SPEC_ID.into(),
+            service_id: "pingap".into(),
+            cwd: "/".into(),
+            argv: vec!["pingap".into()],
+            env: [
+                (
+                    "PINGAP_ADMIN_ADDR".to_string(),
+                    "127.0.0.1:19086".to_string(),
+                ),
+                ("PINGAP_ADMIN_USER".to_string(), "u-prev".to_string()),
+                ("PINGAP_ADMIN_PASSWORD".to_string(), "p-prev".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            port: None,
+        };
+        spec.write().unwrap();
+        let endpoint = endpoint_from_resident_spec().expect("recover from resident spec");
+        assert_eq!(endpoint.addr, "127.0.0.1:19086");
+        assert_eq!(endpoint.user, "u-prev");
+        assert_eq!(endpoint.password, "p-prev");
+    }
+
     use super::{authorization_header, hashes_match, parse_config_hash};
 
     #[test]

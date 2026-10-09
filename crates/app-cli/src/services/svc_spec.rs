@@ -35,6 +35,10 @@ pub(crate) fn spec_root() -> PathBuf {
         .unwrap_or_else(|| "/run/app-cli/specs".into())
 }
 
+/// 常驻 spec 目录名（P1 常驻代理）：独立于 release 代际——
+/// `prune_other_generations` 恒保留，跨编排代次稳定存在。
+pub(crate) const RESIDENT_SPEC_ID: &str = "resident";
+
 impl ServiceSpecFile {
     /// 写入 spec 文件（0600——可能含凭证）并清理其它代目录。
     pub(crate) fn write(&self) -> Result<PathBuf> {
@@ -77,14 +81,15 @@ impl ServiceSpecFile {
         Ok(spec)
     }
 
-    /// 清理指定代之外的所有 spec 目录（编排收敛：只保留当前代）。
+    /// 清理指定代之外的所有 spec 目录（编排收敛：只保留当前代与常驻目录）。
     pub(crate) fn prune_other_generations(keep_release_id: &str) {
         let root = spec_root();
         let Ok(entries) = std::fs::read_dir(&root) else {
             return;
         };
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy() != keep_release_id {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name != keep_release_id && name != RESIDENT_SPEC_ID {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
@@ -151,12 +156,25 @@ mod tests {
         // 身份不匹配拒绝（防串代读错文件）
         assert!(ServiceSpecFile::load("rel-b", "web").is_err());
 
-        // 代际清理：只保留当前代
+        // 代际清理：只保留当前代与常驻目录（P1：resident 不随 release prune）
         sample("rel-old", "web").write().unwrap();
         sample("rel-new", "web").write().unwrap();
+        let resident = ServiceSpecFile {
+            release_id: RESIDENT_SPEC_ID.into(),
+            service_id: "pingap".into(),
+            cwd: "/".into(),
+            argv: vec!["pingap".into(), "-c".into(), "/active/pingap.toml".into()],
+            env: BTreeMap::new(),
+            port: None,
+        };
+        resident.write().unwrap();
         ServiceSpecFile::prune_other_generations("rel-new");
         assert!(ServiceSpecFile::load("rel-new", "web").is_ok());
         assert!(ServiceSpecFile::load("rel-old", "web").is_err());
+        assert!(
+            ServiceSpecFile::load(RESIDENT_SPEC_ID, "pingap").is_ok(),
+            "resident spec must survive release pruning"
+        );
     }
 
     #[test]

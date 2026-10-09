@@ -30,6 +30,9 @@ pub(crate) const PINGAP_PROGRAM: &str = "app-pingap";
 /// 动态分片文件（conf.d 通配吸入；50 排在固定服务之后无实际顺序意义——
 /// 启停顺序由 server 显式 startProcess 控制）。
 const CONF_PATH: &str = "/etc/supervisor/conf.d/50-app-services.conf";
+/// 常驻分片文件（P1：app-pingap 独立于业务代次——业务 stop/换代不撤此
+/// 分片，supervisord 重启也能按同名 spec 复原常驻组）。
+const RESIDENT_CONF_PATH: &str = "/etc/supervisor/conf.d/51-app-cli-resident.conf";
 
 /// 日志轮转对齐 builtin 引擎（10MB/3 份）。
 const LOG_MAXBYTES: &str = "10MB";
@@ -178,7 +181,9 @@ impl SupervisordHost {
                     client,
                     conf_path: CONF_PATH.into(),
                 }
-                .stop_all()
+                // 换代清理不发布 standby：入口保持当前配置（接管方的编排
+                // 会发布新 active）；发布反而会与接管方竞态。
+                .stop_all(None)
                 .await?;
                 runtime_supervisor::CleanupOutcome::Empty.record(root)?;
                 Ok(runtime_supervisor::CleanupOutcome::Empty)
@@ -187,7 +192,7 @@ impl SupervisordHost {
                 // No external-engine mutation was accepted by this worker.
                 // Existing installations may still have a reachable engine.
                 if let Some(host) = Self::detect().await? {
-                    host.stop_all().await?;
+                    host.stop_all(None).await?;
                 }
                 runtime_supervisor::CleanupOutcome::Empty.record(root)?;
                 Ok(runtime_supervisor::CleanupOutcome::Empty)
@@ -201,11 +206,29 @@ impl SupervisordHost {
         }
     }
 
-    /// 停掉全部动态组（热部署切换 / 容器停服级联）。
-    pub(crate) async fn stop_all(&self) -> Result<()> {
+    /// 停掉全部**业务**动态组（`app-svc-*`；热部署切换 / 容器停服级联）。
+    ///
+    /// P1 常驻语义（V2-03/V2-07）：`app-pingap` 不在停止集——入口常驻。
+    /// `standby_root = Some(runtime_root)` 时先发布 standby 到 active 并
+    /// 经 admin hash 确认热载生效，**然后**才停止业务（摘流顺序；发布或
+    /// 确认失败 = 停机失败返回 Err，旧服务保持可证实地运行）。`None` 用于
+    /// 拆除/换代清理路径（入口保持当前配置，由接管方发布新 active）。
+    pub(crate) async fn stop_all(&self, standby_root: Option<&Path>) -> Result<()> {
+        if let Some(runtime_root) = standby_root {
+            let publication = uuid::Uuid::new_v4().simple().to_string();
+            let expected = crate::proxy::compiler::publish_standby(runtime_root, &publication)
+                .await
+                .context("publish standby before stopping business services")?;
+            let endpoint = admin_probe::ensure_admin_endpoint();
+            admin_probe::wait_for_config_hash(endpoint, &expected, admin_probe::CONFIRM_BUDGET)
+                .await
+                .context("confirm standby hot-reload before stopping business services")?;
+            info!("🛑 standby confirmed (publication {publication}); stopping business services");
+        }
         // Remove the restart source before stopping the live groups. Keeping the
         // old fragment after removeProcessGroup lets a supervisord restart or a
-        // later reload resurrect the retired release. Do not touch fixed groups.
+        // later reload resurrect the retired release. Do not touch fixed groups
+        // and the resident fragment (app-pingap).
         let mut failures = Vec::new();
         if let Err(error) =
             write_conf(&self.conf_path, "# app-cli dynamic services stopped\n").await
@@ -245,8 +268,20 @@ impl SupervisordHost {
         Ok(())
     }
 
-    /// 当前动态组名集合（app-svc-* / app-pingap）。
+    /// 当前动态业务组名集合（`app-svc-*`；P1 起 `app-pingap` 为常驻组，
+    /// 不属业务停止/清理范围——入口生命周期独立于编排代次）。
     async fn dynamic_groups(&self) -> Result<Vec<String>> {
+        Ok(self
+            .managed_groups()
+            .await?
+            .into_iter()
+            .filter(|group| group != PINGAP_PROGRAM)
+            .collect())
+    }
+
+    /// app-cli 托管的全部组（业务 `app-svc-*` + 常驻 `app-pingap`）——
+    /// 编排就绪检查用（判定常驻组是否已被 supervisord 托管）。
+    async fn managed_groups(&self) -> Result<Vec<String>> {
         let infos = self.client.get_all_process_info().await?;
         let mut groups = std::collections::BTreeSet::new();
         for info in infos {
@@ -324,9 +359,15 @@ impl SupervisordHost {
             anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
         }
 
-        // 2. pingap 配置编译（生成/校验/原子提交；未就绪前不启动）
+        // 2. pingap 配置编译（生成/校验/原子提交；未就绪前不启动）+
+        //    发布到 active（P1：release 目录为候选，active 为常驻 -c 目标；
+        //    已运行的常驻 pingap 由 --autoreload 周期轮询拾取）。
         anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
         let pingap_outcome = compile_pingap(args, release, dev_profile).await?;
+        let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+        crate::proxy::compiler::publish_active(&runtime_root, &pingap_outcome.config_path)
+            .await
+            .context("publish active pingap config")?;
         let endpoint = admin_probe::ensure_admin_endpoint();
 
         // 2.5 workspace 首页静态服务（幂等；判定与 pingap 编译的兜底路由注入
@@ -382,9 +423,13 @@ impl SupervisordHost {
                 .with_context(|| format!("write spec {}", spec.service_id))?;
         }
         anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
-        let pingap_spec = pingap_service_spec(args, release, &pingap_outcome, endpoint);
-        pingap_spec.write().context("write pingap spec")?;
+        let pingap_spec = pingap_service_spec(args, endpoint);
+        pingap_spec.write().context("write resident pingap spec")?;
         ServiceSpecFile::prune_other_generations(&release.release_id);
+        // 常驻分片幂等覆写（每次编排重写同一内容——凭证/active 路径变化时
+        // 随 reloadConfig 生效；分片不撤，组不删）。
+        let resident_conf = render_resident_conf(&args.log_dir);
+        write_conf(Path::new(RESIDENT_CONF_PATH), &resident_conf).await?;
 
         // 4. 生成并重载 program conf（supervisord 不建日志目录——服务日志目录预建）
         let services_log_dir = args.log_dir.join("services");
@@ -397,12 +442,12 @@ impl SupervisordHost {
         write_conf(&self.conf_path, &conf).await?;
         mutation_result(self.client.reload_config().await).context("supervisord reloadConfig")?;
 
-        // 5. 旧代差量摘除（不在新集合的组）
+        // 5. 旧代差量摘除（不在新集合的业务组；常驻 app-pingap 不在
+        //    dynamic_groups，天然不被摘除）
         let new_names: Vec<String> = specs
             .iter()
             .filter(|spec| runs_as_process(spec, dev_profile))
             .map(|s| format!("{SVC_PROGRAM_PREFIX}{}", s.service_id))
-            .chain([PINGAP_PROGRAM.to_string()])
             .collect();
         for old in &previous_groups {
             anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
@@ -476,12 +521,24 @@ impl SupervisordHost {
             started.push(name);
         }
 
-        // 7. pingap 启动 + 配置 hash 确认（与 builtin 的 start_pingap 确认语义一致）
+        // 7. 常驻 pingap 就绪 + 配置 hash 确认（与 builtin 的 start_pingap
+        //    确认语义一致）。组已存在（跨编排代次存活或 supervisord 重启
+        //    复原）则跳过 add/start——active 已发布，--autoreload 拾取。
         anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
-        mutation_result(self.client.add_process_group(PINGAP_PROGRAM).await)?;
-        anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
-        mutation_result(self.client.start_process_wait(PINGAP_PROGRAM).await)
-            .context("start app-pingap")?;
+        let resident_running = self
+            .managed_groups()
+            .await?
+            .contains(&PINGAP_PROGRAM.to_string());
+        if resident_running {
+            info!(
+                "🛰️  resident {PINGAP_PROGRAM} already managed; relying on autoreload for active config"
+            );
+        } else {
+            mutation_result(self.client.add_process_group(PINGAP_PROGRAM).await)?;
+            anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
+            mutation_result(self.client.start_process_wait(PINGAP_PROGRAM).await)
+                .context("start app-pingap")?;
+        }
         started.push(PINGAP_PROGRAM.to_string());
         tokio::select! {
             result = admin_probe::wait_for_config_hash(
@@ -643,18 +700,22 @@ async fn compile_pingap(
 /// tmpfs spec 的 env，不落持久卷/命令行/日志）。
 fn pingap_service_spec(
     args: &RuntimeArgs,
-    release: &ReleaseLock,
-    outcome: &CompileOutcome,
     endpoint: &admin_probe::AdminEndpoint,
 ) -> ServiceSpecFile {
+    // P1 常驻：spec 固定 `resident` 代（不被 prune），`-c` 指向 owner 生命
+    // 周期固定的 active 路径——release 发布只原子替换 active，常驻 pingap
+    // 经 --autoreload 热载，不随编排代次重建。
+    let active = crate::proxy::compiler::active_config_path(&crate::proxy::compiler::runtime_root(
+        &args.log_dir,
+    ));
     ServiceSpecFile {
-        release_id: release.release_id.clone(),
+        release_id: crate::svc_spec::RESIDENT_SPEC_ID.into(),
         service_id: "pingap".into(),
         cwd: "/".into(),
         argv: vec![
             args.pingap_bin.to_string_lossy().into_owned(),
             "-c".into(),
-            outcome.config_path.to_string_lossy().into_owned(),
+            active.to_string_lossy().into_owned(),
             "--autoreload".into(),
         ],
         env: [
@@ -737,11 +798,21 @@ pub(crate) fn render_programs_conf(
             service_log.display(),
         ));
     }
+    out
+}
+
+/// 常驻分片（仅 `app-pingap`）：spec 固定为 `resident/pingap.toml`（不被
+/// 代际 prune），command 恒 `run-service resident pingap`——与 release 无关，
+/// 崩溃由 supervisord 按同一 spec 复原，业务 stop/换代不撤本分片。
+pub(crate) fn render_resident_conf(log_dir: &Path) -> String {
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "/usr/local/bin/app-cli".into());
     let pingap_log = log_dir.join("services").join("pingap.log");
-    out.push_str(&format!(
+    format!(
         "[program:{PINGAP_PROGRAM}]\n\
-         command={exe} run-service {rid} pingap\n\
-         directory={}\n\
+         command={exe} run-service {} pingap\n\
+         directory=/\n\
          autostart=false\n\
          autorestart=true\n\
          startsecs=3\n\
@@ -754,10 +825,9 @@ pub(crate) fn render_programs_conf(
          stdout_logfile_maxbytes={LOG_MAXBYTES}\n\
          stdout_logfile_backups={LOG_BACKUPS}\n\
          redirect_stderr=true\n",
-        workspace.display(),
+        crate::svc_spec::RESIDENT_SPEC_ID,
         pingap_log.display(),
-    ));
-    out
+    )
 }
 
 /// Keep spec files, rendered programs, stale-group cleanup and process startup
@@ -981,22 +1051,14 @@ NODE_ENV = "production"
         };
         let array = |values: String| format!("<array><data>{values}</data></array>");
         let fixed = array(group("postgres"));
+        // P1：app-pingap 为常驻组——停止序列只含业务组 app-svc-web，
+        // 常驻组与固定组（postgres）同样不被触碰。
         let requests = vec![
             ("reloadConfig", "", array(String::new())),
             (
                 "getAllProcessInfo",
                 "",
                 array(group("postgres") + &group("app-pingap") + &group("app-svc-web")),
-            ),
-            (
-                "stopProcessGroup",
-                "app-pingap",
-                "<boolean>1</boolean>".into(),
-            ),
-            (
-                "removeProcessGroup",
-                "app-pingap",
-                "<boolean>1</boolean>".into(),
             ),
             (
                 "stopProcessGroup",
@@ -1068,6 +1130,13 @@ NODE_ENV = "production"
                     "must not stop fixed PG"
                 );
                 assert!(
+                    !matches!(
+                        (method, target),
+                        ("stopProcessGroup", "app-pingap") | ("removeProcessGroup", "app-pingap")
+                    ),
+                    "resident proxy group must never be stopped or removed"
+                );
+                assert!(
                     !std::fs::read_to_string(&checked_conf)
                         .unwrap()
                         .contains("[program:"),
@@ -1084,8 +1153,8 @@ NODE_ENV = "production"
             conf_path: conf,
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            host.stop_all().await.unwrap();
-            host.stop_all().await.unwrap();
+            host.stop_all(None).await.unwrap();
+            host.stop_all(None).await.unwrap();
             server.await.unwrap();
         })
         .await
@@ -1124,10 +1193,14 @@ NODE_ENV = "production"
         assert!(conf.contains("directory=/app/code/web"));
         assert!(conf.contains("stdout_logfile=/app/logs/services/web.log"));
         assert!(conf.contains("redirect_stderr=true"));
-        assert!(conf.contains("[program:app-pingap]"));
-        assert!(conf.contains("stdout_logfile=/app/logs/services/pingap.log"));
+        // P1：pingap program 移入常驻分片——业务分片只含 app-svc-*
+        assert!(!conf.contains("[program:app-pingap]"));
+        let resident = render_resident_conf(Path::new("/app/logs"));
+        assert!(resident.contains("[program:app-pingap]"));
+        assert!(resident.contains("run-service resident pingap"));
+        assert!(resident.contains("stdout_logfile=/app/logs/services/pingap.log"));
         // autostart=false：启动顺序由 server 显式控制（依赖序）
-        assert_eq!(conf.matches("autostart=false").count(), 2);
+        assert_eq!(conf.matches("autostart=false").count(), 1);
 
         // Frontend templates are static in prod, but must get a real Vite
         // program in dev even though [run].command is empty.
@@ -1158,7 +1231,7 @@ NODE_ENV = "production"
             false,
         );
         assert!(!prod_conf.contains("[program:app-svc-web]"));
-        assert!(prod_conf.contains("[program:app-pingap]"));
+        assert!(!prod_conf.contains("[program:app-pingap]"));
 
         // No devrun means static hosting in both profiles; do not invent a
         // process from the stale command either.
@@ -1204,7 +1277,7 @@ NODE_ENV = "production"
             client: SupervisorClient::new(path),
             conf_path: root.path().join("unused.conf"),
         };
-        let error = host.stop_all().await.unwrap_err().to_string();
+        let error = host.stop_all(None).await.unwrap_err().to_string();
         assert!(error.contains("did not stop"));
         assert!(error.contains("invalid fixed supervisor config"));
         assert!(error.contains("stop failed"));

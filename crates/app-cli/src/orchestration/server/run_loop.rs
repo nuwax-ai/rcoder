@@ -534,6 +534,9 @@ pub(super) async fn server_loop(
     first: Option<InitialAction>,
     foreground: bool,
 ) -> Result<()> {
+    // P1：所有业务停止路径统一先发布 standby 摘流（runtime_root 固定）。
+    let standby_root = crate::proxy::compiler::runtime_root(&owner_args.log_dir);
+
     let mut pending = first;
     let mut active_args = if pending.is_none() {
         // Idle management has no business runtime to resume. A fresh Source or
@@ -629,12 +632,14 @@ pub(super) async fn server_loop(
                 }
                 continue;
             }
-            // stop：停止业务服务（保持管理面）。B01：按**自身受理 ID**收束——
-            // Stop 从不占据 current 执行槽，禁止 finish_current（它会读
-            // current=None 而静默丢终态，Stop 永远 Accepted）。
+            // stop：停止业务服务（保持管理面与常驻入口）。B01：按**自身受理
+            // ID**收束——Stop 从不占据 current 执行槽，禁止 finish_current
+            //（它会读 current=None 而静默丢终态，Stop 永远 Accepted）。
+            // P1/V2-03：先发布 standby 并确认热载（摘流），再停业务；发布
+            // 失败 = 停机失败（Err 保持旧服务可证实地运行）。
             let stopped = async {
                 if let Some(host) = host.as_ref() {
-                    host.stop_all().await?;
+                    host.stop_all(Some(&standby_root)).await?;
                 }
                 crate::static_hosting::reconcile(&[], &args.workspace, false).await
             }
@@ -911,7 +916,7 @@ pub(super) async fn server_loop(
             };
             drop(startup_control);
             if let Some(signal) = startup_signal {
-                if let Err(error) = host.stop_all().await {
+                if let Err(error) = host.stop_all(Some(&standby_root)).await {
                     record_uncertain_control(state, &signal, &format!("startup stop: {error:#}"))
                         .await;
                     hold_unconfirmed(state, format!("startup stop: {error:#}")).await;
@@ -939,7 +944,7 @@ pub(super) async fn server_loop(
                 continue;
             }
             if state.is_cancelled() {
-                host.stop_all().await?;
+                host.stop_all(Some(&standby_root)).await?;
                 if let Err(error) = outcome
                     && error
                         .downcast_ref::<supervisor::ShutdownUnconfirmed>()
@@ -952,7 +957,7 @@ pub(super) async fn server_loop(
             }
             if let Err(e) = outcome {
                 tracing::error!("server: orchestration failed: {e:#}");
-                if let Err(stop_error) = host.stop_all().await {
+                if let Err(stop_error) = host.stop_all(Some(&standby_root)).await {
                     hold_unconfirmed(state, format!("orchestrate: {e:#}; stop: {stop_error:#}"))
                         .await;
                     return Ok(());
@@ -967,7 +972,7 @@ pub(super) async fn server_loop(
                 continue;
             }
             if let Err(error) = state.complete_running() {
-                if let Err(stop_error) = host.stop_all().await {
+                if let Err(stop_error) = host.stop_all(Some(&standby_root)).await {
                     hold_unconfirmed(
                         state,
                         format!("persist running: {error:#}; stop: {stop_error:#}"),
@@ -989,7 +994,7 @@ pub(super) async fn server_loop(
                     } else {
                         "superseded by an admitted stop operation"
                     };
-                    if let Err(error) = host.stop_all().await {
+                    if let Err(error) = host.stop_all(Some(&standby_root)).await {
                         hold_unconfirmed(
                             state,
                             format!("stop after cancelled/superseded startup failed: {error:#}"),
@@ -1035,7 +1040,7 @@ pub(super) async fn server_loop(
                             Next::Wait
                         } else {
                             state.ready.set_ready(false);
-                            if let Err(error) = host.stop_all().await {
+                            if let Err(error) = host.stop_all(Some(&standby_root)).await {
                                 record_uncertain_control(state, &signal, &format!("stop before runtime control failed: {error:#}")).await;
                                 hold_unconfirmed(
                                     state,
@@ -1057,13 +1062,13 @@ pub(super) async fn server_loop(
             drop(control_rx);
             match next {
                 Next::Exit => {
-                    host.stop_all().await?;
+                    host.stop_all(Some(&standby_root)).await?;
                     return Ok(());
                 }
                 Next::Wait => {}
                 Next::Redeploy(action) => {
                     state.ready.set_ready(false);
-                    if let Err(error) = host.stop_all().await {
+                    if let Err(error) = host.stop_all(Some(&standby_root)).await {
                         hold_unconfirmed(
                             state,
                             format!("stop before activation failed: {error:#}"),

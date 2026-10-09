@@ -493,7 +493,10 @@ async fn business_session_inner(
     if startup_error.is_none() {
         startup_error = establish_startup_quiescence(&state, host.is_some(), async {
             if let Some(host) = host.as_ref() {
-                host.stop_all().await?;
+                // 同容器换 owner 的启动收束：残留业务组先经 standby 摘流再停
+                //（同容器常驻 pingap 仍在服务旧路由——裸停会留裸 502 窗口）。
+                let standby_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+                host.stop_all(Some(&standby_root)).await?;
             }
             crate::static_hosting::reconcile(&[], &args.workspace, false).await
         })
@@ -1049,7 +1052,10 @@ async fn serve_supervised_worker(
     if startup_error.is_none() {
         startup_error = establish_startup_quiescence(&state, host.is_some(), async {
             if let Some(host) = host.as_ref() {
-                host.stop_all().await?;
+                // 同容器换 owner 的启动收束：残留业务组先经 standby 摘流再停
+                //（同容器常驻 pingap 仍在服务旧路由——裸停会留裸 502 窗口）。
+                let standby_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+                host.stop_all(Some(&standby_root)).await?;
             }
             crate::static_hosting::reconcile(&[], &args.workspace, false).await
         })
