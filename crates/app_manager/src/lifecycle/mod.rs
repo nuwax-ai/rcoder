@@ -14,6 +14,7 @@ mod query;
 mod readiness;
 mod recovery;
 mod start;
+mod stats;
 mod status;
 mod update;
 mod wake;
