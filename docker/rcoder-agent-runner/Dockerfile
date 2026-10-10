@@ -157,8 +157,12 @@ RUN case "$(dpkg --print-architecture)" in \
 # 覆盖旧官方 binary，保留独立 RCoder patch/binary 证明，拒绝 hash-only 的旧协议。
 COPY --from=pingap-applied-builder /build/output/pingap /usr/local/bin/pingap
 COPY --from=pingap-applied-builder /build/output/pingap.applied.json /usr/local/share/rcoder/pingap-applied.json
-RUN test "$(/usr/local/bin/pingap --apply-protocol-version)" = "1" && \
-    test "$(/usr/local/bin/pingap -V)" = "pingap ${PINGAP_VERSION}"
+COPY --from=pingap-applied-builder /build/pingap-applied/manifest.json /usr/local/share/rcoder/pingap-source.json
+COPY --from=pingap-applied-builder /build/pingap-applied/verify.py /usr/local/share/rcoder/verify-pingap.py
+RUN python3 /usr/local/share/rcoder/verify-pingap.py \
+    --binary /usr/local/bin/pingap --receipt /usr/local/share/rcoder/pingap-applied.json \
+    --manifest /usr/local/share/rcoder/pingap-source.json \
+    --version "${PINGAP_VERSION}" --commit "${PINGAP_COMMIT}" --require-full --tls openssl
 
 # 安装 dbx-web（DBX 数据库 Web GUI，supervisor conf.d/dbx.conf 托管 :4224；
 # 对齐生产 L358-365——二进制从 build_config downloads/ 分发，本地直接 COPY）

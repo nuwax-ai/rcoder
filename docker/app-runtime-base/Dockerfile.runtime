@@ -84,5 +84,9 @@ COPY --from=app-cli-builder /build/target/release/file-server-proxy /usr/local/b
 # 最终覆盖必须是配对 Applied binary；此 hash/provenance 与官方 release catalog 分开。
 COPY --from=app-cli-builder /build/pingap-applied/pingap /usr/local/bin/pingap
 COPY --from=app-cli-builder /build/pingap-applied/pingap.applied.json /usr/local/share/rcoder/pingap-applied.json
-RUN test "$(/usr/local/bin/pingap --apply-protocol-version)" = "1" && \
-    test "$(/usr/local/bin/pingap -V)" = "pingap ${PINGAP_VERSION}"
+COPY --from=app-cli-builder /build/tools/build/pingap-applied/manifest.json /usr/local/share/rcoder/pingap-source.json
+COPY --from=app-cli-builder /build/tools/build/pingap-applied/verify.py /usr/local/share/rcoder/verify-pingap.py
+RUN python3 /usr/local/share/rcoder/verify-pingap.py \
+    --binary /usr/local/bin/pingap --receipt /usr/local/share/rcoder/pingap-applied.json \
+    --manifest /usr/local/share/rcoder/pingap-source.json \
+    --version "${PINGAP_VERSION}" --commit "${PINGAP_COMMIT}" --require-full --tls openssl

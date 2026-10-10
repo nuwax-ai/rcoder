@@ -23,3 +23,21 @@ python3 tools/build/pingap-applied/build.py --fetch --source ./pingap-source \
 
 默认及 full feature 测试、strict Clippy 在 release workflow 的专用 gate 中执行；release build 及
 npm/容器发布仍是各自独立结果。Docker 最终层必须覆盖本目录构建的 binary 并核验 capability。
+
+## 最终镜像校验
+
+app-runtime、agent-runner 和远端 K8s 的 computer/runtime 层须同时复制配套
+Pingap、`pingap.applied.json`、同源 `manifest.json` 和独立 `verify.py`。基础镜像
+中的上游 Pingap 版本正确也不能替代协议校验；只更新 app-cli 会留下不兼容组合。
+
+```bash
+python3 /usr/local/share/rcoder/verify-pingap.py \
+  --binary /usr/local/bin/pingap \
+  --receipt /usr/local/share/rcoder/pingap-applied.json \
+  --manifest /usr/local/share/rcoder/pingap-source.json --require-full --tls openssl
+```
+
+该门禁核对上游版本/commit、补丁摘要、最终二进制 SHA256、目标平台及 full/TLS
+构建选项，再实际执行协议和完整版本查询。任一步失败即中止镜像构建。
+跨架构产物仍需在目标平台执行此门禁，不能以 receipt 中的声明代替运行结果。
+构建门禁通过只证明配套身份与能力，发布前仍须验证真实冷启动、Restart 和配置应用。

@@ -4,12 +4,13 @@ ARG RUST_IMAGE=rust:trixie
 ARG RCODER_BASE
 ARG COMPUTER_BASE
 ARG RUNTIME_BASE
-FROM ${RUST_IMAGE} AS build
+FROM ${RUST_IMAGE} AS toolchain
 ARG APT_MIRROR=http://deb.debian.org
 RUN sed -i "s#http://deb.debian.org#${APT_MIRROR}#g" /etc/apt/sources.list.d/debian.sources
-RUN apt-get update && apt-get install -y --no-install-recommends cmake pkg-config protobuf-compiler libprotobuf-dev libclang-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends cmake pkg-config protobuf-compiler libprotobuf-dev libclang-dev python3 git libssl-dev && rm -rf /var/lib/apt/lists/*
 ARG CARGO_MIRROR=
 RUN if [ -n "$CARGO_MIRROR" ]; then mkdir -p /usr/local/cargo && printf '[source.crates-io]\nreplace-with = "remote-mirror"\n[source.remote-mirror]\nregistry = "%s"\n' "$CARGO_MIRROR" > /usr/local/cargo/config.toml; fi
+FROM toolchain AS build
 WORKDIR /src
 COPY . .
 ARG CARGO_JOBS=4
@@ -25,6 +26,20 @@ RUN --mount=type=cache,id=rcoder-cargo-registry,target=/usr/local/cargo/registry
     cargo build --locked --jobs ${CARGO_JOBS} --profile dev -p rcoder -p agent_runner -p file-server-proxy --features rcoder/rcoder-pg --bin rcoder --bin agent_runner --bin file-server-proxy && \
     cargo build --locked --jobs ${CARGO_JOBS} --profile dev --manifest-path crates/app-cli/Cargo.toml && \
     mkdir /out && cp /cache/target/debug/rcoder /cache/target/debug/agent_runner /cache/target/debug/app-cli /cache/target/debug/file-server-proxy /out/
+
+# New app-cli and its paired proxy use the same frozen source. Keep the proxy
+# Cargo target separate from the workspace cache and from other architectures.
+FROM toolchain AS pingap-applied-build
+WORKDIR /src
+COPY . .
+ARG CARGO_JOBS=4
+ARG TARGETARCH
+ENV CARGO_TARGET_DIR=/cache/pingap-target CARGO_NET_GIT_FETCH_WITH_CLI=true
+RUN --mount=type=cache,id=rcoder-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=rcoder-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=rcoder-pingap-target-${TARGETARCH},target=/cache/pingap-target,sharing=locked \
+    CARGO_BUILD_JOBS=${CARGO_JOBS} python3 tools/build/pingap-applied/build.py \
+        --fetch --source /build/pingap-source --repo-root /src --full --output /out/pingap
 FROM ${RCODER_BASE} AS rcoder
 ENV TTYD_USER=root
 COPY --link --from=build /out/rcoder /out/agent_runner /app/bin/
@@ -38,6 +53,13 @@ ENV TTYD_USER=root
 # Credential identity and PG shutdown helpers belong to this source snapshot,
 # not the potentially older published base image.
 COPY --link --from=build /out/agent_runner /out/app-cli /usr/local/bin/
+COPY --link --from=pingap-applied-build /out/pingap /usr/local/bin/pingap
+COPY --link --from=pingap-applied-build /out/pingap.applied.json /usr/local/share/rcoder/pingap-applied.json
+COPY --link --from=pingap-applied-build /src/tools/build/pingap-applied/manifest.json /usr/local/share/rcoder/pingap-source.json
+COPY --link --from=pingap-applied-build /src/tools/build/pingap-applied/verify.py /usr/local/share/rcoder/verify-pingap.py
+RUN python3 /usr/local/share/rcoder/verify-pingap.py \
+    --binary /usr/local/bin/pingap --receipt /usr/local/share/rcoder/pingap-applied.json \
+    --manifest /usr/local/share/rcoder/pingap-source.json --require-full --tls openssl
 COPY --link docker/rcoder-agent-runner/ttyd/start-ttyd.sh /usr/local/bin/start-ttyd.sh
 COPY --link docker/rcoder-agent-runner/supervisor/conf.d/ttyd.conf /etc/supervisor/conf.d/ttyd.conf
 COPY --link docker/rcoder-agent-runner/pg-admin-identity.sh docker/rcoder-agent-runner/pg-supervise.py docker/rcoder-agent-runner/pg-supervisor-entry.sh /usr/local/bin/
@@ -49,6 +71,13 @@ RUN chmod 0755 /usr/local/bin/pg-supervisor-entry.sh /usr/local/bin/pg-admin-ide
     chmod 0644 /etc/supervisor/conf.d/ttyd.conf
 FROM ${RUNTIME_BASE} AS runtime
 COPY --link --from=build /out/app-cli /out/file-server-proxy /usr/local/bin/
+COPY --link --from=pingap-applied-build /out/pingap /usr/local/bin/pingap
+COPY --link --from=pingap-applied-build /out/pingap.applied.json /usr/local/share/rcoder/pingap-applied.json
+COPY --link --from=pingap-applied-build /src/tools/build/pingap-applied/manifest.json /usr/local/share/rcoder/pingap-source.json
+COPY --link --from=pingap-applied-build /src/tools/build/pingap-applied/verify.py /usr/local/share/rcoder/verify-pingap.py
+RUN python3 /usr/local/share/rcoder/verify-pingap.py \
+    --binary /usr/local/bin/pingap --receipt /usr/local/share/rcoder/pingap-applied.json \
+    --manifest /usr/local/share/rcoder/pingap-source.json --require-full --tls openssl
 COPY --link docker/app-runtime-base/start-app.sh /usr/local/bin/start-app.sh
 COPY --link docker/app-runtime-base/pg-admin-identity.sh docker/app-runtime-base/pg-supervise.py docker/app-runtime-base/pg-supervisor-entry.sh /usr/local/bin/
 # COPY 保留同步源权限，而 Mutagen 同步产物是 0700（组/其他无读位）：
