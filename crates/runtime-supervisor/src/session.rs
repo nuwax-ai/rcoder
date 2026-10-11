@@ -561,7 +561,29 @@ impl OwnerSession {
     }
 
     pub fn request_explicit_business_start(&self, captured: &BusinessStartPermit) -> Result<()> {
+        self.commit_explicit_business_start(captured, None)
+    }
+
+    /// The original dispatch deadline covers both admission and native commit
+    /// lock contention. Expired preparation cannot publish a new Run intent.
+    pub fn request_explicit_business_start_before(
+        &self,
+        captured: &BusinessStartPermit,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        self.commit_explicit_business_start(captured, Some(deadline))
+    }
+
+    fn commit_explicit_business_start(
+        &self,
+        captured: &BusinessStartPermit,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<()> {
         self.core.with_discovery(|discovery| {
+            anyhow::ensure!(
+                deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline),
+                "original business initialization deadline exceeded before native intent commit"
+            );
             let current = &discovery.snapshot;
             anyhow::ensure!(
                 current.supervisor_id == captured.snapshot.supervisor_id

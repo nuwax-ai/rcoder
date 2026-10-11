@@ -2,6 +2,8 @@
 //! protocol stand-in; this does not validate Pingap routing, containers or AI.
 #![cfg(unix)]
 
+#[path = "fixtures/artifact_management_recovery.rs"]
+mod artifact_management_recovery;
 #[path = "fixtures/failed_kernel_recovery.rs"]
 mod failed_kernel_recovery;
 #[path = "fixtures/live_legacy_management.rs"]

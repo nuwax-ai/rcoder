@@ -191,3 +191,38 @@ async fn before_source_preparation_refreshes_initial_ready_generation_without_lo
     assert!(before_stop.after_initialization(&after_stop).is_err());
     assert_eq!(session.snapshot().intent, Intent::Stopped);
 }
+
+#[tokio::test]
+async fn expired_dispatch_waiting_for_native_commit_lock_never_changes_stopped_intent() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = stopped_owner(directory.path()).await;
+    let captured = session.capture_business_start().unwrap();
+    let before = std::fs::read(directory.path().join("supervisor.json")).unwrap();
+    let original = session.snapshot();
+    let barrier = session.core.discovery_commit.lock().unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
+    let (entered, waiting) = std::sync::mpsc::channel();
+    let attempted = session.clone();
+    let thread = std::thread::spawn(move || {
+        entered.send(()).unwrap();
+        attempted.request_explicit_business_start_before(&captured, deadline)
+    });
+    waiting.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(70));
+    assert!(
+        !thread.is_finished(),
+        "the original native commit must still be waiting for its real lock"
+    );
+    drop(barrier);
+    let error = thread.join().unwrap().unwrap_err();
+    assert!(error.to_string().contains("deadline exceeded"), "{error:#}");
+    assert_eq!(
+        serde_json::to_value(session.snapshot()).unwrap(),
+        serde_json::to_value(original).unwrap()
+    );
+    assert_eq!(session.snapshot().intent, Intent::Stopped);
+    assert_eq!(
+        std::fs::read(directory.path().join("supervisor.json")).unwrap(),
+        before
+    );
+}

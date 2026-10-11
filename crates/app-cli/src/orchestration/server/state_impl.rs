@@ -523,7 +523,10 @@ impl ServerState {
     pub(crate) fn set_business_relaunch(
         &self,
         capture: impl Fn() -> Result<runtime_supervisor::BusinessStartPermit> + Send + Sync + 'static,
-        notify: impl Fn(&runtime_supervisor::BusinessStartPermit) -> Result<()> + Send + Sync + 'static,
+        notify: impl Fn(&runtime_supervisor::BusinessStartPermit, tokio::time::Instant) -> Result<()>
+        + Send
+        + Sync
+        + 'static,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Result<()> {
         self.business_wake

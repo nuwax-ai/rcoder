@@ -200,7 +200,9 @@ pub async fn owner_serve(
         },
         {
             let session = session.clone();
-            move |captured| session.request_explicit_business_start(captured)
+            move |captured, deadline| {
+                session.request_explicit_business_start_before(captured, deadline)
+            }
         },
         {
             let session = session.clone();
@@ -1777,6 +1779,10 @@ pub(super) async fn assemble_runtime_kernel(
             });
             return;
         }
+        // One absolute preparation/recovery budget belongs to the original
+        // synchronous dispatch, including scheduling delays. Compilation and
+        // artifact execution retain their own existing budgets.
+        let management_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
         let business_start = if let Some(id) = executing_id {
             match dispatch_state.capture_business_relaunch() {
                 Ok(captured) => captured,
@@ -1930,38 +1936,13 @@ pub(super) async fn assemble_runtime_kernel(
 
                     run_pg: pg,
                 };
-                if let Err(error) =
-                    dispatch_state.commit_business_relaunch(&operation_id, business_start.as_ref())
-                {
-                    reject_business_intent(&dispatch_state, &operation_id, error);
-                    return;
-                }
-                if dispatch_state.deploy_tx.send(request).is_err() {
-                    // RV02：发送失败按原 ID 收束真实失败——内核已受理，
-                    // 不能只打日志留下永久 Accepted。
-                    let state = dispatch_state.clone();
-                    let id = operation_id.clone();
-                    tracing::error!("runtime dispatch: deploy channel closed ({id})");
-                    tokio::spawn(async move {
-                        if let Err(error) = state
-                            .finish_runtime_operation_by_id(
-                                &id,
-                                shared_types::RuntimeOperationState::Failed,
-                                Some((
-                                    "ERR_BACKEND_ERROR".into(),
-                                    "runtime deploy channel closed".into(),
-                                )),
-                            )
-                            .await
-                        {
-                            tracing::error!(%error, "persist deploy channel failure");
-                        }
-                    });
-                } else {
-                    // 统一 owner：受理后若业务会话未在跑（Stopped 后的显式
-                    // 部署/启动），触发会话重建消费该受理。
-                    dispatch_state.request_business_relaunch();
-                }
+                dispatch_artifact_after_management(
+                    dispatch_state.clone(),
+                    operation_id,
+                    request,
+                    business_start,
+                    management_deadline,
+                );
             }
             DispatchAction::DeployArtifact {
                 operation_id,
@@ -1996,37 +1977,13 @@ pub(super) async fn assemble_runtime_kernel(
 
                     run_pg: pg,
                 };
-                if let Err(error) =
-                    dispatch_state.commit_business_relaunch(&operation_id, business_start.as_ref())
-                {
-                    reject_business_intent(&dispatch_state, &operation_id, error);
-                    return;
-                }
-                if dispatch_state.deploy_tx.send(request).is_err() {
-                    // RV02：同上——发送失败按原 ID 收束真实失败。
-                    let state = dispatch_state.clone();
-                    let id = operation_id.clone();
-                    tracing::error!("runtime dispatch: deploy channel closed ({id})");
-                    tokio::spawn(async move {
-                        if let Err(error) = state
-                            .finish_runtime_operation_by_id(
-                                &id,
-                                shared_types::RuntimeOperationState::Failed,
-                                Some((
-                                    "ERR_BACKEND_ERROR".into(),
-                                    "runtime deploy channel closed".into(),
-                                )),
-                            )
-                            .await
-                        {
-                            tracing::error!(%error, "persist deploy channel failure");
-                        }
-                    });
-                } else {
-                    // 统一 owner：受理后若业务会话未在跑（Stopped 后的显式
-                    // 部署/启动），触发会话重建消费该受理。
-                    dispatch_state.request_business_relaunch();
-                }
+                dispatch_artifact_after_management(
+                    dispatch_state.clone(),
+                    operation_id,
+                    request,
+                    business_start,
+                    management_deadline,
+                );
             }
             DispatchAction::OrchestrateSource {
                 operation_id,
@@ -2039,14 +1996,20 @@ pub(super) async fn assemble_runtime_kernel(
                     if state.settle_cancelled_before_execution(&operation_id).await {
                         return;
                     }
-                    let business_start =
-                        match wait_source_management(&state, &operation_id, business_start).await {
-                            Ok(captured) => captured,
-                            Err(error) => {
-                                reject_business_intent(&state, &operation_id, error);
-                                return;
-                            }
-                        };
+                    let business_start = match wait_business_management(
+                        &state,
+                        &operation_id,
+                        business_start,
+                        management_deadline,
+                    )
+                    .await
+                    {
+                        Ok(captured) => captured,
+                        Err(error) => {
+                            reject_business_intent(&state, &operation_id, error);
+                            return;
+                        }
+                    };
                     // This original admitted Source operation owns derivation;
                     // neither its CLI caller nor artifact restoration writes it.
                     // Retain the writer until physical publication has ended so
@@ -2103,7 +2066,21 @@ pub(super) async fn assemble_runtime_kernel(
                         }
                     }
                     if let Err(error) =
-                        state.commit_business_relaunch(&operation_id, business_start.as_ref())
+                        require_management_deadline(&operation_id, management_deadline)
+                    {
+                        reject_business_intent(&state, &operation_id, error);
+                        return;
+                    }
+                    if let Err(error) = state.commit_business_relaunch(
+                        &operation_id,
+                        business_start.as_ref(),
+                        management_deadline,
+                    ) {
+                        reject_business_intent(&state, &operation_id, error);
+                        return;
+                    }
+                    if let Err(error) =
+                        require_management_deadline(&operation_id, management_deadline)
                     {
                         reject_business_intent(&state, &operation_id, error);
                         return;
@@ -2233,21 +2210,93 @@ fn reject_business_intent(state: &Arc<ServerState>, operation_id: &str, error: a
     });
 }
 
-async fn wait_source_management(
+pub(super) fn require_management_deadline(
+    operation_id: &str,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    anyhow::ensure!(
+        tokio::time::Instant::now() < deadline,
+        "actual management initialization deadline exceeded for operation {operation_id}"
+    );
+    Ok(())
+}
+
+fn dispatch_artifact_after_management(
+    state: Arc<ServerState>,
+    operation_id: String,
+    request: DeployRequest,
+    captured: Option<runtime_supervisor::BusinessStartPermit>,
+    deadline: tokio::time::Instant,
+) {
+    tokio::spawn(async move {
+        if state.settle_cancelled_before_execution(&operation_id).await {
+            return;
+        }
+        let prepared = async {
+            let captured =
+                wait_business_management(&state, &operation_id, captured, deadline).await?;
+            // Revalidate after actual old-process cleanup; only this accepted
+            // operation may consume its typed credential hold. Unknown writes
+            // remain protected by the existing recovery handoff.
+            let evaluated = state.credential_recovery(
+                request.run_pg.as_ref(),
+                CredentialRecoveryPurpose::RestoreConfirmedArtifact,
+            )?;
+            if evaluated.supplies_credentials() {
+                state.consume_credentials_hold(&operation_id, evaluated)?;
+            }
+            anyhow::ensure!(
+                !state.runtime_recovery_hold_active(),
+                "runtime recovery must be resolved before starting business"
+            );
+            require_management_deadline(&operation_id, deadline)?;
+            state.commit_business_relaunch(&operation_id, captured.as_ref(), deadline)?;
+            require_management_deadline(&operation_id, deadline)?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = prepared {
+            reject_business_intent(&state, &operation_id, error);
+            return;
+        }
+        if state.deploy_tx.send(request).is_err() {
+            if let Err(error) = state
+                .finish_runtime_operation_by_id(
+                    &operation_id,
+                    shared_types::RuntimeOperationState::Failed,
+                    Some((
+                        "ERR_BACKEND_ERROR".into(),
+                        "runtime deploy channel closed".into(),
+                    )),
+                )
+                .await
+            {
+                hold_unconfirmed(&state, format!("persist deploy channel failure: {error:#}"))
+                    .await;
+            }
+        } else {
+            state.request_business_relaunch();
+        }
+    });
+}
+
+async fn wait_business_management(
     state: &Arc<ServerState>,
     operation_id: &str,
     captured: Option<runtime_supervisor::BusinessStartPermit>,
+    deadline: tokio::time::Instant,
 ) -> Result<Option<runtime_supervisor::BusinessStartPermit>> {
+    require_management_deadline(operation_id, deadline)?;
     let Some(captured) = captured else {
         return Ok(None);
     };
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
     loop {
+        require_management_deadline(operation_id, deadline)?;
         anyhow::ensure!(
             !state
                 .runtime_kernel()
                 .is_some_and(|kernel| kernel.is_cancelled(operation_id)),
-            "original Source was cancelled during management initialization"
+            "original business operation was cancelled during management initialization"
         );
         let observed = state
             .capture_business_relaunch()?
@@ -2256,10 +2305,6 @@ async fn wait_source_management(
         {
             return captured.after_initialization(&observed).map(Some);
         }
-        anyhow::ensure!(
-            tokio::time::Instant::now() < deadline,
-            "actual management initialization deadline exceeded for Source {operation_id}"
-        );
         tokio::time::sleep_until(std::cmp::min(
             deadline,
             tokio::time::Instant::now() + std::time::Duration::from_millis(50),
@@ -2934,3 +2979,7 @@ pub(super) async fn admit_explicit_run_replacement(
         })?;
     Ok(Some(operation_id))
 }
+
+#[cfg(test)]
+#[path = "business_management_tests.rs"]
+mod business_management_tests;

@@ -591,6 +591,41 @@ async fn prepare_artifact_proxy(
         crate::startup_probe::StartupContext { dev_profile, host },
     )
     .await?;
+    // The validated publication must outlive activation's workspace rename.
+    // Logs or APP_CLI_PINGAP_RUNTIME_DIR may legitimately sit in that workspace.
+    // Reuse this execution's existing managed range rather than recompiling a
+    // different configuration after the old business has already stopped.
+    let activation_root = match execution_workspace.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => execution_workspace
+            .parent()
+            .context("artifact execution directory has no parent")?
+            .canonicalize()
+            .context("resolve actual artifact execution parent")?
+            .join(
+                execution_workspace
+                    .file_name()
+                    .context("artifact execution directory has no name")?,
+            ),
+        Err(error) => return Err(error).context("resolve actual artifact execution directory"),
+    };
+    let candidate_path = outcome
+        .config_path
+        .canonicalize()
+        .context("resolve actual prepared proxy snapshot")?;
+    let outcome = if candidate_path.starts_with(&activation_root) {
+        let stable_root = process_utils::command_authority::current_root()
+            .context("artifact proxy snapshot requires its original managed execution range")?
+            .canonicalize()
+            .context("resolve actual managed execution range")?;
+        anyhow::ensure!(
+            !stable_root.starts_with(&activation_root),
+            "artifact activation would replace its live management execution range"
+        );
+        crate::proxy::publication::freeze_candidate(&stable_root, &outcome).await?
+    } else {
+        outcome
+    };
     Ok(crate::supervisor::PreparedProxy {
         workspace: execution_workspace.into(),
         release,

@@ -3,8 +3,11 @@ use super::*;
 type NativeControlProbe = Box<dyn Fn() -> Option<(String, String)> + Send + Sync>;
 type BusinessIntentCapture =
     Box<dyn Fn() -> Result<runtime_supervisor::BusinessStartPermit> + Send + Sync>;
-type BusinessIntentCommit =
-    Box<dyn Fn(&runtime_supervisor::BusinessStartPermit) -> Result<()> + Send + Sync>;
+type BusinessIntentCommit = Box<
+    dyn Fn(&runtime_supervisor::BusinessStartPermit, tokio::time::Instant) -> Result<()>
+        + Send
+        + Sync,
+>;
 
 /// Management-kernel startup is independent of business recovery/readiness.
 #[derive(Clone)]
@@ -475,11 +478,13 @@ impl ServerState {
         &self,
         operation_id: &str,
         captured: Option<&runtime_supervisor::BusinessStartPermit>,
+        deadline: tokio::time::Instant,
     ) -> Result<()> {
         let _admission = self
             .admission
             .lock()
             .map_err(|_| anyhow::anyhow!("business intent admission lock poisoned"))?;
+        require_management_deadline(operation_id, deadline)?;
         anyhow::ensure!(
             self.accepting.load(std::sync::atomic::Ordering::Acquire),
             "owner is shutting down"
@@ -491,7 +496,7 @@ impl ServerState {
             "original business operation was cancelled before dispatch"
         );
         if let (Some(notify), Some(captured)) = (self.business_relaunch.get(), captured) {
-            notify(captured)?;
+            notify(captured, deadline)?;
         }
         Ok(())
     }
