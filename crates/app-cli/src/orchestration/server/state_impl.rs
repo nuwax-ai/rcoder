@@ -9,8 +9,7 @@ impl ServerState {
             control_token: std::sync::OnceLock::new(),
             execution_project: std::sync::OnceLock::new(),
             owner_execution_workspace: std::sync::OnceLock::new(),
-            runtime_kernel: std::sync::OnceLock::new(),
-            kernel_required: std::sync::atomic::AtomicBool::new(false),
+            kernel_startup: RwLock::new(KernelStartupStatus::Unsupported),
             runtime_recovery_hold: std::sync::atomic::AtomicU8::new(0),
             credential_recovery_operation: std::sync::Mutex::new(None),
             pending_dev_profile: std::sync::Mutex::new(None),
@@ -70,10 +69,33 @@ impl ServerState {
         }
     }
 
-    /// 运行操作内核（api 层 /v1/runtime/* 消费；未注入返回 None）。
+    /// Enter the management assembly stage before opening its HTTP router.
     pub(crate) fn mark_kernel_required(&self) {
-        self.kernel_required
-            .store(true, std::sync::atomic::Ordering::Release);
+        let Ok(mut startup) = self.kernel_startup.write() else {
+            tracing::error!("management kernel startup lock poisoned");
+            return;
+        };
+        if matches!(*startup, KernelStartupStatus::Unsupported) {
+            *startup = KernelStartupStatus::Assembling;
+        }
+    }
+
+    pub(crate) fn mark_kernel_failed(&self) {
+        // A business failure or late callback cannot revoke a published kernel.
+        let Ok(mut startup) = self.kernel_startup.write() else {
+            tracing::error!("management kernel startup lock poisoned");
+            return;
+        };
+        if matches!(*startup, KernelStartupStatus::Assembling) {
+            *startup = KernelStartupStatus::Failed;
+        }
+    }
+
+    pub(crate) fn kernel_startup_status(&self) -> KernelStartupStatus {
+        self.kernel_startup
+            .read()
+            .map(|startup| startup.clone())
+            .unwrap_or(KernelStartupStatus::Failed)
     }
 
     /// R08：记录/读取当前操作的 dev profile。
@@ -286,13 +308,19 @@ impl ServerState {
     }
 
     pub(crate) fn kernel_unavailable(&self) -> bool {
-        self.kernel_required
-            .load(std::sync::atomic::Ordering::Acquire)
-            && self.runtime_kernel.get().is_none()
+        matches!(
+            self.kernel_startup_status(),
+            KernelStartupStatus::Assembling | KernelStartupStatus::Failed
+        )
     }
 
     pub(crate) fn runtime_kernel(&self) -> Option<Arc<crate::runtime_kernel::RuntimeKernel>> {
-        self.runtime_kernel.get().cloned()
+        match self.kernel_startup_status() {
+            KernelStartupStatus::Ready(kernel) => Some(kernel),
+            KernelStartupStatus::Unsupported
+            | KernelStartupStatus::Assembling
+            | KernelStartupStatus::Failed => None,
+        }
     }
 
     #[cfg(test)]
@@ -305,7 +333,18 @@ impl ServerState {
         &self,
         kernel: Arc<crate::runtime_kernel::RuntimeKernel>,
     ) -> bool {
-        self.runtime_kernel.set(kernel).is_ok()
+        let Ok(mut startup) = self.kernel_startup.write() else {
+            tracing::error!("management kernel startup lock poisoned");
+            return false;
+        };
+        if matches!(
+            *startup,
+            KernelStartupStatus::Ready(_) | KernelStartupStatus::Failed
+        ) {
+            return false;
+        }
+        *startup = KernelStartupStatus::Ready(kernel);
+        true
     }
 
     /// 当前执行中的运行操作（dispatch 设置；主循环边界收束后清除）。

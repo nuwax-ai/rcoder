@@ -128,62 +128,44 @@ pub async fn owner_serve(
     // 早期运行内核装配（plan §5.1 step 3）：发布身份/能力与端点记录；业务
     // 恢复尚未发生。装配失败=管理降级（B05 语义）：API 保持在线，业务启动
     // 压制，具体原因可从身份/恢复端点与日志观察到。
-    match assemble_runtime_kernel(&state, args).await {
+    match publish_runtime_kernel(&state, assemble_runtime_kernel(&state, args).await) {
         Ok(kernel) => {
-            let credential_result = state
-                .control_token()
-                .context("owner control token missing")
-                .and_then(|token| kernel.store().store_token(&token))
-                .context("publish owner control credential");
-            match credential_result {
-                Ok(()) => {
-                    state.set_runtime_kernel(kernel.clone());
-                    // R3：管理面可用性与业务恢复解耦——API 已绑定、身份已
-                    // 发布即开放管理查询（围栏/Stopped 驻留期间 deploy/status
-                    // 以 idle 应答而非 503；file-server 的恢复预检不再被
-                    // initializing 窗口卡死）。业务会话自身的恢复窗口仍经
-                    // begin_business_session 重新置 initializing 门控新业务受理。
-                    state.mark_initialized();
-                    // R06 事件桥：编排 EVT 同步进入活跃操作的运行事件 journal +
-                    // stdout 管道（dev 任务的 Done/阶段事件经此转发）——统一
-                    // owner 路径同样必须安装，否则 file-server 侧等待终局事件
-                    // 只能靠预算超时（app 11 式静默）。
+            // R3：管理面可用性与业务恢复解耦——API 已绑定、身份已
+            // 发布即开放管理查询（围栏/Stopped 驻留期间 deploy/status
+            // 以 idle 应答而非 503；file-server 的恢复预检不再被
+            // initializing 窗口卡死）。业务会话自身的恢复窗口仍经
+            // begin_business_session 重新置 initializing 门控新业务受理。
+            state.mark_initialized();
+            // R06 事件桥：编排 EVT 同步进入活跃操作的运行事件 journal +
+            // stdout 管道（dev 任务的 Done/阶段事件经此转发）——统一
+            // owner 路径同样必须安装，否则 file-server 侧等待终局事件
+            // 只能靠预算超时（app 11 式静默）。
+            {
+                let kernel = kernel.clone();
+                let event_state = state.clone();
+                crate::orchestration_events::install_bridge(Box::new(move |json| {
+                    if let Some(operation_id) = event_state.current_runtime_operation()
+                        && let Some(record) = bridge_event_fields(&json)
                     {
-                        let kernel = kernel.clone();
-                        let event_state = state.clone();
-                        crate::orchestration_events::install_bridge(Box::new(move |json| {
-                            if let Some(operation_id) = event_state.current_runtime_operation()
-                                && let Some(record) = bridge_event_fields(&json)
-                            {
-                                kernel.append_orchestration_event(
-                                    &operation_id,
-                                    &record.stage,
-                                    record.service,
-                                    &record.event_name,
-                                    record.payload,
-                                );
-                            }
-                        }));
-                    }
-                    let endpoint = crate::runtime_kernel::EndpointRecord {
-                        protocol_version: kernel.identity().protocol_version,
-                        application_id: kernel.identity().application_id.clone(),
-                        workspace_id: kernel.identity().workspace_id.clone(),
-                        runtime_instance_id: kernel.identity().runtime_instance_id.clone(),
-                        address: bound_api_addr.clone(),
-                    };
-                    if let Err(endpoint_error) = kernel.store().store_endpoint(&endpoint) {
-                        tracing::warn!(
-                            "endpoint discovery record publish failed: {endpoint_error:#}"
+                        kernel.append_orchestration_event(
+                            &operation_id,
+                            &record.stage,
+                            record.service,
+                            &record.event_name,
+                            record.payload,
                         );
                     }
-                }
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        "owner credential publication failed; business startup suppressed"
-                    );
-                }
+                }));
+            }
+            let endpoint = crate::runtime_kernel::EndpointRecord {
+                protocol_version: kernel.identity().protocol_version,
+                application_id: kernel.identity().application_id.clone(),
+                workspace_id: kernel.identity().workspace_id.clone(),
+                runtime_instance_id: kernel.identity().runtime_instance_id.clone(),
+                address: bound_api_addr.clone(),
+            };
+            if let Err(endpoint_error) = kernel.store().store_endpoint(&endpoint) {
+                tracing::warn!("endpoint discovery record publish failed: {endpoint_error:#}");
             }
         }
         Err(error) => {
@@ -1140,6 +1122,9 @@ async fn serve_supervised_worker(
         .err();
     }
     let ownership_claimed = startup_error.is_none();
+    if !ownership_claimed {
+        state.mark_kernel_failed();
+    }
     let mut kernel_recovery_hold = false;
     if ownership_claimed {
         state.mark_kernel_required();
@@ -1302,18 +1287,12 @@ async fn serve_supervised_worker(
                         "runtime state requires storage-level recovery; automatic business startup suppressed"
                     );
                 }
-                let credential_result = state
-                    .control_token()
-                    .context("owner control token missing")
-                    .and_then(|token| kernel.store().store_token(&token))
-                    .context("publish owner control credential");
-                if let Err(error) = credential_result {
+                if let Err(error) = publish_runtime_kernel(&state, Ok(kernel.clone())) {
                     state.close_admission();
                     api_handle.abort();
                     signal_task.abort();
                     return Err(error);
                 }
-                state.set_runtime_kernel(kernel.clone());
                 {
                     let kernel = kernel.clone();
                     let event_state = state.clone();
@@ -1346,6 +1325,7 @@ async fn serve_supervised_worker(
                 }
             }
             Err(error) => {
+                state.mark_kernel_failed();
                 kernel_recovery_hold = true;
                 tracing::error!(
                     "runtime kernel unavailable ({error:#}); automatic business startup suppressed"
@@ -1606,6 +1586,43 @@ pub(super) fn runtime_workspace_id(workspace: &std::path::Path) -> String {
     // A full SHA-256 hex digest fits the protocol's 64-byte identifier limit.
     hex::encode(Sha256::digest(project_root.as_os_str().as_encoded_bytes()))
 }
+
+/// The management kernel becomes Ready only after its owner credential is durable.
+/// Assembly/credential failures remain distinct from later business recovery.
+fn publish_runtime_kernel(
+    state: &ServerState,
+    assembled: Result<Arc<crate::runtime_kernel::RuntimeKernel>>,
+) -> Result<Arc<crate::runtime_kernel::RuntimeKernel>> {
+    let result = assembled.and_then(|kernel| {
+        anyhow::ensure!(
+            matches!(
+                state.kernel_startup_status(),
+                KernelStartupStatus::Assembling
+            ),
+            "management kernel is not awaiting startup publication"
+        );
+        let token = state
+            .control_token()
+            .context("owner control token missing")?;
+        kernel
+            .store()
+            .store_token(&token)
+            .context("publish owner control credential")?;
+        anyhow::ensure!(
+            state.set_runtime_kernel(kernel.clone()),
+            "management kernel publication was rejected"
+        );
+        Ok(kernel)
+    });
+    if result.is_err() {
+        state.mark_kernel_failed();
+    }
+    result
+}
+
+#[cfg(test)]
+#[path = "kernel_startup_tests.rs"]
+mod kernel_startup_tests;
 
 /// 装配运行操作内核（serve 专用；dispatch 把内核动作翻译进既有执行通道）。
 pub(super) async fn assemble_runtime_kernel(

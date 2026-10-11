@@ -1073,6 +1073,8 @@ mod tests {
     async fn recovery_during_startup_reports_initializing_code() {
         let state = test_state();
         // 新建 ServerState 默认 initializing=true，不调用 mark_initialized。
+        // This is a managed owner assembling its kernel, not unsupported mode.
+        state.server.mark_kernel_required();
         state.server.initialize_owner_token().unwrap();
         let token = state.server.control_token().unwrap();
         let request = axum::http::Request::builder()

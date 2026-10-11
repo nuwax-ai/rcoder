@@ -29,18 +29,24 @@ pub(super) struct RuntimeOperationBody {
 fn kernel_of(
     state: &AppState,
 ) -> Result<Arc<RuntimeKernel>, (StatusCode, Json<serde_json::Value>)> {
-    state.runtime_kernel().ok_or_else(|| {
-        let recovering = state.server.kernel_unavailable();
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "success": false,
-                "code": if recovering { "ERR_RECOVERY_REQUIRED" } else { "ERR_PROTOCOL_UNSUPPORTED" },
-                "message": if recovering { "runtime owner startup recovery failed; inspect the owner log" }
-                           else { "runtime control kernel is not active in this mode" },
-            })),
-        )
-    })
+    use crate::server::KernelStartupStatus;
+
+    let (code, message) = match state.server.kernel_startup_status() {
+        KernelStartupStatus::Ready(kernel) => return Ok(kernel),
+        KernelStartupStatus::Assembling => (
+            "ERR_INITIALIZING",
+            "runtime owner management kernel is initializing",
+        ),
+        KernelStartupStatus::Failed => (
+            "ERR_RECOVERY_REQUIRED",
+            "runtime owner startup recovery failed; inspect the owner log",
+        ),
+        KernelStartupStatus::Unsupported => (
+            "ERR_PROTOCOL_UNSUPPORTED",
+            "runtime control kernel is not active in this mode",
+        ),
+    };
+    Err(reject(code, message, StatusCode::SERVICE_UNAVAILABLE))
 }
 
 fn reject(code: &str, message: &str, status: StatusCode) -> (StatusCode, Json<serde_json::Value>) {
@@ -92,7 +98,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     responses(
         (status = 200, description = "Recovery evidence in data; not permission to resume", body = serde_json::Value),
         (status = 403, description = "Invalid owner token"),
-        (status = 503, description = "Recovery evidence unavailable")
+        (status = 503, description = "ERR_INITIALIZING during kernel assembly or business recovery; ERR_RECOVERY_REQUIRED after kernel/credential assembly failure")
     ),
     tag = "Runtime Control"
 )]
@@ -106,6 +112,9 @@ pub(super) async fn recovery(
             .get("x-deploy-token")
             .and_then(|value| value.to_str().ok()),
     )?;
+    // Classify kernel assembly before the independent business recovery gate.
+    // A failed or unsupported kernel must not remain ERR_INITIALIZING.
+    kernel_of(&state)?;
     if state.server.initializing() {
         // 启动窗口码对齐协议文档与客户端重试契约（owner_client 的有界等待
         // 只认 ERR_INITIALIZING；用 ERR_INVALID_STATE 会让调用方立即放弃）。
@@ -133,7 +142,7 @@ pub(super) async fn recovery(
     path = "/v1/runtime/identity",
     responses(
         (status = 200, description = "Owner identity after startup reconciliation", body = serde_json::Value),
-        (status = 503, description = "ERR_INITIALIZING while reconciling, ERR_RECOVERY_REQUIRED on failed recovery, ERR_PROTOCOL_UNSUPPORTED in run mode")
+        (status = 503, description = "ERR_INITIALIZING while assembling the management kernel, ERR_RECOVERY_REQUIRED after assembly/credential failure, ERR_PROTOCOL_UNSUPPORTED when this mode has no kernel; later business recovery does not revoke the owner identity")
     ),
     tag = "Runtime Control"
 )]
@@ -154,7 +163,10 @@ pub(super) async fn identity(
 #[utoipa::path(
     get,
     path = "/v1/runtime/status",
-    responses((status = 200, description = "Runtime status view", body = serde_json::Value)),
+    responses(
+        (status = 200, description = "Runtime status view", body = serde_json::Value),
+        (status = 503, description = "ERR_INITIALIZING during management kernel assembly; ERR_RECOVERY_REQUIRED after assembly/credential failure; ERR_PROTOCOL_UNSUPPORTED without a management kernel")
+    ),
     tag = "Runtime Control"
 )]
 pub(super) async fn status(
@@ -205,6 +217,7 @@ pub(super) async fn status(
     responses(
         (status = 202, description = "Operation accepted or idempotent replay. Fresh Source Start/Restart uses current input and can replace a redacted-credential or missing-history hold without requiring the old artifact release. Artifact restoration retains its original identity checks. While a normal build/deploy is active, a newer Start/Restart supersedes it. While a Stop/Restart control is physically executing, a different Start/Restart is rejected Busy with the active operation identity instead of being queued; same-id retries replay recorded progress and terminal state.", body = serde_json::Value),
         (status = 409, description = "Conflict: id/replay/busy/revision/instance/recovery. Invalid current credentials, physical cleanup or independent platform write outcomes retain their specific protection. Application migration receipts are advisory and never block admission. Stop retains kernel safety checks.", body = serde_json::Value),
+        (status = 503, description = "Management kernel not available: ERR_INITIALIZING during assembly; ERR_RECOVERY_REQUIRED after assembly/credential failure; ERR_PROTOCOL_UNSUPPORTED in a mode without the kernel. No operation is accepted."),
     ),
     tag = "Runtime Control"
 )]
@@ -226,6 +239,7 @@ pub(super) async fn submit_operation(
             StatusCode::BAD_REQUEST,
         )
     })?;
+    let kernel = kernel_of(&state)?;
     let is_stop = body.request.kind == shared_types::RuntimeOperationKind::Stop;
     if state.server.initializing() && !is_stop {
         return Err(reject(
@@ -234,7 +248,6 @@ pub(super) async fn submit_operation(
             StatusCode::CONFLICT,
         ));
     }
-    let kernel = kernel_of(&state)?;
     use crate::server::{CredentialRecovery, CredentialRecoveryPurpose};
     let credential_mode = match body.request.kind {
         shared_types::RuntimeOperationKind::Start | shared_types::RuntimeOperationKind::Restart => {
@@ -517,9 +530,6 @@ pub(super) async fn operation_events_sse(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-/// 共享：runtime_kernel 槽位访问（AppState 转发）。
-impl AppState {
-    pub(super) fn runtime_kernel(&self) -> Option<Arc<RuntimeKernel>> {
-        self.server.runtime_kernel()
-    }
-}
+#[cfg(test)]
+#[path = "runtime_startup_tests.rs"]
+mod startup_tests;

@@ -2,6 +2,15 @@ use super::*;
 
 type NativeControlProbe = Box<dyn Fn() -> Option<(String, String)> + Send + Sync>;
 
+/// Management-kernel startup is independent of business recovery/readiness.
+#[derive(Clone)]
+pub(crate) enum KernelStartupStatus {
+    Unsupported,
+    Assembling,
+    Ready(Arc<crate::runtime_kernel::RuntimeKernel>),
+    Failed,
+}
+
 /// server 全局状态（api 层与主循环共享；读多写少，std RwLock 短临界区不跨 await）。
 pub struct ServerState {
     pub(super) control_token: std::sync::OnceLock<String>,
@@ -49,13 +58,10 @@ pub struct ServerState {
     /// 日志布局（跟随服务托管引擎；serve 探测后设置，legacy 默认 Builtin）。
     pub(super) log_layout: RwLock<LogLayout>,
     pub(super) log_catalog_context: RwLock<Option<userapp_log_reader::catalog::CatalogLocation>>,
-    /// 运行操作内核槽位（阶段二：serve 在 ownership 认领后注入；legacy 形态
-    /// 恒 None——api 层 /v1/runtime/* 相应 503）。
-    pub(super) runtime_kernel: std::sync::OnceLock<Arc<crate::runtime_kernel::RuntimeKernel>>,
-    /// R05：启动路径是否**尝试过**装配运行内核。true 且 runtime_kernel 为
-    /// None = 状态根打开失败（可信状态不可读）——所有写入口 fail-closed；
-    /// false = 从未尝试（测试/无内核上下文）——保持旧语义。
-    pub(super) kernel_required: std::sync::atomic::AtomicBool,
+    /// Required-but-absent is not evidence of failure while assembly is running.
+    /// Status and immutable kernel identity share one short transition lock.
+    /// Both Assembling and Failed close writes; only Failed requires recovery.
+    pub(super) kernel_startup: RwLock<KernelStartupStatus>,
     /// V04：server 级恢复门禁——运行操作**终态持久化失败**（结果未知）时
     /// 挂起：保留执行身份、关闭部署受理、压低 ready，直至进程重启由内核
     /// 恢复裁决。未知结果标记只升不降；存量凭据脱敏仅作诊断，不建立保护。
