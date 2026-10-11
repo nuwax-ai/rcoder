@@ -77,6 +77,8 @@ pub(crate) enum DispatchAction {
     },
     /// 停止业务服务（保持管理面可用）。
     StopBusiness { operation_id: String },
+    /// Cancel a captured Source's child execution, without admitting Stop.
+    CancelSource { operation_id: String },
 }
 
 #[derive(Default)]
@@ -923,6 +925,13 @@ impl RuntimeKernel {
         // ——Stop 只占 pending 槽，绝不抢走执行者身份（V03）。
         // 第二个 Stop 应复用原请求查询；新启动可保留最新意图。
         let is_stop = request.kind == RuntimeOperationKind::Stop;
+        let latest_source = matches!(
+            (&request.kind, &request.profile),
+            (
+                RuntimeOperationKind::Start | RuntimeOperationKind::Restart,
+                shared_types::RunProfileInput::Source { .. }
+            )
+        );
         if is_stop && let Some(pending) = guard.pending_stop.clone() {
             return Err(AdmissionRejection {
                 code: ERR_OPERATION_IN_PROGRESS,
@@ -956,7 +965,10 @@ impl RuntimeKernel {
         // Start/Restart 在持久化新操作前返回 Busy（附当前操作身份），
         // 不进入内部排队；普通构建/部署的自动接替规则保持不变。
         // 同请求重试在更早的重放判定中返回已记录进度，不受此分支影响。
-        if !is_stop && (guard.pending_stop.is_some() || guard.active_operation_id.is_some()) {
+        if !is_stop
+            && !latest_source
+            && (guard.pending_stop.is_some() || guard.active_operation_id.is_some())
+        {
             let busy_control = guard.pending_stop.is_some() || {
                 // RV09：占槽记录读取失败必须如实拒绝（不能 .ok 折叠成
                 // "非控制操作"绕过 Busy 判定后静默排队）。
@@ -1095,6 +1107,54 @@ impl RuntimeKernel {
             }
             guard.queued_input = Some(stored.clone());
             queued = true;
+            // The single latest Source slot supersedes an older Source build.
+            // Its terminal result still waits for actual cleanup; Stop keeps
+            // its independent barrier and is never cancelled by this intent.
+            if latest_source && let Some(active_id) = guard.active_operation_id.clone() {
+                let active = match self.store.load_operation(&active_id) {
+                    Ok(active) => active,
+                    Err(error) => {
+                        guard.recovery_protection = true;
+                        return Err(self.hold_partial_admission(
+                            &stored,
+                            format!("read superseded Source: {error:#}"),
+                        ));
+                    }
+                };
+                if let Some(active) = active
+                    && matches!(
+                        (&active.view.kind, &active.request.profile),
+                        (
+                            RuntimeOperationKind::Start | RuntimeOperationKind::Restart,
+                            shared_types::RunProfileInput::Source { .. }
+                        )
+                    )
+                {
+                    let mut cancelled = match self.cancelled.lock() {
+                        Ok(cancelled) => cancelled,
+                        Err(_) => {
+                            guard.recovery_protection = true;
+                            return Err(self.hold_partial_admission(
+                                &stored,
+                                "Source cancellation lock poisoned".into(),
+                            ));
+                        }
+                    };
+                    if let Err(error) = self.store.store_cancellation(&active) {
+                        cancelled.insert(active_id.clone());
+                        guard.recovery_protection = true;
+                        return Err(self.hold_partial_admission(
+                            &stored,
+                            format!("persist superseded Source cancellation: {error:#}"),
+                        ));
+                    }
+                    cancelled.insert(active_id.clone());
+                    drop(cancelled);
+                    (self.dispatch)(DispatchAction::CancelSource {
+                        operation_id: active_id,
+                    });
+                }
+            }
         } else {
             // R02 补漏：无 active 时受理——先沉降滞留的旧排队者（失败/崩溃
             // 路径可能未清槽），绝不让更旧请求在本请求成功后被派发
@@ -1522,6 +1582,18 @@ impl RuntimeKernel {
             return Err(error).context("persist cancellation intent");
         }
         cancelled.insert(operation_id.to_string());
+        drop(cancelled);
+        if matches!(
+            (&operation.view.kind, &operation.request.profile),
+            (
+                RuntimeOperationKind::Start | RuntimeOperationKind::Restart,
+                shared_types::RunProfileInput::Source { .. }
+            )
+        ) {
+            (self.dispatch)(DispatchAction::CancelSource {
+                operation_id: operation_id.to_owned(),
+            });
+        }
         Ok(true)
     }
 
@@ -1569,6 +1641,25 @@ impl RuntimeKernel {
             .lock()
             .map(|set| set.contains(operation_id))
             .unwrap_or(false)
+    }
+
+    pub(crate) fn is_source_operation(&self, operation_id: &str) -> Result<bool> {
+        let Some(operation) = self.store.load_operation(operation_id)? else {
+            return Ok(false);
+        };
+        anyhow::ensure!(
+            operation.view.runtime_instance_id == self.identity.runtime_instance_id
+                && operation.request.expected_runtime_instance_id
+                    == self.identity.runtime_instance_id,
+            "Source cancellation belongs to another runtime instance"
+        );
+        Ok(matches!(
+            (&operation.view.kind, &operation.request.profile),
+            (
+                RuntimeOperationKind::Start | RuntimeOperationKind::Restart,
+                shared_types::RunProfileInput::Source { .. }
+            )
+        ))
     }
 
     /// 受理请求 → 执行派发动作映射（admit 与排队派发共用；组合已由

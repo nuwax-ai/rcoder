@@ -408,6 +408,7 @@ mod compute_error_route_tests {
             context: &UserAppExecutionContext,
         ) -> ContainerRuntimeResult<BuilderControlTarget> {
             Ok(BuilderControlTarget {
+                builder_startup_mode: Default::default(),
                 resource_binding: None,
                 context: context.clone(),
                 workload: Some(AppResourceIdentity {
@@ -565,6 +566,7 @@ mod compute_error_route_tests {
             let app = self.app().await;
             self.store
                 .admit_compute_control(&ComputeControlRequest {
+                    builder_startup_mode: Default::default(),
                     app_id: "routeapp".into(),
                     lifecycle_id: app.lifecycle_id,
                     scope: UserAppOperationScope::Dev,

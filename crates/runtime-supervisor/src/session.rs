@@ -80,6 +80,49 @@ pub struct SessionScope {
     pub supervisor_id: String,
 }
 
+/// Captured before a new explicit business request yields. Its native control
+/// history boundary invalidates an old callback even after a newer Stop ended.
+/// This is an in-memory permit; it introduces no persistent proof record.
+#[derive(Clone, Debug)]
+pub struct BusinessStartPermit {
+    snapshot: Snapshot,
+    controls: usize,
+}
+
+impl BusinessStartPermit {
+    pub fn management_ready(&self) -> bool {
+        self.snapshot.operation_id.is_none()
+            && self.snapshot.intent != Intent::Shutdown
+            && matches!(
+                self.snapshot.phase,
+                Phase::Ready | Phase::Stopped | Phase::RecoveryRequired
+            )
+            && self.snapshot.problem.is_none()
+    }
+
+    /// Capture the actual management generation immediately before Source
+    /// preparation begins. Initial recovery may move through Ready while it
+    /// replaces the old generation; native control history must remain unchanged.
+    /// After preparation begins the commit keeps this exact generation.
+    pub fn after_initialization(&self, observed: &Self) -> Result<Self> {
+        anyhow::ensure!(
+            self.snapshot.supervisor_id == observed.snapshot.supervisor_id
+                && self.snapshot.binding == observed.snapshot.binding
+                && self.controls == observed.controls,
+            "native control changed while waiting for management initialization"
+        );
+        anyhow::ensure!(
+            observed.management_ready(),
+            "actual native management initialization is not complete"
+        );
+        Ok(observed.clone())
+    }
+}
+
+#[cfg(test)]
+#[path = "session_business_intent_tests.rs"]
+mod business_intent_tests;
+
 static CURRENT_SCOPE: std::sync::RwLock<Option<SessionScope>> = std::sync::RwLock::new(None);
 
 /// Read the current business session scope installed by the running owner.
@@ -503,6 +546,44 @@ impl OwnerSession {
     /// while business is stopped) into the session's intent loop.
     pub fn request_relaunch(&self) {
         self.core.relaunch_requested.notify_one();
+    }
+
+    pub fn capture_business_start(&self) -> Result<BusinessStartPermit> {
+        let discovery = self
+            .core
+            .discovery
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native business intent capture lock poisoned"))?;
+        Ok(BusinessStartPermit {
+            snapshot: discovery.snapshot.clone(),
+            controls: discovery.requests.len(),
+        })
+    }
+
+    pub fn request_explicit_business_start(&self, captured: &BusinessStartPermit) -> Result<()> {
+        self.core.with_discovery(|discovery| {
+            let current = &discovery.snapshot;
+            anyhow::ensure!(
+                current.supervisor_id == captured.snapshot.supervisor_id
+                    && current.binding == captured.snapshot.binding
+                    && current.generation == captured.snapshot.generation
+                    && discovery.requests.len() == captured.controls,
+                "native owner control changed after explicit business preparation"
+            );
+            anyhow::ensure!(
+                current.intent != Intent::Shutdown
+                    && current.operation_id.is_none()
+                    && !matches!(
+                        current.phase,
+                        Phase::Stopping | Phase::CleanupPending | Phase::Reconciling
+                    ),
+                "native Stop/Shutdown must finish before explicit business start (phase={}, operation_id={:?}, generation={:?}, intent={:?})",
+                current.phase, current.operation_id, current.generation, current.intent
+            );
+            discovery.snapshot.intent = Intent::Run;
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// Wake reconciliation for the same failed execution without granting a new

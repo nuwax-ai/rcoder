@@ -42,6 +42,7 @@ pub(crate) fn spawn_operation(
             .await?;
             let ready_deadline = Instant::now()
                 + Duration::from_secs(owned.config.userapp_storage.ensure_timeout_seconds);
+            let startup_mode = claimed_startup_mode(&owned, &claimed, &claimed_id).await?;
             let predecessor = match registration::capture_predecessor(&owned, &claimed).await {
                 Ok(predecessor) => predecessor,
                 Err(error) => {
@@ -69,6 +70,7 @@ pub(crate) fn spawn_operation(
                     executor_id: claimed_id.clone(),
                     request_fingerprint: claimed.request_fingerprint.clone(),
                 },
+                startup_mode,
             );
             let creation = async {
                 let result = creation.await;

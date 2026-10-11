@@ -39,6 +39,7 @@ struct LocatorRuntime {
 impl LocatorRuntime {
     fn target(&self, context: &UserAppExecutionContext) -> BuilderControlTarget {
         BuilderControlTarget {
+            builder_startup_mode: Default::default(),
             context: context.clone(),
             resource_binding: None,
             workload: self
@@ -349,6 +350,21 @@ async fn assert_read_only_rejection(state: &Arc<AppState>, runtime: &LocatorRunt
 #[tokio::test]
 async fn dev_locator_accepts_only_verified_current_builder() {
     let (state, runtime, _directory) = fixture(vec![Some(running_builder())], false).await;
+    // The identity fixture is not a Kubernetes NodePort provider. Supply its
+    // address-layer observation for the deploy-host feature combination; this
+    // test still performs no transport readiness or container mutation.
+    #[cfg(feature = "deploy-host")]
+    let published_key = {
+        let observed = running_builder();
+        let key = shared_types::build_backend_addr(
+            &observed.container_name,
+            &observed.container_ip,
+            &state.config.app_manager.namespace,
+            &state.cluster_domain,
+        );
+        shared_types::published::register_direct(&key, "127.0.0.1".parse().unwrap());
+        key
+    };
     let before = state.userapp_store.get_application(APP_ID).await.unwrap();
     let locator = make_locator(&state);
     assert_eq!(
@@ -377,6 +393,8 @@ async fn dev_locator_accepts_only_verified_current_builder() {
         state.userapp_store.get_application(APP_ID).await.unwrap(),
         before
     );
+    #[cfg(feature = "deploy-host")]
+    shared_types::published::unregister(&published_key);
 }
 
 #[tokio::test]

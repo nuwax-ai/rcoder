@@ -1,6 +1,10 @@
 use super::*;
 
 type NativeControlProbe = Box<dyn Fn() -> Option<(String, String)> + Send + Sync>;
+type BusinessIntentCapture =
+    Box<dyn Fn() -> Result<runtime_supervisor::BusinessStartPermit> + Send + Sync>;
+type BusinessIntentCommit =
+    Box<dyn Fn(&runtime_supervisor::BusinessStartPermit) -> Result<()> + Send + Sync>;
 
 /// Management-kernel startup is independent of business recovery/readiness.
 #[derive(Clone)]
@@ -55,6 +59,8 @@ pub struct ServerState {
     /// 统一 owner：跨业务会话可续期（会话结束即换新），避免一次取消永久
     /// 卡死后续会话。访问经 [`ServerState::cancel_token`] 系列方法。
     pub(super) cancel: RwLock<CancellationToken>,
+    /// Exact current Source child token; owner and pending Stop are independent.
+    pub(super) source_cancellation: source_cancellation::SourceCancellation,
     /// 日志布局（跟随服务托管引擎；serve 探测后设置，legacy 默认 Builtin）。
     pub(super) log_layout: RwLock<LogLayout>,
     pub(super) log_catalog_context: RwLock<Option<userapp_log_reader::catalog::CatalogLocation>>,
@@ -92,7 +98,9 @@ pub struct ServerState {
     pub(super) deploy_inputs_eligible: std::sync::atomic::AtomicBool,
     /// 统一 owner：业务重启通知（运行操作受理后，若当前无业务会话在跑，
     /// 经此触发会话重建）。由 owner 装配时注入。
-    pub(super) business_relaunch: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+    pub(super) business_relaunch_capture: std::sync::OnceLock<BusinessIntentCapture>,
+    pub(super) business_wake: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+    pub(super) business_relaunch: std::sync::OnceLock<BusinessIntentCommit>,
     /// R3：原生会话正处启动恢复活跃相位（Reconciling/Starting/Stopping/
     /// CleanupPending）。管理查询门控 = initializing ∨ 本位（围栏清理期
     /// deploy/status 503；降级驻留 RecoveryRequired 不阻塞——证据可查）。
@@ -448,10 +456,44 @@ impl ServerState {
     }
 
     /// 统一 owner：通知 owner 会话重建业务（运行操作已受理但无会话在跑）。
+    pub(crate) fn capture_business_relaunch(
+        &self,
+    ) -> Result<Option<runtime_supervisor::BusinessStartPermit>> {
+        self.business_relaunch_capture
+            .get()
+            .map(|capture| capture())
+            .transpose()
+    }
+
     pub(crate) fn request_business_relaunch(&self) {
-        if let Some(notify) = self.business_relaunch.get() {
-            notify();
+        if let Some(wake) = self.business_wake.get() {
+            wake();
         }
+    }
+
+    pub(crate) fn commit_business_relaunch(
+        &self,
+        operation_id: &str,
+        captured: Option<&runtime_supervisor::BusinessStartPermit>,
+    ) -> Result<()> {
+        let _admission = self
+            .admission
+            .lock()
+            .map_err(|_| anyhow::anyhow!("business intent admission lock poisoned"))?;
+        anyhow::ensure!(
+            self.accepting.load(std::sync::atomic::Ordering::Acquire),
+            "owner is shutting down"
+        );
+        anyhow::ensure!(
+            !self
+                .runtime_kernel()
+                .is_some_and(|kernel| kernel.is_cancelled(operation_id)),
+            "original business operation was cancelled before dispatch"
+        );
+        if let (Some(notify), Some(captured)) = (self.business_relaunch.get(), captured) {
+            notify(captured)?;
+        }
+        Ok(())
     }
 }
 

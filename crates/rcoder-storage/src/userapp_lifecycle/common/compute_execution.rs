@@ -685,6 +685,120 @@ pub(super) async fn resume_stopped_restart(
     compute::current(tx, &identity).await
 }
 
+/// Archive bookkeeping cannot grant a new runtime write. The caller verifies
+/// the original physical stop/lease/volumes; this transaction retains its exact
+/// execution and current-head CAS before any restore may be dispatched.
+pub(super) async fn capture_stopped_builder_template(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &ComputeControlRecord,
+    source: &BuilderControlTarget,
+    template: &BuilderRestartTemplate,
+) -> Result<ComputeControlRecord, Error> {
+    repo::claim_app(tx, backend, &snapshot.app_id).await?;
+    let context = snapshot
+        .execution_context()
+        .map_err(|error| invalid(&error))?;
+    let original: BuilderControlTarget =
+        serde_json::from_value(snapshot.checkpoint.clone()).map_err(storage)?;
+    original.validate().map_err(Error::InvalidOperation)?;
+    source.validate().map_err(Error::InvalidOperation)?;
+    let old = original
+        .workload
+        .as_ref()
+        .ok_or_else(|| invalid("Original retained builder missing"))?;
+    let current = source
+        .workload
+        .as_ref()
+        .ok_or_else(|| invalid("Retained builder source missing"))?;
+    let volumes: Vec<AppResourceIdentity> = serde_json::from_value(
+        snapshot
+            .checkpoint
+            .get("builder_volumes")
+            .cloned()
+            .ok_or_else(|| invalid("Original builder volume witness missing"))?,
+    )
+    .map_err(storage)?;
+    if snapshot.scope != UserAppOperationScope::Dev
+        || snapshot.action != ComputeControlAction::Restart
+        || snapshot.stage != "stopped"
+        || !matches!(
+            snapshot.state,
+            ComputeControlState::Running | ComputeControlState::RecoveryRequired
+        )
+        || snapshot.lease.is_none()
+        || old.kind != AppResourceKind::Container
+        || old.kind != current.kind
+        || old.uid != current.uid
+        || old.name != current.name
+        || original.context != context
+        || source.context != context
+        || original.resource_binding != source.resource_binding
+        || original.restart_image != source.restart_image
+        || original.restart_runtime_workspace != source.restart_runtime_workspace
+        || original.builder_startup_mode != source.builder_startup_mode
+        || source.pod.is_some()
+        || template.source != *source
+        || template.archive.kind != AppResourceKind::File
+        || template.archive.name.is_empty()
+        || template.archive.uid.is_empty()
+        || volumes.is_empty()
+        || template.volumes != volumes
+    {
+        return Err(invalid("Invalid stopped builder archive capture witness"));
+    }
+    let identity = ComputeExecutorIdentity {
+        app_id: snapshot.app_id.clone(),
+        lifecycle_id: snapshot.lifecycle_id.clone(),
+        operation_id: snapshot.operation_id.clone(),
+        scope: snapshot.scope,
+        generation: snapshot.generation,
+        executor_id: context.executor_id,
+    };
+    if compute::current(tx, &identity).await? != *snapshot {
+        return Err(Error::VersionConflict);
+    }
+    drained(tx, snapshot).await?;
+    let revision = snapshot
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| invalid("Compute revision exhausted"))?;
+    let mut checkpoint = snapshot.checkpoint.clone();
+    let prior = checkpoint.get("builder_restart_template").cloned();
+    let object = checkpoint
+        .as_object_mut()
+        .ok_or_else(|| invalid("Builder checkpoint must be an object"))?;
+    // Historical reference values stay in the same private operation ledger.
+    // No old archive bytes are rewritten or deleted by this transaction.
+    let history = object
+        .entry("builder_restart_template_history")
+        .or_insert_with(|| serde_json::json!([]));
+    history
+        .as_array_mut()
+        .ok_or_else(|| invalid("Builder restart reference history must be an array"))?
+        .push(serde_json::json!({"was_present": prior.is_some(), "value": prior}));
+    object.insert(
+        "builder_restart_template".into(),
+        serde_json::to_value(template).map_err(storage)?,
+    );
+    for (key, value) in serde_json::to_value(source)
+        .map_err(storage)?
+        .as_object()
+        .ok_or_else(|| invalid("Builder source must be an object"))?
+    {
+        object.insert(key.clone(), value.clone());
+    }
+    let changed = toasty::sql::statement(repo::sql(backend,
+        "UPDATE userapp_compute_controls SET checkpoint_json=$4,revision=$3,updated_at_us=$5 WHERE operation_id=$1 AND revision=$2"))
+        .bind(&snapshot.operation_id).bind(snapshot.revision).bind(revision)
+        .bind(serde_json::to_string(&checkpoint).map_err(storage)?)
+        .bind(chrono::Utc::now().timestamp_micros()).exec(tx).await.map_err(storage)?;
+    if changed != 1 {
+        return Err(Error::VersionConflict);
+    }
+    compute::current(tx, &identity).await
+}
+
 pub(super) async fn resume_builder_restart(
     tx: &mut dyn Executor,
     backend: Backend,
@@ -773,6 +887,12 @@ pub(super) async fn resume_builder_restart(
     }
     if let Some(template) = snapshot.checkpoint.get("builder_restart_template") {
         checkpoint["builder_restart_template"] = template.clone();
+    }
+    if let Some(history) = snapshot.checkpoint.get("builder_restart_template_history") {
+        checkpoint["builder_restart_template_history"] = history.clone();
+    }
+    if let Some(mode) = snapshot.checkpoint.get("builder_startup_mode") {
+        checkpoint["builder_startup_mode"] = mode.clone();
     }
     let changed = toasty::sql::statement(repo::sql(backend,
         "UPDATE userapp_compute_controls SET state='running',stage='starting',checkpoint_json=$4,error_code=NULL,error_message=NULL,revision=$3 WHERE operation_id=$1 AND revision=$2"))

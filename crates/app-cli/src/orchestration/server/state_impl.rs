@@ -21,6 +21,7 @@ impl ServerState {
             supervision_probe_tx,
             supervision_probe_rx: tokio::sync::Mutex::new(supervision_probe_rx),
             current_runtime_operation: RwLock::new(None),
+            source_cancellation: source_cancellation::SourceCancellation::default(),
             business_generation: RwLock::new(None),
             native_control: std::sync::OnceLock::new(),
             admission: std::sync::Mutex::new(()),
@@ -65,6 +66,8 @@ impl ServerState {
             log_catalog_context: RwLock::new(None),
             deploy_inputs_eligible: std::sync::atomic::AtomicBool::new(true),
             business_relaunch: std::sync::OnceLock::new(),
+            business_relaunch_capture: std::sync::OnceLock::new(),
+            business_wake: std::sync::OnceLock::new(),
             business_recovery_active: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -519,8 +522,16 @@ impl ServerState {
     /// 统一 owner：注入业务重启通知（运行操作受理后触发会话重建）。
     pub(crate) fn set_business_relaunch(
         &self,
-        notify: impl Fn() + Send + Sync + 'static,
+        capture: impl Fn() -> Result<runtime_supervisor::BusinessStartPermit> + Send + Sync + 'static,
+        notify: impl Fn(&runtime_supervisor::BusinessStartPermit) -> Result<()> + Send + Sync + 'static,
+        wake: impl Fn() + Send + Sync + 'static,
     ) -> Result<()> {
+        self.business_wake
+            .set(Box::new(wake))
+            .map_err(|_| anyhow::anyhow!("business wake hook already installed"))?;
+        self.business_relaunch_capture
+            .set(Box::new(capture))
+            .map_err(|_| anyhow::anyhow!("business relaunch capture already installed"))?;
         self.business_relaunch
             .set(Box::new(notify))
             .map_err(|_| anyhow::anyhow!("business relaunch hook already installed"))

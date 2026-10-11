@@ -212,6 +212,7 @@ error.backend_error: "后端服务执行失败；请查看操作消息或服务�
 
 # UserApp 源码恢复诊断
 error.source_history.missing_artifact: "历史制品目录已不存在；请提交新的源码启动或明确部署请求。"
+error.source_history.derived_source_changed: "历史源码发布信息已变化；请使用当前工作区重新启动源码。"
 error.source_history.ambiguous_artifact: "历史制品目录无法唯一定位；新的源码请求仍可使用当前授权源码根。"
 error.source_history.generation_changed: "历史部署代次与当前管理实例不匹配；请提交新的源码启动或明确部署请求。"
 error.source_history.inconsistent_identity: "历史部署身份字段不一致；原记录已保留，请提交新的源码启动或明确部署请求。"

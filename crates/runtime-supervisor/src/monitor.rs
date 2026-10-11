@@ -80,7 +80,7 @@ pub struct Owner {
 }
 impl Owner {
     /// Canonical scope root this owner lock protects.
-    pub(crate) fn scope_root(&self) -> &Path {
+    pub fn scope_root(&self) -> &Path {
         &self.root
     }
     pub(crate) fn lease(&self) -> &process_utils::command_authority::OwnerLease {
@@ -300,22 +300,15 @@ impl Owner {
                 // A newer schema may add fields rejected by Discovery's strict
                 // decoder. Inspect readable identity/version before classifying
                 // the record as damaged, rather than erasing a valid new schema.
-                if let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    if let Some(version) = raw.get("version").and_then(serde_json::Value::as_u64) {
-                        ensure!(
-                            version == 1 || version == u64::from(control::CONTROL_VERSION),
-                            "unsupported supervisor receipt"
-                        );
-                    }
-                    if let Some(raw_binding) = raw.pointer("/snapshot/binding")
-                        && let Ok(recorded) =
-                            serde_json::from_value::<control::Binding>(raw_binding.clone())
-                    {
-                        ensure!(
-                            &recorded == binding || previous == Some(&recorded),
-                            "supervisor scope belongs to another resource"
-                        );
-                    }
+                if let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    && let Some(raw_binding) = raw.pointer("/snapshot/binding")
+                    && let Ok(recorded) =
+                        serde_json::from_value::<control::Binding>(raw_binding.clone())
+                {
+                    ensure!(
+                        &recorded == binding || previous == Some(&recorded),
+                        "supervisor scope belongs to another resource"
+                    );
                 }
                 preserve_discovery(&path, &bytes)?;
                 tracing::warn!(%error, "rebuilding damaged supervisor discovery under owner lock");
@@ -323,13 +316,17 @@ impl Owner {
             }
         };
         ensure!(
-            matches!(old.version, 1 | control::CONTROL_VERSION),
-            "unsupported supervisor receipt"
-        );
-        ensure!(
             &old.snapshot.binding == binding || previous == Some(&old.snapshot.binding),
             "supervisor scope belongs to another resource"
         );
+        if !matches!(old.version, 1 | control::CONTROL_VERSION) {
+            preserve_discovery(&path, &bytes)?;
+            tracing::warn!(
+                version = old.version,
+                "historical supervisor protocol preserved; rebuilding management under its actual owner lock"
+            );
+            return Ok((None, true));
+        }
         if &old.snapshot.binding != binding {
             preserve_discovery_as(&path, &bytes, "recovered")?;
         }
@@ -1175,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuilding_discovery_preserves_binding_version_and_io_errors() {
+    fn rebuilding_discovery_preserves_foreign_binding_and_io_errors_but_recovers_old_version() {
         let dir = tempfile::tempdir().unwrap();
         let owner = Owner::try_acquire(dir.path()).unwrap().unwrap();
         let binding = control::Binding {
@@ -1198,12 +1195,14 @@ mod tests {
         saved.snapshot.binding = binding.clone();
         saved.version = 999;
         record::save(&path, &saved).unwrap();
-        assert!(owner.load_discovery(&binding).is_err());
+        let (history, rebuilt) = owner.load_discovery(&binding).unwrap();
+        assert!(history.is_none() && rebuilt);
         assert_eq!(record::read::<Discovery>(&path).unwrap().version, 999);
         let mut future = serde_json::to_value(&saved).unwrap();
         future["new_protocol_field"] = true.into();
         record::save(&path, &future).unwrap();
-        assert!(owner.load_discovery(&binding).is_err());
+        let (history, rebuilt) = owner.load_discovery(&binding).unwrap();
+        assert!(history.is_none() && rebuilt);
         assert_eq!(record::read::<serde_json::Value>(&path).unwrap(), future);
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
@@ -1212,6 +1211,46 @@ mod tests {
             "I/O error is not corrupt JSON"
         );
         assert!(path.is_dir());
+    }
+
+    #[test]
+    fn old_protocol_discovery_cannot_hide_a_real_unsettled_generation_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let owner = Owner::try_acquire(&root).unwrap().unwrap();
+        let binding = control::Binding {
+            component: "test".into(),
+            resource: root.clone(),
+        };
+        let mut old = inactive_discovery(binding.clone());
+        old.version = 999;
+        record::save(&root.join("supervisor.json"), &old).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let work = root.join("work").join(&id);
+        std::fs::create_dir_all(&work).unwrap();
+        let value = Generation {
+            version: 1,
+            id,
+            supervisor: old.instance,
+            token: "fixture".into(),
+            intent: Intent::Run,
+            phase: GenerationPhase::Running,
+            worker_pid: Some(std::process::id()),
+            exit_code: None,
+            error: None,
+            physical_domain: None,
+            process_epoch: crate::epoch::current(),
+        };
+        record::save(&work.join("generation.json"), &value).unwrap();
+        let before = std::fs::read(work.join("generation.json")).unwrap();
+        let _actual_execution = record::lock(&work.join("generation.lock")).unwrap();
+        let (history, rebuilt) = owner.load_discovery(&binding).unwrap();
+        assert!(history.is_none() && rebuilt);
+        let error = record::reconcile_foreign(&root, &uuid::Uuid::new_v4().to_string())
+            .err()
+            .unwrap();
+        assert!(error.downcast_ref::<std::fs::TryLockError>().is_some());
+        assert_eq!(std::fs::read(work.join("generation.json")).unwrap(), before);
     }
 
     fn work_generation(scope: &Path, domain: Option<crate::domain::PhysicalDomain>) -> String {

@@ -3,6 +3,31 @@ use super::*;
 #[cfg(feature = "kubernetes")]
 #[async_trait]
 impl AgentContainerRuntime for KubernetesRuntime {
+    async fn get_bound_builder_file_credentials(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<shared_types::FileServerRequestCredentials> {
+        self.read_builder_file_credentials(target).await
+    }
+
+    async fn start_builder_control_with_options(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        options: &shared_types::BuilderStartOptions,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        if options.startup_mode != target.builder_startup_mode {
+            return Err(ContainerRuntimeError::Conflict(
+                "Builder startup intent differs from its checkpoint".into(),
+            ));
+        }
+        if let Some(template) = &options.restart_template {
+            self.start_builder_with_restart_template(target, template)
+                .await
+        } else {
+            self.start_builder_compute(target).await
+        }
+    }
+
     async fn acquire_builder_operation(
         &self,
         app_id: &str,
@@ -164,6 +189,15 @@ impl AgentContainerRuntime for KubernetesRuntime {
         self.start_builder_compute(target).await
     }
 
+    async fn start_builder_control_with_restart(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        template: &shared_types::BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        self.start_builder_with_restart_template(target, template)
+            .await
+    }
+
     async fn current_builder_image(&self) -> ContainerRuntimeResult<Option<String>> {
         Ok(Some(
             self.select_image(&ServiceType::UserappBuilder)
@@ -195,6 +229,13 @@ impl AgentContainerRuntime for KubernetesRuntime {
         target: &shared_types::BuilderControlTarget,
     ) -> ContainerRuntimeResult<bool> {
         self.reconcile_builder_stop_receipt(target).await
+    }
+
+    async fn observe_builder_compute_stopped(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        self.observe_retained_builder_stopped(target).await
     }
 
     fn supports_builder_compute_fencing(&self) -> bool {

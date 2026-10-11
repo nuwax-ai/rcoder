@@ -21,13 +21,19 @@ fn validate_input(
 ) -> Result<(), Error> {
     match (command, input) {
         (None, Some(input))
-            if kind == UserAppOperationKind::AdoptBuilder && fingerprint == input.digest() =>
+            if matches!(
+                kind,
+                UserAppOperationKind::AdoptBuilder | UserAppOperationKind::EnsureBuilder
+            ) && fingerprint == input.digest() =>
         {
             Ok(())
         }
         (None, _) if kind == UserAppOperationKind::AdoptBuilder => Err(Error::InvalidOperation(
             "Adoption requires its original input digest".into(),
         )),
+        (None, Some(_)) if kind == UserAppOperationKind::EnsureBuilder => Err(
+            Error::InvalidOperation("Builder creation requires its original input digest".into()),
+        ),
         (
             Some(
                 UserAppControlCommand::Create { input_digest }

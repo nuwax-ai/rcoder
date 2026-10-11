@@ -4,16 +4,21 @@ use crate::{
     UserAppOperationLeaseReceipt, UserAppOperationScope,
 };
 
-/// Admission's image policy is input, not a submitted runtime mutation.
+/// Admission's image/startup policies are inputs, not submitted runtime writes.
 /// Historical null checkpoints remain readable; unknown evidence is preserved.
 pub fn compute_unstarted_checkpoint(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Null => true,
         serde_json::Value::Object(fields) => {
-            fields.len() == 1
+            fields
+                .keys()
+                .all(|key| matches!(key.as_str(), "restart_image_roll" | "builder_startup_mode"))
                 && fields
                     .get("restart_image_roll")
                     .is_some_and(serde_json::Value::is_boolean)
+                && fields.get("builder_startup_mode").is_none_or(|mode| {
+                    serde_json::from_value::<crate::BuilderStartupMode>(mode.clone()).is_ok()
+                })
         }
         _ => false,
     }
@@ -67,11 +72,13 @@ pub enum ComputeLeaseInspection {
 mod tests {
     use super::*;
     #[test]
-    fn initial_checkpoint_accepts_only_legacy_null_or_image_policy() {
+    fn initial_checkpoint_accepts_only_known_unstarted_policy_inputs() {
         for value in [
             serde_json::Value::Null,
             serde_json::json!({"restart_image_roll":true}),
             serde_json::json!({"restart_image_roll":false}),
+            serde_json::json!({"restart_image_roll":false,"builder_startup_mode":"management_only"}),
+            serde_json::json!({"restart_image_roll":true,"builder_startup_mode":"preserve_business_intent"}),
         ] {
             assert!(compute_unstarted_checkpoint(&value));
         }
@@ -79,6 +86,8 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({"restart_image_roll":"true"}),
             serde_json::json!({"restart_image_roll":true,"target":"unknown"}),
+            serde_json::json!({"restart_image_roll":true,"builder_startup_mode":"unknown"}),
+            serde_json::json!({"restart_image_roll":true,"builder_startup_mode":"management_only","unknown_write":true}),
         ] {
             assert!(!compute_unstarted_checkpoint(&value));
         }

@@ -218,8 +218,18 @@ mod cases {
             );
             assert_eq!(
                 kernel.commit_execution("a").await.unwrap(),
-                CommitBarrierOutcome::Committed
+                if kind == RuntimeOperationKind::Restart {
+                    CommitBarrierOutcome::Cancelled
+                } else {
+                    CommitBarrierOutcome::Committed
+                }
             );
+            if kind == RuntimeOperationKind::Restart {
+                kernel
+                    .finish("a", RuntimeOperationState::Cancelled, None, None, 2)
+                    .await
+                    .unwrap();
+            }
             assert_eq!(
                 kernel.admission.lock().await.active_operation_id.as_deref(),
                 Some("b")
@@ -234,25 +244,26 @@ mod cases {
                 assert_eq!(pg.password, "probe-secret");
             }
             if kind == RuntimeOperationKind::Restart {
-                // recovery v3 R5：Restart 物理执行期间，不同 Start 在持久化
-                // 前返回 Busy（附执行中操作身份）——不再内部排队；"b" 到达
-                // 终态后 "c" 正常受理。
-                let rejection = kernel
+                // 最新 Source 进入唯一接替槽；旧请求实际清理终态前不派发。
+                kernel
                     .admit(request(RuntimeOperationKind::Start, "c"))
                     .await
-                    .unwrap_err();
-                assert_eq!(rejection.code, "ERR_OPERATION_IN_PROGRESS");
-                assert_eq!(rejection.active_operation_id.as_deref(), Some("b"));
-                assert!(
-                    !kernel.store.operation_path("c").exists(),
-                    "Busy 拒绝不得持久化新操作"
+                    .unwrap();
+                assert_eq!(
+                    kernel
+                        .status()
+                        .await
+                        .unwrap()
+                        .active_operation_id
+                        .as_deref(),
+                    Some("b")
                 );
                 assert_eq!(
                     kernel.commit_execution("b").await.unwrap(),
-                    CommitBarrierOutcome::Committed
+                    CommitBarrierOutcome::Cancelled
                 );
                 kernel
-                    .admit(request(RuntimeOperationKind::Start, "c"))
+                    .finish("b", RuntimeOperationState::Cancelled, None, None, 2)
                     .await
                     .unwrap();
                 assert_eq!(
@@ -280,7 +291,11 @@ mod cases {
             }
             assert_eq!(
                 kernel.get("b").await.unwrap().unwrap().state,
-                RuntimeOperationState::Succeeded
+                if kind == RuntimeOperationKind::Restart {
+                    RuntimeOperationState::Cancelled
+                } else {
+                    RuntimeOperationState::Succeeded
+                }
             );
         }
     }
@@ -627,7 +642,15 @@ mod cases {
             let guard = kernel.admission.lock().await;
             if terminal == RuntimeOperationState::RecoveryRequired {
                 assert!(guard.recovery_protection);
-                assert_eq!(captured.lock().unwrap().len(), 1);
+                assert_eq!(
+                    captured
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|action| matches!(action, DispatchAction::OrchestrateSource { .. }))
+                        .count(),
+                    1
+                );
                 assert_eq!(
                     kernel
                         .store
@@ -641,7 +664,15 @@ mod cases {
             } else {
                 assert_eq!(guard.active_operation_id.as_deref(), Some("b"));
                 assert!(guard.pending_restart.is_none());
-                assert_eq!(captured.lock().unwrap().len(), 2);
+                assert_eq!(
+                    captured
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|action| matches!(action, DispatchAction::OrchestrateSource { .. }))
+                        .count(),
+                    2
+                );
             }
         }
     }
@@ -665,21 +696,16 @@ mod cases {
                 .admit(request(RuntimeOperationKind::Stop, "stop"))
                 .await
                 .unwrap();
-            // 恢复 v3 R5：Stop 屏障期间的不同 Start 在持久化前 Busy；
-            // 同请求重试不受影响；屏障经 finish 到终态后新 Start 受理。
+            // Source 可受理，但 Stop 的真实终态边界仍在派发之前。
             let mut during = request(RuntimeOperationKind::Start, "start");
             during.expected_revision = 1;
-            let rejection = kernel.admit(during).await.unwrap_err();
-            assert_eq!(rejection.code, "ERR_OPERATION_IN_PROGRESS");
-            assert!(rejection.active_operation_id.is_some());
-            assert!(!kernel.store.operation_path("start").exists());
+            kernel.admit(during).await.unwrap();
+            assert_eq!(captured.lock().unwrap().len(), 1);
+            assert!(!kernel.is_cancelled("stop"));
             kernel
                 .finish("stop", stop_result, None, None, 2)
                 .await
                 .unwrap();
-            let mut start = request(RuntimeOperationKind::Start, "start");
-            start.expected_revision = 1;
-            kernel.admit(start).await.unwrap();
             // Stop 的 StopBusiness 派发 + Start 的 OrchestrateSource 派发。
             assert_eq!(captured.lock().unwrap().len(), 2);
             assert_eq!(
@@ -784,22 +810,16 @@ mod cases {
             .finish("op-a", RuntimeOperationState::Failed, None, None, 2)
             .await
             .unwrap();
-        // recovery v3 R5：op-b（Restart）执行期间的不同 Start 返回 Busy。
-        let rejection = kernel
+        kernel
             .admit(request(RuntimeOperationKind::Start, "op-c"))
             .await
-            .unwrap_err();
-        assert_eq!(rejection.code, "ERR_OPERATION_IN_PROGRESS");
+            .unwrap();
         kernel
             .finish("op-a", RuntimeOperationState::Succeeded, None, None, 3)
             .await
             .unwrap();
         kernel
-            .finish("op-b", RuntimeOperationState::Succeeded, None, None, 2)
-            .await
-            .unwrap();
-        kernel
-            .admit(request(RuntimeOperationKind::Start, "op-c"))
+            .finish("op-b", RuntimeOperationState::Cancelled, None, None, 2)
             .await
             .unwrap();
         assert_eq!(
@@ -1519,6 +1539,7 @@ mod cases {
         )
         .expect("legacy desired");
         let store = open_store(&workspace);
+        store.reconcile_legacy_after_quiescence().unwrap();
         // 运行记录迁移到新位置；保留旧锁文件与守卫，避免迁移期间锁域分裂。
         assert!(!workspace.join(STATE_DIR_NAME).join("desired.json").exists());
         assert!(workspace.join(STATE_DIR_NAME).join("owner.lock").exists());
@@ -1542,6 +1563,7 @@ mod cases {
         )
         .expect("bare desired");
         let store = open_store(&workspace);
+        store.reconcile_legacy_after_quiescence().unwrap();
         assert_eq!(
             store.load_desired().expect("desired"),
             (DesiredState::Running, 2)
@@ -1570,6 +1592,7 @@ mod cases {
         let _owner = crate::platform::owner_guard::OwnerGuard::acquire(&root).unwrap();
         std::fs::write(root.join(".deploy-coordinator.json"), "journal-bootstrap").unwrap();
         let store = RuntimeStore::open_with_root(root.clone(), &workspace).unwrap();
+        store.reconcile_legacy_after_quiescence().unwrap();
         assert_eq!(store.load_desired().unwrap(), (DesiredState::Stopped, 7));
         assert_eq!(
             std::fs::read_to_string(root.join("token")).unwrap(),
@@ -1604,16 +1627,28 @@ mod cases {
         let root = app_state_root(&workspace);
         let _owner = crate::platform::owner_guard::OwnerGuard::acquire(&root).unwrap();
         std::fs::write(root.join("token"), "current-token").unwrap();
-        assert!(RuntimeStore::open_with_root(root.clone(), &workspace).is_err());
+        let store = RuntimeStore::open_with_root(root.clone(), &workspace).unwrap();
+        assert!(
+            legacy.join("desired.json").exists(),
+            "opening never moves historical state before quiescence"
+        );
+        store.reconcile_legacy_after_quiescence().unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("token")).unwrap(),
             "current-token"
         );
-        assert!(legacy.join("desired.json").exists());
+        assert!(!legacy.join("desired.json").exists());
+        assert!(std::fs::read_dir(&legacy).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".runtime-history-")
+        }));
     }
 
     #[tokio::test]
-    async fn dual_authority_domains_fail_closed() {
+    async fn dual_authority_domains_converge_after_quiescence_with_all_locks_retained() {
         let dir = tempfile::tempdir().expect("dir");
         let workspace = dir.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace");
@@ -1626,11 +1661,16 @@ mod cases {
         .expect("legacy marker");
         let root = app_state_root(&workspace);
         std::fs::create_dir_all(root.join("operations")).expect("new root");
-        let error = RuntimeStore::open_with_root(root, &workspace)
-            .err()
-            .expect("must refuse");
-        assert!(error.to_string().contains("authority domains"));
-        // 多处 legacy 并存（in-workspace + bare 卷根）同样拒绝裁决
+        let store = RuntimeStore::open_with_root(root, &workspace).unwrap();
+        assert!(legacy.join("desired.json").exists());
+        assert!(
+            crate::platform::owner_guard::OwnerGuard::try_acquire(&legacy)
+                .unwrap()
+                .is_none()
+        );
+        store.reconcile_legacy_after_quiescence().unwrap();
+        assert_eq!(store.load_desired().unwrap(), (DesiredState::Stopped, 1));
+        // 两个旧域真实锁均释放，历史冲突不能阻断新的明确Source意图。
         let dir2 = tempfile::tempdir().expect("dir2");
         let workspace2 = dir2.path().join("workspace");
         std::fs::create_dir_all(&workspace2).expect("workspace");
@@ -1649,10 +1689,23 @@ mod cases {
         )
         .expect("legacy bare marker");
         let root2 = app_state_root(&workspace2);
-        let error2 = RuntimeStore::open_with_root(root2, &workspace2)
-            .err()
-            .expect("must refuse");
-        assert!(error2.to_string().contains("legacy"));
+        let store2 = RuntimeStore::open_with_root(root2, &workspace2).unwrap();
+        for legacy in [&legacy_ws, &legacy_bare] {
+            assert!(
+                crate::platform::owner_guard::OwnerGuard::try_acquire(legacy)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(legacy.join("desired.json").exists());
+        }
+        store2.reconcile_legacy_after_quiescence().unwrap();
+        assert_eq!(
+            store2.load_desired().unwrap(),
+            (DesiredState::Stopped, 0),
+            "ambiguous old intent cannot automatically run business"
+        );
+        store2.store_desired(DesiredState::Running, 0).unwrap();
+        assert_eq!(store2.load_desired().unwrap(), (DesiredState::Running, 0));
     }
 
     // ── R03：真实取消墓碑；未实现 profile 组合结构化拒绝 ────────────────────────
@@ -1827,11 +1880,8 @@ mod cases {
     }
 
     #[tokio::test]
-    async fn partial_admission_holds_operation_and_protection() {
+    async fn unreadable_desired_rejects_before_operation_admission() {
         let (dir, _keep) = temp_store();
-        let _workspace = dir.path().join("workspace");
-        // 先正常打开一次 kernel 并受理一个操作，让 desired.json 存在；
-        // 然后把 desired.json 变为不可写目录，模拟后续 desired 写失败。
         {
             let kernel = kernel(dir.path());
             kernel
@@ -1847,11 +1897,50 @@ mod cases {
         std::fs::remove_file(&desired).expect("remove desired");
         std::fs::create_dir(&desired).expect("block desired writes");
 
-        let kernel = kernel(dir.path());
+        let dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = dispatches.clone();
+        let kernel = RuntimeKernel::new(
+            open_store(&dir.path().join("workspace")),
+            identity(),
+            Box::new(move |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }),
+        );
+        let rejection = kernel
+            .admit(request(RuntimeOperationKind::Start, "op-read-error"))
+            .await
+            .expect_err("desired read fails before Accepted is persisted");
+        assert_eq!(rejection.code, "ERR_BACKEND_ERROR");
+        assert!(kernel.get("op-read-error").await.unwrap().is_none());
+        assert_eq!(dispatches.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(desired.is_dir(), "the original unreadable path is retained");
+    }
+
+    #[tokio::test]
+    async fn partial_admission_holds_operation_and_protection() {
+        let (dir, _keep) = temp_store();
+        let dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = dispatches.clone();
+        let kernel = RuntimeKernel::new(
+            open_store(&dir.path().join("workspace")),
+            identity(),
+            Box::new(move |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }),
+        );
+        kernel
+            .store
+            .store_desired(DesiredState::Stopped, 0)
+            .unwrap();
+        let desired_before = std::fs::read(kernel.store.desired_path()).unwrap();
+        kernel
+            .store
+            .desired_write_fault
+            .store(true, std::sync::atomic::Ordering::Release);
         let rejection = kernel
             .admit(request(RuntimeOperationKind::Start, "op-partial"))
             .await
-            .expect_err("desired write fails");
+            .expect_err("final desired write fails after durable Accepted");
         assert_eq!(rejection.code, ERR_RECOVERY_REQUIRED);
         assert!(rejection.message.contains("held for recovery"));
         // 部分提交的操作转 RecoveryRequired（可查询，不再派发）
@@ -1861,6 +1950,16 @@ mod cases {
             .expect("query")
             .expect("present");
         assert_eq!(held.state, RuntimeOperationState::RecoveryRequired);
+        let persisted = kernel.store.load_operation("op-partial").unwrap().unwrap();
+        assert_eq!(
+            persisted.view.state,
+            RuntimeOperationState::RecoveryRequired
+        );
+        assert_eq!(
+            std::fs::read(kernel.store.desired_path()).unwrap(),
+            desired_before
+        );
+        assert_eq!(dispatches.load(std::sync::atomic::Ordering::Relaxed), 0);
         // 后续写被拒
         let blocked = kernel
             .admit(request(RuntimeOperationKind::Start, "op-next"))
@@ -2202,12 +2301,20 @@ mod cases {
             Some("op-queued")
         );
         let actions = actions.lock().unwrap();
-        assert_eq!(actions.len(), 2);
+        let sources: Vec<_> = actions
+            .iter()
+            .filter(|action| matches!(action, DispatchAction::OrchestrateSource { .. }))
+            .collect();
+        assert_eq!(
+            sources.len(),
+            2,
+            "cancellation notification is not business dispatch"
+        );
         let DispatchAction::OrchestrateSource {
             operation_id,
             pg: Some(pg),
             ..
-        } = &actions[1]
+        } = sources[1]
         else {
             panic!("queued original input was not dispatched");
         };
@@ -2354,6 +2461,223 @@ mod cases {
         assert_eq!(
             kernel.status().await.expect("status").active_operation_id,
             Some("op-next".to_string())
+        );
+    }
+    #[tokio::test]
+    async fn latest_source_cancels_old_execution_and_only_latest_pending_is_promoted() {
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "source-old"))
+            .await
+            .unwrap();
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "source-middle"))
+            .await
+            .unwrap();
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "source-latest"))
+            .await
+            .unwrap();
+        assert!(kernel.is_cancelled("source-old"));
+        assert_eq!(
+            kernel.commit_execution("source-old").await.unwrap(),
+            CommitBarrierOutcome::Cancelled
+        );
+        assert_eq!(
+            kernel.get("source-middle").await.unwrap().unwrap().state,
+            RuntimeOperationState::Cancelled
+        );
+        assert_eq!(
+            kernel
+                .status()
+                .await
+                .unwrap()
+                .active_operation_id
+                .as_deref(),
+            Some("source-old")
+        );
+        // Confirmation of actual old cleanup is the execution driver's boundary.
+        kernel
+            .finish(
+                "source-old",
+                RuntimeOperationState::Cancelled,
+                None,
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            kernel
+                .status()
+                .await
+                .unwrap()
+                .active_operation_id
+                .as_deref(),
+            Some("source-latest")
+        );
+        assert_eq!(
+            kernel.commit_execution("source-old").await.unwrap(),
+            CommitBarrierOutcome::NotActive
+        );
+        assert_eq!(
+            kernel.commit_execution("source-latest").await.unwrap(),
+            CommitBarrierOutcome::Committed
+        );
+        assert_eq!(
+            kernel.get("source-old").await.unwrap().unwrap().state,
+            RuntimeOperationState::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_source_notification_targets_original_child_without_replacing_stop() {
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<DispatchAction>>> = Default::default();
+        let sink = captured.clone();
+        let (dir, _keep) = temp_store();
+        let kernel = RuntimeKernel::new(
+            open_store(&dir.path().join("workspace")),
+            identity(),
+            Box::new(move |action| {
+                sink.lock().unwrap().push(action);
+            }),
+        );
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "executing-source"))
+            .await
+            .unwrap();
+        kernel
+            .admit(request(RuntimeOperationKind::Stop, "original-stop"))
+            .await
+            .unwrap();
+        let mut latest = request(RuntimeOperationKind::Start, "latest-source");
+        latest.expected_revision = 1;
+        kernel.admit(latest).await.unwrap();
+        {
+            let actions = captured.lock().unwrap();
+            let notifications: Vec<_> = actions
+                .iter()
+                .filter_map(|action| match action {
+                    DispatchAction::CancelSource { operation_id } => Some(operation_id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(notifications, ["executing-source"]);
+            assert!(!actions.iter().any(|action| matches!(action, DispatchAction::OrchestrateSource { operation_id, .. } if operation_id == "latest-source")));
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|action| matches!(action, DispatchAction::StopBusiness { .. }))
+                    .count(),
+                1
+            );
+        }
+        assert!(!kernel.is_cancelled("original-stop"));
+        assert_eq!(
+            kernel.get("original-stop").await.unwrap().unwrap().state,
+            RuntimeOperationState::Accepted
+        );
+        kernel
+            .finish(
+                "executing-source",
+                RuntimeOperationState::Cancelled,
+                None,
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            kernel
+                .status()
+                .await
+                .unwrap()
+                .active_operation_id
+                .as_deref(),
+            Some("latest-source")
+        );
+        kernel
+            .finish(
+                "original-stop",
+                RuntimeOperationState::Succeeded,
+                None,
+                None,
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            kernel
+                .status()
+                .await
+                .unwrap()
+                .active_operation_id
+                .as_deref(),
+            Some("latest-source")
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_source_during_stop_waits_for_the_real_stop_terminal_boundary() {
+        let (dir, _keep) = temp_store();
+        let kernel = kernel(dir.path());
+        kernel
+            .admit(request(RuntimeOperationKind::Start, "source-running"))
+            .await
+            .unwrap();
+        kernel
+            .admit(request(RuntimeOperationKind::Stop, "stop-original"))
+            .await
+            .unwrap();
+        let mut next = request(RuntimeOperationKind::Start, "source-after-stop");
+        next.expected_revision = 1;
+        assert!(matches!(
+            kernel.admit(next).await.unwrap(),
+            AdmissionOutcome::Accepted(_)
+        ));
+        assert!(!kernel.is_cancelled("stop-original"));
+        kernel
+            .finish(
+                "source-running",
+                RuntimeOperationState::Cancelled,
+                None,
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            kernel
+                .status()
+                .await
+                .unwrap()
+                .active_operation_id
+                .as_deref(),
+            Some("source-after-stop")
+        );
+        kernel
+            .finish(
+                "stop-original",
+                RuntimeOperationState::Succeeded,
+                None,
+                None,
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            kernel
+                .status()
+                .await
+                .unwrap()
+                .active_operation_id
+                .as_deref(),
+            Some("source-after-stop")
+        );
+        assert_eq!(
+            kernel.commit_execution("source-after-stop").await.unwrap(),
+            CommitBarrierOutcome::Committed
         );
     }
 }

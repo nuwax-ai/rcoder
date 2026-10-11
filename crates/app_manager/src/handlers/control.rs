@@ -422,6 +422,7 @@ mod builder_retry_tests {
                         registration_predecessor: None,
                         creation_lease_released: true,
                         target: shared_types::BuilderControlTarget {
+                            builder_startup_mode: Default::default(),
                             context: context.clone(),
                             resource_binding: None,
                             pod: None,

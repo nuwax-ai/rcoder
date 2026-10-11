@@ -6,6 +6,7 @@ fn request(
     action: ComputeControlAction,
 ) -> ComputeControlRequest {
     ComputeControlRequest {
+        builder_startup_mode: Default::default(),
         app_id: app.app_id.clone(),
         lifecycle_id: app.lifecycle_id.clone(),
         scope: UserAppOperationScope::Dev,
@@ -1261,6 +1262,7 @@ async fn stopped_restart_replacement_uid_requires_witness_and_single_cas_winner(
         let mut new = old.clone();
         new.resource.uid = "newphysical".into();
         let builder = BuilderControlTarget {
+            builder_startup_mode: Default::default(),
             context,
             resource_binding: None,
             workload: Some(resource),

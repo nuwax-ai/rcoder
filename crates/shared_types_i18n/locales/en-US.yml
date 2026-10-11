@@ -212,6 +212,7 @@ error.backend_error: "Backend service failed; see the operation message or servi
 
 # UserApp source recovery diagnostics (CLI/log default; HTTP selects locale)
 error.source_history.missing_artifact: "The previous artifact directory is missing; submit a new source start or an explicit deployment request."
+error.source_history.derived_source_changed: "The previous source release metadata has changed; submit a new source start using the current workspace."
 error.source_history.ambiguous_artifact: "The previous artifact directory cannot be identified uniquely; a new source request can use the currently authorized source root."
 error.source_history.generation_changed: "The previous deployment generation does not match the current owner; submit a new source start or an explicit deployment request."
 error.source_history.inconsistent_identity: "The previous deployment identity fields are inconsistent; the original record is preserved. Submit a new source start or an explicit deployment request."

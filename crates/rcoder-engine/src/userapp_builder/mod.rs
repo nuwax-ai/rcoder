@@ -32,11 +32,19 @@ impl std::fmt::Display for BuilderEnsureSuperseded {
 }
 
 impl std::error::Error for BuilderEnsureSuperseded {}
+mod access;
 pub(crate) mod auto_repair;
 pub mod compute_control;
 mod compute_drain_recovery;
 pub mod control;
 mod creation;
+pub(crate) use access::BuilderAccessIntent;
+#[cfg(test)]
+pub(crate) use access::tests::{
+    fixture as builder_access_test_state, stopped as builder_stop_fixture,
+};
+#[cfg(test)]
+pub(crate) use creation::fence_settler_tests::runtime_state as builder_runtime_test_state;
 mod dev_cleanup;
 mod dev_locator;
 mod lifecycle;
@@ -124,7 +132,7 @@ pub async fn ensure_userapp_builder(state: &AppState, app_id: &str) -> Result<Co
         + std::time::Duration::from_secs(state.config.userapp_storage.ensure_timeout_seconds);
     within_builder_deadline(
         deadline,
-        ensure_builder_target_until(state, app_id, deadline, true),
+        ensure_builder_target_until(state, app_id, deadline, BuilderAccessIntent::Management),
     )
     .await
 }
@@ -133,10 +141,11 @@ pub(crate) async fn ensure_userapp_builder_until(
     state: &AppState,
     app_id: &str,
     deadline: tokio::time::Instant,
+    intent: BuilderAccessIntent,
 ) -> Result<ContainerBasicInfo> {
     // deadline 包裹由调用方负责（ensure_userapp_builder 包装/upstream 自带
     // timeout_at）——此处只透传，保持既有错误形态。
-    ensure_builder_target_until(state, app_id, deadline, false).await
+    ensure_builder_target_until(state, app_id, deadline, intent).await
 }
 
 /// ensure 体：应用共享模型——builder identifier == 纯 app_id，恒走
@@ -145,19 +154,24 @@ async fn ensure_builder_target_until(
     state: &AppState,
     app_id: &str,
     deadline: tokio::time::Instant,
-    explicit_start: bool,
+    intent: BuilderAccessIntent,
 ) -> Result<ContainerBasicInfo> {
     let recovered = adoption::discover_missing_identity(state, app_id).await?;
+    let identity = match recovered {
+        Some(identity) => identity,
+        None => state.userapp_store.ensure_identity(app_id).await?,
+    };
     state
         .app_service
         .verify_recovered_storage(app_id, shared_types::UserAppOperationScope::Dev)
         .await?;
+    let recreate_stopped = access::prepare(state, &identity, intent, deadline).await?;
     state
         .userapp_store
         .check_compute_access(
             app_id,
             shared_types::UserAppOperationScope::Dev,
-            explicit_start,
+            recreate_stopped,
         )
         .await?;
     let instance = app_id;
@@ -177,10 +191,11 @@ async fn ensure_builder_target_until(
             shared_types::USERAPP_APP_ID_MAX_LEN
         ));
     }
-    let identity = match recovered {
-        Some(identity) => identity,
-        None => state.userapp_store.ensure_identity(app_id).await?,
-    };
+    let identity = state
+        .userapp_store
+        .get_application(app_id)
+        .await?
+        .ok_or(shared_types::UserAppStoreError::NotFound)?;
     if let Some(repair) = auto_repair::repair_if_needed(state, app_id, None).await? {
         return Err(anyhow!(
             "Published builder address unavailable; automatic repair operation={} state={:?}",
@@ -194,7 +209,15 @@ async fn ensure_builder_target_until(
     {
         return Ok(verified);
     }
-    creation::ensure(state, app_id, instance, _lifecycle, deadline).await
+    creation::ensure(
+        state,
+        app_id,
+        instance,
+        _lifecycle,
+        deadline,
+        intent.startup_mode(),
+    )
+    .await
 }
 
 /// 当前操作是否围栏 builder：dev 槽（Ensure/Adopt/Stop/Restart/DestroyDev/
@@ -231,13 +254,23 @@ async fn ensure_userapp_builder_probed_until(
     deadline: tokio::time::Instant,
 ) -> Result<(ContainerBasicInfo, bool)> {
     let recovered = adoption::discover_missing_identity(state, app_id).await?;
+    let identity = match recovered {
+        Some(identity) => identity,
+        None => state.userapp_store.ensure_identity(app_id).await?,
+    };
     state
         .app_service
         .verify_recovered_storage(app_id, shared_types::UserAppOperationScope::Dev)
         .await?;
+    let recreate_stopped =
+        access::prepare(state, &identity, BuilderAccessIntent::Management, deadline).await?;
     state
         .userapp_store
-        .check_compute_access(app_id, shared_types::UserAppOperationScope::Dev, false)
+        .check_compute_access(
+            app_id,
+            shared_types::UserAppOperationScope::Dev,
+            recreate_stopped,
+        )
         .await?;
     let instance = app_id;
     let _lifecycle = lifecycle::acquire(instance).await;
@@ -251,10 +284,11 @@ async fn ensure_userapp_builder_probed_until(
             shared_types::USERAPP_APP_ID_MAX_LEN
         ));
     }
-    let identity = match recovered {
-        Some(identity) => identity,
-        None => state.userapp_store.ensure_identity(app_id).await?,
-    };
+    let identity = state
+        .userapp_store
+        .get_application(app_id)
+        .await?
+        .ok_or(shared_types::UserAppStoreError::NotFound)?;
     if let Some(repair) = auto_repair::repair_if_needed(state, app_id, None).await? {
         return Err(anyhow!(
             "Published builder address unavailable; automatic repair operation={} state={:?}",
@@ -273,7 +307,15 @@ async fn ensure_userapp_builder_probed_until(
         deadline: tokio::time::Instant,
         lease: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<ContainerBasicInfo> {
-        creation::ensure(state, app_id, instance, lease, deadline).await
+        creation::ensure(
+            state,
+            app_id,
+            instance,
+            lease,
+            deadline,
+            shared_types::BuilderStartupMode::ManagementOnly,
+        )
+        .await
     }
 
     if !fenced && let Some(info) = registered_or_discovered_builder(state, instance).await? {
@@ -749,6 +791,7 @@ async fn create_builder_inner(
     app_id: &str,
     instance: &str,
     execution_context: shared_types::UserAppExecutionContext,
+    startup_mode: shared_types::BuilderStartupMode,
 ) -> Result<ContainerBasicInfo> {
     let bound_target = adoption::capture_bound_target(state, &execution_context).await?;
     state
@@ -766,6 +809,7 @@ async fn create_builder_inner(
         .build();
 
     params.resource_binding = bound_target.resource_binding;
+    params.builder_startup_mode = startup_mode;
 
     let cancelled = params.creation_cancelled.clone();
     let creation = state.runtime().create_container(params);

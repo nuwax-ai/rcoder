@@ -1,9 +1,18 @@
 use super::*;
 
+#[cfg(test)]
+#[path = "store_recovery_tests.rs"]
+mod recovery_tests;
+
 pub struct RuntimeStore {
     pub(super) root: PathBuf,
     // Keep the legacy lock domain fenced while the migrated owner is alive.
-    _legacy_owner: Option<crate::platform::owner_guard::OwnerGuard>,
+    _legacy_owners: Vec<runtime_supervisor::Owner>,
+    legacy_bindings: Vec<runtime_supervisor::Binding>,
+    legacy_roots: std::sync::Mutex<Vec<PathBuf>>,
+    legacy_desired: Option<(DesiredState, u64)>,
+    #[cfg(test)]
+    pub(super) desired_write_fault: std::sync::atomic::AtomicBool,
 }
 
 /// 扫描结果（R04）：读取/解码失败不再静默跳过——损坏记录**隔离**进
@@ -106,6 +115,38 @@ impl RuntimeStore {
     /// - `{workspace 卷根}/.app-cli-state`（R02–R08 的 bare 卷根布局——
     ///   本轮加入 application_id 段后成为 legacy）
     pub(crate) fn open_with_root(root: PathBuf, workspace: &Path) -> Result<Self> {
+        let authorities = Self::discover_legacy_authorities(&root, workspace)?;
+        let (existing_legacy, legacy_bindings): (Vec<_>, Vec<_>) = authorities.into_iter().unzip();
+        // Acquire every actual legacy authority before interpreting any of its
+        // ordinary records. Mere coexistence/mtime is not a live second owner.
+        let mut legacy_owners = Vec::new();
+        for legacy in &existing_legacy {
+            let guard = runtime_supervisor::Owner::try_acquire(legacy)?
+                .context("legacy runtime owner still owns its execution scope")?;
+            legacy_owners.push(guard);
+        }
+        // Expose an unambiguous old desired revision while management assembles,
+        // so early Stop/new intent cannot be superseded by the later migration.
+        let legacy_desired = legacy_desired_base(&existing_legacy)?;
+        std::fs::create_dir_all(root.join("operations")).context("create runtime state dir")?;
+        std::fs::create_dir_all(root.join("events")).context("create runtime events dir")?;
+        Ok(Self {
+            root,
+            _legacy_owners: legacy_owners,
+            legacy_bindings,
+            legacy_roots: std::sync::Mutex::new(existing_legacy),
+            legacy_desired,
+            #[cfg(test)]
+            desired_write_fault: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Shared, read-only scope selection for preparation and retained leases.
+    /// Caller still authenticates any live native owner before its Shutdown.
+    pub(crate) fn discover_legacy_authorities(
+        root: &Path,
+        workspace: &Path,
+    ) -> Result<Vec<(PathBuf, runtime_supervisor::Binding)>> {
         let project = runtime_state_layout::canonical_project_root(workspace);
         let volume = project
             .parent()
@@ -115,78 +156,115 @@ impl RuntimeStore {
             project.join(STATE_DIR_NAME),
             volume.join(STATE_DIR_NAME),
         ];
-        let root_identity = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let root_identity = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         let mut checked = std::collections::BTreeSet::new();
-        let mut existing_legacy: Option<PathBuf> = None;
+        let mut existing_legacy = Vec::new();
+        let mut legacy_bindings = Vec::new();
         for legacy in legacy_locations {
             let physical = std::fs::canonicalize(&legacy).unwrap_or_else(|_| legacy.clone());
             if physical == root_identity
                 || !checked.insert(physical)
-                || !is_legacy_state_domain(&legacy)?
+                || !(is_legacy_state_domain(&legacy)?
+                    || legacy.join("supervisor.json").try_exists()?
+                    || legacy.join("work").try_exists()?
+                    || legacy.join("resident").try_exists()?)
             {
                 continue;
             }
-            anyhow::ensure!(
-                existing_legacy.is_none(),
-                "multiple legacy runtime state locations exist; resolve explicitly before starting"
-            );
-            existing_legacy = Some(legacy);
-        }
-        let mut legacy_owner = None;
-        if let Some(legacy) = existing_legacy {
-            // OwnerGuard has normally already created root/owner.lock. Those
-            // bootstrap files are not persisted runtime authority. Never ignore
-            // existing desired/identity/operations/events/token/endpoint data.
-            anyhow::ensure!(
-                !is_legacy_state_domain(&root)?,
-                "runtime state exists at stable and legacy roots (two authority domains); resolve explicitly before starting"
-            );
-            let guard = crate::platform::owner_guard::OwnerGuard::acquire(&legacy)
-                .context("legacy runtime owner prevents state migration")?;
-            std::fs::create_dir_all(&root).context("create migrated runtime root")?;
-            // Preflight every destination before the first rename. Move only
-            // runtime-owned entries, not sibling registries, journal locks or
-            // another project's directory under a legacy bare root.
-            let entries: Vec<_> = RUNTIME_STATE_ENTRIES
-                .iter()
-                .map(|name| (legacy.join(name), root.join(name)))
-                .filter_map(|(source, target)| match root_exists(&source) {
-                    Ok(true) => Some(Ok((source, target))),
-                    Ok(false) => None,
-                    Err(error) => Some(Err(error)),
-                })
-                .collect::<Result<_>>()?;
-            for (_, target) in &entries {
-                anyhow::ensure!(
-                    !root_exists(target)?,
-                    "runtime migration would overwrite existing persisted state"
-                );
+            if !legacy_belongs_to_project(&legacy, &project)? {
+                tracing::warn!(root = %legacy.display(), "foreign legacy application/project retained without importing its records");
+                continue;
             }
-            for (source, target) in entries {
-                std::fs::rename(&source, &target).with_context(|| {
-                    format!(
-                        "migrate runtime state {} -> {}",
-                        source.display(),
-                        target.display()
-                    )
-                })?;
+            let Some(binding) = legacy_native_binding(&legacy, &project)? else {
+                tracing::warn!(root = %legacy.display(), "foreign legacy native component retained without touching its authority");
+                continue;
+            };
+            existing_legacy.push(legacy);
+            legacy_bindings.push(binding);
+        }
+        Ok(existing_legacy.into_iter().zip(legacy_bindings).collect())
+    }
+
+    pub(crate) async fn drain_legacy_execution(
+        &self,
+        application_id: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        for (owner, binding) in self._legacy_owners.iter().zip(&self.legacy_bindings) {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "legacy execution cleanup deadline exceeded"
+            );
+            let cleanup = crate::supervision::cleanup_command(owner.scope_root())?;
+            owner
+                .drain_previous_ranges(binding, application_id, &cleanup, deadline)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Called only after startup stopped the actual prior business execution.
+    /// Retain current intent/credentials; import missing history and archive
+    /// colliding bytes. Database/migration records are outside this allowlist.
+    pub(crate) fn reconcile_legacy_after_quiescence(&self) -> Result<()> {
+        let mut roots = self
+            .legacy_roots
+            .lock()
+            .map_err(|_| anyhow::anyhow!("legacy runtime recovery lock poisoned"))?;
+        if !roots.is_empty()
+            && !root_exists(&self.desired_path())?
+            && let Some((desired, revision)) = self.legacy_desired
+        {
+            self.store_desired(desired, revision)?;
+        }
+        for legacy in roots.iter() {
+            let backup = legacy.join(format!(
+                ".runtime-history-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            for name in RUNTIME_STATE_ENTRIES {
+                let source = legacy.join(name);
+                if !root_exists(&source)? {
+                    continue;
+                }
+                let target = self.root.join(name);
+                if std::fs::symlink_metadata(&source)?.file_type().is_dir() && target.is_dir() {
+                    for entry in std::fs::read_dir(&source)? {
+                        let entry = entry?;
+                        let destination = target.join(entry.file_name());
+                        let destination = if root_exists(&destination)? {
+                            let archived = backup.join(name);
+                            std::fs::create_dir_all(&archived)?;
+                            archived.join(entry.file_name())
+                        } else {
+                            destination
+                        };
+                        std::fs::rename(entry.path(), destination)
+                            .context("preserve legacy runtime operation history")?;
+                    }
+                    std::fs::remove_dir(&source)
+                        .context("retire empty legacy runtime history directory")?;
+                } else {
+                    let destination = if root_exists(&target)? {
+                        std::fs::create_dir_all(&backup)?;
+                        backup.join(name)
+                    } else {
+                        target
+                    };
+                    std::fs::rename(&source, destination)
+                        .context("preserve legacy runtime control record")?;
+                }
             }
             #[cfg(unix)]
             {
-                std::fs::File::open(&root)?.sync_all()?;
-                std::fs::File::open(&legacy)?.sync_all()?;
+                std::fs::File::open(legacy)?.sync_all()?;
+                std::fs::File::open(&self.root)?.sync_all()?;
             }
-            // Never unlink the old lockfile/directory. Partial moves fail closed
-            // next time because both roots contain authority; no guessing or overwrite.
-            legacy_owner = Some(guard);
-            tracing::info!("runtime state migrated to stable root: {}", root.display());
+            tracing::warn!(legacy = %legacy.display(), authority = %self.root.display(),
+                "runtime control history reconciled after actual business quiescence");
         }
-        std::fs::create_dir_all(root.join("operations")).context("create runtime state dir")?;
-        std::fs::create_dir_all(root.join("events")).context("create runtime events dir")?;
-        Ok(Self {
-            root,
-            _legacy_owner: legacy_owner,
-        })
+        roots.clear();
+        Ok(())
     }
 
     pub(super) fn identity_path(&self) -> PathBuf {
@@ -240,6 +318,12 @@ impl RuntimeStore {
     /// 多项目天然隔离：状态根按 application_id 分目录，各项目各一份记录。
     pub(crate) fn store_endpoint(&self, record: &EndpointRecord) -> Result<()> {
         write_json(&endpoint_path(&self.root), record)
+    }
+
+    /// Discovery only: a failed kernel still owns its actual bound listener.
+    /// Clients authenticate its native owner before deciding to rebuild it.
+    pub(crate) fn write_endpoint_hint(root: &Path, record: &EndpointRecord) -> Result<()> {
+        write_json(&endpoint_path(root), record)
     }
 
     /// 干净关停时清除发现记录（崩溃残留的旧记录由客户端核验拒绝——XP10）。
@@ -364,28 +448,63 @@ impl RuntimeStore {
                 shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into(),
             ],
         };
+        match std::fs::read(self.identity_path()) {
+            Ok(bytes) => {
+                use sha2::{Digest, Sha256};
+                let name = format!(
+                    "identity.history-{}.json",
+                    hex::encode(Sha256::digest(&bytes))
+                );
+                match std::fs::read(self.root.join(&name)) {
+                    Ok(retained) => {
+                        anyhow::ensure!(retained == bytes, "original identity backup changed")
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        self.store_private_bytes(&name, &bytes)?;
+                    }
+                    Err(error) => return Err(error).context("read original identity backup"),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("read previous identity before replacement"),
+        }
         // identity.json 不回读旧 runtime_instance（旧实例身份不得复用），仅覆盖。
         write_json(&self.identity_path(), &identity)?;
         Ok(identity)
     }
 
     pub(crate) fn load_desired(&self) -> Result<(DesiredState, u64)> {
-        let value: Option<serde_json::Value> = read_json(&self.desired_path())?;
+        let value: Option<serde_json::Value> = match read_json(&self.desired_path()) {
+            Ok(value) => value,
+            Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => {
+                tracing::warn!(%error, "historical desired metadata is damaged; automatic launch suppressed until quiescence recovery");
+                return Ok((DesiredState::Stopped, 0));
+            }
+            Err(error) => return Err(error),
+        };
         match value {
             Some(value) => {
-                let desired = serde_json::from_value(value["desired"].clone())
-                    .context("decode desired state")?;
-                let revision = value["revision"].as_u64().context("decode revision")?;
-                Ok((desired, revision))
+                match (
+                    serde_json::from_value(value["desired"].clone()),
+                    value["revision"].as_u64(),
+                ) {
+                    (Ok(desired), Some(revision)) => Ok((desired, revision)),
+                    _ => {
+                        tracing::warn!(
+                            "historical desired fields are damaged; automatic launch suppressed until quiescence recovery"
+                        );
+                        Ok((DesiredState::Stopped, 0))
+                    }
+                }
             }
-            None => Ok((DesiredState::Running, 0)),
+            None => Ok(self.legacy_desired.unwrap_or((DesiredState::Running, 0))),
         }
     }
 
     /// Startup owns the runtime exclusively and has stopped old processes.
     /// Preserve malformed intent for diagnosis and start management in Stopped;
     /// an explicit request can then choose Running without deleting user data.
-    pub(super) fn repair_desired_after_quiescence(&self) -> Result<()> {
+    pub(crate) fn repair_desired_after_quiescence(&self) -> Result<()> {
         let path = self.desired_path();
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
@@ -407,8 +526,63 @@ impl RuntimeStore {
 
     /// 持久化 desired + revision（单文件覆盖写，先 fsync 再可见）。
     pub(crate) fn store_desired(&self, desired: DesiredState, revision: u64) -> Result<()> {
-        let value = serde_json::json!({ "desired": desired, "revision": revision });
+        let mut value: serde_json::Value =
+            read_json(&self.desired_path())?.unwrap_or_else(|| serde_json::json!({}));
+        let object = value
+            .as_object_mut()
+            .context("desired state must be an object")?;
+        object.insert("desired".into(), serde_json::to_value(desired)?);
+        object.insert("revision".into(), revision.into());
+        // Inject only the final write in protocol tests. The preceding reads
+        // and durable Accepted operation still use the actual filesystem.
+        #[cfg(test)]
+        if self
+            .desired_write_fault
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected desired state write failure",
+            ))
+            .context("persist desired state");
+        }
         write_json(&self.desired_path(), &value)
+    }
+
+    /// One physical management wake is consumed atomically with its Stopped
+    /// intent. It is bookkeeping, not a lease or an extra proof file. A later
+    /// Source/Stop update retains this marker and selects the current intent.
+    pub(crate) fn consume_management_boot(&self, boot_id: &str) -> Result<bool> {
+        shared_types::validate_identifier(boot_id, "management_boot_id")
+            .map_err(anyhow::Error::msg)?;
+        let mut value: serde_json::Value =
+            read_json(&self.desired_path())?.unwrap_or_else(|| serde_json::json!({}));
+        if value
+            .get("management_boot_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(boot_id)
+        {
+            return Ok(false);
+        }
+        let (desired, revision) = self.load_desired()?;
+        let revision = if desired == DesiredState::Running {
+            revision
+                .checked_add(1)
+                .context("management boot revision overflow")?
+        } else {
+            revision
+        };
+        let object = value
+            .as_object_mut()
+            .context("desired state must be an object")?;
+        object.insert(
+            "desired".into(),
+            serde_json::to_value(DesiredState::Stopped)?,
+        );
+        object.insert("revision".into(), revision.into());
+        object.insert("management_boot_id".into(), boot_id.into());
+        write_json(&self.desired_path(), &value)?;
+        Ok(true)
     }
 
     pub(crate) fn load_operation(&self, operation_id: &str) -> Result<Option<StoredOperation>> {
@@ -636,6 +810,135 @@ pub(super) const RUNTIME_STATE_ENTRIES: &[&str] = &[
     "token",
     "endpoint.json",
 ];
+
+fn legacy_desired_base(roots: &[PathBuf]) -> Result<Option<(DesiredState, u64)>> {
+    let mut selected = None;
+    for root in roots {
+        let path = root.join("desired.json");
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("read legacy desired state"),
+        };
+        let decoded = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| {
+                Some((
+                    serde_json::from_value::<DesiredState>(value["desired"].clone()).ok()?,
+                    value["revision"].as_u64()?,
+                ))
+            });
+        let Some(value) = decoded else {
+            tracing::warn!(path = %path.display(), "damaged legacy desired input retained; explicit source selects new intent");
+            return Ok(Some((DesiredState::Stopped, 0)));
+        };
+        if selected.is_some_and(|selected| selected != value) {
+            tracing::warn!(
+                "conflicting legacy desired inputs retained; waiting for explicit source input"
+            );
+            return Ok(Some((DesiredState::Stopped, 0)));
+        }
+        selected = Some(value);
+    }
+    Ok(selected)
+}
+
+fn legacy_belongs_to_project(root: &Path, project: &Path) -> Result<bool> {
+    let path = root.join("identity.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error).context("read legacy project identity"),
+    };
+    let value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            if !bytes.is_empty() {
+                tracing::warn!(path = %path.display(), %error, "damaged legacy identity preserved for actual scope cleanup");
+            }
+            serde_json::Value::Null
+        }
+    };
+    let requested_app = std::env::var("PROJECT_ID")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let recorded_app = value
+        .get("application_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty());
+    if matches!((requested_app.as_deref(), recorded_app), (Some(requested), Some(recorded)) if requested != recorded)
+    {
+        return Ok(false);
+    }
+    if value
+        .get("service_family")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|family| family != "userapp-dev")
+    {
+        return Ok(false);
+    }
+    if requested_app
+        .as_deref()
+        .zip(recorded_app)
+        .is_some_and(|(requested, recorded)| requested == recorded)
+    {
+        return Ok(true);
+    }
+    if let Some(source) = value
+        .get("source_root")
+        .and_then(serde_json::Value::as_str)
+        .filter(|source| Path::new(source).is_absolute())
+    {
+        return Ok(runtime_state_layout::canonical_project_root(Path::new(source)) == project);
+    }
+    match std::fs::read(root.join("supervisor.json")) {
+        Ok(bytes) => {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && let Some(binding) = value.pointer("/snapshot/binding")
+                && let Ok(binding) =
+                    serde_json::from_value::<runtime_supervisor::Binding>(binding.clone())
+            {
+                return Ok(binding.component == "app-cli"
+                    && runtime_state_layout::canonical_project_root(&binding.resource) == project);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("read legacy native project binding"),
+    }
+    Ok(true)
+}
+
+fn legacy_native_binding(
+    root: &Path,
+    project: &Path,
+) -> Result<Option<runtime_supervisor::Binding>> {
+    let path = root.join("supervisor.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Some(runtime_supervisor::Binding {
+                component: "app-cli".into(),
+                resource: project.to_path_buf(),
+            }));
+        }
+        Err(error) => return Err(error).context("read legacy native binding"),
+    };
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && let Some(binding) = value.pointer("/snapshot/binding")
+        && let Ok(binding) = serde_json::from_value::<runtime_supervisor::Binding>(binding.clone())
+    {
+        if !binding.component.trim().is_empty() && binding.component != "app-cli" {
+            return Ok(None);
+        }
+        if !binding.component.trim().is_empty() && binding.resource.is_absolute() {
+            return Ok(Some(binding));
+        }
+    }
+    Ok(Some(runtime_supervisor::Binding {
+        component: "app-cli".into(),
+        resource: project.to_path_buf(),
+    }))
+}
 pub(super) fn is_legacy_state_domain(path: &Path) -> Result<bool> {
     for name in RUNTIME_STATE_ENTRIES {
         if root_exists(&path.join(name))? {
@@ -704,13 +1007,9 @@ pub(super) fn is_transient_windows_lock(error: &anyhow::Error) -> bool {
 }
 
 pub(super) fn read_json(path: &Path) -> Result<Option<serde_json::Value>> {
-    if !path.is_file() {
-        return Ok(None);
-    }
-    // A record that vanishes between the is_file check and the read (accepted
-    // operation whose file is not yet visible, replaced records) is an
-    // observation of absence, not a corrupt store — surface it as not-found so
-    // callers keep their retry semantics instead of a hard error.
+    // Read the actual record: only absence is a not-found observation. A
+    // directory or unreadable file must retain its concrete I/O failure instead
+    // of silently selecting the default business intent.
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

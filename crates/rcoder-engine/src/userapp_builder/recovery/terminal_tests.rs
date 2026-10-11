@@ -255,6 +255,7 @@ async fn compute_terminal_scan_preserves_uncertain_then_releases_confirmed_recei
     let app = store.ensure_identity("computeapp").await.unwrap();
     let pending = store
         .admit_compute_control(&ComputeControlRequest {
+            builder_startup_mode: Default::default(),
             app_id: app.app_id.clone(),
             lifecycle_id: app.lifecycle_id.clone(),
             scope: UserAppOperationScope::Dev,

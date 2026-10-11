@@ -31,9 +31,23 @@ pub(crate) async fn reconcile_prior(
     identity: &ResidentIdentity,
     settled_previous: Option<&crate::Binding>,
 ) -> Result<()> {
+    reconcile_prior_until(
+        root,
+        identity,
+        settled_previous,
+        tokio::time::Instant::now() + Duration::from_secs(15),
+    )
+    .await
+}
+
+pub(crate) async fn reconcile_prior_until(
+    root: &Path,
+    identity: &ResidentIdentity,
+    settled_previous: Option<&crate::Binding>,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
     let directory = root.join("resident");
     if directory.try_exists()? {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         for entry in std::fs::read_dir(&directory)? {
             let previous = entry?.path();
             ensure!(
@@ -51,7 +65,9 @@ pub(crate) async fn reconcile_prior(
                     permitted.as_ref() == Some(&old.binding),
                     "resident belongs to another application or workspace"
                 );
-                process_utils::guardian::recover(&previous)
+                process_utils::command_authority::Gate::try_acquire(&previous)?.close()?;
+                recover_previous(&previous, false, deadline)
+                    .await
                     .context("authorized previous resident cleanup is no longer quiescent")?;
                 continue;
             }
@@ -68,38 +84,52 @@ pub(crate) async fn reconcile_prior(
                 "resident belongs to another physical domain; matching original owner/workspace platform exit evidence required"
             );
             process_utils::command_authority::Gate::try_acquire(&previous)?.close()?;
-            loop {
-                let replacement = old
-                    .process_epoch
-                    .as_deref()
-                    .zip(identity.process_epoch.as_deref())
-                    .is_some_and(|(before, now)| crate::epoch::proves_replacement(before, now));
-                let result = if platform_exit || replacement {
-                    // Same platform domain plus a replaced boot/PID namespace
-                    // proves no process of that incarnation can survive.
-                    process_utils::guardian::confirm_physical_domain_exit(&previous)
-                } else {
-                    process_utils::guardian::recover(&previous)
-                };
-                match result {
-                    Ok(()) => break,
-                    Err(error)
-                        if error
-                            .downcast_ref::<std::fs::TryLockError>()
-                            .is_some_and(|e| matches!(e, std::fs::TryLockError::WouldBlock))
-                            && tokio::time::Instant::now() < deadline =>
-                    {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                    Err(error) => {
-                        return Err(error)
-                            .context("prior resident guardian cleanup remains unconfirmed");
-                    }
-                }
-            }
+            let replacement = old
+                .process_epoch
+                .as_deref()
+                .zip(identity.process_epoch.as_deref())
+                .is_some_and(|(before, now)| crate::epoch::proves_replacement(before, now));
+            recover_previous(&previous, platform_exit || replacement, deadline).await?;
         }
     }
     Ok(())
+}
+
+async fn recover_previous(
+    previous: &Path,
+    physical_exit: bool,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    loop {
+        let result = if physical_exit {
+            process_utils::guardian::confirm_physical_domain_exit(previous)
+                .map(|()| process_utils::guardian::RecoveryOutcome::Settled)
+        } else {
+            process_utils::guardian::recover_with_scope_check(previous)
+        };
+        match result {
+            Ok(process_utils::guardian::RecoveryOutcome::Settled) => return Ok(()),
+            Ok(process_utils::guardian::RecoveryOutcome::Stopping { detail }) => {
+                ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "prior resident still draining: {detail}"
+                );
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<std::fs::TryLockError>()
+                    .is_some_and(|e| matches!(e, std::fs::TryLockError::WouldBlock))
+                    && tokio::time::Instant::now() < deadline => {}
+            Err(error) => {
+                return Err(error).context("prior resident guardian cleanup remains unconfirmed");
+            }
+        }
+        tokio::time::sleep_until(std::cmp::min(
+            deadline,
+            tokio::time::Instant::now() + Duration::from_millis(100),
+        ))
+        .await;
+    }
 }
 
 #[cfg(test)]
@@ -131,6 +161,182 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    struct ProcessCleanup(std::process::Child);
+
+    #[cfg(unix)]
+    impl Drop for ProcessCleanup {
+        fn drop(&mut self) {
+            let _result = self.0.kill();
+            let _result = self.0.wait();
+        }
+    }
+
+    #[cfg(unix)]
+    fn running_guardian(scope: &ResidentScope, command_pid: u32) -> std::path::PathBuf {
+        let root = scope
+            .root()
+            .join("guardians")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("receipt.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version":2, "id":root.file_name().unwrap().to_str().unwrap(),
+                "instance_id":scope.identity().owner_instance, "phase":"Running",
+                "command_record":null, "command_digest":"0".repeat(64),
+                "root_status":null, "diagnostic_pid":command_pid,
+                "resident_identity":scope.identity()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        root
+    }
+
+    /// The actual owner lock and command process are gone, but the crash left
+    /// an ordinary Running receipt. A new owner must converge without deleting
+    /// that receipt or inventing a successful command result.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dead_resident_command_is_settled_before_successor_initialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let binding = serde_json::json!({"component":"app-cli", "resource":root});
+        let owner = OwnerLease::try_acquire(&root).unwrap().unwrap();
+        let original = identity("app", &uuid::Uuid::new_v4().to_string(), &binding);
+        discovery(&root, &original);
+        let scope = ResidentScope::initialize(&owner, original).unwrap();
+        let mut command = ProcessCleanup(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let command_pid = command.0.id();
+        let guardian = running_guardian(&scope, command_pid);
+        scope.close().unwrap();
+        command.0.kill().unwrap();
+        command.0.wait().unwrap();
+        assert!(!process_utils::process_exists(command_pid).unwrap());
+        assert!(!process_utils::process_group_exists(command_pid).unwrap());
+        drop(scope);
+        drop(owner);
+        let successor = OwnerLease::try_acquire(&root).unwrap().unwrap();
+        let next = identity("app", &uuid::Uuid::new_v4().to_string(), &binding);
+        discovery(&root, &next);
+        let replacement = initialize(&root, &successor, next.clone()).await.unwrap();
+        assert_eq!(replacement.identity(), &next);
+        let recovered: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(guardian.join("receipt.json")).unwrap()).unwrap();
+        assert_eq!(recovered["phase"], "Quiescent");
+        assert!(recovered["root_status"].is_null());
+        assert!(root.join("owner.lock").is_file());
+        assert!(OwnerLease::try_acquire(&root).unwrap().is_none());
+        replacement.close().unwrap();
+        replacement.record_quiescent().unwrap();
+    }
+
+    /// A released owner lock alone is insufficient while its actual command
+    /// remains alive. Recovery waits, preserves the receipt, and continues as
+    /// soon as the real command exits within the original recovery budget.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resident_recovery_waits_for_live_command_then_converges() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let binding = serde_json::json!({"component":"app-cli", "resource":root});
+        let owner = OwnerLease::try_acquire(&root).unwrap().unwrap();
+        let original = identity("app", &uuid::Uuid::new_v4().to_string(), &binding);
+        discovery(&root, &original);
+        let scope = ResidentScope::initialize(&owner, original).unwrap();
+        let mut command = ProcessCleanup(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let guardian = running_guardian(&scope, command.0.id());
+        let before = std::fs::read(guardian.join("receipt.json")).unwrap();
+        scope.close().unwrap();
+        drop(scope);
+        drop(owner);
+        let successor = OwnerLease::try_acquire(&root).unwrap().unwrap();
+        let next = identity("app", &uuid::Uuid::new_v4().to_string(), &binding);
+        discovery(&root, &next);
+        let recovery = initialize(&root, &successor, next.clone());
+        tokio::pin!(recovery);
+        tokio::select! {
+            result = &mut recovery => panic!("live original command must defer successor (succeeded={})", result.is_ok()),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        assert_eq!(
+            std::fs::read(guardian.join("receipt.json")).unwrap(),
+            before
+        );
+        assert!(process_utils::process_exists(command.0.id()).unwrap());
+        command.0.kill().unwrap();
+        command.0.wait().unwrap();
+        let replacement = tokio::time::timeout(Duration::from_secs(2), recovery)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.identity(), &next);
+        replacement.close().unwrap();
+        replacement.record_quiescent().unwrap();
+    }
+
+    /// The guardian's own real lock remains authoritative even when its
+    /// command PID already exited; a delayed guardian may still commit writes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resident_recovery_waits_for_real_guardian_lock_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let binding = serde_json::json!({"component":"app-cli", "resource":root});
+        let owner = OwnerLease::try_acquire(&root).unwrap().unwrap();
+        let original = identity("app", &uuid::Uuid::new_v4().to_string(), &binding);
+        discovery(&root, &original);
+        let scope = ResidentScope::initialize(&owner, original).unwrap();
+        let mut command = std::process::Command::new("true").spawn().unwrap();
+        let command_pid = command.id();
+        command.wait().unwrap();
+        let guardian = running_guardian(&scope, command_pid);
+        let lock = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(guardian.join("guardian.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let before = std::fs::read(guardian.join("receipt.json")).unwrap();
+        scope.close().unwrap();
+        drop(scope);
+        drop(owner);
+        let successor = OwnerLease::try_acquire(&root).unwrap().unwrap();
+        let next = identity("app", &uuid::Uuid::new_v4().to_string(), &binding);
+        discovery(&root, &next);
+        let recovery = initialize(&root, &successor, next.clone());
+        tokio::pin!(recovery);
+        tokio::select! {
+            result = &mut recovery => panic!("held guardian lock must defer successor (succeeded={})", result.is_ok()),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        assert_eq!(
+            std::fs::read(guardian.join("receipt.json")).unwrap(),
+            before
+        );
+        drop(lock);
+        let replacement = tokio::time::timeout(Duration::from_secs(2), recovery)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.identity(), &next);
+        replacement.close().unwrap();
+        replacement.record_quiescent().unwrap();
     }
 
     #[tokio::test]

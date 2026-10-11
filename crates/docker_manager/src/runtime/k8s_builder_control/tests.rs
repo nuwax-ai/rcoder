@@ -499,6 +499,7 @@ async fn stop_api_contract_with_workspace(
         }),
         restart_image: image_roll.map(str::to_string),
         restart_runtime_workspace: runtime_workspace.map(str::to_string),
+        builder_startup_mode: shared_types::BuilderStartupMode::default(),
     };
     tokio::time::timeout(Duration::from_secs(5), async {
         let outcome = runtime

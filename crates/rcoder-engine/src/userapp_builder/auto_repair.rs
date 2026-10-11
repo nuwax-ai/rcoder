@@ -77,6 +77,7 @@ pub(super) async fn repair_if_needed(
         let record = match state
             .userapp_store
             .admit_idle_compute_repair(&ComputeControlRequest {
+                builder_startup_mode: Default::default(),
                 app_id: app_id.to_owned(),
                 lifecycle_id: app.lifecycle_id.clone(),
                 scope: UserAppOperationScope::Dev,

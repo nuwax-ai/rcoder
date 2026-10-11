@@ -2,6 +2,30 @@
 //! stop/restart cannot accidentally delegate to full builder/PVC deletion.
 use serde::{Deserialize, Serialize};
 
+pub const APP_CLI_CONTROL_ONLY_ENV: &str = "APP_CLI_CONTROL_ONLY";
+pub const APP_CLI_MANAGEMENT_BOOT_ID_ENV: &str = "APP_CLI_MANAGEMENT_BOOT_ID";
+
+/// A compute wake can restore management without reviving business services.
+/// Old checkpoints retain their original startup behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BuilderStartupMode {
+    #[default]
+    PreserveBusinessIntent,
+    ManagementOnly,
+}
+impl BuilderStartupMode {
+    pub const fn is_preserve(&self) -> bool {
+        matches!(self, Self::PreserveBusinessIntent)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BuilderStartOptions {
+    pub startup_mode: BuilderStartupMode,
+    pub restart_template: Option<BuilderRestartTemplate>,
+}
+
 /// Public checkpoint references private runtime configuration; it never embeds
 /// container environment variables or credentials in an operation response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +87,9 @@ pub struct BuilderControlTarget {
     /// Missing in old checkpoints; recovery must never invent a new intent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_runtime_workspace: Option<String>,
+    /// Startup intent frozen before stopping compute; not a configuration proof.
+    #[serde(default, skip_serializing_if = "BuilderStartupMode::is_preserve")]
+    pub builder_startup_mode: BuilderStartupMode,
 }
 
 // The compute ledger adds protocol and volume witnesses alongside the target.
@@ -82,6 +109,8 @@ impl<'de> Deserialize<'de> for BuilderControlTarget {
             #[serde(default)]
             restart_runtime_workspace: Option<String>,
             #[serde(default)]
+            builder_startup_mode: BuilderStartupMode,
+            #[serde(default)]
             #[allow(dead_code)]
             builder_compute_single_write: bool,
             #[serde(default)]
@@ -89,7 +118,15 @@ impl<'de> Deserialize<'de> for BuilderControlTarget {
             builder_volumes: Vec<crate::AppResourceIdentity>,
             #[serde(default)]
             #[allow(dead_code)]
-            builder_restart_template: Option<BuilderRestartTemplate>,
+            // This deserializer extracts the physical target only. The
+            // executor separately resolves archive metadata after observing
+            // the stop boundary, retaining damaged history for diagnostics.
+            builder_restart_template: Option<serde_json::Value>,
+            #[serde(default)]
+            #[allow(dead_code)]
+            // Private historical archive references only; no permission to
+            // relax physical identity or unknown-write protection.
+            builder_restart_template_history: Vec<serde_json::Value>,
         }
         let wire = Wire::deserialize(deserializer)?;
         Ok(Self {
@@ -99,6 +136,7 @@ impl<'de> Deserialize<'de> for BuilderControlTarget {
             pod: wire.pod,
             restart_image: wire.restart_image,
             restart_runtime_workspace: wire.restart_runtime_workspace,
+            builder_startup_mode: wire.builder_startup_mode,
         })
     }
 }
@@ -221,6 +259,7 @@ mod tests {
             request_fingerprint: "a".repeat(64),
         };
         let mut target = BuilderControlTarget {
+            builder_startup_mode: Default::default(),
             resource_binding: None,
             context,
             workload: None,
@@ -531,6 +570,7 @@ mod registration_confirmation_tests {
             container,
             registration_predecessor: None,
             target: BuilderControlTarget {
+                builder_startup_mode: Default::default(),
                 resource_binding: None,
                 context,
                 workload: Some(AppResourceIdentity {

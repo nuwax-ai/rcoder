@@ -326,7 +326,8 @@ pub(super) async fn admit(
     toasty::sql::statement(repo::sql(backend,"INSERT INTO userapp_compute_controls (operation_id,app_id,lifecycle_id,scope,generation,revision,action,state,request_id,request_fingerprint,stage,checkpoint_json,evidence_json,created_at_us,updated_at_us) VALUES ($1,$2,$3,$4,$5,1,$6,'pending',$7,$8,'accepted',$9,$10,$11,$11)"))
         .bind(&request.operation_id).bind(&request.app_id).bind(&request.lifecycle_id).bind(scope).bind(generation)
         .bind(action(request.action)).bind(&request.request_id).bind(&request.request_fingerprint)
-        .bind(serde_json::json!({"restart_image_roll":request.restart_image_roll}).to_string())
+        .bind(serde_json::json!({"restart_image_roll":request.restart_image_roll,
+            "builder_startup_mode":request.builder_startup_mode}).to_string())
         .bind(serde_json::to_string(&interrupted).map_err(storage)?).bind(now).exec(tx).await.map_err(storage)?;
     let desired = match request.action {
         ComputeControlAction::Stop => DesiredState::Stopped,
@@ -877,6 +878,7 @@ mod stale_control_tests {
         action: ComputeControlAction,
     ) -> ComputeControlRequest {
         ComputeControlRequest {
+            builder_startup_mode: Default::default(),
             app_id: app.app_id.clone(),
             lifecycle_id: app.lifecycle_id.clone(),
             scope: UserAppOperationScope::Prod,

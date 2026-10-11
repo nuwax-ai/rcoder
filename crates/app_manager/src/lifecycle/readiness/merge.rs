@@ -544,6 +544,7 @@ mod tests {
         let app = store.ensure_identity("194").await.unwrap();
         let record = store
             .admit_compute_control(&shared_types::ComputeControlRequest {
+                builder_startup_mode: Default::default(),
                 app_id: app.app_id.clone(),
                 lifecycle_id: app.lifecycle_id,
                 scope: UserAppOperationScope::Prod,

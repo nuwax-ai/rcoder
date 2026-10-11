@@ -1054,6 +1054,20 @@ pub trait UserAppLifecycleStore: Send + Sync {
         target: &crate::BuilderControlTarget,
     ) -> Result<crate::ComputeControlRecord, UserAppStoreError>;
 
+    /// Retain a new private archive only after the same retained builder's
+    /// stopped execution, original lease and volumes were observed. This CAS
+    /// preserves the original operation/stage and historical reference.
+    async fn capture_stopped_builder_restart_template(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _source: &crate::BuilderControlTarget,
+        _template: &crate::BuilderRestartTemplate,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Stopped builder restart template capture is unsupported".into(),
+        ))
+    }
+
     /// Claims a pending control using its exact revision and current intent.
     /// A different executor cannot take over Running merely because time passed.
     async fn claim_compute_control(

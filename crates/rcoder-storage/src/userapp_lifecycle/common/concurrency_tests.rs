@@ -78,6 +78,7 @@ async fn holder_progress_timestamp_reads_actual_column_and_exact_revision() {
     );
     let compute = store
         .admit_compute_control(&ComputeControlRequest {
+            builder_startup_mode: Default::default(),
             app_id: app.app_id.clone(),
             lifecycle_id: app.lifecycle_id.clone(),
             scope: UserAppOperationScope::Prod,

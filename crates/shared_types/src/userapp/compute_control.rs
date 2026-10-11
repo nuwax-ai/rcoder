@@ -73,6 +73,12 @@ pub struct ComputeControlRequest {
     /// the platform image; the choice is frozen at admission.
     #[serde(default)]
     pub restart_image_roll: bool,
+    /// Persisted compute startup intent; management wakes do not start business.
+    #[serde(
+        default,
+        skip_serializing_if = "super::builder_control::BuilderStartupMode::is_preserve"
+    )]
+    pub builder_startup_mode: super::builder_control::BuilderStartupMode,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ComputeControlRecord {

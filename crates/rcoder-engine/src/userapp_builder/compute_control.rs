@@ -7,6 +7,10 @@ use sha2::{Digest, Sha256};
 use shared_types::*;
 use std::{sync::Arc, time::Duration};
 
+mod builder_start;
+use builder_start::prepare_start_options;
+mod stopped_template;
+
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct ComputeOperationView {
     pub operation_id: String,
@@ -98,6 +102,26 @@ pub async fn submit_physical_start(
     .await
 }
 
+/// Restore compute for a file or Source request without replaying old business.
+pub(crate) async fn submit_physical_start_for_access(
+    state: &Arc<AppState>,
+    app_id: String,
+    scope: UserAppOperationScope,
+    request: UserAppControlRequest,
+    mode: BuilderStartupMode,
+) -> Result<ComputeOperationView> {
+    submit_with_startup_mode(
+        state,
+        app_id,
+        scope,
+        ComputeControlAction::Restart,
+        request,
+        false,
+        mode,
+    )
+    .await
+}
+
 async fn submit_with_image_policy(
     state: &Arc<AppState>,
     app_id: String,
@@ -105,6 +129,27 @@ async fn submit_with_image_policy(
     action: ComputeControlAction,
     request: UserAppControlRequest,
     restart_image_roll: bool,
+) -> Result<ComputeOperationView> {
+    submit_with_startup_mode(
+        state,
+        app_id,
+        scope,
+        action,
+        request,
+        restart_image_roll,
+        BuilderStartupMode::PreserveBusinessIntent,
+    )
+    .await
+}
+
+async fn submit_with_startup_mode(
+    state: &Arc<AppState>,
+    app_id: String,
+    scope: UserAppOperationScope,
+    action: ComputeControlAction,
+    request: UserAppControlRequest,
+    restart_image_roll: bool,
+    builder_startup_mode: BuilderStartupMode,
 ) -> Result<ComputeOperationView> {
     validate_identifier(&app_id, "app_id").map_err(anyhow::Error::msg)?;
     if let Some(request_id) = request.request_id.as_deref() {
@@ -131,16 +176,22 @@ async fn submit_with_image_policy(
         .request_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     validate_identifier(&request_id, "request_id").map_err(anyhow::Error::msg)?;
-    let fingerprint: String = Sha256::digest(serde_json::to_vec(&(
+    let original_intent = serde_json::to_vec(&(
         &app_id,
         &app.lifecycle_id,
         scope,
         action,
         restart_image_roll,
-    ))?)
-    .iter()
-    .map(|byte| format!("{byte:02x}"))
-    .collect();
+    ))?;
+    let encoded_intent = if builder_startup_mode.is_preserve() {
+        original_intent
+    } else {
+        serde_json::to_vec(&(original_intent, builder_startup_mode))?
+    };
+    let fingerprint: String = Sha256::digest(encoded_intent)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     // Own shutdown accounting before admission; HTTP cancellation cannot discard
     // a committed intent. Pending records are also picked up by discovery.
     let flight = state.userapp_op_flight.guard()?;
@@ -155,6 +206,7 @@ async fn submit_with_image_policy(
             operation_id: uuid::Uuid::new_v4().to_string(),
             request_fingerprint: fingerprint.clone(),
             restart_image_roll,
+            builder_startup_mode,
         })
         .await;
     let record = match admitted {
@@ -597,7 +649,11 @@ pub(crate) async fn execute_pending(state: &AppState, pending: ComputeControlRec
             let failure = ComputeControlProgress {
                 identity: identity.clone(),
                 expected_revision: record.revision,
-                state: ComputeControlState::RecoveryRequired,
+                state: if settled && stage == ComputeControlStage::Stopped {
+                    ComputeControlState::Failed
+                } else {
+                    ComputeControlState::RecoveryRequired
+                },
                 stage,
                 checkpoint: record.checkpoint.clone(),
                 error_code: Some(ERR_BACKEND_ERROR.into()),
@@ -889,13 +945,24 @@ async fn execute_claimed(
     }
     let mut target = if identity.scope == UserAppOperationScope::Dev {
         let mut captured = super::adoption::capture_bound_target(state, &context).await?;
+        captured.builder_startup_mode = record
+            .checkpoint
+            .get("builder_startup_mode")
+            .map(|mode| serde_json::from_value(mode.clone()))
+            .transpose()
+            .context("Decode captured builder startup mode")?
+            .unwrap_or_default();
         if record.action == ComputeControlAction::Restart
-            && record
-                .checkpoint
-                .get("restart_image_roll")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
+            && (captured.builder_startup_mode == BuilderStartupMode::ManagementOnly
+                || record
+                    .checkpoint
+                    .get("restart_image_roll")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false))
         {
+            // A stopped legacy runtime cannot honor management-only boot.
+            // Freeze the current paired runner once; ordinary running reuse
+            // never enters this path and keeps its actual image/configuration.
             captured.restart_image = state.runtime().current_builder_image().await?;
         }
         freeze_builder_restart_workspace(&mut captured, record.action);
@@ -982,6 +1049,7 @@ async fn execute_claimed(
             let mut fresh = super::adoption::capture_bound_target(state, &context).await?;
             fresh.restart_image = old.restart_image.clone();
             fresh.restart_runtime_workspace = old.restart_runtime_workspace.clone();
+            fresh.builder_startup_mode = old.builder_startup_mode;
             if old.workload.as_ref().map(|r| &r.uid) != fresh.workload.as_ref().map(|r| &r.uid)
                 || state
                     .runtime()
@@ -1000,6 +1068,7 @@ async fn execute_claimed(
                 fresh = state.runtime().restore_builder_restart(&template).await?;
                 fresh.restart_image = old.restart_image.clone();
                 fresh.restart_runtime_workspace = old.restart_runtime_workspace.clone();
+                fresh.builder_startup_mode = old.builder_startup_mode;
                 *settled = true;
             }
             ensure!(
@@ -1031,6 +1100,12 @@ async fn execute_claimed(
             }
             fresh
         };
+        let builder_options = if identity.scope == UserAppOperationScope::Dev {
+            let captured: BuilderControlTarget = serde_json::from_value(fresh.clone())?;
+            Some(prepare_start_options(state.runtime().as_ref(), &captured, &fresh).await?)
+        } else {
+            None
+        };
         progress(
             state,
             record,
@@ -1048,9 +1123,12 @@ async fn execute_claimed(
         *settled = false;
         if identity.scope == UserAppOperationScope::Dev {
             let target: BuilderControlTarget = serde_json::from_value(fresh.clone())?;
+            let options = builder_options
+                .as_ref()
+                .context("Prepared builder startup options missing")?;
             let info = state
                 .runtime()
-                .start_builder_control(&target)
+                .start_builder_control_with_options(&target, options)
                 .await?
                 .ok_or_else(|| anyhow!("Restart did not return a builder"))?;
             *settled = true;
@@ -1313,13 +1391,15 @@ async fn run_restart_continuation(
             .userapp_store
             .check_compute_executor(&identity)
             .await?;
-        unknown_write = true;
         match &prepared {
-            RestartContinuation::Prod(target) => state.runtime().start_app_compute(target).await?,
+            RestartContinuation::Prod(target) => {
+                unknown_write = true;
+                state.runtime().start_app_compute(target).await?
+            },
             RestartContinuation::Dev(target) => {
-                let info = state
-                    .runtime()
-                    .start_builder_control(target)
+                let options = prepare_start_options(state.runtime().as_ref(), target, &checkpoint).await?;
+                unknown_write = true;
+                let info = state.runtime().start_builder_control_with_options(target, &options)
                     .await?
                     .ok_or_else(|| {
                         anyhow!("Builder continuation did not return a ready instance")
@@ -1352,16 +1432,14 @@ async fn run_restart_continuation(
                 UserAppOperationScope::Dev => {
                     match record.checkpoint.get("builder_restart_template") {
                         Some(value) => {
-                            let template: BuilderRestartTemplate =
-                                serde_json::from_value(value.clone()).map_err(|error| {
-                                    anyhow::anyhow!("Decode builder restart archive: {error}")
-                                })?;
-                            Some(
-                                state
-                                    .runtime()
-                                    .cleanup_builder_restart_archive(&template)
-                                    .await,
-                            )
+                            match serde_json::from_value::<BuilderRestartTemplate>(value.clone()) {
+                                Ok(template) => Some(state.runtime().cleanup_builder_restart_archive(&template).await),
+                                Err(error) => {
+                                    tracing::warn!(%error, operation_id = %record.operation_id,
+                                        "Completed builder restart retains undecodable historical archive; cleanup was not dispatched");
+                                    None
+                                }
+                            }
                         }
                         None => None,
                     }
@@ -1400,7 +1478,11 @@ async fn run_restart_continuation(
                 .advance_compute_control(&ComputeControlProgress {
                     identity: identity.clone(),
                     expected_revision: record.revision,
-                    state: ComputeControlState::RecoveryRequired,
+                    state: if !unknown_write && record.stage != "verifying" {
+                        ComputeControlState::Failed
+                    } else {
+                        ComputeControlState::RecoveryRequired
+                    },
                     stage: if record.stage == "verifying" {
                         ComputeControlStage::Verifying
                     } else {
@@ -1559,6 +1641,7 @@ pub(crate) async fn reconcile_superseded(
 }
 
 async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord) -> Result<()> {
+    let mut continuing = snapshot.clone();
     ensure!(
         snapshot.stage == "stopped"
             || (snapshot.stage == "starting" && snapshot.has_conditional_compute_write()),
@@ -1600,26 +1683,29 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
         let mut fresh = super::adoption::capture_bound_target(state, &context).await?;
         fresh.restart_image = old.restart_image.clone();
         fresh.restart_runtime_workspace = old.restart_runtime_workspace.clone();
+        fresh.builder_startup_mode = old.builder_startup_mode;
         if fresh.workload.as_ref().map(|r| &r.uid) != old.workload.as_ref().map(|r| &r.uid)
             || state
                 .runtime()
                 .builder_image_replacement_needed(&fresh)
                 .await?
         {
-            let template: BuilderRestartTemplate = serde_json::from_value(
-                snapshot
-                    .checkpoint
-                    .get("builder_restart_template")
-                    .context("Original restart template is unavailable")?
-                    .clone(),
-            )?;
-            ensure!(template.source == old, "Restart archive source differs");
+            let (captured, template) = stopped_template::prepare(
+                state.runtime().as_ref(),
+                state.userapp_store.as_ref(),
+                snapshot,
+                &old,
+                &fresh,
+            )
+            .await?;
+            continuing = captured;
             // The durable stopped boundary already confirms old compute exited.
             // Restore only a zero-replica controller; the CAS below must succeed
             // before any new business instance can start.
             let mut restored = state.runtime().restore_builder_restart(&template).await?;
             restored.restart_image = old.restart_image.clone();
             restored.restart_runtime_workspace = old.restart_runtime_workspace.clone();
+            restored.builder_startup_mode = old.builder_startup_mode;
             restored
         } else {
             ensure!(
@@ -1645,10 +1731,10 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
         "Builder lease changed before continuation claim"
     );
     let prepared = builder_compute_checkpoint(state, &target, true).await?;
-    verify_builder_volume_witness(&snapshot.checkpoint, &prepared)?;
+    verify_builder_volume_witness(&continuing.checkpoint, &prepared)?;
     let record = state
         .userapp_store
-        .resume_builder_restart_start(snapshot, &target)
+        .resume_builder_restart_start(&continuing, &target)
         .await?;
     run_restart_continuation(state, record, RestartContinuation::Dev(target)).await
 }
@@ -1832,6 +1918,7 @@ mod restart_workspace_tests {
     #[test]
     fn only_new_kubernetes_dev_restart_freezes_source_directory() {
         let mut target = BuilderControlTarget {
+            builder_startup_mode: Default::default(),
             context: UserAppExecutionContext {
                 app_id: "228".into(),
                 lifecycle_id: "life".into(),

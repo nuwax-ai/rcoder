@@ -19,6 +19,7 @@ async fn superseded_ensure_crosses_control_but_never_reverses_completed_stop() {
         let app = store.ensure_identity(app_id).await.expect("app");
         let control = store
             .admit_compute_control(&ComputeControlRequest {
+                builder_startup_mode: Default::default(),
                 app_id: app_id.into(),
                 lifecycle_id: app.lifecycle_id.clone(),
                 scope: UserAppOperationScope::Dev,

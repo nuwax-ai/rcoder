@@ -84,6 +84,13 @@ pub async fn owner_serve(
     let normalized = args.for_management()?;
     let args = &normalized;
     session.register_resident_application(&application_id)?;
+    crate::control::legacy_management::prepare_legacy_management(
+        &args.workspace,
+        &state_root,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(45),
+    )
+    .await
+    .context("prepare original legacy management owner before binding current listener")?;
     let api_listener = crate::api::bind_listener(&args.admin_addr).await?;
     let ready = RuntimeStatusService::default();
     let state = Arc::new(ServerState::new(ready));
@@ -172,12 +179,34 @@ pub async fn owner_serve(
             tracing::error!(
                 "runtime kernel unavailable ({error:#}); automatic business startup suppressed"
             );
+            let hint = crate::runtime_kernel::EndpointRecord {
+                protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+                application_id: application_id.clone(),
+                workspace_id: runtime_workspace_id(&args.workspace),
+                runtime_instance_id: session.snapshot().supervisor_id,
+                address: bound_api_addr.clone(),
+            };
+            if let Err(hint_error) =
+                crate::runtime_kernel::RuntimeStore::write_endpoint_hint(&state_root, &hint)
+            {
+                tracing::warn!(%hint_error, "failed management listener discovery hint could not be published");
+            }
         }
     }
-    state.set_business_relaunch({
-        let session = session.clone();
-        move || session.request_relaunch()
-    })?;
+    state.set_business_relaunch(
+        {
+            let session = session.clone();
+            move || session.capture_business_start()
+        },
+        {
+            let session = session.clone();
+            move |captured| session.request_explicit_business_start(captured)
+        },
+        {
+            let session = session.clone();
+            move || session.request_relaunch()
+        },
+    )?;
     state.set_native_control({
         let session = session.clone();
         move || {
@@ -492,7 +521,7 @@ async fn business_session(
 }
 
 async fn business_session_inner(
-    args: RuntimeArgs,
+    mut args: RuntimeArgs,
     state_root: std::path::PathBuf,
     state: Arc<ServerState>,
     session: std::sync::Arc<runtime_supervisor::OwnerSession>,
@@ -519,6 +548,11 @@ async fn business_session_inner(
     // operation_id；phase 由 launch 保留 Stopped 终态），不再用会话外
     // 的相位快照授权取消接力——Stop 落在旧快照与 token renew 之间不再
     // 被 renew 丢弃。
+    let saved_journal = state
+        .journal
+        .lock()
+        .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
+        .take();
     state.begin_business_session(launch.generation.clone(), launch.fresh, {
         let session = session.clone();
         move || stop_handover_in_progress(&session)
@@ -536,7 +570,10 @@ async fn business_session_inner(
             .await
             .context("prepare kernel for business relaunch")?;
     }
-    let mut journal = Journal::open_with_root(&args.workspace, state_root.clone())?;
+    let mut journal = match saved_journal {
+        Some(journal) => journal,
+        None => Journal::open_with_root(&args.workspace, state_root.clone())?,
+    };
     journal.attach_worker_generation(launch.generation.clone());
     if std::env::var(shared_types::APP_DEPLOY_GENERATION_ID).is_err()
         && let Some(receipt) = journal.receipt.as_ref()
@@ -547,14 +584,6 @@ async fn business_session_inner(
         .journal
         .lock()
         .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))? = Some(journal);
-    let migrate = state
-        .journal
-        .lock()
-        .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
-        .as_mut()
-        .context("deployment journal missing")?
-        .migrate_after_bind();
-    migrate.context("migrate deployment journal after management bind")?;
     crate::deploy::cleanup_startup(&args.workspace).await?;
 
     let signal_state = state.clone();
@@ -588,6 +617,17 @@ async fn business_session_inner(
         .err();
     }
     let ownership_claimed = startup_error.is_none();
+    if ownership_claimed && args.control_only {
+        args.control_only = match std::env::var(shared_types::APP_CLI_MANAGEMENT_BOOT_ID_ENV) {
+            Ok(boot_id) => state
+                .runtime_kernel()
+                .context("management boot requires runtime store")?
+                .store()
+                .consume_management_boot(&boot_id)?,
+            Err(std::env::VarError::NotPresent) => fresh_launch,
+            Err(error) => return Err(error).context("read management boot identifier"),
+        };
+    }
     // B05：内核装配先于启动决策。统一 owner 已在会话外完成装配——这里消费
     // 装配结果；未装配（状态根不可用）时写入口 fail-closed。
     let mut kernel_recovery_hold = false;
@@ -1712,6 +1752,13 @@ pub(super) async fn assemble_runtime_kernel(
         .set(owner_workspace.clone())
         .map_err(|_| anyhow::anyhow!("owner execution workspace was already initialized"))?;
     let dispatch = Box::new(move |action: DispatchAction| {
+        if let DispatchAction::CancelSource { operation_id } = &action {
+            if let Err(error) = dispatch_state.source_cancellation.cancel(operation_id) {
+                dispatch_state.begin_runtime_recovery_hold();
+                tracing::warn!(operation_id, %error, "cancel original Source execution failed");
+            }
+            return;
+        }
         let executing_id = match &action {
             DispatchAction::OrchestrateSource { operation_id, .. }
             | DispatchAction::DeployLocalArtifact { operation_id, .. }
@@ -1730,6 +1777,17 @@ pub(super) async fn assemble_runtime_kernel(
             });
             return;
         }
+        let business_start = if let Some(id) = executing_id {
+            match dispatch_state.capture_business_relaunch() {
+                Ok(captured) => captured,
+                Err(error) => {
+                    reject_business_intent(&dispatch_state, id, error);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let credential_recovery = match &action {
             DispatchAction::OrchestrateSource { pg, .. } => dispatch_state
                 .credential_recovery(pg.as_ref(), CredentialRecoveryPurpose::StartCurrentSource),
@@ -1738,7 +1796,9 @@ pub(super) async fn assemble_runtime_kernel(
                 pg.as_ref(),
                 CredentialRecoveryPurpose::RestoreConfirmedArtifact,
             ),
-            DispatchAction::StopBusiness { .. } => Ok(CredentialRecovery::NotRequired),
+            DispatchAction::StopBusiness { .. } | DispatchAction::CancelSource { .. } => {
+                Ok(CredentialRecovery::NotRequired)
+            }
         };
         let (evaluated_recovery, mut recovery_failure) = match credential_recovery {
             Ok(allowed) => (allowed, None),
@@ -1870,6 +1930,12 @@ pub(super) async fn assemble_runtime_kernel(
 
                     run_pg: pg,
                 };
+                if let Err(error) =
+                    dispatch_state.commit_business_relaunch(&operation_id, business_start.as_ref())
+                {
+                    reject_business_intent(&dispatch_state, &operation_id, error);
+                    return;
+                }
                 if dispatch_state.deploy_tx.send(request).is_err() {
                     // RV02：发送失败按原 ID 收束真实失败——内核已受理，
                     // 不能只打日志留下永久 Accepted。
@@ -1930,6 +1996,12 @@ pub(super) async fn assemble_runtime_kernel(
 
                     run_pg: pg,
                 };
+                if let Err(error) =
+                    dispatch_state.commit_business_relaunch(&operation_id, business_start.as_ref())
+                {
+                    reject_business_intent(&dispatch_state, &operation_id, error);
+                    return;
+                }
                 if dispatch_state.deploy_tx.send(request).is_err() {
                     // RV02：同上——发送失败按原 ID 收束真实失败。
                     let state = dispatch_state.clone();
@@ -1967,6 +2039,14 @@ pub(super) async fn assemble_runtime_kernel(
                     if state.settle_cancelled_before_execution(&operation_id).await {
                         return;
                     }
+                    let business_start =
+                        match wait_source_management(&state, &operation_id, business_start).await {
+                            Ok(captured) => captured,
+                            Err(error) => {
+                                reject_business_intent(&state, &operation_id, error);
+                                return;
+                            }
+                        };
                     // This original admitted Source operation owns derivation;
                     // neither its CLI caller nor artifact restoration writes it.
                     // Retain the writer until physical publication has ended so
@@ -2002,6 +2082,30 @@ pub(super) async fn assemble_runtime_kernel(
                         return;
                     }
                     if state.settle_cancelled_before_execution(&operation_id).await {
+                        return;
+                    }
+                    match state.credential_recovery(
+                        pg.as_ref(),
+                        CredentialRecoveryPurpose::StartCurrentSource,
+                    ) {
+                        Ok(evaluated) if evaluated.supplies_credentials() => {
+                            if let Err(error) =
+                                state.consume_credentials_hold(&operation_id, evaluated)
+                            {
+                                reject_business_intent(&state, &operation_id, error);
+                                return;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            reject_business_intent(&state, &operation_id, error);
+                            return;
+                        }
+                    }
+                    if let Err(error) =
+                        state.commit_business_relaunch(&operation_id, business_start.as_ref())
+                    {
+                        reject_business_intent(&state, &operation_id, error);
                         return;
                     }
                     match state.control_tx.send(ControlSignal::OrchestrateSource {
@@ -2055,6 +2159,7 @@ pub(super) async fn assemble_runtime_kernel(
                     });
                 }
             }
+            DispatchAction::CancelSource { .. } => {}
         }
     });
     Ok(Arc::new(RuntimeKernel::new(store, identity, dispatch)))
@@ -2074,8 +2179,7 @@ fn restore_standalone_generation_before_identity(
     if slot.is_some() {
         return Ok(());
     }
-    let mut journal = Journal::open_with_root(workspace, root.to_path_buf())?;
-    journal.migrate_after_bind()?;
+    let journal = Journal::open_with_root(workspace, root.to_path_buf())?;
     if let Some(receipt) = journal.receipt.as_ref() {
         if receipt.generation.trim().is_empty()
             || receipt.operation.deployment_generation_id != receipt.generation
@@ -2102,6 +2206,68 @@ fn restore_standalone_generation_before_identity(
     Ok(())
 }
 
+fn reject_business_intent(state: &Arc<ServerState>, operation_id: &str, error: anyhow::Error) {
+    let state = state.clone();
+    let operation_id = operation_id.to_owned();
+    tokio::spawn(async move {
+        if state.settle_cancelled_before_execution(&operation_id).await {
+            return;
+        }
+        if let Err(persist_error) = state
+            .finish_runtime_operation_by_id(
+                &operation_id,
+                shared_types::RuntimeOperationState::Failed,
+                Some((
+                    shared_types::ERR_OPERATION_IN_PROGRESS.into(),
+                    format!("commit original business intent before dispatch: {error:#}"),
+                )),
+            )
+            .await
+        {
+            hold_unconfirmed(
+                &state,
+                format!("persist business intent rejection: {persist_error:#}"),
+            )
+            .await;
+        }
+    });
+}
+
+async fn wait_source_management(
+    state: &Arc<ServerState>,
+    operation_id: &str,
+    captured: Option<runtime_supervisor::BusinessStartPermit>,
+) -> Result<Option<runtime_supervisor::BusinessStartPermit>> {
+    let Some(captured) = captured else {
+        return Ok(None);
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+    loop {
+        anyhow::ensure!(
+            !state
+                .runtime_kernel()
+                .is_some_and(|kernel| kernel.is_cancelled(operation_id)),
+            "original Source was cancelled during management initialization"
+        );
+        let observed = state
+            .capture_business_relaunch()?
+            .context("native business capture hook disappeared")?;
+        if !state.initializing() && !state.business_recovery_active() && observed.management_ready()
+        {
+            return captured.after_initialization(&observed).map(Some);
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "actual management initialization deadline exceeded for Source {operation_id}"
+        );
+        tokio::time::sleep_until(std::cmp::min(
+            deadline,
+            tokio::time::Instant::now() + std::time::Duration::from_millis(50),
+        ))
+        .await;
+    }
+}
+
 pub(super) async fn establish_startup_quiescence(
     state: &ServerState,
     supervised: bool,
@@ -2119,11 +2285,34 @@ pub(super) async fn establish_startup_quiescence(
     stop_owned
         .await
         .context("confirm startup business process shutdown")?;
+    if let Some(kernel) = state.runtime_kernel() {
+        kernel
+            .store()
+            .drain_legacy_execution(
+                &kernel.identity().application_id,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(15),
+            )
+            .await
+            .context(
+                "confirm actual legacy business ranges stopped before control history migration",
+            )?;
+        kernel
+            .store()
+            .reconcile_legacy_after_quiescence()
+            .context("reconcile legacy runtime history after actual business shutdown")?;
+        kernel
+            .store()
+            .repair_desired_after_quiescence()
+            .context("preserve damaged desired state after actual business shutdown")?;
+    }
     let mut guard = state
         .journal
         .lock()
         .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?;
     if let Some(journal) = guard.as_mut() {
+        journal
+            .reconcile_legacy_after_quiescence()
+            .context("reconcile old deployment control history after actual business shutdown")?;
         if let Err(error) = normalize_platform_generation_after_quiescence(state, journal) {
             tracing::error!(%error, "Legacy deployment identity remains unconfirmed; preserving its records and recovery protection");
             state.begin_runtime_recovery_hold();
@@ -2401,6 +2590,8 @@ pub(super) async fn initialize_startup(
     args: &RuntimeArgs,
     state: &ServerState,
 ) -> Result<Option<InitialAction>> {
+    // The unified owner's session has reduced this flag to the first physical
+    // management wake. A consumed boot ID never overrides a later Source intent.
     if args.control_only {
         state.set_phase(ServerPhase::Idle);
         return Ok(None);
@@ -2463,6 +2654,27 @@ pub(super) async fn initialize_startup(
         .inspect_err(|_| state.begin_runtime_recovery_hold())?;
     if let Some(receipt) = resume {
         let release = crate::manifest::read_release_lock(&args.workspace)?;
+        if receipt
+            .active
+            .as_ref()
+            .map(|active| active.artifact_release_id.as_str())
+            != Some(release.release_id.as_str())
+            && receipt
+                .active
+                .as_ref()
+                .and_then(|active| active.request.as_ref())
+                .is_some_and(|request| request.execution_target == Some(ExecutionTarget::Source))
+        {
+            state
+                .journal
+                .lock()
+                .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
+                .as_ref()
+                .context("historical source journal missing")?
+                .preserve_source_history()?;
+            state.begin_source_history_hold();
+            return Err(credential_recovery::SourceHistoryProblem::DerivedSourceChanged.into());
+        }
         anyhow::ensure!(
             receipt
                 .active

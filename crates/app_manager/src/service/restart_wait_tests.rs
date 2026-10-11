@@ -335,6 +335,7 @@ async fn active_physical_stop_and_restart_reject_restart_without_queueing() {
             .metadata
             .store
             .admit_compute_control(&ComputeControlRequest {
+                builder_startup_mode: Default::default(),
                 app_id: app_id.into(),
                 lifecycle_id: app.lifecycle_id.clone(),
                 scope: UserAppOperationScope::Prod,

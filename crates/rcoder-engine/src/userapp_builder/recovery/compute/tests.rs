@@ -10,6 +10,7 @@ async fn seed(state: &AppState, name: &str, bound: bool, unknown: bool) -> Compu
     let pending = state
         .userapp_store
         .admit_compute_control(&ComputeControlRequest {
+            builder_startup_mode: Default::default(),
             app_id: name.into(),
             lifecycle_id: app.lifecycle_id,
             scope: UserAppOperationScope::Dev,

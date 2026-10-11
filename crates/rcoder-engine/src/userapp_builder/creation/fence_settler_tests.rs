@@ -160,6 +160,7 @@ impl AgentContainerRuntime for FenceRuntime {
     ) -> ContainerRuntimeResult<BuilderControlTarget> {
         // workload=None → capture_bound_target 回落到 capture_builder_control。
         Ok(BuilderControlTarget {
+            builder_startup_mode: Default::default(),
             resource_binding: None,
             context: _context.clone(),
             workload: None,
@@ -174,6 +175,7 @@ impl AgentContainerRuntime for FenceRuntime {
     ) -> ContainerRuntimeResult<BuilderControlTarget> {
         let workload = self.builder_workload.lock().expect("lock").clone();
         Ok(BuilderControlTarget {
+            builder_startup_mode: Default::default(),
             resource_binding: None,
             context: context.clone(),
             workload: workload.map(|name| AppResourceIdentity {
@@ -194,6 +196,14 @@ impl WorkspaceRuntime for FenceRuntime {}
 
 #[async_trait::async_trait]
 impl UserAppDeploymentRuntime for FenceRuntime {
+    async fn discover_application_identity(
+        &self,
+        _: &str,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppDiscoveredIdentity>> {
+        // This protocol fixture has no native metadata discovery witnesses;
+        // the caller's real lifecycle store remains the existing identity.
+        Ok(None)
+    }
     async fn prepare_compute_operation(
         &self,
         context: &shared_types::UserAppExecutionContext,

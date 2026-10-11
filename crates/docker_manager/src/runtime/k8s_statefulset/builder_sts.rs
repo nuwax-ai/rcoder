@@ -60,7 +60,7 @@ impl KubernetesRuntime {
         let family = ServiceType::UserappBuilder;
         let name = self.pod_name(&context.app_id, &family)?;
         let api = self.statefulsets();
-        let existing = match api.get_opt(&name).await {
+        let mut existing = match api.get_opt(&name).await {
             Ok(Some(existing)) => existing,
             Ok(None) => match api.create(&PostParams::default(), &desired).await {
                 Ok(_) => return Ok(()),
@@ -112,7 +112,8 @@ impl KubernetesRuntime {
                             "Desired builder template hash is missing".into(),
                         )
                     })?;
-                self.heal_builder_template_hash(&existing, desired_hash)
+                existing = self
+                    .heal_builder_template_hash(&existing, desired_hash)
                     .await?;
             }
         }
@@ -347,7 +348,7 @@ impl KubernetesRuntime {
         &self,
         existing: &StatefulSet,
         desired_hash: &str,
-    ) -> ContainerRuntimeResult<()> {
+    ) -> ContainerRuntimeResult<StatefulSet> {
         let Some(name) = existing.metadata.name.as_deref() else {
             return Err(ContainerRuntimeError::ConfigurationError(
                 "Existing builder StatefulSet has no name".into(),
@@ -365,12 +366,11 @@ impl KubernetesRuntime {
             &mut heal_patch,
             &existing.metadata,
         )?;
-        if let Err(error) = self
+        let healed = self
             .statefulsets()
             .patch(name, &PatchParams::default(), &Patch::Merge(heal_patch))
             .await
-        {
-            return Err(match &error {
+            .map_err(|error| match &error {
                 kube::Error::Api(status) if status.code == 409 || status.code == 422 => {
                     ContainerRuntimeError::Conflict(
                         "Builder StatefulSet changed during template-hash heal".into(),
@@ -379,13 +379,17 @@ impl KubernetesRuntime {
                 _ => ContainerRuntimeError::K8sError(format!(
                     "Heal builder template hash {name}: {error}"
                 )),
-            });
+            })?;
+        if healed.metadata.uid != existing.metadata.uid {
+            return Err(ContainerRuntimeError::Conflict(
+                "Builder StatefulSet replaced during template-hash heal".into(),
+            ));
         }
         warn!(
             "[K8S-STS] {} template-hash healed to current algorithm (legacy annotation superseded)",
             name
         );
-        Ok(())
+        Ok(healed)
     }
 }
 

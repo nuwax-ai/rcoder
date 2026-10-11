@@ -33,6 +33,29 @@ PROXY = "http://127.0.0.1:9080"
 TERMINAL = {"succeeded", "failed", "cancelled", "recovery_required"}
 
 
+def owner_initialization_complete(snapshot, recovery_status, recovery, runtime_instance, supervisor):
+    """Pure admission guard: identity availability is not startup completion."""
+    if not runtime_instance or not supervisor or snapshot.get("supervisor_id") != supervisor:
+        raise AssertionError("native owner changed during initialization")
+    phase = snapshot.get("phase")
+    if phase not in {"reconciling", "starting", "ready", "stopping", "cleanup_pending",
+                     "recovery_required", "stopped"}:
+        raise AssertionError("native owner initialization has an unknown phase")
+    if phase == "recovery_required" or snapshot.get("error") is not None:
+        raise AssertionError("native owner initialization requires recovery")
+    if recovery_status == 503 and recovery.get("code") == "ERR_INITIALIZING":
+        return False
+    if recovery_status != 200 or recovery.get("success") is not True:
+        raise AssertionError(f"owner initialization recovery query failed: status={recovery_status}, "
+                             f"code={recovery.get('code')}")
+    view = recovery.get("data")
+    if not isinstance(view, dict) or view.get("runtime_instance_id") != runtime_instance:
+        raise AssertionError("startup recovery belongs to a different owner instance")
+    if view.get("kernel_protected") is not False or view.get("owner_protected") is not False:
+        raise AssertionError("fresh isolated owner initialization remains recovery-protected")
+    return phase == "ready"
+
+
 def require_business_process(captured, python_binary: Path, script: Path):
     """Pure fault-injection guard; an HTTP PID alone never authorizes a signal."""
     if (type(captured.get("pid")) is not int or captured["pid"] <= 1
@@ -56,7 +79,7 @@ class Acceptance:
         self.evidence = {"engine": engine, "source_digest": source_digest,
                          "checks": [], "operations": [], "passed": False}
 
-    def request(self, path: str, method="GET", body=None, request_id=None, base=ADMIN):
+    def request(self, path: str, method="GET", body=None, request_id=None, base=ADMIN, timeout=None):
         headers = {"X-Deploy-Token": self.token, "Connection": "close"}
         if request_id:
             headers["X-Request-ID"] = request_id
@@ -67,7 +90,8 @@ class Acceptance:
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
         try:
-            with self.opener.open(req, timeout=35 if method == "POST" else 5) as response:
+            with self.opener.open(req, timeout=timeout if timeout is not None else
+                                  (35 if method == "POST" else 5)) as response:
                 status, raw = response.status, response.read()
         except urllib.error.HTTPError as error:
             status, raw = error.code, error.read()
@@ -98,8 +122,8 @@ class Acceptance:
             time.sleep(0.2)
         raise AssertionError(f"observation deadline exhausted; last={last!r}")
 
-    def identity(self):
-        status, envelope = self.request("/v1/runtime/identity")
+    def identity(self, timeout=None):
+        status, envelope = self.request("/v1/runtime/identity", timeout=timeout)
         if status==503 and envelope.get("code")=="ERR_INITIALIZING":
             self.evidence["identity_initializing_observations"]=self.evidence.get("identity_initializing_observations",0)+1
             self.save()
@@ -107,6 +131,43 @@ class Acceptance:
         if status != 200 or not envelope.get("success"):
             raise AssertionError(f"management identity unavailable: status={status}, code={envelope.get('code')}")
         return envelope["data"]
+
+    def wait_owner_initialized(self, captured_identity, seconds=45):
+        """Bounded read-only wait; only explicit ERR_INITIALIZING is transient."""
+        runtime_instance = captured_identity["runtime_instance_id"]
+        deadline = time.monotonic() + seconds
+        supervisor = None
+        last = None
+
+        def remaining(limit):
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise AssertionError(f"owner initialization deadline exhausted; last={last!r}")
+            return min(limit, budget)
+
+        while True:
+            current = self.identity(timeout=remaining(5))
+            if not isinstance(current, dict) or current.get("runtime_instance_id") != runtime_instance:
+                raise AssertionError("management owner changed after initialization identity capture")
+            snapshot = self.native_status(timeout=remaining(3))
+            if supervisor is None:
+                supervisor = snapshot["supervisor_id"]
+            binding = snapshot.get("binding") or {}
+            if (binding.get("component") != "app-cli"
+                    or Path(binding.get("resource", "")).resolve(strict=True) != WORK.resolve(strict=True)):
+                raise AssertionError("initializing native owner belongs to another workspace")
+            status, recovery = self.request("/v1/runtime/recovery", timeout=remaining(5))
+            last = {"supervisor_id": snapshot["supervisor_id"], "phase": snapshot["phase"],
+                    "recovery_status": status, "recovery_code": recovery.get("code")}
+            initialized = owner_initialization_complete(snapshot, status, recovery,
+                                                        runtime_instance, supervisor)
+            remaining(5)  # A late successful read cannot exceed the original budget.
+            if initialized:
+                self.check("captured owner finished initialization before business admission", True,
+                           runtime_instance_id=runtime_instance, supervisor_id=supervisor,
+                           native_phase=snapshot["phase"], recovery=recovery["data"])
+                return captured_identity
+            time.sleep(min(0.2, remaining(0.2)))
 
     def owner_environment(self):
         env = os.environ.copy()
@@ -125,6 +186,7 @@ class Acceptance:
         return env
 
     def start_owner(self):
+        deadline = time.monotonic() + 45
         env = self.owner_environment()
         args = [str(CLI), "serve", "--workspace", str(WORK), "--control-only",
                 "--log-dir", str(STATE / "logs"), "--admin-addr", "0.0.0.0:3010"]
@@ -147,7 +209,9 @@ class Acceptance:
             self.supervisor = subprocess.Popen(["supervisord", "-n", "-c", str(conf)], env=env,
                                                stdout=open(STATE / "supervisor-console.log", "ab"),
                                                stderr=subprocess.STDOUT, start_new_session=True)
-        self.wait(self.identity, lambda view: isinstance(view,dict) and bool(view.get("runtime_instance_id")), 45)
+        captured = self.wait(self.identity, lambda view: isinstance(view,dict) and bool(view.get("runtime_instance_id")),
+                             max(0, deadline - time.monotonic()))
+        self.wait_owner_initialized(captured, seconds=max(0, deadline - time.monotonic()))
 
     def operate(self, kind: str, succeeds=True):
         identity = self.identity()
@@ -252,7 +316,7 @@ class Acceptance:
                                          "pid": pid, "start_ticks": captured["start_ticks"]})
         self.save()
 
-    def native_status(self):
+    def native_status(self, timeout=3):
         discovery = json.loads((STATE / "control/supervisor.json").read_text())
         if discovery["version"] != 2:
             raise AssertionError("native status protocol changed before business fault injection")
@@ -260,7 +324,7 @@ class Acceptance:
         frame = {"version": 2, "instance": discovery["instance"], "token": discovery["token"],
                  "request": {"request_id": str(uuid.uuid4()), "action": "status",
                              "expected_generation": discovery["snapshot"]["generation"]}}
-        with socket.create_connection((address, int(port)), timeout=3) as connection:
+        with socket.create_connection((address, int(port)), timeout=timeout) as connection:
             connection.sendall(json.dumps(frame).encode() + b"\n")
             with connection.makefile("rb") as reader:
                 raw = reader.readline(32769)
@@ -547,7 +611,10 @@ class Acceptance:
         if self.engine == "builtin":
             self.owner.wait(timeout=10)
             self.start_owner()
-        self.wait(self.identity, lambda view: isinstance(view,dict) and view["runtime_instance_id"] != original_identity)
+        recovery_deadline = time.monotonic() + 90
+        recovered_identity = self.wait(self.identity, lambda view: isinstance(view,dict) and view["runtime_instance_id"] != original_identity,
+                                       max(0, recovery_deadline - time.monotonic()))
+        self.wait_owner_initialized(recovered_identity, seconds=max(0, recovery_deadline - time.monotonic()))
         self.operate("restart"); self.ready("B")
         self.check("same state and sentinel after both crashes", hashlib.sha256((STATE / "sentinel.txt").read_bytes()).hexdigest() == sentinel)
         self.stop_once()

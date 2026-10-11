@@ -13,6 +13,9 @@
 
 pub mod db;
 mod db_password;
+#[cfg(test)]
+mod dev_access_route_tests;
+mod dev_request;
 mod error_body;
 pub(crate) mod file_credentials;
 pub mod forward;

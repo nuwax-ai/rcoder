@@ -145,6 +145,7 @@ impl Fixture {
         let mut evidence = BuilderCreationEvidence {
             creation_lease_released: true,
             target: BuilderControlTarget {
+                builder_startup_mode: Default::default(),
                 context: UserAppExecutionContext {
                     app_id: app.app_id.clone(),
                     lifecycle_id: app.lifecycle_id.clone(),
@@ -698,6 +699,7 @@ async fn stop_or_delete_admission_fences_registration_and_preserves_operation() 
         if stop {
             f.control
                 .admit_compute_control(&ComputeControlRequest {
+                    builder_startup_mode: Default::default(),
                     app_id: f.app.app_id.clone(),
                     lifecycle_id: f.app.lifecycle_id.clone(),
                     scope: UserAppOperationScope::Dev,

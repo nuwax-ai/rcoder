@@ -46,6 +46,20 @@ impl ConfirmationRuntime {
 
 #[async_trait::async_trait]
 impl AgentContainerRuntime for ConfirmationRuntime {
+    async fn get_bound_builder_file_credentials(
+        &self,
+        target: &BuilderControlTarget,
+    ) -> ContainerRuntimeResult<shared_types::FileServerRequestCredentials> {
+        let expected = self.capture_builder_control(&target.context).await?;
+        if target.workload != expected.workload || target.pod != expected.pod {
+            return Err(ContainerRuntimeError::Conflict(
+                "fixture credential peer was replaced".into(),
+            ));
+        }
+        // This fixture's actual HTTP peer explicitly has optional auth disabled;
+        // do not synthesize credentials from the AppState's latest template.
+        Ok(shared_types::FileServerRequestCredentials::default())
+    }
     async fn create_container(
         &self,
         params: container_runtime_api::ContainerCreateParams,
@@ -291,6 +305,7 @@ async fn fixture_on_store(
         format!("builder-{app_id}")
     };
     let current = BuilderControlTarget {
+        builder_startup_mode: Default::default(),
         resource_binding: None,
         context,
         workload: Some(AppResourceIdentity {

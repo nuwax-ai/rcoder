@@ -350,7 +350,7 @@ fn verify_upgrade_domain(
 /// A retry must use the admitted native Shutdown identity. Its explicit
 /// expected generation preserves the original execution even after live slots
 /// become idle; no request, migration outcome or cleanup result is fabricated.
-fn upgrade_shutdown_request(
+pub(super) fn upgrade_shutdown_request(
     root: &Path,
     snapshot: &runtime_supervisor::Snapshot,
 ) -> Result<(runtime_supervisor::Snapshot, runtime_supervisor::Request)> {

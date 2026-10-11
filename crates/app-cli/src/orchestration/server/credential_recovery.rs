@@ -19,6 +19,7 @@ pub(super) enum SourceHistoryProblem {
     AmbiguousArtifact,
     DeploymentGenerationChanged,
     InconsistentDeploymentIdentity,
+    DerivedSourceChanged,
 }
 
 impl std::fmt::Display for SourceHistoryProblem {
@@ -37,6 +38,7 @@ impl SourceHistoryProblem {
                 Self::InconsistentDeploymentIdentity => {
                     "error.source_history.inconsistent_identity"
                 }
+                Self::DerivedSourceChanged => "error.source_history.derived_source_changed",
             },
             locale,
         )
@@ -257,6 +259,7 @@ mod localization_tests {
             SourceHistoryProblem::AmbiguousArtifact,
             SourceHistoryProblem::DeploymentGenerationChanged,
             SourceHistoryProblem::InconsistentDeploymentIdentity,
+            SourceHistoryProblem::DerivedSourceChanged,
         ] {
             let english = problem.to_string();
             assert!(english.is_ascii() && english.starts_with("The previous"));

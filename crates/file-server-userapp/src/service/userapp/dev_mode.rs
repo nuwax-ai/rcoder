@@ -730,7 +730,9 @@ mod tests {
             runtime_instance_id: "healthy-owner".into(),
             deployment_generation_id: "healthy-generation".into(),
             protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
-            capabilities: Vec::new(),
+            // The owner supports official proxy restart, but intentionally
+            // lacks startup-probe-v1: that is the preflight contract under test.
+            capabilities: vec![shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into()],
         };
         let posts = Arc::new(AtomicUsize::new(0));
         let count = posts.clone();

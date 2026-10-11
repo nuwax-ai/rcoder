@@ -724,6 +724,7 @@ mod tests {
             }).await.unwrap();
             }
             let target = |uid: &str, pod_uid: &str| BuilderControlTarget {
+                builder_startup_mode: Default::default(),
                 resource_binding: None,
                 context: context.clone(),
                 workload: Some(AppResourceIdentity {

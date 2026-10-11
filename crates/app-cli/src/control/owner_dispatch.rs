@@ -3,7 +3,7 @@
 //! 同一 workspace 已有 serve owner（OwnerGuard 被活进程持有）时，重复的
 //! legacy CLI 调用**不再绕过所有权**本地起第二套编排——转为运行 API 客户端：
 //! 提交 Start/Restart(Source) 并等待终态（“重复启动是正常操作”）。身份不符、
-//! 协议不兼容、凭据缺失 → 明确拒绝（不杀对方、不换端口、不删锁文件）。
+//! 本应用旧协议或损坏控制记录由认证 native 通道收束后重建；异应用拒绝。
 //!
 //! 普通 run 无 owner 时由 run_client 拉起 serve --control-only，再提交
 //! 明确 Source 或 Artifact 操作。serve 自身承载 owner；内核锁保证唯一性。
@@ -271,15 +271,42 @@ pub async fn reuse_management_owner(
     let workspace = normalized.as_path();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
     tokio::time::timeout_at(deadline, async {
-        let (address, identity) =
-            discover_owner(admin_addr, state_root, std::time::Duration::from_secs(10))
-                .await
-                .context("owner lock is held but no management identity is available")?;
+        let discovered =
+            discover_owner(admin_addr, state_root, std::time::Duration::from_secs(10)).await;
+        let (address, identity) = match discovered {
+            Some(discovered) => discovered,
+            None => {
+                let mut addresses = vec![connect_address(admin_addr)];
+                if let Some(endpoint) =
+                    crate::runtime_kernel::RuntimeStore::read_endpoint(state_root)
+                {
+                    addresses.push(connect_address(&endpoint.address));
+                }
+                if super::failed_management::retire_failed_kernel(
+                    state_root, workspace, &addresses, deadline,
+                )
+                .await?
+                {
+                    return Ok(ManagementReuse::NoOwner);
+                }
+                for address in &addresses {
+                    if legacy_app_cli_responds(address).await {
+                        super::failed_management::retire_owned_manager(
+                            state_root, workspace, deadline,
+                        )
+                        .await
+                        .context("retire this application's legacy management owner")?;
+                        return Ok(ManagementReuse::NoOwner);
+                    }
+                }
+                // No readiness is not permission to bootstrap. The run client
+                // rechecks the real OS lock and waits within its original budget.
+                return Ok(ManagementReuse::NoOwner);
+            }
+        };
         anyhow::ensure!(
-            identity.protocol_version == RUNTIME_CONTROL_PROTOCOL_VERSION
-                && identity.application_id == application_id
-                && identity.service_family == "userapp-dev",
-            "management owner identity does not match this application and protocol"
+            identity.application_id == application_id && identity.service_family == "userapp-dev",
+            "management owner belongs to another application or service family"
         );
         shared_types::validate_identifier(&identity.workspace_id, "workspace_id")
             .map_err(anyhow::Error::msg)?;
@@ -302,7 +329,14 @@ pub async fn reuse_management_owner(
             }
             bail!("management owner belongs to another workspace");
         }
-        verify_saved_management_identity(state_root, &identity)?;
+        if identity.protocol_version != RUNTIME_CONTROL_PROTOCOL_VERSION
+            || verify_saved_management_identity(state_root, &identity).is_err()
+        {
+            super::failed_management::retire_owned_manager(state_root, workspace, deadline)
+                .await
+                .context("rebuild management after legacy protocol or damaged identity record")?;
+            return Ok(ManagementReuse::NoOwner);
+        }
         if !supports_official_proxy_restart(&identity) {
             crate::control::managed_owner::retire_unsupported_proxy(
                 state_root, workspace, &address, &identity, deadline,
@@ -508,11 +542,16 @@ async fn dispatch_to_owner_inner(
     // 凭据：owner 启用写端点时落盘状态根（与平台侧同一读取契约）
     let token = crate::runtime_kernel::RuntimeStore::read_token(state_root);
     let Some(token) = token else {
-        bail!(
-            "workspace is already managed by an app-cli owner whose runtime API \
-             credentials have not been published or cannot be read; \
-             wait for owner initialization or check state directory access"
-        );
+        super::failed_management::retire_observed_manager(
+            state_root,
+            workspace,
+            admin_addr,
+            &identity,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(45),
+        )
+        .await
+        .context("restore management after its API credential became unavailable")?;
+        return Ok(OwnerDispatch::NoOwner);
     };
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -526,12 +565,28 @@ async fn dispatch_to_owner_inner(
     // 当前 revision + 提交 Start（源码形态——legacy 入口无制品输入）
     let status_url = format!("http://{admin_addr}/v1/runtime/status");
     let status: shared_types::RuntimeStatusView = {
-        let body: serde_json::Value = client
+        let response = client
             .get(&status_url)
             .header("X-Deploy-Token", &token)
             .send()
             .await
-            .context("query owner status")?
+            .context("query owner status")?;
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            super::failed_management::retire_observed_manager(
+                state_root,
+                workspace,
+                admin_addr,
+                &identity,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(45),
+            )
+            .await
+            .context("recover this owner's unavailable management credentials")?;
+            return Ok(OwnerDispatch::NoOwner);
+        }
+        let body: serde_json::Value = response
             .error_for_status()
             .context("owner status rejected")?
             .json()
@@ -548,8 +603,23 @@ async fn dispatch_to_owner_inner(
             .get(format!("http://{admin_addr}/v1/runtime/recovery"))
             .header("X-Deploy-Token", &token)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            super::failed_management::retire_observed_manager(
+                state_root,
+                workspace,
+                admin_addr,
+                &identity,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(45),
+            )
+            .await
+            .context("recover management credentials before submitting Source")?;
+            return Ok(OwnerDispatch::NoOwner);
+        }
+        let response = response.error_for_status()?;
         let body: serde_json::Value = response.json().await?;
         let recovery: shared_types::RuntimeRecoveryView =
             serde_json::from_value(envelope_data(&body)?)?;
@@ -581,7 +651,7 @@ async fn dispatch_to_owner_inner(
     }
     let operation_id = format!("cli-dispatch-{}", uuid::Uuid::new_v4().simple());
     println!("observing Source operation {operation_id}");
-    let request = RuntimeOperationRequest {
+    let mut request = RuntimeOperationRequest {
         operation_id: operation_id.clone(),
         expected_runtime_instance_id: identity.runtime_instance_id.clone(),
         expected_revision: status.revision,
@@ -596,38 +666,106 @@ async fn dispatch_to_owner_inner(
         request_context: None,
     };
     let submit_url = format!("http://{admin_addr}/v1/runtime/operations");
-    let response = client
-        .post(&submit_url)
-        .header("X-Deploy-Token", &token)
-        .json(&request)
-        .send()
+    let poll_path = format!("/v1/runtime/operations/{operation_id}");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+    let accepted = loop {
+        let response = tokio::time::timeout_at(deadline, client.post(&submit_url)
+            .header("X-Deploy-Token", &token).json(&request).send()).await
+            .with_context(|| format!("Source operation {operation_id} admission deadline"))?
+            .with_context(|| format!("submit Source operation {operation_id}; query this ID before retrying an unconfirmed submission"))?;
+        let status_code = response.status();
+        let body: serde_json::Value = tokio::time::timeout_at(deadline, response.json())
+            .await
+            .context("Source admission response deadline")?
+            .context("parse submit response")?;
+        if status_code.is_success() {
+            break Some(
+                serde_json::from_value::<shared_types::RuntimeOperationAccepted>(envelope_data(
+                    &body,
+                )?)
+                .context("decode operation acceptance receipt")?,
+            );
+        }
+        let code = body
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("ERR");
+        if !matches!(
+            code,
+            "ERR_OPERATION_IN_PROGRESS" | "ERR_INITIALIZING" | "ERR_REVISION_MISMATCH"
+        ) {
+            bail!(
+                "owner rejected dispatch: {} ({code})",
+                body.get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+            );
+        }
+        // Reconcile this exact ID before changing any admission precondition.
+        // Only a confirmed not-found after a known zero-write rejection permits
+        // another POST; transport failures never replay an unknown write.
+        let observed = tokio::time::timeout_at(
+            deadline,
+            client
+                .get(format!("http://{admin_addr}{poll_path}"))
+                .header("X-Deploy-Token", &token)
+                .send(),
+        )
         .await
-        .with_context(|| format!("submit Source operation {operation_id}; query this ID before retrying an unconfirmed submission"))?;
-    let status_code = response.status();
-    let body: serde_json::Value = response.json().await.context("parse submit response")?;
-    if !status_code.is_success() {
-        bail!(
-            "owner rejected dispatch: {} ({})",
-            body.get("message")
-                .and_then(|value| value.as_str())
-                .unwrap_or("unknown"),
-            body.get("code")
-                .and_then(|value| value.as_str())
-                .unwrap_or("ERR"),
+        .context("Source acceptance lookup deadline")??;
+        if observed.status().is_success() {
+            let reply: serde_json::Value = tokio::time::timeout_at(deadline, observed.json())
+                .await
+                .context("Source acceptance body deadline")??;
+            let original: RuntimeOperationView = serde_json::from_value(envelope_data(&reply)?)?;
+            anyhow::ensure!(
+                original.operation_id == operation_id
+                    && original.runtime_instance_id == identity.runtime_instance_id,
+                "Source acceptance lookup returned another operation"
+            );
+            break None;
+        }
+        anyhow::ensure!(
+            observed.status() == reqwest::StatusCode::NOT_FOUND,
+            "cannot confirm Source operation {operation_id} was not accepted"
+        );
+        let refreshed = tokio::time::timeout_at(
+            deadline,
+            client
+                .get(&status_url)
+                .header("X-Deploy-Token", &token)
+                .send(),
+        )
+        .await
+        .context("Source status refresh deadline")??;
+        if refreshed.status().is_success() {
+            let reply: serde_json::Value = tokio::time::timeout_at(deadline, refreshed.json())
+                .await
+                .context("Source status body deadline")??;
+            let current: shared_types::RuntimeStatusView =
+                serde_json::from_value(envelope_data(&reply)?)?;
+            if current.runtime_instance_id != identity.runtime_instance_id {
+                return Ok(OwnerDispatch::NoOwner);
+            }
+            request.expected_revision = current.revision;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "Source operation {operation_id} admission remains pending"
+        );
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + std::time::Duration::from_millis(100)).min(deadline),
+        )
+        .await;
+    };
+    if let Some(accepted) = accepted {
+        anyhow::ensure!(
+            accepted.operation_id == operation_id && accepted.poll == poll_path,
+            "owner returned a different operation acceptance receipt"
         );
     }
-    let accepted: shared_types::RuntimeOperationAccepted =
-        serde_json::from_value(envelope_data(&body)?)
-            .context("decode operation acceptance receipt")?;
-    let poll_path = format!("/v1/runtime/operations/{operation_id}");
-    anyhow::ensure!(
-        accepted.operation_id == operation_id && accepted.poll == poll_path,
-        "owner returned a different operation acceptance receipt"
-    );
 
-    // A 202 receipt is not a full operation view, even on terminal replay.
     // Fetch the authoritative view before trusting its instance, kind or outcome.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
     let mut event_cursor: u64 = 0;
     // R1：journal done 的持留捕获——原操作终态确认后经一致性校验才发出，
     // 终局绑定权威视图、恰好一次。

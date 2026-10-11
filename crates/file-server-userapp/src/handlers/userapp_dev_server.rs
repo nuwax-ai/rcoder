@@ -1374,7 +1374,9 @@ mod operation_recovery_tests {
                 runtime_instance_id: "original-instance".into(),
                 deployment_generation_id: "generation".into(),
                 protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
-                capabilities: vec![],
+                // This fixture models a current HTTP control owner. It does
+                // not model native retirement of a legacy Pingap owner.
+                capabilities: vec![shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into()],
             };
             let posts = Arc::new(Mutex::new(
                 Vec::<shared_types::RuntimeOperationRequest>::new(),

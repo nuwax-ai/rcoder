@@ -134,6 +134,17 @@ pub trait AgentContainerRuntime: Send + Sync {
         self.capture_builder_control(context).await
     }
 
+    /// Read credentials from this captured live builder, never from a later
+    /// platform template. Implementations must not expose the credential in logs.
+    async fn get_bound_builder_file_credentials(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<shared_types::FileServerRequestCredentials> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Captured builder file credentials are unsupported".into(),
+        ))
+    }
+
     /// Recover an original successful create response from a durable runtime
     /// receipt. May release only that receipt's original inactive lease; never
     /// create/start resources or infer success from a same-named container.
@@ -230,6 +241,16 @@ pub trait AgentContainerRuntime: Send + Sync {
         Ok(false)
     }
 
+    /// Read actual stopped compute, including an external stop without a
+    /// platform receipt. This does not authorize a write or retire a lease.
+    /// Pending/restarting resources cannot be treated as stopped.
+    async fn observe_builder_compute_stopped(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
     fn supports_builder_compute_fencing(&self) -> bool {
         false
     }
@@ -249,6 +270,31 @@ pub trait AgentContainerRuntime: Send + Sync {
         &self,
         _target: &shared_types::BuilderControlTarget,
     ) -> ContainerRuntimeResult<Option<shared_types::BuilderRestartTemplate>> {
+        Ok(None)
+    }
+
+    /// Recapture the same retained stopped builder when its historical archive
+    /// is unreadable. This only saves configuration; the caller must retain the
+    /// original operation lease, validate its volume witnesses, and persist the
+    /// replacement reference before any compute restore. Unsupported backends
+    /// cannot infer this capability from an absent or pending resource.
+    async fn recapture_stopped_builder_restart(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<shared_types::BuilderRestartTemplate> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Stopped builder restart recapture is unsupported".into(),
+        ))
+    }
+
+    /// Observe the private archive referenced by an existing checkpoint.
+    /// `Some(false)` identifies missing/damaged history; `None` means this
+    /// backend did not observe its bytes. This is a recovery aid, not a normal
+    /// query admission gate or authority to replace compute.
+    async fn inspect_builder_restart_archive(
+        &self,
+        _template: &shared_types::BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<Option<bool>> {
         Ok(None)
     }
 
@@ -312,6 +358,47 @@ pub trait AgentContainerRuntime: Send + Sync {
         Err(ContainerRuntimeError::ConfigurationError(
             "Captured builder startup is unsupported".into(),
         ))
+    }
+
+    /// Start using the restart archive captured before stopping old compute.
+    /// Runtimes that freeze a candidate configuration consume that same archive;
+    /// legacy archives retain their original startup semantics.
+    async fn start_builder_control_with_restart(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        template: &shared_types::BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        if template.source.context != target.context {
+            return Err(ContainerRuntimeError::Conflict(
+                "Builder restart archive belongs to a different operation".into(),
+            ));
+        }
+        self.start_builder_control(target).await
+    }
+
+    /// Consume the original startup intent and optional restart snapshot.
+    async fn start_builder_control_with_options(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        options: &shared_types::BuilderStartOptions,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        if options.startup_mode != target.builder_startup_mode {
+            return Err(ContainerRuntimeError::Conflict(
+                "Builder startup options changed after admission".into(),
+            ));
+        }
+        if options.startup_mode == shared_types::BuilderStartupMode::ManagementOnly {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Management-only builder startup is unsupported".into(),
+            ));
+        }
+        match options.restart_template.as_ref() {
+            Some(template) => {
+                self.start_builder_control_with_restart(target, template)
+                    .await
+            }
+            None => self.start_builder_control(target).await,
+        }
     }
 
     /// Return the currently configured builder image for an explicit compute

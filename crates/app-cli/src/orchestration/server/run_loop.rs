@@ -656,7 +656,11 @@ pub(super) async fn fail_activation(
         args,
         state,
         error,
-        shared_types::RuntimeOperationState::Failed,
+        if state.current_operation_cancelled() {
+            shared_types::RuntimeOperationState::Cancelled
+        } else {
+            shared_types::RuntimeOperationState::Failed
+        },
     )
     .await
 }
@@ -1320,6 +1324,8 @@ pub(super) async fn server_loop(
                 continue;
             };
             let orchestration_cancel = state.cancel_child_token();
+            let _source_cancellation =
+                state.register_source_cancellation(orchestration_cancel.clone())?;
             let orchestration = host.orchestrate(
                 &execution_args,
                 &release,
@@ -1481,6 +1487,7 @@ pub(super) async fn server_loop(
         // builtin：编排 supervise（可被下一次部署请求打断：cancel → 停服 → 回
         // Deploying）；编排完成进 supervise 时经 on_running 通知 → 相位切 Running。
         let cancel = state.cancel_child_token();
+        let _source_cancellation = state.register_source_cancellation(cancel.clone())?;
         let runtime_status = state.runtime_status();
         let (running_tx, mut running_rx) = tokio::sync::oneshot::channel::<()>();
         // RV05：内置引擎的服务编排任务延续捕获的命令范围——会话结束后

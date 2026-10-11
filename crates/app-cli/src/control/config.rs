@@ -174,7 +174,7 @@ pub struct ServeArgs {
     #[arg(long, env = "APP_CLI_ATTACH")]
     pub attach: bool,
     /// Restore management access only and wait for explicit operations; do not automatically start services or deploy from environment variables.
-    #[arg(long, conflicts_with = "attach")]
+    #[arg(long, env = shared_types::APP_CLI_CONTROL_ONLY_ENV, conflicts_with = "attach")]
     pub control_only: bool,
 }
 

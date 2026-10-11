@@ -32,12 +32,6 @@ pub(crate) struct PreparedAgentConfig {
     container_id: String,
 }
 
-impl PreparedAgentConfig {
-    pub(crate) fn image(&self) -> &str {
-        &self.image
-    }
-}
-
 impl<'a> AgentContainerStarter<'a> {
     pub fn new(manager: &'a DockerManager) -> Self {
         Self { manager }
@@ -109,6 +103,7 @@ impl<'a> AgentContainerStarter<'a> {
             container_id,
         } = prepared;
         let ContainerCreateParams {
+            builder_startup_mode,
             execution_context,
             creation_cancelled,
             project_id,
@@ -333,6 +328,17 @@ impl<'a> AgentContainerStarter<'a> {
         }
 
         // 注意：子容器以 root 用户运行，不再需要 UID/GID 匹配
+        if service_type == ServiceType::UserappBuilder
+            && builder_startup_mode == shared_types::BuilderStartupMode::ManagementOnly
+            && let Some(context) = &execution_context
+        {
+            builder = builder
+                .env(shared_types::APP_CLI_CONTROL_ONLY_ENV, "true")
+                .env(
+                    shared_types::APP_CLI_MANAGEMENT_BOOT_ID_ENV,
+                    &context.operation_id,
+                );
+        }
 
         // 设置网络
         let network_name = self.manager.get_main_network_name().await;

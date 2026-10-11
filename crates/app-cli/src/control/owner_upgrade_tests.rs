@@ -283,7 +283,7 @@ async fn missing_upgrade_capability_does_not_authorize_foreign_or_unauthenticate
 }
 
 #[tokio::test]
-async fn changed_saved_instance_is_not_retired_based_on_old_capability_probe() {
+async fn mismatched_saved_instance_is_repaired_by_captured_native_scope_cleanup() {
     let owner = OldOwner::start().await;
     let changed = RuntimeIdentityView {
         runtime_instance_id: uuid::Uuid::new_v4().to_string(),
@@ -294,23 +294,23 @@ async fn changed_saved_instance_is_not_retired_based_on_old_capability_probe() {
         serde_json::to_vec(&changed).unwrap(),
     )
     .unwrap();
-    let error = reuse_management_owner(
+    let result = reuse_management_owner(
         &owner.address,
         &owner.source,
         &owner.state,
         &owner.identity.application_id,
     )
     .await
-    .unwrap_err();
-    assert!(format!("{error:#}").contains("does not own the observed management API identity"));
+    .unwrap();
+    assert_eq!(result, ManagementReuse::NoOwner);
     assert!(
         runtime_supervisor::Owner::try_acquire(&owner.state)
             .unwrap()
-            .is_none()
+            .is_some()
     );
-    let observed = runtime_supervisor::last_snapshot(&owner.state).unwrap();
-    assert_ne!(observed.intent, runtime_supervisor::Intent::Shutdown);
-    owner.close().await;
+    // Historical identity is not a permanent gate. Verify native shutdown,
+    // released OS lock and unchanged source before allowing normal bootstrap.
+    owner.assert_released().await;
 }
 
 #[tokio::test]

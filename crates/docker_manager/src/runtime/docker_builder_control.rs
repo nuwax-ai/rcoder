@@ -6,6 +6,110 @@ use shared_types::{
 };
 
 impl DockerRuntime {
+    pub(super) async fn observe_retained_builder_stopped(
+        &self,
+        target: &BuilderControlTarget,
+    ) -> Result<bool> {
+        target.validate().map_err(Error::ConfigurationError)?;
+        let Some(resource) = target.workload.as_ref() else {
+            return Ok(false);
+        };
+        if resource.kind != shared_types::AppResourceKind::Container {
+            return Ok(false);
+        }
+        let client = self.inner.get_docker_client();
+        let current = match client.inspect_container(&resource.uid, None).await {
+            Ok(current) => current,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(false),
+            Err(error) => {
+                return Err(Error::DockerError(format!(
+                    "Observe captured stopped builder: {error}"
+                )));
+            }
+        };
+        if control_identity_with_binding(
+            &current,
+            &resource.name,
+            &target.context,
+            target.resource_binding.as_ref(),
+            false,
+        )? != *resource
+        {
+            return Err(Error::Conflict(
+                "Captured Docker builder changed during stop observation".into(),
+            ));
+        }
+        Ok(current.state.as_ref().is_some_and(|state| {
+            state.running == Some(false)
+                && state.restarting != Some(true)
+                && state.dead != Some(true)
+                // CREATED is a retained container that has never executed.
+                // Like EXITED, it needs the durable management-only wake path;
+                // this observation itself does not acknowledge or permit a write.
+                && matches!(
+                    &state.status,
+                    Some(
+                        bollard::models::ContainerStateStatusEnum::CREATED
+                            | bollard::models::ContainerStateStatusEnum::EXITED
+                    )
+                )
+        }))
+    }
+
+    pub(super) async fn read_builder_file_credentials(
+        &self,
+        target: &BuilderControlTarget,
+    ) -> Result<shared_types::FileServerRequestCredentials> {
+        target.validate().map_err(Error::ConfigurationError)?;
+        let resource = target
+            .workload
+            .as_ref()
+            .ok_or(Error::ManagementNotRunning)?;
+        let before = self
+            .capture_builder_compute_with_binding(
+                &target.context,
+                target.resource_binding.as_ref(),
+                false,
+            )
+            .await?;
+        if before.workload.as_ref().map(|value| &value.uid) != Some(&resource.uid) {
+            return Err(Error::Conflict(
+                "Builder physical identity changed before credential read".into(),
+            ));
+        }
+        let client = self.inner.get_docker_client();
+        let info = client
+            .inspect_container(&resource.uid, None)
+            .await
+            .map_err(|error| {
+                Error::DockerError(format!("Inspect builder credential target: {error}"))
+            })?;
+        if info.state.as_ref().and_then(|state| state.running) != Some(true) {
+            return Err(Error::ManagementNotRunning);
+        }
+        let result = super::docker_app_runtime::execute_container_command(
+            client,
+            &resource.uid,
+            super::builder_file_credentials::read_command(),
+        )
+        .await?;
+        let after = self
+            .capture_builder_compute_with_binding(
+                &target.context,
+                target.resource_binding.as_ref(),
+                false,
+            )
+            .await?;
+        if after.workload.as_ref().map(|value| &value.uid) != Some(&resource.uid) {
+            return Err(Error::Conflict(
+                "Builder physical identity changed during credential read".into(),
+            ));
+        }
+        super::builder_file_credentials::credentials(result)
+    }
+
     pub(super) async fn reconcile_builder_start(
         &self,
         target: &BuilderControlTarget,
@@ -129,7 +233,7 @@ impl DockerRuntime {
     pub(super) async fn resume_bound_builder(
         &self,
         params: &container_runtime_api::ContainerCreateParams,
-        expected_image: &str,
+        expected_image: Option<&str>,
     ) -> Result<ContainerBasicInfo> {
         let check_cancelled = || {
             if params
@@ -149,9 +253,10 @@ impl DockerRuntime {
             let binding = params.resource_binding.as_ref().ok_or_else(|| {
                 Error::ConfigurationError("Bound builder requires durable resource proof".into())
             })?;
-            let target = self
+            let mut target = self
                 .capture_builder_compute_with_binding(context, Some(binding), false)
                 .await?;
+            target.builder_startup_mode = params.builder_startup_mode;
             let resource = target.workload.as_ref().ok_or_else(|| {
                 Error::Conflict(
                     "Bound builder disappeared; automatic replacement is forbidden".into(),
@@ -165,15 +270,14 @@ impl DockerRuntime {
                 .map_err(|error| {
                     Error::DockerError(format!("Inspect bound builder configuration: {error}"))
                 })?;
-            if info
-                .config
-                .as_ref()
-                .and_then(|config| config.image.as_deref())
-                != Some(expected_image)
-            {
-                return Err(Error::Conflict(
-                    "Bound builder image configuration changed".into(),
-                ));
+            if expected_image.is_some_and(|expected_image| {
+                info.config
+                    .as_ref()
+                    .and_then(|config| config.image.as_deref())
+                    != Some(expected_image)
+            }) {
+                tracing::info!(app = %context.app_id,
+                    "bound Docker builder retained; image rollout requires explicit restart");
             }
             Ok::<_, Error>(target)
         }
@@ -256,6 +360,7 @@ impl DockerRuntime {
             pod: None,
             restart_image: None,
             restart_runtime_workspace: None,
+            builder_startup_mode: shared_types::BuilderStartupMode::default(),
         })
     }
 
@@ -317,6 +422,36 @@ impl DockerRuntime {
             return Err(rejected_before_write(
                 "Builder control identity changed".into(),
             ));
+        }
+        if restart
+            && only_start
+            && target.builder_startup_mode == shared_types::BuilderStartupMode::ManagementOnly
+            && before.state.as_ref().and_then(|state| state.running) != Some(true)
+        {
+            let env = before
+                .config
+                .as_ref()
+                .and_then(|config| config.env.as_ref());
+            let control_only = env.is_some_and(|env| {
+                env.iter().any(|entry| {
+                    entry == &format!("{}=true", shared_types::APP_CLI_CONTROL_ONLY_ENV)
+                })
+            });
+            let boot_id = env.is_some_and(|env| {
+                env.iter().any(|entry| {
+                    entry
+                        == &format!(
+                            "{}={}",
+                            shared_types::APP_CLI_MANAGEMENT_BOOT_ID_ENV,
+                            target.context.operation_id
+                        )
+                })
+            });
+            if !control_only || !boot_id {
+                return Err(Error::ConfigurationError(
+                    "Management-only wake requires the operation's restored boot environment; use its controlled restart".into(),
+                ));
+            }
         }
         if restart && only_start {
             match client
@@ -606,7 +741,7 @@ mod tests {
     use super::*;
 
     /// 测试内 env 变异（nextest 进程隔离；对齐 loader.rs / app-cli 测试先例）。
-    mod receipt_env {
+    pub(super) mod receipt_env {
         #![allow(unsafe_code)]
 
         pub fn set_root(path: &std::path::Path) {
@@ -720,6 +855,7 @@ mod tests {
                 pod: None,
                 restart_image: None,
                 restart_runtime_workspace: None,
+                builder_startup_mode: shared_types::BuilderStartupMode::default(),
             };
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 let result = runtime
@@ -783,3 +919,10 @@ mod tests {
         assert!(control_identity(&info, "builder", &context).is_err());
     }
 }
+
+#[cfg(test)]
+mod recapture_tests;
+#[cfg(test)]
+mod resume_tests;
+#[cfg(test)]
+mod stopped_tests;

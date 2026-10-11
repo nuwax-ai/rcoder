@@ -81,7 +81,7 @@ pub(crate) async fn resume_pending(
     }
     // 恢复指纹按共享模型重算（应用共享：instance == app_id）
     let instance = current.app_id.clone();
-    if instance_fingerprint(state, &current.app_id)? != current.request_fingerprint {
+    if !pending_configuration_matches(state, &current)? {
         let executor = uuid::Uuid::new_v4().to_string();
         let claimed = progress(
             &state.userapp_store,
@@ -97,11 +97,11 @@ pub(crate) async fn resume_pending(
             &state.userapp_store,
             &claimed,
             &executor,
-            UserAppOperationState::RecoveryRequired,
+            UserAppOperationState::Failed,
             "configuration_changed",
             serde_json::Value::Null,
             Some(
-                "Builder configuration changed before execution; explicit recovery is required"
+                "Builder configuration changed before execution; no runtime writes were issued; retry with the current configuration"
                     .into(),
             ),
         )

@@ -6,6 +6,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod recovered_generation;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Intent {
@@ -399,7 +401,9 @@ pub(crate) fn reconcile_foreign(
         if !root.join("generation.json").try_exists()? {
             continue;
         }
-        let value = generation(&root)?;
+        let Some(value) = recovered_generation::read_or_recover(&root, current.as_ref())? else {
+            continue;
+        };
         if value.supervisor == instance {
             // Own in-process generation: tracked by the session itself.
             continue;
@@ -473,7 +477,9 @@ fn reconcile_local(
         if !root.join("generation.json").try_exists()? {
             continue;
         } // legacy adapter owns legacy receipts
-        let value = generation(&root)?;
+        let Some(value) = recovered_generation::read_or_recover(&root, current)? else {
+            continue;
+        };
         if previous_container(&value, current) {
             // Keep foreign process and command receipts unchanged. A replacement
             // container must not interpret them as live work in its own process

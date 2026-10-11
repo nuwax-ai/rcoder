@@ -16,10 +16,11 @@ pub(crate) fn build_agent_env_vars(
     user_id_val: &str,
     service_type_str: &str,
     service_type: &ServiceType,
-    docker_service: Option<&ServiceImageConfig>,
-    k8s_service: Option<&K8sServiceConfig>,
+    service_configs: (Option<&ServiceImageConfig>, Option<&K8sServiceConfig>),
     params: &ContainerCreateParams,
+    builder_deploy_credential: Option<&EnvVar>,
 ) -> Vec<EnvVar> {
+    let (docker_service, k8s_service) = service_configs;
     // 容器内契约（agent_runner profiler 标签、PROJECT_ID env）要纯 app_id：
     // 优先取显式 builder_app_id（创建路径直传，语义不重载）；存量复合键
     // 残留时右切还原纯 app 段，其余原样透传。
@@ -147,6 +148,8 @@ pub(crate) fn build_agent_env_vars(
         // merged_env 循环会追加第二个同名键——kubelet 取后值，存量
         // APP_CLI_MANAGED=0 会复活灰度残留并覆盖平台的 1。
         merged_env.remove("APP_CLI_MANAGED");
+        merged_env.remove(shared_types::APP_CLI_CONTROL_ONLY_ENV);
+        merged_env.remove(shared_types::APP_CLI_MANAGEMENT_BOOT_ID_ENV);
         merged_env.remove("APP_CLI_RUNTIME_WORKSPACE");
         merged_env.remove("APP_CLI_DEPLOY_TOKEN");
         env_vars.retain(|entry| entry.name != "APP_CLI_MANAGED");
@@ -163,11 +166,23 @@ pub(crate) fn build_agent_env_vars(
             )),
             ..Default::default()
         });
-        env_vars.push(EnvVar {
-            name: "APP_CLI_DEPLOY_TOKEN".to_string(),
-            value: Some(uuid::Uuid::new_v4().simple().to_string()),
-            ..Default::default()
-        });
+        if let Some(credential) = builder_deploy_credential {
+            env_vars.push(credential.clone());
+        }
+        if params.builder_startup_mode == shared_types::BuilderStartupMode::ManagementOnly
+            && let Some(context) = &params.execution_context
+        {
+            env_vars.push(EnvVar {
+                name: shared_types::APP_CLI_CONTROL_ONLY_ENV.into(),
+                value: Some("true".into()),
+                ..Default::default()
+            });
+            env_vars.push(EnvVar {
+                name: shared_types::APP_CLI_MANAGEMENT_BOOT_ID_ENV.into(),
+                value: Some(context.operation_id.clone()),
+                ..Default::default()
+            });
+        }
     }
     for (k, v) in &merged_env {
         if RESERVED.contains(&k.as_str()) {
@@ -298,6 +313,11 @@ mod b03_tests {
     #[test]
     fn managed_switch_completes_owner_injection_chain() {
         let base = params();
+        let credential = EnvVar {
+            name: "APP_CLI_DEPLOY_TOKEN".into(),
+            value: Some("test-credential-retained-verbatim-32".into()),
+            ..Default::default()
+        };
         // builder：无论 service env 是否带开关，链恒补全
         for service in [k8s_service(false), k8s_service(true)] {
             let on = build_agent_env_vars(
@@ -305,9 +325,9 @@ mod b03_tests {
                 "u1",
                 "userapp-builder",
                 &ServiceType::UserappBuilder,
-                None,
-                Some(&service),
+                (None, Some(&service)),
                 &base,
+                Some(&credential),
             );
             assert_eq!(
                 value_of(&on, "APP_CLI_MANAGED").as_deref(),
@@ -335,9 +355,9 @@ mod b03_tests {
             "u1",
             "userapp-builder",
             &ServiceType::UserappBuilder,
-            None,
-            Some(&disabled),
+            (None, Some(&disabled)),
             &base,
+            Some(&credential),
         );
         assert_eq!(value_of(&forced, "APP_CLI_MANAGED").as_deref(), Some("1"));
         // 键唯一性：kubelet 取后值，重复键会让 config 的 0 实际生效。
@@ -358,9 +378,9 @@ mod b03_tests {
             "u1",
             "web-agent-runner",
             &ServiceType::WebAgentRunner,
-            None,
-            Some(&web),
+            (None, Some(&web)),
             &base,
+            None,
         );
         assert!(value_of(&off, "APP_CLI_MANAGED").is_none());
         assert!(value_of(&off, "APP_CLI_RUNTIME_WORKSPACE").is_none());

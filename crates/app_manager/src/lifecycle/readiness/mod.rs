@@ -275,6 +275,7 @@ mod tests {
                 store: store.clone(),
                 first: AtomicBool::new(true),
                 request: shared_types::ComputeControlRequest {
+                    builder_startup_mode: Default::default(),
                     app_id: "194".into(),
                     lifecycle_id: identity.lifecycle_id,
                     scope: UserAppOperationScope::Dev,
@@ -342,6 +343,7 @@ mod tests {
         let app = store.ensure_identity("194").await.unwrap();
         let accepted = store
             .admit_compute_control(&shared_types::ComputeControlRequest {
+                builder_startup_mode: Default::default(),
                 app_id: app.app_id.clone(),
                 lifecycle_id: app.lifecycle_id,
                 scope: UserAppOperationScope::Prod,

@@ -7,6 +7,7 @@ mod control;
 pub mod domain;
 mod epoch;
 mod guardian;
+mod legacy_drain;
 mod monitor;
 mod owner_handover;
 mod record;
@@ -33,8 +34,8 @@ pub use recovery::{
     stop_work_with_cleanup,
 };
 pub use session::{
-    BusinessFactory, BusinessLaunch, BusinessRun, FenceState, OwnerCleanup, OwnerSession,
-    SessionOptions, SessionScope, current_scope,
+    BusinessFactory, BusinessLaunch, BusinessRun, BusinessStartPermit, FenceState, OwnerCleanup,
+    OwnerSession, SessionOptions, SessionScope, current_scope,
 };
 pub use worker::{Worker, WorkerControl};
 

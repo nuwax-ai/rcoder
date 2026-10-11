@@ -3,6 +3,203 @@ use super::*;
 #[cfg(test)]
 mod cases {
     use super::*;
+
+    async fn startup_input_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+                &directory.path().join("startup-input.db"),
+            )
+            .await
+            .unwrap(),
+        );
+        let runtime = Arc::new(fence_settler_tests::FenceRuntime::default());
+        let state = crate::userapp_builder::builder_runtime_test_state(runtime, store, None).await;
+        state
+            .userapp_store
+            .ensure_identity("inputapp")
+            .await
+            .unwrap();
+        (state, directory)
+    }
+
+    fn admission(fingerprint: String, operation_id: &str) -> UserAppAdmission {
+        UserAppAdmission {
+            runtime_policy_on_success: None,
+            command: None,
+            metadata: None,
+            app_id: "inputapp".into(),
+            lifecycle_id: None,
+            operation_id: operation_id.into(),
+            request_id: None,
+            request_fingerprint: fingerprint,
+            kind: UserAppOperationKind::EnsureBuilder,
+        }
+    }
+
+    #[tokio::test]
+    async fn builder_startup_mode_survives_admission_and_executor_recovery_input() {
+        for mode in [
+            shared_types::BuilderStartupMode::ManagementOnly,
+            shared_types::BuilderStartupMode::PreserveBusinessIntent,
+        ] {
+            let (state, _directory) = startup_input_state().await;
+            let input = creation_input(&state, "inputapp", mode).unwrap();
+            let wire: BuilderCreationInput = serde_json::from_str(input.encoded()).unwrap();
+            assert_eq!(wire.startup_mode, mode);
+            assert_eq!(wire.schema, 4);
+            assert_eq!(wire.configuration_fingerprint.len(), 64);
+            assert!(
+                !input.encoded().contains("environment"),
+                "private input contains a configuration digest, not credentials"
+            );
+            let pending = match state
+                .userapp_store
+                .admit_with_input(&admission(input.digest(), "new-input"), Some(&input))
+                .await
+                .unwrap()
+            {
+                UserAppAdmissionOutcome::Accepted(record) => record,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert!(pending_configuration_matches(&state, &pending).unwrap());
+            let claimed = progress(
+                &state.userapp_store,
+                &pending,
+                "new-executor",
+                UserAppOperationState::Running,
+                "claimed",
+                serde_json::Value::Null,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                claimed_startup_mode(&state, &claimed, "new-executor")
+                    .await
+                    .unwrap(),
+                mode
+            );
+            assert!(
+                claimed_startup_mode(&state, &claimed, "foreign-executor")
+                    .await
+                    .is_err()
+            );
+            state.userapp_store_control.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_creation_without_private_input_preserves_its_original_boot_mode() {
+        let (state, _directory) = startup_input_state().await;
+        let pending = match state
+            .userapp_store
+            .admit(&admission(
+                legacy_instance_fingerprint(&state, "inputapp").unwrap(),
+                "old-input",
+            ))
+            .await
+            .unwrap()
+        {
+            UserAppAdmissionOutcome::Accepted(record) => record,
+            other => panic!("unexpected {other:?}"),
+        };
+        let claimed = progress(
+            &state.userapp_store,
+            &pending,
+            "old-executor",
+            UserAppOperationState::Running,
+            "claimed",
+            serde_json::Value::Null,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            claimed_startup_mode(&state, &claimed, "old-executor")
+                .await
+                .unwrap(),
+            shared_types::BuilderStartupMode::PreserveBusinessIntent
+        );
+        state.userapp_store_control.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn changed_pending_builder_without_writes_fails_and_allows_current_request() {
+        let (mut state, _directory) = startup_input_state().await;
+        let original_fingerprint = legacy_instance_fingerprint(&state, "inputapp").unwrap();
+        let pending = match state
+            .userapp_store
+            .admit(&admission(original_fingerprint.clone(), "old-template"))
+            .await
+            .unwrap()
+        {
+            UserAppAdmissionOutcome::Accepted(record) => record,
+            other => panic!("unexpected {other:?}"),
+        };
+        let service: shared_types::K8sServiceConfig = serde_json::from_value(serde_json::json!({
+            "service_type": "user-app-builder", "image": "registry.example/runner:new", "environment": {"FILE_SERVER_PROXY_TOKEN": "private-effective-input"}
+        })).unwrap();
+        let mut config = shared_types::KubernetesConfig::default();
+        config.services.insert(
+            shared_types::ServiceType::UserappBuilder
+                .container_family_key()
+                .into(),
+            service,
+        );
+        Arc::get_mut(&mut state).unwrap().config.kubernetes_config = Some(config);
+        assert!(!pending_configuration_matches(&state, &pending).unwrap());
+        assert!(resume_pending(&state, &pending).await.unwrap());
+        let old = state
+            .userapp_store
+            .get_operation("inputapp", "old-template")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.state, UserAppOperationState::Failed);
+        assert_eq!(old.step, "configuration_changed");
+        assert_eq!(old.request_fingerprint, original_fingerprint);
+        assert!(
+            old.error_message
+                .as_deref()
+                .unwrap()
+                .contains("no runtime writes")
+        );
+        assert!(
+            state
+                .userapp_store
+                .get_operation_lease("inputapp", "old-template")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let input = creation_input(
+            &state,
+            "inputapp",
+            shared_types::BuilderStartupMode::ManagementOnly,
+        )
+        .unwrap();
+        assert!(!input.encoded().contains("private-effective-input"));
+        let retry = state
+            .userapp_store
+            .admit_with_input(&admission(input.digest(), "current-template"), Some(&input))
+            .await
+            .unwrap();
+        assert!(
+            matches!(retry, UserAppAdmissionOutcome::Accepted(record) if record.operation_id == "current-template")
+        );
+        assert_eq!(
+            state
+                .userapp_store
+                .get_operation("inputapp", "old-template")
+                .await
+                .unwrap()
+                .unwrap(),
+            old
+        );
+        state.userapp_store_control.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn expired_creation_retains_observation_and_discards_late_success() {
         let local = crate::userapp_builder::lifecycle::acquire("budget-observation").await;
@@ -284,6 +481,7 @@ mod cases {
             registration_predecessor: None,
             creation_lease_released: true,
             target: shared_types::BuilderControlTarget {
+                builder_startup_mode: Default::default(),
                 resource_binding: None,
                 pod: None,
                 restart_image: None,

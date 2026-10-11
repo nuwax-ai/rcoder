@@ -2,12 +2,18 @@
 //! protocol stand-in; this does not validate Pingap routing, containers or AI.
 #![cfg(unix)]
 
+#[path = "fixtures/failed_kernel_recovery.rs"]
+mod failed_kernel_recovery;
+#[path = "fixtures/live_legacy_management.rs"]
+mod live_legacy_management;
 #[path = "fixtures/native_stop_during_startup.rs"]
 mod native_stop_during_startup;
 #[path = "fixtures/protocol_support.rs"]
 mod protocol_support;
 #[path = "fixtures/proxy_writer_barrier.rs"]
 mod proxy_writer_barrier;
+#[path = "fixtures/resident_owner_recovery.rs"]
+mod resident_owner_recovery;
 
 use serde_json::{Value, json};
 use std::{
@@ -22,6 +28,7 @@ struct Fixture {
     state: PathBuf,
     app: String,
     pingap: PathBuf,
+    admin_addr: String,
     clients: Vec<Child>,
     owner: Option<String>,
     owner_pid: Option<u32>,
@@ -41,6 +48,7 @@ impl Fixture {
             state,
             app,
             pingap,
+            admin_addr: "127.0.0.1:0".into(),
             clients: vec![],
             owner: None,
             owner_pid: None,
@@ -99,7 +107,7 @@ impl Fixture {
         command.arg(action).arg("--workspace").arg(workspace);
         if action == "run" {
             command
-                .args(["--admin-addr", "127.0.0.1:0", "--log-dir"])
+                .args(["--admin-addr", self.admin_addr.as_str(), "--log-dir"])
                 .arg(self.source.join("logs"))
                 .arg("--pingap-bin")
                 .arg(&self.pingap);
@@ -111,6 +119,8 @@ impl Fixture {
             "APP_DEPLOY_GENERATION_ID",
             "APP_DEPLOY_SHA256",
             "APP_CLI_ATTACH",
+            "APP_CLI_CONTROL_ONLY",
+            "APP_CLI_MANAGEMENT_BOOT_ID",
             "APP_CLI_MANAGED",
             "SERVICE_TYPE",
             "USERAPP_WORKSPACE_DIR",
@@ -1274,6 +1284,77 @@ async fn await_active_operation(fixture: &Fixture, client: &reqwest::Client, bas
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+#[tokio::test]
+async fn newer_run_cancels_active_source_and_same_owner_serves_latest_source() {
+    let mut fixture = Fixture::new();
+    let started = fixture.source.join("superseded-command-started");
+    let command = toml::Value::Array(
+        [
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf '%s\\n' \"$$\" > \"$1\"; sleep 15; exec \"$2\" http \"$3\"".to_owned(),
+            "source-cancellation-fixture".to_owned(),
+            started.to_string_lossy().into_owned(),
+            env!("CARGO_BIN_EXE_tree-fixture").to_owned(),
+            "superseded-source".to_owned(),
+        ]
+        .into_iter()
+        .map(toml::Value::String)
+        .collect(),
+    );
+    fixture.write_manifests(command, "already executing delayed Source", 30);
+    let first = fixture.spawn_run("superseded-source");
+    let client = client();
+    let (base, identity, native) = fixture.ready(&client).await;
+    let old_id = await_active_operation(&fixture, &client, &base).await;
+    let executing_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !std::fs::read(&started).is_ok_and(|bytes| !bytes.is_empty()) {
+        assert!(
+            tokio::time::Instant::now() < executing_deadline,
+            "the old Source command must actually execute before supersession: {}",
+            fixture.diagnostics()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let token = std::fs::read_to_string(fixture.state.join("token")).unwrap();
+    std::fs::write(fixture.source.join("sentinel"), b"keep data").unwrap();
+    fixture.manifests("latest-source");
+    let supersession_started = tokio::time::Instant::now();
+    let latest = fixture.spawn_run("latest-source");
+    let latest_status = operation_client_exit(&mut fixture, latest).await;
+    assert!(
+        latest_status.success(),
+        "latest run: {}",
+        fixture.diagnostics()
+    );
+    assert!(
+        supersession_started.elapsed() < Duration::from_secs(10),
+        "latest Source waited for the old 15s command to finish instead of cancelling its actual child: elapsed={:?}; {}",
+        supersession_started.elapsed(),
+        fixture.diagnostics()
+    );
+    assert!(
+        !operation_client_exit(&mut fixture, first).await.success(),
+        "superseded client cannot report success"
+    );
+    fixture.http(&client, "latest-source").await;
+    fixture.same_owner(&client, &base, &identity, &native).await;
+    let old = operation_view(&client, &base, &token, &old_id).await;
+    assert_eq!(old["state"], "cancelled");
+    // Wait beyond the original delayed launch to expose a leaked late callback.
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    fixture.http(&client, "latest-source").await;
+    assert_eq!(
+        operation_view(&client, &base, &token, &old_id).await["state"],
+        "cancelled"
+    );
+    assert_eq!(
+        std::fs::read(fixture.source.join("sentinel")).unwrap(),
+        b"keep data"
+    );
+    fixture.same_owner(&client, &base, &identity, &native).await;
 }
 
 async fn operation_view(

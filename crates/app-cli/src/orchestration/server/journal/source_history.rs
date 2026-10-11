@@ -6,7 +6,8 @@ impl Journal {
     /// Called while the journal lease is held. Identical bytes share one backup
     /// across retries; this diagnostic copy never grants execution ownership.
     pub(in crate::orchestration::server) fn preserve_source_history(&self) -> Result<PathBuf> {
-        let bytes = std::fs::read(self.root.join(".deploy-operation.json"))
+        let source = self.legacy_root.as_ref().unwrap_or(&self.root);
+        let bytes = std::fs::read(source.join(".deploy-operation.json"))
             .context("read historical deployment receipt before Source replacement")?;
         let backup = self.root.join(format!(
             ".deploy-operation.source-history-{}.json",

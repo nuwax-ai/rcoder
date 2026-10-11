@@ -112,6 +112,7 @@ async fn resolve_dev_addr(
     state: &AppState,
     app_id: &str,
     artifact_download: bool,
+    intent: crate::userapp_builder::BuilderAccessIntent,
 ) -> Result<String, Box<Response>> {
     let configured =
         std::time::Duration::from_secs(state.config.userapp_storage.ensure_timeout_seconds);
@@ -123,13 +124,16 @@ async fn resolve_dev_addr(
         ))
     };
     let deadline = tokio::time::Instant::now() + budget;
-    tokio::time::timeout_at(deadline, resolve_dev_addr_inner(state, app_id, deadline))
-        .await
-        .unwrap_or_else(|_| {
-            Err(builder_control_response(
-                &shared_types::UserAppWaitTimeout { operation_id: None }.into(),
-            ))
-        })
+    tokio::time::timeout_at(
+        deadline,
+        resolve_dev_addr_inner(state, app_id, deadline, intent),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(builder_control_response(
+            &shared_types::UserAppWaitTimeout { operation_id: None }.into(),
+        ))
+    })
 }
 
 /// 转发层"可等待"的 builder 冲突判定。两种形态是同一个 builder 控制窗口
@@ -197,14 +201,16 @@ async fn resolve_dev_addr_inner(
     state: &AppState,
     app_id: &str,
     deadline: tokio::time::Instant,
+    intent: crate::userapp_builder::BuilderAccessIntent,
 ) -> Result<String, Box<Response>> {
     // A dev-scope control operation (Stop/Restart) fences new business ensure
     // attempts by admission design, and may also cancel an already-admitted
     // ensure mid-flight. Wait out either conflict within the caller's budget.
-    // Each attempt rechecks durable intent: completed Stop remains stopped;
-    // completed Restart can be reused. This never grants an explicit start.
+    // Each attempt rechecks durable intent. A completed physical Stop may be
+    // revived through management-only compute recovery; the original Source
+    // request is sent once afterwards, and reads never restart business.
     let mut info = retry_builder_ensure(deadline, || {
-        ensure_userapp_builder_until(state, app_id, deadline)
+        ensure_userapp_builder_until(state, app_id, deadline, intent)
     })
     .await
     .map_err(|error| {
@@ -264,7 +270,7 @@ async fn resolve_dev_addr_inner(
                 // and runtime under the application lock. The observation above
                 // does not authorize clearing a newer registration or its streams.
                 info = retry_builder_ensure(deadline, || {
-                    ensure_userapp_builder_until(state, app_id, deadline)
+                    ensure_userapp_builder_until(state, app_id, deadline, intent)
                 })
                 .await
                 .map_err(|error| {
@@ -512,7 +518,8 @@ pub(crate) async fn forward_to_dev(state: &AppState, app_id: &str, req: Request)
     }
     // 制品拉取保留完整配置预算；其余交互转发使用较短的响应预算。
     let artifact_download = req.uri().path().starts_with(STATIC_PATH_PREFIX);
-    let addr = match resolve_dev_addr(state, app_id, artifact_download).await {
+    let intent = super::dev_request::builder_access_intent(req.method(), req.uri().path());
+    let addr = match resolve_dev_addr(state, app_id, artifact_download, intent).await {
         Ok(addr) => addr,
         Err(resp) => return super::error_body::reject(req, *resp).await,
     };

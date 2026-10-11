@@ -32,6 +32,11 @@ pub struct ContainerCreateParams {
     /// 路径（消费方回落 project_id 右切，兼容存量裸 app_id 形态）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builder_app_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "shared_types::BuilderStartupMode::is_preserve"
+    )]
+    pub builder_startup_mode: shared_types::BuilderStartupMode,
     /// User identifier (used as container name base for ComputerAgentRunner)
     pub user_id: Option<String>,
     /// Service type determining container purpose
@@ -157,6 +162,7 @@ pub struct ContainerCreateParamsBuilder {
     resource_binding: Option<shared_types::UserAppResourceBinding>,
     project_id: Option<String>,
     builder_app_id: Option<String>,
+    builder_startup_mode: shared_types::BuilderStartupMode,
     user_id: Option<String>,
     service_type: Option<ServiceType>,
     resource_limits: Option<ServiceResourceLimits>,
@@ -189,6 +195,11 @@ impl ContainerCreateParamsBuilder {
     /// UserappBuilder 容器内契约的纯 app_id（显式传值，避免 project_id 复用歧义）。
     pub fn builder_app_id(mut self, app_id: impl Into<String>) -> Self {
         self.builder_app_id = Some(app_id.into());
+        self
+    }
+
+    pub fn builder_startup_mode(mut self, mode: shared_types::BuilderStartupMode) -> Self {
+        self.builder_startup_mode = mode;
         self
     }
 
@@ -295,6 +306,7 @@ impl ContainerCreateParamsBuilder {
             resource_binding: self.resource_binding,
             project_id: self.project_id,
             builder_app_id: self.builder_app_id,
+            builder_startup_mode: self.builder_startup_mode,
             user_id: self.user_id,
             service_type: self.service_type.unwrap_or(ServiceType::WebAgentRunner),
             resource_limits: self.resource_limits,

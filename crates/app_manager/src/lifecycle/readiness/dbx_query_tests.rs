@@ -42,6 +42,7 @@ fn dbx_control_request(
     action: ComputeControlAction,
 ) -> shared_types::ComputeControlRequest {
     shared_types::ComputeControlRequest {
+        builder_startup_mode: Default::default(),
         app_id: "dbxreview".into(),
         lifecycle_id,
         scope: UserAppOperationScope::Dev,

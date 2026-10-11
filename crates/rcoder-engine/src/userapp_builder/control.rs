@@ -566,6 +566,7 @@ mod tests {
             context: &UserAppExecutionContext,
         ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
             Ok(shared_types::BuilderControlTarget {
+                builder_startup_mode: Default::default(),
                 resource_binding: None,
                 context: context.clone(),
                 workload: Some(shared_types::AppResourceIdentity {
@@ -589,6 +590,7 @@ mod tests {
                 gate.resume.notified().await;
             }
             Ok(shared_types::BuilderControlTarget {
+                builder_startup_mode: Default::default(),
                 resource_binding: None,
                 context: context.clone(),
                 workload: Some(shared_types::AppResourceIdentity {
@@ -747,6 +749,7 @@ mod tests {
         let stop = state
             .userapp_store
             .admit_compute_control(&shared_types::ComputeControlRequest {
+                builder_startup_mode: Default::default(),
                 app_id: "testapp".into(),
                 lifecycle_id: app.lifecycle_id,
                 scope: shared_types::UserAppOperationScope::Dev,

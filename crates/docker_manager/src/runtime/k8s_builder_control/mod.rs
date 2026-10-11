@@ -19,11 +19,21 @@ use std::time::Duration;
 // 无跨模块路径引用——helpers 私有 glob 仅供 mod.rs 作用域（子模块经
 // `use super::*` 互见）。
 
+mod configuration;
 mod helpers;
 #[cfg(test)]
 mod live_tests;
+mod observe;
 mod ops;
+#[cfg(test)]
+mod restart_update_tests;
+#[cfg(test)]
+mod resume_tests;
 #[cfg(test)]
 mod tests;
 
+use configuration::verify_existing_builder_views;
+pub(crate) use configuration::{
+    normalized_builder_pod_spec, retained_builder_credential, verify_bound_builder_storage,
+};
 use helpers::*;

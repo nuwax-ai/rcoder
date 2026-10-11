@@ -1,6 +1,52 @@
 use super::*;
 
 impl KubernetesRuntime {
+    pub(crate) async fn read_builder_file_credentials(
+        &self,
+        target: &BuilderControlTarget,
+    ) -> Result<shared_types::FileServerRequestCredentials> {
+        target.validate().map_err(Error::ConfigurationError)?;
+        let expected = target.pod.as_ref().ok_or(Error::ManagementNotRunning)?;
+        let before = self
+            .capture_builder_compute_with_binding(
+                &target.context,
+                target.resource_binding.as_ref(),
+                false,
+            )
+            .await?;
+        if before.workload.as_ref().map(|value| &value.uid)
+            != target.workload.as_ref().map(|value| &value.uid)
+            || before.pod.as_ref().map(|value| &value.uid) != Some(&expected.uid)
+        {
+            return Err(Error::Conflict(
+                "Builder physical identity changed before credential read".into(),
+            ));
+        }
+        let result = self
+            .exec_pod_container(
+                &expected.name,
+                "agent",
+                super::super::builder_file_credentials::read_command(),
+            )
+            .await?;
+        let after = self
+            .capture_builder_compute_with_binding(
+                &target.context,
+                target.resource_binding.as_ref(),
+                false,
+            )
+            .await?;
+        if after.workload.as_ref().map(|value| &value.uid)
+            != before.workload.as_ref().map(|value| &value.uid)
+            || after.pod.as_ref().map(|value| &value.uid) != Some(&expected.uid)
+        {
+            return Err(Error::Conflict(
+                "Builder physical identity changed during credential read".into(),
+            ));
+        }
+        super::super::builder_file_credentials::credentials(result)
+    }
+
     pub(crate) async fn capture_builder_volume_witness(
         &self,
         target: &BuilderControlTarget,
@@ -146,6 +192,7 @@ impl KubernetesRuntime {
         let mut fresh = fresh;
         fresh.restart_image = target.restart_image.clone();
         fresh.restart_runtime_workspace = target.restart_runtime_workspace.clone();
+        fresh.builder_startup_mode = target.builder_startup_mode;
         Ok(Some(fresh))
     }
 
@@ -487,7 +534,6 @@ impl KubernetesRuntime {
         ContainerBasicInfo,
         Option<shared_types::UserAppResourceBinding>,
     )> {
-        let mut upgrade_attempted = false;
         let (target, upgraded_binding) = async {
             let context = params.execution_context.as_ref().ok_or_else(|| {
                 Error::ConfigurationError("Bound builder requires execution context".into())
@@ -495,9 +541,10 @@ impl KubernetesRuntime {
             let binding = params.resource_binding.as_ref().ok_or_else(|| {
                 Error::ConfigurationError("Bound builder requires durable resource proof".into())
             })?;
-            let target = self
+            let mut target = self
                 .capture_builder_compute_with_binding(context, Some(binding), false)
                 .await?;
+            target.builder_startup_mode = params.builder_startup_mode;
             let workload = target.workload.as_ref().ok_or_else(|| {
                 Error::Conflict(
                     "Bound builder disappeared; automatic replacement is forbidden".into(),
@@ -508,14 +555,15 @@ impl KubernetesRuntime {
                 .get(&workload.name)
                 .await
                 .map_err(|error| api_error("Inspect bound builder configuration", error))?;
-            if workload_identity_with_binding(&current, context, Some(binding), false)? != *workload
-            {
+            let observed = workload_identity_with_binding(&current, context, Some(binding), false)?;
+            if observed.uid != workload.uid || observed.name != workload.name {
                 return Err(Error::Conflict(
                     "Bound builder changed during configuration validation".into(),
                 ));
             }
-            let desired =
-                self.build_agent_pod_spec(&context.app_id, &ServiceType::UserappBuilder, params)?;
+            // status/metadata updates can advance RV without replacing compute.
+            // Future writes use the version read with these actual data views.
+            target.workload = Some(observed);
             let actual = current
                 .spec
                 .as_ref()
@@ -523,69 +571,17 @@ impl KubernetesRuntime {
                 .ok_or_else(|| {
                     Error::ConfigurationError("Bound builder Pod template missing".into())
                 })?;
-            if !configured_fields_match(
-                &serde_json::to_value(&desired)
-                    .map_err(|error| Error::ConfigurationError(error.to_string()))?,
-                &serde_json::to_value(actual)
-                    .map_err(|error| Error::ConfigurationError(error.to_string()))?,
-            ) {
-                // RV07：配置漂移不再一律 Conflict 围栏——managed-owner 升级
-                // 签名内的漂移（APP_CLI_MANAGED 三键）在**本持久操作内**
-                // 执行受控替换（缩容→前置条件删除→确认旧 Pod 退出→重建；
-                // PVC 独立保留），然后按创建等价身份捕获新物理负载并交出
-                // 新绑定。任何其他漂移仍拒绝（不盲删存量）。
-                let desired_sts = self
-                    .desired_builder_statefulset(context, desired)
-                    .map_err(|error| Error::ConfigurationError(error.to_string()))?;
-                match crate::runtime::k8s_statefulset::helpers::validate_builder_statefulset(
-                    &current,
-                    &desired_sts,
-                    context,
-                )
-                .map_err(|error| Error::Conflict(error.to_string()))?
-                {
-                    crate::runtime::k8s_statefulset::helpers::BuilderTemplateCheck::NeedsUpgrade => {
-                        upgrade_attempted = true;
-                        self.replace_builder_statefulset_controlled(context, &current, desired_sts)
-                            .await
-                            .map_err(|error| Error::Conflict(error.to_string()))?;
-                        // 新物理身份按创建等价校验捕获：替换后的 STS 带完整
-                        // 应用/lifecycle 元数据注解，无需旧 UID 绑定背书
-                        //（与全新创建同一信任级别，不是"任意通过"）。
-                        let new_target = self
-                            .capture_builder_compute_with_binding(context, None, true)
-                            .await?;
-                        let new_workload = new_target.workload.as_ref().ok_or_else(|| {
-                            Error::Conflict(
-                                "Upgraded builder StatefulSet disappeared before capture".into(),
-                            )
-                        })?;
-                        let new_binding = shared_types::UserAppResourceBinding {
-                            app_id: context.app_id.clone(),
-                            lifecycle_id: context.lifecycle_id.clone(),
-                            service_type: ServiceType::UserappBuilder,
-                            physical_uid: new_workload.uid.clone(),
-                            adopted_by_operation: context.operation_id.clone(),
-                        };
-                        tracing::info!(
-                            app = %context.app_id,
-                            old_uid = ?current.metadata.uid,
-                            new_uid = %new_workload.uid,
-                            "bound builder upgraded in-operation; durable binding handed over"
-                        );
-                        return Ok((new_target, Some(new_binding)));
-                    }
-                    _ => {
-                        return Err(Error::Conflict(
-                            "Bound builder Pod configuration changed".into(),
-                        ));
-                    }
-                }
-            }
+            verify_existing_builder_views(&context.app_id, actual)?;
+            // The durable binding proves the existing compute, independently of
+            // the current platform's creation fingerprint. A read/ensure must
+            // not replace it merely because a release changed ordinary config.
+            // Explicit Restart freezes and applies that update under its ledger.
+            tracing::debug!(app = %context.app_id,
+                "bound builder retained independently of current platform template");
             Ok((target, None))
         }
         .await
-        .map_err(|error| if upgrade_attempted { error } else { rejected_before_write(error.to_string()) })?;
+        .map_err(|error| rejected_before_write(error.to_string()))?;
         let outcome = self
             .apply_builder_compute_mode_inner(
                 &target,
@@ -593,6 +589,7 @@ impl KubernetesRuntime {
                 true,
                 true,
                 Some(params.creation_cancelled.as_ref()),
+                None,
             )
             .await;
         self.report_control_outcome(&target, true, true, &outcome);
@@ -636,6 +633,7 @@ impl KubernetesRuntime {
                     pod: None,
                     restart_image: None,
                     restart_runtime_workspace: None,
+                    builder_startup_mode: shared_types::BuilderStartupMode::default(),
                 });
             }
             Err(error) => return Err(api_error("Capture builder workload", error)),
@@ -655,6 +653,7 @@ impl KubernetesRuntime {
             pod,
             restart_image: None,
             restart_runtime_workspace: None,
+            builder_startup_mode: shared_types::BuilderStartupMode::default(),
         })
     }
 
@@ -871,7 +870,7 @@ impl KubernetesRuntime {
         only_start: bool,
     ) -> Result<Option<ContainerBasicInfo>> {
         let outcome = self
-            .apply_builder_compute_mode_inner(target, restart, only_start, false, None)
+            .apply_builder_compute_mode_inner(target, restart, only_start, false, None, None)
             .await;
         self.report_control_outcome(target, restart, only_start, &outcome);
         outcome
@@ -943,6 +942,7 @@ impl KubernetesRuntime {
         only_start: bool,
         require_ready: bool,
         cancellation: Option<&std::sync::atomic::AtomicBool>,
+        observation_deadline: Option<std::time::Instant>,
     ) -> Result<Option<ContainerBasicInfo>> {
         let check_cancelled = || {
             if cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
@@ -971,23 +971,44 @@ impl KubernetesRuntime {
         }
         let sts_api: Api<StatefulSet> = Api::namespaced(self.client.clone(), &self.namespace);
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
-        let current = sts_api
-            .get(&workload.name)
-            .await
+        let read = sts_api.get(&workload.name);
+        let current = if let Some(deadline) = observation_deadline {
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), read)
+                .await.map_err(|_| Error::Timeout("Builder control observation budget exhausted before readiness verification".into()))?
+        } else { read.await }
             .map_err(|error| rejected_before_write(format!("Verify builder workload: {error}")))?;
-        if workload_identity_with_binding(
+        let observed = workload_identity_with_binding(
             &current,
             &target.context,
             target.resource_binding.as_ref(),
             false,
         )
-        .map_err(|error| rejected_before_write(error.to_string()))?
-            != *workload
-        {
+        .map_err(|error| rejected_before_write(error.to_string()))?;
+        if observed.uid != workload.uid || observed.name != workload.name {
             return Err(rejected_before_write(
                 "Builder workload changed after capture".into(),
             ));
         }
+        let refreshed;
+        let workload = if observed != *workload && restart && only_start {
+            let spec = current
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.template.spec.as_ref())
+                .ok_or_else(|| {
+                    rejected_before_write("Builder template missing before wake".into())
+                })?;
+            verify_existing_builder_views(&target.context.app_id, spec)
+                .map_err(|error| rejected_before_write(error.to_string()))?;
+            refreshed = observed;
+            &refreshed
+        } else if observed != *workload {
+            return Err(rejected_before_write(
+                "Builder workload changed after capture".into(),
+            ));
+        } else {
+            workload
+        };
         check_cancelled()?;
         if restart && only_start {
             let replicas = current
@@ -1027,8 +1048,13 @@ impl KubernetesRuntime {
                     &receipt,
                     target.restart_image.as_deref(),
                     target.restart_runtime_workspace.as_deref(),
+                    target.builder_startup_mode,
                 )?;
-                if target.restart_image.is_some() || target.restart_runtime_workspace.is_some() {
+                if target.restart_image.is_some()
+                    || target.restart_runtime_workspace.is_some()
+                    || target.builder_startup_mode
+                        == shared_types::BuilderStartupMode::ManagementOnly
+                {
                     sts_api
                         .patch(
                             &workload.name,
@@ -1103,7 +1129,8 @@ impl KubernetesRuntime {
         let observation = async {
             // Only observation is time bounded. A timeout never authorizes lease
             // release; the caller records an uncertain operation for reconciliation.
-            let deadline = std::time::Instant::now() + Duration::from_secs(90);
+            let deadline = observation_deadline
+                .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(90));
             let pod_name =
                 self.agent_pod_name(&target.context.app_id, &ServiceType::UserappBuilder)?;
             // 批次 B（plan §3）：STS + Pod 双资源 watch 观察——两条流共享总

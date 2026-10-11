@@ -417,6 +417,26 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         .await
     }
 
+    async fn capture_stopped_builder_restart_template(
+        &self,
+        snapshot: &ComputeControlRecord,
+        source: &BuilderControlTarget,
+        template: &BuilderRestartTemplate,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let source = source.clone();
+        let template = template.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_execution::capture_stopped_builder_template(
+                    tx, backend, &snapshot, &source, &template,
+                )
+                .await
+            })
+        })
+        .await
+    }
+
     async fn claim_compute_control(
         &self,
         identity: &ComputeExecutorIdentity,

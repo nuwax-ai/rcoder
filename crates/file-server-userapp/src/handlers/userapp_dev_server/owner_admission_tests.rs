@@ -127,7 +127,9 @@ async fn owner_stop_case(hold_admission: bool, completion_case: Option<Completio
         runtime_instance_id: "original-owner-instance".into(),
         deployment_generation_id: "original-generation".into(),
         protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
-        capabilities: Vec::new(),
+        // Exercise the current owner admission/event protocol without taking
+        // the separate authenticated native upgrade path.
+        capabilities: vec![shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into()],
     };
     let owner_state = Arc::new(Mutex::new(OwnerState {
         completion_fixture: completion_case.is_some(),

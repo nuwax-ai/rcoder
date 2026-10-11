@@ -105,8 +105,18 @@ pub async fn run(args: &RuntimeArgs) -> Result<()> {
         deadline,
         tokio::time::Instant::now() + Duration::from_secs(45),
     );
+    tokio::time::timeout_at(
+        bootstrap_deadline,
+        super::legacy_management::prepare_legacy_management(
+            &args.workspace,
+            &state,
+            bootstrap_deadline,
+        ),
+    )
+    .await
+    .context("run legacy management recovery deadline; no new Source was submitted")??;
     let mut launched: Option<(Child, PathBuf)> = None;
-    for _ in 0..3 {
+    while tokio::time::Instant::now() < bootstrap_deadline {
         if let Some(lock) = runtime_supervisor::Owner::try_acquire(&state)? {
             // Only a real released kernel lock authorizes this bootstrap. The
             // actual serve child competes for that same stable lock itself.
@@ -175,6 +185,6 @@ pub async fn run(args: &RuntimeArgs) -> Result<()> {
         }
     }
     bail!(
-        "management owner changed repeatedly during run bootstrap; no competing orchestration is permitted"
+        "management bootstrap deadline exceeded; original owner cleanup or initialization is still pending"
     )
 }

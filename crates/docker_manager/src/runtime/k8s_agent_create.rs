@@ -9,7 +9,7 @@ use container_runtime_api::{
     ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult, ContainerRuntimeStatus,
 };
 use k8s_openapi::api::core::v1::{
-    Container as K8sContainer, ContainerPort, LocalObjectReference,
+    Container as K8sContainer, ContainerPort, EnvVar, LocalObjectReference,
     PersistentVolumeClaimVolumeSource, PodSecurityContext, PodSpec, Probe, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -132,7 +132,37 @@ impl KubernetesRuntime {
         // 构造 PodSpec（纯计算，无 K8s API 副作用）。
         // Pod 的 ObjectMeta（name/labels）不传给 STS——STS 模板的 labels 由
         // build_agent_statefulset 经 build_standard_labels 自行设置，故此处只返回 PodSpec。
-        let pod_spec = self.build_agent_pod_spec(identifier, &service_type, &params)?;
+        let credential = if service_type == ServiceType::UserappBuilder {
+            let existing = self
+                .statefulsets()
+                .get_opt(&pod_name)
+                .await
+                .map_err(|error| {
+                    ContainerRuntimeError::K8sError(format!(
+                        "Read builder credential source: {error}"
+                    ))
+                })?;
+            let retained = existing
+                .as_ref()
+                .and_then(|sts| sts.spec.as_ref())
+                .and_then(|spec| spec.template.spec.as_ref())
+                .map(super::k8s_builder_control::retained_builder_credential)
+                .transpose()?
+                .flatten();
+            retained.or_else(|| {
+                existing.is_none().then(|| EnvVar {
+                    name: "APP_CLI_DEPLOY_TOKEN".into(),
+                    value: Some(uuid::Uuid::new_v4().simple().to_string()),
+                    ..Default::default()
+                })
+            })
+        } else {
+            None
+        };
+        let mut pod_spec = self.build_agent_pod_spec(identifier, &service_type, &params)?;
+        if let Some(credential) = credential {
+            Self::install_builder_credential(&mut pod_spec, credential)?;
+        }
 
         // agent-runner 走 StatefulSet（K8s 原生 pod 级自愈）：把 pod spec
         // wrap 进 STS（而非裸 Pod）。STS replicas=1 时 pod 被 evict/删除 → 控制器自动重建
@@ -524,15 +554,15 @@ impl KubernetesRuntime {
                             &user_id_val,
                             &service_type_str,
                             service_type,
-                            docker_service,
-                            k8s_service,
+                            (docker_service, k8s_service),
                             params,
+                            None,
                         );
                         if matches!(service_type, ServiceType::UserappBuilder) {
                             // 执行域身份（进程域退出回执的绑定锚点）：instance 经
                             // RCODER_PHYSICAL_POD_UID 在 Pod 内解析（调度前不可知）；
                             // volume 绑定 per-app PVC 与其挂载视图，跨 Pod 重建稳定。
-                            env.push(k8s_openapi::api::core::v1::EnvVar {
+                            env.push(EnvVar {
                                 name: runtime_supervisor::domain::DOMAIN_ENV.to_string(),
                                 value: Some(super::k8s_native_domain::builder_domain_env(
                                     &self.config.execution_authority,
@@ -649,5 +679,22 @@ impl KubernetesRuntime {
             topology_spread_constraints,
             ..Default::default()
         })
+    }
+
+    pub(crate) fn install_builder_credential(
+        pod_spec: &mut PodSpec,
+        credential: EnvVar,
+    ) -> ContainerRuntimeResult<()> {
+        let agent = pod_spec
+            .containers
+            .iter_mut()
+            .find(|container| container.name == "agent")
+            .ok_or_else(|| {
+                ContainerRuntimeError::ConfigurationError("Builder agent container missing".into())
+            })?;
+        let env = agent.env.get_or_insert_default();
+        env.retain(|entry| entry.name != "APP_CLI_DEPLOY_TOKEN");
+        env.push(credential);
+        Ok(())
     }
 }

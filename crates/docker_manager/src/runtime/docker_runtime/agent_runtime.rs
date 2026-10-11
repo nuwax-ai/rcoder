@@ -2,6 +2,26 @@ use super::*;
 
 #[async_trait]
 impl AgentContainerRuntime for DockerRuntime {
+    async fn get_bound_builder_file_credentials(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<shared_types::FileServerRequestCredentials> {
+        self.read_builder_file_credentials(target).await
+    }
+
+    async fn start_builder_control_with_options(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        options: &shared_types::BuilderStartOptions,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        if options.startup_mode != target.builder_startup_mode {
+            return Err(ContainerRuntimeError::Conflict(
+                "Builder startup intent differs from its checkpoint".into(),
+            ));
+        }
+        self.start_builder_compute(target).await
+    }
+
     async fn current_builder_image(&self) -> ContainerRuntimeResult<Option<String>> {
         self.inner
             .select_image(&ServiceType::UserappBuilder, None)
@@ -18,7 +38,7 @@ impl AgentContainerRuntime for DockerRuntime {
         &self,
         target: &shared_types::BuilderControlTarget,
     ) -> ContainerRuntimeResult<bool> {
-        let (Some(image), Some(resource)) = (&target.restart_image, &target.workload) else {
+        let Some(resource) = &target.workload else {
             return Ok(false);
         };
         let inspect = self
@@ -29,11 +49,32 @@ impl AgentContainerRuntime for DockerRuntime {
             .map_err(|error| {
                 ContainerRuntimeError::DockerError(format!("Inspect builder image: {error}"))
             })?;
-        Ok(inspect
-            .config
-            .as_ref()
-            .and_then(|config| config.image.as_ref())
-            != Some(image))
+        let management_boot_needed = target.builder_startup_mode
+            == shared_types::BuilderStartupMode::ManagementOnly
+            && !inspect
+                .config
+                .as_ref()
+                .and_then(|config| config.env.as_ref())
+                .is_some_and(|env| {
+                    env.iter().any(|entry| {
+                        entry == &format!("{}=true", shared_types::APP_CLI_CONTROL_ONLY_ENV)
+                    }) && env.iter().any(|entry| {
+                        entry
+                            == &format!(
+                                "{}={}",
+                                shared_types::APP_CLI_MANAGEMENT_BOOT_ID_ENV,
+                                target.context.operation_id
+                            )
+                    })
+                });
+        Ok(management_boot_needed
+            || target.restart_image.as_ref().is_some_and(|image| {
+                inspect
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.image.as_ref())
+                    != Some(image)
+            }))
     }
 
     async fn refresh_container_reach(
@@ -295,11 +336,32 @@ impl AgentContainerRuntime for DockerRuntime {
         Ok(result)
     }
 
+    async fn observe_builder_compute_stopped(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        self.observe_retained_builder_stopped(target).await
+    }
+
     async fn archive_builder_restart(
         &self,
         target: &shared_types::BuilderControlTarget,
     ) -> ContainerRuntimeResult<Option<shared_types::BuilderRestartTemplate>> {
         self.archive_builder_template(target).await
+    }
+
+    async fn recapture_stopped_builder_restart(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<shared_types::BuilderRestartTemplate> {
+        self.recapture_stopped_builder_template(target).await
+    }
+
+    async fn inspect_builder_restart_archive(
+        &self,
+        template: &shared_types::BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<Option<bool>> {
+        self.inspect_private_builder_archive(template).await
     }
 
     async fn restore_builder_restart(
@@ -375,7 +437,9 @@ impl AgentContainerRuntime for DockerRuntime {
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
         params.validate_execution_context()?;
-        let prepared = if params.service_type == ServiceType::UserappBuilder {
+        let prepared = if params.service_type == ServiceType::UserappBuilder
+            && params.resource_binding.is_none()
+        {
             Some(
                 crate::agent_container_starter::AgentContainerStarter::new(&self.inner)
                     .preflight(&params)
@@ -413,18 +477,19 @@ impl AgentContainerRuntime for DockerRuntime {
             None
         };
         if let Some(lease) = lease {
-            let prepared = prepared.ok_or_else(|| {
-                ContainerRuntimeError::ConfigurationError("builder preflight result missing".into())
-            })?;
             let inner = self.inner.clone();
             let context = params.execution_context.clone();
             let binding = params.resource_binding.clone();
             return tokio::spawn(async move {
                 let result = if params.resource_binding.is_some() {
                     Self::new(inner.clone())
-                        .resume_bound_builder(&params, prepared.image())
+                        .resume_bound_builder(&params, None)
                         .await
                 } else {
+                    let Some(prepared) = prepared else {
+                        return crate::runtime::builder_completion::finish(lease,
+                            Err(ContainerRuntimeError::ConfigurationError("builder preflight result missing".into()))).await;
+                    };
                     let result = crate::agent_container_starter::AgentContainerStarter::new(&inner)
                         .start_prepared(params, prepared)
                         .await;

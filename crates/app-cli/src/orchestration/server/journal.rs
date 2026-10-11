@@ -199,6 +199,7 @@ pub(crate) struct Journal {
     // must not start against now-empty legacy record paths during migration.
     legacy_leases: Vec<File>,
     legacy_root: Option<PathBuf>,
+    legacy_conflicts: Vec<PathBuf>,
 }
 impl Drop for Journal {
     fn drop(&mut self) {
@@ -298,6 +299,11 @@ impl Journal {
         {
             return Ok(false);
         }
+        for legacy in &self.legacy_conflicts {
+            if legacy.join(RECOVERY_REQUIRED_RECORD).try_exists()? {
+                return Ok(false);
+            }
+        }
         Ok(true)
     }
 
@@ -330,7 +336,7 @@ impl Journal {
             }
             if !has_records {
                 let mut old = Self::open_root_recovering(legacy.clone(), supervised)?;
-                migrate_lost_deployment_record(&legacy, &journal.root)?;
+                journal.legacy_conflicts.push(legacy.clone());
                 journal.legacy_leases.push(
                     old.lease
                         .take()
@@ -365,35 +371,11 @@ impl Journal {
             // - 任一侧在途、或 legacy 反而更新（旧运行时在新布局之后又跑过，
             //   降级混跑）→ 仍显式拒绝，文案给出两侧路径。
             let mut old = Self::open_root_recovering(legacy.clone(), supervised)?;
-            migrate_lost_deployment_record(&legacy, &journal.root)?;
-            let legacy_settled = domain_settled(
-                old.receipt.as_ref().map(|receipt| &receipt.boundary),
-                old.previous_owner.as_ref(),
-            );
-            let authority_settled = domain_settled(
-                journal.receipt.as_ref().map(|receipt| &receipt.boundary),
-                journal.previous_owner.as_ref(),
-            );
-            anyhow::ensure!(
-                authority_settled && legacy_settled,
-                "deployment journal conflict: in-flight records in authority {} or legacy {} \
-                 (settle the interrupted deployment, then restart)",
-                journal.root.display(),
-                legacy.display()
-            );
-            anyhow::ensure!(
-                authority_covers_legacy(&journal.root, &legacy),
-                "legacy deployment records at {} are newer than authority {} \
-                 (old runtime ran after the state-root migration); explicit recovery required",
-                legacy.display(),
-                journal.root.display()
-            );
-            archive_superseded_records(&legacy)?;
+            journal.legacy_conflicts.push(legacy.clone());
             tracing::warn!(
                 legacy = %legacy.display(),
                 authority = %journal.root.display(),
-                "archived superseded legacy deployment journal (both domains settled, \
-                 authority records newer); startup continues"
+                "retained conflicting journal history under both real locks; reconciliation waits for actual business quiescence"
             );
             // 保留 legacy 锁到 owner 生命周期结束（与迁移路径同理）：归档后旧
             // 二进制不得在 legacy 路径上以全新记录启动。
@@ -429,6 +411,18 @@ impl Journal {
         Ok(())
     }
 
+    /// The native/engine startup cleanup has actually finished. Historical
+    /// boundary, owner state and mtime no longer veto a new source request.
+    pub(crate) fn reconcile_legacy_after_quiescence(&mut self) -> Result<()> {
+        self.migrate_after_bind()?;
+        for legacy in &self.legacy_conflicts {
+            migrate_lost_deployment_record(legacy, &self.root)?;
+            archive_superseded_records(legacy)?;
+        }
+        self.legacy_conflicts.clear();
+        Ok(())
+    }
+
     fn open_root(root: PathBuf) -> Result<Self> {
         Self::open_root_recovering(root, false)
     }
@@ -461,6 +455,7 @@ impl Journal {
             previous_owner,
             legacy_leases: Vec::new(),
             legacy_root: None,
+            legacy_conflicts: Vec::new(),
         })
     }
     fn write_verified<T: Serialize + serde::de::DeserializeOwned>(
@@ -647,6 +642,17 @@ impl Journal {
             .context("reconciled activation journal missing")
     }
     pub fn require_fresh_process_scope(&self) -> Result<()> {
+        // The in-process native owner launches a generation only after its
+        // actual prior command ranges completed cleanup. Its held owner and
+        // generation locks are stronger than an incomplete legacy coordinator.
+        if let Some(scope) = runtime_supervisor::current_scope()
+            && std::fs::canonicalize(&self.root).ok().as_deref()
+                == scope.work_root.parent().and_then(Path::parent)
+        {
+            runtime_supervisor::verify_live(&self.root, &scope.supervisor_id, &scope.generation)
+                .context("verify current native execution after prior business cleanup")?;
+            return Ok(());
+        }
         if self
             .previous_owner
             .as_ref()
@@ -1053,7 +1059,12 @@ mod tests {
         drop(authority);
         std::thread::sleep(std::time::Duration::from_millis(20));
 
-        let journal = Journal::open_with_root(&source, root.clone()).unwrap();
+        let mut journal = Journal::open_with_root(&source, root.clone()).unwrap();
+        assert!(
+            dir.path().join(".deploy-operation.json").exists(),
+            "history remains before actual cleanup"
+        );
+        journal.reconcile_legacy_after_quiescence().unwrap();
         // 权威记录原样保留；journal 直接可用（重部署路径恢复）
         assert_eq!(
             std::fs::read(root.join(".deploy-operation.json")).unwrap(),
@@ -1085,7 +1096,7 @@ mod tests {
     /// 双权威域·拒绝（任一侧在途）：legacy 侧 coordinator 从未 quiescent
     /// （可能在跑/被中断未收束）→ 归档不生效，记录原样保留。
     #[test]
-    fn dual_domain_with_in_flight_legacy_records_still_rejected() {
+    fn old_active_legacy_metadata_does_not_block_after_real_quiescence() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("project");
         std::fs::create_dir_all(&source).unwrap();
@@ -1103,15 +1114,33 @@ mod tests {
         drop(authority);
         std::thread::sleep(std::time::Duration::from_millis(20));
 
-        assert!(Journal::open_with_root(&source, root.clone()).is_err());
+        let before = std::fs::read(dir.path().join(".deploy-operation.json")).unwrap();
+        let mut journal = Journal::open_with_root(&source, root.clone()).unwrap();
         assert!(dir.path().join(".deploy-operation.json").exists());
         assert!(root.join(".deploy-operation.json").exists());
+        assert!(
+            Journal::open_root(dir.path().to_path_buf()).is_err(),
+            "retain the actual old lock"
+        );
+        journal.reconcile_legacy_after_quiescence().unwrap();
+        assert!(!dir.path().join(".deploy-operation.json").exists());
+        let archived = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".deploy-operation.json.superseded-")
+            })
+            .unwrap();
+        assert_eq!(std::fs::read(archived).unwrap(), before);
     }
 
     /// 双权威域·拒绝（权威侧在途）：权威 boundary 处于交接中
     /// （Switching）→ 不允许自动归档 legacy。
     #[test]
-    fn dual_domain_with_in_flight_authority_records_still_rejected() {
+    fn old_switching_metadata_is_preserved_without_blocking_new_source_after_quiescence() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("project");
         std::fs::create_dir_all(&source).unwrap();
@@ -1129,14 +1158,24 @@ mod tests {
         drop(authority);
         std::thread::sleep(std::time::Duration::from_millis(20));
 
-        assert!(Journal::open_with_root(&source, root.clone()).is_err());
+        let before = std::fs::read(root.join(".deploy-operation.json")).unwrap();
+        let mut journal = Journal::open_with_root(&source, root.clone()).unwrap();
         assert!(dir.path().join(".deploy-operation.json").exists());
+        journal.reconcile_legacy_after_quiescence().unwrap();
+        assert_eq!(
+            std::fs::read(root.join(".deploy-operation.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            journal.receipt.as_ref().unwrap().boundary,
+            Boundary::Switching
+        );
     }
 
     /// 双权威域·拒绝（legacy 反而更新）：旧运行时在新布局迁移之后又写过
     /// legacy 记录（降级混跑）——真相有争议，必须显式恢复。
     #[test]
-    fn legacy_records_newer_than_authority_rejected_as_downgrade_mixing() {
+    fn old_legacy_mtime_never_vetoes_current_authority_after_quiescence() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("project");
         std::fs::create_dir_all(&source).unwrap();
@@ -1156,9 +1195,16 @@ mod tests {
         drop(legacy);
         std::thread::sleep(std::time::Duration::from_millis(20));
 
-        assert!(Journal::open_with_root(&source, root.clone()).is_err());
+        let before = std::fs::read(root.join(".deploy-operation.json")).unwrap();
+        let mut journal = Journal::open_with_root(&source, root.clone()).unwrap();
         assert!(dir.path().join(".deploy-operation.json").exists());
         assert!(root.join(".deploy-operation.json").exists());
+        journal.reconcile_legacy_after_quiescence().unwrap();
+        assert!(!dir.path().join(".deploy-operation.json").exists());
+        assert_eq!(
+            std::fs::read(root.join(".deploy-operation.json")).unwrap(),
+            before
+        );
     }
 
     // ── `app-cli journal adopt` 子命令（可审计显式裁决）────────────────────

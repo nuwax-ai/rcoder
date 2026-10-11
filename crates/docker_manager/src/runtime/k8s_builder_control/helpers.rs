@@ -211,6 +211,7 @@ pub(super) fn observation_error(error: crate::runtime::k8s_observation::Observat
 
 /// Kubernetes may populate omitted defaults, but every explicitly requested
 /// field and ordered list entry must match. Sidecars/config changes are rejected.
+#[cfg(test)]
 pub(super) fn configured_fields_match(
     desired: &serde_json::Value,
     actual: &serde_json::Value,
@@ -254,6 +255,7 @@ pub(super) fn builder_compute_start_patch(
     receipt: &str,
     image: Option<&str>,
     runtime_workspace: Option<&str>,
+    startup_mode: shared_types::BuilderStartupMode,
 ) -> Result<serde_json::Value> {
     let mut patch = serde_json::json!({
         "metadata": {
@@ -263,7 +265,10 @@ pub(super) fn builder_compute_start_patch(
         },
         "spec": {"replicas": 1}
     });
-    if image.is_some() || runtime_workspace.is_some() {
+    if image.is_some()
+        || runtime_workspace.is_some()
+        || startup_mode == shared_types::BuilderStartupMode::ManagementOnly
+    {
         let mut agent = serde_json::json!({"name": "agent"});
         if let Some(image) = image {
             agent["image"] = serde_json::json!(image);
@@ -294,6 +299,55 @@ pub(super) fn builder_compute_start_patch(
             }
             env.push(serde_json::json!({"name": "APP_CLI_RUNTIME_WORKSPACE", "value": root}));
             agent["env"] = serde_json::Value::Array(env);
+        }
+        if startup_mode == shared_types::BuilderStartupMode::ManagementOnly {
+            let context: UserAppExecutionContext =
+                serde_json::from_str(receipt).map_err(|error| {
+                    Error::ConfigurationError(format!("Decode builder boot intent: {error}"))
+                })?;
+            let mut env = current
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.template.spec.as_ref())
+                .and_then(|spec| {
+                    spec.containers
+                        .iter()
+                        .find(|container| container.name == "agent")
+                })
+                .and_then(|container| container.env.clone())
+                .unwrap_or_default();
+            env.retain(|entry| {
+                entry.name != shared_types::APP_CLI_CONTROL_ONLY_ENV
+                    && entry.name != shared_types::APP_CLI_MANAGEMENT_BOOT_ID_ENV
+            });
+            env.push(k8s_openapi::api::core::v1::EnvVar {
+                name: shared_types::APP_CLI_CONTROL_ONLY_ENV.into(),
+                value: Some("true".into()),
+                ..Default::default()
+            });
+            env.push(k8s_openapi::api::core::v1::EnvVar {
+                name: shared_types::APP_CLI_MANAGEMENT_BOOT_ID_ENV.into(),
+                value: Some(context.operation_id),
+                ..Default::default()
+            });
+            if let Some(root) = runtime_workspace {
+                env.retain(|entry| entry.name != "APP_CLI_RUNTIME_WORKSPACE");
+                env.push(k8s_openapi::api::core::v1::EnvVar {
+                    name: "APP_CLI_RUNTIME_WORKSPACE".into(),
+                    value: Some(root.into()),
+                    ..Default::default()
+                });
+            }
+            let mut values = vec![serde_json::json!({"$patch":"replace"})];
+            values.extend(
+                env.iter()
+                    .map(serde_json::to_value)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        Error::ConfigurationError(format!("Encode builder boot intent: {error}"))
+                    })?,
+            );
+            agent["env"] = serde_json::Value::Array(values);
         }
         patch["spec"]["template"] = serde_json::json!({
             "spec": {"containers": [agent]}

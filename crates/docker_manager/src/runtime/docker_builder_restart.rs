@@ -7,9 +7,11 @@
 //! mirroring the K8s zero-replica restore contract.
 //!
 //! The archive replays the captured runtime configuration (image, env, binds,
-//! network). Builder container env never carries credentials — they travel on
-//! the runtime-operation channel and are excluded from disk persistence — and
-//! the archive file is written with owner-only permissions. Identity labels
+//! network), including deployed FILE_SERVER_PROXY_TOKEN/APP_CLI_DEPLOY_TOKEN
+//! credentials when present in the retained environment. The private payload
+//! has owner-only 0600 permissions and never enters public checkpoints or logs;
+//! checkpoints carry only its reference. PG operation inputs still use their
+//! existing private operation receipts. Identity labels
 //! are re-derived from the operation context so the replacement binds to the
 //! current lifecycle instead of replaying possibly stale labels.
 use super::docker_runtime::DockerRuntime;
@@ -267,7 +269,68 @@ impl DockerRuntime {
         &self,
         target: &BuilderControlTarget,
     ) -> Result<Option<BuilderRestartTemplate>> {
+        self.capture_builder_archive(target, false).await
+    }
+
+    pub(super) async fn recapture_stopped_builder_template(
+        &self,
+        target: &BuilderControlTarget,
+    ) -> Result<BuilderRestartTemplate> {
+        self.capture_builder_archive(target, true)
+            .await?
+            .ok_or_else(|| conflict("Stopped builder recapture returned no template"))
+    }
+
+    pub(super) async fn inspect_private_builder_archive(
+        &self,
+        template: &BuilderRestartTemplate,
+    ) -> Result<Option<bool>> {
+        let name = std::path::Path::new(&template.archive.name);
+        let mut components = name.components();
+        let safe_name = matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none();
+        if template.source.validate().is_err()
+            || template.archive.kind != AppResourceKind::File
+            || template.archive.uid.is_empty()
+            || !safe_name
+            || !template
+                .source
+                .workload
+                .as_ref()
+                .is_some_and(|resource| resource.kind == AppResourceKind::Container)
+            || template.volumes.is_empty()
+        {
+            return Ok(Some(false));
+        }
+        let path = archive_path(&template.source.context, &template.archive.name).await?;
+        let payload = match read_archive(path).await {
+            Ok(Some(payload)) => payload,
+            Ok(None) | Err(Error::Conflict(_)) => return Ok(Some(false)),
+            Err(error) => return Err(error),
+        };
+        if sha256_hex(&payload) != template.archive.uid {
+            return Ok(Some(false));
+        }
+        let archive: Archive = match serde_json::from_slice(&payload) {
+            Ok(archive) => archive,
+            Err(_) => return Ok(Some(false)),
+        };
+        Ok(Some(
+            archive.source == template.source
+                && !archive.image.is_empty()
+                && !archive.binds.is_empty(),
+        ))
+    }
+
+    async fn capture_builder_archive(
+        &self,
+        target: &BuilderControlTarget,
+        recovery: bool,
+    ) -> Result<Option<BuilderRestartTemplate>> {
         target.validate().map_err(Error::ConfigurationError)?;
+        if recovery {
+            self.confirm_stopped_archive_recapture(target).await?;
+        }
         let Some(resource) = &target.workload else {
             return Err(conflict("Original builder container is missing"));
         };
@@ -375,8 +438,15 @@ impl DockerRuntime {
             .await?;
         after.restart_image = target.restart_image.clone();
         after.restart_runtime_workspace = target.restart_runtime_workspace.clone();
+        after.builder_startup_mode = target.builder_startup_mode;
         if after != *target {
             return Err(conflict("Builder changed during template capture"));
+        }
+        if recovery {
+            if self.capture_builder_volume_witness(target).await? != volumes {
+                return Err(conflict("Stopped builder volumes changed during recapture"));
+            }
+            self.confirm_stopped_archive_recapture(target).await?;
         }
         let payload = serde_json::to_vec(&archive)
             .map_err(|error| fail(format!("Encode archive: {error}")))?;
@@ -386,7 +456,17 @@ impl DockerRuntime {
             ));
         }
         let digest = sha256_hex(&payload);
-        let name = format!("builder-restart-{}.{}", &digest[..32], &digest[32..]);
+        let name = if recovery {
+            // Preserve the poisoned historical path. A fresh basename also
+            // prevents another damaged recovery file becoming a new permanent
+            // collision; the payload UID stays its actual content digest.
+            format!(
+                "builder-restart-recovered-{digest}.{}",
+                uuid::Uuid::new_v4()
+            )
+        } else {
+            format!("builder-restart-{}.{}", &digest[..32], &digest[32..])
+        };
         let path = archive_path(&target.context, &name).await?;
         persist_exclusive(path, payload).await?;
         Ok(Some(BuilderRestartTemplate {
@@ -399,6 +479,17 @@ impl DockerRuntime {
             },
             volumes,
         }))
+    }
+
+    async fn confirm_stopped_archive_recapture(&self, target: &BuilderControlTarget) -> Result<()> {
+        if !super::docker_compute_receipt::matches_stop(target).await?
+            || !self.observe_retained_builder_stopped(target).await?
+        {
+            return Err(conflict(
+                "Original operation stop and retained builder exit are not confirmed for recapture",
+            ));
+        }
+        Ok(())
     }
 
     pub(super) async fn restore_builder_template(
@@ -731,6 +822,22 @@ fn restore_body(
         cpuset_cpus: archive.cpuset_cpus.clone(),
         ..Default::default()
     };
+    let mut env = archive.env.clone();
+    if archive.source.builder_startup_mode == shared_types::BuilderStartupMode::ManagementOnly {
+        env.retain(|entry| {
+            !entry.starts_with(&format!("{}=", shared_types::APP_CLI_CONTROL_ONLY_ENV))
+                && !entry.starts_with(&format!(
+                    "{}=",
+                    shared_types::APP_CLI_MANAGEMENT_BOOT_ID_ENV
+                ))
+        });
+        env.push(format!("{}=true", shared_types::APP_CLI_CONTROL_ONLY_ENV));
+        env.push(format!(
+            "{}={}",
+            shared_types::APP_CLI_MANAGEMENT_BOOT_ID_ENV,
+            archive.source.context.operation_id
+        ));
+    }
     Ok(bollard::models::ContainerCreateBody {
         image: Some(
             archive
@@ -739,7 +846,7 @@ fn restore_body(
                 .clone()
                 .unwrap_or_else(|| archive.image.clone()),
         ),
-        env: Some(archive.env.clone()),
+        env: Some(env),
         cmd: archive.cmd.clone(),
         entrypoint: archive.entrypoint.clone(),
         working_dir: archive.working_dir.clone(),

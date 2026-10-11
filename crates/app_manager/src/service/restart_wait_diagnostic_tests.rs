@@ -91,6 +91,7 @@ async fn restart_rechecks_exact_rejected_holder_when_it_finishes_during_diagnost
                     .metadata
                     .store
                     .admit_compute_control(&ComputeControlRequest {
+                        builder_startup_mode: Default::default(),
                         app_id: app_id.into(),
                         lifecycle_id: original.lifecycle_id.clone(),
                         scope: UserAppOperationScope::Prod,
@@ -288,6 +289,7 @@ async fn waiting_restart_allows_original_business_restart_to_consume_old_stop_in
         .metadata
         .store
         .admit_compute_control(&ComputeControlRequest {
+            builder_startup_mode: Default::default(),
             app_id: app_id.into(),
             lifecycle_id: lifecycle.lifecycle_id.clone(),
             scope: UserAppOperationScope::Prod,
@@ -608,6 +610,7 @@ async fn restart_new_durable_facts_invalidate_history_before_the_next_read_can_f
                             .metadata
                             .store
                             .admit_compute_control(&ComputeControlRequest {
+                                builder_startup_mode: Default::default(),
                                 app_id: app_id.into(),
                                 lifecycle_id: original.lifecycle_id.clone(),
                                 scope: UserAppOperationScope::Prod,

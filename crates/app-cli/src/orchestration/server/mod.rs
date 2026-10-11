@@ -53,6 +53,7 @@ const DEPLOY_PROTOCOL: u32 = shared_types::app_cli_deploy::APP_CLI_OPERATION_ID_
 
 mod run_loop;
 mod serve;
+mod source_cancellation;
 #[cfg(test)]
 mod source_recovery_tests;
 mod startup;
