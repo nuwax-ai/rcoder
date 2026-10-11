@@ -209,6 +209,8 @@ pub struct RunServiceArgs {
 /// Normalized runtime configuration; never contains CLI actions.
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeArgs {
+    /// Captured orchestration operation, never inferred from a later request.
+    pub operation_id: Option<String>,
     pub workspace: PathBuf,
     pub log_dir: PathBuf,
     pub admin_addr: String,
@@ -236,6 +238,7 @@ impl RuntimeArgs {
 impl From<RunArgs> for RuntimeArgs {
     fn from(args: RunArgs) -> Self {
         Self {
+            operation_id: None,
             workspace: args.workspace.workspace,
             log_dir: args.runtime.log_dir,
             admin_addr: args.runtime.admin_addr,

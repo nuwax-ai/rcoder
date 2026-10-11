@@ -18,6 +18,11 @@ pub struct CompileOutcome {
     pub config_path: PathBuf,
     pub expected_hash: String,
     pub publication_id: String,
+    /// Parent runtime operation when supplied; otherwise this publication is a local child operation.
+    pub operation_id: Option<String>,
+    /// Business release bound while preparing this immutable candidate. Old
+    /// snapshots without this evidence must not borrow a newer desired release.
+    pub serving_release_id: Option<String>,
     pub config_digest: String,
     pub entry_probes: Vec<ProxyProbeTarget>,
     pub business_probes: Vec<ServiceProbeTarget>,
@@ -34,6 +39,25 @@ pub struct ServiceProbeTarget {
     pub service_id: String,
     pub address: std::net::SocketAddr,
     pub path: String,
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_publication_config(
+    config: PingapConfig,
+    operation: &str,
+    status: u16,
+) -> Result<PingapConfig> {
+    publication_config(config, operation, status)
+}
+
+#[cfg(test)]
+pub(crate) async fn fixture_persist_candidate(
+    root: &Path,
+    config: &PingapConfig,
+    operation: &str,
+    status: u16,
+) -> Result<CompileOutcome> {
+    persist_candidate(root, config, operation, status).await
 }
 
 pub(super) const PUBLICATION_OBJECT: &str = "rcoder:publication";
@@ -130,6 +154,78 @@ static PUBLICATION_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(
 pub async fn publication_guard() -> tokio::sync::MutexGuard<'static, ()> {
     PUBLICATION_GATE.lock().await
 }
+#[derive(Debug)]
+pub struct ProxyOperationBusy {
+    pub current: Option<shared_types::ProxyConfirmation>,
+}
+
+impl std::fmt::Display for ProxyOperationBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("proxy operation is already in progress")
+    }
+}
+impl std::error::Error for ProxyOperationBusy {}
+
+pub(crate) fn proxy_busy_error() -> anyhow::Error {
+    ProxyOperationBusy {
+        current: official_confirmation(),
+    }
+    .into()
+}
+
+pub(crate) fn try_publication_guard() -> Result<tokio::sync::MutexGuard<'static, ()>> {
+    PUBLICATION_GATE.try_lock().map_err(|_| proxy_busy_error())
+}
+static OFFICIAL_CONFIRMATION: std::sync::Mutex<Option<shared_types::ProxyConfirmation>> =
+    std::sync::Mutex::new(None);
+
+pub fn official_confirmation() -> Option<shared_types::ProxyConfirmation> {
+    OFFICIAL_CONFIRMATION
+        .lock()
+        .ok()
+        .and_then(|value| value.clone())
+}
+
+pub(crate) fn record_official_phase(
+    outcome: &CompileOutcome,
+    phase: shared_types::ProxyPhase,
+    instance: Option<&str>,
+) -> Result<()> {
+    let confirmed = matches!(
+        phase,
+        shared_types::ProxyPhase::Serving | shared_types::ProxyPhase::Standby
+    );
+    let view = shared_types::ProxyConfirmation {
+        contract: shared_types::ProxyConfirmationContract::OfficialRestartHttpV1,
+        confirmed,
+        phase,
+        operation_id: outcome
+            .operation_id
+            .clone()
+            .unwrap_or_else(|| outcome.publication_id.clone()),
+        proxy_instance_id: instance.map(str::to_owned),
+        config_digest: Some(outcome.config_digest.clone()),
+    };
+    let changed = {
+        let mut held = OFFICIAL_CONFIRMATION
+            .lock()
+            .map_err(|_| anyhow::anyhow!("official proxy confirmation lock poisoned"))?;
+        let changed = held.as_ref() != Some(&view);
+        *held = Some(view.clone());
+        changed
+    };
+    if changed {
+        // Event bridges can read confirmation again. Release the state lock
+        // before calling them, and keep credentials/configuration out of logs.
+        tracing::info!(?phase, operation_id = %view.operation_id,
+            "official proxy transition");
+        crate::orchestration_events::emit(&crate::orchestration_events::OrchestrationEvent::Log {
+            service: "pingap".into(),
+            line: format!("Proxy {phase:?} (operation {})", view.operation_id),
+        });
+    }
+    Ok(())
+}
 static CONFIRMED_PUBLICATION: std::sync::Mutex<
     Option<(CompileOutcome, super::apply_status::ConfirmedPublication)>,
 > = std::sync::Mutex::new(None);
@@ -140,6 +236,7 @@ pub fn record_confirmed_publication(
 ) -> Result<()> {
     anyhow::ensure!(
         outcome.publication_id == confirmation.publication_id
+            && outcome.operation_id == confirmation.operation_id
             && outcome.config_digest == confirmation.config_digest
             && super::admin_probe::hashes_match(&outcome.expected_hash, &confirmation.config_hash),
         "proxy confirmation does not belong to this candidate"
@@ -148,9 +245,70 @@ pub fn record_confirmed_publication(
         .lock()
         .map_err(|_| anyhow::anyhow!("proxy publication lock poisoned"))? =
         Some((outcome.clone(), confirmation.clone()));
+    let phase = if !outcome.entry_probes.is_empty()
+        && outcome
+            .entry_probes
+            .iter()
+            .all(|target| target.expected_status == 503)
+    {
+        shared_types::ProxyPhase::Standby
+    } else {
+        shared_types::ProxyPhase::Serving
+    };
+    record_official_phase(outcome, phase, Some(&confirmation.instance_id))?;
     record_expected_hash(&outcome.expected_hash);
     PUBLICATION_UNCERTAIN.store(false, std::sync::atomic::Ordering::Release);
     Ok(())
+}
+
+/// A separate record preserves the official confirmation without extending
+/// the strict historical engine receipt. This is app-cli process/HTTP evidence.
+pub(crate) fn prepare_official_confirmation(
+    root: &Path,
+    outcome: &CompileOutcome,
+    confirmation: &super::apply_status::ConfirmedPublication,
+) -> Result<PreparedOfficialConfirmation> {
+    #[derive(serde::Serialize)]
+    struct Record<'a> {
+        schema_version: u32,
+        contract: &'static str,
+        config_path: &'a Path,
+        confirmation: &'a super::apply_status::ConfirmedPublication,
+    }
+    std::fs::create_dir_all(root).context("create official proxy confirmation directory")?;
+    let record = Record {
+        schema_version: 1,
+        contract: "official_restart_http_v1",
+        config_path: &outcome.config_path,
+        confirmation,
+    };
+    let mut file = tempfile::NamedTempFile::new_in(root)?;
+    serde_json::to_writer(&mut file, &record)?;
+    std::io::Write::flush(&mut file)?;
+    file.as_file().sync_all()?;
+    Ok(PreparedOfficialConfirmation {
+        file,
+        root: root.to_path_buf(),
+    })
+}
+
+/// Serialization and file fsync happen before the synchronous epoch fence.
+/// Only the atomic namespace publication is serialized with Stop revocation.
+pub(crate) struct PreparedOfficialConfirmation {
+    file: tempfile::NamedTempFile,
+    root: PathBuf,
+}
+
+impl PreparedOfficialConfirmation {
+    pub(crate) fn publish(self) -> Result<()> {
+        process_utils::atomic_file::persist(
+            self.file,
+            &self.root.join("official-proxy-confirmation.json"),
+        )?;
+        #[cfg(unix)]
+        std::fs::File::open(&self.root)?.sync_all()?;
+        Ok(())
+    }
 }
 
 pub fn confirmed_publication() -> Option<(CompileOutcome, super::apply_status::ConfirmedPublication)>
@@ -244,6 +402,19 @@ pub fn clear_current_confirmation() -> Result<()> {
     *CONFIRMED_PUBLICATION
         .lock()
         .map_err(|_| anyhow::anyhow!("proxy publication lock poisoned"))? = None;
+    let mut official = OFFICIAL_CONFIRMATION
+        .lock()
+        .map_err(|_| anyhow::anyhow!("official proxy confirmation lock poisoned"))?;
+    if let Some(view) = official.as_mut() {
+        view.confirmed = false;
+        view.proxy_instance_id = None;
+        if matches!(
+            view.phase,
+            shared_types::ProxyPhase::Serving | shared_types::ProxyPhase::Standby
+        ) {
+            view.phase = shared_types::ProxyPhase::Absent;
+        }
+    }
     record_expected_hash("");
     PUBLICATION_UNCERTAIN.store(true, std::sync::atomic::Ordering::Release);
     Ok(())
@@ -539,7 +710,7 @@ pub async fn publish_standby_to_path(
 
 pub use super::publication::{
     publish_confirmed, publish_standby_confirmed, publish_standby_confirmed_to_path,
-    publish_standby_confirmed_to_path_until, rollback_publication,
+    publish_standby_confirmed_to_path_until,
 };
 
 pub async fn compile_and_validate(
@@ -571,7 +742,6 @@ pub async fn compile_prepared(
     release: &ReleaseLock,
     dev_profile: bool,
 ) -> Result<CompileOutcome> {
-    require_application_protocol(pingap_bin).await?;
     let layout = vec![runtime_root.to_path_buf()];
     let (content, _) =
         compile_effective_config_with_roots(read_workspace, release, &layout, dev_profile).await?;
@@ -590,6 +760,7 @@ pub async fn compile_prepared(
     } else {
         write_validated_candidate(runtime_root, pingap_bin, &config, &publication, 200).await?
     };
+    outcome.serving_release_id = Some(release.release_id.clone());
     outcome.business_probes = release
         .services
         .iter()
@@ -609,20 +780,6 @@ pub async fn compile_prepared(
         })
         .collect();
     Ok(outcome)
-}
-
-async fn require_application_protocol(binary: &Path) -> Result<()> {
-    let mut command = Command::new(binary);
-    command.arg("--apply-protocol-version");
-    let output = process_utils::guardian::output_owned(command, std::time::Duration::from_secs(5))
-        .await
-        .context("inspect proxy application protocol before runtime mutation")?;
-    anyhow::ensure!(
-        output.status.success()
-            && std::str::from_utf8(&output.stdout).is_ok_and(|value| value.trim() == "1"),
-        "Pingap does not support application protocol v1; install the paired runtime binary before starting or replacing services"
-    );
-    Ok(())
 }
 
 fn rebind_file_references(
@@ -666,26 +823,82 @@ fn rebind_file_references(
     Ok(())
 }
 
-async fn write_validated_candidate(
+pub(crate) async fn write_validated_candidate(
     runtime_root: &Path,
     pingap_bin: &Path,
     config: &PingapConfig,
     publication: &str,
     status: u16,
 ) -> Result<CompileOutcome> {
+    validate_candidate(pingap_bin, config, runtime_root).await?;
     let outcome = persist_candidate(runtime_root, config, publication, status).await?;
-    let target = &outcome.config_path;
+    Ok(outcome)
+}
+
+/// Validate the complete candidate using the pinned official executable before
+/// stopping an existing proxy or business process. No admin fallback is enabled
+/// for `-t`: malformed configuration must remain a hard failure.
+pub async fn validate_candidate(
+    pingap_bin: &Path,
+    config: &PingapConfig,
+    runtime_root: &Path,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    validate_candidate_until(pingap_bin, config, runtime_root, deadline).await
+}
+
+/// Runtime transitions use their original deadline for capability observation,
+/// native configuration validation, and cleanup. An earlier phase cannot grant
+/// this preflight a fresh budget after the control request has waited.
+pub(crate) async fn validate_candidate_until(
+    pingap_bin: &Path,
+    config: &PingapConfig,
+    runtime_root: &Path,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    anyhow::ensure!(
+        tokio::time::Instant::now() < deadline,
+        "proxy candidate validation deadline exceeded before preflight"
+    );
+    let binary_digest = super::capabilities::preflight_until(pingap_bin, config, deadline).await?;
+    tokio::time::timeout_at(deadline, tokio::fs::create_dir_all(runtime_root))
+        .await
+        .context("proxy validation root deadline exceeded")?
+        .context("create proxy validation root")?;
+    let directory = tempfile::Builder::new()
+        .prefix("preflight-")
+        .tempdir_in(runtime_root)
+        .context("create private candidate validation directory")?;
+    anyhow::ensure!(
+        tokio::time::Instant::now() < deadline,
+        "proxy candidate validation deadline exceeded before configuration write"
+    );
+    let target = directory.path().join("pingap.toml");
+    tokio::time::timeout_at(
+        deadline,
+        tokio::fs::write(&target, toml::to_string_pretty(config)?),
+    )
+    .await
+    .context("proxy validation configuration write deadline exceeded")?
+    .context("write native proxy validation configuration")?;
     let mut command = Command::new(pingap_bin);
-    command.arg("-t").arg("-c").arg(target);
-    let output = process_utils::guardian::output_owned(command, std::time::Duration::from_secs(30))
+    super::official_env::sanitize(&mut command);
+    command.arg("-t").arg("-c").arg(&target);
+    let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+    anyhow::ensure!(
+        !budget.is_zero(),
+        "proxy native validation deadline exceeded"
+    );
+    let output = super::capabilities::native_test_until(command, deadline, directory)
         .await
         .with_context(|| format!("validate {} -t", pingap_bin.display()))?;
+    super::capabilities::verify_binary_until(pingap_bin, &binary_digest, deadline).await?;
     anyhow::ensure!(
         output.status.success(),
         "pingap -t rejected candidate: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
-    Ok(outcome)
+    Ok(())
 }
 
 pub(super) async fn persist_candidate(
@@ -715,6 +928,8 @@ pub(super) async fn persist_candidate(
     file.sync_all().await?;
     set_private_permissions(&target).await?;
     Ok(CompileOutcome {
+        serving_release_id: None,
+        operation_id: None,
         config_path: target,
         expected_hash,
         publication_id: publication.into(),

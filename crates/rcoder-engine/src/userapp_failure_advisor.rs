@@ -80,9 +80,65 @@ impl UserAppProxyFailureAdvisor for UserAppProxyFailureAdvisorImpl {
         .await
         .unwrap_or(None)
     }
+
+    async fn advise_current(
+        &self,
+        app_id: &str,
+        stage: &str,
+        budget: Duration,
+    ) -> Option<UserAppProxyFailureHint> {
+        let stage = UserappStage::parse(stage)?;
+        tokio::time::timeout(
+            budget.min(ADVISE_BUDGET_CAP),
+            self.observe_current(app_id, stage, budget),
+        )
+        .await
+        .ok()
+        .flatten()
+    }
 }
 
 impl UserAppProxyFailureAdvisorImpl {
+    async fn observe_current(
+        &self,
+        app_id: &str,
+        stage: UserappStage,
+        budget: Duration,
+    ) -> Option<UserAppProxyFailureHint> {
+        let state = self.state.upgrade()?;
+        let reader = state.app_service.readiness_reader()?;
+        match reader
+            .observe(app_id, stage, budget.min(ADVISE_BUDGET_CAP))
+            .await
+        {
+            Ok(UserAppReadinessObservation::Snapshot { physical, snapshot }) => {
+                current_snapshot_hint(physical, *snapshot)
+            }
+            Ok(UserAppReadinessObservation::NoCompute { state }) => Some(UserAppProxyFailureHint {
+                readiness_status: match state {
+                    shared_types::UserAppNoComputeState::Stopped => {
+                        Some(shared_types::UserAppReadinessStatus::Stopped)
+                    }
+                    shared_types::UserAppNoComputeState::Missing if stage == UserappStage::Prod => {
+                        Some(shared_types::UserAppReadinessStatus::NotDeployed)
+                    }
+                    shared_types::UserAppNoComputeState::Missing
+                    | shared_types::UserAppNoComputeState::Starting
+                    | shared_types::UserAppNoComputeState::Stopping
+                    | shared_types::UserAppNoComputeState::Failed
+                    | shared_types::UserAppNoComputeState::Unknown => None,
+                },
+                error_origin_confirmed: false,
+                proxy_confirmation: None,
+            }),
+            Ok(UserAppReadinessObservation::AdminUnreachable { .. })
+            | Ok(UserAppReadinessObservation::UnsupportedRuntime { .. })
+            | Ok(UserAppReadinessObservation::InstanceChanged)
+            | Ok(UserAppReadinessObservation::TimedOut)
+            | Err(_) => None,
+        }
+    }
+
     /// 外层 Option 表示缓存命中；Some(None) 缓存“没有诊断”，避免重复观察。
     async fn cached_hint(&self, key: &HintKey) -> Option<Option<UserAppProxyFailureHint>> {
         self.cache
@@ -143,6 +199,7 @@ impl UserAppProxyFailureAdvisorImpl {
         match reader.observe(app_id, stage, budget).await {
             Ok(UserAppReadinessObservation::Snapshot { snapshot, .. }) => {
                 Some(UserAppProxyFailureHint {
+                    proxy_confirmation: None,
                     readiness_status: Some(snapshot.status),
                     error_origin_confirmed: snapshot.proxy.error_origin_contract.as_deref()
                         == Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT),
@@ -168,6 +225,7 @@ impl UserAppProxyFailureAdvisorImpl {
                     | shared_types::UserAppNoComputeState::Unknown => None,
                 };
                 status.map(|readiness_status| UserAppProxyFailureHint {
+                    proxy_confirmation: None,
                     readiness_status: Some(readiness_status),
                     error_origin_confirmed: false,
                 })
@@ -175,6 +233,35 @@ impl UserAppProxyFailureAdvisorImpl {
             Ok(_) | Err(_) => None,
         }
     }
+}
+/// The reader's Snapshot variant is returned only after the captured physical
+/// identity was rechecked. Missing identity or owner token cannot prove progress.
+pub(crate) fn current_snapshot_hint(
+    physical: shared_types::UserAppReadinessPhysical,
+    snapshot: shared_types::UserAppBusinessReadiness,
+) -> Option<UserAppProxyFailureHint> {
+    if physical
+        .instance_id
+        .as_deref()
+        .is_none_or(|id| id.trim().is_empty())
+    {
+        return None;
+    }
+    let proxy_confirmation = if snapshot
+        .runtime_instance_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty())
+    {
+        snapshot.proxy.confirmation
+    } else {
+        None
+    };
+    Some(UserAppProxyFailureHint {
+        readiness_status: Some(snapshot.status),
+        error_origin_confirmed: snapshot.proxy.error_origin_contract.as_deref()
+            == Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT),
+        proxy_confirmation,
+    })
 }
 
 #[cfg(test)]
@@ -186,6 +273,7 @@ mod tests {
     async fn failure_advisor_invalid_stage_cannot_reuse_dev_hint() {
         let advisor = UserAppProxyFailureAdvisorImpl::new(Weak::new());
         let hint = UserAppProxyFailureHint {
+            proxy_confirmation: None,
             readiness_status: Some(shared_types::UserAppReadinessStatus::Failed),
             error_origin_confirmed: true,
         };
@@ -274,5 +362,68 @@ mod tests {
             advisor.inflight.is_empty(),
             "a cancelled observer must not strand the key"
         );
+    }
+    #[tokio::test]
+    async fn fresh_diagnostics_cannot_reuse_cached_starting_or_origin_evidence() {
+        let advisor = UserAppProxyFailureAdvisorImpl::new(Weak::new());
+        let hint = UserAppProxyFailureHint {
+            readiness_status: Some(shared_types::UserAppReadinessStatus::Starting),
+            error_origin_confirmed: true,
+            proxy_confirmation: Some(shared_types::ProxyConfirmation {
+                contract: shared_types::ProxyConfirmationContract::OfficialRestartHttpV1,
+                confirmed: false,
+                phase: shared_types::ProxyPhase::Starting,
+                operation_id: "old-native-operation".into(),
+                proxy_instance_id: None,
+                config_digest: None,
+            }),
+        };
+        advisor
+            .cached_observation(("app".into(), "dev"), async { Some(hint) })
+            .await;
+        assert!(
+            advisor
+                .advise("app", "dev", Duration::from_secs(1))
+                .await
+                .is_some()
+        );
+        assert!(
+            advisor
+                .advise_current("app", "dev", Duration::from_secs(1))
+                .await
+                .is_none(),
+            "no live reader must not borrow cached state, operation identity or origin proof"
+        );
+    }
+
+    #[test]
+    fn current_native_confirmation_requires_both_physical_and_owner_identity() {
+        let snapshot:shared_types::UserAppBusinessReadiness=serde_json::from_value(serde_json::json!({
+            "ready":false,"status":"starting","checked_at":"2026-10-11T00:00:00Z","observation_revision":0,
+            "runtime_instance_id":"current-owner","operation_id":"native-op","services":[],
+            "proxy":{"ready":false,"status":"starting","confirmation":{"contract":"official_restart_http_v1","confirmed":false,"phase":"stopping","operation_id":"native-op","proxy_instance_id":null,"config_digest":null}}
+        })).unwrap();
+        let physical = shared_types::UserAppReadinessPhysical {
+            instance_id: Some("current-pod-uid".into()),
+            address: None,
+            channel: shared_types::UserAppReadinessChannel::Exec,
+        };
+        let hint = current_snapshot_hint(physical.clone(), snapshot.clone()).unwrap();
+        assert_eq!(hint.transition_operation_id(), Some("native-op"));
+        let mut missing = physical;
+        missing.instance_id = None;
+        assert!(current_snapshot_hint(missing, snapshot.clone()).is_none());
+        let mut old = snapshot;
+        old.runtime_instance_id = None;
+        let hint = current_snapshot_hint(
+            shared_types::UserAppReadinessPhysical {
+                instance_id: Some("pod".into()),
+                address: None,
+                channel: shared_types::UserAppReadinessChannel::Exec,
+            },
+            old,
+        )
+        .unwrap();
+        assert!(hint.transition_operation_id().is_none());
     }
 }

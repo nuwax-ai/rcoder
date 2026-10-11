@@ -421,13 +421,19 @@ async fn forward_to_addr(
             warn!(
                 "[USERAPP_FORWARD] upstream request failed: app_id={app_id}, target={target}: {e:?}"
             );
-            // 分类仅限 dev 路径（dev 有重启窗口语义与专属文案；prod 的
-            // 连接失败由唤醒层分类，这里保持通用 502）。
-            if e.is_connect() && kind == ForwardKind::Dev {
-                return HttpResultError::dev_container_unreachable(
-                    shared_types::current_request_locale(),
-                )
-                .into_response();
+            // Both UserApp scopes can briefly lose their proxy/control socket.
+            // Only connect errors are classified here: no response/body is replayed.
+            if e.is_connect() {
+                let locale = shared_types::current_request_locale();
+                let unavailable = match kind {
+                    ForwardKind::Dev => HttpResultError::dev_container_unreachable(locale),
+                    ForwardKind::ProdRuntime => HttpResultError::unavailable_with_code(
+                        shared_types::ERR_CONTAINER_ADDRESS_NOT_READY,
+                        shared_types::t("userapp_error_page.generic.message", locale),
+                        10,
+                    ),
+                };
+                return unavailable.into_response();
             }
             return HttpResultError::bad_gateway(format!(
                 "{} container request failed before a response was received",

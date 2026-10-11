@@ -47,3 +47,4 @@ pub mod compute_recovery;
 pub mod discovery;
 
 pub mod diagnostic;
+pub mod proxy_control;

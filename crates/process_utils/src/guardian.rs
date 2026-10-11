@@ -16,6 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 mod spawn_checked;
 pub use spawn_checked::{
     SpawnAttemptFailure, spawn_guarded_owner_checked_until, spawn_owned_checked,
+    spawn_owned_checked_until,
 };
 
 #[derive(Serialize, Deserialize)]

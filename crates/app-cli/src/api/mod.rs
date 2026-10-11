@@ -35,6 +35,9 @@ use userapp_log_reader::{CancelOnDrop, LogProvider};
 
 mod envelope;
 mod proxy;
+#[cfg(test)]
+mod proxy_admission_tests;
+mod proxy_reload;
 mod readiness;
 mod runtime;
 
@@ -80,6 +83,11 @@ use envelope::ApiJson;
         shared_types::UserAppServiceReadiness,
         shared_types::UserAppReadinessStatus,
         shared_types::UserAppReadinessReason,
+        shared_types::ProxyConfirmation,
+        shared_types::ProxyConfirmationContract,
+        shared_types::ProxyPhase,
+        shared_types::ProxyReloadOperation,
+        shared_types::ProxyReloadState,
     )),
     tags(
         (name = "Runtime Logs", description = "Multi-service declared file logs"),

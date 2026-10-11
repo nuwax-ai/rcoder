@@ -1,3 +1,8 @@
+# 已停用：历史 Pingap Applied 补丁
+
+此目录仅保留旧版本的源码与验证依据，不再参与 Docker、npm 或运行时构建。
+当前交付使用未经修改的官方 Pingap；不要执行本目录脚本生成新发布产物。
+
 # RCoder 配对 Pingap
 
 此目录保存官方严格 pin 的 reviewed patch；不是官方 release 资产。`tools/build/pingap-assets.json`

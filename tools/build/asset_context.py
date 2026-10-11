@@ -98,15 +98,10 @@ def snapshot(source, target, references, kind, required=None, trusted_catalog=No
     if not required.issubset(components):
         raise ValueError('missing asset references: ' + ', '.join(sorted(required - components)))
     if kind == 'agent':
-        # The final agent image builds the reviewed paired binary separately
-        # from the immutable official release downloads above.
-        helper = Path(__file__).with_name('pingap-applied')
-        spec = importlib.util.spec_from_file_location('pingap_applied_source', helper / 'apply.py')
-        paired = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(paired)
-        paired.checked_manifest(helper)
-        shutil.copytree(helper, target / 'pingap-applied', dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        helpers = target / 'pingap-official'
+        helpers.mkdir(exist_ok=True)
+        for filename in ('pingap_official.py', 'runtime_assets.py', 'pingap-assets.json'):
+            shutil.copy2(Path(__file__).with_name(filename), helpers / filename)
     (target / 'asset-manifest.json').write_text(json.dumps(manifests, sort_keys=True) + '\n')
     return versions
 

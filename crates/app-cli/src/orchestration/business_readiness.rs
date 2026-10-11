@@ -40,6 +40,19 @@ const OBSERVE_BUDGET: Duration = Duration::from_secs(3);
 const PROBE_CONCURRENCY: usize = 8;
 /// 相同观察的短缓存（合并并发查询；指纹变化立即失效）。
 const CACHE_TTL: Duration = Duration::from_secs(1);
+type PhysicalVerifier = for<'a> fn(
+    &'a crate::proxy::apply_status::ConfirmedPublication,
+    tokio::time::Instant,
+) -> futures::future::BoxFuture<'a, anyhow::Result<()>>;
+
+fn verify_owned_physical(
+    receipt: &crate::proxy::apply_status::ConfirmedPublication,
+    deadline: tokio::time::Instant,
+) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(crate::proxy::observation::verify_physical(
+        receipt, deadline,
+    ))
+}
 
 /// 进程内状态指纹：任何应使旧观察失效的变化都会改变指纹。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +63,7 @@ struct ObservationFingerprint {
     initializing: bool,
     expected_proxy_hash: Option<String>,
     applied_publication: Option<crate::proxy::apply_status::ConfirmedPublication>,
+    proxy_confirmation: Option<shared_types::ProxyConfirmation>,
     publication_uncertain: bool,
     current_operation: Option<String>,
     dev_profile: Option<bool>,
@@ -72,6 +86,7 @@ impl ObservationFingerprint {
             expected_proxy_hash: crate::proxy::compiler::expected_hash(),
             applied_publication: crate::proxy::compiler::confirmed_publication()
                 .map(|(_, confirmed)| confirmed),
+            proxy_confirmation: crate::proxy::compiler::official_confirmation(),
             publication_uncertain: crate::proxy::compiler::publication_uncertain(),
             current_operation: server.current_runtime_operation(),
             dev_profile: server.proxy_context().map(|context| context.dev_profile),
@@ -94,6 +109,7 @@ pub struct BusinessReadinessObserver {
     cache: std::sync::Mutex<Option<CachedReadiness>>,
     /// 进程内单调观察序号（指纹每变化一次 +1；跨调用持久，不随缓存清除回落）。
     revision: std::sync::atomic::AtomicU64,
+    physical_verifier: PhysicalVerifier,
 }
 
 impl BusinessReadinessObserver {
@@ -103,6 +119,7 @@ impl BusinessReadinessObserver {
             probe_gate: tokio::sync::Mutex::new(()),
             cache: std::sync::Mutex::new(None),
             revision: std::sync::atomic::AtomicU64::new(0),
+            physical_verifier: verify_owned_physical,
         }
     }
 
@@ -135,8 +152,9 @@ impl BusinessReadinessObserver {
         if let Some(result) = self.fresh_cached() {
             return result;
         }
-        let result = Arc::new(self.probe_round().await);
-        self.store_cache(result.clone());
+        let (fingerprint, result) = self.probe_round().await;
+        let result = Arc::new(result);
+        self.store_cache(fingerprint, result.clone());
         result
     }
 
@@ -156,16 +174,18 @@ impl BusinessReadinessObserver {
         }
     }
 
-    fn store_cache(&self, result: Arc<UserAppBusinessReadiness>) {
-        let fingerprint = ObservationFingerprint::capture(&self.server);
+    fn store_cache(
+        &self,
+        fingerprint: ObservationFingerprint,
+        result: Arc<UserAppBusinessReadiness>,
+    ) {
+        // Store the identity actually observed. Recapturing here could label a
+        // completed old Ready result with a new proxy incarnation's fingerprint.
         let mut guard = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let revision = match guard.as_ref() {
-            Some(cached) if cached.fingerprint == fingerprint => cached.revision,
-            _ => self.revision.load(std::sync::atomic::Ordering::Acquire),
-        };
+        let revision = result.observation_revision;
         *guard = Some(CachedReadiness {
             fingerprint,
             revision,
@@ -178,54 +198,61 @@ impl BusinessReadinessObserver {
     ///
     /// 两轮共用一个总 deadline（换代重试不额外放大预算，保证上层 rcoder 的
     /// 通道超时（直连 4s/exec 6s）不会被第二轮击穿成 ADMIN_UNREACHABLE）。
-    async fn probe_round(&self) -> UserAppBusinessReadiness {
+    async fn probe_round(&self) -> (ObservationFingerprint, UserAppBusinessReadiness) {
         let fingerprint_before = ObservationFingerprint::capture(&self.server);
         let revision = self.current_revision(&fingerprint_before);
         let deadline = tokio::time::Instant::now() + OBSERVE_BUDGET;
-        let mut result = Self::probe_once(&self.server, deadline).await;
+        let mut result = Self::probe_once(&self.server, deadline, self.physical_verifier).await;
         let fingerprint_after = ObservationFingerprint::capture(&self.server);
         let mut final_revision = revision;
+        let mut final_fingerprint = fingerprint_before.clone();
         if fingerprint_after != fingerprint_before {
             // 换代窗口：剩余预算内快速重试一次，仍不稳定则按 INSTANCE_CHANGED 丢弃。
-            let retry = Self::probe_once(&self.server, deadline).await;
+            let retry = Self::probe_once(&self.server, deadline, self.physical_verifier).await;
             let fingerprint_retry = ObservationFingerprint::capture(&self.server);
             if fingerprint_retry == fingerprint_after {
                 result = retry;
                 // 探测期间发生了换代：观察序号按换代后指纹重算（单调推进，
                 // 不得把换代前后的两代标成同一序号）。
                 final_revision = self.current_revision(&fingerprint_retry);
+                final_fingerprint = fingerprint_retry;
             } else {
                 tracing::warn!(
                     "business readiness observation discarded: instance transition during probe"
                 );
-                return UserAppBusinessReadiness {
-                    ready: false,
-                    status: UserAppReadinessStatus::Unknown,
-                    reason_code: Some(UserAppReadinessReason::InstanceChanged),
-                    checked_at: now_rfc3339(),
-                    runtime_instance_id: runtime_instance_id(&self.server),
-                    serving_release_id: None,
-                    target_release_id: None,
-                    operation_id: self.server.current_runtime_operation(),
-                    observation_revision: revision,
-                    proxy: UserAppProxyReadiness {
+                return (
+                    fingerprint_retry,
+                    UserAppBusinessReadiness {
                         ready: false,
                         status: UserAppReadinessStatus::Unknown,
                         reason_code: Some(UserAppReadinessReason::InstanceChanged),
-                        error_origin_contract: None,
+                        checked_at: now_rfc3339(),
+                        runtime_instance_id: runtime_instance_id(&self.server),
+                        serving_release_id: None,
+                        target_release_id: None,
+                        operation_id: self.server.current_runtime_operation(),
+                        observation_revision: revision,
+                        proxy: UserAppProxyReadiness {
+                            ready: false,
+                            status: UserAppReadinessStatus::Unknown,
+                            reason_code: Some(UserAppReadinessReason::InstanceChanged),
+                            error_origin_contract: None,
+                            confirmation: None,
+                        },
+                        services: Vec::new(),
                     },
-                    services: Vec::new(),
-                };
+                );
             }
         }
         result.observation_revision = final_revision;
-        result
+        (final_fingerprint, result)
     }
 
     /// 一次完整观察：状态机短路 → 并发服务探测 → Pingap admin 快照 → 集中推导。
     async fn probe_once(
         server: &Arc<ServerState>,
         deadline: tokio::time::Instant,
+        physical: PhysicalVerifier,
     ) -> UserAppBusinessReadiness {
         let checked_at = now_rfc3339();
         let instance_id = runtime_instance_id(server);
@@ -233,6 +260,7 @@ impl BusinessReadinessObserver {
         let phase = server.phase();
         let release = server.release();
         let initializing = server.initializing();
+        let proxy_confirmation = crate::proxy::compiler::official_confirmation();
 
         // 初始化恢复期（P1-01）：API 已 bind 但 kernel/恢复未完成——一切业务
         // 观察都是过早的。初始化不需要等完，但不能宣称任何业务事实。
@@ -252,6 +280,7 @@ impl BusinessReadinessObserver {
                     status: UserAppReadinessStatus::Starting,
                     reason_code: Some(UserAppReadinessReason::ProxyNotStarted),
                     error_origin_contract: None,
+                    confirmation: None,
                 },
                 services: Vec::new(),
             };
@@ -274,6 +303,7 @@ impl BusinessReadinessObserver {
                     status: UserAppReadinessStatus::NotDeployed,
                     reason_code: None,
                     error_origin_contract: None,
+                    confirmation: None,
                 },
                 services: Vec::new(),
             };
@@ -297,6 +327,45 @@ impl BusinessReadinessObserver {
                     status: UserAppReadinessStatus::Stopped,
                     reason_code: None,
                     error_origin_contract: None,
+                    confirmation: None,
+                },
+                services: Vec::new(),
+            };
+        }
+
+        // A frozen official replacement cannot borrow the previous serving
+        // observation while its owned process is stopping or being verified.
+        if let Some(status) = proxy_transition_status(proxy_confirmation.as_ref()) {
+            let reason = match status {
+                UserAppReadinessStatus::Starting => UserAppReadinessReason::ServiceStarting,
+                UserAppReadinessStatus::Failed => UserAppReadinessReason::OrchestrationFailed,
+                UserAppReadinessStatus::NotDeployed
+                | UserAppReadinessStatus::Stopping
+                | UserAppReadinessStatus::Stopped
+                | UserAppReadinessStatus::Ready
+                | UserAppReadinessStatus::Degraded
+                | UserAppReadinessStatus::Unknown
+                | UserAppReadinessStatus::Unsupported => UserAppReadinessReason::ObserveIncomplete,
+            };
+            return UserAppBusinessReadiness {
+                ready: false,
+                status,
+                reason_code: Some(reason),
+                checked_at,
+                runtime_instance_id: instance_id,
+                serving_release_id: None,
+                target_release_id: Some(release.release_id),
+                operation_id: proxy_confirmation
+                    .as_ref()
+                    .map(|confirmation| confirmation.operation_id.clone())
+                    .or(operation_id),
+                observation_revision: 0,
+                proxy: UserAppProxyReadiness {
+                    ready: false,
+                    status,
+                    reason_code: Some(reason),
+                    error_origin_contract: None,
+                    confirmation: proxy_confirmation,
                 },
                 services: Vec::new(),
             };
@@ -324,7 +393,7 @@ impl BusinessReadinessObserver {
                 reason_code: Some(UserAppReadinessReason::NoProxiedWebServices),
                 checked_at,
                 runtime_instance_id: instance_id,
-                serving_release_id: Some(release.release_id.clone()),
+                serving_release_id: None,
                 target_release_id: None,
                 operation_id,
                 observation_revision: 0,
@@ -333,6 +402,7 @@ impl BusinessReadinessObserver {
                     status: UserAppReadinessStatus::Unsupported,
                     reason_code: Some(UserAppReadinessReason::NoProxiedWebServices),
                     error_origin_contract: None,
+                    confirmation: None,
                 },
                 services: Vec::new(),
             };
@@ -346,7 +416,7 @@ impl BusinessReadinessObserver {
                 reason_code: Some(UserAppReadinessReason::CustomRouteUnverified),
                 checked_at,
                 runtime_instance_id: instance_id,
-                serving_release_id: Some(release.release_id.clone()),
+                serving_release_id: None,
                 target_release_id: None,
                 operation_id,
                 observation_revision: 0,
@@ -355,6 +425,7 @@ impl BusinessReadinessObserver {
                     status: UserAppReadinessStatus::Unsupported,
                     reason_code: Some(UserAppReadinessReason::CustomRouteUnverified),
                     error_origin_contract: None,
+                    confirmation: None,
                 },
                 services: Vec::new(),
             };
@@ -363,9 +434,9 @@ impl BusinessReadinessObserver {
         // ── 真实探测：服务 HTTP（并发 ≤8）+ Pingap admin 快照 + 入口 TCP ──
         // 总预算由调用方 deadline 给定（探测轮内两轮共用；单项另受 2s 上限），
         // 预算耗尽的未完成项记 unknown（不折算成失败，也不从汇总集合消失）。
-        let (admin_snapshot, publication_confirmed, entry_reachable) = tokio::join!(
+        let (admin_snapshot, publication, entry_reachable) = tokio::join!(
             fetch_admin_snapshot(deadline),
-            verify_publication(deadline),
+            verify_publication(deadline, physical),
             async {
                 tokio::time::timeout(
                     item_budget(deadline),
@@ -401,10 +472,10 @@ impl BusinessReadinessObserver {
             admin_snapshot.as_ref(),
             entry_reachable,
             phase.clone(),
-            publication_confirmed,
+            publication.0,
         );
 
-        let target_release_id = target_release_hint(server, &release.release_id);
+        let target_release_id = target_release_hint(server, publication.1.as_deref().unwrap_or(""));
 
         let readiness = derive_top_level(phase.clone(), &services, proxy_ready, proxy_status);
         UserAppBusinessReadiness {
@@ -413,7 +484,11 @@ impl BusinessReadinessObserver {
             reason_code: top_level_reason(readiness, &services),
             checked_at,
             runtime_instance_id: instance_id,
-            serving_release_id: readiness.is_ready().then(|| release.release_id.clone()),
+            serving_release_id: if readiness.is_ready() {
+                publication.1
+            } else {
+                None
+            },
             target_release_id,
             operation_id,
             observation_revision: 0,
@@ -422,6 +497,10 @@ impl BusinessReadinessObserver {
                 status: proxy_status,
                 reason_code: proxy_reason,
                 error_origin_contract: origin_contract,
+                confirmation: proxy_confirmation.map(|mut confirmation| {
+                    confirmation.confirmed &= proxy_ready;
+                    confirmation
+                }),
             },
             services,
         }
@@ -441,13 +520,25 @@ fn now_rfc3339() -> String {
 
 /// 准备中的目标版本（热部署请求 token；与当前 serving 不同才有意义）。
 fn target_release_hint(server: &ServerState, current: &str) -> Option<String> {
-    let request = server
-        .deploy_request_release_id()
-        .filter(|value| !value.trim().is_empty() && value != current);
     match server.phase() {
-        ServerPhase::Deploying | ServerPhase::Orchestrating => request,
-        _ => None,
+        ServerPhase::Deploying | ServerPhase::Orchestrating => {}
+        ServerPhase::Idle | ServerPhase::Running | ServerPhase::Failed(_) => return None,
     }
+    let operation = server.deploy_status().operation?;
+    match operation.phase {
+        shared_types::AppCliDeployPhase::Deploying
+        | shared_types::AppCliDeployPhase::Orchestrating => {}
+        shared_types::AppCliDeployPhase::Idle
+        | shared_types::AppCliDeployPhase::Running
+        | shared_types::AppCliDeployPhase::Failed => return None,
+    }
+    if let Some(active) = server.current_runtime_operation()
+        && active != operation.operation_id
+    {
+        return None;
+    }
+    (!operation.request_release_id.trim().is_empty() && operation.request_release_id != current)
+        .then_some(operation.request_release_id)
 }
 
 /// 单服务探测：HTTP 健康契约（+ 静态入口核验 + upstream 可用性）。
@@ -550,6 +641,7 @@ async fn probe_service(
 /// 一次性 HTTP 探测：2xx=true、非 2xx=false、连接/请求错误=Err。
 async fn http_probe(url: &str, budget: Duration) -> anyhow::Result<bool> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .connect_timeout(budget)
         .timeout(budget)
         .redirect(reqwest::redirect::Policy::none())
@@ -574,24 +666,75 @@ async fn static_entry_available(port: u16) -> bool {
 }
 
 /// Pingap admin 只读快照（未注册端点/不可达返回 None——推导层归类）。
-async fn verify_publication(deadline: tokio::time::Instant) -> bool {
+async fn verify_publication(
+    deadline: tokio::time::Instant,
+    physical: PhysicalVerifier,
+) -> (bool, Option<String>) {
     if crate::proxy::compiler::publication_uncertain() {
-        return false;
+        return (false, None);
     }
     let Some((outcome, expected)) = crate::proxy::compiler::confirmed_publication() else {
-        return false;
+        return (false, None);
     };
+    let Some(confirmation) = crate::proxy::compiler::official_confirmation() else {
+        return (false, None);
+    };
+    if !confirmation.confirmed
+        || confirmation.proxy_instance_id.as_deref() != Some(expected.instance_id.as_str())
+        || confirmation.config_digest.as_deref() != Some(outcome.config_digest.as_str())
+        || !matches!(confirmation.phase, shared_types::ProxyPhase::Serving)
+    {
+        return (false, None);
+    }
     let Some(endpoint) = admin_probe::admin_endpoint() else {
-        return false;
+        return (false, None);
     };
-    match admin_probe::wait_for_publication(endpoint, &outcome, item_budget(deadline)).await {
+    if physical(&expected, deadline).await.is_err() {
+        return (false, None);
+    }
+    match admin_probe::wait_for_official_publication(
+        endpoint,
+        &outcome,
+        expected.process_id,
+        &expected.instance_id,
+        item_budget(deadline),
+    )
+    .await
+    {
         Ok(actual) => {
-            actual.process_id == expected.process_id && actual.instance_id == expected.instance_id
+            let verified = actual.process_id == expected.process_id
+                && actual.instance_id == expected.instance_id
+                && physical(&expected, deadline).await.is_ok()
+                && crate::proxy::compiler::official_confirmation().as_ref() == Some(&confirmation);
+            (
+                verified,
+                if verified {
+                    outcome.serving_release_id
+                } else {
+                    None
+                },
+            )
         }
         Err(error) => {
             tracing::debug!("business readiness: complete publication unconfirmed: {error:#}");
-            false
+            (false, None)
         }
+    }
+}
+
+fn proxy_transition_status(
+    confirmation: Option<&shared_types::ProxyConfirmation>,
+) -> Option<UserAppReadinessStatus> {
+    let confirmation = confirmation?;
+    use shared_types::ProxyPhase;
+    match confirmation.phase {
+        ProxyPhase::Preparing
+        | ProxyPhase::Stopping
+        | ProxyPhase::Starting
+        | ProxyPhase::Verifying => Some(UserAppReadinessStatus::Starting),
+        ProxyPhase::Failed => Some(UserAppReadinessStatus::Failed),
+        ProxyPhase::Absent | ProxyPhase::RecoveryRequired => Some(UserAppReadinessStatus::Unknown),
+        ProxyPhase::Serving | ProxyPhase::Standby => None,
     }
 }
 
@@ -773,6 +916,90 @@ fn top_level_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cache_keeps_the_observed_identity_when_state_changes_before_store() {
+        let state = Arc::new(ServerState::new(
+            crate::runtime_status::RuntimeStatusService::default(),
+        ));
+        state.mark_initialized();
+        let observer = BusinessReadinessObserver::new(state.clone());
+        let (fingerprint, observed) = observer.probe_round().await;
+        assert_eq!(observed.status, UserAppReadinessStatus::NotDeployed);
+        state.set_phase(ServerPhase::Deploying);
+        observer.store_cache(fingerprint, Arc::new(observed));
+        assert!(
+            observer.fresh_cached().is_none(),
+            "old observation must not be relabeled with the new state during cache insertion"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_observation_does_not_claim_a_desired_release_is_serving() {
+        let state = Arc::new(ServerState::new(
+            crate::runtime_status::RuntimeStatusService::default(),
+        ));
+        state.mark_initialized();
+        state.set_phase(ServerPhase::Running);
+        let mut no_services = combo_lock(19491);
+        no_services.services.clear();
+        no_services.release_id = "desired-without-proxy".into();
+        state.set_release(no_services);
+        let observer = BusinessReadinessObserver::new(state.clone());
+        let observed = observer.observe().await;
+        assert_eq!(observed.status, UserAppReadinessStatus::Unsupported);
+        assert_eq!(
+            observed.reason_code,
+            Some(UserAppReadinessReason::NoProxiedWebServices)
+        );
+        assert!(observed.serving_release_id.is_none());
+        let mut custom = combo_lock(19491);
+        custom.release_id = "desired-custom".into();
+        custom.pingap.mode = workspace_manifest::PingapMode::Custom;
+        state.set_release(custom);
+        let observed = observer.observe().await;
+        assert_eq!(
+            observed.reason_code,
+            Some(UserAppReadinessReason::CustomRouteUnverified)
+        );
+        assert!(observed.serving_release_id.is_none());
+    }
+
+    #[test]
+    fn official_replacement_phases_never_borrow_old_ready() {
+        let mut confirmation = shared_types::ProxyConfirmation {
+            contract: shared_types::ProxyConfirmationContract::OfficialRestartHttpV1,
+            confirmed: false,
+            phase: shared_types::ProxyPhase::Preparing,
+            operation_id: "reload".into(),
+            proxy_instance_id: None,
+            config_digest: None,
+        };
+        for phase in [
+            shared_types::ProxyPhase::Preparing,
+            shared_types::ProxyPhase::Stopping,
+            shared_types::ProxyPhase::Starting,
+            shared_types::ProxyPhase::Verifying,
+        ] {
+            confirmation.phase = phase;
+            assert_eq!(
+                proxy_transition_status(Some(&confirmation)),
+                Some(UserAppReadinessStatus::Starting)
+            );
+        }
+        confirmation.phase = shared_types::ProxyPhase::Failed;
+        assert_eq!(
+            proxy_transition_status(Some(&confirmation)),
+            Some(UserAppReadinessStatus::Failed)
+        );
+        confirmation.phase = shared_types::ProxyPhase::RecoveryRequired;
+        assert_eq!(
+            proxy_transition_status(Some(&confirmation)),
+            Some(UserAppReadinessStatus::Unknown)
+        );
+        confirmation.phase = shared_types::ProxyPhase::Serving;
+        assert_eq!(proxy_transition_status(Some(&confirmation)), None);
+    }
 
     fn service(
         id: &str,
@@ -971,31 +1198,40 @@ mod tests {
     }
 
     /// 假 admin `/api/basic`：返回与 `expected_hash` 匹配的 hash + upstream 健康。
-    fn spawn_fake_admin(
-        listener: std::net::TcpListener,
-        expected_hash: String,
-        apply_status: String,
-    ) {
+    fn spawn_fake_admin(listener: std::net::TcpListener, expected_hash: String, process_id: u32) {
         std::thread::spawn(move || {
             for socket in listener.incoming() {
                 let Ok(mut socket) = socket else { continue };
                 let expected_hash = expected_hash.clone();
-                let apply_status = apply_status.clone();
                 std::thread::spawn(move || {
                     use std::io::{Read, Write};
                     let mut buf = [0u8; 4096];
                     if socket.read(&mut buf).is_err() {
                         return;
                     }
-                    let body = if String::from_utf8_lossy(&buf)
-                        .starts_with("GET /api/apply-status ")
-                    {
-                        apply_status
-                    } else {
-                        format!(
-                            r#"{{"config_hash":"{expected_hash}","upstream_healthy_status":{{"web":{{"healthy":1,"total":1}}}}}}"#
-                        )
-                    };
+                    #[derive(serde::Serialize)]
+                    struct Basic<'a> {
+                        config_hash: &'a str,
+                        pid: String,
+                        upstream_healthy_status: std::collections::BTreeMap<&'static str, Health>,
+                    }
+                    #[derive(serde::Serialize)]
+                    struct Health {
+                        healthy: u32,
+                        total: u32,
+                    }
+                    let body = serde_json::to_string(&Basic {
+                        config_hash: &expected_hash,
+                        pid: process_id.to_string(),
+                        upstream_healthy_status: std::collections::BTreeMap::from([(
+                            "web",
+                            Health {
+                                healthy: 1,
+                                total: 1,
+                            },
+                        )]),
+                    })
+                    .unwrap();
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -1094,6 +1330,8 @@ path = "/"
         let admin = std::net::TcpListener::bind("127.0.0.1:3018").expect("bind fake admin 3018");
         let expected_hash = "COMBOHASH01".to_string();
         let outcome = crate::proxy::compiler::CompileOutcome {
+            serving_release_id: Some("rel-combo".into()),
+            operation_id: None,
             config_path: "unused-component-candidate.toml".into(),
             expected_hash: expected_hash.clone(),
             publication_id: publication_id.clone(),
@@ -1104,29 +1342,17 @@ path = "/"
             }],
             business_probes: vec![],
         };
-        let applied = crate::proxy::apply_status::ApplyStatus {
-            schema_version: 1,
+        let confirmed = crate::proxy::apply_status::ConfirmedPublication {
             process_id: std::process::id(),
-            process_instance_id,
-            applied: Some(crate::proxy::apply_status::AppliedPublication {
-                attempt_id: 1,
-                operation_id: Some(publication_id),
-                config_hash: expected_hash.clone(),
-                config_digest: outcome.config_digest.clone(),
-                applied_at_unix_ms: 1,
-            }),
-            last_attempt: None,
+            instance_id: process_instance_id,
+            publication_id,
+            config_hash: expected_hash.clone(),
+            config_digest: outcome.config_digest.clone(),
+            attempt_id: 1,
+            operation_id: None,
         };
-        crate::proxy::compiler::record_confirmed_publication(
-            &outcome,
-            &applied.current_publication().unwrap(),
-        )
-        .unwrap();
-        spawn_fake_admin(
-            admin,
-            expected_hash,
-            serde_json::to_string(&applied).unwrap(),
-        );
+        crate::proxy::compiler::record_confirmed_publication(&outcome, &confirmed).unwrap();
+        spawn_fake_admin(admin, expected_hash, confirmed.process_id);
         crate::proxy::admin_probe::register_admin_endpoint(
             "127.0.0.1:3018".into(),
             "combo".into(),
@@ -1145,7 +1371,17 @@ path = "/"
         state.mark_initialized();
         state.set_release(combo_lock(service_port));
         state.set_phase(crate::server::ServerPhase::Running);
-        let observer = super::BusinessReadinessObserver::new(state.clone());
+        let mut observer = super::BusinessReadinessObserver::new(state.clone());
+        // This component fixture tests aggregate HTTP observations only. Its
+        // explicit proof adapter is not production authority or real ownership
+        // acceptance; native owner suites exercise retained Child/engine proof.
+        fn controlled_proof(
+            _receipt: &crate::proxy::apply_status::ConfirmedPublication,
+            _deadline: tokio::time::Instant,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        observer.physical_verifier = controlled_proof;
 
         // 1) 服务未监听 → starting（connect refused 不算退化）。
         let observed = await_status(&observer, UserAppReadinessStatus::Starting).await;
@@ -1170,6 +1406,51 @@ path = "/"
         assert_eq!(observed.services.len(), 1);
         assert!(observed.services[0].ready);
         assert_eq!(observed.serving_release_id.as_deref(), Some("rel-combo"));
+        state
+            .try_accept_deploy_with_id(
+                crate::server::DeployRequest {
+                    runtime_operation_id: None,
+                    url: "https://fixture.invalid/new.zip".into(),
+                    release_id: "rel-desired".into(),
+                    sha256: None,
+                    local_path: None,
+                    execution_target: None,
+                    run_pg: None,
+                },
+                "desired-operation".into(),
+            )
+            .unwrap();
+        let mut desired = combo_lock(service_port);
+        desired.release_id = "rel-desired".into();
+        state.set_release(desired);
+        state.set_phase(ServerPhase::Orchestrating);
+        let observed = observer.observe().await;
+        assert!(observed.ready);
+        assert_eq!(
+            observed.serving_release_id.as_deref(),
+            Some("rel-combo"),
+            "old verified HTTP must not be labeled with the newly desired release"
+        );
+        assert_eq!(observed.target_release_id.as_deref(), Some("rel-desired"));
+        state.set_release(combo_lock(service_port));
+        state.set_phase(ServerPhase::Running);
+        fn rejected_proof(
+            _receipt: &crate::proxy::apply_status::ConfirmedPublication,
+            _deadline: tokio::time::Instant,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { anyhow::bail!("controlled foreign process identity") })
+        }
+        observer.physical_verifier = rejected_proof;
+        observer.cache.lock().unwrap().take();
+        let unowned = observer.observe().await;
+        assert!(
+            !unowned.ready && !unowned.proxy.ready,
+            "matching HTTP, PID and hash cannot replace physical owner proof"
+        );
+        assert!(unowned.serving_release_id.is_none());
+        assert!(!unowned.proxy.confirmation.as_ref().unwrap().confirmed);
+        observer.physical_verifier = controlled_proof;
+        observer.cache.lock().unwrap().take();
         let probe_before = state.runtime_status().is_ready();
 
         // 3) 服务转 503 → degraded（HTTP 契约失败）；代理入口仍健康（局部状态保留）。

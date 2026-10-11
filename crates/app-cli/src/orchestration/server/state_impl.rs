@@ -27,6 +27,11 @@ impl ServerState {
             admission: std::sync::Mutex::new(()),
             accepting: std::sync::atomic::AtomicBool::new(true),
             auxiliary_writers: std::sync::atomic::AtomicUsize::new(0),
+            runtime_admission_writers: std::sync::atomic::AtomicUsize::new(0),
+            runtime_admission_epoch: std::sync::atomic::AtomicU64::new(0),
+            auxiliary_operation: std::sync::Mutex::new(None),
+            auxiliary_cancel: std::sync::Mutex::new(None),
+            writer_settled: tokio::sync::Notify::new(),
             shutdown_unconfirmed: std::sync::atomic::AtomicBool::new(false),
             shutdown_grace_seconds: std::sync::atomic::AtomicU64::new(30),
             shutdown_group_count: std::sync::atomic::AtomicU64::new(1),
@@ -50,6 +55,7 @@ impl ServerState {
                     "progress_v1".into(),
                     "deployment_run_pg".into(),
                     shared_types::BUSINESS_READINESS_CAPABILITY.into(),
+                    shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into(),
                 ],
                 ..Default::default()
             }),
@@ -331,16 +337,6 @@ impl ServerState {
             .clone()
     }
 
-    /// 部署请求 token（`request_release_id`）——业务就绪观察用来标注
-    /// 「正在准备的目标版本」。与 release_id（内容身份）两层语义。
-    pub(crate) fn deploy_request_release_id(&self) -> Option<String> {
-        self.deploy_status
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .request_release_id
-            .clone()
-    }
-
     /// 按显式 ID 收束运行操作（R01）：只收束指定操作，不误完成并发受理的
     /// 其他操作；在执行槽匹配时一并清除。
     ///
@@ -429,6 +425,11 @@ impl ServerState {
         self.accepting
             .store(false, std::sync::atomic::Ordering::Release);
         self.trigger_cancel();
+        if let Ok(cancellation) = self.auxiliary_cancel.lock()
+            && let Some(cancellation) = cancellation.as_ref()
+        {
+            cancellation.cancel();
+        }
     }
 
     pub(super) fn generation_control(
@@ -452,6 +453,14 @@ impl ServerState {
             generation: generation.to_owned(),
             standby_root: crate::proxy::compiler::runtime_root(log_dir),
         }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_native_control(
+        &self,
+        observe: impl Fn() -> Option<(String, String)> + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.set_native_control(observe)
     }
 
     pub(super) fn set_native_control(
@@ -556,6 +565,7 @@ impl ServerState {
                 "progress_v1".into(),
                 "deployment_run_pg".into(),
                 shared_types::BUSINESS_READINESS_CAPABILITY.into(),
+                shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into(),
             ],
             ..Default::default()
         };
@@ -568,6 +578,10 @@ impl ServerState {
             .lock()
             .map_err(|_| anyhow::anyhow!("runtime admission lock poisoned"))?;
         anyhow::ensure!(
+            self.native_control_blocker().is_none(),
+            "native Stop/Recover control is in progress"
+        );
+        anyhow::ensure!(
             self.accepting.load(std::sync::atomic::Ordering::Acquire)
                 && !self.initializing()
                 && !self.runtime_recovery_hold_active(),
@@ -579,12 +593,153 @@ impl ServerState {
                 == 0,
             "another runtime configuration writer is active"
         );
+        let cancellation = CancellationToken::new();
+        *self
+            .auxiliary_cancel
+            .lock()
+            .map_err(|_| anyhow::anyhow!("auxiliary cancellation lock poisoned"))? =
+            Some(cancellation.clone());
         self.auxiliary_writers
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(AuxiliaryWriter {
             state: self,
             confirmed: false,
+            cancellation,
         })
+    }
+
+    pub(crate) fn begin_runtime_admission(&self) -> Result<super::state::RuntimeAdmission<'_>> {
+        let _admission = self
+            .admission
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime admission lock poisoned"))?;
+        let auxiliary_hold = if self
+            .auxiliary_writers
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+        {
+            Some((
+                self.auxiliary_operation
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("auxiliary operation lock poisoned"))?
+                    .clone(),
+                "configuration_writer".into(),
+            ))
+        } else if !self.accepting.load(std::sync::atomic::Ordering::Acquire) {
+            Some((None, "owner_closing".into()))
+        } else {
+            None
+        };
+        self.runtime_admission_writers
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.runtime_admission_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(super::state::RuntimeAdmission {
+            state: self,
+            auxiliary_hold,
+        })
+    }
+
+    pub(crate) async fn begin_proxy_write(&self, operation: &str) -> Result<AuxiliaryWriter<'_>> {
+        let epoch = self
+            .runtime_admission_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        if let Some(kernel) = self.runtime_kernel() {
+            anyhow::ensure!(
+                !kernel.has_configuration_barrier().await,
+                "a business runtime operation is in progress"
+            );
+        }
+        let _admission = self
+            .admission
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime admission lock poisoned"))?;
+        anyhow::ensure!(
+            self.native_control_blocker().is_none(),
+            "native Stop/Recover control is in progress"
+        );
+        anyhow::ensure!(
+            self.runtime_admission_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                == epoch,
+            "runtime operation admission changed during configuration observation"
+        );
+        anyhow::ensure!(
+            self.runtime_admission_writers
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0,
+            "runtime operation admission is in progress"
+        );
+        anyhow::ensure!(
+            self.accepting.load(std::sync::atomic::Ordering::Acquire)
+                && !self.initializing()
+                && !self.runtime_recovery_hold_active()
+                && self.current_runtime_operation().is_none()
+                && self.phase().accepts_deploy(),
+            "runtime write admission is closed"
+        );
+        anyhow::ensure!(
+            self.auxiliary_writers
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0,
+            "another runtime configuration writer is active"
+        );
+        let cancellation = CancellationToken::new();
+        *self
+            .auxiliary_operation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("auxiliary operation lock poisoned"))? =
+            Some(operation.into());
+        *self
+            .auxiliary_cancel
+            .lock()
+            .map_err(|_| anyhow::anyhow!("auxiliary cancellation lock poisoned"))? =
+            Some(cancellation.clone());
+        self.auxiliary_writers
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(AuxiliaryWriter {
+            state: self,
+            confirmed: false,
+            cancellation,
+        })
+    }
+
+    pub(crate) fn cancel_auxiliary_writes(&self) -> Result<()> {
+        let _admission = self
+            .admission
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime admission lock poisoned"))?;
+        if let Some(cancellation) = self
+            .auxiliary_cancel
+            .lock()
+            .map_err(|_| anyhow::anyhow!("auxiliary cancellation lock poisoned"))?
+            .as_ref()
+        {
+            cancellation.cancel();
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn wait_auxiliary_writes(&self, deadline: tokio::time::Instant) -> Result<()> {
+        loop {
+            let notified = self.writer_settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .auxiliary_writers
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+                && self
+                    .runtime_admission_writers
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == 0
+            {
+                return Ok(());
+            }
+            tokio::time::timeout_at(deadline, notified).await.context(
+                "admitted runtime/configuration writes have not settled before shutdown deadline",
+            )?;
+        }
     }
 
     /// 标记启动恢复完成：开放写端点受理与 ready 判定。
@@ -990,6 +1145,17 @@ impl ServerState {
         if let Some(saved) = history.get(&operation_id) {
             return deploy_replay::check(saved, &fingerprint).map(DeployAdmission::Replayed);
         }
+        if self
+            .auxiliary_writers
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+            || self
+                .runtime_admission_writers
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+        {
+            return Err(AdmissionError::Busy("a runtime configuration writer or control admission is in progress; deployment was not accepted".into()));
+        }
         if let Some((operation, stage)) = self.native_control_blocker() {
             return Err(AdmissionError::Busy(format!(
                 "native control operation {operation} is stopping business ({stage}); retry after it completes"
@@ -1130,6 +1296,7 @@ impl ServerState {
                 "progress_v1".into(),
                 "deployment_run_pg".into(),
                 shared_types::BUSINESS_READINESS_CAPABILITY.into(),
+                shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into(),
             ],
             progress: None,
         };
@@ -1284,6 +1451,7 @@ impl ServerState {
                 "progress_v1".into(),
                 "deployment_run_pg".into(),
                 shared_types::BUSINESS_READINESS_CAPABILITY.into(),
+                shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into(),
             ],
             progress: None,
         };

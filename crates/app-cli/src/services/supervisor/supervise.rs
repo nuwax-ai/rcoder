@@ -11,6 +11,7 @@ pub(super) async fn supervise(
     cancel: Option<tokio_util::sync::CancellationToken>,
     known_failed: Vec<String>,
 ) -> Result<()> {
+    let captured_scope = runtime_supervisor::current_scope();
     let forced = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("📡 received SIGINT, shutting down");
@@ -41,17 +42,41 @@ pub(super) async fn supervise(
     // second publication here would introduce a failure after the old Child
     // ownership has already been surrendered. Unexpected exits and signals
     // cannot preserve a live business execution; close an undrainable proxy.
-    let drain = if forced {
-        drain_or_close_resident().await
+    let fault = if forced {
+        super::resident::begin_fault_cleanup(captured_scope)
+    } else {
+        Ok(None)
+    };
+    let drain: Result<()> = if forced {
+        match &fault {
+            Ok(Some(fault)) => {
+                if let Err(drain_error) = fault
+                    .drain(tokio::time::Instant::now() + crate::proxy::admin_probe::CONFIRM_BUDGET)
+                    .await
+                {
+                    super::resident::close_entry().await.map_err(|close_error|ShutdownUnconfirmed(format!("fault entry drain failed: {drain_error:#}; closure unconfirmed: {close_error:#}")).into())
+                } else {
+                    Ok(())
+                }
+            }
+            Ok(None) => Ok(()),
+            Err(error) => Err(anyhow::anyhow!(
+                "fault cleanup coordination failed: {error:#}"
+            )),
+        }
     } else {
         Ok(())
     };
     let stopped = shutdown_all(children, shutdown_timeout_seconds).await;
-    match (drain, stopped) {
+    let result = match (drain, stopped) {
         (_, Err(stop_error)) => Err(stop_error),
         (Err(drain_error), Ok(())) => Err(drain_error),
         (Ok(()), Ok(())) => Ok(()),
+    };
+    if let Ok(Some(fault)) = fault {
+        fault.finish(&result);
     }
+    result
 }
 
 pub(super) async fn drain_or_close_resident() -> Result<()> {

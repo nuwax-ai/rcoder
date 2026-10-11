@@ -59,7 +59,7 @@ impl Access {
 }
 
 enum FetchOutcome {
-    Snapshot(UserAppBusinessReadiness),
+    Snapshot(Box<UserAppBusinessReadiness>),
     Unsupported,
     Unreachable,
 }
@@ -226,7 +226,7 @@ async fn fetch_direct(addr: &str, budget: Duration) -> FetchOutcome {
         }
         let body = response.text().await.map_err(|error| error.to_string())?;
         Ok::<_, String>(match parse_admin_envelope(&body) {
-            Ok(Some(snapshot)) => FetchOutcome::Snapshot(snapshot),
+            Ok(Some(snapshot)) => FetchOutcome::Snapshot(Box::new(snapshot)),
             _ => protocol_invalid_snapshot(),
         })
     };
@@ -262,7 +262,7 @@ fn parse_admin_envelope(body: &str) -> anyhow::Result<Option<UserAppBusinessRead
 /// exec 输出分类：退出码 0 = 快照；3 = 旧运行时；其余 = 不可达。
 fn classify_exec(exec: &container_runtime_api::ExecResult) -> FetchOutcome {
     match exec.exit_code {
-        0 => match serde_json::from_str::<UserAppBusinessReadiness>(exec.stdout.trim()) {
+        0 => match serde_json::from_str::<Box<UserAppBusinessReadiness>>(exec.stdout.trim()) {
             Ok(snapshot) => FetchOutcome::Snapshot(snapshot),
             // 退出 0 但输出不可解析：协议错误（合成 unknown 快照，不当 ready）。
             Err(error) => {
@@ -286,7 +286,7 @@ fn classify_exec(exec: &container_runtime_api::ExecResult) -> FetchOutcome {
 
 /// 协议错误 → 合成 unknown 快照（带 ADMIN_PROTOCOL_INVALID；不伪装 stopped/failed）。
 fn protocol_invalid_snapshot() -> FetchOutcome {
-    FetchOutcome::Snapshot(UserAppBusinessReadiness {
+    FetchOutcome::Snapshot(Box::new(UserAppBusinessReadiness {
         ready: false,
         status: UserAppReadinessStatus::Unknown,
         reason_code: Some(UserAppReadinessReason::AdminProtocolInvalid),
@@ -297,13 +297,14 @@ fn protocol_invalid_snapshot() -> FetchOutcome {
         operation_id: None,
         observation_revision: 0,
         proxy: UserAppProxyReadiness {
+            confirmation: None,
             ready: false,
             status: UserAppReadinessStatus::Unknown,
             reason_code: Some(UserAppReadinessReason::AdminProtocolInvalid),
             error_origin_contract: None,
         },
         services: Vec::new(),
-    })
+    }))
 }
 
 #[cfg(test)]

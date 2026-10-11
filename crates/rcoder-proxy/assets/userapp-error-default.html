@@ -190,7 +190,7 @@
   var state = document.getElementById('node-app-state');
   var link = document.getElementById('link-app');
   if (!node || !glyph || !state) { return; }
-  if (cause === 'starting') {
+  if ((cause === 'starting' || cause === 'restarting')) {
     node.className = 'node warn';
     glyph.innerHTML = '<span class="spin"></span>';
     state.textContent = node.getAttribute('data-i18n-starting') || '';

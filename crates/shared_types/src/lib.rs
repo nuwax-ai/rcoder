@@ -69,6 +69,10 @@ pub use userapp::forward_contract::{
 };
 pub use userapp::http_credentials::{FileServerCredentialsProvider, FileServerRequestCredentials};
 pub use userapp::metadata::AppMetadataRecord;
+pub use userapp::proxy_control::{
+    OFFICIAL_PROXY_RESTART_CAPABILITY, ProxyConfirmation, ProxyConfirmationContract, ProxyPhase,
+    ProxyReloadOperation, ProxyReloadState,
+};
 pub use userapp::run_credentials::{SourceRunCredentialError, resolve_source_run_pg};
 pub use userapp::runtime_configuration::*;
 pub use userapp::runtime_control::{

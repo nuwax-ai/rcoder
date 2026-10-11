@@ -288,22 +288,13 @@ impl ProxyHttp for ProxyServiceWrapper {
             // → starting 文案；无证据/其余 → Generic（不凭连接失败虚报启动
             // 中）。操作 kind 白名单级证据随 P1 的 app-cli 快照扩展收窄；
             // prod 维持既有 Generic 表示不变。
-            let mut cause = crate::error_page::ErrorPageCause::Generic;
-            if ctx
-                .userapp_route
+            ctx.fresh_failure_evidence = true;
+            PortProxy::capture_proxy_transition(ctx);
+            let cause = ctx
+                .failure_hint
                 .as_ref()
-                .is_some_and(|route| route.stage == "dev")
-                && let Some(status) = ctx
-                    .app_connect_recovery
-                    .as_ref()
-                    .and_then(|state| state.dev_evidence_status)
-            {
-                cause = crate::error_page::UserAppProxyFailureHint {
-                    readiness_status: Some(status),
-                    error_origin_confirmed: false,
-                }
-                .page_cause();
-            }
+                .map(|hint| hint.page_cause())
+                .unwrap_or(crate::error_page::ErrorPageCause::Generic);
             self.inner
                 .respond_userapp_error(
                     session,
@@ -742,9 +733,19 @@ mod tests {
             _budget: Duration,
         ) -> Option<crate::error_page::UserAppProxyFailureHint> {
             Some(crate::error_page::UserAppProxyFailureHint {
+                proxy_confirmation: None,
                 readiness_status: Some(self.status),
                 error_origin_confirmed: self.confirmed,
             })
+        }
+        async fn advise_current(
+            &self,
+            app_id: &str,
+            stage: &str,
+            budget: Duration,
+        ) -> Option<crate::error_page::UserAppProxyFailureHint> {
+            // This controlled fixture has no TTL cache or changing deployment.
+            self.advise(app_id, stage, budget).await
         }
     }
 
@@ -1189,9 +1190,25 @@ mod implementation_probe_timeout_tests {
             _budget: std::time::Duration,
         ) -> Option<crate::error_page::UserAppProxyFailureHint> {
             Some(crate::error_page::UserAppProxyFailureHint {
+                proxy_confirmation: Some(shared_types::ProxyConfirmation {
+                    contract: shared_types::ProxyConfirmationContract::OfficialRestartHttpV1,
+                    confirmed: false,
+                    phase: shared_types::ProxyPhase::Starting,
+                    operation_id: "current-native-proxy-operation".into(),
+                    proxy_instance_id: None,
+                    config_digest: None,
+                }),
                 readiness_status: Some(shared_types::UserAppReadinessStatus::Starting),
                 error_origin_confirmed: false,
             })
+        }
+        async fn advise_current(
+            &self,
+            app_id: &str,
+            stage: &str,
+            budget: std::time::Duration,
+        ) -> Option<crate::error_page::UserAppProxyFailureHint> {
+            self.advise(app_id, stage, budget).await
         }
     }
 
@@ -1210,7 +1227,7 @@ mod implementation_probe_timeout_tests {
                 .parse::<std::net::IpAddr>()
                 .expect("loopback alias"),
         );
-        for (with_advisor, marker) in [(true, "应用正在启动"), (false, "应用暂时无法访问")]
+        for (with_advisor, marker) in [(true, "应用服务正在切换"), (false, "应用暂时无法访问")]
         {
             let proxy_reservation =
                 std::net::TcpListener::bind("127.0.0.1:0").expect("reserve proxy port");
@@ -1265,6 +1282,21 @@ mod implementation_probe_timeout_tests {
                 "recovery terminal must carry Retry-After: {response}"
             );
             assert!(response.contains(marker), "{response}");
+            if with_advisor {
+                assert!(
+                    response
+                        .to_ascii_lowercase()
+                        .contains("x-rcoder-operation-id: current-native-proxy-operation"),
+                    "fresh native identity must be preserved: {response}"
+                );
+            } else {
+                assert!(
+                    !response
+                        .to_ascii_lowercase()
+                        .contains("x-rcoder-operation-id"),
+                    "unknown must not invent an operation: {response}"
+                );
+            }
         }
     }
 

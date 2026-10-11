@@ -1,49 +1,123 @@
-//! Resident entry observation, ownership, migration and publication barriers.
+//! Official Pingap replacement with exact supervisord owner provenance.
 use super::*;
+use crate::proxy::{
+    apply_status::ConfirmedPublication,
+    publication::{self, ProcessHost, ProcessInstance},
+};
 
 impl SupervisordHost {
     pub(crate) async fn verify_entry_confirmation(
         &self,
-        confirmation: &crate::proxy::apply_status::ConfirmedPublication,
+        confirmation: &ConfirmedPublication,
     ) -> Result<()> {
         let info = self.client.process_info(PINGAP_PROGRAM).await?;
         anyhow::ensure!(
             info.checked_state(PINGAP_PROGRAM)? == SupervisorProcessState::Running,
-            "proxy application result has no RUNNING supervisord instance"
+            "proxy confirmation has no RUNNING supervisord instance"
         );
         anyhow::ensure!(
             info.running_identity()?.pid == i64::from(confirmation.process_id),
-            "proxy application result belongs to another supervisord PID"
+            "proxy confirmation belongs to another supervisord PID"
         );
         let (config, _) = self.live_entry_binding(&info).await?;
+        let (outcome, held) = crate::proxy::compiler::confirmed_publication()
+            .context("proxy has no local official confirmation")?;
         anyhow::ensure!(
-            config
-                .parent()
-                .and_then(Path::file_name)
-                .is_some_and(|name| name == "active"),
-            "proxy confirmation belongs to a legacy configuration path"
+            held == *confirmation && config == outcome.config_path,
+            "proxy confirmation configuration or host instance changed"
         );
-        let scope = supervisor::resident::owner_scope()?
-            .context("proxy confirmation has no retained owner domain")?;
+        let scope =
+            supervisor::resident::owner_scope()?.context("proxy has no retained owner domain")?;
         scope.verify_owner_for_cleanup()?;
         let root = config
             .parent()
             .and_then(Path::parent)
-            .context("proxy confirmation has no runtime root")?;
+            .context("proxy snapshot runtime root missing")?;
         let receipt = verify_resident_engine_receipt(
             root,
             scope.identity(),
             &crate::xmlrpc::default_socket_path(),
         )?
-        .context("proxy confirmation has no resident owner receipt")?;
+        .context("proxy owner receipt missing")?;
         anyhow::ensure!(
-            receipt.config == config,
-            "proxy confirmation configuration differs from owner receipt"
+            receipt.config == config && receipt.process.as_ref() == Some(&info.running_identity()?),
+            "proxy exact owner receipt changed"
         );
         Ok(())
     }
 
-    /// User controls call this before surrendering business Child ownership.
+    /// Supervisord may restart only this immutable spec after a crash. Such a
+    /// new PID is not Ready until the retained owner proves it again over HTTP.
+    pub(crate) async fn reconcile_official_incarnation(
+        &self,
+        runtime_root: &Path,
+        expected: &CompileOutcome,
+        held: &ConfirmedPublication,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        let epoch = supervisor::resident::control_epoch()?;
+        let info = self
+            .resident_entry_settled_with_budget(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await?;
+        let Some(info) = info else {
+            return self
+                .replace_official(runtime_root, expected, deadline)
+                .await
+                .map(|_| ());
+        };
+        if info.checked_state(PINGAP_PROGRAM)? != SupervisorProcessState::Running {
+            return self
+                .replace_official(runtime_root, expected, deadline)
+                .await
+                .map(|_| ());
+        }
+        if info.running_identity()?.pid == i64::from(held.process_id) {
+            // Equal PID alone cannot retain a prior incarnation after PID reuse.
+            // Check start time, exact wrapper and owner receipt without mutation.
+            match tokio::time::timeout_at(deadline, self.verify_entry_confirmation(held)).await {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(_changed)) => {}
+                Err(_) => anyhow::bail!("supervisord physical observation deadline exhausted"),
+            }
+        }
+        let _guard = match crate::proxy::compiler::try_publication_guard() {
+            Ok(guard) => guard,
+            Err(_) => return Ok(()),
+        };
+        let (config, spec) = self.live_entry_binding(&info).await?;
+        anyhow::ensure!(
+            config == expected.config_path,
+            "supervisord restarted a different proxy snapshot"
+        );
+        self.authorize_entry_domain(runtime_root, &config, &spec, &info)
+            .await?;
+        publication::validate_immutable(expected).await?;
+        let running = info.running_identity()?;
+        let instance = ProcessInstance {
+            pid: u32::try_from(running.pid)?,
+            id: uuid::Uuid::new_v4().to_string(),
+        };
+        let mut host = OfficialSupervisorHost {
+            host: self,
+            runtime_root,
+            spec,
+            current: Some((instance.clone(), running)),
+            cancel: None,
+            epoch,
+        };
+        crate::proxy::compiler::record_official_phase(
+            expected,
+            shared_types::ProxyPhase::Verifying,
+            Some(&instance.id),
+        )?;
+        host.verify_exact(&instance, deadline).await?;
+        let confirmation = host.confirm(expected, &instance, deadline).await?;
+        host.verify_exact(&instance, deadline).await?;
+        host.commit(expected, &confirmation, deadline).await
+    }
+
     pub(crate) async fn drain_entry(&self, runtime_root: &Path) -> Result<()> {
         self.drain_entry_until(
             runtime_root,
@@ -57,74 +131,83 @@ impl SupervisordHost {
         runtime_root: &Path,
         deadline: tokio::time::Instant,
     ) -> Result<()> {
-        tokio::time::timeout_at(deadline, self.drain_entry_inner(runtime_root, deadline)).await
-            .map_err(|_| supervisor::ShutdownUnconfirmed("entry drain deadline exhausted; business retained and publication result unknown".into()))?
+        self.drain_entry_for_operation_until(runtime_root, deadline, None)
+            .await
+    }
+
+    pub(crate) async fn drain_entry_for_operation_until(
+        &self,
+        runtime_root: &Path,
+        deadline: tokio::time::Instant,
+        operation_id: Option<String>,
+    ) -> Result<()> {
+        self.drain_entry_inner(runtime_root, deadline, operation_id)
+            .await
     }
 
     pub(super) async fn drain_entry_inner(
         &self,
         runtime_root: &Path,
         deadline: tokio::time::Instant,
+        operation_id: Option<String>,
     ) -> Result<()> {
-        let Some(info) = self.resident_entry_settled().await? else {
-            if let Some(spec) = configured_entry_spec(&self.conf_path)? {
-                return self
-                    .migrate_legacy_entry(runtime_root, &entry_config_from_argv(&spec.argv)?, &spec)
-                    .await;
+        // Lifecycle control has already been admitted. Background reconfirmation
+        // or readonly observation must settle rather than reject Stop as Busy.
+        let _control = supervisor::resident::control_publication(deadline).await?;
+        let Some(info) = self
+            .resident_entry_settled_with_budget(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await?
+        else {
+            if configured_entry_spec(&self.conf_path)?.is_none() {
+                return Ok(());
             }
-            anyhow::ensure!(
-                self.dynamic_groups().await?.is_empty(),
-                "business groups exist without an owned resident entry configuration"
-            );
-            return Ok(());
-        };
-        if info.checked_state(PINGAP_PROGRAM)? != SupervisorProcessState::Running {
             let spec = configured_entry_spec(&self.conf_path)?
-                .context("stopped resident has no owned wrapper specification")?;
+                .context("configured proxy spec disappeared")?;
             return self
-                .migrate_legacy_entry(runtime_root, &entry_config_from_argv(&spec.argv)?, &spec)
+                .migrate_legacy_entry(
+                    runtime_root,
+                    &entry_config_from_argv(&spec.argv)?,
+                    &spec,
+                    deadline,
+                    operation_id,
+                )
                 .await;
-        }
-        let (config, spec) = self.live_entry_binding(&info).await?;
-        self.authorize_entry_domain(runtime_root, &config, &spec, &info)
-            .await
-            .map_err(|error| {
-                anyhow::Error::new(EntryOwnershipUnconfirmed(format!(
-                    "resident owner domain is unconfirmed: {error:#}"
-                )))
-                .context(supervisor::ShutdownUnconfirmed(
-                    "resident ownership is unconfirmed; business retained".into(),
-                ))
-            })?;
-        if config != crate::proxy::compiler::active_config_path(runtime_root) {
-            return self
-                .migrate_legacy_entry(runtime_root, &config, &spec)
-                .await;
-        }
-        let endpoint = admin_probe::ensure_admin_endpoint()?;
-        let observation = admin_probe::fetch_apply_status(endpoint).await?;
-        anyhow::ensure!(
-            i64::from(observation.process_id) == info.running_identity()?.pid,
-            "proxy admin does not belong to the observed supervisord PID"
-        );
-        crate::proxy::compiler::publish_standby_confirmed_to_path_until(
+        };
+        let (config, spec) =
+            if info.checked_state(PINGAP_PROGRAM)? == SupervisorProcessState::Running {
+                let (config, spec) = self.live_entry_binding(&info).await?;
+                self.authorize_entry_domain(runtime_root, &config, &spec, &info)
+                    .await?;
+                (config, spec)
+            } else {
+                let spec = configured_entry_spec(&self.conf_path)?
+                    .context("stopped proxy has no owned configuration")?;
+                let config = entry_config_from_argv(&spec.argv)?;
+                // Authority is checked before deriving or validating a candidate.
+                // Missing binaries/configuration cannot mask a foreign receipt.
+                self.authorize_inactive_entry(runtime_root, &config)?;
+                (config, spec)
+            };
+        let mut outcome = publication::standby_candidate(runtime_root, &config).await?;
+        outcome.operation_id = operation_id;
+        let bytes = publication::validate_immutable(&outcome).await?;
+        let graph = pingap_config::PingapConfig::new(&bytes, true)?;
+        crate::proxy::compiler::validate_candidate_until(
+            Path::new(&spec.argv[0]),
+            &graph,
             runtime_root,
-            &crate::proxy::compiler::active_config_path(runtime_root),
-            endpoint,
             deadline,
         )
         .await?;
-        if self.client.running_process(PINGAP_PROGRAM).await? != info.running_identity()? {
-            return Err(supervisor::ShutdownUnconfirmed(
-                "resident instance changed after drain; business retained".into(),
-            )
-            .into());
-        }
-        Ok(())
+        self.replace_official_under_guard(runtime_root, &outcome, deadline, None)
+            .await
+            .map(|_| ())
     }
 
-    /// Snapshot the exact old -c topology before candidate compatibility checks.
-    /// Copying it to the new path does not claim that the old process watches it.
+    /// The active file is only a compatibility topology view; its presence and
+    /// historical Applied records never authorize a new process incarnation.
     pub(crate) async fn prepare_entry_baseline(&self, runtime_root: &Path) -> Result<()> {
         let Some(info) = self.resident_entry_settled().await? else {
             return Ok(());
@@ -135,9 +218,12 @@ impl SupervisordHost {
         let (config, spec) = self.live_entry_binding(&info).await?;
         self.authorize_entry_domain(runtime_root, &config, &spec, &info)
             .await?;
-        let active = crate::proxy::compiler::active_config_path(runtime_root);
-        if config != active {
-            crate::proxy::compiler::publish_to_path(&config, &active).await?;
+        if config != crate::proxy::compiler::active_config_path(runtime_root) {
+            crate::proxy::compiler::publish_to_path(
+                &config,
+                &crate::proxy::compiler::active_config_path(runtime_root),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -147,127 +233,181 @@ impl SupervisordHost {
         runtime_root: &Path,
         old_config: &Path,
         old_spec: &ServiceSpecFile,
+        deadline: tokio::time::Instant,
+        operation_id: Option<String>,
     ) -> Result<()> {
-        let _publication_guard = crate::proxy::compiler::publication_guard().await;
-        // A configured but inactive program supplies no PID provenance. Its
-        // immutable owner claim must authorize reuse before copying active or
-        // withdrawing any supervisor fragment.
-        let ownership = (|| -> Result<()> {
+        self.authorize_inactive_entry(runtime_root, old_config)?;
+        admin_probe::register_verified_legacy_endpoint(old_spec)?;
+        let mut outcome = publication::standby_candidate(runtime_root, old_config).await?;
+        outcome.operation_id = operation_id;
+        let graph = pingap_config::PingapConfig::new(
+            &publication::validate_immutable(&outcome).await?,
+            true,
+        )?;
+        crate::proxy::compiler::validate_candidate_until(
+            Path::new(&old_spec.argv[0]),
+            &graph,
+            runtime_root,
+            deadline,
+        )
+        .await?;
+        self.replace_official_under_guard(runtime_root, &outcome, deadline, None)
+            .await
+            .map(|_| ())
+    }
+
+    fn authorize_inactive_entry(&self, runtime_root: &Path, config: &Path) -> Result<()> {
+        let result = (|| -> Result<()> {
             let scope = supervisor::resident::owner_scope()?
-                .context("inactive resident has no retained owner capability")?;
-            scope.record_running()?;
+                .context("inactive proxy has no retained owner capability")?;
+            scope.verify_owner_for_cleanup()?;
             let receipt = verify_resident_engine_receipt(
                 runtime_root,
                 scope.identity(),
                 &crate::xmlrpc::default_socket_path(),
             )?
-            .context(
-                "inactive resident has no owner-domain receipt; explicit bootstrap required",
-            )?;
+            .context("inactive proxy has no owner-domain receipt")?;
             anyhow::ensure!(
-                receipt.config == old_config
-                    && std::fs::canonicalize(old_config)?
-                        .starts_with(std::fs::canonicalize(runtime_root)?),
-                "inactive resident configuration differs from its owner-domain claim"
+                receipt.config == config
+                    && config.is_absolute()
+                    && config.starts_with(std::fs::canonicalize(runtime_root)?)
+                    && !config
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir)),
+                "inactive proxy configuration differs from its owner-domain claim"
             );
             Ok(())
         })();
-        ownership.map_err(|error| {
+        result.map_err(|error| {
             anyhow::Error::new(EntryOwnershipUnconfirmed(format!(
-                "inactive resident ownership rejected: {error:#}"
+                "inactive proxy owner domain rejected: {error:#}"
             )))
             .context(supervisor::ShutdownUnconfirmed(
-                "inactive resident ownership is unconfirmed; business retained".into(),
+                "inactive proxy ownership is unconfirmed; business retained".into(),
             ))
-        })?;
-        let endpoint = admin_probe::register_verified_legacy_endpoint(old_spec)?;
-        let active = crate::proxy::compiler::active_config_path(runtime_root);
-        crate::proxy::compiler::publish_to_path(old_config, &active).await?;
-        let publication = uuid::Uuid::new_v4().simple().to_string();
-        // Build the complete new standby before touching the old entry. An old
-        // pin need not implement Applied; the new instance must prove it does.
-        let standby = crate::proxy::compiler::publish_standby(runtime_root, &publication).await?;
-        self.close_entry().await?;
-        let migration = async {
-            self.record_entry_domain(runtime_root, &active, None)
-                .await?;
-            let mut spec = old_spec.clone();
-            spec.release_id = crate::svc_spec::RESIDENT_SPEC_ID.into();
-            spec.argv[2] = active.to_string_lossy().into_owned();
-            spec.write()?;
-            let content = match tokio::fs::read_to_string(&self.conf_path).await {
-                Ok(content) => content,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-                Err(error) => {
-                    return Err(error).context("read dynamic fragment for resident migration");
-                }
-            };
-            write_conf(&self.conf_path, &without_resident_program(&content)).await?;
-            let log_root = runtime_root
-                .parent()
-                .context("resident runtime has no log root")?;
-            tokio::fs::create_dir_all(log_root.join("services")).await?;
-            let resident_conf = self
-                .conf_path
-                .parent()
-                .context("supervisor fragment has no parent")?
-                .join(RESIDENT_CONF_FILE);
-            write_conf(&resident_conf, &render_resident_conf(log_root)).await?;
-            mutation_result(self.client.reload_config().await)?;
-            mutation_result(self.client.add_process_group(PINGAP_PROGRAM).await)?;
-            mutation_result(self.client.start_process_wait(PINGAP_PROGRAM).await)?;
-            let instance = self.client.running_process(PINGAP_PROGRAM).await?;
-            let confirmed =
-                admin_probe::wait_for_publication(endpoint, &standby, admin_probe::CONFIRM_BUDGET)
-                    .await?;
-            anyhow::ensure!(
-                i64::from(confirmed.process_id) == instance.pid,
-                "new resident Applied receipt belongs to another PID"
-            );
-            self.record_entry_domain(runtime_root, &active, Some(&instance))
-                .await?;
-            anyhow::ensure!(
-                self.client.running_process(PINGAP_PROGRAM).await? == instance,
-                "new resident restarted before migration confirmation"
-            );
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
-        migration.map_err(|error| supervisor::ShutdownUnconfirmed(format!(
-            "legacy entry was closed; new resident standby is unconfirmed; business execution preserved: {error:#}"
-        )).into())
+        })
     }
 
+    /// Only withdraw proxy restart sources. Business groups and their fragment
+    /// remain intact during a configuration reload or failed proxy replacement.
     pub(super) async fn close_entry(&self) -> Result<()> {
-        let Some(info) = self.resident_entry_settled().await? else {
-            return Ok(());
-        };
-        if info.checked_state(PINGAP_PROGRAM)? == SupervisorProcessState::Running {
-            self.live_entry_binding(&info).await?;
-        } else {
-            let spec = configured_entry_spec(&self.conf_path)?
-                .context("resident group has no owned configuration")?;
-            admin_probe::register_verified_legacy_endpoint(&spec)?;
+        let existing = self.resident_entry_settled().await?;
+        if let Some(info) = &existing {
+            if info.checked_state(PINGAP_PROGRAM)? == SupervisorProcessState::Running {
+                self.live_entry_binding(info).await?;
+            } else {
+                let spec = configured_entry_spec(&self.conf_path)?
+                    .context("proxy group has no owned configuration")?;
+                admin_probe::register_verified_legacy_endpoint(&spec)?;
+            }
         }
-        // Remove both restart sources before touching the authenticated group.
-        write_conf(
-            &self.conf_path,
-            "# app-cli business and legacy proxy stopped\n",
-        )
-        .await?;
-        let resident_conf = self
-            .conf_path
-            .parent()
-            .context("dynamic configuration has no parent")?
-            .join(RESIDENT_CONF_FILE);
-        write_conf(&resident_conf, "# app-cli resident stopped\n").await?;
+        let content = match tokio::fs::read_to_string(&self.conf_path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(error).context("read business fragment before proxy withdrawal");
+            }
+        };
+        write_conf(&self.conf_path, &without_resident_program(&content)).await?;
+        write_conf(&self.resident_conf_path()?, "# official proxy stopped\n").await?;
         mutation_result(self.client.reload_config().await)?;
-        mutation_result(self.client.stop_remove_group(PINGAP_PROGRAM).await)?;
+        if existing.is_some() {
+            mutation_result(self.client.stop_remove_group(PINGAP_PROGRAM).await)?;
+        }
         anyhow::ensure!(
             self.resident_entry_settled().await?.is_none(),
-            "resident group still registered after shutdown"
+            "proxy group remains after exact shutdown"
         );
+        crate::proxy::compiler::clear_current_confirmation()?;
         Ok(())
+    }
+
+    pub(crate) async fn replace_official(
+        &self,
+        runtime_root: &Path,
+        outcome: &CompileOutcome,
+        deadline: tokio::time::Instant,
+    ) -> Result<ConfirmedPublication> {
+        self.replace_official_with_cancel(runtime_root, outcome, deadline, None)
+            .await
+    }
+
+    pub(crate) async fn replace_official_with_cancel(
+        &self,
+        runtime_root: &Path,
+        outcome: &CompileOutcome,
+        deadline: tokio::time::Instant,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<ConfirmedPublication> {
+        let _guard = crate::proxy::compiler::try_publication_guard()?;
+        self.replace_official_under_guard(runtime_root, outcome, deadline, cancel)
+            .await
+    }
+
+    async fn replace_official_under_guard(
+        &self,
+        runtime_root: &Path,
+        outcome: &CompileOutcome,
+        deadline: tokio::time::Instant,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<ConfirmedPublication> {
+        let epoch = supervisor::resident::control_epoch()?;
+        let candidate = publication::freeze_candidate(runtime_root, outcome).await?;
+        let configured = configured_entry_spec(&self.conf_path)?;
+        let was_configured = configured.is_some();
+        let original_spec = match configured {
+            Some(spec) => spec,
+            None => {
+                anyhow::ensure!(
+                    self.resident_entry_settled_with_budget(
+                        deadline.saturating_duration_since(tokio::time::Instant::now())
+                    )
+                    .await?
+                    .is_none(),
+                    "proxy process exists without an owned launch specification"
+                );
+                let scope = supervisor::resident::owner_scope()?
+                    .context("proxy bootstrap has no owner capability")?;
+                scope.record_running_until(deadline).await?;
+                let spec = ServiceSpecFile::load(crate::svc_spec::RESIDENT_SPEC_ID, "pingap")?;
+                anyhow::ensure!(
+                    entry_config_from_argv(&spec.argv)?.starts_with(runtime_root),
+                    "proxy bootstrap specification belongs to another runtime root"
+                );
+                spec
+            }
+        };
+        match self
+            .resident_entry_settled_with_budget(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await?
+        {
+            Some(info)
+                if info.checked_state(PINGAP_PROGRAM)? == SupervisorProcessState::Running =>
+            {
+                let (config, spec) = self.live_entry_binding(&info).await?;
+                self.authorize_entry_domain(runtime_root, &config, &spec, &info)
+                    .await?;
+            }
+            _ if was_configured => self.authorize_inactive_entry(
+                runtime_root,
+                &entry_config_from_argv(&original_spec.argv)?,
+            )?,
+            _ => {}
+        }
+        let previous = crate::proxy::compiler::confirmed_publication()
+            .filter(|(outcome, _)| outcome.config_path.starts_with(runtime_root))
+            .map(|(outcome, _)| outcome);
+        let mut host = OfficialSupervisorHost {
+            host: self,
+            runtime_root,
+            spec: original_spec,
+            current: None,
+            cancel,
+            epoch,
+        };
+        publication::restart_verified(&mut host, &candidate, previous.as_ref(), deadline).await
     }
 
     /// Bind the observed PID/start pair to its exact wrapper spec and -c path.
@@ -277,6 +417,19 @@ impl SupervisordHost {
         info: &SupervisordProcessInfo,
     ) -> Result<(PathBuf, ServiceSpecFile)> {
         let instance = info.running_identity()?;
+        #[cfg(test)]
+        if let Some(observe) = &self.fixture_argv {
+            let argv = observe(instance.pid)?;
+            let config = entry_config_from_argv(&argv)?;
+            let spec = matching_entry_spec(&self.conf_path, &argv, &config)?
+                .context("controlled process argv has no exact wrapper binding")?;
+            anyhow::ensure!(
+                self.client.running_process(PINGAP_PROGRAM).await? == instance,
+                "controlled resident identity changed during argv observation"
+            );
+            admin_probe::register_verified_legacy_endpoint(&spec)?;
+            return Ok((config, spec));
+        }
         #[cfg(target_os = "linux")]
         {
             let bytes = tokio::fs::read(format!("/proc/{}/cmdline", instance.pid))
@@ -318,9 +471,21 @@ impl SupervisordHost {
         let root =
             std::fs::canonicalize(runtime_root).context("resolve resident runtime domain")?;
         anyhow::ensure!(
-            std::fs::canonicalize(config)?.starts_with(&root),
+            config.is_absolute()
+                && config.starts_with(&root)
+                && !config
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir)),
             "resident configuration belongs to another runtime root"
         );
+        match std::fs::canonicalize(config) {
+            Ok(resolved) => anyhow::ensure!(
+                resolved.starts_with(&root),
+                "resident configuration resolves outside the owner range"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("resolve resident configuration"),
+        }
         if let Some(receipt) = verify_resident_engine_receipt(
             runtime_root,
             identity,
@@ -517,5 +682,199 @@ impl SupervisordHost {
         })
         .await
         .context("resident process did not settle before observation deadline")?
+    }
+}
+
+pub(super) struct OfficialSupervisorHost<'a> {
+    pub(super) host: &'a SupervisordHost,
+    pub(super) runtime_root: &'a Path,
+    pub(super) spec: ServiceSpecFile,
+    pub(super) current: Option<(ProcessInstance, crate::xmlrpc::RunningProcess)>,
+    pub(super) cancel: Option<&'a tokio_util::sync::CancellationToken>,
+    pub(super) epoch: u64,
+}
+
+impl OfficialSupervisorHost<'_> {
+    fn admitted(&self, deadline: tokio::time::Instant) -> Result<()> {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline
+                && !self.cancel.is_some_and(|token| token.is_cancelled())
+                && !supervisor::resident::owner_is_closing()?,
+            "proxy operation expired or was cancelled"
+        );
+        anyhow::ensure!(
+            supervisor::resident::control_epoch()? == self.epoch,
+            "proxy operation revoked by lifecycle control"
+        );
+        let scope = supervisor::resident::owner_scope()?
+            .context("proxy operation has no owner capability")?;
+        scope.verify_owner_for_cleanup()?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ProcessHost for OfficialSupervisorHost<'_> {
+    async fn stop_exact(&mut self, _deadline: tokio::time::Instant) -> Result<()> {
+        // XML-RPC mutations settle their actual outcome. Do not cancel an
+        // in-flight write and pretend the group was never started or stopped.
+        self.host.close_entry().await?;
+        self.current = None;
+        let scope =
+            supervisor::resident::owner_scope()?.context("proxy stop has no owner capability")?;
+        if !supervisor::resident::owner_is_closing()? {
+            scope.record_running()?;
+        }
+        Ok(())
+    }
+    async fn start_exact(
+        &mut self,
+        candidate: &CompileOutcome,
+        deadline: tokio::time::Instant,
+    ) -> Result<ProcessInstance> {
+        self.admitted(deadline)?;
+        let scope =
+            supervisor::resident::owner_scope()?.context("proxy start has no owner capability")?;
+        scope.record_running_until(deadline).await?;
+        let mut spec = self.spec.clone();
+        spec.release_id = crate::svc_spec::RESIDENT_SPEC_ID.into();
+        spec.argv.truncate(3);
+        spec.argv[2] = candidate.config_path.to_string_lossy().into_owned();
+        let credentials = [
+            "PINGAP_ADMIN_ADDR",
+            "PINGAP_ADMIN_USER",
+            "PINGAP_ADMIN_PASSWORD",
+        ]
+        .into_iter()
+        .filter_map(|key| {
+            spec.env
+                .get(key)
+                .cloned()
+                .map(|value| (key.to_string(), value))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+        spec.env
+            .extend(crate::proxy::official_env::cleared_environment());
+        spec.env.extend(credentials);
+        self.host
+            .record_entry_domain(self.runtime_root, &candidate.config_path, None)
+            .await?;
+        spec.write()?;
+        let log_root = self
+            .runtime_root
+            .parent()
+            .context("proxy runtime log root missing")?;
+        tokio::fs::create_dir_all(log_root.join("services")).await?;
+        write_conf(
+            &self.host.resident_conf_path()?,
+            &render_resident_conf(log_root),
+        )
+        .await?;
+        self.admitted(deadline)?;
+        mutation_result(self.host.client.reload_config().await)?;
+        self.admitted(deadline)?;
+        scope.record_running_until(deadline).await?;
+        mutation_result(self.host.client.add_process_group(PINGAP_PROGRAM).await)?;
+        self.admitted(deadline)?;
+        scope.record_running_until(deadline).await?;
+        mutation_result(self.host.client.start_process_wait(PINGAP_PROGRAM).await)?;
+        let running = self.host.client.running_process(PINGAP_PROGRAM).await?;
+        let instance = ProcessInstance {
+            pid: u32::try_from(running.pid).context("invalid official proxy PID")?,
+            id: uuid::Uuid::new_v4().to_string(),
+        };
+        self.current = Some((instance.clone(), running));
+        self.spec = spec;
+        Ok(instance)
+    }
+    async fn verify_exact(
+        &mut self,
+        expected: &ProcessInstance,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        self.admitted(deadline)?;
+        let (held, running) = self
+            .current
+            .as_ref()
+            .context("proxy host has no retained instance")?;
+        anyhow::ensure!(
+            held == expected && self.host.client.running_process(PINGAP_PROGRAM).await? == *running,
+            "official proxy supervisord process identity changed"
+        );
+        let info = self.host.client.process_info(PINGAP_PROGRAM).await?;
+        let (config, _) = self.host.live_entry_binding(&info).await?;
+        anyhow::ensure!(
+            config == entry_config_from_argv(&self.spec.argv)?,
+            "official proxy launch snapshot changed"
+        );
+        Ok(())
+    }
+    async fn confirm(
+        &mut self,
+        candidate: &CompileOutcome,
+        instance: &ProcessInstance,
+        deadline: tokio::time::Instant,
+    ) -> Result<ConfirmedPublication> {
+        self.admitted(deadline)?;
+        let endpoint = admin_probe::ensure_admin_endpoint()?;
+        let cancelled = async {
+            match self.cancel {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            result=admin_probe::wait_for_official_publication(endpoint,candidate,instance.pid,&instance.id,
+                deadline.saturating_duration_since(tokio::time::Instant::now()))=>result,
+            ()=cancelled=>Err(anyhow::anyhow!("proxy confirmation cancelled by its operation")),
+            ()=supervisor::resident::control_revoked(self.epoch)=>Err(anyhow::anyhow!("proxy confirmation revoked by lifecycle control")),
+        }
+    }
+    async fn commit(
+        &mut self,
+        candidate: &CompileOutcome,
+        receipt: &ConfirmedPublication,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        self.admitted(deadline)?;
+        let (_, running) = self
+            .current
+            .as_ref()
+            .context("proxy commit has no retained instance")?;
+        self.host
+            .record_entry_domain(self.runtime_root, &candidate.config_path, Some(running))
+            .await?;
+        self.admitted(deadline)?;
+        crate::proxy::compiler::publish_active_until(
+            self.runtime_root,
+            &candidate.config_path,
+            deadline,
+        )
+        .await?;
+        self.admitted(deadline)?;
+        let file = crate::proxy::compiler::prepare_official_confirmation(
+            self.runtime_root,
+            candidate,
+            receipt,
+        )?;
+        supervisor::resident::commit_current_epoch(deadline, self.epoch, || {
+            file.publish()?;
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "supervisord proxy confirmation commit deadline exhausted"
+            );
+            crate::proxy::compiler::record_confirmed_publication(candidate, receipt)
+        })
+    }
+    fn mark_unknown(&self, message: String) -> anyhow::Error {
+        if let Ok(Some(scope)) = supervisor::resident::owner_scope()
+            && let Err(error) = scope.record_unknown(&message)
+        {
+            return supervisor::ShutdownUnconfirmed(format!(
+                "{message}; persist proxy Unknown failed: {error:#}"
+            ))
+            .into();
+        }
+        supervisor::ShutdownUnconfirmed(message).into()
     }
 }

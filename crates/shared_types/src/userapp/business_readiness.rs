@@ -145,6 +145,9 @@ pub struct UserAppProxyReadiness {
     /// 未确认时为 None（故障页据此决定是否信任 `X-Pingap-EType` 标记）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_origin_contract: Option<String>,
+    /// app-cli owned proxy transition, independent of Pingap private APIs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<super::proxy_control::ProxyConfirmation>,
 }
 
 /// app-cli 业务就绪快照（`/v1/app/readiness` 的 data 载荷，rcoder 原样消费）。
@@ -312,7 +315,7 @@ pub enum UserAppReadinessObservation {
     /// 计算资源在运行，app-cli 返回了业务快照。
     Snapshot {
         physical: UserAppReadinessPhysical,
-        snapshot: UserAppBusinessReadiness,
+        snapshot: Box<UserAppBusinessReadiness>,
     },
     /// 计算资源在运行，但管理接口传输失败（拒绝/超时）→ unknown/ADMIN_UNREACHABLE。
     AdminUnreachable { physical: UserAppReadinessPhysical },
@@ -393,6 +396,7 @@ mod tests {
             operation_id: None,
             observation_revision: 7,
             proxy: UserAppProxyReadiness {
+                confirmation: None,
                 ready: false,
                 status: UserAppReadinessStatus::Starting,
                 reason_code: Some(UserAppReadinessReason::ProxyNotStarted),

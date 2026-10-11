@@ -256,4 +256,7 @@ userapp_error_page.ui.hint: "回報問題時請附上此編號，便於定位本
 userapp_error_page.ui.copy: "複製"
 userapp_error_page.ui.copied: "已複製"
 userapp_error_page.ui.aria_chain: "鏈路診斷：瀏覽器與閘道器正常，應用服務目前無法使用"
-error.dev_container_unreachable: "開發容器暫時無法連線，可能正在重新啟動，請稍後再試"
+error.dev_container_unreachable: "開發容器暫時無法連線，請稍後再試"
+
+userapp_error_page.restarting.title: "應用服務正在切換"
+userapp_error_page.restarting.message: "應用服務正在啟動或重新啟動，請稍後重試。"

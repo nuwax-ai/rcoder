@@ -38,9 +38,30 @@ pub(super) enum InitialAction {
     StopBusiness {
         operation_id: String,
     },
+    /// The original Stop has already drained the entry and confirmed business
+    /// cleanup in its live driver. Only static teardown and terminal commit remain.
+    BusinessStopped {
+        operation_id: String,
+    },
     /// 排队期已取消的操作：已按自身 ID 收束 Cancelled，零副作用——
     /// 不停止无关运行实例、不派发 Stop（R04：取消收束不得变成 Stop 执行）。
     Settled,
+}
+
+impl InitialAction {
+    fn stop_operation(&self) -> Option<(&str, bool)> {
+        match self {
+            Self::StopBusiness { operation_id } => Some((operation_id, false)),
+            Self::BusinessStopped { operation_id } => Some((operation_id, true)),
+            Self::Deploy(_)
+            | Self::Prepared(_)
+            | Self::Source
+            | Self::SourcePrepared(_)
+            | Self::ExistingPrepared(_)
+            | Self::Existing { .. }
+            | Self::Settled => None,
+        }
+    }
 }
 
 /// RV01：消费前核对原操作仍是有效执行者。信号在通道排队期间，其操作
@@ -116,11 +137,6 @@ pub(super) async fn preflight_hot_reload_compat(
     )
     .await
     .context("compile and validate candidate before stopping predecessor")?;
-    let active = crate::proxy::compiler::active_config_path(&runtime_root);
-    let candidate = tokio::fs::read_to_string(&outcome.config_path)
-        .await
-        .context("read validated proxy candidate")?;
-    crate::proxy::compiler::validate_hot_reload_compatible(&active, &candidate)?;
     Ok(crate::supervisor::PreparedProxy {
         workspace: args.workspace.clone(),
         release,
@@ -143,6 +159,45 @@ async fn prepare_source_control(
     preflight_hot_reload_compat(&source_args, *dev_profile)
         .await
         .map(Some)
+}
+
+async fn settle_configuration_before_stop(
+    state: &ServerState,
+    signal: &ControlSignal,
+) -> anyhow::Result<Option<tokio::time::Instant>> {
+    match signal {
+        ControlSignal::OrchestrateSource { .. } => Ok(None),
+        ControlSignal::StopBusiness { .. } => {
+            let deadline = tokio::time::Instant::now() + crate::proxy::admin_probe::CONFIRM_BUDGET;
+            state.cancel_auxiliary_writes()?;
+            state.wait_auxiliary_writes(deadline).await.map_err(|error|
+                supervisor::ShutdownUnconfirmed(format!("original configuration writer cleanup remains pending before Stop: {error:#}")))?;
+            Ok(Some(deadline))
+        }
+    }
+}
+
+fn confirmed_business_stop(action: InitialAction) -> InitialAction {
+    match action {
+        InitialAction::StopBusiness { operation_id } => {
+            InitialAction::BusinessStopped { operation_id }
+        }
+        action @ (InitialAction::Deploy(_)
+        | InitialAction::Prepared(_)
+        | InitialAction::Source
+        | InitialAction::SourcePrepared(_)
+        | InitialAction::ExistingPrepared(_)
+        | InitialAction::Existing { .. }
+        | InitialAction::BusinessStopped { .. }
+        | InitialAction::Settled) => action,
+    }
+}
+
+fn control_operation_id(signal: &ControlSignal) -> &str {
+    match signal {
+        ControlSignal::OrchestrateSource { operation_id, .. }
+        | ControlSignal::StopBusiness { operation_id } => operation_id,
+    }
 }
 
 async fn reject_live_control(state: &ServerState, signal: &ControlSignal, error: &anyhow::Error) {
@@ -532,11 +587,6 @@ async fn prepare_artifact_proxy(
         dev_profile,
     )
     .await?;
-    let candidate = tokio::fs::read_to_string(&outcome.config_path).await?;
-    crate::proxy::compiler::validate_hot_reload_compatible(
-        &crate::proxy::compiler::active_config_path(&root),
-        &candidate,
-    )?;
     Ok(crate::supervisor::PreparedProxy {
         workspace: execution_workspace.into(),
         release,
@@ -799,12 +849,20 @@ async fn wait_supervisord_running(
             signal = control_rx.recv() => match signal {
                 Some(signal) => {
                     if !claim_live_source_control(state, &signal).await { continue; }
+                    let stop_deadline = match settle_configuration_before_stop(state, &signal).await {
+                        Ok(deadline) => deadline,
+                        Err(error) => { reject_live_control(state, &signal, &error).await; continue; }
+                    };
                     let prepared = match prepare_source_control(owner_args, state, &signal).await {
                         Ok(prepared) => prepared,
                         Err(error) => { reject_live_control(state, &signal, &error).await; continue; }
                     };
                     if source_cancelled_after_preflight(state, &signal).await { continue; }
-                    if let Err(error) = host.drain_entry(standby_root).await {
+                    if let Err(error) = host.drain_entry_for_operation_until(
+                        standby_root,
+                        stop_deadline.unwrap_or_else(|| tokio::time::Instant::now() + crate::proxy::admin_probe::CONFIRM_BUDGET),
+                        Some(control_operation_id(&signal).to_owned()),
+                    ).await {
                         reject_live_control(state, &signal, &error).await;
                         continue;
                     }
@@ -836,7 +894,7 @@ async fn wait_supervisord_running(
                         .await;
                     return Ok(None);
                 }
-                return Ok(Some(*action));
+                return Ok(Some(confirmed_business_stop(*action)));
             }
         }
     }
@@ -940,7 +998,8 @@ pub(super) async fn server_loop(
             }
             continue;
         }
-        if let InitialAction::StopBusiness { operation_id } = action {
+        if let Some((operation_id, business_stopped)) = action.stop_operation() {
+            let operation_id = operation_id.to_owned();
             // RV01：消费前核对——Stop 信号排队期间可能已被交接收束
             //（prepare_relaunch 幂等成功/看门狗按已确认无执行完成），
             // 重复执行停止无副作用但会以陈旧相位覆盖收束后的状态。
@@ -953,11 +1012,31 @@ pub(super) async fn server_loop(
             // stop：停止业务服务（保持管理面与常驻入口）。B01：按**自身受理
             // ID**收束——Stop 从不占据 current 执行槽，禁止 finish_current
             //（它会读 current=None 而静默丢终态，Stop 永远 Accepted）。
-            // P1/V2-03：先发布 standby 并确认热载（摘流），再停业务；发布
+            // P1/V2-03：先发布并确认 standby（摘流），再停业务；发布
             // 失败 = 停机失败（Err 保持旧服务可证实地运行）。
             let stopped = async {
-                if let Some(host) = host.as_ref() {
-                    host.stop_all(Some(&standby_root)).await?;
+                if !business_stopped {
+                    let signal = ControlSignal::StopBusiness {
+                        operation_id: operation_id.clone(),
+                    };
+                    let deadline = settle_configuration_before_stop(state, &signal)
+                        .await?
+                        .context("Stop did not provide its cleanup deadline")?;
+                    if let Some(host) = host.as_ref() {
+                        host.drain_entry_for_operation_until(
+                            &standby_root,
+                            deadline,
+                            Some(operation_id.clone()),
+                        )
+                        .await?;
+                        host.stop_business().await?;
+                    } else {
+                        supervisor::resident::publish_standby_for_operation_until(
+                            deadline,
+                            Some(operation_id.clone()),
+                        )
+                        .await?;
+                    }
                 }
                 crate::static_hosting::reconcile(&[], &args.workspace, false).await
             }
@@ -1023,7 +1102,9 @@ pub(super) async fn server_loop(
         );
         let mut prepared_proxy = None;
         let prepared = match action {
-            InitialAction::StopBusiness { .. } | InitialAction::Settled => {
+            InitialAction::StopBusiness { .. }
+            | InitialAction::BusinessStopped { .. }
+            | InitialAction::Settled => {
                 unreachable!("handled above")
             }
             InitialAction::Deploy(request) => {
@@ -1214,6 +1295,13 @@ pub(super) async fn server_loop(
         let run_dev_profile = state
             .take_pending_dev_profile()
             .unwrap_or_else(crate::supervisor::dev_run_profile);
+        let mut execution_args = args.clone();
+        execution_args.operation_id = state.current_runtime_operation().or_else(|| {
+            state
+                .deploy_status()
+                .operation
+                .map(|operation| operation.operation_id)
+        });
         state.set_proxy_context(args.workspace.clone(), run_dev_profile);
         // R08：本次操作的 PG 凭据（owner 复用时平台传入的新凭据——注入服务
         // env 覆盖旧值）。take 一次性消费；未携带 → None（维持进程 env）
@@ -1229,7 +1317,7 @@ pub(super) async fn server_loop(
             };
             let orchestration_cancel = state.cancel_child_token();
             let orchestration = host.orchestrate(
-                args,
+                &execution_args,
                 &release,
                 &runtime_status,
                 crate::supervisor::RunProfile {
@@ -1394,7 +1482,7 @@ pub(super) async fn server_loop(
         // RV05：内置引擎的服务编排任务延续捕获的命令范围——会话结束后
         // 迟到的受管命令仍向旧（已闭门）范围登记，不进入 Direct/新代次。
         let mut sup = process_utils::command_context::spawn_scoped(supervisor::run_with_cancel(
-            args.clone(),
+            execution_args,
             runtime_status,
             cancel.clone(),
             Some(running_tx),
@@ -1525,12 +1613,19 @@ pub(super) async fn server_loop(
             signal = builtin_control.recv() => match signal {
                 Some(signal) => {
                     if !claim_live_source_control(state, &signal).await { continue; }
+                    let stop_deadline = match settle_configuration_before_stop(state, &signal).await {
+                        Ok(deadline) => deadline,
+                        Err(error) => { reject_live_control(state, &signal, &error).await; continue; }
+                    };
                     let prepared = match prepare_source_control(owner_args, state, &signal).await {
                         Ok(prepared) => prepared,
                         Err(error) => { reject_live_control(state, &signal, &error).await; continue; }
                     };
                     if source_cancelled_after_preflight(state, &signal).await { continue; }
-                    if let Err(error) = supervisor::resident::publish_standby_if_serving().await {
+                    if let Err(error) = supervisor::resident::publish_standby_for_operation_until(
+                        stop_deadline.unwrap_or_else(|| tokio::time::Instant::now() + crate::proxy::admin_probe::CONFIRM_BUDGET),
+                        Some(control_operation_id(&signal).to_owned()),
+                    ).await {
                         reject_live_control(state, &signal, &error).await;
                         continue;
                     }
@@ -1542,7 +1637,7 @@ pub(super) async fn server_loop(
                         hold_unconfirmed(state, format!("stop before runtime control failed: {error:#}")).await;
                         return Ok(());
                     }
-                    Next::Redeploy(Box::new(action))
+                    Next::Redeploy(Box::new(confirmed_business_stop(action)))
                 }
                 None => Next::Wait,
             },
@@ -1733,14 +1828,14 @@ mod lifecycle_tests {
             toml::to_string(&custom_release("artifact-a")).unwrap(),
         )
         .unwrap();
-        // 候选配置必须满足平台入口契约（0.0.0.0:9080），否则会在编译校验处
-        // 被拒，到不了本测试要验证的「server 拓扑变化拒绝」判定。
+        // Invalid source must fail before touching the running predecessor.
+        // Listener changes are now supported by controlled proxy restart.
         let config = |port| {
             format!(
                 "[basic]\n\n[servers.entry]\naddr = \"0.0.0.0:9080\"\n\n[servers.app]\naddr = \"127.0.0.1:{port}\"\n"
             )
         };
-        std::fs::write(source.join("proxy.toml"), config(19082)).unwrap();
+        std::fs::write(source.join("proxy.toml"), "[servers.entry\n").unwrap();
         std::fs::write(current.join("proxy.toml"), config(19081)).unwrap();
         let log_dir = root.path().join("logs");
         let runtime_root = crate::proxy::compiler::runtime_root(&log_dir);
@@ -1775,11 +1870,7 @@ mod lifecycle_tests {
         .await
         .unwrap();
         let pingap = root.path().join("pingap");
-        std::fs::write(
-            &pingap,
-            "#!/bin/sh\nif [ \"$1\" = '--apply-protocol-version' ]; then echo 1; fi\nexit 0\n",
-        )
-        .unwrap();
+        std::fs::write(&pingap, "#!/bin/sh\nexit 19\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&pingap, std::fs::Permissions::from_mode(0o755)).unwrap();
         let owner_args = RuntimeArgs {
@@ -1876,8 +1967,8 @@ mod lifecycle_tests {
                     .unwrap()
                     .error_message
                     .as_deref()
-                    .is_some_and(|message| message.contains("server")),
-                "the source listener change must be the rejection reason"
+                    .is_some_and(|message| message.contains("invalid Pingap source")),
+                "invalid source syntax must be the rejection reason"
             );
             assert_eq!(state.phase(), ServerPhase::Running);
             assert!(state.ready.is_ready());

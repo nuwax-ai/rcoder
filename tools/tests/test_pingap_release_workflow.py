@@ -1,8 +1,6 @@
-import os
+"""Validate official-source release recipe contracts; not native acceptance."""
+import json
 from pathlib import Path
-import subprocess
-import sys
-import tempfile
 import unittest
 
 import yaml
@@ -15,34 +13,31 @@ class PingapReleaseWorkflowTests(unittest.TestCase):
     def step(self, job, name):
         return next(step for step in WORKFLOW['jobs'][job]['steps'] if step.get('name') == name)
 
-    def test_both_checkout_jobs_apply_reviewed_patch_before_build(self):
+    def test_source_jobs_compile_exact_unmodified_upstream(self):
         for job in ('build-pingap-windows', 'build-pingap-unix'):
             with self.subTest(job=job):
                 steps = WORKFLOW['jobs'][job]['steps']
                 upstream = next(step for step in steps if step.get('with', {}).get('repository') == 'vicanso/pingap')
                 self.assertEqual(upstream['with']['path'], '.pingap-source')
-                applying = self.step(job, 'Apply reviewed paired Pingap protocol patch')
-                building = self.step(job, 'Build pingap (tls-rustls)')
-                self.assertIn('apply.py --source .pingap-source --repo-root .', applying['run'])
-                self.assertIn('--already-applied --tls rustls', building['run'])
-                self.assertLess(steps.index(applying), steps.index(building))
-                self.assertNotIn('npm', applying['run'])
+                self.assertEqual(upstream['with']['ref'], '${{ env.PINGAP_REV }}')
+                building = self.step(job, 'Build pingap (tls-rustls)')['run']
+                self.assertIn('pingap_official.py --repo-root . build --source .pingap-source --tls rustls', building)
+                self.assertNotIn('already-applied', building)
+                self.assertNotIn('apply.py', building)
 
-    def test_paired_protocol_and_default_full_gates_block_publication(self):
-        jobs = WORKFLOW['jobs']
-        for job in ('pair-gate-windows', 'pair-gate-unix'):
-            self.assertIn('gate-pingap-applied', jobs[job]['needs'])
-        gate = jobs['gate-pingap-applied']
-        self.assertEqual(gate['env']['RUSTUP_TOOLCHAIN'], '1.98.1')
-        default = self.step('gate-pingap-applied', 'Default feature tests and strict Clippy')['run']
-        full = self.step('gate-pingap-applied', 'Full feature tests and strict Clippy')['run']
-        self.assertIn('--features serde_json/preserve_order', default)
-        self.assertIn('cargo test --locked', default)
-        self.assertIn('--features full', full)
-        for script in (default, full):
-            self.assertIn('--no-fail-fast', script)
-            self.assertIn('--all-targets', script)
-            self.assertIn('-- -D warnings', script)
+    def test_linux_npm_preserves_glibc_and_tls_support_from_unmodified_source(self):
+        script = self.step('build-pingap-unix', 'Build pingap (tls-rustls)')['run']
+        self.assertIn('--zig-glibc 2.17', script)
+        self.assertIn('--tls rustls', script)
+        self.assertNotIn('install --download', script)
+        abi = self.step('build-pingap-unix', 'Verify Linux Pingap glibc baseline')['run']
+        self.assertIn('max(required) > (2, 17)', abi)
+
+    def test_no_private_protocol_or_patch_can_block_or_enter_publication(self):
+        self.assertNotIn('gate-pingap-applied', WORKFLOW['jobs'])
+        text = (ROOT / '.github/workflows/release-app-cli.yml').read_text()
+        for private in ('--apply-protocol-version', 'pingap-applied/', '.applied.json', 'apply-status'):
+            self.assertNotIn(private, text)
 
     def test_all_cargo_release_builds_are_locked(self):
         for job in ('build', 'build-pingap-windows', 'build-pingap-unix'):
@@ -51,7 +46,7 @@ class PingapReleaseWorkflowTests(unittest.TestCase):
                     if line.strip().startswith(('cargo build ', 'cargo zigbuild ')):
                         self.assertIn('--locked', line)
 
-    def test_publish_and_release_require_every_distributed_platform_pair_gate(self):
+    def test_publish_requires_native_configuration_pair_gates(self):
         for job in ('publish-npm', 'release'):
             self.assertIn('pair-gate-windows', WORKFLOW['jobs'][job]['needs'])
             self.assertIn('pair-gate-unix', WORKFLOW['jobs'][job]['needs'])
@@ -61,31 +56,32 @@ class PingapReleaseWorkflowTests(unittest.TestCase):
                           ('pair-gate-unix', 'Validate the distributed Unix pair')]:
             script = self.step(job, step)['run']
             self.assertIn('parse_pingap_version', script)
-            self.assertIn('--apply-protocol-version', script)
             self.assertIn('[ -s pingap.toml ]', script)
             self.assertIn('"$PINGAP" -c pingap.toml -t', script)
+        for job in ('pair-gate-windows', 'pair-gate-unix'):
+            native = self.step(job, 'Real native owner startup Stop and Start')['run']
+            self.assertIn('tools/build/verify_official_pair.py', native)
+            self.assertIn('--app-cli dist/app-cli-', native)
+            self.assertIn('--pingap dist/pingap', native)
+            self.assertNotIn('|| true', native)
+            uploads = [step for step in WORKFLOW['jobs'][job]['steps'] if step.get('uses', '').startswith('actions/upload-artifact@')]
+            self.assertTrue(uploads)
+            self.assertTrue(all('official-pair-gate/state' not in step['with']['path'] for step in uploads))
 
-    def test_reviewed_patch_bytes_are_kept_lf_on_windows(self):
-        attrs = (ROOT / 'tools/build/pingap-applied/.gitattributes').read_text()
-        self.assertIn('* text eol=lf', attrs)
-        script = self.step('build-pingap-windows', 'Disable CRLF conversion')['run']
-        self.assertIn('core.autocrlf false', script)
-
-    def test_paired_receipts_are_included_in_each_bundled_platform_package(self):
-        import json
+    def test_build_receipts_distribute_official_identity_without_runtime_requirement(self):
         for name in ('app-cli-linux-x64', 'app-cli-darwin-x64', 'app-cli-darwin-arm64', 'app-cli-windows-x64'):
             data = json.loads((ROOT / 'npm' / name / 'package.json').read_text())
-            receipt = 'pingap.exe.applied.json' if name.endswith('windows-x64') else 'pingap.applied.json'
+            receipt = 'pingap.exe.official.json' if name.endswith('windows-x64') else 'pingap.official.json'
             self.assertIn(receipt, data['files'])
+            self.assertFalse(any('applied' in item for item in data['files']))
         scripts = '\n'.join(step.get('run', '') for step in WORKFLOW['jobs']['publish-npm']['steps'])
-        self.assertIn('dist/pingap.exe.applied.json', scripts)
-        self.assertIn('dist/pingap-x86_64-unknown-linux-gnu.applied.json', scripts)
+        self.assertIn('dist/pingap.exe.official.json', scripts)
+        self.assertIn('dist/pingap-x86_64-unknown-linux-gnu.official.json', scripts)
 
-    def test_smoke_version_comparison_is_exact_and_never_uses_strings_fallback(self):
+    def test_smoke_version_comparison_is_exact(self):
         for job in ('build-pingap-windows', 'build-pingap-unix'):
             script = self.step(job, 'Smoke test pingap -V')['run']
             self.assertIn('[ "$OUT" = "pingap $PINGAP_VERSION_EXPECTED" ]', script)
-            self.assertIn('--apply-protocol-version', script)
             self.assertNotIn('strings ', script)
             self.assertNotIn('|| true', script)
 

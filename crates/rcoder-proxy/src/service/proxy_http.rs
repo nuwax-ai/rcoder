@@ -52,32 +52,84 @@ async fn wait_for_peer_connection(peer: &HttpPeer, deadline: tokio::time::Instan
 }
 
 impl PortProxy {
-    /// dev 失败分档证据采集（一次性）：等待窗口内以剩余预算（≤1.5s）问询
-    /// 顾问，快照状态存入恢复上下文；已采集或无顾问时零开销跳过。
-    async fn collect_dev_evidence_once(
+    /// Fresh diagnostics stay inside the original connection deadline. Each
+    /// failed attempt replaces earlier evidence, including an absent observation.
+    async fn collect_connection_evidence(
         &self,
         ctx: &mut TrackingCtx,
         app_id: &str,
+        stage: &str,
         deadline: tokio::time::Instant,
     ) {
-        if ctx
-            .app_connect_recovery
-            .as_ref()
-            .is_some_and(|state| state.dev_evidence_status.is_some())
-        {
+        ctx.fresh_failure_evidence = true;
+        if ctx.userapp_route.is_none() {
+            ctx.failure_hint = None;
+            ctx.failure_hint_at = None;
             return;
         }
-        let Some(advisor) = self.failure_advisor_slot.load_full() else {
-            return;
-        };
         let budget = deadline
             .saturating_duration_since(tokio::time::Instant::now())
             .min(Duration::from_millis(1500));
-        if let Some(hint) = advisor.advise(app_id, "dev", budget).await
-            && let Some(state) = ctx.app_connect_recovery.as_mut()
-        {
-            state.dev_evidence_status = hint.readiness_status;
+        if budget.is_zero() {
+            // Deadline exhaustion supplies no contradictory fact. Preserve only
+            // this request's recent verified snapshot, never the advisor cache.
+            if ctx
+                .failure_hint_at
+                .is_none_or(|observed| observed.elapsed() > Duration::from_secs(2))
+            {
+                ctx.failure_hint = None;
+                ctx.failure_hint_at = None;
+            }
+            return;
         }
+        ctx.failure_hint = None;
+        ctx.failure_hint_at = None;
+        let Some(advisor) = self.failure_advisor_slot.load_full() else {
+            return;
+        };
+        ctx.failure_hint =
+            tokio::time::timeout(budget, advisor.advise_current(app_id, stage, budget))
+                .await
+                .ok()
+                .flatten();
+        ctx.failure_hint_at = ctx
+            .failure_hint
+            .as_ref()
+            .map(|_| tokio::time::Instant::now());
+        if let Some(state) = ctx.app_connect_recovery.as_mut() {
+            state.dev_evidence_status = ctx
+                .failure_hint
+                .as_ref()
+                .and_then(|hint| hint.readiness_status);
+        }
+    }
+
+    pub(crate) fn capture_proxy_transition(ctx: &mut TrackingCtx) {
+        if ctx.wake_failure.is_some() || ctx.userapp_route.is_none() {
+            return;
+        }
+        if ctx
+            .failure_hint_at
+            .is_none_or(|observed| observed.elapsed() > Duration::from_secs(2))
+        {
+            ctx.failure_hint = None;
+            return;
+        }
+        let Some(operation_id) = ctx
+            .failure_hint
+            .as_ref()
+            .and_then(|hint| hint.transition_operation_id())
+        else {
+            return;
+        };
+        let mut failure = shared_types::WakeFailure::new(
+            shared_types::ERR_OPERATION_IN_PROGRESS,
+            "proxy_transition",
+            "Application service is starting or restarting",
+        );
+        failure.operation_id = Some(operation_id.to_string());
+        failure.retryable = true;
+        ctx.wake_failure = Some(failure);
     }
 
     /// dispatch + 恢复预算约束（T4a）：存在恢复上下文时，定位/ensure 的
@@ -125,13 +177,15 @@ impl PortProxy {
             peer.options
                 .connection_timeout
                 .unwrap_or(remaining)
-                .min(remaining),
+                .min(remaining)
+                .min(CONNECT_RECOVERY_ATTEMPT_TIMEOUT),
         );
         peer.options.total_connection_timeout = Some(
             peer.options
                 .total_connection_timeout
                 .unwrap_or(remaining)
-                .min(remaining),
+                .min(remaining)
+                .min(CONNECT_RECOVERY_ATTEMPT_TIMEOUT),
         );
         true
     }
@@ -500,7 +554,8 @@ impl ProxyHttp for PortProxy {
                     // 首个失败切片后提前采集失败分档证据（V2-08：预算内、
                     // 终局只读不再加管理面等待——deadline 耗尽时顾问拿不到
                     // 预算，证据必须在等待窗口内落进恢复上下文）。
-                    self.collect_dev_evidence_once(ctx, &app_id, deadline).await;
+                    self.collect_connection_evidence(ctx, &app_id, "dev", deadline)
+                        .await;
                     // 切片等待未就绪：预算内重解析一次（ensure 的独立受理
                     // 工作不受本请求等待影响）。
                     match self
@@ -527,7 +582,24 @@ impl ProxyHttp for PortProxy {
                 }
                 recovered
             } else {
-                wait_for_peer_connection(&peer, deadline).await
+                let mut recovered = false;
+                loop {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    if wait_for_peer_connection(&peer, (now + DEV_RE_RESOLVE_SLICE).min(deadline))
+                        .await
+                    {
+                        recovered = true;
+                        break;
+                    }
+                    if tokio::time::Instant::now() < deadline {
+                        self.collect_connection_evidence(ctx, &app_id, "prod", deadline)
+                            .await;
+                    }
+                }
+                recovered
             };
             if !recovered {
                 warn!(%app_id, "UserApp service connection did not recover before wait deadline");
@@ -552,7 +624,28 @@ impl ProxyHttp for PortProxy {
     where
         Self::CTX: Send + Sync,
     {
-        let code = default_error_status(error);
+        let connect_failure =
+            ctx.userapp_route.is_some() && is_entry_connect_failure(error.etype());
+        let code = if connect_failure {
+            503
+        } else {
+            default_error_status(error)
+        };
+        if connect_failure {
+            if !ctx.fresh_failure_evidence
+                && let Some(route) = ctx.userapp_route.clone()
+            {
+                // A no-recovery path may spend only a short diagnostics budget.
+                self.collect_connection_evidence(
+                    ctx,
+                    &route.app_id,
+                    route.stage,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .await;
+            }
+            Self::capture_proxy_transition(ctx);
+        }
         if ctx.userapp_route.is_some() && code > 0 {
             // 原因用封闭的错误类型词表（etype），不透出内部地址/凭据细节
             let reason = error.etype().as_str().to_string();
@@ -562,7 +655,7 @@ impl ProxyHttp for PortProxy {
                 code,
                 crate::error_page::ErrorPageCause::Generic,
                 &reason,
-                None,
+                connect_failure.then_some(15),
                 // 错误链完整进日志（可能含内部地址——只进日志不进页面）
                 &format!("pingora error: {error}"),
             )
@@ -621,6 +714,9 @@ impl ProxyHttp for PortProxy {
         ctx: &mut Self::CTX,
     ) -> PingoraResult<()> {
         ctx.app_connect_recovery = None;
+        ctx.failure_hint = None;
+        ctx.fresh_failure_evidence = false;
+        ctx.failure_hint_at = None;
         // 记录连接是否被重用
         ctx.connection_reused = reused;
 
@@ -816,7 +912,10 @@ impl PortProxy {
                     .min(Duration::from_millis(1500))
             })
             .unwrap_or_else(|| Duration::from_millis(1000));
-        let Some(hint) = advisor.advise(&route.app_id, route.stage, budget).await else {
+        let Some(hint) = advisor
+            .advise_current(&route.app_id, route.stage, budget)
+            .await
+        else {
             return;
         };
         if !hint.error_origin_confirmed {
@@ -827,6 +926,21 @@ impl PortProxy {
         };
         // 替换决策读取页面前同样触发按需刷新（错误请求是收敛路径之一）
         renderer.request_refresh();
+        let connect_failure = upstream_response
+            .headers
+            .get(shared_types::X_PINGAP_ETYPE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(is_connect_etype_header);
+        if connect_failure {
+            if let Err(error) = upstream_response.set_status(503) {
+                tracing::warn!("normalize trusted proxy connection failure status failed: {error}");
+                return;
+            }
+            ctx.failure_hint = Some(hint.clone());
+            ctx.failure_hint_at = Some(tokio::time::Instant::now());
+            ctx.fresh_failure_evidence = true;
+            Self::capture_proxy_transition(ctx);
+        }
         let status = upstream_response.status.as_u16();
         let diagnostic_id = crate::error_page::new_diagnostic_id();
         // 语言协商与 write_error_response 同一函数（Accept-Language → locale）
@@ -863,6 +977,7 @@ impl PortProxy {
                             "reason": "pingap_self_produced_error",
                             "message": message,
                             "diagnostic_id": diagnostic_id,
+                            "operation_id": hint.transition_operation_id(),
                         }
                     });
                     ("application/json", payload.to_string().into())
@@ -898,6 +1013,17 @@ impl PortProxy {
             .insert_header(crate::error_page::DIAGNOSTIC_HEADER, diagnostic_id.as_str())
         {
             tracing::warn!("rewrite diagnostic header on replaced response failed: {error}");
+        }
+        if connect_failure && let Err(error) = upstream_response.insert_header("retry-after", "15")
+        {
+            tracing::warn!("rewrite retry-after on proxy connection failure failed: {error}");
+        }
+        if connect_failure
+            && let Some(operation_id) = hint.transition_operation_id()
+            && let Err(error) =
+                upstream_response.insert_header("x-rcoder-operation-id", operation_id)
+        {
+            tracing::warn!("insert current proxy operation identity failed: {error}");
         }
         // 移除标记头：替换后的表示不再携带来源标记（避免下游重复判定）
         if let Some(_removed) = upstream_response.remove_header(shared_types::X_PINGAP_ETYPE_HEADER)
@@ -950,7 +1076,12 @@ impl PortProxy {
     ) {
         // 文案证据：失败顾问有当前实例观察时用确定文案（starting/stopped/
         // failed）；Generic 入参或无证据一律通用文案（不凭连接拒绝宣称启动中）。
-        let cause = if matches!(cause, crate::error_page::ErrorPageCause::Generic)
+        let cause = if ctx.fresh_failure_evidence {
+            ctx.failure_hint
+                .as_ref()
+                .map(|hint| hint.page_cause())
+                .unwrap_or(cause)
+        } else if matches!(cause, crate::error_page::ErrorPageCause::Generic)
             && let Some(advisor) = self.failure_advisor_slot.load_full()
             && let Some(route) = ctx.userapp_route.clone()
         {
@@ -1031,6 +1162,19 @@ impl PortProxy {
             }
         }
     }
+}
+
+fn is_entry_connect_failure(error: &ErrorType) -> bool {
+    matches!(
+        error,
+        ErrorType::ConnectRefused | ErrorType::ConnectNoRoute | ErrorType::ConnectTimedout
+    )
+}
+fn is_connect_etype_header(value: &str) -> bool {
+    matches!(
+        value,
+        "ConnectRefused" | "ConnectNoRoute" | "ConnectTimedout"
+    )
 }
 
 /// Pingora 默认 fail_to_proxy 的状态映射（proxy_trait.rs 631-668 同款）——
@@ -1316,6 +1460,90 @@ mod tests {
         assert_eq!(
             dbx_root_redirect_location(&router, "/web/ttyd/u1", None),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod official_restart_failure_tests {
+    use super::*;
+
+    #[test]
+    fn only_pre_http_entry_connect_errors_are_unavailability() {
+        for error in [
+            ErrorType::ConnectRefused,
+            ErrorType::ConnectNoRoute,
+            ErrorType::ConnectTimedout,
+        ] {
+            assert!(is_entry_connect_failure(&error));
+        }
+        for error in [
+            ErrorType::ReadTimedout,
+            ErrorType::WriteTimedout,
+            ErrorType::HTTPStatus(502),
+            ErrorType::HTTPStatus(503),
+            ErrorType::HTTPStatus(504),
+        ] {
+            assert!(!is_entry_connect_failure(&error));
+        }
+        assert!(is_connect_etype_header("ConnectRefused"));
+        assert!(!is_connect_etype_header("HTTPStatus"));
+        assert!(!is_connect_etype_header("ReadTimedout"));
+    }
+
+    #[test]
+    fn only_fresh_transition_supplies_native_operation_identity() {
+        let mut ctx = TrackingCtx::new();
+        ctx.userapp_route = Some(crate::service::types::UserAppRouteCtx {
+            app_id: "native-app".into(),
+            stage: "dev",
+        });
+        ctx.failure_hint = Some(crate::error_page::UserAppProxyFailureHint {
+            readiness_status: Some(shared_types::UserAppReadinessStatus::Starting),
+            error_origin_confirmed: false,
+            proxy_confirmation: Some(shared_types::ProxyConfirmation {
+                contract: shared_types::ProxyConfirmationContract::OfficialRestartHttpV1,
+                confirmed: false,
+                phase: shared_types::ProxyPhase::Stopping,
+                operation_id: "native-exact-operation".into(),
+                proxy_instance_id: None,
+                config_digest: None,
+            }),
+        });
+        PortProxy::capture_proxy_transition(&mut ctx);
+        assert!(
+            ctx.wake_failure.is_none(),
+            "missing observation age cannot be fresh evidence"
+        );
+        ctx.failure_hint = Some(crate::error_page::UserAppProxyFailureHint {
+            readiness_status: Some(shared_types::UserAppReadinessStatus::Starting),
+            error_origin_confirmed: false,
+            proxy_confirmation: Some(shared_types::ProxyConfirmation {
+                contract: shared_types::ProxyConfirmationContract::OfficialRestartHttpV1,
+                confirmed: false,
+                phase: shared_types::ProxyPhase::Starting,
+                operation_id: "native-exact-operation".into(),
+                proxy_instance_id: None,
+                config_digest: None,
+            }),
+        });
+        ctx.failure_hint_at = Some(tokio::time::Instant::now());
+        PortProxy::capture_proxy_transition(&mut ctx);
+        assert_eq!(
+            ctx.wake_failure.as_ref().unwrap().operation_id.as_deref(),
+            Some("native-exact-operation")
+        );
+        let original = shared_types::WakeFailure::timeout(
+            "wake_observation",
+            Some("parent-wake-operation".into()),
+            true,
+        );
+        ctx.wake_failure = Some(original);
+        PortProxy::capture_proxy_transition(&mut ctx);
+        assert_eq!(
+            ctx.wake_failure.as_ref().unwrap().operation_id.as_deref(),
+            Some("parent-wake-operation"),
+            "native child must never overwrite an actual parent wake identity"
         );
     }
 }

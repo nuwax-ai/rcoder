@@ -307,7 +307,7 @@ fn corrupted_lock_is_rebuilt_and_real_startup_failure_exits_non_zero() {
     assert_eq!(done_event_count(&output.stdout), 1);
 }
 
-/// A02/A04：配置完整预检通过，真实协议进程启动后拒绝本次 publication。
+/// A02/A04：配置完整预检通过，受管进程启动后读回错误配置身份。
 /// 终局保留 orchestrator 与真实服务 spawn 失败，Done 恰好一次、客户端
 /// 非零退出；管理 owner 保留且最终精确清理代理。
 #[test]
@@ -322,7 +322,7 @@ fn pingap_failure_emits_single_done_and_exits_non_zero() {
     let executable = env!("CARGO_BIN_EXE_tree-fixture").replace('\'', "'\"'\"'");
     // The witness is written only for a real serving launch, never for either
     // preflight command. Unix exec preserves this exact child PID.
-    std::fs::write(&proxy,format!("#!/bin/sh\nfor arg in \"$@\"; do\ncase \"$arg\" in --apply-protocol-version|-t) exec '{executable}' protocol-pingap \"$@\";; esac\ndone\nprintf '%s\\n' \"$$\" > \"$PROTOCOL_PROXY_STARTED_FILE\"\nexec '{executable}' protocol-pingap \"$@\"\n")).unwrap();
+    std::fs::write(&proxy,format!("#!/bin/sh\nif [ \"$1\" = '-c' ] && grep -q 'rcoder:publication' \"$2\"; then\nprintf '%s\\n' \"$$\" > \"$PROTOCOL_PROXY_STARTED_FILE\"\nfi\nexec '{executable}' protocol-pingap \"$@\"\n")).unwrap();
     let fault = directory.path().join("proxy-admin-fault");
     std::fs::write(&fault, "failed").unwrap();
     let started = directory.path().join("proxy-started-pid");
@@ -397,11 +397,11 @@ fn pingap_failure_emits_single_done_and_exits_non_zero() {
         publication_failure["error"]
             .as_str()
             .unwrap()
-            .contains("controlled post-spawn application failure"),
-        "the terminal must retain the application protocol rejection: {done_line}"
+            .contains("official proxy loaded another configuration"),
+        "the terminal must retain the official process configuration rejection: {done_line}"
     );
     assert!(
-        combined.contains("controlled post-spawn application failure"),
+        combined.contains("official proxy loaded another configuration"),
         "the compiled candidate must reach the actual admin failure: {combined}"
     );
     let proxy_pid: u32 = std::fs::read_to_string(&started)

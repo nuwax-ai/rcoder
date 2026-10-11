@@ -9,18 +9,6 @@
 # 使用本地基础镜像
 ARG BASE_IMAGE=rcoder-agent-base:latest
 
-# asset_context.py 注入 reviewed helper/patch，官方 downloads catalog 保持原状。
-FROM rust:1.98.1-bookworm AS pingap-applied-builder
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 git pkg-config libssl-dev protobuf-compiler cmake libclang-dev && \
-    rm -rf /var/lib/apt/lists/*
-COPY pingap-applied/ /build/pingap-applied/
-ARG PINGAP_VERSION
-ARG PINGAP_COMMIT
-RUN python3 -c 'import json,os; m=json.load(open("/build/pingap-applied/manifest.json")); assert m["version"] == os.environ["PINGAP_VERSION"] and m["base_commit"] == os.environ["PINGAP_COMMIT"]' && \
-    CARGO_BUILD_JOBS=2 python3 /build/pingap-applied/build.py --fetch --source /build/pingap-source \
-        --full --output /build/output/pingap
-
 FROM ${BASE_IMAGE}
 
 # 设置工作目录
@@ -141,28 +129,17 @@ ARG PINGAP_COMMIT
 ENV RCODER_PINGAP_VERSION=${PINGAP_VERSION} \
     RCODER_PINGAP_COMMIT=${PINGAP_COMMIT}
 COPY downloads/pingap-v*-linux-gnu-*-full.tar.gz /tmp/pingap/
-RUN case "$(dpkg --print-architecture)" in \
+COPY pingap-official/ /usr/local/share/rcoder/
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
         amd64) PINGAP_ARCH=x86 ;; \
         arm64) PINGAP_ARCH=aarch64 ;; \
         *) echo "Unsupported arch: $(dpkg --print-architecture)" && exit 1 ;; \
     esac && \
     TARBALL="/tmp/pingap/pingap-v${PINGAP_VERSION}-linux-gnu-${PINGAP_ARCH}-full.tar.gz" && \
-    test -f "$TARBALL" && \
-    tar -C /usr/local/bin -xzf "$TARBALL" && \
-    mv "/usr/local/bin/pingap-linux-gnu-${PINGAP_ARCH}-full" /usr/local/bin/pingap && \
-    chmod +x /usr/local/bin/pingap && \
-    rm -rf /tmp/pingap && \
-    /usr/local/bin/pingap --version
-
-# 覆盖旧官方 binary，保留独立 RCoder patch/binary 证明，拒绝 hash-only 的旧协议。
-COPY --from=pingap-applied-builder /build/output/pingap /usr/local/bin/pingap
-COPY --from=pingap-applied-builder /build/output/pingap.applied.json /usr/local/share/rcoder/pingap-applied.json
-COPY --from=pingap-applied-builder /build/pingap-applied/manifest.json /usr/local/share/rcoder/pingap-source.json
-COPY --from=pingap-applied-builder /build/pingap-applied/verify.py /usr/local/share/rcoder/verify-pingap.py
-RUN python3 /usr/local/share/rcoder/verify-pingap.py \
-    --binary /usr/local/bin/pingap --receipt /usr/local/share/rcoder/pingap-applied.json \
-    --manifest /usr/local/share/rcoder/pingap-source.json \
-    --version "${PINGAP_VERSION}" --commit "${PINGAP_COMMIT}" --require-full --tls openssl
+    python3 /usr/local/share/rcoder/pingap_official.py --version "${PINGAP_VERSION}" --commit "${PINGAP_COMMIT}" install \
+        --archive "$TARBALL" --arch ${TARGETARCH} --output /usr/local/bin/pingap && \
+    rm -rf /tmp/pingap
 
 # 安装 dbx-web（DBX 数据库 Web GUI，supervisor conf.d/dbx.conf 托管 :4224；
 # 对齐生产 L358-365——二进制从 build_config downloads/ 分发，本地直接 COPY）

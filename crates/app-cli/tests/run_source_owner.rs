@@ -4,6 +4,8 @@
 
 #[path = "fixtures/protocol_support.rs"]
 mod protocol_support;
+#[path = "fixtures/proxy_writer_barrier.rs"]
+mod proxy_writer_barrier;
 
 use serde_json::{Value, json};
 use std::{
@@ -89,7 +91,9 @@ impl Fixture {
     }
 
     fn command_at(&self, action: &str, log: &str, workspace: &std::path::Path) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_app-cli"));
+        let binary = std::env::var_os("APP_CLI_TEST_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_app-cli").into());
+        let mut command = Command::new(binary);
         command.arg(action).arg("--workspace").arg(workspace);
         if action == "run" {
             command
@@ -1455,7 +1459,7 @@ async fn stop_before_commit_yields_single_failure_done() {
 }
 
 /// Real owner/guardian/Child lifecycle with an explicit protocol stand-in.
-/// Applied/route engine correctness remains a separate paired Pingap gate.
+/// Official Pingap routing correctness remains a separate real-binary gate.
 #[tokio::test]
 async fn resident_exact_kill_recovers_latest_confirmed_graph_without_owner_requests() {
     let mut fixture = Fixture::new();
@@ -1513,11 +1517,13 @@ async fn resident_exact_kill_recovers_latest_confirmed_graph_without_owner_reque
     fixture.http(&client, "latest").await;
     wait_entry(&client, &entry, "latest").await;
     let before: Value = serde_json::from_slice(&std::fs::read(&pid_file).unwrap()).unwrap();
-    assert_eq!(
+    assert_ne!(
         before["pid"].as_u64(),
         Some(first_pid),
-        "business Restart replaced resident"
+        "official controlled Restart must replace the proxy incarnation"
     );
+    assert!(before["pid"].as_u64().is_some_and(|pid| pid > 1));
+    let before_pid = before["pid"].as_u64().unwrap();
     let confirmed_graph = std::fs::read(&active).unwrap();
 
     // Admin failures cannot authorize a duplicate spawn or discard a live Child.
@@ -1542,15 +1548,20 @@ async fn resident_exact_kill_recovers_latest_confirmed_graph_without_owner_reque
         std::fs::read_dir(guardians).unwrap().any(|entry| {
             let path = entry.unwrap().path().join("receipt.json");
             let receipt: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-            receipt["diagnostic_pid"].as_u64() == Some(first_pid)
+            receipt["diagnostic_pid"].as_u64() == Some(before_pid)
                 && receipt["resident_identity"]["application_id"] == fixture.app
                 && receipt["resident_identity"]["owner_instance"] == native.supervisor_id
         }),
         "target PID was not registered under the captured owner resident domain"
     );
+    let captured: Value = serde_json::from_slice(&std::fs::read(&pid_file).unwrap()).unwrap();
+    assert_eq!(
+        captured, before,
+        "proxy incarnation changed before fault injection"
+    );
     assert!(
         Command::new("kill")
-            .args(["-KILL", &first_pid.to_string()])
+            .args(["-KILL", &before_pid.to_string()])
             .status()
             .unwrap()
             .success()
@@ -1562,7 +1573,7 @@ async fn resident_exact_kill_recovers_latest_confirmed_graph_without_owner_reque
         loop {
             if let Ok(bytes) = std::fs::read(&pid_file)
                 && let Ok(proxy) = serde_json::from_slice::<Value>(&bytes)
-                && proxy["pid"].as_u64().is_some_and(|pid| pid != first_pid)
+                && proxy["pid"].as_u64().is_some_and(|pid| pid != before_pid)
             {
                 break;
             }
@@ -1591,8 +1602,25 @@ async fn resident_exact_kill_recovers_latest_confirmed_graph_without_owner_reque
         "normal Stop left a business route"
     );
     let stopped: Value = serde_json::from_slice(&std::fs::read(&pid_file).unwrap()).unwrap();
-    assert_eq!(
+    assert_ne!(
         stopped["pid"], after["pid"],
-        "normal Stop killed resident instead of preserving standby"
+        "official Stop must replace the proxy with a confirmed standby"
     );
+    assert_ne!(stopped["instance"], after["instance"]);
+    assert!(
+        !process_utils::process_exists(u32::try_from(after["pid"].as_u64().unwrap()).unwrap())
+            .unwrap(),
+        "successful Stop retained the previous proxy process"
+    );
+    let proxy: Value = client
+        .get(format!("{base}/v1/proxy/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(proxy["data"]["confirmation"]["phase"], "standby");
+    assert_eq!(proxy["data"]["confirmation"]["confirmed"], true);
+    fixture.same_owner(&client, &base, &identity, &native).await;
 }

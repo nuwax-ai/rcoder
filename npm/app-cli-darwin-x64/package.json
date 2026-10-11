@@ -11,7 +11,7 @@
   "files": [
     "app-cli",
     "pingap",
-    "pingap.applied.json"
+    "pingap.official.json"
   ],
   "license": "Apache-2.0",
   "repository": {

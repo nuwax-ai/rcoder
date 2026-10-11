@@ -280,7 +280,23 @@ pub(super) async fn submit_operation(
     }
     .supplies_credentials();
     let owner_hold = state.server.runtime_recovery_hold_active() && !supplying_credentials;
-    let admission = if let Some(native) = state.server.native_control_blocker() {
+    let reservation = state.server.begin_runtime_admission().map_err(|error| {
+        reject(
+            "ERR_RECOVERY_REQUIRED",
+            &format!("reserve runtime admission: {error:#}"),
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+    })?;
+    let admission = if reservation.auxiliary_hold.is_some() {
+        kernel
+            .admit_with_auxiliary_hold(
+                body.request,
+                owner_hold,
+                state.server.native_control_blocker(),
+                reservation.auxiliary_hold.clone(),
+            )
+            .await
+    } else if let Some(native) = state.server.native_control_blocker() {
         kernel
             .admit_with_control_hold(body.request, owner_hold, Some(native))
             .await
@@ -289,6 +305,21 @@ pub(super) async fn submit_operation(
     } else {
         kernel.admit(body.request).await
     };
+    if is_stop
+        && matches!(
+            &admission,
+            Ok(crate::runtime_kernel::AdmissionOutcome::Accepted(_))
+        )
+    {
+        state.server.cancel_auxiliary_writes().map_err(|error| {
+            reject(
+                "ERR_RECOVERY_REQUIRED",
+                &format!("cancel prior configuration writer: {error:#}"),
+                StatusCode::SERVICE_UNAVAILABLE,
+            )
+        })?;
+    }
+    drop(reservation);
     match admission {
         Ok(outcome) => {
             let view = match outcome {

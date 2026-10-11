@@ -82,7 +82,7 @@ class AssetContextTests(unittest.TestCase):
         (source / 'downloads/dbx-web-amd64').write_bytes(b'another-build')
         self.assertEqual((target / 'downloads/dbx-web-amd64').read_bytes(), b'dbx-amd64')
 
-    def test_runtime_named_context_includes_paired_helpers_and_identity(self):
+    def test_runtime_named_context_includes_official_helpers_and_identity(self):
         module = ROOT / 'docker/build-app-runtime.py'
         spec = importlib.util.spec_from_file_location('runtime_build_paired_context', module)
         runtime = importlib.util.module_from_spec(spec)
@@ -95,16 +95,16 @@ class AssetContextTests(unittest.TestCase):
             (fixture / name).mkdir()
         build = fixture / 'tools/build'
         build.mkdir(parents=True)
-        for name in ('pingap_identity.py', 'pingap-assets.json'):
+        for name in ('pingap_identity.py', 'pingap-assets.json', 'runtime_assets.py', 'pingap_official.py'):
             shutil.copy2(ROOT / 'tools/build' / name, build / name)
-        shutil.copytree(ROOT / 'tools/build/pingap-applied', build / 'pingap-applied')
         (build / 'credentials.json').write_text('must not be copied')
         destination = self.root / 'named-cargo-context'
         destination.mkdir()
         runtime.prepare_context(fixture, destination)
         copied = destination / 'tools/build'
-        self.assertTrue((copied / 'pingap-applied/build.py').is_file())
-        self.assertTrue((copied / 'pingap-applied/applied-reload.patch').is_file())
+        self.assertTrue((copied / 'pingap_official.py').is_file())
+        self.assertTrue((copied / 'runtime_assets.py').is_file())
+        self.assertFalse((copied / 'pingap-applied').exists())
         self.assertTrue((copied / 'pingap_identity.py').is_file())
         self.assertTrue((copied / 'pingap-assets.json').is_file())
         self.assertFalse((copied / 'credentials.json').exists())

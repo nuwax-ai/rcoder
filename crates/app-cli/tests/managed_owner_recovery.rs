@@ -96,7 +96,7 @@ async fn ready(
             expected.display(),
             runtime_supervisor::last_snapshot(state),
             std::fs::read_to_string(state.join("identity.json")).unwrap_or_default(),
-            format!(
+            format_args!(
                 "old={}\nnew={}",
                 std::fs::read_to_string(
                     state.parent().unwrap().parent().unwrap().join("old.stderr")

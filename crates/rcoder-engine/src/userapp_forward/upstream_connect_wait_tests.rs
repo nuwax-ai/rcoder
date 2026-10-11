@@ -149,3 +149,95 @@ async fn tcp_connect_once_within_bounds() {
         "拒绝连接的端口在紧预算内应返回 false"
     );
 }
+
+#[tokio::test]
+async fn prod_forward_connect_failure_is_retryable_unavailability_without_progress_claim() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let response = forward_to_addr(
+        ForwardKind::ProdRuntime,
+        "prod-fixture",
+        &format!("http://{address}"),
+        &shared_types::FileServerRequestCredentials::default(),
+        Request::builder().uri("/").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "10");
+    let body = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["code"],
+        shared_types::ERR_CONTAINER_ADDRESS_NOT_READY
+    );
+    assert!(
+        payload
+            .get("operation_id")
+            .is_none_or(|value| value.is_null())
+    );
+    assert!(!payload["message"].as_str().unwrap().contains("http://"));
+}
+
+#[tokio::test]
+async fn application_error_status_body_and_post_are_forwarded_once() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for kind in [ForwardKind::Dev, ForwardKind::ProdRuntime] {
+        for status in [502, 503, 504] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let sentinel = format!("application error body {status}");
+            let expected = sentinel.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0u8; 4096];
+                    let size = stream.read(&mut chunk).await.unwrap();
+                    assert!(size > 0);
+                    bytes.extend_from_slice(&chunk[..size]);
+                    if bytes
+                        .windows(b"posted-once".len())
+                        .any(|window| window == b"posted-once")
+                    {
+                        break;
+                    }
+                }
+                assert!(String::from_utf8_lossy(&bytes).starts_with("POST /mutation "));
+                stream.write_all(format!("HTTP/1.1 {status} Application\r\nX-App-Error: retained\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sentinel}",sentinel.len()).as_bytes()).await.unwrap();
+                drop(stream);
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                        .await
+                        .is_err(),
+                    "forwarder replayed the request"
+                );
+            });
+            let request = Request::builder()
+                .method("POST")
+                .uri("/mutation")
+                .body(Body::from("posted-once"))
+                .unwrap();
+            let response = forward_to_addr(
+                kind,
+                "fixture",
+                &format!("http://{address}"),
+                &shared_types::FileServerRequestCredentials::default(),
+                request,
+            )
+            .await;
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(response.headers()["x-app-error"], "retained");
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                expected.as_bytes()
+            );
+            server.await.unwrap();
+        }
+    }
+}

@@ -265,6 +265,15 @@ impl RuntimeKernel {
         let guard = self.admission.lock().await;
         guard.active_operation_id.is_some() || guard.pending_restart.is_some()
     }
+    pub(crate) async fn has_configuration_barrier(&self) -> bool {
+        let guard = self.admission.lock().await;
+        guard.active_operation_id.is_some()
+            || guard.pending_restart.is_some()
+            || guard.pending_stop.is_some()
+            || guard.interrupted_stop.is_some()
+            || guard.queued_input.is_some()
+            || guard.foreground_exiting_operation.is_some()
+    }
 
     /// 会话交接收束（RV01 重整）：只收束 [`RuntimeKernel::note_execution_session_ended`]
     /// 记录的、属于**已结束会话**的操作集，绝不清扫当前槽位——会话结束后
@@ -740,6 +749,17 @@ impl RuntimeKernel {
         owner_recovery_hold: bool,
         native_control: Option<(String, String)>,
     ) -> std::result::Result<AdmissionOutcome, AdmissionRejection> {
+        self.admit_with_auxiliary_hold(request, owner_recovery_hold, native_control, None)
+            .await
+    }
+
+    pub(crate) async fn admit_with_auxiliary_hold(
+        &self,
+        request: RuntimeOperationRequest,
+        owner_recovery_hold: bool,
+        native_control: Option<(String, String)>,
+        auxiliary: Option<(Option<String>, String)>,
+    ) -> std::result::Result<AdmissionOutcome, AdmissionRejection> {
         if let Err(error) = validate_runtime_operation_request(&request) {
             return Err(AdmissionRejection {
                 code: "ERR_VALIDATION",
@@ -830,6 +850,17 @@ impl RuntimeKernel {
                     "foreground owner is exiting after operation {operation_id}; retry after it exits"
                 ),
                 active_operation_id: Some(operation_id.clone()),
+            });
+        }
+        if request.kind != RuntimeOperationKind::Stop
+            && let Some((operation_id, stage)) = auxiliary
+        {
+            return Err(AdmissionRejection {
+                code: ERR_OPERATION_IN_PROGRESS,
+                message: format!(
+                    "configuration write is in progress at {stage}; retry after it finishes"
+                ),
+                active_operation_id: operation_id,
             });
         }
         // Same-request replay precedes the native control barrier. A different

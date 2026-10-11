@@ -63,10 +63,7 @@ impl DevServerManager {
             AppError::business(format!("external owner recovery required: {error:#}"))
         })?;
         let owner_addr = self.config.app_cli_admin_probe_addr.clone();
-        let Some(crate::service::dev_server::owner_recovery::AvailableOwner {
-            address: owner_addr,
-            identity,
-        }) = self
+        let Some(available) = self
             .recover_owner_if_needed(project_id, project_path)
             .await?
         else {
@@ -105,6 +102,12 @@ impl DevServerManager {
             }
             return Ok(None);
         };
+        let crate::service::dev_server::owner_recovery::AvailableOwner {
+            address: owner_addr,
+            identity,
+        } = self.ensure_official_owner_for_start(
+            project_id, project_path, available, deadline, true,
+        ).await?;
 
         if !crate::service::dev_server::owner_client::protocol_compatible(&identity) {
             return Err(AppError::business(format!(

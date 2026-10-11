@@ -1,5 +1,6 @@
-//! Serialized publication transactions. Failure is safe only after the previous
-//! complete graph is confirmed again; unknown restoration retains write fencing.
+//! app-cli owned publication transactions for unmodified official Pingap.
+//! Configuration markers prove listener execution; process ownership comes
+//! exclusively from the host, never from a private Pingap application API.
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
@@ -8,80 +9,302 @@ use tokio::time::Instant;
 
 use super::{
     admin_probe::{self, AdminEndpoint},
-    apply_status::{ApplyStatus, ConfirmedPublication},
-    compiler::{self, CompileOutcome, PUBLICATION_OBJECT},
+    apply_status::ConfirmedPublication,
+    compiler::{self, CompileOutcome},
 };
 
-async fn observe(endpoint: &AdminEndpoint, deadline: Instant) -> Result<ApplyStatus> {
-    tokio::time::timeout_at(deadline, admin_probe::fetch_apply_status(endpoint))
-        .await
-        .context("proxy publication observation deadline exhausted")?
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProcessInstance {
+    pub pid: u32,
+    /// Host-issued incarnation. It is not a Pingap-supplied nonce.
+    pub id: String,
 }
 
-fn same_instance(status: &ApplyStatus, expected: &ConfirmedPublication) -> Result<()> {
+/// Hosts must retain the exact process identity across every await. Stop must
+/// confirm the owned execution tree is empty before start may replace it.
+#[async_trait::async_trait]
+pub(crate) trait ProcessHost: Send {
+    async fn stop_exact(&mut self, deadline: Instant) -> Result<()>;
+    async fn start_exact(
+        &mut self,
+        candidate: &CompileOutcome,
+        deadline: Instant,
+    ) -> Result<ProcessInstance>;
+    async fn verify_exact(&mut self, expected: &ProcessInstance, deadline: Instant) -> Result<()>;
+    async fn confirm(
+        &mut self,
+        candidate: &CompileOutcome,
+        instance: &ProcessInstance,
+        deadline: Instant,
+    ) -> Result<ConfirmedPublication>;
+    async fn commit(
+        &mut self,
+        candidate: &CompileOutcome,
+        receipt: &ConfirmedPublication,
+        deadline: Instant,
+    ) -> Result<()>;
+    fn mark_unknown(&self, message: String) -> anyhow::Error;
+}
+
+/// One shared transition for both native Child and supervisord hosts. The
+/// original request remains failed even when the last verified snapshot is
+/// restored. An absent snapshot does not turn confirmed cleanup into Unknown.
+pub(crate) async fn restart_verified<H: ProcessHost>(
+    host: &mut H,
+    candidate: &CompileOutcome,
+    previous: Option<&CompileOutcome>,
+    deadline: Instant,
+) -> Result<ConfirmedPublication> {
+    validate_immutable_until(candidate, deadline).await?;
+    compiler::record_official_phase(candidate, shared_types::ProxyPhase::Preparing, None)?;
     ensure!(
-        status.schema_version == 1
-            && status.process_id == expected.process_id
-            && status.process_instance_id == expected.instance_id,
-        "proxy process identity changed; restoration is not authorized"
+        Instant::now() < deadline,
+        "proxy replacement expired before stopping the old instance"
     );
+    // Failure here leaves the original Child/receipt retained. Never bypass an
+    // uncertain stop by spawning a second instance or by using another port.
+    compiler::record_official_phase(candidate, shared_types::ProxyPhase::Stopping, None)?;
+    host.stop_exact(deadline).await.map_err(|error| {
+        protected_error(
+            host,
+            candidate,
+            format!("proxy old instance cleanup unconfirmed: {error:#}"),
+        )
+    })?;
+    let reserve = if previous.is_some() {
+        std::time::Duration::from_secs(8)
+    } else {
+        std::time::Duration::ZERO
+    };
+    let forward_deadline = Instant::now()
+        + deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(reserve);
+    match start_confirm_commit(host, candidate, forward_deadline).await {
+        Ok(receipt) => Ok(receipt),
+        Err(original) => {
+            log_transition_failure(candidate, "candidate", &original);
+            host.stop_exact(deadline).await.map_err(|cleanup| protected_error(host,candidate,format!("proxy candidate rejected: {original:#}; candidate cleanup unconfirmed: {cleanup:#}")))?;
+            let Some(previous) = previous else {
+                compiler::record_official_phase(candidate, shared_types::ProxyPhase::Failed, None)?;
+                return Err(original).context(
+                    "proxy candidate rejected; cleanup confirmed; a new request may retry",
+                );
+            };
+            let restore = async {
+                validate_immutable_until(previous, deadline).await?;
+                start_confirm_commit(host, previous, deadline).await
+            }
+            .await;
+            match restore {
+                Ok(_) => {
+                    tracing::warn!(operation_id=%candidate.operation_id.as_deref().unwrap_or(&candidate.publication_id),
+                        phase="restored", "proxy replacement failed; previous verified snapshot restored; original request remains failed");
+                    // Current serving confirmation remains the restored snapshot;
+                    // the failed request remains visible in its operation record.
+                    Err(original).context(
+                        "proxy replacement failed; previous verified configuration restored",
+                    )
+                }
+                Err(restore_error) => {
+                    log_transition_failure(candidate, "restore", &restore_error);
+                    // Restoration failure is still retryable if its new tree is
+                    // known empty. Only physical uncertainty protects writes.
+                    host.stop_exact(deadline).await.map_err(|cleanup| protected_error(host,candidate,format!("proxy candidate rejected: {original:#}; restoration failed: {restore_error:#}; cleanup unconfirmed: {cleanup:#}")))?;
+                    compiler::record_official_phase(
+                        candidate,
+                        shared_types::ProxyPhase::Failed,
+                        None,
+                    )?;
+                    Err(original).context(format!("proxy restoration failed but cleanup confirmed: {restore_error:#}; a new request may retry"))
+                }
+            }
+        }
+    }
+}
+
+fn log_transition_failure(candidate: &CompileOutcome, phase: &'static str, error: &anyhow::Error) {
+    let detail = shared_types::sanitize_error_text(&format!("{error:#}"));
+    tracing::warn!(operation_id=%candidate.operation_id.as_deref().unwrap_or(&candidate.publication_id),
+        phase,error=%detail,"official proxy transition failed");
+    crate::orchestration_events::emit(&crate::orchestration_events::OrchestrationEvent::Log {
+        service: "pingap".into(),
+        line: format!("Proxy {phase} failed: {detail}"),
+    });
+}
+
+fn protected_error<H: ProcessHost>(
+    host: &H,
+    candidate: &CompileOutcome,
+    message: String,
+) -> anyhow::Error {
+    tracing::error!(operation_id=%candidate.operation_id.as_deref().unwrap_or(&candidate.publication_id),
+        phase="recovery_required",error=%shared_types::sanitize_error_text(&message),"proxy physical cleanup remains unconfirmed");
+    match compiler::record_official_phase(
+        candidate,
+        shared_types::ProxyPhase::RecoveryRequired,
+        None,
+    ) {
+        Ok(()) => host.mark_unknown(message),
+        Err(error) => host.mark_unknown(format!(
+            "{message}; persist recovery phase failed: {error:#}"
+        )),
+    }
+}
+
+async fn start_confirm_commit<H: ProcessHost>(
+    host: &mut H,
+    candidate: &CompileOutcome,
+    deadline: Instant,
+) -> Result<ConfirmedPublication> {
+    ensure!(
+        Instant::now() < deadline,
+        "proxy replacement expired before process start"
+    );
+    compiler::record_official_phase(candidate, shared_types::ProxyPhase::Starting, None)?;
+    let instance = host.start_exact(candidate, deadline).await?;
+    host.verify_exact(&instance, deadline).await?;
+    compiler::record_official_phase(
+        candidate,
+        shared_types::ProxyPhase::Verifying,
+        Some(&instance.id),
+    )?;
+    let receipt = host.confirm(candidate, &instance, deadline).await?;
+    ensure!(
+        receipt.process_id == instance.pid && receipt.instance_id == instance.id,
+        "proxy observation does not belong to the retained host instance"
+    );
+    host.verify_exact(&instance, deadline).await?;
+    ensure!(
+        Instant::now() < deadline,
+        "proxy confirmation completed after its deadline"
+    );
+    host.commit(candidate, &receipt, deadline).await?;
+    host.verify_exact(&instance, deadline).await?;
+    ensure!(
+        Instant::now() < deadline,
+        "proxy commit exceeded its total deadline"
+    );
+    let phase = if !candidate.entry_probes.is_empty()
+        && candidate
+            .entry_probes
+            .iter()
+            .all(|probe| probe.expected_status == 503)
+    {
+        shared_types::ProxyPhase::Standby
+    } else {
+        shared_types::ProxyPhase::Serving
+    };
+    compiler::record_official_phase(candidate, phase, Some(&instance.id))?;
+    Ok(receipt)
+}
+
+pub(crate) async fn validate_immutable_until(
+    candidate: &CompileOutcome,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    tokio::time::timeout_at(deadline, validate_immutable(candidate))
+        .await
+        .context("proxy immutable snapshot observation deadline exhausted")?
+}
+
+pub(crate) async fn validate_immutable(candidate: &CompileOutcome) -> Result<Vec<u8>> {
+    let metadata = tokio::fs::symlink_metadata(&candidate.config_path)
+        .await
+        .context("observe immutable proxy snapshot")?;
+    ensure!(
+        metadata.file_type().is_file(),
+        "proxy snapshot is not a regular file"
+    );
+    let bytes = tokio::fs::read(&candidate.config_path)
+        .await
+        .context("read immutable proxy snapshot")?;
+    let config = PingapConfig::new(&bytes, true).context("decode proxy snapshot")?;
+    ensure!(
+        compiler::configuration_digest(&config)? == candidate.config_digest
+            && admin_probe::hashes_match(&config.hash()?, &candidate.expected_hash),
+        "proxy snapshot differs from its authorized configuration"
+    );
+    Ok(bytes)
+}
+
+/// Never launch Pingap against the mutable active file. It remains a diagnostic
+/// view and a topology source for legacy upgrades, not a reload control plane.
+pub(crate) fn freeze_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .context("immutable proxy snapshot parent missing")?;
+    process_utils::command_context::create_durable_directory(parent)?;
+    ensure!(
+        std::fs::canonicalize(parent)? == parent,
+        "immutable proxy directory resolves outside the owner range"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let mut options = std::fs::File::options();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(bytes)?;
+            file.flush()?;
+            file.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            ensure!(
+                std::fs::symlink_metadata(path)?.file_type().is_file(),
+                "immutable proxy snapshot is not a regular file"
+            );
+            ensure!(
+                std::fs::read(path)? == bytes,
+                "publication identity already belongs to different immutable content"
+            );
+        }
+        Err(error) => return Err(error).context("create immutable proxy snapshot"),
+    }
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
-async fn baseline(
-    target: &Path,
-    endpoint: &AdminEndpoint,
-    deadline: Instant,
-) -> Result<(PingapConfig, ConfirmedPublication)> {
-    let status = observe(endpoint, deadline).await?;
-    status.validate_identity()?;
-    let applied = status
-        .applied
-        .as_ref()
-        .context("proxy has no completed application result")?;
-    let snapshot = tokio::time::timeout_at(deadline, tokio::fs::read(target))
-        .await
-        .context("read applied graph deadline exhausted")?;
-    let config = snapshot
-        .ok()
-        .and_then(|bytes| PingapConfig::new(&bytes, true).ok());
-    let config = match config {
-        Some(config) if compiler::configuration_digest(&config)? == applied.config_digest => config,
-        _ => {
-            // An incomplete active file cannot permanently prevent source retry.
-            // Only this owner's previously confirmed immutable snapshot grants
-            // recovery authority; no directory scan or arbitrary old UUID does.
-            let (outcome, confirmation) = compiler::confirmed_publication().context(
-                "active file differs from the applied graph and no trusted snapshot exists",
-            )?;
-            same_instance(&status, &confirmation)?;
-            ensure!(
-                status.confirmed(&outcome)?.is_some(),
-                "stored proxy receipt is no longer applied"
-            );
-            let bytes = tokio::time::timeout_at(deadline, tokio::fs::read(&outcome.config_path))
-                .await
-                .context("read confirmed snapshot deadline exhausted")??;
-            let config = PingapConfig::new(&bytes, true).context("decode confirmed snapshot")?;
-            ensure!(
-                compiler::configuration_digest(&config)? == applied.config_digest,
-                "confirmed immutable snapshot was modified"
-            );
-            config
-        }
+pub(crate) async fn freeze_candidate(
+    root: &Path,
+    outcome: &CompileOutcome,
+) -> Result<CompileOutcome> {
+    let bytes = validate_immutable(outcome).await?;
+    ensure!(
+        uuid::Uuid::parse_str(&outcome.publication_id).is_ok(),
+        "invalid proxy operation identity"
+    );
+    let path = root
+        .join("official-snapshots")
+        .join(format!("{}.toml", outcome.publication_id));
+    freeze_private(&path, &bytes)?;
+    Ok(CompileOutcome {
+        config_path: path,
+        ..outcome.clone()
+    })
+}
+
+pub(crate) async fn standby_candidate(root: &Path, topology: &Path) -> Result<CompileOutcome> {
+    let content = match tokio::fs::read_to_string(topology).await {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("read standby topology"),
     };
-    let confirmation = ConfirmedPublication {
-        process_id: status.process_id,
-        instance_id: status.process_instance_id,
-        publication_id: applied
-            .operation_id
-            .clone()
-            .context("applied publication identity missing")?,
-        config_hash: applied.config_hash.clone(),
-        config_digest: applied.config_digest.clone(),
-        attempt_id: applied.attempt_id,
-    };
-    Ok((config, confirmation))
+    let id = uuid::Uuid::new_v4().to_string();
+    let (content, _) = compiler::build_standby_from_topology(&id, content.as_deref())?;
+    let config = PingapConfig::new(content.as_bytes(), true)?;
+    let outcome = compiler::persist_candidate(root, &config, &id, 503).await?;
+    freeze_candidate(root, &outcome).await
 }
 
 pub async fn publish_standby_confirmed(
@@ -90,189 +313,46 @@ pub async fn publish_standby_confirmed(
 ) -> Result<CompileOutcome> {
     publish_standby_confirmed_to_path(root, &compiler::active_config_path(root), endpoint).await
 }
-
 pub async fn publish_standby_confirmed_to_path(
     root: &Path,
     target: &Path,
     endpoint: &AdminEndpoint,
 ) -> Result<CompileOutcome> {
-    let deadline = Instant::now() + admin_probe::CONFIRM_BUDGET;
-    publish_standby_confirmed_to_path_until(root, target, endpoint, deadline).await
-}
-
-pub async fn publish_standby_confirmed_to_path_until(
-    root: &Path,
-    target: &Path,
-    endpoint: &AdminEndpoint,
-    deadline: Instant,
-) -> Result<CompileOutcome> {
-    let _guard = tokio::time::timeout_at(deadline, compiler::publication_guard())
-        .await
-        .context("proxy publication gate deadline exhausted before mutation")?;
-    tokio::time::timeout_at(deadline, compiler::wait_for_file_replacements())
-        .await
-        .context("previous file replacement remains pending")?;
-    let (previous, instance) = baseline(target, endpoint, deadline).await?;
-    let id = uuid::Uuid::new_v4().to_string();
-    let content = toml::to_string_pretty(&previous)?;
-    let (content, _) = compiler::build_standby_from_topology(&id, Some(&content))?;
-    let config = PingapConfig::new(content.as_bytes(), true)?;
-    let candidate = compiler::persist_candidate(root, &config, &id, 503).await?;
-    transact(
-        root, target, &candidate, previous, &instance, endpoint, deadline,
-    )
-    .await?;
-    Ok(candidate)
-}
-
-/// Used by management reload when no builtin actor owns the entry. Callers
-/// serialize this with orchestration through the existing auxiliary writer.
-pub async fn publish_confirmed(
-    root: &Path,
-    target: &Path,
-    candidate: &CompileOutcome,
-    endpoint: &AdminEndpoint,
-) -> Result<ConfirmedPublication> {
-    let deadline = Instant::now() + admin_probe::CONFIRM_BUDGET;
-    let _guard = tokio::time::timeout_at(deadline, compiler::publication_guard())
-        .await
-        .context("proxy publication gate deadline exhausted before mutation")?;
-    tokio::time::timeout_at(deadline, compiler::wait_for_file_replacements())
-        .await
-        .context("previous file replacement remains pending")?;
-    let (previous, instance) = baseline(target, endpoint, deadline).await?;
-    transact(
-        root, target, candidate, previous, &instance, endpoint, deadline,
+    publish_standby_confirmed_to_path_until(
+        root,
+        target,
+        endpoint,
+        Instant::now() + admin_probe::CONFIRM_BUDGET,
     )
     .await
 }
-
-async fn transact(
+pub async fn publish_standby_confirmed_to_path_until(
     root: &Path,
     target: &Path,
-    candidate: &CompileOutcome,
-    previous: PingapConfig,
-    instance: &ConfirmedPublication,
-    endpoint: &AdminEndpoint,
+    _endpoint: &AdminEndpoint,
     deadline: Instant,
-) -> Result<ConfirmedPublication> {
-    let previous_probes = compiler::confirmed_publication()
-        .filter(|(_, receipt)| {
-            receipt.publication_id == instance.publication_id
-                && receipt.config_digest == instance.config_digest
-        })
-        .map(|(outcome, _)| outcome.business_probes)
-        .context("previous graph lacks its owned business verification contract")?;
-    let bytes = tokio::time::timeout_at(deadline, tokio::fs::read(&candidate.config_path))
-        .await
-        .context("read publication candidate deadline exhausted")??;
-    let config = PingapConfig::new(&bytes, true)?;
-    ensure!(
-        compiler::configuration_digest(&config)? == candidate.config_digest,
-        "validated proxy candidate was modified"
-    );
-    ensure!(
-        Instant::now() < deadline,
-        "proxy publication budget exhausted before mutation"
-    );
-    // Do not detach a blocking rename by timing out its JoinHandle: it could
-    // overwrite a later rollback. Await its known completion, then evaluate the
-    // original absolute budget. A late completion remains unknown, never success.
-    let forward = match compiler::replace_config_bytes_until(target, bytes, deadline).await {
-        Ok(()) => {
-            let budget = deadline
-                .saturating_duration_since(Instant::now())
-                .saturating_sub(std::time::Duration::from_secs(6));
-            admin_probe::wait_for_publication(endpoint, candidate, budget).await
-        }
-        Err(error) => Err(error),
-    };
-    match forward {
-        Ok(confirmation)
-            if confirmation.process_id == instance.process_id
-                && confirmation.instance_id == instance.instance_id =>
-        {
-            compiler::record_confirmed_publication(candidate, &confirmation)?;
-            Ok(confirmation)
-        }
-        result => {
-            let error = result
-                .err()
-                .unwrap_or_else(|| anyhow::anyhow!("proxy instance changed during publication"));
-            match rollback_publication(
-                root,
-                target,
-                previous,
-                endpoint,
-                instance,
-                &previous_probes,
-                deadline,
-            )
-            .await
-            {
-                Ok((outcome, confirmation)) => {
-                    compiler::record_confirmed_publication(&outcome, &confirmation)?;
-                    Err(error)
-                        .context("publication rejected; previous graph restored, business retained")
-                }
-                Err(restore_error) => Err(crate::supervisor::ShutdownUnconfirmed(format!(
-                    "publication rejected: {error:#}; proxy restoration unknown: {restore_error:#}"
-                ))
-                .into()),
-            }
-        }
-    }
+) -> Result<CompileOutcome> {
+    let outcome = standby_candidate(root, target).await?;
+    let host = crate::services::supervisord_host::SupervisordHost::from_env()
+        .await?
+        .context("proxy replacement requires a managed process host")?;
+    host.replace_official(root, &outcome, deadline).await?;
+    Ok(outcome)
 }
 
-pub async fn rollback_publication(
+pub async fn publish_confirmed(
     root: &Path,
-    target: &Path,
-    mut previous: PingapConfig,
-    endpoint: &AdminEndpoint,
-    expected_instance: &ConfirmedPublication,
-    previous_business_probes: &[compiler::ServiceProbeTarget],
-    deadline: Instant,
-) -> Result<(CompileOutcome, ConfirmedPublication)> {
-    same_instance(&observe(endpoint, deadline).await?, expected_instance)?;
-    let status = previous
-        .plugins
-        .get(PUBLICATION_OBJECT)
-        .and_then(|plugin| plugin.get("status"))
-        .and_then(toml::Value::as_integer)
-        .context("previous graph lacks a trusted publication marker")?;
-    ensure!(
-        status == 200 || status == 503,
-        "invalid previous publication probe status"
-    );
-    previous.plugins.remove(PUBLICATION_OBJECT);
-    previous.locations.remove(PUBLICATION_OBJECT);
-    for server in previous.servers.values_mut() {
-        if let Some(locations) = &mut server.locations {
-            locations.retain(|name| name != PUBLICATION_OBJECT);
-        }
-    }
-    let id = uuid::Uuid::new_v4().to_string();
-    let config = compiler::publication_config(previous, &id, status as u16)?;
-    let mut outcome = compiler::persist_candidate(root, &config, &id, status as u16).await?;
-    if status == 200 {
-        outcome.business_probes = previous_business_probes.to_vec();
-    }
-    ensure!(
-        Instant::now() < deadline,
-        "restoration budget exhausted before mutation"
-    );
-    let bytes = tokio::fs::read(&outcome.config_path).await?;
-    compiler::replace_config_bytes_until(target, bytes, deadline).await?;
-    let confirmation = admin_probe::wait_for_publication(
-        endpoint,
-        &outcome,
-        deadline.saturating_duration_since(Instant::now()),
+    _target: &Path,
+    candidate: &CompileOutcome,
+    _endpoint: &AdminEndpoint,
+) -> Result<ConfirmedPublication> {
+    let host = crate::services::supervisord_host::SupervisordHost::from_env()
+        .await?
+        .context("proxy replacement requires a managed process host")?;
+    host.replace_official(
+        root,
+        candidate,
+        Instant::now() + admin_probe::CONFIRM_BUDGET,
     )
-    .await?;
-    ensure!(
-        confirmation.process_id == expected_instance.process_id
-            && confirmation.instance_id == expected_instance.instance_id,
-        "proxy process changed during restoration"
-    );
-    Ok((outcome, confirmation))
+    .await
 }

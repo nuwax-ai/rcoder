@@ -1,7 +1,8 @@
 //! 管理 API 统一响应信封（app-cli 本地版）。
 //!
 //! wire 形态与主 workspace `shared_types::HttpResult` 逐字段对齐：
-//! `{code, message, data, tid, success}` 恒 5 键（失败 `data` 恒 `null`；
+//! `{code, message, data, tid, success}` 恒 5 键（普通失败 `data=null`；
+//! 已有操作身份的失败可携带端点声明的结构化诊断，如代理 reload 回执；
 //! `success` 由 `code == "0000"` 推导）。app-cli 是独立 workspace（root exclude，
 //! 锁解耦设计）；信封保留本地实现以维持下述 HTTP 语义——**改字段必须两处同步**，
 //! 本文件 mod tests 的 wire 锁快照负责锚定漂移。
@@ -32,7 +33,7 @@ pub(crate) struct HttpResult<T> {
     pub code: String,
     /// 人类可读消息
     pub message: String,
-    /// 业务数据（失败恒 `null`）
+    /// 业务数据；普通错误为空，已受理操作可保留结构化身份及失败详情。
     pub data: Option<T>,
     /// trace id（app-cli 无 OTel，恒 `null`）
     pub tid: Option<String>,

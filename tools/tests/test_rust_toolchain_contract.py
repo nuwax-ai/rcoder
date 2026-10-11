@@ -91,7 +91,7 @@ class RustToolchainContract(unittest.TestCase):
                                        if 'cargo build ' in step.get('run', '')
                                        or 'cargo zigbuild ' in step.get('run', '')
                                        or 'dist build ' in step.get('run', '')
-                                       or 'pingap-applied/build.py ' in step.get('run', ''))
+                                       or 'pingap_official.py ' in step.get('run', ''))
                     self.assertLess(update_index, first_build)
 
     def test_app_cli_path_dependencies_trigger_independent_checks(self):

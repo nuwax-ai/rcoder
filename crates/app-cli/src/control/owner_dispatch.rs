@@ -186,6 +186,10 @@ pub enum ManagementReuse {
     NoOwner,
 }
 
+#[cfg(test)]
+#[path = "owner_upgrade_tests.rs"]
+mod owner_upgrade_tests;
+
 pub(crate) struct EnvironmentDeployment {
     pub request: crate::server::DeployRequest,
     pub operation_id: String,
@@ -201,17 +205,21 @@ pub(crate) async fn dispatch_environment_deployment(
     application_id: &str,
     deployment: &EnvironmentDeployment,
     deadline: tokio::time::Instant,
-) -> Result<()> {
+) -> Result<ManagementReuse> {
     tokio::time::timeout_at(deadline, async {
         let (address, identity) = discover_owner(&args.admin_addr, state_root, std::time::Duration::from_secs(10)).await.context("discover artifact deployment owner")?;
         anyhow::ensure!(identity.protocol_version == RUNTIME_CONTROL_PROTOCOL_VERSION && identity.application_id == application_id && identity.service_family == "userapp-dev", "artifact owner application or protocol changed before submission");
-        anyhow::ensure!(identity.capabilities.iter().any(|cap| cap == "deploy-artifact-url"), "runtime owner cannot deploy artifact URLs");
         let expected_root = runtime_state_layout::resolve_project_origin(&args.workspace)?;
         let owner_root = runtime_state_layout::resolve_project_origin(std::path::Path::new(&identity.source_root))?;
         anyhow::ensure!(runtime_state_layout::canonical_project_root(&expected_root) == runtime_state_layout::canonical_project_root(&owner_root), "artifact owner workspace changed before submission");
         verify_saved_management_identity(state_root, &identity)?;
         let native = runtime_supervisor::control(state_root, runtime_supervisor::Request::new(runtime_supervisor::Action::Status)).await?;
         anyhow::ensure!(native.binding.component == "app-cli" && runtime_state_layout::canonical_project_root(&native.binding.resource) == runtime_state_layout::canonical_project_root(&expected_root), "native artifact authority belongs to another workspace");
+        if !supports_official_proxy_restart(&identity) {
+            crate::control::managed_owner::retire_unsupported_proxy(state_root, &args.workspace, &address, &identity, deadline).await?;
+            return Ok(ManagementReuse::NoOwner);
+        }
+        anyhow::ensure!(identity.capabilities.iter().any(|cap| cap == "deploy-artifact-url"), "runtime owner cannot deploy artifact URLs");
         let token = crate::runtime_kernel::RuntimeStore::read_token(state_root).context("artifact owner credentials are unavailable")?;
         let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(std::time::Duration::from_secs(10)).no_proxy().build()?;
         wait_until_initialized(&client, &address, std::time::Duration::from_secs(10)).await?;
@@ -243,7 +251,7 @@ pub(crate) async fn dispatch_environment_deployment(
             let operation: shared_types::AppDeploymentOperation = serde_json::from_value(body["data"]["operation"].clone()).context("decode original artifact operation")?;
             anyhow::ensure!(operation.operation_id == *id && operation.request_release_id == deployment.request.release_id && operation.deployment_generation_id == deployment.generation, "artifact owner returned a different operation or deployment generation");
             match operation.phase {
-                shared_types::AppCliDeployPhase::Running if operation.persisted => { println!("artifact operation {id} completed on the running owner"); return Ok(()); }
+                shared_types::AppCliDeployPhase::Running if operation.persisted => { println!("artifact operation {id} completed on the running owner"); return Ok(ManagementReuse::Ready); }
                 shared_types::AppCliDeployPhase::Failed => bail!("artifact operation {id} failed: {}", operation.error.as_deref().unwrap_or("no detail")),
                 _ => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
             }
@@ -261,7 +269,8 @@ pub async fn reuse_management_owner(
 ) -> Result<ManagementReuse> {
     let normalized = runtime_state_layout::normalize_management_workspace(workspace)?;
     let workspace = normalized.as_path();
-    tokio::time::timeout(std::time::Duration::from_secs(45), async {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+    tokio::time::timeout_at(deadline, async {
         let (address, identity) =
             discover_owner(admin_addr, state_root, std::time::Duration::from_secs(10))
                 .await
@@ -294,6 +303,13 @@ pub async fn reuse_management_owner(
             bail!("management owner belongs to another workspace");
         }
         verify_saved_management_identity(state_root, &identity)?;
+        if !supports_official_proxy_restart(&identity) {
+            crate::control::managed_owner::retire_unsupported_proxy(
+                state_root, workspace, &address, &identity, deadline,
+            )
+            .await?;
+            return Ok(ManagementReuse::NoOwner);
+        }
         let before = runtime_supervisor::control(
             state_root,
             runtime_supervisor::Request::new(runtime_supervisor::Action::Status),
@@ -353,7 +369,17 @@ pub async fn reuse_management_owner(
     .context("management-only owner reuse deadline exceeded; no business request was submitted")?
 }
 
-fn same_management_identity(left: &RuntimeIdentityView, right: &RuntimeIdentityView) -> bool {
+fn supports_official_proxy_restart(identity: &RuntimeIdentityView) -> bool {
+    identity
+        .capabilities
+        .iter()
+        .any(|capability| capability == shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY)
+}
+
+pub(super) fn same_management_identity(
+    left: &RuntimeIdentityView,
+    right: &RuntimeIdentityView,
+) -> bool {
     left.application_id == right.application_id
         && left.service_family == right.service_family
         && left.workspace_id == right.workspace_id
@@ -364,7 +390,7 @@ fn same_management_identity(left: &RuntimeIdentityView, right: &RuntimeIdentityV
         && left.capabilities == right.capabilities
 }
 
-fn verify_saved_management_identity(
+pub(super) fn verify_saved_management_identity(
     state_root: &std::path::Path,
     identity: &RuntimeIdentityView,
 ) -> Result<()> {
@@ -462,6 +488,21 @@ async fn dispatch_to_owner_inner(
         );
     }
     let expected_ws = identity.workspace_id.clone();
+    anyhow::ensure!(
+        identity.service_family == "userapp-dev",
+        "runtime owner belongs to another service family"
+    );
+    if !supports_official_proxy_restart(&identity) {
+        crate::control::managed_owner::retire_unsupported_proxy(
+            state_root,
+            workspace,
+            admin_addr,
+            &identity,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(45),
+        )
+        .await?;
+        return Ok(OwnerDispatch::NoOwner);
+    }
     crate::build_deploy::source_lock::require_owner_capability(workspace, &identity.capabilities)?;
 
     // 凭据：owner 启用写端点时落盘状态根（与平台侧同一读取契约）
@@ -747,7 +788,10 @@ mod tests {
             runtime_instance_id: "original-runtime-instance".into(),
             deployment_generation_id: "original-deployment".into(),
             protocol_version: RUNTIME_CONTROL_PROTOCOL_VERSION,
-            capabilities: vec!["operations".into()],
+            capabilities: vec![
+                "operations".into(),
+                shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into(),
+            ],
         };
         let identity_bytes = serde_json::to_vec(&identity).unwrap();
         std::fs::write(state_root.join("identity.json"), &identity_bytes).unwrap();
@@ -1009,7 +1053,7 @@ mod tests {
             runtime_instance_id: "inst-d".into(),
             deployment_generation_id: "g".into(),
             protocol_version: RUNTIME_CONTROL_PROTOCOL_VERSION,
-            capabilities: Vec::new(),
+            capabilities: vec![shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into()],
         };
         let identity_for_probe = identity.clone();
         let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1128,6 +1172,7 @@ mod tests {
         // lock: it must submit to that owner, without opening its own listener.
         let _guard = crate::platform::owner_guard::OwnerGuard::acquire(&state_root).unwrap();
         let args = crate::RuntimeArgs {
+            operation_id: None,
             workspace: ws.clone(),
             log_dir: dir.path().join("logs"),
             admin_addr: addr.clone(),
@@ -1211,7 +1256,7 @@ mod tests {
         assert_eq!(submitted.lock().unwrap().len(), 3);
 
         // Capability follows current Source input, not the old derived lock.
-        // Keep this older owner's empty capability list: an unsupported new
+        // Keep this owner's absent startup-probe capability: an unsupported new
         // strategy must fail before admission, and corrected input may retry.
         let cached = std::fs::read(ws.join("release.lock.toml")).unwrap();
         std::fs::write(

@@ -1,327 +1,257 @@
-//! Controlled HTTP protocol fixtures, not evidence of real Pingap application.
-use super::{admin_probe::AdminEndpoint, apply_status::*, compiler, publication};
-use pingap_config::PingapConfig;
-use std::{
-    io::{Read, Write},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+//! Controlled process-host fixtures exercise transition order and recovery.
+//! They do not claim acceptance of a real Pingap binary or deployed container.
+use super::{
+    apply_status::ConfirmedPublication,
+    compiler,
+    publication::{self, ProcessHost, ProcessInstance},
 };
+use anyhow::{Context, Result};
+use pingap_config::PingapConfig;
+use std::path::Path;
+use tokio::time::Instant;
 
+#[derive(Default)]
 struct Fixture {
-    endpoint: AdminEndpoint,
-    address: std::net::SocketAddr,
-    reject: Arc<Mutex<Option<String>>>,
-    foreign: Arc<AtomicBool>,
-    business_fails: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    current: Option<ProcessInstance>,
+    rejected: Option<String>,
+    reject_all: bool,
+    unknown_stop: bool,
+    foreign_observation: bool,
+    operations: Vec<String>,
+    committed: Option<compiler::CompileOutcome>,
 }
-impl Fixture {
-    fn new(active: std::path::PathBuf) -> Self {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let address = listener.local_addr().unwrap();
-        let reject = Arc::new(Mutex::new(None::<String>));
-        let foreign = Arc::new(AtomicBool::new(false));
-        let stop = Arc::new(AtomicBool::new(false));
-        let business_fails = Arc::new(AtomicBool::new(false));
-        let unhealthy = business_fails.clone();
-        let (rejected, changed, cancelled) = (reject.clone(), foreign.clone(), stop.clone());
-        let worker = std::thread::spawn(move || {
-            let instance = uuid::Uuid::new_v4().to_string();
-            let other = uuid::Uuid::new_v4().to_string();
-            let mut status = ApplyStatus {
-                schema_version: 1,
-                process_id: std::process::id(),
-                process_instance_id: instance.clone(),
-                applied: None,
-                last_attempt: None,
-            };
-            let mut attempt = 0;
-            while !cancelled.load(Ordering::Acquire) {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(value) => value,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                        continue;
-                    }
-                    Err(error) => panic!("fixture accept: {error}"),
-                };
-                stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(std::time::Duration::from_secs(1)))
-                    .unwrap();
-                let mut request = [0u8; 2048];
-                let count = match stream.read(&mut request) {
-                    Ok(0) | Err(_) => continue,
-                    Ok(count) => count,
-                };
-                let request = String::from_utf8_lossy(&request[..count]);
-                let config = std::fs::read(&active)
-                    .ok()
-                    .and_then(|bytes| PingapConfig::new(&bytes, true).ok());
-                if let Some(config) = config {
-                    let id = config.plugins[compiler::PUBLICATION_OBJECT]["data"]
-                        .as_str()
-                        .unwrap()
-                        .to_owned();
-                    let digest = compiler::configuration_digest(&config).unwrap();
-                    let hash = config.hash().unwrap();
-                    if status
-                        .last_attempt
-                        .as_ref()
-                        .and_then(|value| value.operation_id.as_deref())
-                        != Some(&id)
-                    {
-                        attempt += 1;
-                        let failed = rejected.lock().unwrap().as_deref() == Some(&id);
-                        status.last_attempt = Some(ApplyAttempt {
-                            attempt_id: attempt,
-                            operation_id: Some(id.clone()),
-                            config_hash: Some(hash.clone()),
-                            config_digest: Some(digest.clone()),
-                            state: if failed {
-                                ApplyState::Failed
-                            } else {
-                                ApplyState::Applied
-                            },
-                            failure: failed.then(|| ApplyFailure {
-                                category: "fixture_rejection".into(),
-                                message: "candidate rejected".into(),
-                            }),
-                        });
-                        if !failed {
-                            status.applied = Some(AppliedPublication {
-                                attempt_id: attempt,
-                                operation_id: Some(id),
-                                config_hash: hash,
-                                config_digest: digest,
-                                applied_at_unix_ms: 1,
-                            });
-                        }
-                    }
-                }
-                status.process_instance_id = if changed.load(Ordering::Acquire) {
-                    other.clone()
-                } else {
-                    instance.clone()
-                };
-                let (code, headers, body) = if request.starts_with("GET /api/apply-status ") {
-                    assert!(request.to_ascii_lowercase().contains("authorization:"));
-                    (200, String::new(), serde_json::to_string(&status).unwrap())
-                } else if request.starts_with("GET /business/health ") {
-                    (
-                        if unhealthy.load(Ordering::Acquire) {
-                            503
-                        } else {
-                            200
-                        },
-                        String::new(),
-                        "business".into(),
-                    )
-                } else {
-                    let id = status
-                        .applied
-                        .as_ref()
-                        .unwrap()
-                        .operation_id
-                        .as_deref()
-                        .unwrap();
-                    let code = if std::fs::read_to_string(&active)
-                        .unwrap()
-                        .contains("status = 503")
-                    {
-                        503
-                    } else {
-                        200
-                    };
-                    (
-                        code,
-                        format!("X-Rcoder-Publication: {id}\r\n"),
-                        id.to_owned(),
-                    )
-                };
-                let response = format!(
-                    "HTTP/1.1 {code} Test\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                // A client may cancel a bounded observation after connecting.
-                // The transaction's behavior assertions still require replies.
-                let _ = stream.write_all(response.as_bytes());
-            }
-        });
-        Self {
-            endpoint: AdminEndpoint {
-                addr: address.to_string(),
-                user: "fixture".into(),
-                password: "fixture".into(),
-            },
-            address,
-            reject,
-            foreign,
-            business_fails,
-            stop,
-            worker: Some(worker),
-        }
+
+#[async_trait::async_trait]
+impl ProcessHost for Fixture {
+    async fn stop_exact(&mut self, _deadline: Instant) -> Result<()> {
+        self.operations.push("stop".into());
+        anyhow::ensure!(!self.unknown_stop, "owned process cleanup is unknown");
+        self.current = None;
+        Ok(())
     }
-}
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        let result = self.worker.take().unwrap().join();
-        if !std::thread::panicking() {
-            result.unwrap();
-        }
+    async fn start_exact(
+        &mut self,
+        candidate: &compiler::CompileOutcome,
+        _deadline: Instant,
+    ) -> Result<ProcessInstance> {
+        anyhow::ensure!(
+            self.current.is_none(),
+            "a previous owned process is still alive"
+        );
+        self.operations
+            .push(format!("start:{}", candidate.publication_id));
+        let instance = ProcessInstance {
+            pid: 42,
+            id: uuid::Uuid::new_v4().to_string(),
+        };
+        self.current = Some(instance.clone());
+        Ok(instance)
+    }
+    async fn verify_exact(&mut self, expected: &ProcessInstance, _deadline: Instant) -> Result<()> {
+        anyhow::ensure!(
+            self.current.as_ref() == Some(expected),
+            "owned process changed"
+        );
+        Ok(())
+    }
+    async fn confirm(
+        &mut self,
+        candidate: &compiler::CompileOutcome,
+        instance: &ProcessInstance,
+        _deadline: Instant,
+    ) -> Result<ConfirmedPublication> {
+        self.operations
+            .push(format!("confirm:{}", candidate.publication_id));
+        anyhow::ensure!(
+            !self.reject_all && self.rejected.as_deref() != Some(&candidate.publication_id),
+            "controlled candidate HTTP failure"
+        );
+        Ok(ConfirmedPublication {
+            process_id: instance.pid,
+            instance_id: if self.foreign_observation {
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                instance.id.clone()
+            },
+            publication_id: candidate.publication_id.clone(),
+            operation_id: candidate.operation_id.clone(),
+            config_hash: candidate.expected_hash.clone(),
+            config_digest: candidate.config_digest.clone(),
+            attempt_id: 1,
+        })
+    }
+    async fn commit(
+        &mut self,
+        candidate: &compiler::CompileOutcome,
+        _receipt: &ConfirmedPublication,
+        _deadline: Instant,
+    ) -> Result<()> {
+        self.operations
+            .push(format!("commit:{}", candidate.publication_id));
+        self.committed = Some(candidate.clone());
+        Ok(())
+    }
+    fn mark_unknown(&self, message: String) -> anyhow::Error {
+        crate::supervisor::ShutdownUnconfirmed(message).into()
     }
 }
 
-async fn candidate(
-    root: &std::path::Path,
-    address: std::net::SocketAddr,
-    status: u16,
-) -> compiler::CompileOutcome {
-    let mut config = PingapConfig::default();
-    config.basic.auto_restart_check_interval = Some(std::time::Duration::from_secs(2));
-    config.servers.insert(
+async fn candidate(root: &Path) -> compiler::CompileOutcome {
+    let mut graph = PingapConfig::default();
+    graph.servers.insert(
         "fixture".into(),
         pingap_config::ServerConf {
-            addr: address.to_string(),
+            addr: "127.0.0.1:9080".into(),
             ..Default::default()
         },
     );
     let id = uuid::Uuid::new_v4().to_string();
-    let config = compiler::publication_config(config, &id, status).unwrap();
-    compiler::persist_candidate(root, &config, &id, status)
+    let graph = compiler::publication_config(graph, &id, 200).unwrap();
+    compiler::persist_candidate(root, &graph, &id, 200)
         .await
         .unwrap()
 }
+fn deadline() -> Instant {
+    Instant::now() + std::time::Duration::from_secs(20)
+}
 
 #[tokio::test]
-async fn rejected_publication_restores_new_correlated_old_graph() {
+async fn rejected_candidate_restores_verified_snapshot_but_original_stays_failed() {
     let root = tempfile::tempdir().unwrap();
-    let active = compiler::active_config_path(root.path());
-    let fixture = Fixture::new(active.clone());
-    let mut original = candidate(root.path(), fixture.address, 200).await;
+    let mut original = candidate(root.path()).await;
     original.business_probes.push(compiler::ServiceProbeTarget {
         service_id: "backend".into(),
-        address: fixture.address,
-        path: "/business/health".into(),
+        address: "127.0.0.1:1234".parse().unwrap(),
+        path: "/health".into(),
     });
-    compiler::publish_active(root.path(), &original.config_path)
-        .await
-        .unwrap();
-    let original_receipt = super::admin_probe::wait_for_publication(
-        &fixture.endpoint,
-        &original,
-        std::time::Duration::from_secs(2),
-    )
-    .await
-    .unwrap();
-    compiler::record_confirmed_publication(&original, &original_receipt).unwrap();
-    let rejected = candidate(root.path(), fixture.address, 200).await;
-    *fixture.reject.lock().unwrap() = Some(rejected.publication_id.clone());
-    let error = publication::publish_confirmed(root.path(), &active, &rejected, &fixture.endpoint)
+    let rejected = candidate(root.path()).await;
+    let mut host = Fixture {
+        rejected: Some(rejected.publication_id.clone()),
+        ..Default::default()
+    };
+    let error = publication::restart_verified(&mut host, &rejected, Some(&original), deadline())
         .await
         .unwrap_err();
     assert!(
         !error.is::<crate::supervisor::ShutdownUnconfirmed>(),
         "{error:#}"
     );
-    assert!(format!("{error:#}").contains("previous graph restored"));
-    let (restored, receipt) = compiler::confirmed_publication().unwrap();
-    assert_ne!(restored.publication_id, rejected.publication_id);
-    assert_ne!(restored.publication_id, original.publication_id);
-    assert_eq!(receipt.instance_id, original_receipt.instance_id);
+    assert!(format!("{error:#}").contains("previous verified configuration restored"));
+    let restored = host.committed.as_ref().unwrap();
+    assert_eq!(restored.publication_id, original.publication_id);
+    assert_eq!(restored.business_probes.len(), 1);
     assert_eq!(
-        std::fs::read(active).unwrap(),
-        std::fs::read(&restored.config_path).unwrap()
-    );
-    assert_eq!(
-        restored.business_probes.len(),
-        1,
-        "serving rollback must preserve the HTTP contract"
-    );
-    fixture.business_fails.store(true, Ordering::Release);
-    assert!(
-        super::admin_probe::wait_for_publication(
-            &fixture.endpoint,
-            &restored,
-            std::time::Duration::from_secs(2)
-        )
-        .await
-        .is_err(),
-        "marker alone must not hide a stopped backend after rollback"
+        host.operations,
+        vec![
+            "stop".into(),
+            format!("start:{}", rejected.publication_id),
+            format!("confirm:{}", rejected.publication_id),
+            "stop".into(),
+            format!("start:{}", original.publication_id),
+            format!("confirm:{}", original.publication_id),
+            format!("commit:{}", original.publication_id)
+        ]
     );
 }
 
 #[tokio::test]
-async fn foreign_process_cannot_authorize_rollback_write() {
+async fn rejected_bootstrap_without_snapshot_is_retryable_after_exact_cleanup() {
     let root = tempfile::tempdir().unwrap();
-    let active = compiler::active_config_path(root.path());
-    let fixture = Fixture::new(active.clone());
-    let original = candidate(root.path(), fixture.address, 200).await;
-    compiler::publish_active(root.path(), &original.config_path)
+    let candidate = candidate(root.path()).await;
+    let mut host = Fixture {
+        reject_all: true,
+        ..Default::default()
+    };
+    let error = publication::restart_verified(&mut host, &candidate, None, deadline())
+        .await
+        .unwrap_err();
+    assert!(!error.is::<crate::supervisor::ShutdownUnconfirmed>());
+    assert!(host.current.is_none());
+    assert!(host.committed.is_none());
+    host.reject_all = false;
+    publication::restart_verified(&mut host, &candidate, None, deadline())
         .await
         .unwrap();
-    let receipt = super::admin_probe::wait_for_publication(
-        &fixture.endpoint,
-        &original,
-        std::time::Duration::from_secs(2),
-    )
-    .await
-    .unwrap();
-    let bytes = std::fs::read(&active).unwrap();
-    let previous = PingapConfig::new(&bytes, true).unwrap();
-    fixture.foreign.store(true, Ordering::Release);
-    let result = publication::rollback_publication(
-        root.path(),
-        &active,
-        previous,
-        &fixture.endpoint,
-        &receipt,
-        &original.business_probes,
-        tokio::time::Instant::now() + std::time::Duration::from_secs(2),
-    )
-    .await;
-    assert!(result.is_err());
-    assert_eq!(std::fs::read(active).unwrap(), bytes);
+    assert!(host.current.is_some());
+    assert!(host.committed.is_some());
+}
+
+#[tokio::test]
+async fn rejected_restoration_with_confirmed_cleanup_does_not_permanently_fence_source() {
+    let root = tempfile::tempdir().unwrap();
+    let original = candidate(root.path()).await;
+    let candidate = candidate(root.path()).await;
+    let mut host = Fixture {
+        reject_all: true,
+        ..Default::default()
+    };
+    let error = publication::restart_verified(&mut host, &candidate, Some(&original), deadline())
+        .await
+        .unwrap_err();
+    assert!(
+        !error.is::<crate::supervisor::ShutdownUnconfirmed>(),
+        "{error:#}"
+    );
+    assert!(format!("{error:#}").contains("cleanup confirmed"));
+    assert!(host.current.is_none());
+}
+
+#[tokio::test]
+async fn unconfirmed_stop_never_starts_or_restores_another_process() {
+    let root = tempfile::tempdir().unwrap();
+    let candidate = candidate(root.path()).await;
+    let mut host = Fixture {
+        unknown_stop: true,
+        ..Default::default()
+    };
+    let error = publication::restart_verified(&mut host, &candidate, None, deadline())
+        .await
+        .unwrap_err();
+    assert!(error.is::<crate::supervisor::ShutdownUnconfirmed>());
+    assert_eq!(host.operations, ["stop"]);
+}
+
+#[tokio::test]
+async fn foreign_observation_cannot_publish_success() {
+    let root = tempfile::tempdir().unwrap();
+    let candidate = candidate(root.path()).await;
+    let mut host = Fixture {
+        foreign_observation: true,
+        ..Default::default()
+    };
+    let error = publication::restart_verified(&mut host, &candidate, None, deadline())
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("retained host instance"));
+    assert!(host.committed.is_none());
+    assert!(host.current.is_none());
+}
+
+#[tokio::test]
+async fn modified_snapshot_is_rejected_before_old_process_stop() {
+    let root = tempfile::tempdir().unwrap();
+    let candidate = candidate(root.path()).await;
+    std::fs::write(&candidate.config_path, "[basic]\nname = 'changed'\n").unwrap();
+    let mut host = Fixture::default();
+    assert!(
+        publication::restart_verified(&mut host, &candidate, None, deadline())
+            .await
+            .is_err()
+    );
+    assert!(host.operations.is_empty());
 }
 
 #[test]
 fn digest_matches_upstream_canonical_fixture() {
-    let bytes = include_bytes!("../../tests/fixtures/applied-config.toml");
-    let config = PingapConfig::new(bytes, true).unwrap();
+    let config = PingapConfig::new(
+        include_bytes!("../../tests/fixtures/applied-config.toml"),
+        true,
+    )
+    .unwrap();
     assert_eq!(
-        compiler::configuration_digest(&config).unwrap(),
+        compiler::configuration_digest(&config)
+            .context("canonical config digest")
+            .unwrap(),
         include_str!("../../tests/fixtures/applied-config.sha256").trim()
     );
-}
-
-#[tokio::test]
-async fn applied_marker_does_not_confirm_an_unavailable_business() {
-    let root = tempfile::tempdir().unwrap();
-    let active = compiler::active_config_path(root.path());
-    let fixture = Fixture::new(active);
-    let mut outcome = candidate(root.path(), fixture.address, 200).await;
-    let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = unavailable.local_addr().unwrap();
-    drop(unavailable);
-    outcome.business_probes.push(compiler::ServiceProbeTarget {
-        service_id: "backend".into(),
-        address,
-        path: "/health".into(),
-    });
-    compiler::publish_active(root.path(), &outcome.config_path)
-        .await
-        .unwrap();
-    let error = super::admin_probe::wait_for_publication(
-        &fixture.endpoint,
-        &outcome,
-        std::time::Duration::from_secs(2),
-    )
-    .await
-    .unwrap_err();
-    assert!(format!("{error:#}").contains("verify business service backend"));
 }

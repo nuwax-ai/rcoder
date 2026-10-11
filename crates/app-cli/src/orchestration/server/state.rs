@@ -11,6 +11,11 @@ pub struct ServerState {
     pub(super) admission: std::sync::Mutex<()>,
     pub(super) accepting: std::sync::atomic::AtomicBool,
     pub(super) auxiliary_writers: std::sync::atomic::AtomicUsize,
+    pub(super) runtime_admission_writers: std::sync::atomic::AtomicUsize,
+    pub(super) runtime_admission_epoch: std::sync::atomic::AtomicU64,
+    pub(super) auxiliary_operation: std::sync::Mutex<Option<String>>,
+    pub(super) auxiliary_cancel: std::sync::Mutex<Option<CancellationToken>>,
+    pub(super) writer_settled: tokio::sync::Notify,
     pub(super) shutdown_unconfirmed: std::sync::atomic::AtomicBool,
     // High-water marks retain the previous generation's stop requirements while
     // a replacement release is being prepared/published.
@@ -91,6 +96,21 @@ pub struct ServerState {
 pub(crate) struct AuxiliaryWriter<'a> {
     pub(super) state: &'a ServerState,
     pub(super) confirmed: bool,
+    pub(super) cancellation: CancellationToken,
+}
+
+pub(crate) struct RuntimeAdmission<'a> {
+    pub(super) state: &'a ServerState,
+    pub(crate) auxiliary_hold: Option<(Option<String>, String)>,
+}
+
+impl Drop for RuntimeAdmission<'_> {
+    fn drop(&mut self) {
+        self.state
+            .runtime_admission_writers
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.state.writer_settled.notify_waiters();
+    }
 }
 
 pub(super) const CREDENTIALS_HOLD: u8 = 1;
@@ -120,17 +140,37 @@ impl AuxiliaryWriter<'_> {
     pub(crate) fn confirm(&mut self) {
         self.confirmed = true;
     }
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
 }
 impl Drop for AuxiliaryWriter<'_> {
     fn drop(&mut self) {
+        let _admission = match self.state.admission.lock() {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.state
+                    .runtime_recovery_hold
+                    .fetch_or(2, std::sync::atomic::Ordering::AcqRel);
+                tracing::error!("configuration writer completion admission poisoned: {error}");
+                return;
+            }
+        };
         if !self.confirmed {
             self.state
                 .runtime_recovery_hold
                 .fetch_or(2, std::sync::atomic::Ordering::AcqRel);
         }
+        if let Ok(mut operation) = self.state.auxiliary_operation.lock() {
+            operation.take();
+        }
+        if let Ok(mut cancellation) = self.state.auxiliary_cancel.lock() {
+            cancellation.take();
+        }
         self.state
             .auxiliary_writers
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.state.writer_settled.notify_waiters();
     }
 }
 
@@ -153,7 +193,19 @@ pub(crate) enum ControlSignal {
 #[async_trait::async_trait]
 impl runtime_supervisor::WorkerControl for ServerState {
     async fn prepare_stop(&self, deadline: tokio::time::Instant) -> Result<()> {
-        crate::supervisor::resident::publish_standby_until(deadline).await
+        self.cancel_auxiliary_writes()?;
+        self.wait_auxiliary_writes(deadline)
+            .await
+            .map_err(|error| {
+                crate::supervisor::ShutdownUnconfirmed(format!(
+                    "configuration writes remain unsettled before Stop: {error:#}"
+                ))
+            })?;
+        crate::supervisor::resident::publish_standby_for_operation_until(
+            deadline,
+            self.current_runtime_operation(),
+        )
+        .await
     }
     fn ready(&self) -> bool {
         !self.initializing()
@@ -195,6 +247,14 @@ impl runtime_supervisor::WorkerControl for ServerState {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("runtime admission lock poisoned"))?;
             self.trigger_cancel();
+            if let Some(cancellation) = self
+                .auxiliary_cancel
+                .lock()
+                .map_err(|_| anyhow::anyhow!("auxiliary cancellation lock poisoned"))?
+                .as_ref()
+            {
+                cancellation.cancel();
+            }
             self.accepting
                 .store(false, std::sync::atomic::Ordering::Release);
         }
@@ -228,6 +288,15 @@ impl runtime_supervisor::WorkerControl for GenerationControl {
             self.ready(),
             "business control generation is no longer current"
         );
+        self.state.cancel_auxiliary_writes()?;
+        self.state
+            .wait_auxiliary_writes(deadline)
+            .await
+            .map_err(|error| {
+                crate::supervisor::ShutdownUnconfirmed(format!(
+                    "configuration writes remain unsettled before generation Stop: {error:#}"
+                ))
+            })?;
         // This is called before the native control closes its generation gate.
         // Do not queue another control request: the native handler owns that queue.
         if let Some(host) = tokio::time::timeout_at(

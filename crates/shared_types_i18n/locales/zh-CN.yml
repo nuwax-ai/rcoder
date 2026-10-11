@@ -260,4 +260,7 @@ userapp_error_page.ui.hint: "反馈问题时请附上此编号，便于定位本
 userapp_error_page.ui.copy: "复制"
 userapp_error_page.ui.copied: "已复制"
 userapp_error_page.ui.aria_chain: "链路诊断：浏览器与网关正常，应用服务当前不可用"
-error.dev_container_unreachable: "开发容器暂时不可达，可能正在重启，请稍后重试"
+error.dev_container_unreachable: "开发容器暂时不可达，请稍后重试"
+
+userapp_error_page.restarting.title: "应用服务正在切换"
+userapp_error_page.restarting.message: "应用服务正在启动或重启，请稍后重试。"

@@ -44,9 +44,14 @@ const RESIDENT_CONF_FILE: &str = "51-app-cli-resident.conf";
 const LOG_MAXBYTES: &str = "10MB";
 const LOG_BACKUPS: &str = "3";
 
+#[cfg(test)]
+type FixtureArgvObserver = std::sync::Arc<dyn Fn(i64) -> Result<Vec<String>> + Send + Sync>;
+
 pub(crate) struct SupervisordHost {
     client: SupervisorClient,
     conf_path: PathBuf,
+    #[cfg(test)]
+    fixture_argv: Option<FixtureArgvObserver>,
 }
 
 impl SupervisordHost {
@@ -71,6 +76,8 @@ impl SupervisordHost {
         Ok(Some(Self {
             client,
             conf_path: CONF_PATH.into(),
+            #[cfg(test)]
+            fixture_argv: None,
         }))
     }
     #[cfg(test)]
@@ -78,6 +85,7 @@ impl SupervisordHost {
         Self {
             client: SupervisorClient::new(socket),
             conf_path,
+            fixture_argv: None,
         }
     }
     /// 引擎探测：socket 存在 + XML-RPC ping 成功（serve 启动时调用一次）。
@@ -133,6 +141,8 @@ impl SupervisordHost {
         Ok(Some(Self {
             client,
             conf_path: PathBuf::from(CONF_PATH),
+            #[cfg(test)]
+            fixture_argv: None,
         }))
     }
 
@@ -187,7 +197,7 @@ impl SupervisordHost {
         //    standby 摘流 → 停旧 → 起新 → 发布正常路由并确认；提前发布
         //    会让新路由指向未启动的服务，切换窗口 502）。
         anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
-        let pingap_outcome = match prepared_proxy {
+        let mut pingap_outcome = match prepared_proxy {
             Some(prepared) => {
                 anyhow::ensure!(
                     prepared.workspace == args.workspace
@@ -204,27 +214,20 @@ impl SupervisordHost {
                     supervisor::PreflightRejected(format!("proxy candidate preflight: {error:#}"))
                 })?,
         };
+        pingap_outcome.operation_id = args.operation_id.clone();
         let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
         let endpoint = admin_probe::ensure_admin_endpoint()?;
         // Restart 摘流：常驻入口正在服务旧路由时，先校验热载兼容（server
         // 拓扑变化 Fail Fast 保旧服务），再切 standby 并确认热载生效
         // （mock 503 直出），然后停旧起新；首编（入口未起）跳过。
         if entry_serving {
-            let active = crate::proxy::compiler::active_config_path(&runtime_root);
-            let candidate = tokio::fs::read_to_string(&pingap_outcome.config_path)
-                .await
-                .with_context(|| {
-                    format!("read candidate {}", pingap_outcome.config_path.display())
-                })?;
-            crate::proxy::compiler::validate_hot_reload_compatible(&active, &candidate).map_err(
-                |error| {
-                    supervisor::PreflightRejected(format!(
-                        "proxy compatibility preflight: {error:#}"
-                    ))
-                },
-            )?;
             anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
-            self.drain_entry(&runtime_root).await?;
+            self.drain_entry_for_operation_until(
+                &runtime_root,
+                tokio::time::Instant::now() + admin_probe::CONFIRM_BUDGET,
+                args.operation_id.clone(),
+            )
+            .await?;
         }
         if !previous_groups.is_empty() {
             self.stop_business().await?;
@@ -304,18 +307,14 @@ impl SupervisordHost {
                 .with_context(|| format!("write spec {}", spec.service_id))?;
         }
         anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
-        let pingap_spec = pingap_service_spec(args, endpoint);
-        self.record_entry_domain(
-            &runtime_root,
-            &crate::proxy::compiler::active_config_path(&runtime_root),
-            None,
-        )
-        .await?;
-        pingap_spec.write().context("write resident pingap spec")?;
-        // 常驻分片幂等覆写（每次编排重写同一内容——凭证/active 路径变化时
-        // 随 reloadConfig 生效；分片不撤，组不删）。
-        let resident_conf = render_resident_conf(&args.log_dir);
-        write_conf(&self.resident_conf_path()?, &resident_conf).await?;
+        // A first bootstrap supplies the launch contract. Existing immutable
+        // resident ownership is left untouched until exact proxy replacement.
+        if configured_entry_spec(&self.conf_path)?.is_none() {
+            let pingap_spec = pingap_service_spec(args, endpoint);
+            pingap_spec
+                .write()
+                .context("write official proxy launch contract")?;
+        }
 
         // 4. 生成并重载 program conf（supervisord 不建日志目录——服务日志目录预建）
         let services_log_dir = args.log_dir.join("services");
@@ -417,44 +416,18 @@ impl SupervisordHost {
             started.push(name);
         }
 
-        // 7. 新服务已就绪：发布正常路由到 active（常驻 -c 目标；已运行的
-        //    常驻 pingap 由 --autoreload 拾取）→ 确保常驻组在 → hash 确认。
+        // The official binary reads one immutable snapshot. Replacing the
+        // proxy is independent of business groups and does not rely on reload.
         anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
-        let publication_guard = crate::proxy::compiler::publication_guard().await;
-        crate::proxy::compiler::publish_active(&runtime_root, &pingap_outcome.config_path)
-            .await
-            .context("publish active pingap config")?;
-        // C2：以进程 state=RUNNING 为准——STOPPED/FATAL/已配置未启动的组
-        // 必须走 startProcess（addProcessGroup 对已存在组幂等成功）。
-        if self.resident_entry_running().await? {
-            info!("🛰️  resident {PINGAP_PROGRAM} running; relying on autoreload for active config");
-        } else {
-            // 组可能已存在（STOPPED/FATAL/supervisord 重启后 autostart=false）：
-            // addProcessGroup 幂等，随后显式 startProcess。
-            mutation_result(self.client.add_process_group(PINGAP_PROGRAM).await)?;
-            anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
-            mutation_result(self.client.start_process_wait(PINGAP_PROGRAM).await)
-                .context("start app-pingap")?;
-        }
-        started.push(PINGAP_PROGRAM.to_string());
-        let entry_instance = self.client.running_process(PINGAP_PROGRAM).await?;
-        tokio::select! {
-            result = admin_probe::wait_for_publication(
-            endpoint,
+        self.replace_official_with_cancel(
+            &runtime_root,
             &pingap_outcome,
-            admin_probe::CONFIRM_BUDGET,
-        ) => {
-                let confirmed = result.context("pingap publication confirm")?;
-                anyhow::ensure!(i64::from(confirmed.process_id) == entry_instance.pid
-                    && self.client.running_process(PINGAP_PROGRAM).await? == entry_instance,
-                    "resident process changed during active confirmation");
-                // 已确认生效：业务就绪观察以此核对 admin 实际 hash。
-                crate::proxy::compiler::record_confirmed_publication(&pingap_outcome, &confirmed)?;
-                self.record_entry_domain(&runtime_root, &crate::proxy::compiler::active_config_path(&runtime_root), Some(&entry_instance)).await?;
-            }
-            () = cancel.cancelled() => bail!("Orchestration cancelled"),
-        }
-        drop(publication_guard);
+            tokio::time::Instant::now() + admin_probe::CONFIRM_BUDGET,
+            Some(cancel),
+        )
+        .await
+        .context("official Pingap restart and HTTP confirmation")?;
+        anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
 
         // 8. bridge readiness（语义与 builtin 一致：无 bridge=编排完成即 ready；
         //    有 bridge 只等指定后端，失败 NotReady 摘流不失败）
@@ -600,15 +573,14 @@ async fn compile_pingap(
     .await
 }
 
-/// pingap 的 spec（argv = pingap -c {config} --autoreload；admin 凭证只进
+/// pingap 的 spec（argv = pingap -c {immutable-config}；admin 凭证只进
 /// tmpfs spec 的 env，不落持久卷/命令行/日志）。
 fn pingap_service_spec(
     args: &RuntimeArgs,
     endpoint: &admin_probe::AdminEndpoint,
 ) -> ServiceSpecFile {
-    // P1 常驻：spec 固定 `resident` 代（不被 prune），`-c` 指向 owner 生命
-    // 周期固定的 active 路径——release 发布只原子替换 active，常驻 pingap
-    // 经 --autoreload 热载，不随编排代次重建。
+    // The first bootstrap contract is installed before a process exists; the
+    // host replaces -c with an immutable owner snapshot before every launch.
     let active = crate::proxy::compiler::active_config_path(&crate::proxy::compiler::runtime_root(
         &args.log_dir,
     ));
@@ -620,18 +592,19 @@ fn pingap_service_spec(
             args.pingap_bin.to_string_lossy().into_owned(),
             "-c".into(),
             active.to_string_lossy().into_owned(),
-            "--autoreload".into(),
         ],
-        env: [
-            ("PINGAP_ADMIN_ADDR".to_string(), endpoint.addr.clone()),
-            ("PINGAP_ADMIN_USER".to_string(), endpoint.user.clone()),
-            (
-                "PINGAP_ADMIN_PASSWORD".to_string(),
-                endpoint.password.clone(),
-            ),
-        ]
-        .into_iter()
-        .collect(),
+        env: {
+            let mut env = crate::proxy::official_env::cleared_environment();
+            env.extend([
+                ("PINGAP_ADMIN_ADDR".to_string(), endpoint.addr.clone()),
+                ("PINGAP_ADMIN_USER".to_string(), endpoint.user.clone()),
+                (
+                    "PINGAP_ADMIN_PASSWORD".to_string(),
+                    endpoint.password.clone(),
+                ),
+            ]);
+            env
+        },
         port: None,
     }
 }

@@ -284,6 +284,10 @@ pub struct TrackingCtx {
     pub userapp_route: Option<UserAppRouteCtx>,
     /// Captured wake failure; later readiness advice must not replace its identity.
     pub wake_failure: Option<shared_types::WakeFailure>,
+    /// Fresh UID-rechecked evidence; never copied from the advisor TTL cache.
+    pub failure_hint: Option<crate::error_page::UserAppProxyFailureHint>,
+    pub fresh_failure_evidence: bool,
+    pub failure_hint_at: Option<tokio::time::Instant>,
     /// 已确认来源的 Pingap 自产错误正文替换（response_filter 决定；body filter
     /// 首块输出新正文并丢弃原错误体，不拼接）。None = 不替换。
     pub replace_error_body: Option<bytes::Bytes>,
@@ -313,6 +317,9 @@ impl TrackingCtx {
             start: std::time::Instant::now(),
             userapp_route: None,
             wake_failure: None,
+            failure_hint: None,
+            fresh_failure_evidence: false,
+            failure_hint_at: None,
             replace_error_body: None,
             error_replacement_emitted: false,
             target_port: None,

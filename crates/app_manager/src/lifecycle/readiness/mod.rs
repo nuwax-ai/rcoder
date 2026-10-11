@@ -261,7 +261,7 @@ mod tests {
                         address: None,
                         channel: shared_types::UserAppReadinessChannel::Exec,
                     },
-                    snapshot: ready_snapshot(),
+                    snapshot: Box::new(ready_snapshot()),
                 })
             }
         }

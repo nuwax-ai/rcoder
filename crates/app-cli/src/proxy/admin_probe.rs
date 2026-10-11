@@ -1,8 +1,8 @@
-//! Pingap admin 只读探测通道：仅用于确认配置重载实际生效（config_hash 比对）。
+//! Pingap admin 只读探测通道：官方管理观察与受控实例的 HTTP 确认。
 //!
 //! ## 只读纪律（不可违背）
 //! 本模块**永不使用 admin 写端点**（POST /api/configs、POST /api/restart 等）；
-//! TOML + `--autoreload` 始终是配置的唯一权威来源，admin 只是 app-cli 启动 pingap 时
+//! 不可变 TOML 快照是配置的唯一权威来源，admin 只是 app-cli 启动 pingap 时
 //! 经 env 注入的 loopback 观察点，用来读取 `GET /api/basic` 返回的 `config_hash`。
 //!
 //! ## 鉴权算法（pingap src/plugin/admin.rs:272-330，非 Basic Auth）
@@ -132,9 +132,8 @@ fn verify_proxy_spec(spec: &crate::svc_spec::ServiceSpecFile) -> Result<()> {
         "credential record belongs to a business command"
     );
     anyhow::ensure!(
-        spec.argv.len() == 4
+        (spec.argv.len() == 3 || (spec.argv.len() == 4 && spec.argv[3] == "--autoreload"))
             && spec.argv[1] == "-c"
-            && spec.argv[3] == "--autoreload"
             && std::path::Path::new(&spec.argv[2]).is_absolute(),
         "proxy specification command does not match its launch contract"
     );
@@ -241,40 +240,54 @@ pub struct UpstreamHealthView {
 /// admin `/api/basic` 的只读快照（业务就绪观察消费的字段子集）。
 #[derive(Debug, Clone)]
 pub struct AdminBasicSnapshot {
+    /// Actual worker PID returned by the official binary (not its guardian).
+    pub process_id: Option<u32>,
     /// 当前实际生效配置 hash（缺失 = 观察不完整）
     pub config_hash: Option<String>,
     /// upstream 名（= service_id）→ 健康视图
     pub upstreams: std::collections::HashMap<String, UpstreamHealthView>,
 }
 
-/// 解析 `/api/basic` 为 [`AdminBasicSnapshot`]（未知字段忽略，向前兼容）。
+#[derive(serde::Deserialize)]
+struct AdminBasicWire {
+    config_hash: Option<String>,
+    pid: Option<String>,
+    #[serde(default)]
+    upstream_healthy_status: std::collections::HashMap<String, UpstreamHealthWire>,
+}
+
+#[derive(serde::Deserialize)]
+struct UpstreamHealthWire {
+    #[serde(default)]
+    healthy: u32,
+    #[serde(default)]
+    total: u32,
+}
+
+/// Read the official wire fields; malformed counts or PID are protocol errors.
 pub fn parse_admin_basic(body: &str) -> Result<AdminBasicSnapshot> {
-    let value: serde_json::Value =
+    let wire: AdminBasicWire =
         serde_json::from_str(body).context("parse admin /api/basic JSON body")?;
-    let config_hash = value
-        .get("config_hash")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let mut upstreams = std::collections::HashMap::new();
-    if let Some(map) = value
-        .get("upstream_healthy_status")
-        .and_then(serde_json::Value::as_object)
-    {
-        for (name, status) in map {
-            let healthy = status
-                .get("healthy")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as u32;
-            let total = status
-                .get("total")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as u32;
-            upstreams.insert(name.clone(), UpstreamHealthView { healthy, total });
-        }
-    }
+    let process_id = wire
+        .pid
+        .map(|pid| pid.parse::<u32>().context("invalid official Pingap PID"))
+        .transpose()?;
     Ok(AdminBasicSnapshot {
-        config_hash,
-        upstreams,
+        config_hash: wire.config_hash,
+        process_id,
+        upstreams: wire
+            .upstream_healthy_status
+            .into_iter()
+            .map(|(name, status)| {
+                (
+                    name,
+                    UpstreamHealthView {
+                        healthy: status.healthy,
+                        total: status.total,
+                    },
+                )
+            })
+            .collect(),
     })
 }
 
@@ -314,150 +327,135 @@ pub async fn fetch_config_hash(addr: &str, user: &str, password: &str) -> Result
     fetch_with_client(&client, addr, user, password).await
 }
 
-pub async fn fetch_apply_status(
-    endpoint: &AdminEndpoint,
-) -> Result<super::apply_status::ApplyStatus> {
-    validate_endpoint(endpoint)?;
-    let client = build_probe_client()?;
-    fetch_application(&client, endpoint).await
-}
-
-async fn fetch_application(
-    client: &reqwest::Client,
-    endpoint: &AdminEndpoint,
-) -> Result<super::apply_status::ApplyStatus> {
-    let url = format!("http://{}/api/apply-status", endpoint.addr);
-    let response = client
-        .get(&url)
-        .header(
-            "Authorization",
-            authorization_header(&endpoint.user, &endpoint.password, now_unix_seconds()?),
-        )
-        .send()
-        .await
-        .context("read proxy application result")?;
-    anyhow::ensure!(
-        response.status().is_success(),
-        "proxy does not provide an authenticated application result (HTTP {})",
-        response.status()
-    );
-    let bytes = response
-        .bytes()
-        .await
-        .context("read proxy application result body")?;
-    serde_json::from_slice(&bytes).context("decode proxy application result")
-}
-
-/// One total deadline covers the application result and every listener probe.
-/// The hash is only a consistency field; an Applied graph, UUID and process
-/// identity must match before the data plane can confirm this operation.
-pub async fn wait_for_publication(
+/// Confirm this caller-owned immutable instance through official read-only APIs.
+/// The UUID belongs to app-cli; it is never presented as a Pingap Applied receipt.
+pub async fn wait_for_official_publication(
     endpoint: &AdminEndpoint,
     expected: &super::compiler::CompileOutcome,
+    expected_pid: u32,
+    instance_id: &str,
     budget: Duration,
 ) -> Result<super::apply_status::ConfirmedPublication> {
     validate_endpoint(endpoint)?;
+    anyhow::ensure!(
+        expected_pid > 0 && uuid::Uuid::parse_str(instance_id).is_ok(),
+        "official proxy confirmation requires an owned process identity"
+    );
     let deadline = tokio::time::Instant::now() + budget;
     let client = build_probe_client()?;
-    let mut instance: Option<(u32, String)> = None;
-    let mut last = "publication has not been observed".to_string();
+    let mut last = "owned proxy has not answered".to_owned();
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
+        if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "proxy publication {} was not confirmed: {last}",
+                "official proxy publication {} was not confirmed: {last}",
                 expected.publication_id
             );
         }
-        let observed =
-            match tokio::time::timeout_at(deadline, fetch_application(&client, endpoint)).await {
-                Ok(Ok(observed)) => observed,
-                Ok(Err(error)) => {
-                    last = format!("{error:#}");
-                    tokio::time::sleep(PROBE_INTERVAL.min(remaining)).await;
-                    continue;
+        let before = tokio::time::timeout_at(deadline, fetch_admin_basic(endpoint)).await;
+        match before {
+            Ok(Ok(snapshot)) => {
+                anyhow::ensure!(
+                    snapshot.process_id == Some(expected_pid),
+                    "official admin belongs to another proxy process"
+                );
+                anyhow::ensure!(
+                    snapshot
+                        .config_hash
+                        .as_deref()
+                        .is_some_and(|hash| hashes_match(&expected.expected_hash, hash)),
+                    "official proxy loaded another configuration"
+                );
+                match verify_http_contract(&client, expected, deadline).await {
+                    Ok(()) => {
+                        let after = tokio::time::timeout_at(deadline, fetch_admin_basic(endpoint))
+                            .await
+                            .context("official proxy final observation deadline exhausted")??;
+                        anyhow::ensure!(
+                            after.process_id == Some(expected_pid)
+                                && after
+                                    .config_hash
+                                    .as_deref()
+                                    .is_some_and(|hash| hashes_match(
+                                        &expected.expected_hash,
+                                        hash
+                                    )),
+                            "official proxy instance or configuration changed after HTTP verification"
+                        );
+                        anyhow::ensure!(
+                            tokio::time::Instant::now() < deadline,
+                            "official proxy verification completed after its deadline"
+                        );
+                        return Ok(super::apply_status::ConfirmedPublication {
+                            process_id: expected_pid,
+                            instance_id: instance_id.to_owned(),
+                            publication_id: expected.publication_id.clone(),
+                            config_hash: expected.expected_hash.clone(),
+                            config_digest: expected.config_digest.clone(),
+                            // One immutable activation per app-cli instance UUID.
+                            attempt_id: 1,
+                            operation_id: expected.operation_id.clone(),
+                        });
+                    }
+                    Err(error) => last = format!("{error:#}"),
                 }
-                Err(_) => anyhow::bail!(
-                    "proxy publication observation exceeded its total deadline: {last}"
-                ),
-            };
-        let current = (observed.process_id, observed.process_instance_id.clone());
-        if let Some(ref first) = instance {
-            anyhow::ensure!(
-                *first == current,
-                "proxy instance changed while confirming publication"
-            );
-        } else {
-            instance = Some(current);
-        }
-        if let Some(confirmed) = observed.confirmed(expected)? {
-            for target in &expected.entry_probes {
-                let url = format!("http://{}/_pub/{}", target.address, expected.publication_id);
-                let response = tokio::time::timeout_at(deadline, client.get(&url).send())
-                    .await
-                    .context("proxy listener verification deadline exhausted")?
-                    .with_context(|| format!("verify proxy listener {}", target.address))?;
-                anyhow::ensure!(
-                    response.status().as_u16() == target.expected_status,
-                    "proxy publication listener status mismatch"
-                );
-                anyhow::ensure!(
-                    response
-                        .headers()
-                        .get("X-Rcoder-Publication")
-                        .and_then(|value| value.to_str().ok())
-                        == Some(&expected.publication_id),
-                    "proxy listener returned another publication"
-                );
-                let bytes = tokio::time::timeout_at(deadline, response.bytes())
-                    .await
-                    .context("proxy publication body deadline exhausted")??;
-                anyhow::ensure!(
-                    bytes.as_ref() == expected.publication_id.as_bytes(),
-                    "proxy listener did not execute this publication marker"
-                );
             }
-            // A marker can execute while a declared backend is unavailable.
-            // Serving confirmation requires the release's real HTTP contract.
-            for target in &expected.business_probes {
-                let url = format!("http://{}{}", target.address, target.path);
-                let response = tokio::time::timeout_at(deadline, client.get(&url).send())
-                    .await
-                    .context("business HTTP verification deadline exhausted")?
-                    .with_context(|| format!("verify business service {}", target.service_id))?;
-                anyhow::ensure!(
-                    response.status().is_success(),
-                    "business service {} failed its HTTP contract (HTTP {})",
-                    target.service_id,
-                    response.status()
-                );
+            Ok(Err(error)) => last = format!("{error:#}"),
+            Err(_) => {
+                anyhow::bail!("official proxy observation exceeded its total deadline: {last}")
             }
-            // A listener marker cannot authorize a response from another process
-            // that replaced the authenticated admin during the HTTP observations.
-            let after = tokio::time::timeout_at(deadline, fetch_application(&client, endpoint))
-                .await
-                .context("proxy final application observation deadline exhausted")??;
-            anyhow::ensure!(
-                after.process_id == confirmed.process_id
-                    && after.process_instance_id == confirmed.instance_id,
-                "proxy instance changed after listener verification"
-            );
-            anyhow::ensure!(
-                after.confirmed(expected)?.is_some(),
-                "proxy application changed after listener verification"
-            );
-            anyhow::ensure!(
-                tokio::time::Instant::now() < deadline,
-                "proxy confirmation completed after its deadline"
-            );
-            return Ok(confirmed);
         }
-        last = "current Applied graph belongs to another publication".into();
         tokio::time::sleep(
             PROBE_INTERVAL.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
         )
         .await;
     }
+}
+
+async fn verify_http_contract(
+    client: &reqwest::Client,
+    expected: &super::compiler::CompileOutcome,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    for target in &expected.entry_probes {
+        let url = format!("http://{}/_pub/{}", target.address, expected.publication_id);
+        let response = tokio::time::timeout_at(deadline, client.get(&url).send())
+            .await
+            .context("proxy listener verification deadline exhausted")?
+            .with_context(|| format!("verify proxy listener {}", target.address))?;
+        anyhow::ensure!(
+            response.status().as_u16() == target.expected_status,
+            "proxy publication listener status mismatch"
+        );
+        anyhow::ensure!(
+            response
+                .headers()
+                .get("X-Rcoder-Publication")
+                .and_then(|value| value.to_str().ok())
+                == Some(&expected.publication_id),
+            "proxy listener returned another publication"
+        );
+        let bytes = tokio::time::timeout_at(deadline, response.bytes())
+            .await
+            .context("proxy publication body deadline exhausted")??;
+        anyhow::ensure!(
+            bytes.as_ref() == expected.publication_id.as_bytes(),
+            "proxy listener did not execute this publication marker"
+        );
+    }
+    for target in &expected.business_probes {
+        let url = format!("http://{}{}", target.address, target.path);
+        let response = tokio::time::timeout_at(deadline, client.get(&url).send())
+            .await
+            .context("business HTTP verification deadline exhausted")?
+            .with_context(|| format!("verify business service {}", target.service_id))?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "business service {} failed its HTTP contract (HTTP {})",
+            target.service_id,
+            response.status()
+        );
+    }
+    Ok(())
 }
 
 fn build_probe_client() -> Result<reqwest::Client> {

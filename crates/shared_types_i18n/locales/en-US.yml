@@ -260,4 +260,7 @@ userapp_error_page.ui.hint: "Include this ID when reporting the issue to help lo
 userapp_error_page.ui.copy: "Copy"
 userapp_error_page.ui.copied: "Copied"
 userapp_error_page.ui.aria_chain: "Path diagnostics: browser and gateway are healthy, the app service is currently unavailable"
-error.dev_container_unreachable: "The dev container is temporarily unreachable (it may be restarting). Please try again shortly."
+error.dev_container_unreachable: "The dev container is temporarily unreachable. Please try again shortly."
+
+userapp_error_page.restarting.title: "Application service is restarting"
+userapp_error_page.restarting.message: "The application service is starting or restarting. Please try again shortly."

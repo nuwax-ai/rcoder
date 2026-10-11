@@ -62,6 +62,8 @@ impl SupervisordHost {
                 Self {
                     client,
                     conf_path: CONF_PATH.into(),
+                    #[cfg(test)]
+                    fixture_argv: None,
                 }
                 // 换代清理不发布 standby：入口保持当前配置（接管方的编排
                 // 会发布新 active）；发布反而会与接管方竞态。

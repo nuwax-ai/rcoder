@@ -84,14 +84,15 @@ pub async fn owner_serve(
     let normalized = args.for_management()?;
     let args = &normalized;
     session.register_resident_application(&application_id)?;
+    let api_listener = crate::api::bind_listener(&args.admin_addr).await?;
+    let ready = RuntimeStatusService::default();
+    let state = Arc::new(ServerState::new(ready));
     session.set_owner_cleanup(Arc::new(OwnerResidentCleanup {
         session: Arc::downgrade(&session),
         args: args.clone(),
         application_id: application_id.clone(),
+        state: Arc::downgrade(&state),
     }))?;
-    let api_listener = crate::api::bind_listener(&args.admin_addr).await?;
-    let ready = RuntimeStatusService::default();
-    let state = Arc::new(ServerState::new(ready));
     state.initialize_owner_token()?;
     state.mark_kernel_required();
     // R3：会话以 Reconciling 起步——镜像任务启动前的窗口内同步置位，
@@ -340,6 +341,14 @@ pub async fn owner_serve(
     // Foreground completion and an abnormal owner-loop exit must also close
     // owner resources. Native Shutdown already ran this before its terminal;
     // the same physical cleanup is idempotent and remains evidence-based.
+    state.close_admission();
+    state
+        .wait_auxiliary_writes(
+            tokio::time::Instant::now()
+                + state.shutdown_budget(matches!(state.log_layout(), LogLayout::Supervisord)),
+        )
+        .await
+        .context("owner exit has unsettled admitted configuration writes")?;
     if let Err(error) = crate::services::supervisor::resident::shutdown().await {
         state.begin_failure(
             format!("owner resident shutdown unconfirmed: {error:#}"),
@@ -373,11 +382,20 @@ struct OwnerResidentCleanup {
     session: std::sync::Weak<runtime_supervisor::OwnerSession>,
     args: RuntimeArgs,
     application_id: String,
+    state: std::sync::Weak<ServerState>,
 }
 
 #[async_trait::async_trait]
 impl runtime_supervisor::OwnerCleanup for OwnerResidentCleanup {
     async fn shutdown(&self) -> Result<()> {
+        if let Some(state) = self.state.upgrade() {
+            state.close_admission();
+            let deadline = tokio::time::Instant::now()
+                + state.shutdown_budget(matches!(state.log_layout(), LogLayout::Supervisord));
+            state.wait_auxiliary_writes(deadline).await.context(
+                "owner cannot exit while admitted configuration writes remain unsettled",
+            )?;
+        }
         let _publication = crate::proxy::compiler::publication_guard().await;
         crate::proxy::compiler::wait_for_file_replacements().await;
         if crate::services::supervisor::resident::owner_scope_root()?.is_none() {
@@ -1536,6 +1554,13 @@ pub(super) async fn finish_clean_shutdown(
         "an earlier shutdown failure remains unconfirmed"
     );
     state.preparations.drain().await?;
+    anyhow::ensure!(
+        state
+            .auxiliary_writers
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0,
+        "configuration writes remain unsettled; shutdown cannot be acknowledged"
+    );
     crate::static_hosting::reconcile(&[], &args.workspace, false).await?;
     if owner_exiting {
         // 干净退出清除 endpoint 发现记录（崩溃残留的旧记录由客户端核验拒绝）

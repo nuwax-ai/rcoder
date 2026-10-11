@@ -250,12 +250,20 @@ pub(super) struct HttpResultError {
 impl HttpResultError {
     pub(super) fn from_app_error(cause: shared_types::AppError) -> Self {
         Self {
-            status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            status: cause.status_code(),
             message: String::new(),
             retry_after_secs: None,
             cause: Some(cause),
             code: None,
         }
+    }
+
+    /// Connection unavailability is HTTP 503 while the shared envelope retains
+    /// the exact in-flight operation and its existing business error code.
+    pub(super) fn into_unavailable(mut self) -> Self {
+        self.status = axum::http::StatusCode::SERVICE_UNAVAILABLE;
+        self.retry_after_secs = Some(10);
+        self
     }
 
     pub(super) fn bad_request(message: impl Into<String>) -> Self {
@@ -334,7 +342,14 @@ impl HttpResultError {
 impl IntoResponse for HttpResultError {
     fn into_response(self) -> Response {
         if let Some(cause) = self.cause {
-            return cause.into_response();
+            let mut response = cause.into_response();
+            *response.status_mut() = self.status;
+            if let Some(seconds) = self.retry_after_secs
+                && let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string())
+            {
+                response.headers_mut().insert("retry-after", value);
+            }
+            return response;
         }
         // Reuse the shared envelope (including trace and safe error text), but
         // let the outer response retain the transport status: HttpResult's own

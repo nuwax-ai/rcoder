@@ -284,6 +284,7 @@ NODE_ENV = "production"
         let host = SupervisordHost {
             client: SupervisorClient::new(socket),
             conf_path: conf,
+            fixture_argv: None,
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             host.stop_business().await.unwrap();
@@ -409,6 +410,7 @@ NODE_ENV = "production"
         let host = SupervisordHost {
             client: SupervisorClient::new(path),
             conf_path: root.path().join("unused.conf"),
+            fixture_argv: None,
         };
         let error = host.stop_business().await.unwrap_err().to_string();
         assert!(error.contains("did not stop"));
@@ -953,50 +955,153 @@ mod owner_shutdown_domain_tests {
 #[cfg(test)]
 mod publication_receipt_tests {
     use super::*;
+    use crate::proxy::publication::{ProcessHost, ProcessInstance};
 
-    /// Complete host orchestration with controlled supervisor/admin/entry RPC
-    /// peers and a real in-process static backend. This is protocol evidence.
+    /// Component evidence: official confirmation has its own record; owner
+    /// receipt writes do not invalidate it. Real process/HTTP orchestration is
+    /// covered by the native and container acceptance tests, not a fake Applied API.
     #[cfg(unix)]
     #[test]
-    fn successful_orchestration_keeps_publication_confirmed_after_owner_receipt_writes() {
-        let _env_guard = crate::svc_spec::SPEC_ENV_LOCK.lock().unwrap();
+    fn official_confirmation_survives_owner_receipt_writes_without_private_api() {
+        let _guard = crate::svc_spec::SPEC_ENV_LOCK.lock().unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(async {
-            use std::os::unix::fs::PermissionsExt;
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let saved_spec = std::env::var_os("APP_CLI_SPEC_DIR");
-            let saved_pg = std::env::var_os("APP_CLI_REQUIRE_PG");
-            let saved_runtime = std::env::var_os("APP_CLI_PINGAP_RUNTIME_DIR");
             let temporary = tempfile::tempdir().unwrap();
-            let root = std::fs::canonicalize(temporary.path()).unwrap();
+            let root = temporary.path().canonicalize().unwrap();
             let workspace = root.join("workspace");
-            std::fs::create_dir_all(workspace.join("web/dist")).unwrap();
-            std::fs::write(
-                workspace.join("web/dist/index.html"),
-                b"real static backend",
+            std::fs::create_dir(&workspace).unwrap();
+            let args = RuntimeArgs {
+                workspace: workspace.clone(),
+                log_dir: root.join("logs"),
+                ..Default::default()
+            };
+            let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+            let (lease, scope) = owner_test_context::scope(&root, &workspace);
+            let identity = scope.identity().clone();
+            supervisor::resident::bind_owner(scope, &args).unwrap();
+            let mut config = pingap_config::PingapConfig::default();
+            config.servers.insert(
+                "fixture".into(),
+                pingap_config::ServerConf {
+                    addr: "127.0.0.1:9080".into(),
+                    ..Default::default()
+                },
+            );
+            let id = uuid::Uuid::new_v4().to_string();
+            let config =
+                crate::proxy::compiler::fixture_publication_config(config, &id, 200).unwrap();
+            let mut outcome =
+                crate::proxy::compiler::fixture_persist_candidate(&runtime_root, &config, &id, 200)
+                    .await
+                    .unwrap();
+            outcome.operation_id = Some("parent-operation".into());
+            let outcome = crate::proxy::publication::freeze_candidate(&runtime_root, &outcome)
+                .await
+                .unwrap();
+            let instance = ProcessInstance {
+                pid: 42,
+                id: uuid::Uuid::new_v4().to_string(),
+            };
+            let running = crate::xmlrpc::RunningProcess {
+                pid: 42,
+                started: 123,
+            };
+            let confirmation = crate::proxy::apply_status::ConfirmedPublication {
+                process_id: 42,
+                instance_id: instance.id.clone(),
+                publication_id: id,
+                operation_id: Some("parent-operation".into()),
+                config_hash: outcome.expected_hash.clone(),
+                config_digest: outcome.config_digest.clone(),
+                attempt_id: 1,
+            };
+            let host = SupervisordHost::protocol_fixture(
+                root.join("uncontacted.sock"),
+                root.join("dynamic.conf"),
+            );
+            let endpoint = admin_probe::AdminEndpoint {
+                addr: "127.0.0.1:19086".into(),
+                user: "fixture".into(),
+                password: "fixture".into(),
+            };
+            let mut process_host = super::resident::OfficialSupervisorHost {
+                host: &host,
+                runtime_root: &runtime_root,
+                spec: pingap_service_spec(&args, &endpoint),
+                current: Some((instance, running.clone())),
+                cancel: None,
+                epoch: supervisor::resident::control_epoch().unwrap(),
+            };
+            process_host
+                .commit(
+                    &outcome,
+                    &confirmation,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            assert!(!crate::proxy::compiler::publication_uncertain());
+            let (_, current) = crate::proxy::compiler::confirmed_publication().unwrap();
+            assert_eq!(current, confirmation);
+            let receipt = read_resident_engine_receipt(&runtime_root)
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.identity, identity);
+            assert_eq!(receipt.process, Some(running));
+            assert_eq!(receipt.config, outcome.config_path);
+            let record: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(runtime_root.join("official-proxy-confirmation.json")).unwrap(),
             )
             .unwrap();
-            let backend = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let backend_port = backend.local_addr().unwrap().port();
-            drop(backend);
-            let public = tokio::net::TcpListener::bind("0.0.0.0:9080").await.unwrap();
-            let secondary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let secondary_address = secondary.local_addr().unwrap();
-            let admin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let admin_address = admin.local_addr().unwrap();
-            let release: ReleaseLock = toml::from_str(&format!(
-                r#"
+            assert_eq!(record["contract"], "official_restart_http_v1");
+            assert_eq!(record["confirmation"]["operation_id"], "parent-operation");
+            let strict_bytes = std::fs::read(runtime_root.join(RESIDENT_ENGINE_RECEIPT)).unwrap();
+            assert!(serde_json::from_slice::<ResidentEngineReceipt>(&strict_bytes).is_ok());
+            assert!(
+                !String::from_utf8(strict_bytes)
+                    .unwrap()
+                    .contains("confirmation_contract")
+            );
+            supervisor::resident::shutdown().await.unwrap();
+            drop(lease);
+        });
+    }
+}
+
+#[cfg(test)]
+mod official_orchestration_protocol_tests {
+    use super::*;
+
+    /// Controlled XML-RPC/argv evidence plus real static HTTP, not a real
+    /// supervisord/Pingap deployment. Retains full orchestration ordering checks.
+    #[cfg(unix)]
+    #[test]
+    fn successful_orchestration_confirms_all_listeners_and_business_without_private_applied() {
+        let _guard = crate::svc_spec::SPEC_ENV_LOCK.lock().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use tokio::io::{AsyncReadExt,AsyncWriteExt};
+            let temporary=tempfile::tempdir().unwrap();let root=temporary.path().canonicalize().unwrap();
+            let workspace=root.join("workspace");std::fs::create_dir_all(workspace.join("web/dist")).unwrap();
+            std::fs::write(workspace.join("web/dist/index.html"),b"real static backend").unwrap();
+            let backend=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let backend_port=backend.local_addr().unwrap().port();drop(backend);
+            let entry=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let entry_addr=entry.local_addr().unwrap();
+            let second=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let second_addr=second.local_addr().unwrap();
+            let admin=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let admin_addr=admin.local_addr().unwrap();
+            let mut release:ReleaseLock=toml::from_str(&format!(r#"
                 schema_version=1
-                release_id="publication-fixture"
+                release_id="official-protocol-fixture"
                 workspace_name="fixture"
                 minimum_app_cli_version="0.0.0"
                 runtime_image_digest="fixture"
                 [pingap]
-                mode="custom"
-                config="proxy.toml"
+                mode="managed"
                 version="0.15.0"
                 commit="fixture"
                 [[services]]
@@ -1022,217 +1127,132 @@ mod publication_receipt_tests {
                 path="/"
                 strip_prefix=false
                 [services.env]
-            "#
-            ))
-            .unwrap();
-            std::fs::write(workspace.join("proxy.toml"),format!("[servers.app]\naddr=\"0.0.0.0:9080,{secondary_address}\"\nlocations=[\"business\"]\n[locations.business]\npath=\"/\"\nupstream=\"web\"\n[upstreams.web]\naddrs=[\"127.0.0.1:{backend_port}\"]\n")).unwrap();
-            let pingap = root.join("pingap");
-            std::fs::write(
-                &pingap,
-                "#!/bin/sh\nif [ \"$1\" = '--apply-protocol-version' ]; then echo 1; fi\nexit 0\n",
-            )
-            .unwrap();
-            std::fs::set_permissions(&pingap, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let args = RuntimeArgs {
-                workspace: workspace.clone(),
-                log_dir: root.join("logs"),
-                pingap_bin: pingap,
-                ..Default::default()
-            };
-            let runtime_root = args.log_dir.join("pingap");
-            unsafe {
-                std::env::set_var("APP_CLI_SPEC_DIR", root.join("specs"));
-                std::env::remove_var("APP_CLI_REQUIRE_PG");
-                std::env::set_var("APP_CLI_PINGAP_RUNTIME_DIR", &runtime_root);
+            "#)).unwrap();
+            // Both explicit listeners are retained in the candidate, not inferred
+            // from one generic port check.
+            release.bridge_service=None;
+            let args=RuntimeArgs{workspace:workspace.clone(),log_dir:root.join("logs"),pingap_bin:root.join("pingap"),..Default::default()};
+            let runtime_root=crate::proxy::compiler::runtime_root(&args.log_dir);
+            let saved_spec=std::env::var_os("APP_CLI_SPEC_DIR");
+            let saved_pg=std::env::var_os("APP_CLI_REQUIRE_PG");
+            unsafe {std::env::set_var("APP_CLI_SPEC_DIR",root.join("specs"));std::env::remove_var("APP_CLI_REQUIRE_PG");}
+            let endpoint=admin_probe::AdminEndpoint{addr:admin_addr.to_string(),user:"protocol".into(),password:"protocol".into()};
+            pingap_service_spec(&args,&endpoint).write().unwrap();
+            let (lease,scope)=owner_test_context::scope(&root,&workspace);
+            let identity=scope.identity().clone();supervisor::resident::bind_owner(scope,&args).unwrap();
+            let mut graph=pingap_config::PingapConfig::default();
+            graph.servers.insert("fixture".into(),pingap_config::ServerConf{addr:format!("{entry_addr},{second_addr}"),..Default::default()});
+            let id=uuid::Uuid::new_v4().to_string();let graph=crate::proxy::compiler::fixture_publication_config(graph,&id,200).unwrap();
+            let mut outcome=crate::proxy::compiler::fixture_persist_candidate(&runtime_root,&graph,&id,200).await.unwrap();
+            outcome.business_probes.push(crate::proxy::compiler::ServiceProbeTarget{service_id:"web".into(),address:format!("127.0.0.1:{backend_port}").parse().unwrap(),path:"/".into()});
+            assert_eq!(outcome.entry_probes.len(),2);
+            let candidate=crate::proxy::publication::freeze_candidate(&runtime_root,&outcome).await.unwrap();
+            let mut servers=Vec::new();
+            let listener_hits=std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            for (listener,is_admin) in [(entry,false),(second,false),(admin,true)] {
+                let id=id.clone();let hash=outcome.expected_hash.clone();let hits=listener_hits.clone();
+                servers.push(tokio::spawn(async move {loop {
+                    let(mut stream,_)=listener.accept().await.unwrap();let mut bytes=vec![0;4096];let count=stream.read(&mut bytes).await.unwrap();
+                    let request=String::from_utf8_lossy(&bytes[..count]);
+                    let (body,extra)=if is_admin {
+                        assert!(request.starts_with("GET /api/basic "));assert!(!request.contains("apply-status"));
+                        assert!(request.to_ascii_lowercase().contains("authorization:"));
+                        (serde_json::json!({"pid":"42","config_hash":hash,"version":"0.15.0"}).to_string(),String::new())
+                    }else{assert!(request.starts_with(&format!("GET /_pub/{id} ")));hits.fetch_add(1,std::sync::atomic::Ordering::SeqCst);(id.clone(),format!("X-Rcoder-Publication: {id}\r\n"))};
+                    stream.write_all(format!("HTTP/1.1 200 OK\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                }}));
             }
-            let outcome = crate::proxy::compiler::compile_and_validate(
-                &workspace,
-                &runtime_root,
-                &args.pingap_bin,
-                &release,
-                false,
-            )
-            .await
-            .unwrap();
-            let active = crate::proxy::compiler::active_config_path(&runtime_root);
-            ServiceSpecFile {
-                release_id: crate::svc_spec::RESIDENT_SPEC_ID.into(),
-                service_id: "pingap".into(),
-                cwd: "/".into(),
-                argv: vec![
-                    args.pingap_bin.to_string_lossy().into_owned(),
-                    "-c".into(),
-                    active.to_string_lossy().into_owned(),
-                    "--autoreload".into(),
-                ],
-                env: std::collections::BTreeMap::from([
-                    ("PINGAP_ADMIN_ADDR".into(), admin_address.to_string()),
-                    ("PINGAP_ADMIN_USER".into(), "protocol".into()),
-                    ("PINGAP_ADMIN_PASSWORD".into(), "protocol-password".into()),
-                ]),
-                port: None,
-            }
-            .write()
-            .unwrap();
-            let (lease, scope) = owner_test_context::scope(&root, &workspace);
-            let identity = scope.identity().clone();
-            supervisor::resident::bind_owner(scope, &args).unwrap();
-            let report = crate::proxy::apply_status::ApplyStatus {
-                schema_version: 1,
-                process_id: std::process::id(),
-                process_instance_id: uuid::Uuid::new_v4().to_string(),
-                applied: Some(crate::proxy::apply_status::AppliedPublication {
-                    attempt_id: 1,
-                    operation_id: Some(outcome.publication_id.clone()),
-                    config_hash: outcome.expected_hash.clone(),
-                    config_digest: outcome.config_digest.clone(),
-                    applied_at_unix_ms: 1,
-                }),
-                last_attempt: None,
-            };
-            assert_eq!(outcome.entry_probes.len(), 2, "both the public and secondary listeners must be verified");
-            assert!(outcome.entry_probes.iter().any(|target| target.address == "127.0.0.1:9080".parse().unwrap()));
-            assert!(outcome.entry_probes.iter().any(|target| target.address == secondary_address));
-            assert!(!outcome.business_probes.is_empty(), "the real static backend remains part of serving confirmation");
-            let mut http_servers = Vec::new();
-            for (listener, is_admin) in [(public, false), (secondary, false), (admin, true)] {
-                let publication = outcome.publication_id.clone();
-                let report = report.clone();
-                http_servers.push(tokio::spawn(async move {
-                    loop {
-                        let (mut stream, _) = listener.accept().await.unwrap();
-                        let mut header = Vec::new();
-                        while !header.ends_with(b"\r\n\r\n") { header.push(stream.read_u8().await.unwrap()); }
-                        let request = String::from_utf8(header).unwrap();
-                        let (body, extra) = if is_admin {
-                            assert!(request.starts_with("GET /api/apply-status "));
-                            let authorization = request.lines().find_map(|line| {
-                                let (name, value) = line.split_once(':')?;
-                                name.eq_ignore_ascii_case("authorization").then(|| value.trim())
-                            }).unwrap();
-                            let (_, timestamp) = authorization.rsplit_once(':').unwrap();
-                            let timestamp: u64 = timestamp.parse().unwrap();
-                            assert_eq!(authorization, admin_probe::authorization_header("protocol", "protocol-password", timestamp));
-                            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-                            assert!(now.abs_diff(timestamp) <= 60, "admin authentication timestamp is stale");
-                            (serde_json::to_string(&report).unwrap(), String::new())
-                        } else {
-                            assert!(request.starts_with(&format!("GET /_pub/{publication} ")));
-                            (publication.clone(), format!("X-Rcoder-Publication: {publication}\r\n"))
-                        };
-                        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
-                    }
-                }));
-            }
-            let socket = root.join("rpc.sock");
-            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-            let pid = std::process::id();
-            let supervisor_server = tokio::spawn(async move {
-                for method in [
-                    "getAllProcessInfo",
-                    "getAllProcessInfo",
-                    "reloadConfig",
-                    "getAllProcessInfo",
-                    "addProcessGroup",
-                    "startProcess",
-                    "getProcessInfo",
-                    "getProcessInfo",
-                ] {
-                    let (mut stream, _) = listener.accept().await.unwrap();
-                    let mut header = Vec::new();
-                    while !header.ends_with(b"\r\n\r\n") {
-                        header.push(stream.read_u8().await.unwrap());
-                    }
-                    let header = String::from_utf8(header).unwrap();
-                    let size: usize = header
-                        .lines()
-                        .find_map(|line| line.strip_prefix("Content-Length: "))
-                        .unwrap()
-                        .parse()
-                        .unwrap();
-                    let mut bytes = vec![0; size];
-                    stream.read_exact(&mut bytes).await.unwrap();
-                    let request = String::from_utf8(bytes).unwrap();
-                    assert!(
-                        request.contains(&format!("<methodName>supervisor.{method}</methodName>")),
-                        "{request}"
-                    );
-                    let value=match method {
-                        "getAllProcessInfo"=>"<array><data></data></array>".to_string(),
-                        "reloadConfig"=>"<array><data><value><array><data><value><array><data><value><string>app-pingap</string></value></data></array></value><value><array><data></data></array></value><value><array><data></data></array></value></data></array></value></data></array>".into(),
-                        "getProcessInfo"=>format!(r#"<struct><member><name>group</name><value><string>app-pingap</string></value></member><member><name>name</name><value><string>app-pingap</string></value></member><member><name>statename</name><value><string>RUNNING</string></value></member><member><name>state</name><value><int>20</int></value></member><member><name>pid</name><value><int>{pid}</int></value></member><member><name>start</name><value><int>123</int></value></member></struct>"#),
-                        _=>"<boolean>1</boolean>".into(),
-                    };
-                    let body = format!(
-                        "<methodResponse><params><param><value>{value}</value></param></params></methodResponse>"
-                    );
-                    stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
-                }
-            });
-            let host = SupervisordHost::protocol_fixture(socket, root.join("dynamic.conf"));
-            let status = RuntimeStatusService::default();
-            host.orchestrate(
-                &args,
-                &release,
-                &status,
-                supervisor::RunProfile {
-                    run_migrations: false,
-                    dev_profile: false,
-                    pg: None,
-                    prepared_proxy: Some(supervisor::PreparedProxy {
-                        workspace: workspace.clone(),
-                        release: release.clone(),
-                        dev_profile: false,
-                        outcome: outcome.clone(),
-                    }),
-                },
-                &tokio_util::sync::CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-            supervisor_server.await.unwrap();
-            assert!(status.is_ready());
-            assert!(
-                !crate::proxy::compiler::publication_uncertain(),
-                "receipt JSON writes must not invalidate an already Applied publication"
-            );
-            let (confirmed, receipt) = crate::proxy::compiler::confirmed_publication().unwrap();
-            assert_eq!(confirmed.publication_id, outcome.publication_id);
-            assert_eq!(receipt.process_id, pid);
-            let owner_receipt = read_resident_engine_receipt(&runtime_root)
-                .unwrap()
-                .unwrap();
-            assert_eq!(owner_receipt.identity, identity);
-            assert_eq!(owner_receipt.process.unwrap().pid, i64::from(pid));
-            assert_eq!(
-                std::fs::read(&active).unwrap(),
-                std::fs::read(&outcome.config_path).unwrap()
-            );
-            assert!(host.resident_conf_path().unwrap().exists());
-            let body = reqwest::get(format!("http://127.0.0.1:{backend_port}/"))
-                .await
-                .unwrap()
-                .text()
-                .await
-                .unwrap();
-            assert_eq!(body, "real static backend");
-            crate::static_hosting::reconcile(&[], &workspace, false)
-                .await
-                .unwrap();
-            supervisor::resident::shutdown().await.unwrap();
-            drop(lease);
-            for server in http_servers { server.abort(); let _ = server.await; }
-            owner_test_context::restore_spec_env(saved_spec);
-            unsafe {
-                match saved_pg {
-                    Some(value) => std::env::set_var("APP_CLI_REQUIRE_PG", value),
-                    None => std::env::remove_var("APP_CLI_REQUIRE_PG"),
+            let socket=root.join("supervisor.sock");let listener=tokio::net::UnixListener::bind(&socket).unwrap();
+            let calls=std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));let seen=calls.clone();
+            let process_start=std::sync::Arc::new(std::sync::atomic::AtomicI64::new(123));let rpc_start=process_start.clone();
+            let rpc=tokio::spawn(async move {let mut state="NONE";loop {
+                let(mut stream,_)=listener.accept().await.unwrap();let mut header=Vec::new();while !header.ends_with(b"\r\n\r\n"){header.push(stream.read_u8().await.unwrap());}
+                let header=String::from_utf8(header).unwrap();let size:usize=header.lines().find_map(|line|line.strip_prefix("Content-Length: ")).unwrap().parse().unwrap();
+                let mut bytes=vec![0;size];stream.read_exact(&mut bytes).await.unwrap();let request=String::from_utf8(bytes).unwrap();
+                let method=request.split("<methodName>supervisor.").nth(1).unwrap().split("</methodName>").next().unwrap().to_string();seen.lock().unwrap().push(method.clone());
+                let observed_start=rpc_start.load(std::sync::atomic::Ordering::SeqCst);
+                let row=format!(r#"<struct><member><name>group</name><value><string>app-pingap</string></value></member><member><name>name</name><value><string>app-pingap</string></value></member><member><name>statename</name><value><string>{state}</string></value></member><member><name>state</name><value><int>{}</int></value></member><member><name>pid</name><value><int>{}</int></value></member><member><name>start</name><value><int>{observed_start}</int></value></member></struct>"#,if state=="RUNNING"{20}else{0},if state=="RUNNING"{42}else{0});
+                let value=match method.as_str(){
+                    "getAllProcessInfo" if state=="NONE"=>"<array><data></data></array>".to_string(),
+                    "getAllProcessInfo"=>format!("<array><data><value>{row}</value></data></array>"),
+                    "getProcessInfo"=>row,
+                    "reloadConfig"=>"<array><data><value><array><data><value><array><data></data></array></value><value><array><data></data></array></value><value><array><data></data></array></value></data></array></value></data></array>".to_string(),
+                    "addProcessGroup"=>{state="STOPPED";"<boolean>1</boolean>".into()},
+                    "startProcess"=>{state="RUNNING";"<boolean>1</boolean>".into()},
+                    "stopProcessGroup"=>{state="STOPPED";"<boolean>1</boolean>".into()},
+                    "removeProcessGroup"=>{state="NONE";"<boolean>1</boolean>".into()},
+                    other=>panic!("unexpected supervisor mutation {other}"),
                 };
-                match saved_runtime {
-                    Some(value) => std::env::set_var("APP_CLI_PINGAP_RUNTIME_DIR", value),
-                    None => std::env::remove_var("APP_CLI_PINGAP_RUNTIME_DIR"),
+                let body=format!("<methodResponse><params><param><value>{value}</value></param></params></methodResponse>");
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }});
+            let mut host=SupervisordHost::protocol_fixture(socket,root.join("dynamic.conf"));
+            let launch_argv=vec![args.pingap_bin.to_string_lossy().into_owned(),"-c".into(),candidate.config_path.to_string_lossy().into_owned()];
+            host.fixture_argv=Some(std::sync::Arc::new(move|pid|{anyhow::ensure!(pid==42,"controlled foreign PID");Ok(launch_argv.clone())}));
+            let status=RuntimeStatusService::default();
+            host.orchestrate(&args,&release,&status,supervisor::RunProfile{run_migrations:false,dev_profile:false,pg:None,prepared_proxy:Some(supervisor::PreparedProxy{workspace:workspace.clone(),release:release.clone(),dev_profile:false,outcome:outcome.clone()})},&tokio_util::sync::CancellationToken::new()).await.unwrap();
+            assert!(status.is_ready());assert!(listener_hits.load(std::sync::atomic::Ordering::SeqCst)>=2);
+            let operations=calls.lock().unwrap().clone();assert_eq!(operations.iter().filter(|method|*method=="startProcess").count(),1);
+            assert!(!operations.iter().any(|method|method.contains("app-svc-")));
+            let (_,confirmed)=crate::proxy::compiler::confirmed_publication().unwrap();assert_eq!(confirmed.publication_id,id);assert_eq!(confirmed.process_id,42);
+            let receipt=read_resident_engine_receipt(&runtime_root).unwrap().unwrap();assert_eq!(receipt.identity,identity);assert_eq!(receipt.process.unwrap().pid,42);
+            // Same PID with a new supervisor start timestamp is a new physical
+            // incarnation. Reconfirm it without using PID as kill authority.
+            let (frozen,old_confirmation)=crate::proxy::compiler::confirmed_publication().unwrap();
+            process_start.store(456,std::sync::atomic::Ordering::SeqCst);
+            host.reconcile_official_incarnation(&runtime_root,&frozen,&old_confirmation,tokio::time::Instant::now()+std::time::Duration::from_secs(5)).await.unwrap();
+            let (_,reconfirmed)=crate::proxy::compiler::confirmed_publication().unwrap();
+            assert_ne!(reconfirmed.instance_id,old_confirmation.instance_id);
+            assert_eq!(read_resident_engine_receipt(&runtime_root).unwrap().unwrap().process.unwrap().started,456);
+            assert_eq!(calls.lock().unwrap().iter().filter(|method|*method=="startProcess").count(),1,"reconfirmation must not respawn or stop an observed managed instance");
+            assert!(!crate::proxy::compiler::publication_uncertain());
+            assert_eq!(std::fs::read(crate::proxy::compiler::active_config_path(&runtime_root)).unwrap(),std::fs::read(&outcome.config_path).unwrap());
+            let body=reqwest::get(format!("http://127.0.0.1:{backend_port}/")).await.unwrap().text().await.unwrap();assert_eq!(body,"real static backend");
+            crate::static_hosting::reconcile(&[],&workspace,false).await.unwrap();supervisor::resident::shutdown().await.unwrap();drop(lease);
+            for server in servers{server.abort();}rpc.abort();owner_test_context::restore_spec_env(saved_spec);
+            unsafe {match saved_pg{Some(value)=>std::env::set_var("APP_CLI_REQUIRE_PG",value),None=>std::env::remove_var("APP_CLI_REQUIRE_PG")};}
+        });
+    }
+}
+
+#[cfg(test)]
+mod official_proxy_only_stop_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_replacement_withdraws_only_proxy_fragment_and_preserves_business_specs() {
+        let _guard = crate::svc_spec::SPEC_ENV_LOCK.lock().unwrap();
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            use tokio::io::{AsyncReadExt,AsyncWriteExt};
+            let temporary=tempfile::tempdir().unwrap();let root=temporary.path().canonicalize().unwrap();
+            let saved=std::env::var_os("APP_CLI_SPEC_DIR");unsafe{std::env::set_var("APP_CLI_SPEC_DIR",root.join("specs"));}
+            let config=root.join("runtime/official-snapshots/config.toml");std::fs::create_dir_all(config.parent().unwrap()).unwrap();std::fs::write(&config,b"old graph").unwrap();
+            ServiceSpecFile{release_id:crate::svc_spec::RESIDENT_SPEC_ID.into(),service_id:"pingap".into(),cwd:"/".into(),
+                argv:vec!["/usr/bin/pingap".into(),"-c".into(),config.to_string_lossy().into_owned()],
+                env:std::collections::BTreeMap::from([("PINGAP_ADMIN_ADDR".into(),"127.0.0.1:19086".into()),("PINGAP_ADMIN_USER".into(),"fixture".into()),("PINGAP_ADMIN_PASSWORD".into(),"fixture".into())]),port:None}.write().unwrap();
+            let conf=root.join("dynamic.conf");let business="[program:app-svc-web]\ncommand=/usr/bin/app-cli run-service release web\nautorestart=true\n";
+            std::fs::write(&conf,format!("{business}[program:app-pingap]\ncommand=/usr/bin/app-cli run-service resident pingap\n")).unwrap();
+            let business_spec=root.join("business-spec.toml");std::fs::write(&business_spec,b"business sentinel").unwrap();
+            let socket=root.join("supervisor.sock");let listener=tokio::net::UnixListener::bind(&socket).unwrap();
+            let server=tokio::spawn(async move {let mut present=true;for expected in ["getAllProcessInfo","reloadConfig","stopProcessGroup","removeProcessGroup","getAllProcessInfo"] {
+                let(mut stream,_)=listener.accept().await.unwrap();let mut header=Vec::new();while !header.ends_with(b"\r\n\r\n"){header.push(stream.read_u8().await.unwrap());}
+                let header=String::from_utf8(header).unwrap();let length:usize=header.lines().find_map(|line|line.strip_prefix("Content-Length: ")).unwrap().parse().unwrap();let mut bytes=vec![0;length];stream.read_exact(&mut bytes).await.unwrap();let request=String::from_utf8(bytes).unwrap();
+                assert!(request.contains(&format!("<methodName>supervisor.{expected}</methodName>")),"{request}");assert!(!request.contains("app-svc-web"));
+                let value=match expected {
+                    "getAllProcessInfo" if present=>r#"<array><data><value><struct><member><name>group</name><value><string>app-pingap</string></value></member><member><name>name</name><value><string>app-pingap</string></value></member><member><name>statename</name><value><string>STOPPED</string></value></member><member><name>state</name><value><int>0</int></value></member></struct></value></data></array>"#,
+                    "getAllProcessInfo"=>"<array><data></data></array>",
+                    "reloadConfig"=>"<array><data><value><array><data><value><array><data></data></array></value><value><array><data></data></array></value><value><array><data></data></array></value></data></array></value></data></array>",
+                    "removeProcessGroup"=>{present=false;"<boolean>1</boolean>"},
+                    _=>"<boolean>1</boolean>",
                 };
-            }
+                let body=format!("<methodResponse><params><param><value>{value}</value></param></params></methodResponse>");stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }});
+            let host=SupervisordHost::protocol_fixture(socket,conf.clone());host.close_entry().await.unwrap();server.await.unwrap();
+            assert_eq!(std::fs::read_to_string(&conf).unwrap(),business);
+            assert_eq!(std::fs::read(&business_spec).unwrap(),b"business sentinel");assert_eq!(std::fs::read(&config).unwrap(),b"old graph");
+            assert_eq!(std::fs::read_to_string(root.join(RESIDENT_CONF_FILE)).unwrap(),"# official proxy stopped\n");
+            owner_test_context::restore_spec_env(saved);
         });
     }
 }

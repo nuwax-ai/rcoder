@@ -4,8 +4,9 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Response;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use shared_types::{ProxyConfirmation, ProxyPhase, ProxyReloadOperation, ProxyReloadState};
 
 use crate::proxy::admin_probe;
 use crate::proxy::compiler::{CompileOutcome, compile_and_validate};
@@ -26,20 +27,48 @@ pub(super) struct ProxyValidateData {
 }
 
 /// `POST /v1/proxy/reload` 响应 data。
-#[derive(Serialize, utoipa::ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, utoipa::ToSchema)]
 pub(super) struct ProxyReloadData {
     /// 是否已写入生效配置
     pub reloaded: bool,
-    /// 完整 Applied 回执、进程身份和各监听 HTTP 标记均已确认
+    /// Deprecated: official runtime does not issue private Applied evidence.
+    #[schema(deprecated)]
     pub verified: bool,
     pub publication_id: String,
+    /// Deprecated: official runtime returns an empty string; use confirmation.
+    #[schema(deprecated)]
     pub process_instance_id: String,
     /// 生效配置内容 hash
     pub config_hash: String,
+    /// SHA256 of the complete immutable candidate graph.
+    pub config_digest: String,
     /// 当前部署代标识（boot_id）
     pub release_id: String,
     /// 生效配置落盘路径
     pub effective_config_path: String,
+    pub operation_id: String,
+    pub state: ProxyReloadState,
+    pub replayed: bool,
+    pub confirmation: Option<ProxyConfirmation>,
+}
+
+impl ProxyReloadData {
+    pub(super) fn pending(operation: &ProxyReloadOperation) -> Self {
+        Self {
+            reloaded: false,
+            verified: false,
+            publication_id: String::new(),
+            process_instance_id: String::new(),
+            config_hash: String::new(),
+            config_digest: String::new(),
+            release_id: String::new(),
+            effective_config_path: String::new(),
+            operation_id: operation.operation_id.clone(),
+            state: operation.state,
+            replayed: false,
+            confirmation: None,
+        }
+    }
 }
 
 /// `GET /v1/proxy/status` 响应 data。
@@ -51,7 +80,8 @@ pub(super) struct ProxyStatusData {
     pub mode: String,
     /// 生效配置文件是否已落盘
     pub configured: bool,
-    /// Confirmed complete graph for this process and publication (including standby).
+    /// Deprecated: official runtime does not provide private Applied evidence.
+    #[schema(deprecated)]
     pub applied: bool,
     pub publication_id: Option<String>,
     /// 生效配置落盘路径
@@ -60,6 +90,10 @@ pub(super) struct ProxyStatusData {
     pub pingap_version: Option<String>,
     /// pingap commit（idle 态为 null）
     pub pingap_commit: Option<String>,
+    /// Confirmation owned by app-cli and rechecked over official HTTP APIs.
+    pub confirmation: Option<ProxyConfirmation>,
+    /// Requested reload identity, including terminal results.
+    pub operation: Option<ProxyReloadOperation>,
 }
 
 /// upstream 条目（`GET /v1/proxy/upstreams` data）。
@@ -102,7 +136,8 @@ pub(super) async fn validate(
     }
     // Validation only creates an immutable candidate; it never changes active.
     // The auxiliary gate freezes the orchestration profile during compilation.
-    let mut writer = match state.server.begin_auxiliary_write() {
+    let validation_id = uuid::Uuid::new_v4().to_string();
+    let mut writer = match state.server.begin_proxy_write(&validation_id).await {
         Ok(writer) => writer,
         Err(error) => return proxy_error(error),
     };
@@ -123,11 +158,17 @@ pub(super) async fn validate(
 #[utoipa::path(
     post,
     path = "/v1/proxy/reload",
-    params(("x-deploy-token" = Option<String>, Header, description = "Required when the runtime control token is configured")),
+    params(
+        ("x-deploy-token" = Option<String>, Header, description = "Required when the runtime control token is configured"),
+        ("X-Request-ID" = Option<String>, Header, description = "1..128 printable ASCII characters; repeat the same ID to replay its frozen request and result")
+    ),
     responses(
         (status = 403, description = "Runtime control token missing or invalid"),
-        (status = 200, body = HttpResult<ProxyReloadData>, description = "Active config updated; complete Applied graph, process identity and listener HTTP markers confirmed"),
-        (status = 400, body = HttpResult<String>, description = "Compile failed or reload verification timed out (rolled back to previous config)")
+        (status = 200, body = HttpResult<ProxyReloadData>, description = "Official proxy process replacement and HTTP verification succeeded, or original successful result replayed"),
+        (status = 202, body = HttpResult<ProxyReloadData>, description = "Same reload request remains in progress"),
+        (status = 400, body = HttpResult<ProxyReloadOperation>, description = "Candidate validation or replacement failed; data preserves this request identity"),
+        (status = 409, body = HttpResult<ProxyReloadOperation>, description = "Different request metadata or an active writer prevents admission; no queue"),
+        (status = 503, body = HttpResult<ProxyReloadOperation>, description = "Cleanup or reload outcome remains unconfirmed")
     ),
     tag = "Runtime Proxy"
 )]
@@ -140,92 +181,261 @@ pub(super) async fn reload(
     {
         return envelope::error(StatusCode::FORBIDDEN, "DEPLOY_FORBIDDEN", message);
     }
-    // 初始化恢复期拒绝运行态变更（P1-01：pingap 配置重载与启动恢复竞争）。
-    if state.server.initializing() {
-        return proxy_error(anyhow::anyhow!(
-            "runtime state changes are rejected until startup recovery completes"
-        ));
-    }
-    // admin 探测未注册（supervisor 尚未启动 pingap）时显式报错，绝不静默跳过确认。
-    let Some(endpoint) = admin_probe::admin_endpoint() else {
-        return proxy_error(anyhow::anyhow!(
-            "pingap admin probe not initialized; supervisor has not started pingap"
-        ));
-    };
-
-    let mut writer = match state.server.begin_auxiliary_write() {
-        Ok(writer) => writer,
+    let id = match super::proxy_reload::request_id(&headers) {
+        Ok(id) => id,
         Err(error) => return proxy_error(error),
     };
-    let target = effective_path(&state);
-    let outcome = match compile(&state).await {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            writer.confirm();
-            return proxy_error(error);
-        }
-    };
-    let candidate = match tokio::fs::read_to_string(&outcome.config_path).await {
-        Ok(content) => content,
-        Err(error) => {
-            writer.confirm();
-            return proxy_error(error.into());
-        }
-    };
-    if let Err(error) = crate::proxy::compiler::validate_hot_reload_compatible(&target, &candidate)
-    {
-        writer.confirm();
-        return proxy_error(error);
+    if state.server.initializing() {
+        return reload_rejection(
+            &id,
+            StatusCode::BAD_REQUEST,
+            "PINGAP_CONFIG_INVALID",
+            &anyhow::anyhow!("runtime state changes are rejected until startup recovery completes"),
+        );
     }
+    let metadata = match super::proxy_reload::RequestMetadata::capture(&state) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return reload_rejection(
+                &id,
+                StatusCode::BAD_REQUEST,
+                "PINGAP_CONFIG_INVALID",
+                &error,
+            );
+        }
+    };
+    let journal = super::proxy_reload::root(&state);
+    match super::proxy_reload::read(&journal, &id) {
+        Ok(Some(record)) => {
+            if let Err(error) = record.check_metadata(&metadata) {
+                return reload_rejection(
+                    &id,
+                    StatusCode::CONFLICT,
+                    "ERR_OPERATION_ID_CONFLICT",
+                    &error,
+                );
+            }
+            return record.response(&state, true);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return reload_rejection(
+                &id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ERR_RECOVERY_REQUIRED",
+                &error,
+            );
+        }
+    }
+    let gate = match super::proxy_reload::gate() {
+        Ok(gate) => gate,
+        Err(error) => {
+            return reload_rejection(
+                &id,
+                StatusCode::CONFLICT,
+                "ERR_OPERATION_IN_PROGRESS",
+                &error,
+            );
+        }
+    };
+    // Recheck after taking the nonqueueing gate: a concurrent same-ID request
+    // may have completed between the read and this admission boundary.
+    match super::proxy_reload::read(&journal, &id) {
+        Ok(Some(record)) => {
+            if let Err(error) = record.check_metadata(&metadata) {
+                return reload_rejection(
+                    &id,
+                    StatusCode::CONFLICT,
+                    "ERR_OPERATION_ID_CONFLICT",
+                    &error,
+                );
+            }
+            return record.response(&state, true);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return reload_rejection(
+                &id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ERR_RECOVERY_REQUIRED",
+                &error,
+            );
+        }
+    }
+    let response_id = id.clone();
+    let task = process_utils::command_context::spawn_scoped(async move {
+        let _gate = gate;
+        execute_reload(state, id, metadata).await
+    });
+    // Dropping an HTTP handler only detaches this owned task. An already sent
+    // supervisord write must still settle before its gate or owner is released.
+    match task.await {
+        Ok(response) => response,
+        Err(error) => reload_rejection(
+            &response_id,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ERR_RECOVERY_REQUIRED",
+            &anyhow::Error::new(error),
+        ),
+    }
+}
+
+async fn execute_reload(
+    state: AppState,
+    id: String,
+    metadata: super::proxy_reload::RequestMetadata,
+) -> Response {
+    if state.server.current_runtime_operation().is_some() {
+        return reload_rejection(
+            &id,
+            StatusCode::CONFLICT,
+            "ERR_OPERATION_IN_PROGRESS",
+            &anyhow::anyhow!("a business runtime operation is in progress"),
+        );
+    }
+    let mut writer = match state.server.begin_proxy_write(&id).await {
+        Ok(writer) => writer,
+        Err(error) => {
+            return reload_rejection(
+                &id,
+                StatusCode::CONFLICT,
+                "ERR_OPERATION_IN_PROGRESS",
+                &error,
+            );
+        }
+    };
+    match super::proxy_reload::RequestMetadata::capture(&state) {
+        Ok(actual) if actual == metadata => {}
+        Ok(_) => {
+            writer.confirm();
+            return reload_rejection(
+                &id,
+                StatusCode::CONFLICT,
+                "ERR_OPERATION_ID_CONFLICT",
+                &anyhow::anyhow!("proxy profile changed before admission"),
+            );
+        }
+        Err(error) => {
+            writer.confirm();
+            return reload_rejection(
+                &id,
+                StatusCode::BAD_REQUEST,
+                "PINGAP_CONFIG_INVALID",
+                &error,
+            );
+        }
+    }
+    let mut claim = match super::proxy_reload::Claim::admit(&state, id.clone(), metadata.clone()) {
+        Ok(claim) => claim,
+        Err(error) => {
+            // Admission and head persistence happen before any proxy command.
+            // A head-write failure may already have a truthful Failed record;
+            // replay that exact result instead of inventing unknown physics.
+            writer.confirm();
+            if let Ok(Some(record)) =
+                super::proxy_reload::read(&super::proxy_reload::root(&state), &id)
+                && record.check_metadata(&metadata).is_ok()
+                && record.operation.state == ProxyReloadState::Failed
+            {
+                return record.response(&state, false);
+            }
+            return reload_rejection(
+                &id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ERR_RECOVERY_REQUIRED",
+                &error,
+            );
+        }
+    };
+    let target = effective_path(&state);
     let result = async {
+        let mut outcome = compile(&state).await?;
+        anyhow::ensure!(
+            !writer.cancellation().is_cancelled(),
+            "proxy reload cancelled before runtime dispatch"
+        );
+        anyhow::ensure!(
+            super::proxy_reload::RequestMetadata::capture(&state)? == metadata,
+            "proxy reload profile or deployment identity changed during preparation"
+        );
+        outcome.operation_id = Some(id.clone());
+        let mut data = ProxyReloadData {
+            reloaded: false,
+            verified: false,
+            config_hash: outcome.expected_hash.clone(),
+            config_digest: outcome.config_digest.clone(),
+            publication_id: outcome.publication_id.clone(),
+            process_instance_id: String::new(),
+            release_id: state.server.boot_id(),
+            effective_config_path: target.to_string_lossy().into_owned(),
+            operation_id: id.clone(),
+            state: ProxyReloadState::Running,
+            replayed: false,
+            confirmation: None,
+        };
+        claim.running(data.clone())?;
         if let Some(host) = crate::supervisord_host::SupervisordHost::from_env().await? {
-            let previous = admin_probe::fetch_apply_status(endpoint)
-                .await?
-                .current_publication()?;
-            host.verify_entry_confirmation(&previous).await?;
-            let confirmed = crate::proxy::compiler::publish_confirmed(
+            host.replace_official_with_cancel(
                 &crate::proxy::compiler::runtime_root(&state.log_dir),
-                &target,
                 &outcome,
-                endpoint,
+                tokio::time::Instant::now() + admin_probe::CONFIRM_BUDGET,
+                Some(&writer.cancellation()),
             )
             .await?;
-            host.verify_entry_confirmation(&confirmed)
-                .await
-                .map_err(|error| {
-                    anyhow::Error::from(crate::supervisor::ShutdownUnconfirmed(format!(
-                        "proxy physical identity became unknown after reload: {error:#}"
-                    )))
-                })?;
-            Ok(confirmed)
         } else {
-            crate::supervisor::resident::reload(&outcome).await
+            crate::supervisor::resident::reload_with_cancel(&outcome, &writer.cancellation())
+                .await?;
         }
+        anyhow::ensure!(
+            !writer.cancellation().is_cancelled(),
+            "proxy reload cancelled before success publication"
+        );
+        anyhow::ensure!(
+            super::proxy_reload::RequestMetadata::capture(&state)? == metadata,
+            "proxy reload profile or deployment identity changed before success publication"
+        );
+        data.reloaded = true;
+        data.state = ProxyReloadState::Succeeded;
+        data.confirmation = crate::proxy::compiler::official_confirmation();
+        anyhow::ensure!(
+            data.confirmation
+                .as_ref()
+                .is_some_and(|confirmation| confirmation.confirmed
+                    && confirmation.operation_id == id
+                    && confirmation.config_digest.as_deref()
+                        == Some(outcome.config_digest.as_str())),
+            "official reload completion belongs to another operation"
+        );
+        Ok::<_, anyhow::Error>(data)
     }
     .await;
     match result {
-        Ok(confirmed) => {
+        Ok(data) => {
+            if let Err(error) = claim.succeeded(data.clone()) {
+                return reload_rejection(
+                    &id,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ERR_RECOVERY_REQUIRED",
+                    &error,
+                );
+            }
             writer.confirm();
-            envelope::ok(
-                StatusCode::OK,
-                ProxyReloadData {
-                    reloaded: true,
-                    verified: true,
-                    config_hash: outcome.expected_hash,
-                    publication_id: confirmed.publication_id,
-                    process_instance_id: confirmed.instance_id,
-                    release_id: state.server.boot_id(),
-                    effective_config_path: target.to_string_lossy().into_owned(),
-                },
-            )
+            envelope::ok(StatusCode::OK, data)
         }
         Err(error) => {
-            // A confirmed rollback is an ordinary failed request. Unknown
-            // physical/application outcome retains the existing writer fence.
-            if !error.is::<crate::supervisor::ShutdownUnconfirmed>() {
+            let unconfirmed = error.is::<crate::supervisor::ShutdownUnconfirmed>();
+            if let Err(persistence) = claim.failed(&error, unconfirmed) {
+                return reload_rejection(
+                    &id,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ERR_RECOVERY_REQUIRED",
+                    &persistence.context(format!("reload failed: {error:#}")),
+                );
+            }
+            if !unconfirmed {
                 writer.confirm();
             }
-            proxy_error(error)
+            claim.record.response(&state, false)
         }
     }
 }
@@ -233,10 +443,18 @@ pub(super) async fn reload(
 #[utoipa::path(
     get,
     path = "/v1/proxy/status",
-    responses((status = 200, body = HttpResult<ProxyStatusData>, description = "Proxy release and effective config status")),
+    params(("X-Request-ID" = Option<String>, Header, description = "Read one reload operation including its original terminal result")),
+    responses(
+        (status = 200, body = HttpResult<ProxyStatusData>, description = "Proxy release, official confirmation and optional reload operation"),
+        (status = 400, body = HttpResult<String>, description = "Invalid request identity or configuration observation"),
+        (status = 503, body = HttpResult<ProxyReloadOperation>, description = "Requested reload evidence is unreadable or inconsistent")
+    ),
     tag = "Runtime Proxy"
 )]
-pub(super) async fn status(State(state): State<AppState>) -> Response {
+pub(super) async fn status(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     let path = effective_path(&state);
     let configured = match tokio::fs::metadata(&path).await {
         Ok(metadata) => metadata.is_file(),
@@ -248,40 +466,60 @@ pub(super) async fn status(State(state): State<AppState>) -> Response {
         }
     };
     let expected = crate::proxy::compiler::confirmed_publication();
-    let applied = !crate::proxy::compiler::publication_uncertain()
-        && match (&expected, admin_probe::admin_endpoint()) {
-            (Some((outcome, receipt)), Some(endpoint)) => admin_probe::wait_for_publication(
-                endpoint,
-                outcome,
-                std::time::Duration::from_secs(3),
-            )
-            .await
-            .is_ok_and(|actual| {
-                actual.process_id == receipt.process_id && actual.instance_id == receipt.instance_id
-            }),
-            _ => false,
-        };
+    let confirmation = checked_confirmation(&expected).await;
+    let requested_id = match super::proxy_reload::requested_id(&headers) {
+        Ok(Some(id)) => Some(id),
+        Ok(None) => match super::proxy_reload::current_id(&state) {
+            Ok(id) => id,
+            Err(error) => {
+                return envelope::error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ERR_RECOVERY_REQUIRED",
+                    format!("{error:#}"),
+                );
+            }
+        },
+        Err(error) => return proxy_error(error),
+    };
+    let operation = match requested_id {
+        Some(id) => match super::proxy_reload::read(&super::proxy_reload::root(&state), &id) {
+            Ok(record) => record.map(|record| record.observed_operation(&state)),
+            Err(error) => {
+                return reload_rejection(
+                    &id,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ERR_RECOVERY_REQUIRED",
+                    &error,
+                );
+            }
+        },
+        None => None,
+    };
     let publication_id = expected.map(|(outcome, _)| outcome.publication_id);
     let data = match state.server.release() {
         Some(release) => ProxyStatusData {
             release_id: Some(release.release_id),
             mode: format!("{:?}", release.pingap.mode).to_ascii_lowercase(),
             configured,
-            applied,
+            applied: false,
             publication_id,
             effective_config_path: path.to_string_lossy().to_string(),
             pingap_version: Some(release.pingap.version),
             pingap_commit: Some(release.pingap.commit),
+            confirmation,
+            operation,
         },
         None => ProxyStatusData {
             release_id: None,
             mode: "idle".to_string(),
             configured,
-            applied,
+            applied: false,
             publication_id,
             effective_config_path: path.to_string_lossy().to_string(),
             pingap_version: None,
             pingap_commit: None,
+            confirmation,
+            operation,
         },
     };
     envelope::ok(StatusCode::OK, data)
@@ -366,5 +604,68 @@ fn proxy_error(error: anyhow::Error) -> Response {
         StatusCode::BAD_REQUEST,
         "PINGAP_CONFIG_INVALID",
         format!("{error:#}"),
+    )
+}
+
+async fn checked_confirmation(
+    expected: &Option<(
+        CompileOutcome,
+        crate::proxy::apply_status::ConfirmedPublication,
+    )>,
+) -> Option<ProxyConfirmation> {
+    let mut view = crate::proxy::compiler::official_confirmation()?;
+    if !view.confirmed || crate::proxy::compiler::publication_uncertain() {
+        view.confirmed = false;
+        return Some(view);
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let verified = match (expected, admin_probe::admin_endpoint()) {
+        (Some((outcome, receipt)), Some(endpoint)) => {
+            view.proxy_instance_id.as_deref() == Some(receipt.instance_id.as_str())
+                && view.config_digest.as_deref() == Some(outcome.config_digest.as_str())
+                && crate::proxy::observation::verify_physical(receipt, deadline)
+                    .await
+                    .is_ok()
+                && admin_probe::wait_for_official_publication(
+                    endpoint,
+                    outcome,
+                    receipt.process_id,
+                    &receipt.instance_id,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                )
+                .await
+                .is_ok()
+                && crate::proxy::observation::verify_physical(receipt, deadline)
+                    .await
+                    .is_ok()
+                && crate::proxy::compiler::official_confirmation().as_ref() == Some(&view)
+        }
+        (None, Some(_)) | (Some(_), None) | (None, None) => false,
+    };
+    view.confirmed = verified;
+    Some(view)
+}
+
+fn reload_rejection(id: &str, status: StatusCode, code: &str, error: &anyhow::Error) -> Response {
+    let unknown = code == "ERR_RECOVERY_REQUIRED";
+    super::proxy_reload::failure(
+        status,
+        code,
+        &format!("{error:#}"),
+        ProxyReloadOperation {
+            operation_id: id.into(),
+            state: if unknown {
+                ProxyReloadState::RecoveryRequired
+            } else {
+                ProxyReloadState::Failed
+            },
+            phase: if unknown {
+                ProxyPhase::RecoveryRequired
+            } else {
+                ProxyPhase::Failed
+            },
+            error_code: Some(code.into()),
+            error_message: Some(format!("{error:#}")),
+        },
     )
 }

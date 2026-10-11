@@ -231,10 +231,215 @@ pub(crate) async fn retire_misdirected(
     }
 }
 
+/// Upgrade only an authenticated, exactly bound local owner. A missing
+/// capability alone never grants authority to stop it or start another owner.
+pub(crate) async fn retire_unsupported_proxy(
+    state_root: &Path,
+    workspace: &Path,
+    address: &str,
+    identity: &shared_types::RuntimeIdentityView,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    tokio::time::timeout_at(deadline, async {
+        ensure!(
+            identity.service_family == "userapp-dev"
+                && identity.protocol_version == shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+            "owner is not a compatible application runtime"
+        );
+        super::owner_dispatch::verify_saved_management_identity(state_root, identity)?;
+        let token = crate::runtime_kernel::RuntimeStore::read_token(state_root)
+            .context("owner upgrade credentials are unavailable")?;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        let response = client
+            .get(format!("http://{address}/v1/runtime/status"))
+            .header("X-Deploy-Token", token)
+            .send()
+            .await?
+            .error_for_status()
+            .context("authenticate owner before protocol upgrade")?;
+        let body: shared_types::HttpResult<shared_types::RuntimeStatusView> =
+            response.json().await?;
+        // HttpResult intentionally does not populate its skipped success field
+        // on decode. Earlier runtime-control envelopes used OK, with the same
+        // versioned data contract and HTTP authentication.
+        ensure!(
+            body.code == shared_types::SUCCESS || body.code == "OK",
+            "owner upgrade status query was rejected"
+        );
+        let status = body.data.context("authenticated owner status is missing")?;
+        ensure!(
+            status.runtime_instance_id == identity.runtime_instance_id,
+            "owner changed before protocol upgrade"
+        );
+        let before = runtime_supervisor::control(
+            state_root,
+            runtime_supervisor::Request::new(runtime_supervisor::Action::Status),
+        )
+        .await?;
+        let expected = runtime_state_layout::resolve_project_origin(workspace)?;
+        let observed = runtime_state_layout::resolve_project_origin(&before.binding.resource)?;
+        ensure!(
+            before.binding.component == "app-cli"
+                && runtime_state_layout::canonical_project_root(&expected)
+                    == runtime_state_layout::canonical_project_root(&observed),
+            "native owner upgrade authority belongs to another workspace"
+        );
+        super::owner_dispatch::verify_saved_management_identity(state_root, identity)?;
+        let (captured, request) = upgrade_shutdown_request(state_root, &before)?;
+        verify_upgrade_domain(state_root, &captured, identity)?;
+        tracing::info!(runtime_instance = %identity.runtime_instance_id,
+            supervisor = %captured.supervisor_id, request_id = %request.request_id,
+            "retiring authenticated owner for official proxy restart support");
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        ensure!(
+            !remaining.is_zero(),
+            "owner upgrade deadline exceeded before Shutdown"
+        );
+        runtime_supervisor::shutdown_captured_owner(state_root, &captured, &request, remaining)
+            .await
+            .context("confirm previous owner cleanup and lock release before upgrade")
+    })
+    .await
+    .context("owner upgrade deadline exceeded; retry observes the original Shutdown")?
+}
+
+/// Domain fields are execution evidence, not deployment/migration outcomes.
+fn verify_upgrade_domain(
+    root: &Path,
+    snapshot: &runtime_supervisor::Snapshot,
+    identity: &shared_types::RuntimeIdentityView,
+) -> Result<()> {
+    let current = runtime_supervisor::domain::PhysicalDomain::from_env()?;
+    uuid::Uuid::parse_str(&snapshot.supervisor_id)
+        .context("invalid captured native owner identity")?;
+    let resident = root.join("resident").join(&snapshot.supervisor_id);
+    if resident.try_exists()? {
+        let saved = process_utils::command_authority::read_resident_identity(&resident)?;
+        ensure!(
+            saved.application_id == identity.application_id
+                && saved.owner_instance == snapshot.supervisor_id
+                && saved.binding == serde_json::to_value(&snapshot.binding)?
+                && saved.physical_domain
+                    == current.as_ref().map(serde_json::to_value).transpose()?,
+            "owner upgrade resident identity belongs to another application or physical domain"
+        );
+    }
+    if let Some(generation) = snapshot.generation.as_deref() {
+        // Generation IDs name private work directories; never follow an
+        // arbitrary path supplied by a stale discovery record.
+        uuid::Uuid::parse_str(generation).context("invalid owner upgrade generation")?;
+        let path = root.join("work").join(generation).join("generation.json");
+        #[derive(serde::Deserialize)]
+        struct ExecutionIdentity {
+            id: String,
+            physical_domain: Option<runtime_supervisor::domain::PhysicalDomain>,
+        }
+        let saved: ExecutionIdentity = serde_json::from_slice(&std::fs::read(path)?)?;
+        ensure!(
+            saved.id == generation && saved.physical_domain == current,
+            "owner upgrade execution belongs to another physical domain"
+        );
+    }
+    Ok(())
+}
+
+/// A retry must use the admitted native Shutdown identity. Its explicit
+/// expected generation preserves the original execution even after live slots
+/// become idle; no request, migration outcome or cleanup result is fabricated.
+fn upgrade_shutdown_request(
+    root: &Path,
+    snapshot: &runtime_supervisor::Snapshot,
+) -> Result<(runtime_supervisor::Snapshot, runtime_supervisor::Request)> {
+    if snapshot.intent != runtime_supervisor::Intent::Shutdown {
+        let mut request = runtime_supervisor::Request::new(runtime_supervisor::Action::Shutdown);
+        request.capture_generation(snapshot.generation.as_deref());
+        return Ok((snapshot.clone(), request));
+    }
+    let completed = if snapshot.phase == runtime_supervisor::Phase::Stopped {
+        runtime_supervisor::completed_shutdown_for(root, &snapshot.supervisor_id)?
+    } else {
+        None
+    };
+    let completed_id = completed
+        .as_ref()
+        .map(|(request, _)| request.request_id.as_str());
+    let id = snapshot
+        .operation_id
+        .as_deref()
+        .or(completed_id)
+        .context("in-progress owner Shutdown identity missing")?;
+    #[derive(serde::Deserialize)]
+    struct Ledger {
+        requests: Vec<(runtime_supervisor::Request, runtime_supervisor::Snapshot)>,
+    }
+    let ledger: Ledger = serde_json::from_slice(&std::fs::read(root.join("supervisor.json"))?)?;
+    let mut matching = ledger.requests.into_iter().filter(|(request, saved)| {
+        request.request_id == id
+            && request.action == runtime_supervisor::Action::Shutdown
+            && saved.supervisor_id == snapshot.supervisor_id
+            && saved.binding == snapshot.binding
+    });
+    let (request, _) = matching
+        .next()
+        .context("original owner Shutdown request unavailable")?;
+    ensure!(
+        matching.next().is_none(),
+        "ambiguous owner Shutdown request ledger"
+    );
+    let generation = request
+        .expected_generation
+        .as_deref()
+        .context("owner Shutdown has no exact generation condition")?;
+    let mut captured = snapshot.clone();
+    captured.generation = (!generation.is_empty()).then(|| generation.to_owned());
+    Ok((captured, request))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn upgrade_reuses_exact_shutdown_request_after_generation_slot_clears() {
+        let root = tempfile::tempdir().unwrap();
+        let generation = uuid::Uuid::new_v4().to_string();
+        let mut request = runtime_supervisor::Request::new(runtime_supervisor::Action::Shutdown);
+        request.capture_generation(Some(&generation));
+        let snapshot = runtime_supervisor::Snapshot {
+            version: 1,
+            binding: Binding {
+                component: "app-cli".into(),
+                resource: root.path().join("source"),
+            },
+            supervisor_id: uuid::Uuid::new_v4().to_string(),
+            generation: None,
+            phase: runtime_supervisor::Phase::Stopped,
+            intent: runtime_supervisor::Intent::Shutdown,
+            operation_id: None,
+            error: None,
+            problem: None,
+        };
+        let bytes = serde_json::to_vec(&json!({"version":2,"instance":snapshot.supervisor_id,
+            "address":"127.0.0.1:1", "token":"fixture", "snapshot":snapshot,
+            "requests":[[request,snapshot]]}))
+        .unwrap();
+        std::fs::write(root.path().join("supervisor.json"), &bytes).unwrap();
+        let (captured, retained) = upgrade_shutdown_request(root.path(), &snapshot).unwrap();
+        assert_eq!(retained, request);
+        assert_eq!(captured.generation.as_deref(), Some(generation.as_str()));
+        assert_eq!(
+            std::fs::read(root.path().join("supervisor.json")).unwrap(),
+            bytes
+        );
+        let mut changed = snapshot.clone();
+        changed.supervisor_id = uuid::Uuid::new_v4().to_string();
+        assert!(upgrade_shutdown_request(root.path(), &changed).is_err());
+    }
 
     #[test]
     fn malformed_binding_defers_to_native_recovery_without_hiding_foreign_authority() {

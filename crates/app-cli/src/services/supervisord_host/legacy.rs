@@ -64,7 +64,7 @@ pub(super) fn without_resident_program(content: &str) -> String {
     output
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 pub(super) fn matching_entry_spec(
     conf_path: &Path,
     argv: &[String],

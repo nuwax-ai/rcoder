@@ -11,7 +11,7 @@
   "files": [
     "app-cli.exe",
     "pingap.exe",
-    "pingap.exe.applied.json"
+    "pingap.exe.official.json"
   ],
   "license": "Apache-2.0",
   "repository": {

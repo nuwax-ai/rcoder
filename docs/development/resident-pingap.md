@@ -1,35 +1,58 @@
-# UserApp 常驻代理与配置应用
+# UserApp 官方 Pingap 与受控配置切换
 
-## 生命周期
+## 运行契约
 
-`app-cli serve/run` 的 owner 持有独立的代理执行范围。业务 Stop、源码 Restart 和热部署只切换业务代次；代理先确认 standby，再允许停止旧业务。正常 Stop 保留入口，返回可重试的 HTTP 503。owner Shutdown 必须确认代理和业务执行范围都已清理，才释放所有权。
+使用官方 Pingap 0.15.0 与精确源码 pin，不依赖私有应用协议、补丁或额外的运行时配套证明文件。
+app-cli serve/run 保持单 owner；代理、业务和管理面有独立执行范围。代理切换允许短暂 9080 不可达，
+平台按真实观察返回启动/重启中的 503 或暂时不可用提示，不重放已经发送的请求体。
 
-builtin 保存真实 Child 和不可变的已确认配置。发现该进程确实退出、旧进程树清理确认后，自动恢复最近已确认的配置；admin 超时、401 或解析错误不会授权另起代理。supervisord 按实际 RUNNING/PID/start/argv、专属配置及所有权回执核验并接续常驻组。
+## 配置预检
 
-## 配套二进制
+候选先完成官方配置与插件预检，再允许停止旧运行态。能力缓存以实际二进制 SHA256 为键：
+启动无业务监听、无用户插件的私有临时官方进程，认证读取 /api/basic，核验受管实际 worker
+PID、版本、源码提交及 supported_plugins；精确清理后才缓存。随后验证类别/引用并调用同一
+binary 的 -t。普通 app-cli validate 仍只校验项目，不新增 Pingap 进程依赖。
 
-本实现需要 Pingap 应用协议 v1，不能与未修订的官方 0.15.0 二进制混用。版本号和上游 commit 仍标识基础版本，RCoder 补丁另有 SHA256；构建及实际二进制回执记录两者。构建入口及固定来源见 [配对构建](../../tools/build/pingap-applied/README.md)。`pingap --apply-protocol-version` 必须输出 `1`；能力不满足时在停旧业务前拒绝。
+官方该 pin 的 -t 对未注册类别只警告，因此只看退出码不够。临时探测与候选 -t 均清理继承的
+控制变量；候选实际环境引用保持。所有启动、读写、等待和清理使用有界预算，失败输出具体阶段。
 
-配置摘要使用解析后的完整配置 JSON：递归按键排序后序列化，再计算 SHA256，不依赖 `serde_json` 的排序 feature。CRC32 hash 仅为一致性字段。
+## 代理生命周期
 
-## 发布、查询和失败
+builtin 与 supervisord 使用同一准备、停止、启动、HTTP 验证和提交状态机。实际进程读取不可变
+配置快照，不自动重载。app-cli 持有实例 UUID、实际进程身份和配置摘要；确认依赖前后官方
+管理观察、全部监听 HTTP 标记和声明业务 HTTP，不能用文件存在或 CRC32 hash 单独宣布可用。
 
-- 候选在 `publications/<UUID>/pingap.toml` 中校验并冻结；`validate` 不修改 active。
-- 正常配置统一原子发布到 `active/pingap.toml`。`reload` 使用同一 owner 或发布锁，与摘流、恢复串行。
-- 确认必须匹配 publication UUID、完整摘要、Applied 回执、实际进程身份和每个监听的 HTTP 标记；正常业务发布还检查声明的业务 HTTP 健康契约。
-- `GET /v1/proxy/status` 的 `configured` 表示文件存在；`applied` 表示这次完整应用已确认，包括 standby。二者均不单独表示业务可用。
-- 发布失败只在旧图重新确认后返回普通失败；回切结果未知时保留写保护及具体错误。关键读取失败不当作“首次启动”。
+- Restart：验证 standby → 停旧业务 → 起新业务 → 替换正常代理并验证。
+- Stop：验证 standby → 清理业务 → 保持 stopped，不重新编排业务。
+- proxy reload：替换代理进程，不停止或重编译业务；X-Request-ID 关联原请求和持久终态。
+- owner Shutdown：关闭准入并确认全部已受理写和执行范围收束，才释放系统锁。
 
-Custom 不能自动证明任意业务路由；业务 readiness 继续保留 `custom_route_unverified` 边界。HTTP 标记不能替代页面资源、业务响应或代理路由验收。
+已受理代理写不随 HTTP 客户端断开而丢弃。取消与迟到回调遵守捕获的 owner/操作身份，不启动
+第二个代理，不发布迟到成功。正常管理查询不会唤醒容器或恢复 owner。
 
-## 热载与完整重配置
+旧业务异常退出时，自动清理绑定原执行范围。已受理的业务控制在原截止时间内等待代理和
+原业务进程树完成清理，再继续当前请求；清理未知时保留保护，后续请求须重新核验原范围的
+真实清理证据。该等待不增加请求队列，也不改写旧操作的成功结果。
 
-热载支持 upstreams、locations、plugins 和既有 server.locations。监听、server 集合、basic、证书、storages 及进程级缓存参数变更需要完整重配置；不支持的热请求在停旧业务前拒绝并保留旧业务。
+## 失败与存量升级
 
-完整重配置使用独立的 owner Shutdown → 新 owner bootstrap 流程：先校验新项目，向捕获的代次执行 `app-cli owner shutdown --workspace <root> --generation <generation> --request-id <id>`；受理响应不等于完成。等待该请求的清理成功和旧 owner 退出后，再用原源码根执行 `app-cli serve/run`。新 owner 必须实际取得系统锁，不删除记录或依靠文件存在判定占用。这一路径允许短暂入口中断，不能称为无中断热载。
+预检失败保留旧运行态。新代理失败后精确清理，只能回退同 owner 最近已确认的代理快照；
+回退成功时原操作仍 Failed。没有旧快照但清理已确认时允许新请求重试；物理清理未知才保留
+RecoveryRequired。不自动回滚业务制品，不重放未知数据库迁移。
 
-不要通过删除状态文件、随意改 PID、关闭确认或手工把操作写成成功来恢复。Stop/Shutdown 与新源码重试均使用原身份和可重试的清理链。
+旧 Applied、journal、owner 回执与配置保留为历史。确认文件缺失本身不阻塞新源码启动。
+旧 owner 不支持官方模式时，绑定原实例、代次和请求 ID 执行既有 Shutdown，确认锁释放后
+重建管理 owner 接续当前请求。跨应用或无法证明归属时拒绝，不删除状态文件解锁。
 
-## 验证口径
+## 查询与发布
 
-协议替身只验证 app-cli 的控制、顺序和恢复逻辑。真实 Pingap 图切换、真实 builtin/supervisord 进程，以及 K8s/Gateway 各自记录实际源码摘要和二进制身份；本地组件通过不代表镜像已发布或集群已验收。
+新确认使用 shared_types 的 official_restart_http_v1 契约；它证明受控实例和 HTTP 验证，
+不声称 Pingap 内部完整图 Applied。旧 applied/verified 布尔字段保守返回 false 并弃用，
+调用方读取新 confirmation；configured 仅表示配置文件存在。
+
+Linux 容器使用已校验的官方 full/openssl 发行包。npm 根据原平台与 ABI 约束从未修改的
+官方源码编译，Linux 保留 glibc 2.17；源码、资产和最终二进制身份在构建阶段核验。
+历史补丁见 history/pingap-applied，不参与构建或运行准入。
+
+组件/协议 fixture、真实官方进程、Compose/K8s 部署和发布分别验收。版本正确、管理接口
+应答、一个 HTTP 标记或组件通过数量，都不能替代完整业务启动与取消/恢复验证。

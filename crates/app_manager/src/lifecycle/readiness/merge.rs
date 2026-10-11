@@ -90,6 +90,7 @@ pub(super) fn merge_observation(
         runtime_operation_id: None,
         observation_revision: 0,
         proxy: UserAppProxyReadiness {
+            confirmation: None,
             ready: false,
             status,
             reason_code: reason,
@@ -316,6 +317,7 @@ pub(super) mod fixtures {
             operation_id: Some("runtime-op-1".into()),
             observation_revision: 5,
             proxy: UserAppProxyReadiness {
+                confirmation: None,
                 ready: true,
                 status: UserAppReadinessStatus::Ready,
                 reason_code: None,
@@ -349,7 +351,7 @@ mod tests {
                     address: None,
                     channel: UserAppReadinessChannel::Direct,
                 },
-                snapshot,
+                snapshot: Box::new(snapshot),
             },
         );
         assert_eq!(response.status, UserAppReadinessStatus::Stopping);
@@ -379,7 +381,7 @@ mod tests {
                     address: None,
                     channel: UserAppReadinessChannel::Direct,
                 },
-                snapshot: ready_snapshot(),
+                snapshot: Box::new(ready_snapshot()),
             },
         );
         assert!(response.ready);
@@ -520,7 +522,7 @@ mod tests {
                     address: None,
                     channel: UserAppReadinessChannel::Exec,
                 },
-                snapshot: ready_snapshot(),
+                snapshot: Box::new(ready_snapshot()),
             },
         );
         assert_eq!(
@@ -601,7 +603,7 @@ mod tests {
                         address: None,
                         channel: UserAppReadinessChannel::Direct,
                     },
-                    snapshot: ready_snapshot(),
+                    snapshot: Box::new(ready_snapshot()),
                 },
             );
             assert_eq!(response.container.status, expected, "{state:?}");

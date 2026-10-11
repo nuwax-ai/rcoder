@@ -920,7 +920,7 @@ mod owner_reuse_tests {
             runtime_instance_id: "instance-test".to_string(),
             deployment_generation_id: "gen-test".to_string(),
             protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
-            capabilities: Vec::new(),
+            capabilities: vec![shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into()],
         };
         let status_view = || RuntimeStatusView {
             desired: DesiredState::Running,
@@ -1078,7 +1078,7 @@ mod owner_reuse_tests {
             runtime_instance_id: "instance-r78".to_string(),
             deployment_generation_id: "gen".to_string(),
             protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
-            capabilities: Vec::new(),
+            capabilities: vec![shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into()],
         };
         let status_view = shared_types::RuntimeStatusView {
             desired: shared_types::DesiredState::Running,
@@ -1242,7 +1242,7 @@ mod owner_reuse_tests {
             runtime_instance_id: "instance-art".to_string(),
             deployment_generation_id: "gen".to_string(),
             protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
-            capabilities: Vec::new(),
+            capabilities: vec![shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into()],
         };
         let identity_ws = identity.clone();
         let app = axum::Router::new()
@@ -1744,7 +1744,7 @@ async fn spawn_identity_owner(ws: &Path, instance: &str) -> String {
         runtime_instance_id: instance.to_string(),
         deployment_generation_id: format!("gen-{instance}"),
         protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
-        capabilities: Vec::new(),
+        capabilities: vec![shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into()],
     };
     let router = axum::Router::new().route(
         "/v1/runtime/identity",
@@ -1983,7 +1983,7 @@ fn manifest_late_handover_does_not_replace_successor_launch() {
         runtime_instance_id: "original-owner".into(),
         deployment_generation_id: "deploy".into(),
         protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
-        capabilities: vec![],
+        capabilities: vec![shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into()],
     };
     assert!(
         !manager

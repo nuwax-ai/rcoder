@@ -90,6 +90,28 @@ pub async fn spawn_owned_checked(
     command: tokio::process::Command,
     record: Option<&crate::command_context::CommandRecord>,
 ) -> std::result::Result<OwnedChild, SpawnAttemptFailure> {
+    spawn_owned_checked_inner(command, record, true, None).await
+}
+
+/// Use the original caller deadline for admission and startup. Any attempted
+/// child is returned on failure, so its caller can retain resources until exact
+/// cleanup completes. The legacy entry point keeps its existing startup budget.
+pub async fn spawn_owned_checked_until(
+    command: tokio::process::Command,
+    record: Option<&crate::command_context::CommandRecord>,
+    capture: bool,
+    deadline: tokio::time::Instant,
+) -> std::result::Result<OwnedChild, SpawnAttemptFailure> {
+    spawn_owned_checked_inner(command, record, capture, Some(deadline)).await
+}
+
+async fn spawn_owned_checked_inner(
+    command: tokio::process::Command,
+    record: Option<&crate::command_context::CommandRecord>,
+    capture: bool,
+    deadline: Option<tokio::time::Instant>,
+) -> std::result::Result<OwnedChild, SpawnAttemptFailure> {
+    check_startup_deadline(deadline, None)?;
     let root = match crate::command_context::CommandContext::current()
         .and_then(|context| context.journal_root)
     {
@@ -100,19 +122,27 @@ pub async fn spawn_owned_checked(
         None => crate::command_authority::current_root(),
     };
     let Some(work_root) = root else {
+        check_startup_deadline(deadline, None)?;
         return spawn_managed(command)
             .map(OwnedChild::Direct)
             .map_err(|source| unstarted(source, None));
     };
     let declared_root = crate::command_authority::current_root();
-    let registered = register_guardian(
+    let registration = register_guardian(
         command,
         &work_root,
         record.and_then(|record| record.path()),
         declared_root.as_deref(),
-    )
-    .await
+    );
+    let registered = match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, registration)
+            .await
+            .context("command admission deadline expired")
+            .and_then(|result| result),
+        None => registration.await,
+    }
     .map_err(|source| unstarted(source, None))?;
+    check_startup_deadline(deadline, Some(&registered.root))?;
     let executable = std::env::current_exe().map_err(|source| {
         unstarted(
             anyhow::Error::new(source).context("resolve command guardian executable"),
@@ -124,8 +154,16 @@ pub async fn spawn_owned_checked(
         .arg("--native-command-guardian")
         .arg(&registered.root)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(if capture {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
+        .stderr(if capture {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        });
     if registered.managed {
         command.env(crate::command_authority::WORK_ROOT_ENV, &work_root);
     }
@@ -133,6 +171,7 @@ pub async fn spawn_owned_checked(
     command.process_group(0);
     #[cfg(windows)]
     command.creation_flags(0x0000_0200);
+    check_startup_deadline(deadline, Some(&registered.root))?;
     let mut child = command.spawn().map_err(|source| {
         unstarted(
             anyhow::Error::new(source).context("spawn command guardian"),
@@ -142,10 +181,30 @@ pub async fn spawn_owned_checked(
     let mut lease = child.stdin.take();
     let started = async {
         let pipe = lease.as_mut().context("guardian lease pipe missing")?;
-        pipe.write_all(&registered.frame)
-            .await
-            .context("send guardian command")?;
-        wait_for_start(&mut child, &registered.root, Duration::from_secs(10)).await
+        match deadline {
+            Some(deadline) => {
+                tokio::time::timeout_at(deadline, pipe.write_all(&registered.frame))
+                    .await
+                    .context("command frame deadline expired")??;
+                wait_for_start(
+                    &mut child,
+                    &registered.root,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                )
+                .await?;
+                ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "command startup deadline expired"
+                );
+                Ok(())
+            }
+            None => {
+                pipe.write_all(&registered.frame)
+                    .await
+                    .context("send guardian command")?;
+                wait_for_start(&mut child, &registered.root, Duration::from_secs(10)).await
+            }
+        }
     }
     .await;
     let owned = OwnedChild::Guarded {
@@ -161,6 +220,19 @@ pub async fn spawn_owned_checked(
             child: Some(owned),
         }),
     }
+}
+
+fn check_startup_deadline(
+    deadline: Option<tokio::time::Instant>,
+    registered_root: Option<&Path>,
+) -> std::result::Result<(), SpawnAttemptFailure> {
+    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        return Err(unstarted(
+            anyhow::anyhow!("command startup deadline expired before OS spawn"),
+            registered_root,
+        ));
+    }
+    Ok(())
 }
 
 fn unstarted(mut source: anyhow::Error, root: Option<&Path>) -> SpawnAttemptFailure {
@@ -185,5 +257,31 @@ fn unstarted(mut source: anyhow::Error, root: Option<&Path>) -> SpawnAttemptFail
     SpawnAttemptFailure {
         source,
         child: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn expired_checked_startup_cannot_fall_through_to_os_spawn() {
+        let command = tokio::process::Command::new("never-run-after-deadline");
+        let failure = match spawn_owned_checked_until(
+            command,
+            None,
+            false,
+            tokio::time::Instant::now(),
+        )
+        .await
+        {
+            Ok(_) => panic!("expired startup dispatched a process"),
+            Err(failure) => failure,
+        };
+        assert!(failure.child.is_none());
+        assert!(
+            format!("{:#}", failure.source).contains("deadline expired before OS spawn"),
+            "a missing executable error would prove the expired request reached spawn"
+        );
     }
 }

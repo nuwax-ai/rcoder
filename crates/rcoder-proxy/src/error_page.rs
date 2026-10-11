@@ -158,6 +158,8 @@ pub struct ErrorPageVars {
 pub enum ErrorPageCause {
     /// 有当前实例的启动证据
     Starting,
+    /// 当前 owner 确认官方代理正在启动或替换。
+    Restarting,
     /// 已确认停止
     Stopped,
     /// 有明确启动失败证据
@@ -186,6 +188,7 @@ impl ErrorPageCause {
     fn i18n_slug(self) -> &'static str {
         match self {
             Self::Starting => "starting",
+            Self::Restarting => "restarting",
             Self::Stopped => "stopped",
             Self::Failed => "failed",
             Self::Missing => "missing",
@@ -266,14 +269,37 @@ pub struct UserAppProxyFailureHint {
     /// 当前实例实际生效的 Pingap 配置已确认具备错误来源剥离规则
     /// （`X-Pingap-EType` 只可能来自代理自产错误）
     pub error_origin_confirmed: bool,
+    /// Only fresh, physically rechecked observation may populate this field.
+    pub proxy_confirmation: Option<shared_types::ProxyConfirmation>,
 }
 
 impl UserAppProxyFailureHint {
+    pub fn transition_operation_id(&self) -> Option<&str> {
+        let confirmation = self.proxy_confirmation.as_ref()?;
+        use shared_types::ProxyPhase;
+        let transitioning = match confirmation.phase {
+            ProxyPhase::Preparing
+            | ProxyPhase::Stopping
+            | ProxyPhase::Starting
+            | ProxyPhase::Verifying => true,
+            ProxyPhase::Absent
+            | ProxyPhase::Serving
+            | ProxyPhase::Standby
+            | ProxyPhase::Failed
+            | ProxyPhase::RecoveryRequired => false,
+        };
+        (transitioning && !confirmation.confirmed && !confirmation.operation_id.trim().is_empty())
+            .then_some(confirmation.operation_id.as_str())
+    }
+
     /// 失败页文案分类：有证据才用确定文案，缺证据一律通用（不凭连接拒绝
     /// 宣称"正在启动"）。全枚举显式匹配：ReadinessStatus 新增/改名时编译期
     /// 即暴露此映射。
     pub fn page_cause(&self) -> ErrorPageCause {
         use shared_types::UserAppReadinessStatus as Status;
+        if self.transition_operation_id().is_some() {
+            return ErrorPageCause::Restarting;
+        }
         match self.readiness_status {
             Some(Status::Starting) => ErrorPageCause::Starting,
             Some(Status::Stopped) => ErrorPageCause::Stopped,
@@ -303,6 +329,17 @@ pub trait UserAppProxyFailureAdvisor: Send + Sync {
         stage: &str,
         budget: std::time::Duration,
     ) -> Option<UserAppProxyFailureHint>;
+
+    /// Fresh read-only observation. Default supplies no progress evidence;
+    /// cached advice cannot prove a current operation or configuration origin.
+    async fn advise_current(
+        &self,
+        _app_id: &str,
+        _stage: &str,
+        _budget: std::time::Duration,
+    ) -> Option<UserAppProxyFailureHint> {
+        None
+    }
 }
 
 /// 生成一次性诊断编号（uuid v4 简短形态；请求级，不与业务身份复用）。
@@ -661,9 +698,10 @@ mod tests {
         ErrorPageRenderer::new(None)
     }
 
-    fn all_causes() -> [ErrorPageCause; 9] {
+    fn all_causes() -> [ErrorPageCause; 10] {
         [
             ErrorPageCause::Starting,
+            ErrorPageCause::Restarting,
             ErrorPageCause::Stopped,
             ErrorPageCause::Failed,
             ErrorPageCause::Missing,
@@ -941,11 +979,13 @@ mod tests {
     #[test]
     fn page_cause_maps_not_deployed_to_missing() {
         let hint = UserAppProxyFailureHint {
+            proxy_confirmation: None,
             readiness_status: Some(shared_types::UserAppReadinessStatus::NotDeployed),
             error_origin_confirmed: false,
         };
         assert_eq!(hint.page_cause(), ErrorPageCause::Missing);
         let unknown = UserAppProxyFailureHint {
+            proxy_confirmation: None,
             readiness_status: None,
             error_origin_confirmed: false,
         };
@@ -993,5 +1033,44 @@ mod wake_diagnostic_tests {
             shared_types::ERR_RUNTIME_CONFIGURATION
         );
         assert!(!payload.to_string().contains("private_marker"));
+    }
+    #[test]
+    fn terminal_or_inconsistent_proxy_confirmation_is_not_restart_evidence() {
+        use super::{ErrorPageCause, UserAppProxyFailureHint};
+        for phase in [
+            shared_types::ProxyPhase::Absent,
+            shared_types::ProxyPhase::Serving,
+            shared_types::ProxyPhase::Standby,
+            shared_types::ProxyPhase::Failed,
+            shared_types::ProxyPhase::RecoveryRequired,
+        ] {
+            let hint = UserAppProxyFailureHint {
+                readiness_status: None,
+                error_origin_confirmed: false,
+                proxy_confirmation: Some(shared_types::ProxyConfirmation {
+                    contract: shared_types::ProxyConfirmationContract::OfficialRestartHttpV1,
+                    confirmed: false,
+                    phase,
+                    operation_id: "old-operation".into(),
+                    proxy_instance_id: None,
+                    config_digest: None,
+                }),
+            };
+            assert!(hint.transition_operation_id().is_none());
+            assert_eq!(hint.page_cause(), ErrorPageCause::Generic);
+        }
+        let hint = UserAppProxyFailureHint {
+            readiness_status: None,
+            error_origin_confirmed: false,
+            proxy_confirmation: Some(shared_types::ProxyConfirmation {
+                contract: shared_types::ProxyConfirmationContract::OfficialRestartHttpV1,
+                confirmed: true,
+                phase: shared_types::ProxyPhase::Starting,
+                operation_id: "contradictory-operation".into(),
+                proxy_instance_id: None,
+                config_digest: None,
+            }),
+        };
+        assert!(hint.transition_operation_id().is_none());
     }
 }

@@ -1,4 +1,5 @@
-//! Publication-bound applied graph observation, never candidate-hash authority.
+//! Historical private-protocol DTOs and app-cli owned official process confirmation.
+//! ApplyStatus is retained only for decoding old evidence; official runtime never queries it.
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -44,11 +45,12 @@ pub struct ApplyStatus {
     pub last_attempt: Option<ApplyAttempt>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfirmedPublication {
     pub process_id: u32,
     pub instance_id: String,
     pub publication_id: String,
+    pub operation_id: Option<String>,
     pub config_hash: String,
     pub config_digest: String,
     pub attempt_id: u64,
@@ -76,6 +78,7 @@ impl ApplyStatus {
             "invalid applied proxy receipt"
         );
         Ok(ConfirmedPublication {
+            operation_id: None,
             process_id: self.process_id,
             instance_id: self.process_instance_id.clone(),
             publication_id: applied
@@ -126,6 +129,7 @@ impl ApplyStatus {
             "invalid applied proxy receipt"
         );
         Ok(Some(ConfirmedPublication {
+            operation_id: None,
             process_id: self.process_id,
             instance_id: self.process_instance_id.clone(),
             publication_id: expected.publication_id.clone(),
@@ -142,6 +146,8 @@ mod tests {
     fn fixture() -> (ApplyStatus, super::super::compiler::CompileOutcome) {
         let id = uuid::Uuid::new_v4().to_string();
         let outcome = super::super::compiler::CompileOutcome {
+            serving_release_id: None,
+            operation_id: None,
             config_path: "candidate.toml".into(),
             expected_hash: "0123ABCD".into(),
             publication_id: id.clone(),

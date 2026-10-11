@@ -34,9 +34,10 @@ ARG RCODER_SOURCE_BRANCH
 RUN rm -f rust-toolchain.toml
 # 配置 cargo 源(国内 rsproxy 加速)。文件在 .cargo/config.toml,查阅/修改方便。
 COPY .cargo/config.toml /usr/local/cargo/config.toml
-# 同 exact pin + reviewed patch 构建配对 Applied 协议 binary；旧官方资产保留在 base。
-RUN CARGO_BUILD_JOBS=2 python3 tools/build/pingap-applied/build.py --fetch --source /build/pingap-applied-source \
-    --repo-root /build --full --output /build/pingap-applied/pingap
+# 官方发行物按可信 SHA256 校验，不修改上游源码。
+ARG TARGETARCH
+RUN python3 tools/build/pingap_official.py --repo-root /build install --download \
+    --arch ${TARGETARCH} --output /build/pingap-official/pingap
 RUN cd crates/app-cli && cargo build --release
 # 容器内文件服务单件（RBD 卷形态·容器中心化，file-server-proxy 0.2.0 起）：file-server-proxy
 # default feature 自带 file-server lib 进程内直连（60000 AllRust，无独立 8086 进程/端口）。
@@ -81,12 +82,11 @@ ENV DBX_WEB_URL=http://localhost:4224
 COPY --from=app-cli-builder /build/crates/app-cli/target/release/app-cli /usr/local/bin/app-cli
 COPY --from=app-cli-builder /build/target/release/file-server-proxy /usr/local/bin/file-server-proxy
 
-# 最终覆盖必须是配对 Applied binary；此 hash/provenance 与官方 release catalog 分开。
-COPY --from=app-cli-builder /build/pingap-applied/pingap /usr/local/bin/pingap
-COPY --from=app-cli-builder /build/pingap-applied/pingap.applied.json /usr/local/share/rcoder/pingap-applied.json
-COPY --from=app-cli-builder /build/tools/build/pingap-applied/manifest.json /usr/local/share/rcoder/pingap-source.json
-COPY --from=app-cli-builder /build/tools/build/pingap-applied/verify.py /usr/local/share/rcoder/verify-pingap.py
-RUN python3 /usr/local/share/rcoder/verify-pingap.py \
-    --binary /usr/local/bin/pingap --receipt /usr/local/share/rcoder/pingap-applied.json \
-    --manifest /usr/local/share/rcoder/pingap-source.json \
-    --version "${PINGAP_VERSION}" --commit "${PINGAP_COMMIT}" --require-full --tls openssl
+# 替换同版本旧定制程序；凭据只供构建验收，不是运行准入条件。
+COPY --from=app-cli-builder /build/pingap-official/pingap /usr/local/bin/pingap
+COPY --from=app-cli-builder /build/pingap-official/pingap.official.json /usr/local/share/rcoder/pingap.official.json
+COPY --from=app-cli-builder /build/tools/build/pingap_official.py /usr/local/share/rcoder/verify-pingap.py
+COPY --from=app-cli-builder /build/tools/build/runtime_assets.py /usr/local/share/rcoder/runtime_assets.py
+COPY --from=app-cli-builder /build/tools/build/pingap-assets.json /usr/local/share/rcoder/pingap-assets.json
+RUN python3 /usr/local/share/rcoder/verify-pingap.py --version "${PINGAP_VERSION}" --commit "${PINGAP_COMMIT}" verify \
+    --binary /usr/local/bin/pingap --receipt /usr/local/share/rcoder/pingap.official.json

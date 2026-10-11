@@ -204,6 +204,7 @@ pub(crate) struct OwnerClient {
 impl OwnerClient {
     pub(super) fn new(address: &str, token: &str) -> Result<Self> {
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(10))
             .no_proxy()
             .build()

@@ -135,7 +135,7 @@ pub(super) async fn run_inner(
         crate::workspace_index::index_port_if_eligible(&args.workspace, &specs);
 
     let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
-    let outcome = match prepared_proxy {
+    let mut outcome = match prepared_proxy {
         Some(prepared) => prepared.outcome,
         None => {
             compile_and_validate(
@@ -148,19 +148,11 @@ pub(super) async fn run_inner(
             .await?
         }
     };
+    outcome.operation_id = args.operation_id.clone();
     info!(
         "📝 effective pingap config → {}",
         outcome.config_path.display()
     );
-    // 常驻在服务时先校验热载兼容（server 拓扑变化 Fail Fast 保旧服务）
-    if super::resident::is_serving().await {
-        let active = crate::proxy::compiler::active_config_path(&runtime_root);
-        let candidate = tokio::fs::read_to_string(&outcome.config_path)
-            .await
-            .with_context(|| format!("read candidate {}", outcome.config_path.display()))?;
-        crate::proxy::compiler::validate_hot_reload_compatible(&active, &candidate)?;
-    }
-
     // 2. Wait for the declared PostgreSQL dependency before starting services.
     // RCoder 容器通过 APP_CLI_REQUIRE_PG=1 启用；宿主机独立运行默认不探测。
     if workspace_needs_pg(&specs) {
@@ -331,9 +323,9 @@ pub(super) async fn run_inner(
             !cancel.as_ref().is_some_and(|token| token.is_cancelled()),
             "Orchestration cancelled"
         );
-        // 编译、完整验证、发布 active 并确保入口（P1 常驻语义）：
-        // - serve 形态（有 owner 会话作用域）：常驻 pingap——业务代次重建
-        //   不再杀/拉入口，active 发布由 --autoreload 拾取；
+        // Prepare a complete immutable graph, replace the owned official proxy,
+        // and verify real HTTP. Short entry downtime is an explicit contract.
+        // - serve 形态（有 owner 会话作用域）：owner管理代理替换；
         // - 直跑形态：无 owner 作用域，常驻进程会在 run() 返回后成为孤儿——
         //   维持业务会话树托管（R01）。代理失败时 workspace 不得进入 ready。
         let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);

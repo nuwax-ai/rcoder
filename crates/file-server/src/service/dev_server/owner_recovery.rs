@@ -14,6 +14,7 @@ use super::{
 use crate::error::{AppError, AppResult};
 
 mod handover;
+mod official;
 
 pub(super) struct AvailableOwner {
     pub address: String,
@@ -151,10 +152,22 @@ impl DevServerManager {
         workspace: &Path,
         address: &str,
     ) -> Result<()> {
-        if lock(&self.owner_children)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .get(project)
-            .is_some_and(|child| child.exited().is_none())
+        self.spawn_owner_candidate(project, workspace, address, false)
+            .await
+    }
+
+    async fn spawn_owner_candidate(
+        &self,
+        project: &str,
+        workspace: &Path,
+        address: &str,
+        protocol_upgrade: bool,
+    ) -> Result<()> {
+        if !protocol_upgrade
+            && lock(&self.owner_children)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .get(project)
+                .is_some_and(|child| child.exited().is_none())
         {
             return Ok(());
         }
@@ -197,6 +210,16 @@ impl DevServerManager {
             .stdin(std::process::Stdio::null())
             .stdout(output.try_clone()?)
             .stderr(output);
+        // A management bootstrap never consumes a one-shot business deployment.
+        // Preserve the platform generation and explicit credentials.
+        for key in [
+            "APP_DEPLOY_URL",
+            "APP_RELEASE_ID",
+            "APP_DEPLOY_OPERATION_ID",
+            "APP_DEPLOY_SHA256",
+        ] {
+            command.env_remove(key);
+        }
         let state_root = runtime_state_layout::ensure_state_root(
             workspace,
             std::env::var_os("APP_CLI_STATE_ROOT").as_deref(),
@@ -419,6 +442,18 @@ impl DevServerManager {
     pub async fn preflight_userapp_build(&self, project: &str, workspace: &Path) -> AppResult<()> {
         let mut owner = self.recover_owner_if_needed(project, workspace).await?;
         self.ensure_new_build_admissible(project)?;
+        if let Some(available) = owner.take() {
+            owner = Some(
+                self.ensure_official_owner_for_start(
+                    project,
+                    workspace,
+                    available,
+                    tokio::time::Instant::now() + Duration::from_secs(45),
+                    false,
+                )
+                .await?,
+            );
+        }
         if let Some(available) = &owner {
             let identity = &available.identity;
             let expected_app = std::env::var("PROJECT_ID")

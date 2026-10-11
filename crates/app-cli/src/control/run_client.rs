@@ -145,14 +145,18 @@ pub async fn run(args: &RuntimeArgs) -> Result<()> {
             .map_err(|error| anyhow::anyhow!("{error:#}"))?
         {
             Some(deployment) => {
-                return crate::owner_dispatch::dispatch_environment_deployment(
+                match crate::owner_dispatch::dispatch_environment_deployment(
                     &args,
                     &state,
                     &application,
                     deployment,
                     deadline,
                 )
-                .await;
+                .await?
+                {
+                    ManagementReuse::NoOwner => continue,
+                    ManagementReuse::Ready => return Ok(()),
+                }
             }
             None => {
                 match tokio::time::timeout_at(deadline, crate::owner_dispatch::dispatch_to_owner(&args.admin_addr, &args.workspace, &state, &application)).await.context("run Source request deadline exceeded; query the printed original operation ID before retrying")?? {
