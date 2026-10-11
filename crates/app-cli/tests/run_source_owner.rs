@@ -2,6 +2,8 @@
 //! protocol stand-in; this does not validate Pingap routing, containers or AI.
 #![cfg(unix)]
 
+#[path = "fixtures/native_stop_during_startup.rs"]
+mod native_stop_during_startup;
 #[path = "fixtures/protocol_support.rs"]
 mod protocol_support;
 #[path = "fixtures/proxy_writer_barrier.rs"]

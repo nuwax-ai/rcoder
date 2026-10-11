@@ -13,6 +13,10 @@ use super::{
     compiler::{self, CompileOutcome},
 };
 
+#[cfg(all(test, unix))]
+#[path = "publication_budget_tests.rs"]
+mod budget_tests;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProcessInstance {
     pub pid: u32,
@@ -71,15 +75,7 @@ pub(crate) async fn restart_verified<H: ProcessHost>(
             format!("proxy old instance cleanup unconfirmed: {error:#}"),
         )
     })?;
-    let reserve = if previous.is_some() {
-        std::time::Duration::from_secs(8)
-    } else {
-        std::time::Duration::ZERO
-    };
-    let forward_deadline = Instant::now()
-        + deadline
-            .saturating_duration_since(Instant::now())
-            .saturating_sub(reserve);
+    let forward_deadline = confirmation_deadline(deadline)?;
     match start_confirm_commit(host, candidate, forward_deadline).await {
         Ok(receipt) => Ok(receipt),
         Err(original) => {
@@ -92,8 +88,9 @@ pub(crate) async fn restart_verified<H: ProcessHost>(
                 );
             };
             let restore = async {
-                validate_immutable_until(previous, deadline).await?;
-                start_confirm_commit(host, previous, deadline).await
+                let restore_deadline = confirmation_deadline(deadline)?;
+                validate_immutable_until(previous, restore_deadline).await?;
+                start_confirm_commit(host, previous, restore_deadline).await
             }
             .await;
             match restore {
@@ -121,6 +118,24 @@ pub(crate) async fn restart_verified<H: ProcessHost>(
             }
         }
     }
+}
+
+/// Every launched attempt may need exact tree cleanup, including cold startup
+/// and a failed restoration. Keep the existing eight-second settlement reserve
+/// (three-second grace plus tree reaping) inside the caller's total budget.
+/// A shorter caller budget splits remaining time rather than discarding all
+/// opportunity to confirm; genuinely late cleanup remains protected Unknown.
+fn confirmation_deadline(deadline: Instant) -> Result<Instant> {
+    let now = Instant::now();
+    let available = deadline.saturating_duration_since(now);
+    ensure!(
+        !available.is_zero(),
+        "proxy replacement deadline exhausted before process activation"
+    );
+    let reserve = (available / 2).min(std::time::Duration::from_secs(8));
+    deadline
+        .checked_sub(reserve)
+        .context("proxy confirmation deadline is outside the clock range")
 }
 
 fn log_transition_failure(candidate: &CompileOutcome, phase: &'static str, error: &anyhow::Error) {
@@ -332,8 +347,10 @@ pub async fn publish_standby_confirmed_to_path_until(
     _endpoint: &AdminEndpoint,
     deadline: Instant,
 ) -> Result<CompileOutcome> {
-    let outcome = standby_candidate(root, target).await?;
-    let host = crate::services::supervisord_host::SupervisordHost::from_env()
+    let outcome = tokio::time::timeout_at(deadline, standby_candidate(root, target))
+        .await
+        .context("standby preparation exceeded proxy operation deadline")??;
+    let host = crate::services::supervisord_host::SupervisordHost::from_env_until(deadline)
         .await?
         .context("proxy replacement requires a managed process host")?;
     host.replace_official(root, &outcome, deadline).await?;
@@ -346,13 +363,9 @@ pub async fn publish_confirmed(
     candidate: &CompileOutcome,
     _endpoint: &AdminEndpoint,
 ) -> Result<ConfirmedPublication> {
-    let host = crate::services::supervisord_host::SupervisordHost::from_env()
+    let deadline = Instant::now() + admin_probe::CONFIRM_BUDGET;
+    let host = crate::services::supervisord_host::SupervisordHost::from_env_until(deadline)
         .await?
         .context("proxy replacement requires a managed process host")?;
-    host.replace_official(
-        root,
-        candidate,
-        Instant::now() + admin_probe::CONFIRM_BUDGET,
-    )
-    .await
+    host.replace_official(root, candidate, deadline).await
 }

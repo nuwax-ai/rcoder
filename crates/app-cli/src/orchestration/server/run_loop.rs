@@ -124,6 +124,7 @@ pub(super) async fn signal_operation_already_settled(
 pub(super) async fn preflight_hot_reload_compat(
     args: &crate::RuntimeArgs,
     dev_profile: bool,
+    host: crate::startup_probe::StartupHost,
 ) -> anyhow::Result<crate::supervisor::PreparedProxy> {
     let release = crate::manifest::read_release_lock(&args.workspace)
         .context("read release lock for hot-reload preflight")?;
@@ -133,7 +134,7 @@ pub(super) async fn preflight_hot_reload_compat(
         &runtime_root,
         &args.pingap_bin,
         &release,
-        dev_profile,
+        crate::startup_probe::StartupContext { dev_profile, host },
     )
     .await
     .context("compile and validate candidate before stopping predecessor")?;
@@ -156,7 +157,7 @@ async fn prepare_source_control(
     let mut source_args = owner_args.clone();
     source_args.workspace =
         resolved_execution_workspace(&owner_args.workspace, Some(ExecutionTarget::Source), state)?;
-    preflight_hot_reload_compat(&source_args, *dev_profile)
+    preflight_hot_reload_compat(&source_args, *dev_profile, state.log_layout().into())
         .await
         .map(Some)
 }
@@ -474,6 +475,7 @@ pub(super) async fn next_prepared(
                     prepared.validated_workspace(),
                     &workspace,
                     target == Some(ExecutionTarget::Source),
+                    state.log_layout().into(),
                 )
                 .await
                 {
@@ -526,6 +528,7 @@ pub(super) async fn next_prepared(
                         let proxy = match preflight_hot_reload_compat(
                             &target_args,
                             target == Some(ExecutionTarget::Source),
+                            state.log_layout().into(),
                         )
                         .await
                         {
@@ -575,6 +578,7 @@ async fn prepare_artifact_proxy(
     read_workspace: &std::path::Path,
     execution_workspace: &std::path::Path,
     dev_profile: bool,
+    host: crate::startup_probe::StartupHost,
 ) -> anyhow::Result<crate::supervisor::PreparedProxy> {
     let release = crate::manifest::read_release_lock(read_workspace)?;
     let root = crate::proxy::compiler::runtime_root(&owner_args.log_dir);
@@ -584,7 +588,7 @@ async fn prepare_artifact_proxy(
         &root,
         &owner_args.pingap_bin,
         &release,
-        dev_profile,
+        crate::startup_probe::StartupContext { dev_profile, host },
     )
     .await?;
     Ok(crate::supervisor::PreparedProxy {

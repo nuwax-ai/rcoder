@@ -9,6 +9,67 @@ use workspace_manifest::{PROCESS_STARTUP_OBSERVATION_SECONDS, StartupProbe};
 use crate::manifest::ServiceSpec;
 use process_utils::guardian::OwnedChild as ManagedChild;
 
+/// The process host determines the historical strategy for an omitted probe.
+/// Explicit project strategies are identical for both hosts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupHost {
+    Builtin,
+    Supervisord,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct StartupContext {
+    pub dev_profile: bool,
+    pub host: StartupHost,
+}
+
+impl StartupContext {
+    pub fn builtin(dev_profile: bool) -> Self {
+        Self {
+            dev_profile,
+            host: StartupHost::Builtin,
+        }
+    }
+
+    pub fn supervisord(dev_profile: bool) -> Self {
+        Self {
+            dev_profile,
+            host: StartupHost::Supervisord,
+        }
+    }
+}
+
+impl From<crate::log::service::LogLayout> for StartupHost {
+    fn from(layout: crate::log::service::LogLayout) -> Self {
+        match layout {
+            crate::log::service::LogLayout::Builtin => Self::Builtin,
+            crate::log::service::LogLayout::Supervisord => Self::Supervisord,
+        }
+    }
+}
+
+/// Select the same evidence used by the service starter and proxy publication.
+/// Supervisord's omitted strategy is its existing startsecs check; bridge HTTP
+/// readiness remains a separate observation and is not a publication gate.
+pub(crate) fn effective(spec: &ServiceSpec, context: StartupContext) -> StartupProbe {
+    if let Some(probe) = spec.health.startup_probe {
+        return probe;
+    }
+    if crate::static_hosting::hosts_statically(spec, context.dev_profile) {
+        return StartupProbe::Http;
+    }
+    match context.host {
+        StartupHost::Builtin => {
+            if context.dev_profile && spec.devrun.is_some() {
+                StartupProbe::Tcp
+            } else {
+                StartupProbe::Http
+            }
+        }
+        StartupHost::Supervisord => StartupProbe::Process,
+    }
+}
+
 pub(crate) fn deadline(spec: &ServiceSpec, started: Instant) -> Result<Instant> {
     started
         .checked_add(Duration::from_secs(spec.health.startup_timeout_seconds))
@@ -50,22 +111,29 @@ pub(crate) async fn builtin(
     started: Instant,
     cancel: Option<&CancellationToken>,
 ) -> Result<()> {
-    let Some(probe) = spec.health.startup_probe else {
+    let probe = effective(spec, StartupContext::builtin(dev_profile));
+    if spec.health.startup_probe.is_none() {
         // Preserve legacy probe selection and its historical budget start.
         return within_budget(deadline(spec, Instant::now())?, cancel, async {
-            if dev_profile && spec.devrun.is_some() {
-                crate::supervisor::wait_for_port_open(spec, spec.health.startup_timeout_seconds)
+            match probe {
+                StartupProbe::Tcp => {
+                    crate::supervisor::wait_for_port_open(spec, spec.health.startup_timeout_seconds)
+                        .await
+                }
+                StartupProbe::Http => {
+                    crate::supervisor::wait_for_service_ready_within(
+                        spec,
+                        spec.health.startup_timeout_seconds,
+                    )
                     .await
-            } else {
-                crate::supervisor::wait_for_service_ready_within(
-                    spec,
-                    spec.health.startup_timeout_seconds,
-                )
-                .await
+                }
+                StartupProbe::Process => {
+                    bail!("builtin omitted startup strategy cannot select process evidence")
+                }
             }
         })
         .await;
-    };
+    }
     within_budget(deadline(spec, started)?, cancel, async {
         root_alive(child)?;
         if probe == StartupProbe::Process {

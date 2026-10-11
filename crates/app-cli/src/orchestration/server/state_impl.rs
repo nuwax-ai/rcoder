@@ -491,6 +491,7 @@ impl ServerState {
             state: self.clone(),
             generation: generation.to_owned(),
             standby_root: crate::proxy::compiler::runtime_root(log_dir),
+            scope: runtime_supervisor::current_scope(),
         }))
     }
 
@@ -773,6 +774,12 @@ impl ServerState {
                     .load(std::sync::atomic::Ordering::Acquire)
                     == 0
             {
+                // HTTP/configuration callers may have returned at their deadline
+                // while a dispatched supervisor mutation still owns its socket.
+                // Physical shutdown cannot acknowledge only the caller counters.
+                crate::supervisord_host::SupervisordHost::wait_pending_mutations_until(deadline)
+                    .await?;
+                crate::proxy::compiler::wait_for_file_replacements_until(deadline).await?;
                 return Ok(());
             }
             tokio::time::timeout_at(deadline, notified).await.context(

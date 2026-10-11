@@ -490,6 +490,10 @@ fn validate_builder_identity(
 ) -> Result<()> {
     if actual.service_type.as_ref() != Some(&ServiceType::UserappBuilder)
         || actual.identity_key() != Some(instance)
+        || [actual.project_id.as_deref(), actual.app_id.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|identity| identity != instance)
     {
         return Err(anyhow!("Builder runtime identity conflict: {instance}"));
     }

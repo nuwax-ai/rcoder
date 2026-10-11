@@ -18,6 +18,16 @@ import urllib.request
 import uuid
 
 
+def verify_unused_business_port(port=9080):
+    """Reuse TIME_WAIT after cleanup while still rejecting a live listener."""
+    with socket.socket() as listener:
+        if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(('127.0.0.1', port))
+
+
 class NativePair:
     def __init__(self, app, proxy, root):
         self.app, self.proxy, self.root = app.resolve(), proxy.resolve(), root.resolve()
@@ -27,8 +37,7 @@ class NativePair:
         (self.workspace / 'web').mkdir(parents=True)
         self.ports = {9080}
         # Refuse an occupied business port before touching any owner/process.
-        with socket.socket() as listener:
-            listener.bind(('127.0.0.1', 9080))
+        verify_unused_business_port()
         self.admin = self.port()
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith(('APP_CLI_', 'APP_DEPLOY_', 'RCODER_SUPERVISOR_',

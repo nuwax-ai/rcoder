@@ -31,6 +31,10 @@ startup_timeout_seconds = 25
 
 显式策略的预算从派发启动起计算，覆盖启动确认、检查与退避。builtin 在每个显式服务派发后立即检查，避免后续服务的慢迁移耗尽它的预算；省略策略的历史并行检查保持。supervisord 复用 `startProcess(wait=true)` 的 `startsecs=5` 证据，process 首次启动不使用十次隐式重试。提交启动成功前，两引擎再次核验同一执行实例。
 
+代理发布沿用同一生效启动策略：HTTP 策略验证业务健康路径，TCP 策略不额外要求 HTTP 2xx；builtin 的省略策略在 dev + devrun 下同样不额外要求 `/health`。静态托管保留 HTTP 验证，supervisord 的省略策略保留 startsecs 与独立 bridge 就绪观察。所有策略仍核验每个代理监听器的发布标记、配置摘要及受管进程身份。
+
+启动成功和 HTTP 健康是两类证据。TCP 服务可以成功启动、重复重启，但 `/v1/app/readiness` 仍如实报告声明的 HTTP 健康路径失败；不把 TCP 连通表述为 HTTP 健康。
+
 process 只证明常驻进程存活，不能证明消息队列连接或业务初始化成功。程序应在初始化失败时非零退出，收到停止信号后收束工作。定时任务、执行完就退出的脚本应使用其他业务机制，不伪装为常驻 worker。
 
 ## 校验和兼容
@@ -47,6 +51,16 @@ process 只证明常驻进程存活，不能证明消息队列连接或业务初
 运行时、镜像及客户端写入链先升级，再发布默认输出新字段的 template-cli。存量项目不自动改写。HTTP worker 可以继续使用 `backend-python --kind worker`，保留其 FastAPI 入口；纯进程使用配套版本中的 `worker-python`。
 
 ## 验证入口
+
+真实官方 Pingap 的 builtin 反例使用返回 HTTP 404 的 `/health`，覆盖显式 TCP、省略策略 devrun、显式 HTTP 拒绝及修正后重试。三个正例使用合法 Custom 配置显式选择代理持续 TCP 健康检查，保留真实代理 HTTP 200，同时 app readiness 如实返回 `CUSTOM_ROUTE_UNVERIFIED`。独立 Managed 反例保留持续 HTTP 健康检查，验证 TCP 启动成功、业务直连 HTTP 200、`/health` 404、代理摘流和 HTTP readiness 失败：
+
+```bash
+python3 tests-e2e/tools/official_pingap_startup_probes.py \
+  --repository "$PWD" --app-cli /path/to/app-cli --pingap /path/to/official-pingap \
+  --root /path/to/fresh-evidence-directory
+```
+
+此入口保存各原操作终态、代理确认、真实 HTTP 和清理结果；同一脚本可对比旧、新二进制。它不代替 supervisord、Compose 或 K8s 验收。
 
 ```bash
 cargo nextest run -p workspace-manifest -p file-server -p file-server-userapp --no-fail-fast --all-features

@@ -101,7 +101,10 @@ impl DevEnsureError {
 pub trait UserappDevEnsure: Send + Sync {
     /// 权威定位当前 dev builder（只读、无副作用、不刷新活跃）。
     ///
-    /// `Ok(None)` = 确认不存在（调用方可走 [`Self::ensure_dev_container`]）；
+    /// `Ok(None)` = 已确认缺席，或已核验归属且实际停止、没有可拨流实例
+    /// （调用方可走 [`Self::ensure_dev_container`] 的既有唤醒准入）；
+    /// 控制器存在而 Pod 暂缺的启动/停止窗口属于 `NotReady`，不能当缺席。
+    /// 该观察本身不授予创建、唤醒或接管权限。
     /// `Err(ObserveFailed)` = 查询失败不可判定——不得当作不存在，不得以
     /// 端口探测替代身份核验；`Ok(Some)` 的地址为权威当前值，注册表候选
     /// 与其不一致时以本值为准。

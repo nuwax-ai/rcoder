@@ -457,6 +457,50 @@ pub(super) async fn verify_live_builder(
     instance: &str,
     physical_id: &str,
 ) -> Result<()> {
+    let target = verified_live_builder_target(state, app_id, instance).await?;
+    verify_captured_builder_physical_id(&target, physical_id)
+}
+
+/// Address observations must name the same workload as the bound capture, in
+/// addition to its current Pod/container. Docker has no separate workload UID.
+pub(super) async fn verify_live_builder_observation(
+    state: &AppState,
+    app_id: &str,
+    instance: &str,
+    observed: &container_runtime_api::RuntimeContainerInfo,
+) -> Result<()> {
+    let target = verified_live_builder_target(state, app_id, instance).await?;
+    verify_captured_builder_physical_id(&target, &observed.container_id)?;
+    let workload_matches = target
+        .workload
+        .as_ref()
+        .is_some_and(|workload| match workload.kind {
+            shared_types::AppResourceKind::StatefulSet => {
+                observed.workload_uid.as_deref() == Some(workload.uid.as_str())
+            }
+            shared_types::AppResourceKind::Container => observed.workload_uid.is_none(),
+            shared_types::AppResourceKind::Deployment
+            | shared_types::AppResourceKind::Service
+            | shared_types::AppResourceKind::ConfigMap
+            | shared_types::AppResourceKind::Secret
+            | shared_types::AppResourceKind::HttpRoute
+            | shared_types::AppResourceKind::PersistentVolumeClaim
+            | shared_types::AppResourceKind::HostPath
+            | shared_types::AppResourceKind::File => false,
+        });
+    if !workload_matches {
+        return Err(anyhow!(
+            "Builder workload identity changed during address verification"
+        ));
+    }
+    Ok(())
+}
+
+pub(super) async fn verified_live_builder_target(
+    state: &AppState,
+    app_id: &str,
+    instance: &str,
+) -> Result<shared_types::BuilderControlTarget> {
     let app = state
         .userapp_store
         .get_application(app_id)
@@ -467,12 +511,36 @@ pub(super) async fn verify_live_builder(
     }
     let context = UserAppExecutionContext {
         app_id: instance.into(),
-        lifecycle_id: app.lifecycle_id,
+        lifecycle_id: app.lifecycle_id.clone(),
         operation_id: "read-only-verification".into(),
         executor_id: "reader".into(),
         request_fingerprint: "0".repeat(64),
     };
     let target = capture_bound_target(state, &context).await?;
+    target.validate().map_err(anyhow::Error::msg)?;
+    if target.context != context {
+        return Err(anyhow!(
+            "Builder capture context changed during verification"
+        ));
+    }
+    // A deletion/recreation may have committed while the runtime capture was
+    // awaiting I/O. Old labels and a formerly valid binding do not authorize an
+    // address for the new or retiring lifecycle.
+    let current = state
+        .userapp_store
+        .get_application(app_id)
+        .await?
+        .ok_or(UserAppStoreError::NotFound)?;
+    if current.state != UserAppLifecycleState::Active || current.lifecycle_id != app.lifecycle_id {
+        return Err(UserAppStoreError::LifecycleConflict.into());
+    }
+    Ok(target)
+}
+
+fn verify_captured_builder_physical_id(
+    target: &shared_types::BuilderControlTarget,
+    physical_id: &str,
+) -> Result<()> {
     let actual = target.pod.as_ref().map(|pod| pod.uid.as_str()).or_else(|| {
         target
             .workload

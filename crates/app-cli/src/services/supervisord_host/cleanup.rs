@@ -232,14 +232,31 @@ impl SupervisordHost {
         self.stop_business().await
     }
 
+    #[cfg(test)]
     pub(crate) async fn shutdown_owner_entry(
         &self,
         runtime_root: &Path,
         scope: &runtime_supervisor::ResidentScope,
     ) -> Result<()> {
+        self.shutdown_owner_entry_until(
+            runtime_root,
+            scope,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .await
+    }
+
+    pub(crate) async fn shutdown_owner_entry_until(
+        &self,
+        runtime_root: &Path,
+        scope: &runtime_supervisor::ResidentScope,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
         scope
             .verify_owner_for_cleanup()
             .context("verify retained owner scope before resident shutdown")?;
+        crate::xmlrpc::require_deadline_budget("owner shutdown authorization", deadline)?;
+        self.client.wait_mutations_until(deadline).await?;
         let configured = configured_entry_spec(&self.conf_path)?;
         let receipt = verify_resident_engine_receipt(
             runtime_root,
@@ -252,8 +269,8 @@ impl SupervisordHost {
                 "configured resident has no owner domain receipt; shutdown is not authorized"
             );
             anyhow::ensure!(
-                self.resident_entry_settled().await?.is_none()
-                    && self.dynamic_groups().await?.is_empty(),
+                self.resident_entry_settled_until(deadline).await?.is_none()
+                    && self.dynamic_groups_until(deadline).await?.is_empty(),
                 "supervisord programs exist without owner domain provenance; shutdown is not authorized"
             );
             return Ok(());
@@ -264,46 +281,56 @@ impl SupervisordHost {
                 "configured resident differs from its owner domain receipt"
             );
         }
-        if let Some(info) = self.resident_entry_settled().await?
+        if let Some(info) = self.resident_entry_settled_until(deadline).await?
             && info.checked_state(PINGAP_PROGRAM)? == SupervisorProcessState::Running
         {
-            let (config, _) = self.live_entry_binding(&info).await?;
+            let (config, _) = self.live_entry_binding_until(&info, deadline).await?;
             anyhow::ensure!(
                 config == receipt.config,
                 "resident configuration belongs to a different owner runtime root"
             );
         }
-        self.close_entry().await?;
-        self.stop_business().await
+        self.close_entry_until(deadline).await?;
+        self.stop_business_until(deadline).await
     }
 
     /// The caller has already crossed a confirmed drain barrier, or has
     /// precisely shut down the resident entry during forced owner cleanup.
     pub(crate) async fn stop_business(&self) -> Result<()> {
+        self.stop_business_until(tokio::time::Instant::now() + std::time::Duration::from_secs(60))
+            .await
+    }
+
+    pub(crate) async fn stop_business_until(&self, deadline: tokio::time::Instant) -> Result<()> {
         // Remove the restart source before stopping the live groups. Keeping the
         // old fragment after removeProcessGroup lets a supervisord restart or a
         // later reload resurrect the retired release. Do not touch fixed groups
         // and the resident fragment (app-pingap).
         let mut failures = Vec::new();
-        if let Err(error) =
-            write_conf(&self.conf_path, "# app-cli dynamic services stopped\n").await
+        if let Err(error) = write_conf_until(
+            &self.conf_path,
+            "# app-cli dynamic services stopped\n",
+            deadline,
+        )
+        .await
         {
             failures.push(format!("withdraw dynamic configuration: {error:#}"));
         }
-        if let Err(error) = mutation_result(self.client.reload_config().await) {
+        if let Err(error) = mutation_result(self.client.reload_config_until(deadline).await) {
             failures.push(format!("reload dynamic configuration: {error:#}"));
         }
         // A broken configuration must not prevent stopping live groups. Keep
         // the withdrawal failure, but attempt the physical stop before returning
         // it; an external cleanup receipt still requires every part to succeed.
-        let groups = self.dynamic_groups().await?;
+        let groups = self.dynamic_groups_until(deadline).await?;
         // Begin shutdown together; one slow service must not multiply the grace
         // period by the number of application modules.
-        for (name, result) in futures::future::join_all(
-            groups
-                .iter()
-                .map(|name| async move { (name, self.client.stop_remove_group(name).await) }),
-        )
+        for (name, result) in futures::future::join_all(groups.iter().map(|name| async move {
+            (
+                name,
+                self.client.stop_remove_group_until(name, deadline).await,
+            )
+        }))
         .await
         {
             if let Err(error) = result {
@@ -316,7 +343,7 @@ impl SupervisordHost {
                 failures.join("; ")
             );
         }
-        let remaining = self.dynamic_groups().await?;
+        let remaining = self.dynamic_groups_until(deadline).await?;
         if !remaining.is_empty() {
             bail!("dynamic groups remain after stop: {}", remaining.join(", "));
         }
@@ -326,8 +353,16 @@ impl SupervisordHost {
     /// 当前动态业务组名集合（`app-svc-*`；P1 起 `app-pingap` 为常驻组，
     /// 不属业务停止/清理范围——入口生命周期独立于编排代次）。
     pub(super) async fn dynamic_groups(&self) -> Result<Vec<String>> {
+        self.dynamic_groups_until(tokio::time::Instant::now() + std::time::Duration::from_secs(60))
+            .await
+    }
+
+    pub(super) async fn dynamic_groups_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<String>> {
         Ok(self
-            .managed_groups()
+            .managed_groups_until(deadline)
             .await?
             .into_iter()
             .filter(|group| group != PINGAP_PROGRAM)
@@ -336,8 +371,11 @@ impl SupervisordHost {
 
     /// app-cli 托管的全部组（业务 `app-svc-*` + 常驻 `app-pingap`）——
     /// 编排就绪检查用（判定常驻组是否已被 supervisord 托管）。
-    pub(super) async fn managed_groups(&self) -> Result<Vec<String>> {
-        let infos = self.client.get_all_process_info().await?;
+    pub(super) async fn managed_groups_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<String>> {
+        let infos = self.client.get_all_process_info_until(deadline).await?;
         let mut groups = std::collections::BTreeSet::new();
         for info in infos {
             if info.group.starts_with(SVC_PROGRAM_PREFIX) || info.group == PINGAP_PROGRAM {

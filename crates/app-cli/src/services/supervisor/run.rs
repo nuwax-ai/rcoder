@@ -90,6 +90,7 @@ pub(super) async fn run_inner(
     on_running: Option<tokio::sync::oneshot::Sender<()>>,
     profile: RunProfile,
 ) -> Result<()> {
+    let startup_scope = runtime_supervisor::current_scope();
     runtime_status.set_ready(false);
     let RunProfile {
         run_migrations,
@@ -143,7 +144,7 @@ pub(super) async fn run_inner(
                 &runtime_root,
                 &args.pingap_bin,
                 &release,
-                dev_profile,
+                crate::startup_probe::StartupContext::builtin(dev_profile),
             )
             .await?
         }
@@ -403,7 +404,13 @@ pub(super) async fn run_inner(
         error!("❌ startup failed, shutting down already-started children: {error:#}");
         // Includes cancellation during proxy confirmation or bridge readiness.
         // A normal route must not outlive the business roots it forwards to.
-        if let Err(entry_error) = super::supervise::drain_or_close_resident().await {
+        if let Err(entry_error) = super::supervise::drain_or_close_resident_for_startup(
+            &startup_scope,
+            cancel.as_ref(),
+            tokio::time::Instant::now() + crate::proxy::admin_probe::CONFIRM_BUDGET,
+        )
+        .await
+        {
             error = supervisor_cleanup_unknown(error, entry_error);
         }
         // P1-02：清理错误并入 cause 链，不覆盖原始启动错误（组合后仍可溯因）。
@@ -479,7 +486,12 @@ pub(super) async fn run_inner(
         None => match wait_for_bridge(&release, &specs, cancel.as_ref()).await {
             Ok(ready) => ready,
             Err(error) => {
-                let entry = super::supervise::drain_or_close_resident().await;
+                let entry = super::supervise::drain_or_close_resident_for_startup(
+                    &startup_scope,
+                    cancel.as_ref(),
+                    tokio::time::Instant::now() + crate::proxy::admin_probe::CONFIRM_BUDGET,
+                )
+                .await;
                 let stopped = shutdown_all(std::mem::take(&mut children), 5).await;
                 if let Err(cleanup) = entry {
                     return Err(supervisor_cleanup_unknown(error, cleanup));

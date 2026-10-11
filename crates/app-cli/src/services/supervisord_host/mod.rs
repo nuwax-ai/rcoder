@@ -25,7 +25,10 @@ use crate::svc_spec::ServiceSpecFile;
 use crate::xmlrpc::{SupervisorClient, SupervisorProcessState, SupervisordProcessInfo};
 
 mod cleanup;
+#[cfg(test)]
+mod deadline_tests;
 mod legacy;
+mod official_host;
 mod receipt;
 mod resident;
 
@@ -65,12 +68,16 @@ impl SupervisordHost {
     /// Read-only construction for proxy publication checks. Engine ownership
     /// receipts are written only by the business host's detect path.
     pub(crate) async fn from_env() -> Result<Option<Self>> {
+        Self::from_env_until(tokio::time::Instant::now() + admin_probe::CONFIRM_BUDGET).await
+    }
+
+    pub(crate) async fn from_env_until(deadline: tokio::time::Instant) -> Result<Option<Self>> {
         if !crate::xmlrpc::socket_exists() {
             return Ok(None);
         }
         let client = SupervisorClient::new(crate::xmlrpc::default_socket_path());
         client
-            .ping()
+            .ping_until(deadline)
             .await
             .context("supervisord observation unavailable")?;
         Ok(Some(Self {
@@ -79,6 +86,18 @@ impl SupervisordHost {
             #[cfg(test)]
             fixture_argv: None,
         }))
+    }
+
+    /// Owner retirement must not release its lock while a supervisor write can
+    /// still complete. This waits observation only; it never dispatches a command.
+    pub(crate) async fn wait_pending_mutations_until(deadline: tokio::time::Instant) -> Result<()> {
+        SupervisorClient::new(crate::xmlrpc::default_socket_path())
+            .wait_mutations_until(deadline)
+            .await
+    }
+
+    pub(crate) fn mutations_pending() -> Result<bool> {
+        SupervisorClient::mutations_pending()
     }
     #[cfg(test)]
     pub(crate) fn protocol_fixture(socket: PathBuf, conf_path: PathBuf) -> Self {
@@ -490,8 +509,12 @@ impl SupervisordHost {
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<crate::xmlrpc::RunningProcess> {
         let deadline = crate::startup_probe::deadline(spec, tokio::time::Instant::now())?;
-        let added =
-            settle_start_mutation(deadline, cancel, self.client.add_process_group(name)).await?;
+        let added = settle_start_mutation(
+            deadline,
+            cancel,
+            self.client.add_process_group_until(name, deadline),
+        )
+        .await?;
         if !added {
             return Err(supervisor::ShutdownUnconfirmed(format!(
                 "program {name} was already registered; launch identity is unconfirmed"
@@ -500,7 +523,12 @@ impl SupervisordHost {
         }
         // A stop between the two acknowledged mutations must not launch a new root.
         anyhow::ensure!(!cancel.is_cancelled(), "Startup check cancelled");
-        settle_start_mutation(deadline, cancel, self.client.start_process_wait(name)).await?;
+        settle_start_mutation(
+            deadline,
+            cancel,
+            self.client.start_process_wait_until(name, deadline),
+        )
+        .await?;
         crate::startup_probe::within_budget(deadline, Some(cancel), async {
             // startProcess(wait=true) already observed startsecs=5. Do not wait another 5s.
             let instance = self.client.running_process(name).await?;
@@ -568,7 +596,7 @@ async fn compile_pingap(
         &runtime_root,
         &args.pingap_bin,
         release,
-        dev_profile,
+        crate::startup_probe::StartupContext::supervisord(dev_profile),
     )
     .await
 }
@@ -611,19 +639,24 @@ fn pingap_service_spec(
 
 /// 写 conf 分片（原子：tmp + rename；supervisord reloadConfig 前落盘）。
 async fn write_conf(path: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("create {}", parent.display()))?;
-    }
-    let tmp = path.with_extension("conf.tmp");
-    tokio::fs::write(&tmp, content)
+    crate::proxy::compiler::replace_file_bytes(path, content.as_bytes().to_vec())
         .await
-        .with_context(|| format!("write {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, path)
+        .with_context(|| format!("replace supervisor fragment {}", path.display()))
+}
+
+async fn write_conf_until(
+    path: &Path,
+    content: &str,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    crate::xmlrpc::require_deadline_budget("supervisor fragment write", deadline)?;
+    tokio::time::timeout_at(deadline, write_conf(path, content))
         .await
-        .with_context(|| format!("rename to {}", path.display()))?;
-    Ok(())
+        .map_err(|_| {
+            supervisor::ShutdownUnconfirmed(
+                "supervisor fragment write has not settled before its deadline".into(),
+            )
+        })?
 }
 
 /// 生成动态 program 分片（纯函数，测试覆盖）。
@@ -732,7 +765,7 @@ fn safe_program_token(raw: &str) -> &str {
 // A lost reply to a mutation is not proof that supervisord stopped executing it.
 fn mutation_result<T>(result: Result<T>) -> Result<T> {
     result.map_err(|error| {
-        if crate::xmlrpc::is_confirmed_fault(&error) {
+        if crate::xmlrpc::is_confirmed_fault(&error) || crate::xmlrpc::is_before_dispatch(&error) {
             error
         } else {
             supervisor::ShutdownUnconfirmed(format!(

@@ -8,10 +8,22 @@ use shared_types::ServiceType;
 use super::{dev_file_server_addr, ensure_userapp_builder_probed};
 use crate::app_state::AppState;
 
+#[cfg(test)]
+#[path = "dev_locator_tests.rs"]
+mod tests;
+
 /// Weak 挂接 [`AppState`]——注入发生在 `AppState` Arc 包装后；Weak 防与
 /// `AppState → app_service → dev_locator → AppState` 的引用环。
 pub struct UserappDevLocator {
     state: Weak<AppState>,
+}
+
+enum VerifiedDevBuilder {
+    Absent,
+    /// Captured compute is retained and actually stopped; ensure may wake it.
+    Stopped,
+    NotAddressable,
+    Present(Box<container_runtime_api::RuntimeContainerInfo>),
 }
 
 impl UserappDevLocator {
@@ -23,6 +35,152 @@ impl UserappDevLocator {
         self.state
             .upgrade()
             .ok_or_else(|| "app state already dropped".to_string())
+    }
+
+    /// Discovery parameters are filters, not an ownership proof. Compare two
+    /// structured observations, then verify the captured physical resource and
+    /// lifecycle before publishing the address. This path never ensures compute.
+    async fn verified_builder(
+        &self,
+        state: &AppState,
+        app_id: &str,
+    ) -> anyhow::Result<VerifiedDevBuilder> {
+        let Some(observed) = state
+            .runtime()
+            .find_container(app_id, &ServiceType::UserappBuilder)
+            .await?
+        else {
+            return Self::verify_without_address(state, app_id).await;
+        };
+        super::validate_builder_identity(app_id, &observed)?;
+        let current = state
+            .runtime()
+            .find_container(app_id, &ServiceType::UserappBuilder)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Builder disappeared during discovery"))?;
+        super::validate_builder_identity(app_id, &current)?;
+        if current.container_id != observed.container_id
+            || current.container_name != observed.container_name
+            || current.workload_uid != observed.workload_uid
+            || current.container_ip != observed.container_ip
+            || current.status != observed.status
+        {
+            return Err(anyhow::anyhow!(
+                "Builder instance or address changed during discovery; retry the query"
+            ));
+        }
+        // The final capture closes replacement between the address reads and
+        // validates the durable binding; a later runtime change cannot be made
+        // atomic with a network dial, so callers retain normal retry semantics.
+        super::adoption::verify_live_builder_observation(state, app_id, app_id, &current).await?;
+        if current.status != container_runtime_api::ContainerRuntimeStatus::Running {
+            // Some runtimes return a retained stopped container rather than
+            // None. Only actual read-only compute observation permits wake.
+            return Self::verify_without_address(state, app_id).await;
+        }
+        Ok(VerifiedDevBuilder::Present(Box::new(current)))
+    }
+
+    /// A missing Pod lookup can hide a retained controller. Its actual replica
+    /// observation must agree with bound captures before and after the read.
+    async fn verify_without_address(
+        state: &AppState,
+        app_id: &str,
+    ) -> anyhow::Result<VerifiedDevBuilder> {
+        use container_runtime_api::UserAppRuntimeReadiness;
+        use shared_types::{UserAppNoComputeState, UserappStage};
+
+        if state.userapp_store.get_application(app_id).await?.is_none() {
+            let observation = state
+                .runtime()
+                .observe_userapp_readiness(app_id, UserappStage::Dev)
+                .await?;
+            if observation == UserAppRuntimeReadiness::NotRunning(UserAppNoComputeState::Missing)
+                && state.userapp_store.get_application(app_id).await?.is_none()
+            {
+                return Ok(VerifiedDevBuilder::Absent);
+            }
+            return Err(anyhow::anyhow!(
+                "Builder exists or its absence is unconfirmed without an application lifecycle"
+            ));
+        }
+
+        let captured = super::adoption::verified_live_builder_target(state, app_id, app_id).await?;
+        let observation = state
+            .runtime()
+            .observe_userapp_readiness(app_id, UserappStage::Dev)
+            .await?;
+        let current = super::adoption::verified_live_builder_target(state, app_id, app_id).await?;
+        if captured != current {
+            return Err(anyhow::anyhow!(
+                "Builder changed while verifying missing address; retry the query"
+            ));
+        }
+        match observation {
+            UserAppRuntimeReadiness::NotRunning(UserAppNoComputeState::Missing)
+                if current.workload.is_none() =>
+            {
+                Ok(VerifiedDevBuilder::Absent)
+            }
+            UserAppRuntimeReadiness::NotRunning(UserAppNoComputeState::Stopped)
+                if current.workload.is_some() && current.pod.is_none() =>
+            {
+                Ok(VerifiedDevBuilder::Stopped)
+            }
+            UserAppRuntimeReadiness::NotRunning(
+                UserAppNoComputeState::Starting
+                | UserAppNoComputeState::Stopping
+                | UserAppNoComputeState::Failed,
+            ) if current.workload.is_some() => Ok(VerifiedDevBuilder::NotAddressable),
+            UserAppRuntimeReadiness::Running(target)
+                if readiness_matches_capture(&target, &current) =>
+            {
+                // The separate runtime query found compute, while discovery
+                // still lacks its structured address. Keep retry semantics.
+                Ok(VerifiedDevBuilder::NotAddressable)
+            }
+            UserAppRuntimeReadiness::NotRunning(
+                UserAppNoComputeState::Missing
+                | UserAppNoComputeState::Starting
+                | UserAppNoComputeState::Stopping
+                | UserAppNoComputeState::Stopped
+                | UserAppNoComputeState::Failed
+                | UserAppNoComputeState::Unknown,
+            )
+            | UserAppRuntimeReadiness::Running(_) => Err(anyhow::anyhow!(
+                "Builder absence or readiness observation does not match the captured identity"
+            )),
+        }
+    }
+}
+
+fn readiness_matches_capture(
+    observed: &container_runtime_api::UserAppReadinessTarget,
+    captured: &shared_types::BuilderControlTarget,
+) -> bool {
+    use container_runtime_api::UserAppReadinessInstance;
+    if observed.app_id != captured.context.app_id
+        || observed.stage != shared_types::UserappStage::Dev
+    {
+        return false;
+    }
+    match &observed.instance {
+        UserAppReadinessInstance::Docker { container_id, .. } => {
+            captured.pod.is_none()
+                && captured.workload.as_ref().is_some_and(|workload| {
+                    workload.kind == shared_types::AppResourceKind::Container
+                        && workload.uid == *container_id
+                })
+        }
+        UserAppReadinessInstance::Kubernetes {
+            pod_uid, owner_uid, ..
+        } => {
+            captured.pod.as_ref().is_some_and(|pod| pod.uid == *pod_uid)
+                && captured.workload.as_ref().is_some_and(|workload| {
+                    workload.kind == shared_types::AppResourceKind::StatefulSet
+                        && workload.uid == *owner_uid
+                })
+        }
     }
 }
 
@@ -43,28 +201,39 @@ impl shared_types::UserappDevLocator for UserappDevLocator {
 
     async fn dev_logs_file_server_addr(&self, app_id: &str) -> Result<String, String> {
         let state = self.state()?;
-        let actual = state
-            .runtime()
-            .find_container(app_id, &ServiceType::UserappBuilder)
+        let observed = self
+            .verified_builder(&state, app_id)
             .await
-            .map_err(|error| format!("observe development log container: {error}"))?
-            .ok_or_else(|| format!("Development container for app {app_id} does not exist; its file logs are currently unavailable"))?;
-        super::validate_builder_identity(app_id, &actual).map_err(|error| error.to_string())?;
+            .map_err(|error| format!("observe development log container: {error:#}"))?;
+        let actual = match observed {
+            VerifiedDevBuilder::Present(actual) => actual,
+            VerifiedDevBuilder::Absent => {
+                return Err(format!(
+                    "Development container for app {app_id} does not exist; its file logs are currently unavailable"
+                ));
+            }
+            VerifiedDevBuilder::Stopped | VerifiedDevBuilder::NotAddressable => {
+                return Err(format!(
+                    "Development container for app {app_id} is not running; its file logs are currently unavailable"
+                ));
+            }
+        };
         if actual.status != container_runtime_api::ContainerRuntimeStatus::Running {
             return Err(format!(
                 "Development container for app {app_id} is not running; its file logs are currently unavailable"
             ));
         }
-        super::adoption::verify_live_builder(&state, app_id, app_id, &actual.container_id)
-            .await
-            .map_err(|error| format!("verify development log container identity: {error:#}"))?;
         let info = state
             .runtime()
             .get_container_info_by_identifier(app_id, &ServiceType::UserappBuilder)
             .await
             .map_err(|error| format!("observe development file-server address: {error}"))?
             .ok_or_else(|| format!("Development file-server for app {app_id} is unavailable"))?;
-        if info.container_id != actual.container_id || info.workload_uid != actual.workload_uid {
+        if info.container_id != actual.container_id
+            || info.container_name != actual.container_name
+            || info.workload_uid != actual.workload_uid
+            || info.container_ip != actual.container_ip
+        {
             return Err(
                 "Development container changed while locating logs; retry the query".into(),
             );
@@ -74,12 +243,15 @@ impl shared_types::UserappDevLocator for UserappDevLocator {
 
     async fn dev_container_alive(&self, app_id: &str) -> Result<bool, String> {
         let state = self.state()?;
-        state
-            .runtime()
-            .find_container(app_id, &ServiceType::UserappBuilder)
+        self.verified_builder(&state, app_id)
             .await
-            .map(|found| found.is_some())
-            .map_err(|e| format!("find UserappBuilder (app {app_id}): {e}"))
+            .map(|found| match found {
+                VerifiedDevBuilder::Absent => false,
+                VerifiedDevBuilder::Stopped
+                | VerifiedDevBuilder::NotAddressable
+                | VerifiedDevBuilder::Present(_) => true,
+            })
+            .map_err(|e| format!("find UserappBuilder (app {app_id}): {e:#}"))
     }
 }
 
@@ -97,23 +269,32 @@ impl shared_types::UserappDevEnsure for UserappDevLocator {
                 app_id: app_id.to_string(),
                 detail: error,
             })?;
-        let found = state
-            .runtime()
-            .find_container(app_id, &ServiceType::UserappBuilder)
+        let found = self
+            .verified_builder(&state, app_id)
             .await
             .map_err(|error| shared_types::DevEnsureError::ObserveFailed {
                 app_id: app_id.to_string(),
-                detail: format!("find UserappBuilder: {error}"),
+                detail: format!("verify UserappBuilder: {error:#}"),
             })?;
-        let Some(info) = found else {
-            return Ok(None);
+        let info = match found {
+            VerifiedDevBuilder::Absent | VerifiedDevBuilder::Stopped => return Ok(None),
+            VerifiedDevBuilder::NotAddressable => {
+                return Err(shared_types::DevEnsureError::NotReady {
+                    app_id: app_id.to_string(),
+                    detail: "builder compute is present without a verified discovery address"
+                        .into(),
+                });
+            }
+            VerifiedDevBuilder::Present(info) => info,
         };
-        if info.container_ip.is_empty() {
+        if info.status != container_runtime_api::ContainerRuntimeStatus::Running
+            || info.container_ip.is_empty()
+        {
             // 权威存在但无地址（Pending/重启窗口）：不可拨流也不可 ensure 绕过，
             // 交调用方等待语义（P0 总预算内重试）。
             return Err(shared_types::DevEnsureError::NotReady {
                 app_id: app_id.to_string(),
-                detail: format!("builder present without address (status {:?})", info.status),
+                detail: format!("builder is not addressable (status {:?})", info.status),
             });
         }
         Ok(Some(shared_types::DevBuilderInstance {

@@ -274,6 +274,7 @@ pub(super) struct GenerationControl {
     pub(super) state: Arc<ServerState>,
     pub(super) generation: String,
     pub(super) standby_root: std::path::PathBuf,
+    pub(super) scope: Option<runtime_supervisor::SessionScope>,
 }
 
 #[async_trait::async_trait]
@@ -294,6 +295,15 @@ impl runtime_supervisor::WorkerControl for GenerationControl {
             self.ready(),
             "business control generation is no longer current"
         );
+        let request_id = self
+            .state
+            .native_control_blocker()
+            .map(|(operation, _)| operation)
+            .context("native Stop preparation has no captured control request")?;
+        let scope = self
+            .scope
+            .clone()
+            .context("native Stop preparation has no captured business scope")?;
         self.state.cancel_auxiliary_writes()?;
         self.state
             .wait_auxiliary_writes(deadline)
@@ -305,15 +315,15 @@ impl runtime_supervisor::WorkerControl for GenerationControl {
             })?;
         // This is called before the native control closes its generation gate.
         // Do not queue another control request: the native handler owns that queue.
-        if let Some(host) = tokio::time::timeout_at(
-            deadline,
-            crate::supervisord_host::SupervisordHost::from_env(),
-        )
-        .await??
+        if let Some(host) =
+            crate::supervisord_host::SupervisordHost::from_env_until(deadline).await?
         {
             host.drain_entry_until(&self.standby_root, deadline).await?;
         } else {
-            crate::supervisor::resident::publish_standby_until(deadline).await?;
+            crate::supervisor::resident::publish_standby_for_captured_scope_until(
+                deadline, request_id, scope,
+            )
+            .await?;
         }
         anyhow::ensure!(
             self.ready(),

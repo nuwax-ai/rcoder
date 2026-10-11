@@ -374,17 +374,24 @@ async fn execute_reload(
             confirmation: None,
         };
         claim.running(data.clone())?;
-        if let Some(host) = crate::supervisord_host::SupervisordHost::from_env().await? {
+        let deadline = tokio::time::Instant::now() + admin_probe::CONFIRM_BUDGET;
+        if let Some(host) =
+            crate::supervisord_host::SupervisordHost::from_env_until(deadline).await?
+        {
             host.replace_official_with_cancel(
                 &crate::proxy::compiler::runtime_root(&state.log_dir),
                 &outcome,
-                tokio::time::Instant::now() + admin_probe::CONFIRM_BUDGET,
+                deadline,
                 Some(&writer.cancellation()),
             )
             .await?;
         } else {
-            crate::supervisor::resident::reload_with_cancel(&outcome, &writer.cancellation())
-                .await?;
+            crate::supervisor::resident::reload_with_cancel(
+                &outcome,
+                &writer.cancellation(),
+                deadline,
+            )
+            .await?;
         }
         anyhow::ensure!(
             !writer.cancellation().is_cancelled(),
@@ -588,7 +595,10 @@ async fn compile(state: &AppState) -> anyhow::Result<CompileOutcome> {
         &crate::proxy::compiler::runtime_root(&state.log_dir),
         &state.pingap_bin,
         &release,
-        context.dev_profile,
+        crate::startup_probe::StartupContext {
+            dev_profile: context.dev_profile,
+            host: state.server.log_layout().into(),
+        },
     )
     .await
 }

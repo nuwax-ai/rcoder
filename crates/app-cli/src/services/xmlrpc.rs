@@ -11,6 +11,20 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use roxmltree::Node;
 
+#[path = "xmlrpc_deadline.rs"]
+mod deadline;
+#[cfg(test)]
+#[path = "xmlrpc_deadline_tests.rs"]
+mod deadline_tests;
+
+pub(crate) fn require_deadline_budget(method: &str, until: tokio::time::Instant) -> Result<()> {
+    deadline::require_budget(method, until)
+}
+
+pub(crate) fn is_before_dispatch(error: &anyhow::Error) -> bool {
+    error.is::<deadline::BeforeDispatch>()
+}
+
 /// A parsed RPC fault is a completed response, distinct from lost or malformed replies.
 #[derive(Debug)]
 struct RpcFault(serde_json::Value);
@@ -205,8 +219,25 @@ fn decode_reload_changes(value: serde_json::Value) -> Result<ReloadChanges> {
     })
 }
 
+#[derive(Clone)]
 pub(crate) struct SupervisorClient {
     socket: std::path::PathBuf,
+    #[cfg(test)]
+    dispatch_hook: Option<std::sync::Arc<TestDispatchHook>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DispatchHookPhase {
+    BeforeAttempt,
+    AfterAttempt,
+}
+
+#[cfg(test)]
+struct TestDispatchHook {
+    phase: DispatchHookPhase,
+    reached: tokio::sync::Barrier,
+    release: tokio::sync::Barrier,
 }
 
 /// Evidence for the instance launched into a newly added program group.
@@ -216,33 +247,69 @@ pub(crate) struct RunningProcess {
     pub started: i64,
 }
 
+#[derive(Clone, Copy)]
+enum RpcAccess {
+    Observation,
+    Mutation,
+    Cleanup,
+}
+
 impl SupervisorClient {
     pub(crate) fn new(socket: impl Into<std::path::PathBuf>) -> Self {
         Self {
             socket: socket.into(),
+            #[cfg(test)]
+            dispatch_hook: None,
         }
     }
 
-    /// 连通性探测（supervisor.getVersion → 版本串）。
+    fn default_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_secs(60)
+    }
+
     pub(crate) async fn ping(&self) -> Result<String> {
-        let value = self.call("supervisor.getVersion", &[]).await?;
-        value
+        self.ping_until(Self::default_deadline()).await
+    }
+
+    pub(crate) async fn ping_until(&self, until: tokio::time::Instant) -> Result<String> {
+        self.call_until("supervisor.getVersion", &[], until, RpcAccess::Observation)
+            .await?
             .as_str()
             .map(str::to_string)
-            .ok_or_else(|| anyhow!("getVersion returned non-string: {value}"))
+            .context("getVersion returned non-string")
     }
 
-    /// reloadConfig（即 supervisorctl reread）：返回变更组列表
-    /// `[[added, changed, removed]]`；reread 本身不会更新运行中的组。
     pub(crate) async fn reload_config(&self) -> Result<ReloadChanges> {
-        let value = self.call("supervisor.reloadConfig", &[]).await?;
-        decode_reload_changes(value)
+        self.reload_config_until(Self::default_deadline()).await
     }
 
-    /// addProcessGroup：把 reloadConfig 发现的新组加入托管（返回 false=已存在）。
+    pub(crate) async fn reload_config_until(
+        &self,
+        until: tokio::time::Instant,
+    ) -> Result<ReloadChanges> {
+        decode_reload_changes(
+            self.call_until("supervisor.reloadConfig", &[], until, RpcAccess::Mutation)
+                .await?,
+        )
+    }
+
     pub(crate) async fn add_process_group(&self, group: &str) -> Result<bool> {
+        self.add_process_group_until(group, Self::default_deadline())
+            .await
+    }
+
+    pub(crate) async fn add_process_group_until(
+        &self,
+        group: &str,
+        until: tokio::time::Instant,
+    ) -> Result<bool> {
         let value = match self
-            .call("supervisor.addProcessGroup", &[group.into()])
+            .call_until(
+                "supervisor.addProcessGroup",
+                &[group.into()],
+                until,
+                RpcAccess::Mutation,
+            )
             .await
         {
             Ok(value) => value,
@@ -252,7 +319,7 @@ impl SupervisorClient {
                         && fault.0.get("faultCode").and_then(serde_json::Value::as_i64) == Some(90)
                 }) =>
             {
-                let info = self.process_info(group).await?;
+                let info = self.process_info_until(group, until).await?;
                 info.checked_state(group)?;
                 return Ok(false);
             }
@@ -265,31 +332,61 @@ impl SupervisorClient {
         Ok(true)
     }
 
-    /// stopProcessGroup + removeProcessGroup：停并摘除托管（幂等，组不存在容忍）。
     pub(crate) async fn stop_remove_group(&self, group: &str) -> Result<()> {
+        self.stop_remove_group_until(group, Self::default_deadline())
+            .await
+    }
+
+    pub(crate) async fn stop_remove_group_until(
+        &self,
+        group: &str,
+        until: tokio::time::Instant,
+    ) -> Result<()> {
         match self
-            .call("supervisor.stopProcessGroup", &[group.into()])
+            .call_until(
+                "supervisor.stopProcessGroup",
+                &[group.into()],
+                until,
+                RpcAccess::Cleanup,
+            )
             .await
         {
             Ok(_) => {}
-            // 组不存在（已移除）→ 跳过 remove
-            Err(e) if is_no_such_process(&e) => return Ok(()),
-            Err(e) => return Err(e),
+            Err(error) if is_no_such_process(&error) => return Ok(()),
+            Err(error) => return Err(error),
         }
         match self
-            .call("supervisor.removeProcessGroup", &[group.into()])
+            .call_until(
+                "supervisor.removeProcessGroup",
+                &[group.into()],
+                until,
+                RpcAccess::Cleanup,
+            )
             .await
         {
             Ok(_) => Ok(()),
-            Err(e) if is_no_such_process(&e) => Ok(()),
-            Err(e) => Err(e),
+            Err(error) if is_no_such_process(&error) => Ok(()),
+            Err(error) => Err(error),
         }
     }
 
-    /// startProcess（wait=true：等待 startsecs 通过才返回——编排的顺序控制点）。
     pub(crate) async fn start_process_wait(&self, name: &str) -> Result<()> {
+        self.start_process_wait_until(name, Self::default_deadline())
+            .await
+    }
+
+    pub(crate) async fn start_process_wait_until(
+        &self,
+        name: &str,
+        until: tokio::time::Instant,
+    ) -> Result<()> {
         let value = self
-            .call("supervisor.startProcess", &[name.into(), true.into()])
+            .call_until(
+                "supervisor.startProcess",
+                &[name.into(), true.into()],
+                until,
+                RpcAccess::Mutation,
+            )
             .await?;
         anyhow::ensure!(
             value.as_bool() == Some(true),
@@ -299,7 +396,16 @@ impl SupervisorClient {
     }
 
     pub(crate) async fn running_process(&self, name: &str) -> Result<RunningProcess> {
-        let info = self.process_info(name).await?;
+        self.running_process_until(name, Self::default_deadline())
+            .await
+    }
+
+    pub(crate) async fn running_process_until(
+        &self,
+        name: &str,
+        until: tokio::time::Instant,
+    ) -> Result<RunningProcess> {
+        let info = self.process_info_until(name, until).await?;
         anyhow::ensure!(
             info.checked_state(name)? == SupervisorProcessState::Running,
             "supervisord program {name} is not RUNNING"
@@ -307,89 +413,163 @@ impl SupervisorClient {
         info.running_identity()
     }
 
-    pub(crate) async fn process_info(&self, name: &str) -> Result<SupervisordProcessInfo> {
+    pub(crate) async fn process_info_until(
+        &self,
+        name: &str,
+        until: tokio::time::Instant,
+    ) -> Result<SupervisordProcessInfo> {
         serde_json::from_value(
-            self.call("supervisor.getProcessInfo", &[name.into()])
-                .await?,
+            self.call_until(
+                "supervisor.getProcessInfo",
+                &[name.into()],
+                until,
+                RpcAccess::Observation,
+            )
+            .await?,
         )
         .context("decode supervisord process identity")
     }
 
-    /// getAllProcessInfo：每组一行状态（类型化 [`SupervisordProcessInfo`]，
-    /// 传输边界解析——消费方不按字符串键掏 Value）。
-    pub(crate) async fn get_all_process_info(&self) -> Result<Vec<SupervisordProcessInfo>> {
-        let value = self.call("supervisor.getAllProcessInfo", &[]).await?;
-        let rows = value
-            .as_array()
-            .cloned()
-            .ok_or_else(|| anyhow!("getAllProcessInfo returned non-array: {value}"))?;
-        rows.into_iter()
-            .map(|row| serde_json::from_value(row).context("decode supervisord process info"))
-            .collect()
+    pub(crate) async fn get_all_process_info_until(
+        &self,
+        until: tokio::time::Instant,
+    ) -> Result<Vec<SupervisordProcessInfo>> {
+        let value = self
+            .call_until(
+                "supervisor.getAllProcessInfo",
+                &[],
+                until,
+                RpcAccess::Observation,
+            )
+            .await?;
+        serde_json::from_value(value).context("decode supervisord process info")
     }
 
-    /// 执行一次 XML-RPC 调用（HTTP/1.1 POST /RPC2 over unix socket）。
-    async fn call(&self, method: &str, params: &[serde_json::Value]) -> Result<serde_json::Value> {
+    /// Exact shutdown may wait for a previously dispatched command; ordinary
+    /// writes reject a busy fence instead of forming a request queue.
+    pub(crate) async fn wait_mutations_until(&self, until: tokio::time::Instant) -> Result<()> {
+        #[cfg(unix)]
+        return deadline::wait(&self.socket, until).await;
+        #[cfg(not(unix))]
+        {
+            let _ = until;
+            Ok(())
+        }
+    }
+
+    pub(crate) fn mutations_pending() -> Result<bool> {
+        #[cfg(unix)]
+        return deadline::pending(&default_socket_path());
+        #[cfg(not(unix))]
+        Ok(false)
+    }
+
+    async fn call_until(
+        &self,
+        method: &'static str,
+        params: &[serde_json::Value],
+        until: tokio::time::Instant,
+        access: RpcAccess,
+    ) -> Result<serde_json::Value> {
+        deadline::require_budget(method, until)?;
         let body = build_request(method, params);
         let request = format!(
             "POST /RPC2 HTTP/1.1\r\nHost: supervisor\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         ) + &body;
-
-        let response =
-            tokio::time::timeout(std::time::Duration::from_secs(60), self.transport(&request))
-                .await
-                .map_err(|_| anyhow!("supervisord {method} response deadline exceeded"))
-                .and_then(|result| result)
-                .map_err(|error| {
-                    if matches!(
-                        method,
-                        "supervisor.getVersion"
-                            | "supervisor.getAllProcessInfo"
-                            | "supervisor.getProcessInfo"
-                    ) {
+        match access {
+            RpcAccess::Observation => {
+                let response = tokio::time::timeout_at(until, self.transport(&request))
+                    .await
+                    .with_context(|| {
+                        format!("supervisord {method} observation deadline exceeded")
+                    })??;
+                deadline::require_budget(method, until)?;
+                decode_response(&response)
+            }
+            RpcAccess::Mutation | RpcAccess::Cleanup => {
+                let fence = deadline::fence(&self.socket)?;
+                let permit = match access {
+                    RpcAccess::Observation => return Err(anyhow!("observation cannot acquire a mutation fence")),
+                    RpcAccess::Mutation => deadline::MutationPermit::Exclusive(fence.try_write_owned().map_err(|_| deadline::BeforeDispatch(
+                        format!("supervisord {method} not dispatched: prior mutation has not settled")))?),
+                    RpcAccess::Cleanup => deadline::MutationPermit::Cleanup(tokio::time::timeout_at(until, fence.read_owned()).await
+                        .map_err(|_| crate::supervisor::ShutdownUnconfirmed(
+                            format!("supervisord {method} prior startup/config mutation has not settled before cleanup deadline")))?),
+                };
+                deadline::require_budget(method, until)?;
+                let dispatched = std::sync::Arc::new(deadline::DispatchState::new());
+                let _caller_dispatch = deadline::CallerDispatchGuard(dispatched.clone());
+                let task_dispatched = dispatched.clone();
+                let client = self.clone();
+                // The actual owner capability remains retained while a delayed
+                // supervisor response can still represent an executing write.
+                let owner = crate::supervisor::resident::owner_scope()?;
+                let (send, receive) = tokio::sync::oneshot::channel();
+                tokio::spawn(async move {
+                    let result = client
+                        .transport_mutation(&request, until, &task_dispatched)
+                        .await
+                        .and_then(|response| decode_response(&response));
+                    // This only settles physical RPC ownership. It never commits
+                    // a publication or changes the expired request's result.
+                    if let Err(error) = &result {
+                        tracing::warn!(method, dispatched = task_dispatched.attempting(), error = %shared_types::sanitize_error_text(&format!("{error:#}")), "supervisord retained mutation response settled with error");
+                    }
+                    // The next acknowledged phase may run on another executor
+                    // immediately after send; settle its physical fence first.
+                    permit.release();
+                    drop(owner);
+                    if send.send(result).is_err() {
+                        tracing::debug!(
+                            method,
+                            "supervisord late response settled after request completion"
+                        );
+                    }
+                });
+                let mut result = match tokio::time::timeout_at(until, receive).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => {
+                        Err(anyhow!("supervisord retained mutation task lost: {error}"))
+                    }
+                    Err(_) => Err(anyhow!("supervisord {method} response deadline exceeded")),
+                };
+                if tokio::time::Instant::now() >= until
+                    && !result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|error| error.is::<deadline::BeforeDispatch>())
+                {
+                    let detail = match result {
+                        Ok(_) => "completed response arrived after the deadline".to_string(),
+                        Err(error) => format!("{error:#}"),
+                    };
+                    // Keep the actual reason as text, while an already-expired
+                    // late RpcFault cannot erase the caller's deadline outcome.
+                    result = Err(anyhow!(
+                        "supervisord {method} response was not accepted before request deadline: {detail}"
+                    ));
+                }
+                let sent = dispatched.expire_pending()?;
+                result.map_err(|error| {
+                    if is_confirmed_fault(&error) || error.is::<deadline::BeforeDispatch>() {
                         error
-                    } else {
+                    } else if sent {
                         crate::supervisor::ShutdownUnconfirmed(format!(
                             "supervisord {method} outcome unknown: {error:#}"
                         ))
                         .into()
+                    } else {
+                        deadline::BeforeDispatch(format!(
+                            "supervisord {method} not dispatched: {error:#}"
+                        ))
+                        .into()
                     }
-                })?;
-        let text = String::from_utf8_lossy(&response);
-        let outcome = split_body(&text)
-            .ok_or_else(|| {
-                anyhow!(
-                    "malformed XML-RPC response (no body split): {}",
-                    truncate(&text, 200)
-                )
-            })
-            .and_then(parse_response);
-        outcome.map_err(|error| {
-            if matches!(
-                method,
-                "supervisor.getVersion"
-                    | "supervisor.getAllProcessInfo"
-                    | "supervisor.getProcessInfo"
-            ) || (error
-                .downcast_ref::<RpcFault>()
-                .is_some_and(RpcFault::is_complete))
-            {
-                // A rejected start may already have run child processes. The caller must
-                // still stop and confirm all dynamic groups before restoring directories.
-                error
-            } else {
-                crate::supervisor::ShutdownUnconfirmed(format!(
-                    "supervisord {method} did not confirm completion: {error:#}"
-                ))
-                .into()
+                })
             }
-        })
+        }
     }
 
-    /// unix socket 传输。tokio 的 UnixStream 仅 unix 存在——Windows 编译不过，
-    /// 平台分叉：非 unix 防御性报错（正常路径到不了这里：`socket_exists()`
-    /// 恒 false → `SupervisordHost::detect()` 返回 None → builtin 引擎接管）。
     #[cfg(unix)]
     async fn transport(&self, request: &str) -> Result<Vec<u8>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -402,6 +582,53 @@ impl SupervisorClient {
         Ok(response)
     }
 
+    #[cfg(unix)]
+    async fn transport_mutation(
+        &self,
+        request: &str,
+        until: tokio::time::Instant,
+        dispatched: &deadline::DispatchState,
+    ) -> Result<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream =
+            tokio::time::timeout_at(until, tokio::net::UnixStream::connect(&self.socket))
+                .await
+                .map_err(|_| deadline::before_dispatch("connect"))??;
+        #[cfg(test)]
+        self.dispatch_stage(DispatchHookPhase::BeforeAttempt).await;
+        dispatched.begin_attempt()?;
+        #[cfg(test)]
+        self.dispatch_stage(DispatchHookPhase::AfterAttempt).await;
+        deadline::require_budget("write", until)?;
+        let write = tokio::time::timeout_at(until, stream.write_all(request.as_bytes()))
+            .await
+            .context("supervisord mutation request write deadline exceeded")
+            .and_then(|result| result.context("supervisord mutation request write failed"));
+        if let Err(write_error) = &write {
+            // A partial Content-Length frame cannot be completed after admission
+            // expires. End its write half so a healthy server observes EOF and
+            // can reject it; keep reading the original reply, never resend.
+            stream.shutdown().await.with_context(|| {
+                format!("close partial supervisord request write half: {write_error:#}")
+            })?;
+        }
+        // Do not add a cleanup budget or cancel a full/partial dispatched request
+        // when its caller expires. A retry/Shutdown waits this exact socket task.
+        let mut response = Vec::new();
+        if let Err(read) = stream.read_to_end(&mut response).await {
+            return Err(read).context(match write {
+                Ok(()) => "supervisord dispatched mutation response read failed".to_string(),
+                Err(write) => format!("supervisord potentially partial mutation: {write:#}"),
+            });
+        }
+        if response.is_empty()
+            && let Err(write) = write
+        {
+            return Err(write);
+        }
+        Ok(response)
+    }
+
     #[cfg(not(unix))]
     async fn transport(&self, _request: &str) -> Result<Vec<u8>> {
         anyhow::bail!(
@@ -409,6 +636,38 @@ impl SupervisorClient {
             self.socket.display()
         )
     }
+
+    #[cfg(not(unix))]
+    async fn transport_mutation(
+        &self,
+        _request: &str,
+        _until: tokio::time::Instant,
+        _dispatched: &deadline::DispatchState,
+    ) -> Result<Vec<u8>> {
+        self.transport("").await
+    }
+
+    #[cfg(test)]
+    async fn dispatch_stage(&self, phase: DispatchHookPhase) {
+        if let Some(hook) = &self.dispatch_hook
+            && hook.phase == phase
+        {
+            hook.reached.wait().await;
+            hook.release.wait().await;
+        }
+    }
+}
+
+fn decode_response(response: &[u8]) -> Result<serde_json::Value> {
+    let text = String::from_utf8_lossy(response);
+    split_body(&text)
+        .ok_or_else(|| {
+            anyhow!(
+                "malformed XML-RPC response (no body split): {}",
+                truncate(&text, 200)
+            )
+        })
+        .and_then(parse_response)
 }
 
 /// 按标签名取首个子元素（roxmltree Children 无 find_element 便捷方法）。
@@ -575,282 +834,4 @@ pub(crate) fn socket_exists() -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn request_envelope_shape() {
-        let xml = build_request(
-            "supervisor.startProcess",
-            &["app-svc-web".into(), true.into()],
-        );
-        assert!(xml.contains("<methodName>supervisor.startProcess</methodName>"));
-        assert!(xml.contains("<string>app-svc-web</string>"));
-        assert!(xml.contains("<boolean>1</boolean>"));
-        assert!(!xml.contains('&'));
-    }
-
-    #[test]
-    fn escapes_xml_specials_in_params() {
-        let xml = build_request("m", &["a<b&c".into()]);
-        assert!(xml.contains("a&lt;b&amp;c"));
-    }
-
-    #[test]
-    fn parses_scalar_and_fault() {
-        let ok = parse_response(
-            r#"<?xml version="1.0"?><methodResponse><params><param><value><string>4.2.5</string></value></param></params></methodResponse>"#,
-        )
-        .unwrap();
-        assert_eq!(ok, serde_json::Value::String("4.2.5".into()));
-
-        let fault = parse_response(
-            r#"<?xml version="1.0"?><methodResponse><fault><value><struct><member><name>faultString</name><value><string>no process group named 'x'</string></value></member></struct></value></fault></methodResponse>"#,
-        )
-        .unwrap_err();
-        // 契约 C5: 判据仅 faultCode==10——无结构化码的 fault 不算 NoSuchProcess
-        //（旧 faultString 兜底已按批准需求删除）。
-        assert!(!is_no_such_process(&fault));
-    }
-
-    #[test]
-    fn no_such_process_classifies_only_by_fault_code() {
-        // T004 反例（修复前必挂）: faultString 含 BAD_NAME/no process group
-        // 不得再驱动分类; 官方码 faultCode==10 才是 NoSuchProcess。
-        let fault_code_10 = parse_response(
-            r#"<?xml version="1.0"?><methodResponse><fault><value><struct><member><name>faultCode</name><value><int>10</int></value></member><member><name>faultString</name><value><string>no such process</string></value></member></struct></value></fault></methodResponse>"#,
-        )
-        .unwrap_err();
-        assert!(is_no_such_process(&fault_code_10));
-
-        let fault_code_50_with_bad_name = parse_response(
-            r#"<?xml version="1.0"?><methodResponse><fault><value><struct><member><name>faultCode</name><value><int>50</int></value></member><member><name>faultString</name><value><string>BAD_NAME: app-svc-web</string></value></member></struct></value></fault></methodResponse>"#,
-        )
-        .unwrap_err();
-        assert!(
-            !is_no_such_process(&fault_code_50_with_bad_name),
-            "faultCode=50 按官方码不是 NoSuchProcess, 文案含 BAD_NAME 不得误判"
-        );
-    }
-
-    #[test]
-    fn parses_nested_array_of_structs() {
-        // getAllProcessInfo 形状
-        let xml = r#"<?xml version="1.0"?>
-<methodResponse><params><param><value><array><data>
-<value><struct>
-  <member><name>name</name><value><string>app-svc-web</string></value></member>
-  <member><name>statename</name><value><string>RUNNING</string></value></member>
-  <member><name>pid</name><value><int>42</int></value></member>
-  <member><name>exitstatus</name><value><int>0</int></value></member>
-</struct></value>
-</data></array></value></param></params></methodResponse>"#;
-        let value = parse_response(xml).unwrap();
-        let arr = value.as_array().unwrap();
-        assert_eq!(arr[0]["name"], "app-svc-web");
-        assert_eq!(arr[0]["pid"], 42);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn rpc_fault_distinguishes_completed_start_failure_from_unknown_mutation() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let root = tempfile::tempdir().unwrap();
-        let socket = root.path().join("supervisor.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let fault = r#"<methodResponse><fault><value><struct><member><name>faultCode</name><value><int>50</int></value></member><member><name>faultString</name><value><string>SPAWN_ERROR: app-svc-web</string></value></member></struct></value></fault></methodResponse>"#;
-        let server = tokio::spawn(async move {
-            for body in [fault, "malformed XML", fault, "lost read response"] {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut byte = [0];
-                    stream.read_exact(&mut byte).await.unwrap();
-                    request.push(byte[0]);
-                    if request.ends_with(b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let header = String::from_utf8(request).unwrap();
-                let length: usize = header
-                    .lines()
-                    .find_map(|line| line.strip_prefix("Content-Length: "))
-                    .unwrap()
-                    .parse()
-                    .unwrap();
-                stream.read_exact(&mut vec![0; length]).await.unwrap();
-                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-            }
-        });
-        let client = SupervisorClient::new(socket);
-        let error = client.start_process_wait("app-svc-web").await.unwrap_err();
-        assert!(
-            error
-                .downcast_ref::<crate::supervisor::ShutdownUnconfirmed>()
-                .is_none(),
-            "Completed start fault must permit the caller's stop-and-confirm recovery: {error:#}"
-        );
-        assert!(error.to_string().contains("SPAWN_ERROR"));
-        let malformed = client.start_process_wait("app-svc-web").await.unwrap_err();
-        assert!(
-            malformed
-                .downcast_ref::<crate::supervisor::ShutdownUnconfirmed>()
-                .is_some()
-        );
-        let stop = client.stop_remove_group("app-svc-web").await.unwrap_err();
-        assert!(
-            stop.downcast_ref::<crate::supervisor::ShutdownUnconfirmed>()
-                .is_none(),
-            "a complete stop fault is a rejection, not a lost response"
-        );
-        let read = client.running_process("app-svc-worker").await.unwrap_err();
-        assert!(
-            read.downcast_ref::<crate::supervisor::ShutdownUnconfirmed>()
-                .is_none(),
-            "an observation failure must not invent an in-flight mutation"
-        );
-        server.await.unwrap();
-    }
-
-    #[test]
-    fn splits_http_body() {
-        let raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        assert_eq!(split_body(raw), Some("hello"));
-        assert_eq!(split_body("garbage"), None);
-    }
-}
-
-#[cfg(test)]
-mod r11_tests {
-    use super::*;
-
-    fn fault(code: i64, message: &str) -> anyhow::Error {
-        RpcFault(serde_json::json!({"faultCode": code, "faultString": message})).into()
-    }
-
-    /// R11 反例：typed 分类——判据仅 `faultCode == 10`（契约 C5）。
-    /// 网络错误文案恰含 "no process group" 不再被误判为"不存在"；
-    /// 非 10 码即使 faultString 含 BAD_NAME 也按官方码分类（措辞兜底已删除）；
-    /// malformed fault（缺字段）不判为不存在。
-    #[test]
-    fn no_such_process_classification_is_typed() {
-        // faultCode 10（BAD_NAME）→ 不存在
-        assert!(is_no_such_process(&fault(10, "no process group named 'x'")));
-        // faultCode 10 + 其他措辞 → 仍按官方码分类
-        assert!(is_no_such_process(&fault(10, "whatever")));
-        // 非 10 码但措辞含 BAD_NAME → 按官方码不是"不存在"（旧措辞兜底已删）
-        assert!(!is_no_such_process(&fault(1, "BAD_NAME: foo")));
-        // 非 10 码 + 无相关措辞 → 不是"不存在"
-        assert!(!is_no_such_process(&fault(6, "SHUTDOWN_STATE")));
-        // 反例：普通网络错误文案恰含关键词 → 不误判（typed 边界）
-        let network = anyhow::Error::msg("connect failed: no process group left in pool");
-        assert!(!is_no_such_process(&network));
-        // malformed fault（缺 faultCode）→ 无官方码不判为不存在
-        assert!(!is_no_such_process(
-            &RpcFault(serde_json::json!({"faultString": "unknown"})).into()
-        ));
-        assert!(!is_no_such_process(
-            &RpcFault(serde_json::Value::Null).into()
-        ));
-    }
-}
-
-#[cfg(test)]
-mod process_contract_tests {
-    use super::*;
-
-    #[test]
-    fn complete_state_contract_rejects_missing_unknown_and_conflicting_identity() {
-        let mut row = serde_json::json!({"group":"app-pingap", "name":"app-pingap", "statename":"RUNNING", "state":20, "pid":42, "start":123});
-        for (state, code) in [
-            ("STOPPED", 0),
-            ("STARTING", 10),
-            ("RUNNING", 20),
-            ("BACKOFF", 30),
-            ("STOPPING", 40),
-            ("EXITED", 100),
-            ("FATAL", 200),
-        ] {
-            row["statename"] = state.into();
-            row["state"] = code.into();
-            let info: SupervisordProcessInfo = serde_json::from_value(row.clone()).unwrap();
-            assert_eq!(info.checked_state("app-pingap").unwrap().code(), code);
-        }
-        for field in ["name", "statename", "state", "pid", "start"] {
-            let mut invalid = serde_json::json!({"group":"app-pingap", "name":"app-pingap", "statename":"RUNNING", "state":20, "pid":42, "start":123});
-            invalid.as_object_mut().unwrap().remove(field);
-            let info: SupervisordProcessInfo = serde_json::from_value(invalid).unwrap();
-            assert!(
-                info.checked_state("app-pingap").is_err(),
-                "missing {field} cannot prove running identity"
-            );
-        }
-        row["statename"] = "UNKNOWN".into();
-        row["state"] = 1000.into();
-        assert!(
-            serde_json::from_value::<SupervisordProcessInfo>(row.clone())
-                .unwrap()
-                .checked_state("app-pingap")
-                .is_err()
-        );
-        row["statename"] = "unexpected".into();
-        assert!(serde_json::from_value::<SupervisordProcessInfo>(row).is_err());
-    }
-
-    #[test]
-    fn reload_config_decodes_supervisors_actual_added_changed_removed_shape() {
-        let changes =
-            decode_reload_changes(serde_json::json!([[["new"], ["app-pingap"], ["old"]]])).unwrap();
-        assert_eq!(changes.added, ["new"]);
-        assert_eq!(changes.changed, ["app-pingap"]);
-        assert_eq!(changes.removed, ["old"]);
-        for malformed in [
-            serde_json::json!([]),
-            serde_json::json!([[[]]]),
-            serde_json::json!([[[1], [], []]]),
-            serde_json::json!([[[], [], []], [[], [], []]]),
-        ] {
-            assert!(decode_reload_changes(malformed).is_err());
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn only_complete_already_added_for_the_exact_program_is_idempotent() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let root = tempfile::tempdir().unwrap();
-        let socket = root.path().join("rpc.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(async move {
-            for body in [
-                r#"<fault><value><struct><member><name>faultCode</name><value><int>90</int></value></member><member><name>faultString</name><value><string>ALREADY_ADDED</string></value></member></struct></value></fault>"#,
-                r#"<params><param><value><struct><member><name>group</name><value><string>other</string></value></member><member><name>name</name><value><string>other</string></value></member><member><name>statename</name><value><string>STOPPED</string></value></member><member><name>state</name><value><int>0</int></value></member></struct></value></param></params>"#,
-                r#"<fault><value><struct><member><name>faultCode</name><value><int>50</int></value></member><member><name>faultString</name><value><string>ALREADY_ADDED wording but SPAWN_ERROR code</string></value></member></struct></value></fault>"#,
-            ] {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = [0; 8192];
-                assert!(stream.read(&mut request).await.unwrap() > 0);
-                let body = format!("<methodResponse>{body}</methodResponse>");
-                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
-            }
-        });
-        let client = SupervisorClient::new(socket);
-        assert!(
-            client
-                .add_process_group("app-pingap")
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("identity mismatch")
-        );
-        assert!(
-            client
-                .add_process_group("app-pingap")
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("SPAWN_ERROR")
-        );
-        server.await.unwrap();
-    }
-}
+include!("xmlrpc_tests.rs");

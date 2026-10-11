@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+pub use crate::startup_probe::{StartupContext, StartupHost};
 use anyhow::{Context, Result};
 use pingap_config::PingapConfig;
 use sha2::{Digest, Sha256};
@@ -398,6 +399,17 @@ pub async fn wait_for_file_replacements() {
     let _guard = FILE_REPLACEMENTS.clone().lock_owned().await;
 }
 
+pub(crate) async fn wait_for_file_replacements_until(deadline: tokio::time::Instant) -> Result<()> {
+    let _guard = tokio::time::timeout_at(deadline, FILE_REPLACEMENTS.clone().lock_owned())
+        .await
+        .context("proxy configuration writes remain unsettled before shutdown deadline")?;
+    Ok(())
+}
+
+pub(crate) fn file_replacements_pending() -> bool {
+    FILE_REPLACEMENTS.try_lock().is_err()
+}
+
 pub fn clear_current_confirmation() -> Result<()> {
     *CONFIRMED_PUBLICATION
         .lock()
@@ -430,21 +442,39 @@ pub async fn replace_config_bytes_until(
     bytes: Vec<u8>,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
+    replace_file_with_until(target.to_path_buf(), bytes, deadline, |target, bytes| {
+        PUBLICATION_UNCERTAIN.store(true, std::sync::atomic::Ordering::Release);
+        durable_replace(target, bytes)
+    })
+    .await
+}
+
+async fn replace_file_with_until<F>(
+    target: PathBuf,
+    bytes: Vec<u8>,
+    deadline: tokio::time::Instant,
+    writer: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path, &[u8]) -> Result<()> + Send + 'static,
+{
     let guard = tokio::time::timeout_at(deadline, FILE_REPLACEMENTS.clone().lock_owned())
         .await
         .context("file publication deadline exhausted before dispatch")?;
-    let target = target.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    let task = tokio::task::spawn_blocking(move || {
         let _guard = guard;
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
             "file publication deadline exhausted before dispatch"
         );
-        PUBLICATION_UNCERTAIN.store(true, std::sync::atomic::Ordering::Release);
-        durable_replace(&target, &bytes)
-    })
-    .await
-    .context("proxy publication task failed")?
+        writer(&target, &bytes)
+    });
+    // Expiry ends only the caller's wait. The blocking writer keeps its lease
+    // until real completion, so successors and owner retirement cannot race it.
+    tokio::time::timeout_at(deadline, task)
+        .await
+        .context("proxy file publication did not settle before its deadline")?
+        .context("proxy publication task failed")?
 }
 
 /// Generic metadata writes do not change the applied configuration state.
@@ -718,7 +748,7 @@ pub async fn compile_and_validate(
     runtime_root: &Path,
     pingap_bin: &Path,
     release: &ReleaseLock,
-    dev_profile: bool,
+    startup: StartupContext,
 ) -> Result<CompileOutcome> {
     compile_prepared(
         workspace,
@@ -726,7 +756,7 @@ pub async fn compile_and_validate(
         runtime_root,
         pingap_bin,
         release,
-        dev_profile,
+        startup,
     )
     .await
 }
@@ -740,11 +770,12 @@ pub async fn compile_prepared(
     runtime_root: &Path,
     pingap_bin: &Path,
     release: &ReleaseLock,
-    dev_profile: bool,
+    startup: StartupContext,
 ) -> Result<CompileOutcome> {
     let layout = vec![runtime_root.to_path_buf()];
     let (content, _) =
-        compile_effective_config_with_roots(read_workspace, release, &layout, dev_profile).await?;
+        compile_effective_config_with_roots(read_workspace, release, &layout, startup.dev_profile)
+            .await?;
     let mut config =
         PingapConfig::new(content.as_bytes(), true).context("decode prepared proxy graph")?;
     let publication = uuid::Uuid::new_v4().to_string();
@@ -761,13 +792,25 @@ pub async fn compile_prepared(
         write_validated_candidate(runtime_root, pingap_bin, &config, &publication, 200).await?
     };
     outcome.serving_release_id = Some(release.release_id.clone());
-    outcome.business_probes = release
+    outcome.business_probes = business_http_targets(release, startup);
+    Ok(outcome)
+}
+
+fn business_http_targets(
+    release: &ReleaseLock,
+    startup: StartupContext,
+) -> Vec<ServiceProbeTarget> {
+    release
         .services
         .iter()
         .filter(|service| {
             service.enabled
                 && service.kind == workspace_manifest::ProjectKind::Web
                 && service.proxy.is_some()
+                && matches!(
+                    crate::startup_probe::effective(service, startup),
+                    workspace_manifest::StartupProbe::Http
+                )
         })
         .map(|service| ServiceProbeTarget {
             service_id: service.service_id.clone(),
@@ -778,8 +821,7 @@ pub async fn compile_prepared(
                 service.health.readiness_path.clone()
             },
         })
-        .collect();
-    Ok(outcome)
+        .collect()
 }
 
 fn rebind_file_references(
@@ -1818,3 +1860,11 @@ addr = "0.0.0.0:9081"
         assert!(validate_plugin_paths("cache-bad", &cache_bad).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "compiler_startup_tests.rs"]
+mod startup_contract_tests;
+
+#[cfg(test)]
+#[path = "compiler_deadline_tests.rs"]
+mod file_deadline_tests;

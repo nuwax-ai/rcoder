@@ -370,31 +370,59 @@ struct OwnerResidentCleanup {
 #[async_trait::async_trait]
 impl runtime_supervisor::OwnerCleanup for OwnerResidentCleanup {
     async fn shutdown(&self) -> Result<()> {
-        if let Some(state) = self.state.upgrade() {
+        let state = self.state.upgrade();
+        let budget = state
+            .as_ref()
+            .map_or(crate::proxy::admin_probe::CONFIRM_BUDGET, |state| {
+                state.shutdown_budget(matches!(state.log_layout(), LogLayout::Supervisord))
+            });
+        let deadline = tokio::time::Instant::now() + budget;
+        if let Some(state) = state {
             state.close_admission();
-            let deadline = tokio::time::Instant::now()
-                + state.shutdown_budget(matches!(state.log_layout(), LogLayout::Supervisord));
             state.wait_auxiliary_writes(deadline).await.context(
                 "owner cannot exit while admitted configuration writes remain unsettled",
             )?;
         }
-        let _publication = crate::proxy::compiler::publication_guard().await;
-        crate::proxy::compiler::wait_for_file_replacements().await;
+        let _publication =
+            tokio::time::timeout_at(deadline, crate::proxy::compiler::publication_guard())
+                .await
+                .map_err(|error| {
+                    crate::supervisor::ShutdownUnconfirmed(format!(
+                        "owner publication control remains unsettled at shutdown deadline: {error}"
+                    ))
+                })?;
+        crate::proxy::compiler::wait_for_file_replacements_until(deadline).await?;
         if crate::services::supervisor::resident::owner_scope_root()?.is_none() {
             let session = self
                 .session
                 .upgrade()
                 .context("resident owner session unavailable")?;
-            let scope = session.resident_scope(&self.application_id).await?;
+            let scope = tokio::time::timeout_at(
+                deadline,
+                session.resident_scope(&self.application_id),
+            )
+            .await
+            .map_err(|error| {
+                crate::supervisor::ShutdownUnconfirmed(format!(
+                    "owner cleanup capability was not confirmed before its deadline: {error}"
+                ))
+            })??;
             crate::services::supervisor::resident::bind_owner(scope, &self.args)?;
         }
-        if let Some(host) = SupervisordHost::detect().await? {
+        if let Some(host) = SupervisordHost::from_env_until(deadline).await? {
             let scope = crate::services::supervisor::resident::owner_scope()?
                 .context("supervisord owner cleanup capability missing")?;
             let runtime_root = crate::proxy::compiler::runtime_root(&self.args.log_dir);
-            host.shutdown_owner_entry(&runtime_root, &scope).await?;
+            host.shutdown_owner_entry_until(&runtime_root, &scope, deadline)
+                .await?;
         }
-        crate::services::supervisor::resident::shutdown().await
+        tokio::time::timeout_at(deadline, crate::services::supervisor::resident::shutdown())
+            .await
+            .map_err(|error| {
+                crate::supervisor::ShutdownUnconfirmed(format!(
+                    "owner resident shutdown remains unconfirmed at its deadline: {error}"
+                ))
+            })?
     }
 }
 
@@ -1540,6 +1568,14 @@ pub(super) async fn finish_clean_shutdown(
             .load(std::sync::atomic::Ordering::Acquire)
             == 0,
         "configuration writes remain unsettled; shutdown cannot be acknowledged"
+    );
+    anyhow::ensure!(
+        !crate::supervisord_host::SupervisordHost::mutations_pending()?,
+        "dispatched supervisor writes remain unsettled; shutdown cannot be acknowledged"
+    );
+    anyhow::ensure!(
+        !crate::proxy::compiler::file_replacements_pending(),
+        "proxy configuration replacements remain unsettled; shutdown cannot be acknowledged"
     );
     crate::static_hosting::reconcile(&[], &args.workspace, false).await?;
     if owner_exiting {

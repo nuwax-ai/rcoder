@@ -39,6 +39,7 @@ struct Controller {
     busy: AtomicBool,
     control_pending: AtomicBool,
     fault_cleanup: std::sync::Mutex<Option<Arc<FaultCleanup>>>,
+    control_completion: std::sync::Mutex<Option<Arc<ControlCompletion>>>,
     settled: tokio::sync::Notify,
     status: AtomicU8,
     control_epoch: AtomicU64,
@@ -80,6 +81,7 @@ enum Request {
         watch_was_paused: bool,
         release_control: bool,
         publication: tokio::sync::MutexGuard<'static, ()>,
+        completion: Arc<ControlCompletion>,
         reply: oneshot::Sender<Result<()>>,
     },
     CloseEntry {
@@ -139,6 +141,7 @@ pub(crate) fn bind_owner(scope: ResidentScope, args: &RuntimeArgs) -> Result<()>
         busy: AtomicBool::new(false),
         control_pending: AtomicBool::new(false),
         fault_cleanup: std::sync::Mutex::new(None),
+        control_completion: std::sync::Mutex::new(None),
         settled: tokio::sync::Notify::new(),
         status: AtomicU8::new(ABSENT),
         control_epoch: AtomicU64::new(0),
@@ -212,23 +215,31 @@ pub(crate) async fn verify_entry_confirmation(
 }
 
 pub(crate) async fn reload(outcome: &CompileOutcome) -> Result<ConfirmedPublication> {
-    dispatch_reload(outcome, None).await
+    dispatch_reload(
+        outcome,
+        None,
+        tokio::time::Instant::now() + admin_probe::CONFIRM_BUDGET,
+    )
+    .await
 }
 
 pub(crate) async fn reload_with_cancel(
     outcome: &CompileOutcome,
     cancel: &tokio_util::sync::CancellationToken,
+    deadline: tokio::time::Instant,
 ) -> Result<ConfirmedPublication> {
-    dispatch_reload(outcome, Some(cancel.clone())).await
+    dispatch_reload(outcome, Some(cancel.clone()), deadline).await
 }
 
 async fn dispatch_reload(
     outcome: &CompileOutcome,
     cancel: Option<tokio_util::sync::CancellationToken>,
+    deadline: tokio::time::Instant,
 ) -> Result<ConfirmedPublication> {
     ensure!(
-        !cancel.as_ref().is_some_and(|token| token.is_cancelled()),
-        "proxy operation cancelled before dispatch"
+        tokio::time::Instant::now() < deadline
+            && !cancel.as_ref().is_some_and(|token| token.is_cancelled()),
+        "proxy operation expired or was cancelled before dispatch"
     );
     let owner = controller()?.context("resident reload requires an owner capability")?;
     if owner.control_pending.load(Ordering::Acquire) {
@@ -258,20 +269,49 @@ async fn dispatch_reload(
         }
     };
     drop(dispatch_gate);
+    if tokio::time::Instant::now() >= deadline {
+        owner.busy.store(false, Ordering::Release);
+        anyhow::bail!("proxy operation expired before actor dispatch");
+    }
     let (reply, result) = oneshot::channel();
     if let Err(error) = owner.tx.try_send(Request::Ensure {
         outcome: outcome.clone(),
         cancel,
-        deadline: tokio::time::Instant::now() + admin_probe::CONFIRM_BUDGET,
+        deadline,
         epoch,
         reply,
     }) {
         owner.busy.store(false, Ordering::Release);
         return Err(error).context("resident owner actor unavailable");
     }
-    result
+    // The actor retains its owned process/operation after this caller expires.
+    // A lost timely acknowledgement cannot authorize another publication.
+    receive_reload_result(deadline, result).await
+}
+
+async fn receive_reload_result<T>(
+    deadline: tokio::time::Instant,
+    result: oneshot::Receiver<Result<T>>,
+) -> Result<T> {
+    let confirmation = tokio::time::timeout_at(deadline, result)
         .await
-        .context("resident reload response unavailable")?
+        .map_err(|error| {
+            crate::supervisor::ShutdownUnconfirmed(format!(
+                "native proxy reload remains unconfirmed at its deadline: {error}"
+            ))
+        })?
+        .map_err(|error| {
+            crate::supervisor::ShutdownUnconfirmed(format!(
+                "resident reload response unavailable after dispatch: {error}"
+            ))
+        })??;
+    ensure!(
+        tokio::time::Instant::now() < deadline,
+        crate::supervisor::ShutdownUnconfirmed(
+            "resident reload acknowledgement was observed after its deadline".into()
+        )
+    );
+    Ok(confirmation)
 }
 
 pub(super) async fn ensure_resident(args: &RuntimeArgs, outcome: &CompileOutcome) -> Result<()> {
@@ -303,13 +343,33 @@ pub(crate) async fn publish_standby_for_operation_until(
     deadline: tokio::time::Instant,
     operation_id: Option<String>,
 ) -> Result<()> {
-    dispatch_standby(deadline, operation_id, None).await
+    dispatch_standby(
+        deadline,
+        operation_id,
+        None,
+        runtime_supervisor::current_scope(),
+        ControlOrigin::InProcess,
+    )
+    .await
+}
+
+pub(crate) async fn publish_standby_for_captured_scope_until(
+    deadline: tokio::time::Instant,
+    request_id: String,
+    scope: runtime_supervisor::SessionScope,
+) -> Result<()> {
+    let origin = ControlOrigin::Native {
+        request_id: request_id.clone(),
+    };
+    dispatch_standby(deadline, Some(request_id), None, Some(scope), origin).await
 }
 
 async fn dispatch_standby(
     deadline: tokio::time::Instant,
     operation_id: Option<String>,
     fault: Option<&Arc<FaultCleanup>>,
+    scope: Option<runtime_supervisor::SessionScope>,
+    origin: ControlOrigin,
 ) -> Result<()> {
     let Some(owner) = controller()? else {
         return Ok(());
@@ -328,8 +388,7 @@ async fn dispatch_standby(
     // the background writer and wait for its exact cleanup within that original
     // budget; ordinary reload requests still fail Busy and never queue.
     let mut control =
-        control_publication_until(&owner, deadline, fault, runtime_supervisor::current_scope())
-            .await?;
+        control_publication_with_origin(&owner, deadline, fault, scope, origin).await?;
     let epoch = owner.control_epoch.load(Ordering::Acquire);
     let operation_id = Some(operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
     let publication = control
@@ -344,6 +403,7 @@ async fn dispatch_standby(
         watch_was_paused: control.watch_was_paused,
         release_control: control.release_control,
         publication,
+        completion: control.completion.clone(),
         reply,
     }) {
         return Err(error).context("resident owner actor unavailable");
@@ -363,6 +423,54 @@ pub(crate) struct ControlPublication {
     owns_busy: bool,
     dispatched: bool,
     release_control: bool,
+    completion: Arc<ControlCompletion>,
+}
+
+/// In-process completion of an already-owned drain, never signal authority.
+struct ControlCompletion {
+    origin: ControlOrigin,
+    scope: Option<runtime_supervisor::SessionScope>,
+    deadline: tokio::time::Instant,
+    result: std::sync::Mutex<Option<Result<u64, String>>>,
+    settled: tokio::sync::Notify,
+}
+
+enum ControlOrigin {
+    Native { request_id: String },
+    InProcess,
+    Fault,
+}
+
+fn complete_control(
+    owner: &Controller,
+    completion: &Arc<ControlCompletion>,
+    result: Result<u64, String>,
+    release: bool,
+) -> Result<()> {
+    let mut current = owner
+        .control_completion
+        .lock()
+        .map_err(|_| unconfirmed_error(owner, "control completion lock poisoned".into()))?;
+    let failed = result.is_err();
+    *completion
+        .result
+        .lock()
+        .map_err(|_| unconfirmed_error(owner, "control outcome lock poisoned".into()))? =
+        Some(result);
+    if current
+        .as_ref()
+        .is_some_and(|held| Arc::ptr_eq(held, completion))
+    {
+        if !matches!(completion.origin, ControlOrigin::Native { .. }) || failed {
+            *current = None;
+        }
+        if release {
+            owner.control_pending.store(false, Ordering::Release);
+        }
+    }
+    drop(current);
+    completion.settled.notify_waiters();
+    Ok(())
 }
 
 struct FaultCleanup {
@@ -430,7 +538,14 @@ pub(crate) fn begin_fault_cleanup(
 
 impl FaultCleanupGuard {
     pub(crate) async fn drain(&self, deadline: tokio::time::Instant) -> Result<()> {
-        dispatch_standby(deadline, None, Some(&self.fault)).await
+        dispatch_standby(
+            deadline,
+            None,
+            Some(&self.fault),
+            self.fault.scope.clone(),
+            ControlOrigin::Fault,
+        )
+        .await
     }
     pub(crate) fn finish(mut self, result: &Result<()>) {
         self.complete(
@@ -506,6 +621,7 @@ fn claim_control(
     owner: &Controller,
     own_fault: Option<&Arc<FaultCleanup>>,
     expected: &Option<runtime_supervisor::SessionScope>,
+    completion: &Arc<ControlCompletion>,
 ) -> Result<ControlClaim> {
     let slot = owner
         .fault_cleanup
@@ -517,9 +633,19 @@ fn claim_control(
                 && slot.as_ref().is_some_and(|held| Arc::ptr_eq(held, fault)),
             "captured fault cleanup is no longer the active owner execution"
         );
+        *owner
+            .control_completion
+            .lock()
+            .map_err(|_| anyhow::anyhow!("control completion lock poisoned"))? =
+            Some(completion.clone());
         return Ok(ControlClaim::OwnFault);
     }
+    let mut active = owner
+        .control_completion
+        .lock()
+        .map_err(|_| anyhow::anyhow!("control completion lock poisoned"))?;
     if !owner.control_pending.swap(true, Ordering::AcqRel) {
+        *active = Some(completion.clone());
         return Ok(ControlClaim::Claimed);
     }
     let Some(fault) = slot.as_ref() else {
@@ -662,8 +788,13 @@ impl Drop for ControlPublication {
         if self.owns_busy {
             finish_writer(&self.owner);
         }
-        if self.release_control {
-            self.owner.control_pending.store(false, Ordering::Release);
+        if let Err(error) = complete_control(
+            &self.owner,
+            &self.completion,
+            Err("control ended before a confirmed drain".into()),
+            self.release_control,
+        ) {
+            tracing::error!(error=%format!("{error:#}"), "abandoned control completion remains unknown");
         }
         if !self.owner.stopping.load(Ordering::Acquire)
             && !self.owner.entry_closing.load(Ordering::Acquire)
@@ -686,12 +817,36 @@ async fn control_publication_until(
     own_fault: Option<&Arc<FaultCleanup>>,
     expected_scope: Option<runtime_supervisor::SessionScope>,
 ) -> Result<ControlPublication> {
+    control_publication_with_origin(
+        owner,
+        deadline,
+        own_fault,
+        expected_scope,
+        ControlOrigin::InProcess,
+    )
+    .await
+}
+
+async fn control_publication_with_origin(
+    owner: &Arc<Controller>,
+    deadline: tokio::time::Instant,
+    own_fault: Option<&Arc<FaultCleanup>>,
+    expected_scope: Option<runtime_supervisor::SessionScope>,
+    origin: ControlOrigin,
+) -> Result<ControlPublication> {
+    let completion = Arc::new(ControlCompletion {
+        origin,
+        scope: expected_scope.clone(),
+        deadline,
+        result: std::sync::Mutex::new(None),
+        settled: tokio::sync::Notify::new(),
+    });
     loop {
         ensure!(
             tokio::time::Instant::now() < deadline,
             "control deadline exhausted before captured cleanup admission"
         );
-        let fault = match claim_control(owner, own_fault, &expected_scope)? {
+        let fault = match claim_control(owner, own_fault, &expected_scope, &completion)? {
             ControlClaim::Claimed | ControlClaim::OwnFault => break,
             ControlClaim::Wait(fault) => fault,
         };
@@ -742,6 +897,7 @@ async fn control_publication_until(
         owns_busy: false,
         dispatched: false,
         release_control: own_fault.is_none(),
+        completion,
     };
     revoke_epoch(owner)?;
     loop {
@@ -779,6 +935,151 @@ async fn control_publication_until(
     );
     control.publication = Some(guard);
     Ok(control)
+}
+
+/// Join only an already-owned drain for this captured execution. The original
+/// cancellation is sent by GenerationControl.shutdown after prepare_stop as a
+/// whole succeeds, so entry confirmation alone cannot retire business roots.
+pub(super) async fn await_captured_control_for_startup(
+    captured: &Option<runtime_supervisor::SessionScope>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    deadline: tokio::time::Instant,
+) -> Result<bool> {
+    let Some(owner) = controller()? else {
+        return Ok(false);
+    };
+    let completion = owner
+        .control_completion
+        .lock()
+        .map_err(|_| anyhow::anyhow!("control completion lock poisoned"))?
+        .clone();
+    let Some(completion) = completion else {
+        return Ok(false);
+    };
+    let scope = captured
+        .as_ref()
+        .context("startup cleanup lacks its captured business scope")?;
+    if !same_execution(captured, &completion.scope) {
+        if matches!(completion.origin, ControlOrigin::Native { .. })
+            && !owner.control_pending.load(Ordering::Acquire)
+            && completion
+                .result
+                .lock()
+                .map_err(|_| anyhow::anyhow!("control outcome poisoned"))?
+                .as_ref()
+                .is_some_and(Result::is_ok)
+        {
+            return Ok(false);
+        }
+        anyhow::bail!("startup cleanup belongs to another control generation");
+    }
+    let owner_root = owner
+        .scope
+        .root()
+        .parent()
+        .and_then(std::path::Path::parent)
+        .context("resident owner root missing")?;
+    ensure!(
+        scope.work_root.parent().and_then(std::path::Path::parent) == Some(owner_root)
+            && scope.supervisor_id == owner.scope.identity().owner_instance,
+        "captured control does not belong to the held owner"
+    );
+    owner.scope.verify_owner_for_cleanup()?;
+    let deadline = deadline.min(completion.deadline);
+    let epoch = loop {
+        let changed = completion.settled.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let result = completion
+            .result
+            .lock()
+            .map_err(|_| anyhow::anyhow!("control outcome poisoned"))?
+            .clone();
+        match result {
+            Some(Ok(epoch)) => break epoch,
+            Some(Err(_)) => return Ok(false),
+            None => tokio::time::timeout_at(deadline, changed)
+                .await
+                .context("captured entry drain remains unsettled")?,
+        }
+    };
+    let cancel = cancel.context("captured startup has no generation cancellation token")?;
+    loop {
+        if completion
+            .result
+            .lock()
+            .map_err(|_| anyhow::anyhow!("control outcome poisoned"))?
+            .as_ref()
+            .is_some_and(Result::is_err)
+        {
+            return Ok(false);
+        }
+        ensure!(
+            tokio::time::Instant::now() < deadline
+                && !owner.stopping.load(Ordering::Acquire)
+                && !owner.entry_closing.load(Ordering::Acquire)
+                && owner.control_epoch.load(Ordering::Acquire) == epoch,
+            "captured startup control expired, changed or owner shutdown superseded it"
+        );
+        if cancel.is_cancelled() {
+            owner.scope.verify_owner_for_cleanup()?;
+            return Ok(true);
+        }
+        tokio::select! {
+            ()=cancel.cancelled()=>continue,
+            ()=owner.interrupted.notified()=>continue,
+            ()=tokio::time::sleep(Duration::from_millis(20))=>{},
+        }
+        let ControlOrigin::Native {
+            request_id: expected,
+        } = &completion.origin
+        else {
+            continue;
+        };
+        let snapshot = tokio::time::timeout_at(
+            deadline,
+            runtime_supervisor::control_verified(
+                owner_root,
+                runtime_supervisor::Request::new(runtime_supervisor::Action::Status),
+                &scope.supervisor_id,
+            ),
+        )
+        .await
+        .context("captured native control status deadline exhausted")??;
+        if native_preparation_failed(&snapshot, scope, expected)? {
+            return Ok(false);
+        }
+    }
+}
+
+fn native_preparation_failed(
+    snapshot: &runtime_supervisor::Snapshot,
+    scope: &runtime_supervisor::SessionScope,
+    request_id: &str,
+) -> Result<bool> {
+    ensure!(
+        snapshot.supervisor_id == scope.supervisor_id
+            && snapshot.generation.as_deref() == Some(scope.generation.as_str()),
+        "native owner or generation changed during startup cleanup"
+    );
+    ensure!(
+        snapshot.phase != runtime_supervisor::Phase::RecoveryRequired,
+        "native preparation has an unconfirmed cleanup result"
+    );
+    if snapshot.operation_id.is_none()
+        && snapshot.problem.as_ref().is_some_and(|problem| {
+            problem.code == runtime_supervisor::FailureCode::CleanupUnconfirmed
+        })
+    {
+        // Overall prepare_stop (including its final ready/generation check)
+        // failed. No shutdown/cancel will follow; startup drains itself.
+        return Ok(true);
+    }
+    ensure!(
+        snapshot.operation_id.as_deref() == Some(request_id),
+        "captured native control identity changed during startup cleanup"
+    );
+    Ok(false)
 }
 
 pub(crate) async fn close_entry() -> Result<()> {
@@ -878,15 +1179,19 @@ impl ResidentProxy {
                             finish_writer(&self.owner);
                             drop(reply.send(result));
                         }
-                        Request::Standby { operation_id, deadline, epoch, watch_was_paused, release_control, publication, reply } => {
+                        Request::Standby { operation_id, deadline, epoch, watch_was_paused, release_control, publication, completion, reply } => {
                             // The admitted control owns this exact barrier from
                             // dispatch through actor completion; no readonly
                             // probe can claim the release/enqueue interval.
-                            let result = async {
+                            let mut result = async {
                                 ensure!(tokio::time::Instant::now()<deadline
                                     && !self.owner.stopping.load(Ordering::Acquire)
                                     && self.owner.control_epoch.load(Ordering::Acquire)==epoch,
-                                    "resident control expired or revoked before dispatch");
+                                    "resident control unavailable before dispatch: expired={} stopping={} captured_epoch={} current_epoch={} entry_closing={}",
+                                    tokio::time::Instant::now()>=deadline,
+                                    self.owner.stopping.load(Ordering::Acquire), epoch,
+                                    self.owner.control_epoch.load(Ordering::Acquire),
+                                    self.owner.entry_closing.load(Ordering::Acquire));
                                 self.standby(operation_id, deadline, epoch, &reply).await
                             }.await;
                             drop(publication);
@@ -894,7 +1199,7 @@ impl ResidentProxy {
                                 && !self.owner.entry_closing.load(Ordering::Acquire) {
                                 self.owner.pause_watch.store(if result.is_ok() {false} else {watch_was_paused},Ordering::Release);
                             }
-                            if release_control {self.owner.control_pending.store(false,Ordering::Release);}
+                            if let Err(error) = complete_control(&self.owner, &completion, result.as_ref().map(|_|epoch).map_err(|error|format!("{error:#}")), release_control) {result=Err(error);}
                             finish_writer(&self.owner);
                             drop(reply.send(result));
                         }
@@ -1365,25 +1670,41 @@ impl NativeHost<'_> {
 
 #[async_trait::async_trait]
 impl ProcessHost for NativeHost<'_> {
-    async fn stop_exact(&mut self, _deadline: tokio::time::Instant) -> Result<()> {
-        // Cleanup is never cancelled: it settles the retained original Child.
+    async fn stop_exact(&mut self, deadline: tokio::time::Instant) -> Result<()> {
+        // Lifecycle cancellation cannot skip cleanup. Deadline expiry retains
+        // the exact Child/guardian and any in-flight tree kill for later proof.
         if let Some(child) = self.proxy.child.as_mut() {
             ensure!(
-                child
-                    .stop(Duration::from_secs(crate::supervision::STOP_GRACE_SECONDS))
-                    .await
+                tokio::time::timeout_at(
+                    deadline,
+                    child.stop(Duration::from_secs(crate::supervision::STOP_GRACE_SECONDS))
+                )
+                .await
+                .context("resident exact process cleanup deadline exhausted")?
                     != StopOutcome::Unconfirmed,
                 "resident exact process cleanup remains unconfirmed"
             );
         }
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "resident cleanup deadline exhausted before descendant proof"
+        );
         guardian::recover(self.proxy.owner.scope.root())
             .context("confirm resident descendant cleanup")?;
+        if !self.proxy.owner.stopping.load(Ordering::Acquire) {
+            self.proxy
+                .owner
+                .scope
+                .record_running_until(deadline)
+                .await?;
+        }
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "resident cleanup confirmation completed after deadline"
+        );
+        compiler::clear_current_confirmation()?;
         self.proxy.child.take();
         self.proxy.owner.status.store(ABSENT, Ordering::Release);
-        compiler::clear_current_confirmation()?;
-        if !self.proxy.owner.stopping.load(Ordering::Acquire) {
-            self.proxy.owner.scope.record_running()?;
-        }
         Ok(())
     }
 
@@ -1477,10 +1798,14 @@ impl ProcessHost for NativeHost<'_> {
 }
 
 #[cfg(test)]
+#[path = "resident_reply_tests.rs"]
+mod reply_deadline_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn owned_proxy(
+    pub(super) fn owned_proxy(
         root: &std::path::Path,
     ) -> (process_utils::command_authority::OwnerLease, ResidentProxy) {
         let root = root.canonicalize().unwrap();
@@ -1508,6 +1833,7 @@ mod tests {
             busy: AtomicBool::new(false),
             control_pending: AtomicBool::new(false),
             fault_cleanup: std::sync::Mutex::new(None),
+            control_completion: std::sync::Mutex::new(None),
             settled: tokio::sync::Notify::new(),
             status: AtomicU8::new(ABSENT),
             control_epoch: AtomicU64::new(0),
@@ -1636,6 +1962,7 @@ mod tests {
             busy: AtomicBool::new(false),
             control_pending: AtomicBool::new(false),
             fault_cleanup: std::sync::Mutex::new(None),
+            control_completion: std::sync::Mutex::new(None),
             settled: tokio::sync::Notify::new(),
             status: AtomicU8::new(ABSENT),
             control_epoch: AtomicU64::new(0),
@@ -1846,6 +2173,7 @@ mod tests {
             busy: AtomicBool::new(false),
             control_pending: AtomicBool::new(false),
             fault_cleanup: std::sync::Mutex::new(None),
+            control_completion: std::sync::Mutex::new(None),
             settled: tokio::sync::Notify::new(),
             status: AtomicU8::new(LIVE),
             control_epoch: AtomicU64::new(0),
@@ -1908,6 +2236,7 @@ mod tests {
             busy: AtomicBool::new(false),
             control_pending: AtomicBool::new(false),
             fault_cleanup: std::sync::Mutex::new(None),
+            control_completion: std::sync::Mutex::new(None),
             settled: tokio::sync::Notify::new(),
             status: AtomicU8::new(ABSENT),
             control_epoch: AtomicU64::new(0),
@@ -2106,6 +2435,7 @@ mod tests {
                     busy: AtomicBool::new(true),
                     control_pending: AtomicBool::new(false),
                     fault_cleanup: std::sync::Mutex::new(None),
+                    control_completion: std::sync::Mutex::new(None),
                     settled: tokio::sync::Notify::new(),
                     status: AtomicU8::new(LIVE),
                     control_epoch: AtomicU64::new(0),
@@ -2337,3 +2667,7 @@ mod tests {
             });
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "resident_startup_stop_tests.rs"]
+mod startup_stop_tests;

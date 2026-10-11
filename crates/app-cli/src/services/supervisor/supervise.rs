@@ -91,6 +91,23 @@ pub(super) async fn drain_or_close_resident() -> Result<()> {
     Ok(())
 }
 
+pub(super) async fn drain_or_close_resident_for_startup(
+    captured_scope: &Option<runtime_supervisor::SessionScope>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    match super::resident::await_captured_control_for_startup(captured_scope, cancel, deadline)
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => drain_or_close_resident().await,
+        Err(error) => Err(ShutdownUnconfirmed(format!(
+            "captured startup drain remains unconfirmed: {error:#}"
+        ))
+        .into()),
+    }
+}
+
 /// A deployment cannot publish a terminal status until shutdown is confirmed.
 #[derive(Debug)]
 pub(crate) struct ShutdownUnconfirmed(pub String);
