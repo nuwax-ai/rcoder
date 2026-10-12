@@ -446,8 +446,16 @@ impl AgentContainerRuntime for DockerRuntime {
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
         params.validate_execution_context()?;
+        let captured = if params.service_type == ServiceType::UserappBuilder {
+            self.capture_builder_reuse_snapshot(&params).await?
+        } else {
+            None
+        };
         let prepared = if params.service_type == ServiceType::UserappBuilder
             && params.resource_binding.is_none()
+            && captured
+                .as_ref()
+                .is_none_or(|view| view.target.workload.is_none())
         {
             Some(
                 crate::agent_container_starter::AgentContainerStarter::new(&self.inner)
@@ -490,9 +498,26 @@ impl AgentContainerRuntime for DockerRuntime {
             let context = params.execution_context.clone();
             let binding = params.resource_binding.clone();
             return tokio::spawn(async move {
-                let result = if params.resource_binding.is_some() {
+                let observed = match Self::new(inner.clone()).capture_builder_reuse_snapshot(&params).await {
+                    Ok(observed) => observed,
+                    Err(error) => return crate::runtime::builder_completion::finish(lease, Err(error)).await,
+                };
+                if let Some(original) = captured.as_ref().filter(|view| view.target.workload.is_some())
+                    && observed.as_ref().is_none_or(|fresh| fresh.target.workload != original.target.workload
+                        || fresh.volumes != original.volumes)
+                {
+                    return crate::runtime::builder_completion::finish(lease,
+                        Err(ContainerRuntimeError::RequestRejected(shared_types::RuntimeRequestRejection { status: 409, message: "Existing builder identity or workspace changed while acquiring its lease".into() }))).await;
+                }
+                let captured = observed;
+                let result = if params.resource_binding.is_some()
+                    || captured.as_ref().is_some_and(|view| view.target.workload.is_some()) {
+                    let Some(view) = captured.as_ref() else {
+                        return crate::runtime::builder_completion::finish(lease,
+                            Err(ContainerRuntimeError::ConfigurationError("builder reuse capture missing".into()))).await;
+                    };
                     Self::new(inner.clone())
-                        .resume_bound_builder(&params, None)
+                        .resume_captured_builder(&params, view.clone(), None)
                         .await
                 } else {
                     let Some(prepared) = prepared else {
@@ -500,7 +525,7 @@ impl AgentContainerRuntime for DockerRuntime {
                             Err(ContainerRuntimeError::ConfigurationError("builder preflight result missing".into()))).await;
                     };
                     let result = crate::agent_container_starter::AgentContainerStarter::new(&inner)
-                        .start_prepared(params, prepared)
+                        .start_prepared(params.clone(), prepared)
                         .await;
                     if let (Err(error), Some(context)) = (&result, context.as_ref())
                         && let Some(physical_id) = acknowledged_partial_creation(error)
@@ -532,13 +557,23 @@ impl AgentContainerRuntime for DockerRuntime {
                                 &context.app_id,
                             )
                             .await;
-                            let target = Self::new(inner.clone())
+                            let mut target = Self::new(inner.clone())
                                 .capture_builder_compute_with_binding(
                                     context,
                                     binding.as_ref(),
                                     false,
                                 )
                                 .await?;
+                            target.builder_startup_mode = params.builder_startup_mode;
+                            if captured.as_ref().is_some_and(|view| view.target.workload.is_some()) {
+                                let view = Self::new(inner.clone()).capture_builder_reuse_snapshot(&params).await
+                                    .map_err(|error| ContainerRuntimeError::ConnectionError(format!("Confirm builder after reuse: {error}")))?
+                                    .ok_or_else(|| ContainerRuntimeError::Conflict("Builder capture missing before completion".into()))?;
+                                let original = captured.as_ref().ok_or_else(|| ContainerRuntimeError::Conflict("Builder original capture missing".into()))?;
+                                if view.target.workload != original.target.workload || view.volumes != original.volumes {
+                                    return Err(ContainerRuntimeError::Conflict("Builder identity or workspace changed before completion".into()));
+                                }
+                            }
                             let receipt = crate::runtime::builder_creation_receipt::BuilderCreationReceipt {
                                 target,
                                 container: info.clone(),

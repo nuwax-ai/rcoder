@@ -1,6 +1,14 @@
 use super::*;
 
 pub(super) async fn application_lease_root() -> Result<std::path::PathBuf> {
+    // Full runtime tests use the same actual OS lease and receipt files in a
+    // private writable root. The production lock-root selection is unchanged.
+    #[cfg(test)]
+    if let Ok(root) = std::env::var("RCODER_OPERATION_RECEIPT_ROOT")
+        && !root.trim().is_empty()
+    {
+        return Ok(std::path::PathBuf::from(root));
+    }
     #[cfg(feature = "deploy-host")]
     if shared_types::is_deploy_host() {
         if let Ok(root) = std::env::var("RCODER_OPERATION_LOCK_ROOT")

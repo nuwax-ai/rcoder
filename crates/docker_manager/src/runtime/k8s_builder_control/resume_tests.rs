@@ -15,6 +15,7 @@ pub(super) struct ApiState {
     pub(super) allow_writes: bool,
     pub(super) lose_next_put_response: bool,
     pub(super) archives: std::collections::BTreeMap<String, serde_json::Value>,
+    leases: std::collections::BTreeMap<String, serde_json::Value>,
     pub(super) puts: Vec<serde_json::Value>,
     pub(super) patches: Vec<serde_json::Value>,
     pub(super) pvc: serde_json::Value,
@@ -22,6 +23,10 @@ pub(super) struct ApiState {
     pub(super) extra_pods: Vec<serde_json::Value>,
     resume_replicas_on_second_sts_read: bool,
     fail_pod_list: bool,
+    replace_uid_on_sts_read: Option<usize>,
+    replace_pvc_on_read: Option<usize>,
+    pvc_reads: usize,
+    fail_next_creation_receipt: bool,
 }
 
 async fn connection(mut stream: tokio::net::TcpStream, state: Arc<Mutex<ApiState>>) {
@@ -68,7 +73,56 @@ async fn connection(mut stream: tokio::net::TcpStream, state: Arc<Mutex<ApiState
         );
         let mut status = 200;
         let mut lose_response = false;
-        let reply = if method == "POST" && resource_path.ends_with("/secrets") {
+        let reply = if method == "POST" && resource_path.ends_with("/leases") {
+            let mut lease: serde_json::Value = serde_json::from_slice(request_body).expect("lease");
+            let name = lease["metadata"]["name"].as_str().expect("name").to_owned();
+            lease["metadata"]["uid"] = "lease-original".into();
+            lease["metadata"]["resourceVersion"] = "1".into();
+            state.leases.insert(name, lease.clone());
+            lease
+        } else if resource_path.contains("/leases/") {
+            let name = resource_path.rsplit('/').next().expect("lease name");
+            if method == "DELETE" {
+                let parameters: serde_json::Value =
+                    serde_json::from_slice(request_body).expect("delete");
+                assert_eq!(parameters["preconditions"]["uid"], "lease-original");
+                state.leases.remove(name);
+                serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Success"})
+            } else if let Some(lease) = state.leases.get(name) {
+                lease.clone()
+            } else {
+                status = 404;
+                serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","code":404})
+            }
+        } else if method == "POST" && resource_path.ends_with("/configmaps") {
+            if state.fail_next_creation_receipt {
+                // A persistent non-transient rejection is not masked by the
+                // kube client's retry middleware.
+                status = 403;
+                serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Forbidden","code":403})
+            } else {
+                let mut object: serde_json::Value =
+                    serde_json::from_slice(request_body).expect("receipt");
+                let name = object["metadata"]["name"]
+                    .as_str()
+                    .expect("name")
+                    .to_owned();
+                object["metadata"]["uid"] = "receipt-original".into();
+                object["metadata"]["resourceVersion"] = "1".into();
+                state.archives.insert(name, object.clone());
+                object
+            }
+        } else if resource_path.contains("/configmaps/") {
+            if let Some(object) = state
+                .archives
+                .get(resource_path.rsplit('/').next().expect("name"))
+            {
+                object.clone()
+            } else {
+                status = 404;
+                serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","code":404})
+            }
+        } else if method == "POST" && resource_path.ends_with("/secrets") {
             let mut object: serde_json::Value =
                 serde_json::from_slice(request_body).expect("secret body");
             object["metadata"]["uid"] = "archive-original".into();
@@ -95,6 +149,18 @@ async fn connection(mut stream: tokio::net::TcpStream, state: Arc<Mutex<ApiState
                 serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","message":"Archive not found","code":404})
             }
         } else if resource_path.contains("/persistentvolumeclaims/") {
+            state.pvc_reads += 1;
+            if state
+                .replace_pvc_on_read
+                .is_some_and(|read| state.pvc_reads >= read)
+            {
+                state.pvc["metadata"]["uid"] = "pvc-replacement".into();
+            }
+            if method == "PATCH" {
+                let patch: serde_json::Value =
+                    serde_json::from_slice(request_body).expect("PVC patch");
+                assert_eq!(patch["metadata"]["uid"], state.pvc["metadata"]["uid"]);
+            }
             state.pvc.clone()
         } else if method == "PATCH" && resource_path.contains("/statefulsets/") {
             let patch: serde_json::Value = serde_json::from_slice(request_body).expect("patch");
@@ -184,7 +250,11 @@ async fn connection(mut stream: tokio::net::TcpStream, state: Arc<Mutex<ApiState
                 state.sts["metadata"]["resourceVersion"] = rv.to_string().into();
             }
             let mut object = state.sts.clone();
-            if state.replace_uid_on_second_sts_read && state.sts_reads >= 2 {
+            if (state.replace_uid_on_second_sts_read && state.sts_reads >= 2)
+                || state
+                    .replace_uid_on_sts_read
+                    .is_some_and(|read| state.sts_reads >= read)
+            {
                 object["metadata"]["uid"] = serde_json::json!("foreign-controller");
             }
             object
@@ -217,7 +287,27 @@ async fn connection(mut stream: tokio::net::TcpStream, state: Arc<Mutex<ApiState
                 serde_json::json!({"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"9"},"items":items})
             }
         } else if resource_path.contains("/services/") {
-            state.service.clone()
+            if method == "PATCH" {
+                let patch: serde_json::Value =
+                    serde_json::from_slice(request_body).expect("Service patch");
+                assert_eq!(patch["metadata"]["uid"], state.service["metadata"]["uid"]);
+                for (key, value) in patch["metadata"]["annotations"]
+                    .as_object()
+                    .expect("annotations")
+                {
+                    state.service["metadata"]["annotations"][key] = value.clone();
+                }
+            }
+            let mut service = state.service.clone();
+            if resource_path.ends_with("-headless") {
+                service["metadata"]["name"] = resource_path
+                    .rsplit('/')
+                    .next()
+                    .expect("headless name")
+                    .into();
+                service["spec"]["clusterIP"] = "None".into();
+            }
+            service
         } else {
             panic!("unexpected API request: {first}");
         };
@@ -427,19 +517,25 @@ pub(super) async fn fixture(
             .as_str()
             .expect("PVC name");
     let pvc = serde_json::json!({"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{
-        "name":claim_name,"uid":"pvc-original","resourceVersion":"5","annotations":original.resource_metadata()},
-        "spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":"1Gi"}}},"status":{"phase":"Bound"}});
+        "name":claim_name,"uid":"pvc-original","resourceVersion":"5","annotations":original.resource_metadata(),
+        "labels":{"service_type":ServiceType::UserappBuilder.to_string()}},
+        "spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":"1Gi"}}},"status":{"phase":"Bound","capacity":{"storage":"1Gi"}}});
     let state = Arc::new(Mutex::new(ApiState {
         sts: object,
         pod_seed: pod.clone(),
         extra_pods: vec![],
         resume_replicas_on_second_sts_read: false,
         fail_pod_list: false,
+        replace_uid_on_sts_read: None,
+        replace_pvc_on_read: None,
+        pvc_reads: 0,
+        fail_next_creation_receipt: false,
         pod,
         pvc,
         allow_writes: false,
         lose_next_put_response: false,
         archives: Default::default(),
+        leases: Default::default(),
         puts: vec![],
         patches: vec![],
         service: serde_json::to_value(service).expect("service"),
@@ -456,6 +552,262 @@ pub(super) async fn fixture(
         }
     });
     (runtime, params, state, server)
+}
+
+#[tokio::test]
+async fn create_entry_reuses_owned_existing_builder_without_sql_binding() {
+    existing_create_case(shared_types::BuilderStartupMode::PreserveBusinessIntent).await;
+}
+
+#[tokio::test]
+async fn create_entry_management_only_retains_running_business_and_original_request_intent() {
+    existing_create_case(shared_types::BuilderStartupMode::ManagementOnly).await;
+}
+
+async fn existing_create_case(mode: shared_types::BuilderStartupMode) {
+    use container_runtime_api::AgentContainerRuntime as _;
+    let (runtime, mut params, state, server) = fixture(Some("release")).await;
+    params.resource_binding = None;
+    params.storage_size = Some("1Gi".into());
+    params.builder_startup_mode = mode;
+    state.lock().expect("state").allow_writes = true;
+    let before = state.lock().expect("state").sts.clone();
+    let before_pvc = state.lock().expect("state").pvc.clone();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        runtime.create_container(params.clone()),
+    )
+    .await
+    .expect("create deadline");
+    assert!(
+        result.is_ok(),
+        "legitimate unbound builder must reuse its actual configuration: {result:?}"
+    );
+    assert_eq!(result.expect("existing").container_id, "pod-original");
+    {
+        let actual = state.lock().expect("state");
+        assert_eq!(
+            actual.sts, before,
+            "ensure must keep the actual template and original credential"
+        );
+        assert_eq!(actual.pvc, before_pvc, "ensure must keep the actual PVC");
+        assert!(
+            actual.leases.is_empty(),
+            "completed request must release its actual operation lease"
+        );
+        assert!(
+            actual.requests.iter().all(|request| {
+                request.starts_with("GET ")
+                    || request.contains("/leases")
+                    || request.contains("/configmaps")
+                    || request.contains("/services/")
+            }),
+            "existing compute and data must not be rewritten: {:?}",
+            actual.requests
+        );
+    }
+    let receipt = runtime
+        .read_builder_creation_receipt(params.execution_context.as_ref().expect("context"))
+        .await
+        .expect("read original completion")
+        .expect("receipt exists");
+    assert_eq!(
+        receipt.target.context,
+        params.execution_context.expect("context")
+    );
+    assert_eq!(receipt.target.builder_startup_mode, mode);
+    assert_eq!(
+        receipt.target.workload.expect("workload").uid,
+        "sts-original"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn create_entry_rejects_foreign_or_replaced_existing_compute_before_data_writes() {
+    use container_runtime_api::AgentContainerRuntime as _;
+    for mutation in [
+        "application",
+        "lifecycle",
+        "controller-race",
+        "volume-race",
+        "mount",
+    ] {
+        let (runtime, mut params, state, server) = fixture(Some("release")).await;
+        params.resource_binding = None;
+        {
+            let mut state = state.lock().expect("state");
+            state.allow_writes = true;
+            match mutation {
+                "application" => {
+                    state.sts["metadata"]["annotations"]["rcoder.io/application-id"] =
+                        "foreign".into()
+                }
+                "lifecycle" => {
+                    state.sts["metadata"]["annotations"]["rcoder.io/lifecycle-id"] =
+                        "foreign".into()
+                }
+                "controller-race" => state.replace_uid_on_sts_read = Some(3),
+                "volume-race" => state.replace_pvc_on_read = Some(2),
+                "mount" => {
+                    state.sts["spec"]["template"]["spec"]["containers"][0]["volumeMounts"][0]["subPath"] =
+                        "other-app".into()
+                }
+                _ => unreachable!(),
+            }
+        }
+        let result = runtime.create_container(params).await;
+        assert!(
+            matches!(result, Err(Error::RequestRejected(_))),
+            "{mutation}: {result:?}"
+        );
+        let state = state.lock().expect("state");
+        assert!(
+            state
+                .requests
+                .iter()
+                .all(|request| request.starts_with("GET ") || request.contains("/leases")),
+            "{mutation} must not change compute, data or completion: {:?}",
+            state.requests
+        );
+        assert!(
+            state.leases.is_empty(),
+            "known rejection must release its own lease"
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn unbound_reuse_service_commit_recovers_the_original_operation_after_receipt_failure() {
+    use container_runtime_api::AgentContainerRuntime as _;
+    let (runtime, mut params, state, server) = fixture(Some("release")).await;
+    params.resource_binding = None;
+    {
+        let mut state = state.lock().expect("state");
+        state.allow_writes = true;
+        state.fail_next_creation_receipt = true;
+    }
+    let context = params.execution_context.clone().expect("context");
+    let result = runtime.create_container(params).await;
+    assert!(
+        matches!(result, Err(Error::K8sError(_))),
+        "receipt dispatch failure remains unconfirmed: {result:?}"
+    );
+    assert!(!state.lock().expect("state").leases.is_empty());
+    let recovered = runtime
+        .recover_builder_creation(&context)
+        .await
+        .expect("original service commitment can reconcile")
+        .expect("actual completion evidence");
+    assert_eq!(recovered.target.context, context);
+    assert_eq!(recovered.container.container_id, "pod-original");
+    assert_eq!(
+        recovered.target.workload.expect("workload").uid,
+        "sts-original"
+    );
+    assert!(recovered.creation_lease_released);
+    let state = state.lock().expect("state");
+    assert!(state.leases.is_empty());
+    assert!(
+        state
+            .requests
+            .iter()
+            .all(|request| request.starts_with("GET ")
+                || request.contains("/leases")
+                || request.contains("/configmaps")
+                || request.contains("/services/"))
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn compute_restart_then_cold_unbound_ensure_preserves_updated_compute_and_old_metadata() {
+    use container_runtime_api::AgentContainerRuntime as _;
+    let (runtime, mut params, state, server) = fixture(Some("release")).await;
+    params.resource_binding = None;
+    state.lock().expect("state").allow_writes = true;
+    let original_pvc = state.lock().expect("state").pvc.clone();
+    let mut target = runtime
+        .capture_builder_compute_with_binding(
+            params.execution_context.as_ref().expect("context"),
+            None,
+            false,
+        )
+        .await
+        .expect("actual owned controller");
+    target.restart_image = Some("paired-runtime:updated".into());
+    target.restart_runtime_workspace = Some(shared_types::paths::userapp_dev_workspace("app"));
+    let archive = runtime
+        .archive_builder_restart(&target)
+        .await
+        .expect("freeze")
+        .expect("archive");
+    assert!(
+        runtime
+            .apply_builder_control(&target, false)
+            .await
+            .expect("actual stop")
+            .is_none()
+    );
+    let mut stopped = runtime
+        .capture_builder_compute_with_binding(
+            params.execution_context.as_ref().expect("context"),
+            None,
+            false,
+        )
+        .await
+        .expect("stopped controller");
+    stopped.restart_image = target.restart_image.clone();
+    stopped.restart_runtime_workspace = target.restart_runtime_workspace.clone();
+    let restarted = runtime
+        .start_builder_control_with_restart(&stopped, &archive)
+        .await
+        .expect("actual frozen restart")
+        .expect("ready");
+    assert_eq!(restarted.container_id, "pod-updated");
+    let updated = state.lock().expect("state").sts.clone();
+    let writes_before = state.lock().expect("state").puts.len();
+    assert_eq!(
+        updated["metadata"]["annotations"]["rcoder.io/request-fingerprint"],
+        "a".repeat(64)
+    );
+    let cold = KubernetesRuntime {
+        client: runtime.client.clone(),
+        namespace: runtime.namespace.clone(),
+        config: runtime.config.clone(),
+        pod_cache: Default::default(),
+        subvolume_path_cache: Default::default(),
+        event_publisher: Default::default(),
+        event_counters: Default::default(),
+    };
+    let context = params.execution_context.as_mut().expect("context");
+    context.operation_id = "ordinary-ensure-after-restart".into();
+    context.request_fingerprint = "c".repeat(64);
+    let ready = cold
+        .create_container(params.clone())
+        .await
+        .expect("cold ordinary ensure reuses actual compute");
+    assert_eq!(ready.container_id, "pod-updated");
+    assert_eq!(ready.workload_uid.as_deref(), Some("sts-original"));
+    {
+        let state = state.lock().expect("state");
+        assert_eq!(state.sts, updated);
+        assert_eq!(state.pvc, original_pvc);
+        assert_eq!(
+            state.puts.len(),
+            writes_before,
+            "ordinary ensure must not replay configuration update"
+        );
+        assert!(state.leases.is_empty());
+    }
+    let completion = cold
+        .recover_builder_creation(params.execution_context.as_ref().expect("context"))
+        .await
+        .expect("exact operation evidence")
+        .expect("completion");
+    assert_eq!(completion.container.container_id, "pod-updated");
+    server.abort();
 }
 
 #[tokio::test]

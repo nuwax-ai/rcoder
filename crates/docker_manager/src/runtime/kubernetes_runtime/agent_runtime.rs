@@ -296,6 +296,11 @@ impl AgentContainerRuntime for KubernetesRuntime {
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
         params.validate_execution_context()?;
+        let captured = if params.service_type == ServiceType::UserappBuilder {
+            self.capture_builder_reuse_snapshot(&params).await?
+        } else {
+            None
+        };
         let lease = if params.service_type == ServiceType::UserappBuilder {
             let identifier = params
                 .service_type
@@ -334,9 +339,30 @@ impl AgentContainerRuntime for KubernetesRuntime {
             let context = params.execution_context.clone();
             let binding = params.resource_binding.clone();
             return tokio::spawn(async move {
-                let result = if params.resource_binding.is_some() {
+                let observed = match runtime.capture_builder_reuse_snapshot(&params).await {
+                    Ok(observed) => observed,
+                    Err(error) => return crate::runtime::builder_completion::finish(lease, Err(error)).await,
+                };
+                if let Some(original) = captured.as_ref().filter(|view| view.target.workload.is_some())
+                    && observed.as_ref().is_none_or(|fresh| {
+                        fresh.target.workload.as_ref().map(|value| (&value.uid, &value.name))
+                            != original.target.workload.as_ref().map(|value| (&value.uid, &value.name))
+                            || fresh.volumes != original.volumes
+                    })
+                {
+                    return crate::runtime::builder_completion::finish(lease,
+                        Err(ContainerRuntimeError::RequestRejected(shared_types::RuntimeRequestRejection { status: 409, message: "Existing builder identity or workspace changed while acquiring its lease".into() }))).await;
+                }
+                let captured = observed;
+                let was_existing = params.resource_binding.is_some()
+                    || captured.as_ref().is_some_and(|view| view.target.workload.is_some());
+                let result = if was_existing {
+                    let Some(captured) = captured.as_ref() else {
+                        return crate::runtime::builder_completion::finish(lease,
+                            Err(ContainerRuntimeError::ConfigurationError("builder reuse capture missing".into()))).await;
+                    };
                     runtime
-                        .resume_bound_builder(&params)
+                        .resume_captured_builder(&params, captured.clone())
                         .await
                         // RV07：本操作内执行了受控物理替换时，最终捕获与
                         // 收据改用新物理绑定——旧 UID 绑定对替换后的 STS
@@ -344,20 +370,33 @@ impl AgentContainerRuntime for KubernetesRuntime {
                         .map(|(info, upgraded)| (info, upgraded.or(binding.clone())))
                 } else {
                     runtime
-                        .create_agent_container_with_creation_receipt(params, lease.receipt())
+                        .create_agent_container_with_creation_receipt(params.clone(), lease.receipt())
                         .await
                         .map(|info| (info, binding.clone()))
                 };
                 let result = match (result, context.as_ref()) {
                     (Ok((info, effective_binding)), Some(context)) => {
                         let recorded = async {
-                            let target = runtime
+                            let mut target = runtime
                                 .capture_builder_compute_with_binding(
                                     context,
                                     effective_binding.as_ref(),
                                     false,
                                 )
                                 .await?;
+                            target.builder_startup_mode = params.builder_startup_mode;
+                            if was_existing {
+                                let fresh = runtime.capture_builder_reuse_snapshot(&params).await
+                                    .map_err(|error| ContainerRuntimeError::ConnectionError(format!("Confirm builder after reuse: {error}")))?
+                                    .ok_or_else(|| ContainerRuntimeError::Conflict("Builder capture missing before completion".into()))?;
+                                let original = captured.as_ref().ok_or_else(|| ContainerRuntimeError::Conflict("Builder original capture missing".into()))?;
+                                if fresh.target.workload.as_ref().map(|value| (&value.uid, &value.name))
+                                    != original.target.workload.as_ref().map(|value| (&value.uid, &value.name))
+                                    || fresh.volumes != original.volumes
+                                {
+                                    return Err(ContainerRuntimeError::Conflict("Builder identity or workspace changed before completion".into()));
+                                }
+                            }
                             let receipt = crate::runtime::builder_creation_receipt::BuilderCreationReceipt {
                                 target,
                                 container: info.clone(),
@@ -367,7 +406,7 @@ impl AgentContainerRuntime for KubernetesRuntime {
                                     )
                                 })?,
                             };
-                            if effective_binding.is_some() {
+                            if was_existing {
                                 // A resumed builder needs the same final Service
                                 // commit as a newly created one. Keep its proof
                                 // in that mutation so a crash before the archive

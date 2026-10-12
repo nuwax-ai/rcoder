@@ -5,6 +5,12 @@ use shared_types::{
     BuilderControlTarget, ContainerBasicInfo, ServiceType, UserAppExecutionContext,
 };
 
+#[derive(Clone)]
+pub(super) struct BuilderReuseSnapshot {
+    pub(super) target: BuilderControlTarget,
+    pub(super) volumes: Vec<shared_types::AppResourceIdentity>,
+}
+
 impl DockerRuntime {
     pub(super) async fn observe_retained_builder_stopped(
         &self,
@@ -230,9 +236,52 @@ impl DockerRuntime {
 
     /// Resume the captured adopted container; Docker labels/config are immutable.
     /// This never runs create, removes storage, or restarts an already-running app.
+    #[cfg(test)]
     pub(super) async fn resume_bound_builder(
         &self,
         params: &container_runtime_api::ContainerCreateParams,
+        expected_image: Option<&str>,
+    ) -> Result<ContainerBasicInfo> {
+        let captured = self
+            .capture_builder_reuse_snapshot(params)
+            .await?
+            .ok_or_else(|| rejected_before_write("Builder execution context missing".into()))?;
+        self.resume_captured_builder(params, captured, expected_image)
+            .await
+    }
+
+    pub(super) async fn capture_builder_reuse_snapshot(
+        &self,
+        params: &container_runtime_api::ContainerCreateParams,
+    ) -> Result<Option<BuilderReuseSnapshot>> {
+        let Some(context) = params.execution_context.as_ref() else {
+            return Ok(None);
+        };
+        let captured = async {
+            let mut target = self
+                .capture_builder_compute_with_binding(
+                    context,
+                    params.resource_binding.as_ref(),
+                    false,
+                )
+                .await?;
+            target.builder_startup_mode = params.builder_startup_mode;
+            let volumes = if target.workload.is_some() {
+                self.capture_builder_volume_witness(&target).await?
+            } else {
+                vec![]
+            };
+            Ok::<_, Error>(BuilderReuseSnapshot { target, volumes })
+        }
+        .await
+        .map_err(|error| rejected_before_write(error.to_string()))?;
+        Ok(Some(captured))
+    }
+
+    pub(super) async fn resume_captured_builder(
+        &self,
+        params: &container_runtime_api::ContainerCreateParams,
+        captured: BuilderReuseSnapshot,
         expected_image: Option<&str>,
     ) -> Result<ContainerBasicInfo> {
         let check_cancelled = || {
@@ -250,12 +299,27 @@ impl DockerRuntime {
             let context = params.execution_context.as_ref().ok_or_else(|| {
                 Error::ConfigurationError("Bound builder requires execution context".into())
             })?;
-            let binding = params.resource_binding.as_ref().ok_or_else(|| {
-                Error::ConfigurationError("Bound builder requires durable resource proof".into())
-            })?;
-            let mut target = self
-                .capture_builder_compute_with_binding(context, Some(binding), false)
-                .await?;
+            if captured.target.context != *context
+                || captured.target.resource_binding != params.resource_binding
+            {
+                return Err(Error::Conflict(
+                    "Existing builder capture differs from its request".into(),
+                ));
+            }
+            let fresh = self
+                .capture_builder_reuse_snapshot(params)
+                .await?
+                .ok_or_else(|| {
+                    Error::ConfigurationError("Builder execution context missing".into())
+                })?;
+            if fresh.target.workload != captured.target.workload
+                || fresh.volumes != captured.volumes
+            {
+                return Err(Error::Conflict(
+                    "Existing builder identity or workspace changed before reuse".into(),
+                ));
+            }
+            let mut target = fresh.target;
             target.builder_startup_mode = params.builder_startup_mode;
             let resource = target.workload.as_ref().ok_or_else(|| {
                 Error::Conflict(
@@ -288,6 +352,18 @@ impl DockerRuntime {
         // Dropping a Docker mutation future does not cancel the daemon's write.
         let result = self.apply_builder_compute_mode(&target, true, true).await?;
         check_cancelled()?;
+        let fresh = self
+            .capture_builder_reuse_snapshot(params)
+            .await
+            .map_err(|error| {
+                Error::ConnectionError(format!("Confirm builder after startup: {error}"))
+            })?
+            .ok_or_else(|| Error::Conflict("Builder capture missing after reuse".into()))?;
+        if fresh.target.workload != captured.target.workload || fresh.volumes != captured.volumes {
+            return Err(Error::Conflict(
+                "Existing builder identity or workspace changed after reuse".into(),
+            ));
+        }
         result.ok_or_else(|| {
             Error::Conflict("Bound builder did not return a running container".into())
         })

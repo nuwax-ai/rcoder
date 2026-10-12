@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Clone)]
+pub(crate) struct BuilderReuseSnapshot {
+    pub(crate) target: BuilderControlTarget,
+    pub(crate) volumes: Vec<AppResourceIdentity>,
+}
+
 impl KubernetesRuntime {
     pub(crate) async fn read_builder_file_credentials(
         &self,
@@ -81,8 +87,22 @@ impl KubernetesRuntime {
                 "Builder changed before volume capture".into(),
             ));
         }
+        self.builder_volumes_from_current_view(target, &current)
+            .await
+    }
+
+    async fn builder_volumes_from_current_view(
+        &self,
+        target: &BuilderControlTarget,
+        current: &StatefulSet,
+    ) -> Result<Vec<AppResourceIdentity>> {
+        let workload = target
+            .workload
+            .as_ref()
+            .ok_or_else(|| Error::Conflict("Builder volume workload missing".into()))?;
         let spec = current
             .spec
+            .as_ref()
             .ok_or_else(|| Error::Conflict("Builder spec missing during volume capture".into()))?;
         if spec.replicas.is_some_and(|count| count > 1) {
             return Err(Error::Conflict(
@@ -527,9 +547,83 @@ impl KubernetesRuntime {
     /// RV07：返回值第二项 = 本次操作内执行了受控物理替换时的新物理绑定
     ///（新 STS UID）——调用方（agent_runtime 收据路径）必须用它取代旧
     /// 绑定做最终捕获，否则升级成功后收据仍按旧 UID 校验而失败。
+    #[cfg(test)]
     pub(crate) async fn resume_bound_builder(
         &self,
         params: &container_runtime_api::ContainerCreateParams,
+    ) -> Result<(
+        ContainerBasicInfo,
+        Option<shared_types::UserAppResourceBinding>,
+    )> {
+        let captured = self
+            .capture_builder_reuse_snapshot(params)
+            .await?
+            .ok_or_else(|| rejected_before_write("Builder execution context missing".into()))?;
+        self.resume_captured_builder(params, captured).await
+    }
+
+    /// Existing compute is established by actual identity and data views. A
+    /// missing SQL adoption row does not make a correctly stamped workload absent.
+    pub(crate) async fn capture_builder_reuse_snapshot(
+        &self,
+        params: &container_runtime_api::ContainerCreateParams,
+    ) -> Result<Option<BuilderReuseSnapshot>> {
+        let Some(context) = params.execution_context.as_ref() else {
+            return Ok(None);
+        };
+        let captured = async {
+            let mut target = self
+                .capture_builder_compute_with_binding(
+                    context,
+                    params.resource_binding.as_ref(),
+                    false,
+                )
+                .await?;
+            target.builder_startup_mode = params.builder_startup_mode;
+            let Some(workload) = target.workload.clone() else {
+                return Ok(BuilderReuseSnapshot {
+                    target,
+                    volumes: vec![],
+                });
+            };
+            let api: Api<StatefulSet> = Api::namespaced(self.client.clone(), &self.namespace);
+            let current = api
+                .get(&workload.name)
+                .await
+                .map_err(|error| api_error("Inspect existing builder views", error))?;
+            let observed = workload_identity_with_binding(
+                &current,
+                context,
+                params.resource_binding.as_ref(),
+                false,
+            )?;
+            if observed.uid != workload.uid || observed.name != workload.name {
+                return Err(Error::Conflict(
+                    "Existing builder changed while capturing its views".into(),
+                ));
+            }
+            // Refresh an observation-only RV without changing the captured UID.
+            target.workload = Some(observed);
+            let actual = current
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.template.spec.as_ref())
+                .ok_or_else(|| Error::Conflict("Existing builder Pod template missing".into()))?;
+            verify_existing_builder_views(&context.app_id, actual)?;
+            let volumes = self
+                .builder_volumes_from_current_view(&target, &current)
+                .await?;
+            Ok(BuilderReuseSnapshot { target, volumes })
+        }
+        .await
+        .map_err(|error| rejected_before_write(error.to_string()))?;
+        Ok(Some(captured))
+    }
+
+    pub(crate) async fn resume_captured_builder(
+        &self,
+        params: &container_runtime_api::ContainerCreateParams,
+        captured: BuilderReuseSnapshot,
     ) -> Result<(
         ContainerBasicInfo,
         Option<shared_types::UserAppResourceBinding>,
@@ -538,12 +632,36 @@ impl KubernetesRuntime {
             let context = params.execution_context.as_ref().ok_or_else(|| {
                 Error::ConfigurationError("Bound builder requires execution context".into())
             })?;
-            let binding = params.resource_binding.as_ref().ok_or_else(|| {
-                Error::ConfigurationError("Bound builder requires durable resource proof".into())
-            })?;
-            let mut target = self
-                .capture_builder_compute_with_binding(context, Some(binding), false)
-                .await?;
+            if captured.target.context != *context
+                || captured.target.resource_binding != params.resource_binding
+            {
+                return Err(Error::Conflict(
+                    "Existing builder capture differs from its request".into(),
+                ));
+            }
+            let fresh = self
+                .capture_builder_reuse_snapshot(params)
+                .await?
+                .ok_or_else(|| {
+                    Error::ConfigurationError("Builder execution context missing".into())
+                })?;
+            if fresh
+                .target
+                .workload
+                .as_ref()
+                .map(|value| (&value.uid, &value.name))
+                != captured
+                    .target
+                    .workload
+                    .as_ref()
+                    .map(|value| (&value.uid, &value.name))
+                || fresh.volumes != captured.volumes
+            {
+                return Err(Error::Conflict(
+                    "Existing builder identity or workspace changed before reuse".into(),
+                ));
+            }
+            let mut target = fresh.target;
             target.builder_startup_mode = params.builder_startup_mode;
             let workload = target.workload.as_ref().ok_or_else(|| {
                 Error::Conflict(
@@ -555,7 +673,12 @@ impl KubernetesRuntime {
                 .get(&workload.name)
                 .await
                 .map_err(|error| api_error("Inspect bound builder configuration", error))?;
-            let observed = workload_identity_with_binding(&current, context, Some(binding), false)?;
+            let observed = workload_identity_with_binding(
+                &current,
+                context,
+                params.resource_binding.as_ref(),
+                false,
+            )?;
             if observed.uid != workload.uid || observed.name != workload.name {
                 return Err(Error::Conflict(
                     "Bound builder changed during configuration validation".into(),
@@ -564,6 +687,15 @@ impl KubernetesRuntime {
             // status/metadata updates can advance RV without replacing compute.
             // Future writes use the version read with these actual data views.
             target.workload = Some(observed);
+            if self
+                .builder_volumes_from_current_view(&target, &current)
+                .await?
+                != captured.volumes
+            {
+                return Err(Error::Conflict(
+                    "Existing builder workspace changed before reuse".into(),
+                ));
+            }
             let actual = current
                 .spec
                 .as_ref()
@@ -595,6 +727,29 @@ impl KubernetesRuntime {
         self.report_control_outcome(&target, true, true, &outcome);
         let info = outcome?
             .ok_or_else(|| Error::Conflict("Bound builder did not return a running Pod".into()))?;
+        let fresh = self
+            .capture_builder_reuse_snapshot(params)
+            .await
+            .map_err(|error| {
+                Error::ConnectionError(format!("Confirm builder after startup: {error}"))
+            })?
+            .ok_or_else(|| Error::Conflict("Builder capture missing after reuse".into()))?;
+        if fresh
+            .target
+            .workload
+            .as_ref()
+            .map(|value| (&value.uid, &value.name))
+            != captured
+                .target
+                .workload
+                .as_ref()
+                .map(|value| (&value.uid, &value.name))
+            || fresh.volumes != captured.volumes
+        {
+            return Err(Error::Conflict(
+                "Existing builder identity or workspace changed after reuse".into(),
+            ));
+        }
         // A resumed creation may have a ready Pod but no public Service yet.
         // Repair it under the original lease before committing the completion
         // receipt, so host-side NodePort registration is not skipped.
