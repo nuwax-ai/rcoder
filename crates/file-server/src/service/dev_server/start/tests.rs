@@ -750,8 +750,11 @@ mod owner_reuse_tests {
                             } else {
                                 shared_types::RuntimeOperationState::Accepted
                             };
-                            return axum::Json(envelope(&operation_view(id, state)))
-                                .into_response();
+                            let mut view = operation_view(id, state);
+                            let original = requests.lock().unwrap().iter().find(|request| request.operation_id == id).cloned().unwrap();
+                            view.kind = original.kind;
+                            view.request_digest = shared_types::runtime_request_digest(&original).unwrap();
+                            return axum::Json(envelope(&view)).into_response();
                         }
                         next.run(request).await
                     }
@@ -879,6 +882,168 @@ mod owner_reuse_tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn admitted_source_with_lost_post_ack_reuses_original_operation_and_events() {
+        admitted_without_post_ack(None).await;
+    }
+
+    #[tokio::test]
+    async fn admitted_artifact_with_lost_post_ack_reuses_original_operation_and_events() {
+        admitted_without_post_ack(Some("original-release")).await;
+    }
+
+    /// Real loopback admission persists the original request, then withholds
+    /// only its HTTP acknowledgement. The manager must reconcile the same
+    /// operation within its original launch budget, including terminal events.
+    async fn admitted_without_post_ack(artifact: Option<&str>) {
+        use axum::response::IntoResponse as _;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("source");
+        std::fs::create_dir_all(&workspace).unwrap();
+        if let Some(release) = artifact {
+            use std::io::Write as _;
+            std::fs::create_dir_all(workspace.join("builds")).unwrap();
+            let file = std::fs::File::create(
+                workspace
+                    .join("builds")
+                    .join(format!("workspace-package-{release}.zip")),
+            )
+            .unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file(
+                "release.lock.toml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(include_bytes!(
+                "../../../../../workspace-manifest/tests/fixtures/lock_v1.toml"
+            ))
+            .unwrap();
+            zip.finish().unwrap();
+        }
+        let root = dir.path().join(".app-cli-state/unknown-app");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("token"), "test-token").unwrap();
+        let requests = Arc::new(Mutex::new(
+            Vec::<shared_types::RuntimeOperationRequest>::new(),
+        ));
+        let router = mock_owner_router("hashed-workspace", &workspace)
+            .with_state(Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            .layer(axum::middleware::from_fn({
+                let requests = requests.clone();
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let requests = requests.clone();
+                    async move {
+                        if request.method() == axum::http::Method::POST {
+                            assert_eq!(request.headers()["x-deploy-token"], "test-token");
+                            let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+                                .await
+                                .unwrap();
+                            requests
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::from_slice(&bytes).unwrap());
+                            // Keep the original operation queryable while the
+                            // accepted POST's response is lost past the SDK's 10s timeout.
+                            std::future::pending::<()>().await;
+                            unreachable!("the fixture never returns the lost acknowledgement");
+                        }
+                        if let Some(id) =
+                            request.uri().path().strip_prefix("/v1/runtime/operations/")
+                            && !id.contains('/')
+                        {
+                            let captured = requests
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .find(|r| r.operation_id == id)
+                                .cloned();
+                            let Some(original) = captured else {
+                                return axum::http::StatusCode::NOT_FOUND.into_response();
+                            };
+                            let mut view =
+                                operation_view(id, shared_types::RuntimeOperationState::Succeeded);
+                            view.kind = original.kind;
+                            view.request_digest =
+                                shared_types::runtime_request_digest(&original).unwrap();
+                            return axum::Json(envelope(&view)).into_response();
+                        }
+                        next.run(request).await
+                    }
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::from_env().unwrap();
+        config.log_base_dir = dir.path().join("logs");
+        config.app_cli_admin_probe_addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let manager = DevServerManager::new(Arc::new(config));
+        let events = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let lines = events.clone();
+        let submitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admitted = submitted.clone();
+        let mut hooks = crate::service::dev_server::DevEventHooks::noop();
+        hooks.launch_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(25));
+        hooks.on_line = Arc::new(move |line| {
+            lines
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str(line).unwrap())
+        });
+        hooks.on_submitted = Some(Arc::new(move || {
+            admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let result = manager
+            .reuse_or_refuse_owner(
+                "userapp:ack",
+                &workspace,
+                Some(hooks),
+                None,
+                artifact,
+                Some("original-task"),
+            )
+            .await;
+        // Close the listener even when the old implementation fails this assertion.
+        server.abort();
+        let started = result.expect("an admitted operation must be reconciled after only its POST acknowledgement times out").unwrap();
+        assert_eq!(started.pid, 0);
+        assert_eq!(submitted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let posted = requests.lock().unwrap();
+        assert_eq!(
+            posted.len(),
+            1,
+            "reconciliation must not dispatch another POST"
+        );
+        let original = &posted[0];
+        assert_eq!(original.expected_runtime_instance_id, "instance-test");
+        assert_eq!(original.request_context.as_deref(), Some("original-task"));
+        assert_eq!(
+            original.kind,
+            if artifact.is_some() {
+                shared_types::RuntimeOperationKind::Deploy
+            } else {
+                shared_types::RuntimeOperationKind::Restart
+            }
+        );
+        let delivered = events.lock().unwrap();
+        assert!(
+            delivered
+                .iter()
+                .any(|event| event["event"] == "orchestration_done"),
+            "the original terminal event must reach the caller: {delivered:?}"
+        );
+        let state = manager.read_external_state().unwrap();
+        assert!(state.intents.is_empty());
+        assert_eq!(
+            manager
+                .external_operation_for_task("userapp:ack", "original-task")
+                .unwrap(),
+            Some(original.operation_id.clone())
+        );
+    }
+
     /// HttpResult 信封（wire 层格式手拼 OK；data 载荷一律 typed 构造——
     /// 契约结构体字段偏移时编译器强制 mock 同步，不靠字符串检查）。
     fn envelope<T: serde::Serialize>(data: &T) -> serde_json::Value {
@@ -934,6 +1099,11 @@ mod owner_reuse_tests {
 
         let ws = ws.to_string();
         let identity_ws = ws.clone();
+        let requests = Arc::new(Mutex::new(std::collections::HashMap::<
+            String,
+            shared_types::RuntimeOperationRequest,
+        >::new()));
+        let queried = requests.clone();
         axum::Router::new()
             .route(
                 "/v1/runtime/identity",
@@ -949,53 +1119,67 @@ mod owner_reuse_tests {
             .route(
                 "/v1/runtime/operations",
                 axum::routing::post(
-                    |axum::extract::State(polls): axum::extract::State<
+                    move |axum::extract::State(polls): axum::extract::State<
                         Arc<std::sync::atomic::AtomicUsize>,
                     >,
-                     axum::Json(req): axum::Json<serde_json::Value>| async move {
-                        assert_eq!(req["workspace_id"], "hashed-workspace");
-                        polls.store(1, std::sync::atomic::Ordering::SeqCst);
-                        let id = req
-                            .get("operation_id")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("op")
-                            .to_string();
-                        let receipt = shared_types::RuntimeOperationAccepted {
-                            operation_id: id.clone(),
-                            state: RuntimeOperationState::Accepted,
-                            poll: format!("/v1/runtime/operations/{id}"),
-                        };
-                        (
-                            axum::http::StatusCode::ACCEPTED,
-                            axum::Json(envelope(&receipt)),
-                        )
+                          axum::Json(req): axum::Json<serde_json::Value>| {
+                        let requests = requests.clone();
+                        async move {
+                            let original: shared_types::RuntimeOperationRequest =
+                                serde_json::from_value(req.clone()).unwrap();
+                            requests
+                                .lock()
+                                .unwrap()
+                                .insert(original.operation_id.clone(), original);
+                            assert_eq!(req["workspace_id"], "hashed-workspace");
+                            polls.store(1, std::sync::atomic::Ordering::SeqCst);
+                            let id = req
+                                .get("operation_id")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("op")
+                                .to_string();
+                            let receipt = shared_types::RuntimeOperationAccepted {
+                                operation_id: id.clone(),
+                                state: RuntimeOperationState::Accepted,
+                                poll: format!("/v1/runtime/operations/{id}"),
+                            };
+                            (
+                                axum::http::StatusCode::ACCEPTED,
+                                axum::Json(envelope(&receipt)),
+                            )
+                        }
                     },
                 ),
             )
             .route(
                 "/v1/runtime/operations/{id}",
                 axum::routing::get(
-                    |axum::extract::Path(id): axum::extract::Path<String>,
-                     axum::extract::State(polls): axum::extract::State<
+                    move |axum::extract::Path(id): axum::extract::Path<String>,
+                          axum::extract::State(polls): axum::extract::State<
                         Arc<std::sync::atomic::AtomicUsize>,
-                    >| async move {
-                        if polls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                            return (
-                                axum::http::StatusCode::NOT_FOUND,
-                                axum::Json(serde_json::json!({"message": "not found"})),
-                            );
+                    >| {
+                        let queried = queried.clone();
+                        async move {
+                            if polls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                                return (
+                                    axum::http::StatusCode::NOT_FOUND,
+                                    axum::Json(serde_json::json!({"message": "not found"})),
+                                );
+                            }
+                            // 首查 accepted（留事件流消费窗口），其后 succeeded
+                            let seen = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let state = if seen == 1 {
+                                RuntimeOperationState::Accepted
+                            } else {
+                                RuntimeOperationState::Succeeded
+                            };
+                            let mut view = operation_view(&id, state);
+                            let original = queried.lock().unwrap()[&id].clone();
+                            view.kind = original.kind;
+                            view.request_digest =
+                                shared_types::runtime_request_digest(&original).unwrap();
+                            (axum::http::StatusCode::OK, axum::Json(envelope(&view)))
                         }
-                        // 首查 accepted（留事件流消费窗口），其后 succeeded
-                        let seen = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let state = if seen == 1 {
-                            RuntimeOperationState::Accepted
-                        } else {
-                            RuntimeOperationState::Succeeded
-                        };
-                        (
-                            axum::http::StatusCode::OK,
-                            axum::Json(envelope(&operation_view(&id, state))),
-                        )
                     },
                 ),
             )
@@ -1110,6 +1294,7 @@ mod owner_reuse_tests {
                         axum::Json(envelope(&serde_json::json!({
                             "operation_id": "op-x",
                             "state": "accepted",
+                            "poll": "/v1/runtime/operations/op-x",
                         })))
                     }
                 }),
@@ -1173,11 +1358,18 @@ mod owner_reuse_tests {
             username: "biz_user".to_string(),
             password: "new-s3cret".to_string(),
         };
-        // 复用路径会 wait_terminal 轮询到超时——mock 不提供 operation 查询端点，
-        // 这里只需断言**提交 wire**；超时错误可忽略（操作已受理记录在案）
-        let _reuse_result = mgr
+        // This wire-only fixture returns a complete but foreign ACK. It is
+        // refused immediately and cannot claim that the original operation
+        // was admitted; PG propagation is checked on the actual POST below.
+        let reuse_result = mgr
             .reuse_or_refuse_owner("userapp:r78", &ws, None, Some(&pg), None, None)
             .await;
+        assert!(
+            reuse_result
+                .unwrap_err()
+                .to_string()
+                .contains("mismatched operation receipt")
+        );
         let posted = submitted.lock().unwrap();
         let last = posted
             .last()

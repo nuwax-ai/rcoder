@@ -194,6 +194,18 @@ impl SubmissionRejected {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("owner returned a mismatched operation receipt")]
+struct SubmissionReceiptMismatch;
+
+/// A local pre-dispatch failure permits the same immutable intent to be retried.
+/// Transport errors after polling the HTTP write never provide this evidence.
+#[derive(Debug, thiserror::Error)]
+#[error("runtime operation was not dispatched: {reason}")]
+pub(super) struct SubmissionNotDispatched {
+    pub reason: String,
+}
+
 /// 认证后的运行操作客户端。
 pub(crate) struct OwnerClient {
     address: String,
@@ -279,70 +291,177 @@ impl OwnerClient {
         serde_json::from_value(data).context("decode status view")
     }
 
-    pub(super) async fn submit_request(
+    pub(super) async fn submit_request_until(
         &self,
         request: &RuntimeOperationRequest,
+        deadline: tokio::time::Instant,
     ) -> Result<RuntimeOperationView> {
         let operation_id = request.operation_id.as_str();
-        let instance_id = request.expected_runtime_instance_id.as_str();
-        let kind = request.kind;
-        let url = format!("http://{}/v1/runtime/operations", self.address);
-        super::stop_activity::external_dispatched(request)?;
-        let response = self
-            .client
-            .post(&url)
-            .header("X-Deploy-Token", &self.token)
-            .json(request)
-            .send()
-            .await
-            .with_context(|| format!("submit runtime operation to {}", self.address))?;
-        let status = response.status();
-        let body: serde_json::Value = response.json().await.context("parse submit response")?;
-        if !status.is_success() {
-            return Err(SubmissionRejected {
-                code: body
-                    .get("code")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("ERR")
-                    .to_string(),
-                message: body
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string(),
-                status,
+        if tokio::time::Instant::now() >= deadline {
+            return Err(SubmissionNotDispatched {
+                reason: format!("operation {operation_id} launch deadline expired before POST"),
             }
             .into());
         }
-        let data = body
-            .get("data")
-            .cloned()
-            .context("submit response missing data")?;
-        let accepted: shared_types::RuntimeOperationAccepted =
-            serde_json::from_value(data).context("decode accepted operation")?;
-        anyhow::ensure!(
-            accepted.operation_id == operation_id
-                && accepted.poll == format!("/v1/runtime/operations/{operation_id}"),
-            "owner returned a mismatched operation receipt"
+        super::stop_activity::external_dispatched(request).map_err(|error| {
+            SubmissionNotDispatched {
+                reason: format!("prepare original Stop activity: {error:#}"),
+            }
+        })?;
+        let url = format!("http://{}/v1/runtime/operations", self.address);
+        let reply = tokio::time::timeout_at(deadline, async {
+            let response = self
+                .client
+                .post(&url)
+                .header("X-Deploy-Token", &self.token)
+                .json(request)
+                .send()
+                .await
+                .with_context(|| format!("submit runtime operation to {}", self.address))?;
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.context("parse submit response")?;
+            if !status.is_success() {
+                return Err(SubmissionRejected {
+                    code: body
+                        .get("code")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("ERR")
+                        .to_string(),
+                    message: body
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    status,
+                }
+                .into());
+            }
+            let data = body
+                .get("data")
+                .cloned()
+                .context("submit response missing data")?;
+            let accepted: shared_types::RuntimeOperationAccepted =
+                serde_json::from_value(data).context("decode accepted operation")?;
+            if accepted.operation_id != operation_id
+                || accepted.poll != format!("/v1/runtime/operations/{operation_id}")
+            {
+                return Err(SubmissionReceiptMismatch.into());
+            }
+            Ok::<_, anyhow::Error>(accepted)
+        })
+        .await;
+        match reply {
+            Ok(Ok(_accepted)) => {}
+            Ok(Err(error))
+                if error.downcast_ref::<SubmissionReceiptMismatch>().is_some()
+                    || error
+                        .downcast_ref::<SubmissionRejected>()
+                        .is_some_and(SubmissionRejected::proves_not_admitted) =>
+            {
+                return Err(error);
+            }
+            Ok(Err(error)) => {
+                // A broken reply or ambiguous server error cannot establish
+                // whether this already dispatched write was admitted.
+                tracing::warn!(%operation_id, "owner POST reply did not confirm admission; observing only the original operation");
+                return self
+                    .reconcile_dispatched_until(request, deadline)
+                    .await
+                    .with_context(|| {
+                        format!("original owner POST did not confirm admission: {error:#}")
+                    });
+            }
+            Err(_elapsed) => return Err(unknown_submission(request)),
+        }
+        self.reconcile_dispatched_until(request, deadline).await
+    }
+
+    pub(super) fn verify_request_view(
+        view: &RuntimeOperationView,
+        request: &RuntimeOperationRequest,
+    ) -> Result<()> {
+        let digest = shared_types::runtime_request_digest(request).map_err(anyhow::Error::msg)?;
+        ensure!(
+            view.operation_id == request.operation_id
+                && view.runtime_instance_id == request.expected_runtime_instance_id
+                && view.kind == request.kind
+                && view.request_digest == digest,
+            "original runtime operation identity or digest mismatch; result remains unknown"
         );
-        let view = self.operation(operation_id).await?;
-        anyhow::ensure!(
-            view.operation_id == operation_id
-                && view.runtime_instance_id == instance_id
-                && view.kind == kind,
-            "owner returned a mismatched operation identity"
-        );
-        Ok(view)
+        Ok(())
+    }
+
+    /// A dispatched write with a lost acknowledgement is observed by its
+    /// original immutable identity. A 404 is not evidence to send another POST.
+    pub(super) async fn reconcile_dispatched_until(
+        &self,
+        request: &RuntimeOperationRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<RuntimeOperationView> {
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(unknown_submission(request));
+            }
+            match tokio::time::timeout_at(
+                deadline,
+                self.read_operation_if_exists(&request.operation_id),
+            )
+            .await
+            {
+                Ok(Ok(Some(view))) => {
+                    ensure!(
+                        tokio::time::Instant::now() < deadline,
+                        "original runtime operation observation completed after launch deadline; result remains unknown"
+                    );
+                    Self::verify_request_view(&view, request)?;
+                    super::stop_activity::external_observed(&view)?;
+                    return Ok(view);
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) if is_transport_timeout(&error) => {}
+                Ok(Err(error)) => {
+                    return Err(error).context(
+                        "observe original dispatched runtime operation; result remains unknown",
+                    );
+                }
+                Err(_elapsed) => return Err(unknown_submission(request)),
+            }
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(200)),
+            )
+            .await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_request_timeout(
+        address: &str,
+        token: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Self> {
+        let mut owner = Self::new(address, token)?;
+        owner.client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(timeout)
+            .no_proxy()
+            .build()?;
+        Ok(owner)
     }
 
     /// 查询操作状态。
-    pub(super) async fn operation(&self, operation_id: &str) -> Result<RuntimeOperationView> {
-        self.operation_if_exists(operation_id)
-            .await?
-            .context("owner operation not found")
+    pub(super) async fn operation_if_exists(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<RuntimeOperationView>> {
+        let view = self.read_operation_if_exists(operation_id).await?;
+        if let Some(view) = &view {
+            super::stop_activity::external_observed(view)?;
+        }
+        Ok(view)
     }
 
-    pub(super) async fn operation_if_exists(
+    // Reconciliation verifies the original digest before updating Stop activity.
+    pub(super) async fn read_operation_if_exists(
         &self,
         operation_id: &str,
     ) -> Result<Option<RuntimeOperationView>> {
@@ -376,7 +495,6 @@ impl OwnerClient {
             .context("operation response missing data")?;
         let view: RuntimeOperationView =
             serde_json::from_value(data).context("decode operation view")?;
-        super::stop_activity::external_observed(&view)?;
         Ok(Some(view))
     }
 
@@ -419,16 +537,7 @@ impl OwnerClient {
         serde_json::from_value(events).context("decode event records")
     }
 
-    /// 轮询操作至终态（有界）。
-    pub(super) async fn wait_terminal(
-        &self,
-        operation_id: &str,
-        timeout: std::time::Duration,
-    ) -> Result<RuntimeOperationView> {
-        self.wait_terminal_until(operation_id, tokio::time::Instant::now() + timeout)
-            .await
-    }
-
+    /// 轮询操作至终态（共用调用方 deadline）。
     pub(super) async fn wait_terminal_until(
         &self,
         operation_id: &str,
@@ -462,6 +571,22 @@ impl OwnerClient {
             .await;
         }
     }
+}
+
+fn is_transport_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+    })
+}
+
+fn unknown_submission(request: &RuntimeOperationRequest) -> anyhow::Error {
+    anyhow::anyhow!(
+        "runtime operation {} on original instance {} acknowledgement/observation exceeded launch deadline; result remains unknown; query this original operation before retrying",
+        request.operation_id,
+        request.expected_runtime_instance_id
+    )
 }
 
 /// A foreground owner can exit after committing Stop but before the caller
@@ -977,7 +1102,10 @@ mod observation_tests {
         };
         assert!(
             client
-                .wait_terminal(&request.operation_id, std::time::Duration::from_secs(1))
+                .wait_terminal_until(
+                    &request.operation_id,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(1)
+                )
                 .await
                 .is_err()
         );

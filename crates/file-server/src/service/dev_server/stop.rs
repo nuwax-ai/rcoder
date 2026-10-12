@@ -256,6 +256,7 @@ impl DevServerManager {
         project_id: &str,
         external: &crate::models::ExternalOwner,
     ) -> AppResult<StoppedDev> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
         // R05 幂等恢复：在途停止操作按原 ID 续查，不产生新 ID
         let pending = lock(&self.external_stops)?.get(project_id).cloned();
         let route = async {
@@ -297,7 +298,7 @@ impl DevServerManager {
                     &external.address,
                 )?;
                 let view = client
-                    .wait_terminal(&record.operation_id, std::time::Duration::from_secs(120))
+                    .wait_terminal_until(&record.operation_id, deadline)
                     .await?;
                 anyhow::ensure!(
                     view.operation_id == record.operation_id
@@ -378,13 +379,10 @@ impl DevServerManager {
                 captured_state_root.clone(),
             )?;
             let outcome = async {
-                self.resume_external_intent(project_id, &client, &intent, &request)
+                self.resume_external_intent_until(project_id, &client, &intent, &request, deadline)
                     .await?;
                 client
-                    .wait_terminal(
-                        &intent.request.operation_id,
-                        std::time::Duration::from_secs(120),
-                    )
+                    .wait_terminal_until(&intent.request.operation_id, deadline)
                     .await
             }
             .await;
@@ -633,6 +631,7 @@ mod external_stop_tests {
         identity: Arc<Mutex<Option<shared_types::RuntimeIdentityView>>>,
         tokens: Arc<Mutex<Vec<String>>>,
         submitted: Arc<Mutex<Vec<String>>>,
+        requests: Arc<Mutex<HashMap<String, shared_types::RuntimeOperationRequest>>>,
         states: Arc<Mutex<HashMap<String, RuntimeOperationState>>>,
     }
 
@@ -716,6 +715,11 @@ mod external_stop_tests {
                                 .to_string();
                             assert_eq!(req["workspace_id"], "ws-stable-hash");
                             state.submitted.lock().unwrap().push(id.clone());
+                            state
+                                .requests
+                                .lock()
+                                .unwrap()
+                                .insert(id.clone(), serde_json::from_value(req).unwrap());
                             (
                                 axum::http::StatusCode::ACCEPTED,
                                 axum::Json(envelope(&shared_types::RuntimeOperationAccepted {
@@ -749,10 +753,12 @@ mod external_stop_tests {
                                     .cloned()
                                     .unwrap_or(RuntimeOperationState::Stopping)
                             };
-                            (
-                                axum::http::StatusCode::OK,
-                                axum::Json(envelope(&view(&id, view_state))),
-                            )
+                            let mut view = view(&id, view_state);
+                            if let Some(request) = state.requests.lock().unwrap().get(&id) {
+                                view.request_digest =
+                                    shared_types::runtime_request_digest(request).unwrap();
+                            }
+                            (axum::http::StatusCode::OK, axum::Json(envelope(&view)))
                         }
                     },
                 ),

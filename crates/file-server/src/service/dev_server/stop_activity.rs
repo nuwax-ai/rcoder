@@ -388,3 +388,7 @@ impl DevServerManager {
         observe.map_err(|error| AppError::owner_error("observe original Stop activity", error))
     }
 }
+
+#[cfg(test)]
+#[path = "stop_activity_submit_tests.rs"]
+mod submit_observation_tests;

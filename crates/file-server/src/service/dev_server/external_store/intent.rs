@@ -173,6 +173,7 @@ impl DevServerManager {
                 request: redacted,
                 digest: digest(candidate)?,
                 has_private_config: candidate.run_config.is_some(),
+                dispatch_pending: false,
                 address: owner.address.clone(),
                 project_root: Some(root),
             };
@@ -209,13 +210,15 @@ impl DevServerManager {
         Ok(intent)
     }
 
-    /// Query first; only a definite 404 authorizes replay of the identical original request.
-    pub(crate) async fn resume_external_intent(
+    /// Old intents without dispatch evidence retain their original replay
+    /// behavior. A recorded dispatched write is only observed, never repeated.
+    pub(crate) async fn resume_external_intent_until(
         &self,
         project: &str,
         client: &OwnerClient,
         intent: &Intent,
         supplied: &RuntimeOperationRequest,
+        deadline: tokio::time::Instant,
     ) -> Result<RuntimeOperationView> {
         process_utils::command_context::CommandContext::record_external_operation(
             &intent.request.operation_id,
@@ -233,11 +236,37 @@ impl DevServerManager {
                 "runtime intent configuration differs; refusing to ignore new input"
             );
         }
-        if let Some(view) = client
-            .operation_if_exists(&intent.request.operation_id)
-            .await?
-        {
-            verify_view(&view, &intent.request)?;
+        let current = self.read_external_state()?;
+        let dispatched = current
+            .intents
+            .get(&key(project, intent.request.kind))
+            .filter(|current| current.request.operation_id == intent.request.operation_id)
+            .or_else(|| {
+                current
+                    .completed
+                    .get(&format!("{project}|{}", intent.request.operation_id))
+            })
+            .is_some_and(|current| current.dispatch_pending);
+        if dispatched {
+            super::super::stop_activity::external_dispatched(&intent.request)?;
+            return client
+                .reconcile_dispatched_until(&intent.request, deadline)
+                .await;
+        }
+        let observed = tokio::time::timeout_at(
+            deadline,
+            client.read_operation_if_exists(&intent.request.operation_id),
+        )
+        .await
+        .context(
+            "original runtime intent observation exceeded launch deadline; no POST dispatched",
+        )??;
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "original runtime intent launch deadline expired before submission"
+        );
+        if let Some(view) = observed {
+            OwnerClient::verify_request_view(&view, &intent.request)?;
             super::super::stop_activity::external_observed(&view)?;
             return Ok(view);
         }
@@ -253,9 +282,48 @@ impl DevServerManager {
             digest(&original)? == intent.digest,
             "runtime intent private configuration differs; refusing replay"
         );
-        match client.submit_request(&original).await {
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "original runtime intent launch deadline expired before submission"
+        );
+        let should_dispatch = self.external_transaction(|state| {
+            let current = state
+                .intents
+                .get_mut(&key(project, original.kind))
+                .context("runtime intent disappeared before dispatch")?;
+            ensure!(
+                current.request.operation_id == original.operation_id
+                    && current.request.expected_runtime_instance_id
+                        == original.expected_runtime_instance_id
+                    && current.address == intent.address
+                    && current.digest == intent.digest,
+                "runtime intent changed before dispatch; refusing stale POST"
+            );
+            if current.dispatch_pending {
+                return Ok(false);
+            }
+            current.dispatch_pending = true;
+            Ok(true)
+        })?;
+        if !should_dispatch {
+            super::super::stop_activity::external_dispatched(&original)?;
+            return client.reconcile_dispatched_until(&original, deadline).await;
+        }
+        match client.submit_request_until(&original, deadline).await {
             Ok(view) => Ok(view),
             Err(error) => {
+                if error.downcast_ref::<crate::service::dev_server::owner_client::SubmissionNotDispatched>().is_some() {
+                    self.external_transaction(|state| {
+                        let current = state.intents.get_mut(&key(project, original.kind))
+                            .context("runtime intent disappeared before releasing undispatched request")?;
+                        ensure!(current.request.operation_id == original.operation_id
+                            && current.request.expected_runtime_instance_id == original.expected_runtime_instance_id,
+                            "runtime intent changed before releasing undispatched request");
+                        current.dispatch_pending = false;
+                        Ok(())
+                    })?;
+                    super::super::stop_activity::external_not_admitted(&original.operation_id)?;
+                }
                 if error
                     .downcast_ref::<crate::service::dev_server::owner_client::SubmissionRejected>()
                     .is_some_and(|rejection| rejection.proves_not_admitted())
@@ -268,6 +336,24 @@ impl DevServerManager {
                 Err(error)
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn resume_external_intent(
+        &self,
+        project: &str,
+        client: &OwnerClient,
+        intent: &Intent,
+        supplied: &RuntimeOperationRequest,
+    ) -> Result<RuntimeOperationView> {
+        self.resume_external_intent_until(
+            project,
+            client,
+            intent,
+            supplied,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .await
     }
 
     /// Never clear a replacement intent by project ID alone.

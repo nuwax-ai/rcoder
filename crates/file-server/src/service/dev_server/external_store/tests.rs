@@ -427,8 +427,8 @@ mod cases {
                     let wire = queried.lock().unwrap();
                     if !wire.committed { return (axum::http::StatusCode::NOT_FOUND, axum::Json(serde_json::json!({}))); }
                     (axum::http::StatusCode::OK, axum::Json(serde_json::json!({"data": RuntimeOperationView {
-                        operation_id: id, kind: RuntimeOperationKind::Restart, state: RuntimeOperationState::Succeeded,
-                        request_digest: "digest".into(), revision: 8, runtime_instance_id: "instance".into(),
+                        operation_id: id.clone(), kind: RuntimeOperationKind::Restart, state: RuntimeOperationState::Succeeded,
+                        request_digest: shared_types::runtime_request_digest(wire.posts.iter().find(|request| request.operation_id == id).unwrap()).unwrap(), revision: 8, runtime_instance_id: "instance".into(),
                         error_code: None, error_message: None, failure_detail: None,
                     }})))
                 }
@@ -442,7 +442,7 @@ mod cases {
     }
 
     #[tokio::test]
-    async fn lost_reply_then_restart_queries_original_or_replays_identical_request() {
+    async fn lost_reply_then_restart_queries_original_without_repeating_dispatched_write() {
         for accepted in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let (address, wire, server) = mock(dir.path().to_path_buf(), true, accepted).await;
@@ -453,11 +453,13 @@ mod cases {
             let intent = first
                 .prepare_external_intent("project", dir.path(), &external, &original)
                 .unwrap();
-            assert!(
-                first
-                    .resume_external_intent("project", &client, &intent, &original)
-                    .await
-                    .is_err()
+            let first_result = first
+                .resume_external_intent("project", &client, &intent, &original)
+                .await;
+            assert_eq!(
+                first_result.is_ok(),
+                accepted,
+                "a committed original operation is reconciled during the first call; an absent unknown write remains protected"
             );
             drop(first);
             let restarted = manager(dir.path());
@@ -467,13 +469,33 @@ mod cases {
             let recovered = restarted
                 .prepare_external_intent("project", dir.path(), &external, &later)
                 .unwrap();
-            let view = restarted
+            let observed = restarted
                 .resume_external_intent("project", &client, &recovered, &later)
-                .await
-                .unwrap();
+                .await;
+            if !accepted {
+                assert!(
+                    observed
+                        .unwrap_err()
+                        .to_string()
+                        .contains("result remains unknown")
+                );
+                assert_eq!(
+                    wire.lock().unwrap().posts.len(),
+                    1,
+                    "404 after an unacknowledged POST never proves non-admission"
+                );
+                assert!(
+                    restarted.read_external_state().unwrap().intents
+                        [&key("project", original.kind)]
+                        .dispatch_pending
+                );
+                server.abort();
+                continue;
+            }
+            let view = observed.unwrap();
             assert_eq!(view.operation_id, original.operation_id);
             let posts = &wire.lock().unwrap().posts;
-            assert_eq!(posts.len(), if accepted { 1 } else { 2 });
+            assert_eq!(posts.len(), 1);
             for post in posts {
                 assert_eq!(
                     serde_json::to_value(post).unwrap(),

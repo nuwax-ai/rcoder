@@ -110,7 +110,9 @@ impl DevServerManager {
         operation_id: &str,
         pg: Option<&shared_types::StartPgCredential>,
     ) -> crate::error::AppResult<(Option<String>, RuntimeOperationView)> {
-        let recover = async {
+        let deadline = tokio::time::Instant::now()
+            + super::super::DevEventHooks::launch_budget(self.config.dev_command_timeout_secs);
+        let recover = tokio::time::timeout_at(deadline, async {
             let state = self.read_external_state()?;
             let intent = state
                 .intents
@@ -169,10 +171,14 @@ impl DevServerManager {
                         "runtime intent configuration differs"
                     );
                 }
-                let view = client.operation_if_exists(operation_id).await?.context(
-                    "completed operation no longer retained by owner; replay prohibited",
-                )?;
-                verify_view(&view, &intent.request)?;
+                let view = client
+                    .read_operation_if_exists(operation_id)
+                    .await?
+                    .context(
+                        "completed operation no longer retained by owner; replay prohibited",
+                    )?;
+                OwnerClient::verify_request_view(&view, &intent.request)?;
+                super::super::stop_activity::external_observed(&view)?;
                 if owner_changed {
                     ensure!(
                         view.state.is_terminal(),
@@ -187,7 +193,7 @@ impl DevServerManager {
                 }
                 view
             } else {
-                self.resume_external_intent(project, &client, &intent, &supplied)
+                self.resume_external_intent_until(project, &client, &intent, &supplied, deadline)
                     .await?
             };
             if (!completed || owner_changed)
@@ -207,8 +213,12 @@ impl DevServerManager {
                 )?;
             }
             Ok::<_, anyhow::Error>((intent.request.request_context, view))
-        }
-        .await;
+        })
+        .await
+        .context(
+            "runtime operation recovery observation deadline expired; original intent retained",
+        )
+        .and_then(|result| result);
         recover.map_err(|error| {
             crate::error::AppError::owner_error("runtime operation recovery", error)
         })

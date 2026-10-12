@@ -21,6 +21,8 @@ mod intent;
 mod recover;
 mod state;
 #[cfg(test)]
+mod submit_reconciliation_tests;
+#[cfg(test)]
 mod tests;
 
 // 拆分前 pub(super) = dev_server 层可见（types.rs/stop.rs/owner_recovery.rs

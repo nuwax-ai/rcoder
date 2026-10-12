@@ -6,6 +6,10 @@ pub(crate) struct Intent {
     /// Digest of the original full request, including private configuration.
     pub(super) digest: String,
     pub(super) has_private_config: bool,
+    /// Captured before POST. Unknown replies may only be reconciled by GET;
+    /// an absent operation is not permission to dispatch it again.
+    #[serde(default)]
+    pub(super) dispatch_pending: bool,
     pub(super) address: String,
     #[serde(default)]
     pub(super) project_root: Option<std::path::PathBuf>,

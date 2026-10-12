@@ -231,7 +231,7 @@ impl DevServerManager {
             original_operation_id = Some(operation_id.clone());
             anyhow::ensure!(tokio::time::Instant::now() < deadline,
                 "owner startup observation launch deadline expired before submitting operation {operation_id}; query this original operation before retrying");
-            let admitted = self.resume_external_intent(project_id, &client, &intent, &request)
+            let admitted = self.resume_external_intent_until(project_id, &client, &intent, &request, deadline)
                 .await?;
             crate::service::dev_server::external_store::verify_view(&admitted, &intent.request)?;
             // The local intent alone is not admission evidence. Only the

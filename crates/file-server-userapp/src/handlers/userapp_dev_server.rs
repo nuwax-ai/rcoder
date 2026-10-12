@@ -1397,7 +1397,7 @@ mod operation_recovery_tests {
 
     #[tokio::test]
     async fn recover_handler_preserves_operation_after_lost_reply_and_process_restart() {
-        for accepted_before_loss in [false, true] {
+        for visible_before_loss in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let workspace = root.path().join("workspaces/app123");
             std::fs::create_dir_all(&workspace).unwrap();
@@ -1436,6 +1436,7 @@ mod operation_recovery_tests {
             let post_sink = posts.clone();
             let post_committed = committed.clone();
             let get_committed = committed.clone();
+            let get_posts = posts.clone();
             let owner = Router::new()
                 .route(
                     "/v1/runtime/identity",
@@ -1488,9 +1489,21 @@ mod operation_recovery_tests {
                                 posts.push(request.clone());
                                 if posts.len() == 1 {
                                     committed.store(
-                                        accepted_before_loss,
+                                        visible_before_loss,
                                         std::sync::atomic::Ordering::SeqCst,
                                     );
+                                    if !visible_before_loss {
+                                        let late_original = committed.clone();
+                                        tokio::spawn(async move {
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                50,
+                                            ))
+                                            .await;
+                                            late_original
+                                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                                        });
+                                    }
+
                                     return (
                                         axum::http::StatusCode::OK,
                                         "lost-response".to_string(),
@@ -1520,6 +1533,7 @@ mod operation_recovery_tests {
                     axum::routing::get(
                         move |axum::extract::Path(id): axum::extract::Path<String>| {
                             let committed = get_committed.clone();
+                            let posts = get_posts.clone();
                             async move {
                                 if !committed.load(std::sync::atomic::Ordering::SeqCst) {
                                     return (
@@ -1532,6 +1546,13 @@ mod operation_recovery_tests {
                                         ),
                                     );
                                 }
+                                let original = posts
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .find(|request| request.operation_id == id)
+                                    .cloned()
+                                    .unwrap();
                                 (
                                     axum::http::StatusCode::OK,
                                     axum::Json(HttpResult::success(
@@ -1539,7 +1560,10 @@ mod operation_recovery_tests {
                                             operation_id: id,
                                             kind: shared_types::RuntimeOperationKind::Restart,
                                             state: shared_types::RuntimeOperationState::Succeeded,
-                                            request_digest: "digest".into(),
+                                            request_digest: shared_types::runtime_request_digest(
+                                                &original,
+                                            )
+                                            .unwrap(),
                                             revision: 8,
                                             runtime_instance_id: "original-instance".into(),
                                             error_code: None,
@@ -1595,7 +1619,14 @@ mod operation_recovery_tests {
                 .unwrap();
             assert!(posts.lock().unwrap().is_empty());
             let first = http_recover(state, "original-op", "app123").await;
-            assert_eq!(first["success"], false);
+            assert_eq!(
+                first["success"], true,
+                "the same handler call must reconcile the original accepted write despite its broken ACK: {first}"
+            );
+            assert_eq!(first["data"]["operation"]["operation_id"], "original-op");
+            assert_eq!(posts.lock().unwrap().len(), 1);
+            // Neither temporary absence nor file-server restart grants
+            // permission to send another POST or replace the original ID.
             let restarted = make_state(config);
             let success = http_recover(restarted.clone(), "original-op", "app123").await;
             assert_eq!(success["success"], true, "{success}");
@@ -1604,10 +1635,7 @@ mod operation_recovery_tests {
             assert_eq!(success["data"]["operation"]["state"], "succeeded");
             let replay = http_recover(restarted.clone(), "original-op", "app123").await;
             assert_eq!(replay["success"], true);
-            assert_eq!(
-                posts.lock().unwrap().len(),
-                if accepted_before_loss { 1 } else { 2 }
-            );
+            assert_eq!(posts.lock().unwrap().len(), 1);
             for posted in posts.lock().unwrap().iter() {
                 assert_eq!(
                     serde_json::to_value(posted).unwrap(),
@@ -1618,10 +1646,7 @@ mod operation_recovery_tests {
             committed.store(false, std::sync::atomic::Ordering::SeqCst);
             let missing_receipt = http_recover(restarted.clone(), "original-op", "app123").await;
             assert_eq!(missing_receipt["success"], false);
-            assert_eq!(
-                posts.lock().unwrap().len(),
-                if accepted_before_loss { 1 } else { 2 }
-            );
+            assert_eq!(posts.lock().unwrap().len(), 1);
             let wrong_app = http_recover(restarted, "original-op", "anotherapp").await;
             assert_eq!(wrong_app["success"], false);
             server.abort();
