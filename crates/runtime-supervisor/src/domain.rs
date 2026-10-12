@@ -206,8 +206,10 @@ pub(crate) fn has_confirmed_exit(root: &Path, value: &record::Generation) -> Res
 
 /// An existing platform retirement may cover resident commands too: it proves
 /// the original physical domain cannot execute again, not merely one business
-/// process. Bind it to the resident's original owner and exact workspace before
-/// using it; a successor's local epoch alone never retires another Pod.
+/// process. Several successive owners can leave resident ranges in that domain.
+/// The proof still has to match its own generation, supervisor and workspace;
+/// the resident needs the same exact retired domain, not that proof's owner.
+/// A successor's local epoch alone never retires another Pod.
 pub(crate) fn has_confirmed_resident_exit(
     scope: &Path,
     identity: &process_utils::command_authority::ResidentIdentity,
@@ -245,9 +247,7 @@ pub(crate) fn has_confirmed_resident_exit(
             continue;
         }
         let generation = record::generation(&root)?;
-        if generation.supervisor != identity.owner_instance
-            || generation.physical_domain.as_ref() != Some(&original)
-        {
+        if generation.physical_domain.as_ref() != Some(&original) {
             continue;
         }
         if has_confirmed_exit(&root, &generation)? {

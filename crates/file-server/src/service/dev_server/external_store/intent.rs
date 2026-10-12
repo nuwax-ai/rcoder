@@ -238,6 +238,7 @@ impl DevServerManager {
             .await?
         {
             verify_view(&view, &intent.request)?;
+            super::super::stop_activity::external_observed(&view)?;
             return Ok(view);
         }
         let mut original = intent.request.clone();
@@ -259,6 +260,9 @@ impl DevServerManager {
                     .downcast_ref::<crate::service::dev_server::owner_client::SubmissionRejected>()
                     .is_some_and(|rejection| rejection.proves_not_admitted())
                 {
+                    super::super::stop_activity::external_not_admitted(
+                        &intent.request.operation_id,
+                    )?;
                     self.finish_external_intent(project, &intent.request, false)?;
                 }
                 Err(error)

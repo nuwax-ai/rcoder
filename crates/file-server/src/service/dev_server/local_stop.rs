@@ -222,17 +222,32 @@ impl DevServerManager {
             &mut attempt,
             budget,
             Some(&cleanup),
-            |captured| self.persist_captured_stop(key, captured),
+            |captured| {
+                self.persist_captured_stop(key, captured)?;
+                super::stop_activity::native_dispatched(captured)
+            },
         )
         .await;
         match outcome {
             Ok(_) => {
+                super::stop_activity::native_finished(&attempt.request.request_id).map_err(
+                    |error| AppError::owner_error("complete native Stop activity", error),
+                )?;
                 self.forget_persisted_local_stop(key, &attempt)?;
                 self.retire_seated_stop(key, &attempt.request.request_id);
                 Ok(())
             }
             Err(error) => {
                 if runtime_supervisor::is_stop_refused(&error) {
+                    if error
+                        .downcast_ref::<runtime_supervisor::RecoveryError>()
+                        .is_none()
+                    {
+                        super::stop_activity::native_finished(&attempt.request.request_id)
+                            .map_err(|error| {
+                                AppError::owner_error("reject native Stop activity", error)
+                            })?;
+                    }
                     // 明确拒绝（Busy/身份/协议/RecoveryRequired）：清掉本
                     // attempt，新的用户重试可产生新身份；错误向上传播。
                     self.forget_persisted_local_stop(key, &attempt)?;

@@ -53,6 +53,10 @@ use crate::service::userapp::start_events::{StartEvent as EvtOutcome, StartEvent
 #[path = "userapp_dev_server/owner_admission_tests.rs"]
 mod owner_admission_tests;
 
+#[cfg(test)]
+#[path = "userapp_dev_server/idle_activity_tests.rs"]
+mod idle_activity_tests;
+
 /// app-cli EVT JSON → 进度事件/终局（UA-07: typed 解码走
 /// `shared_types::app_cli_evt` 唯一契约; 未知扩展与已知事件损坏分开留痕,
 /// 两者都不影响编排——尽力而为的观测通道）。返回 None = 调用方丢弃。
@@ -200,44 +204,91 @@ pub(crate) async fn dev_stop(
     State(state): State<UserAppState>,
     Json(body): Json<DevOpBody>,
 ) -> UserAppReply<UserappDevStopped> {
-    let result = async {
-        body.validate().map_err(file_server::error::from_garde)?;
-        let key = dev_key(&body.app_id);
-        let lifecycle = state.build_tasks.dev_lifecycle(&body.app_id).await;
-        let mut generation = lifecycle.lock().await;
-        *generation = generation
-            .checked_add(1)
-            .ok_or_else(|| AppError::system("dev lifecycle generation exhausted"))?;
-        // 先取消在途任务（kill 编译进程组 + 终态 Cancelled），再停服务——
-        // 顺序保证任务侧不会再有 start 动作追上来
-        for task in state.build_tasks.active_tasks_for_app(&body.app_id).await {
-            if !task.is_terminal().await {
-                tracing::info!(
-                    app_id = %body.app_id, task_id = %task.id,
-                    "[DEV_STOP] cancelling in-flight dev task (stop intent)"
-                );
-                task.request_cancel().await;
+    if let Err(error) = body.validate().map_err(file_server::error::from_garde) {
+        return reply(Err(error));
+    }
+    let workers = state.build_tasks.workers.clone();
+    let (completion, receiver) = tokio::sync::oneshot::channel();
+    let execution = workers.spawn(async move {
+        let mut pending = Vec::new();
+        let result = async {
+            let key = dev_key(&body.app_id);
+            let lifecycle = state.build_tasks.dev_lifecycle(&body.app_id).await;
+            let mut generation = lifecycle.lock().await;
+            *generation = generation
+                .checked_add(1)
+                .ok_or_else(|| AppError::system("dev lifecycle generation exhausted"))?;
+            // 先取消在途任务（kill 编译进程组 + 终态 Cancelled），再停服务——
+            // 顺序保证任务侧不会再有 start 动作追上来
+            for task in state.build_tasks.active_tasks_for_app(&body.app_id).await {
+                if !task.is_terminal().await {
+                    tracing::info!(
+                        app_id = %body.app_id, task_id = %task.id,
+                        "[DEV_STOP] cancelling in-flight dev task (stop intent)"
+                    );
+                    task.request_cancel().await;
+                }
+            }
+            // R05：managed 域停止不 ps 扫描——external 登记经运行 API 幂等停；
+            // 登记缺失时核验项目与 owner 身份，再恢复控制通道
+            let workspace = resolve_userapp_dev(&body.app_id, None, &state.fs.config)
+                .map_err(|e| AppError::business(format!("resolve workspace for stop: {e}")))?;
+            let (stopped, captured) = state
+                .fs
+                .dev_server
+                .stop_userapp_dev_tracked(&key, &workspace)
+                .await;
+            pending = captured;
+            let stopped: StoppedDev = stopped?;
+            state.fs.log_cache.delete(&key)?;
+            let message = stopped.message();
+            Ok(UserappDevStopped {
+                message: message.to_string(),
+                app_id: body.app_id.clone(),
+                pid: None,
+                killed_pids: stopped.killed_pids,
+            })
+        }
+        .await;
+        // The caller's budget and response remain unchanged. Losing this
+        // receiver cannot cancel an already admitted Stop or its reconciliation.
+        let _observer = completion.send(result);
+        for observation in pending {
+            let mut last_error = None;
+            loop {
+                match state
+                    .fs
+                    .dev_server
+                    .observe_stop_activity(&observation)
+                    .await
+                {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) => {
+                        let message = error.to_string();
+                        if last_error.as_deref() != Some(message.as_str()) {
+                            tracing::warn!(app_id = %body.app_id, %error,
+                                "original Stop outcome is still unconfirmed");
+                            last_error = Some(message);
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         }
-        // R05：managed 域停止不 ps 扫描——external 登记经运行 API 幂等停；
-        // 登记缺失时核验项目与 owner 身份，再恢复控制通道
-        let workspace = resolve_userapp_dev(&body.app_id, None, &state.fs.config)
-            .map_err(|e| AppError::business(format!("resolve workspace for stop: {e}")))?;
-        let stopped: StoppedDev = state
-            .fs
-            .dev_server
-            .stop_userapp_dev(&key, &workspace)
-            .await?;
-        state.fs.log_cache.delete(&key)?;
-        let message = stopped.message();
-        Ok(UserappDevStopped {
-            message: message.to_string(),
-            app_id: body.app_id,
-            pid: None,
-            killed_pids: stopped.killed_pids,
-        })
-    };
-    reply(result.await)
+    });
+    match execution {
+        Ok(worker) => {
+            // Drop detaches the owned worker; it does not abort execution.
+            drop(worker);
+            reply(receiver.await.unwrap_or_else(|error| {
+                Err(AppError::system(format!(
+                    "Stop worker completion unavailable: {error}"
+                )))
+            }))
+        }
+        Err(error) => reply(Err(AppError::system(format!("admit Stop worker: {error}")))),
+    }
 }
 
 /// 编译并重启 dev 服务

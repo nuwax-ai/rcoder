@@ -30,6 +30,7 @@ frontend-detector = { workspace = true }
 
 # Web 框架
 axum = { workspace = true }
+http-body = { workspace = true }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 

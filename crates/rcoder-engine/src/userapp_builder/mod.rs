@@ -48,6 +48,15 @@ pub(crate) use creation::fence_settler_tests::runtime_state as builder_runtime_t
 mod dev_cleanup;
 mod dev_locator;
 mod lifecycle;
+
+/// Idle retirement shares the existing local creation boundary. Target-side
+/// activity and physical UID checks provide the cross-replica observations;
+/// this guard alone is never a claim of distributed request admission.
+pub(crate) async fn try_idle_builder_retirement(
+    app_id: &str,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    lifecycle::try_acquire(app_id).await
+}
 mod recovery;
 pub(crate) mod retry;
 pub mod shutdown_gate;

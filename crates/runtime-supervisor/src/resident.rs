@@ -133,6 +133,10 @@ async fn recover_previous(
 }
 
 #[cfg(test)]
+#[path = "resident/whole_domain_exit_tests.rs"]
+mod whole_domain_exit_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use process_utils::command_authority::OwnerLease;

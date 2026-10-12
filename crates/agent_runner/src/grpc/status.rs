@@ -203,16 +203,19 @@ fn get_active_tasks_count() -> i32 {
     // Explicit Stop/Restart still follows its normal cancellation path.
     let local_workers =
         i32::try_from(process_utils::workers::active_in_process()).unwrap_or(i32::MAX);
+    let http_requests =
+        i32::try_from(process_utils::request_activity::active_in_process()).unwrap_or(i32::MAX);
 
     debug!(
-        "[GET_CONTAINER_STATUS] active breakdown: agents={}, terminals={}, vnc={}, local_workers={}",
-        agent_count, terminal_count, vnc_count, local_workers
+        "[GET_CONTAINER_STATUS] active breakdown: agents={}, terminals={}, vnc={}, local_workers={}, http_requests={}",
+        agent_count, terminal_count, vnc_count, local_workers, http_requests
     );
 
     agent_count
         .saturating_add(terminal_count)
         .saturating_add(vnc_count)
         .saturating_add(local_workers)
+        .saturating_add(http_requests)
 }
 
 fn get_uptime_seconds() -> i64 {

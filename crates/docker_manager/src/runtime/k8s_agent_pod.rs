@@ -12,7 +12,7 @@ use container_runtime_api::{
 };
 use k8s_openapi::api::core::v1::{Pod, Service};
 use kube::api::{Api, DeleteParams, ListParams};
-use shared_types::ServiceType;
+use shared_types::{ContainerBasicInfo, ServiceType};
 use tracing::{debug, error, info, warn};
 
 use super::k8s_pod::K8sPodOps;
@@ -38,7 +38,7 @@ impl KubernetesRuntime {
 
         if *service_type == ServiceType::UserappBuilder {
             return self
-                .stop_idle_builder(identifier, &pod_name, &agent_pod)
+                .stop_idle_builder(identifier, &pod_name, &agent_pod, None, None)
                 .await;
         }
 
@@ -100,11 +100,72 @@ impl KubernetesRuntime {
 
     /// Idle retirement captures every deletion target before the bounded owner
     /// drain. A replacement created during drain is never another delete target.
+    pub(crate) async fn retire_captured_idle_builder(
+        &self,
+        identifier: &str,
+        captured: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<()> {
+        self.retire_captured_idle_builder_until(
+            identifier,
+            captured,
+            tokio::time::Instant::now() + super::idle_builder_retirement::RETIREMENT_BUDGET,
+        )
+        .await
+    }
+
+    pub(crate) async fn retire_captured_idle_builder_until(
+        &self,
+        identifier: &str,
+        captured: &ContainerBasicInfo,
+        deadline: tokio::time::Instant,
+    ) -> ContainerRuntimeResult<()> {
+        let dispatched = std::sync::atomic::AtomicBool::new(false);
+        tokio::time::timeout_at(
+            deadline,
+            self.retire_captured_idle_builder_inner(identifier, captured, &dispatched),
+        )
+        .await
+        .map_err(|_| {
+            super::idle_builder_retirement::deadline_error(
+                dispatched.load(std::sync::atomic::Ordering::Acquire),
+            )
+        })?
+    }
+
+    async fn retire_captured_idle_builder_inner(
+        &self,
+        identifier: &str,
+        captured: &ContainerBasicInfo,
+        dispatched: &std::sync::atomic::AtomicBool,
+    ) -> ContainerRuntimeResult<()> {
+        let sts_name = &captured.container_name;
+        if captured.project_id != identifier
+            || identifier.is_empty()
+            || sts_name.is_empty()
+            || captured.container_id.is_empty()
+            || captured.workload_uid.as_ref().is_none_or(String::is_empty)
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "Captured idle builder identity is incomplete".into(),
+            ));
+        }
+        self.stop_idle_builder(
+            identifier,
+            sts_name,
+            &format!("{sts_name}-0"),
+            Some(captured),
+            Some(dispatched),
+        )
+        .await
+    }
+
     async fn stop_idle_builder(
         &self,
         identifier: &str,
         sts_name: &str,
         pod_name: &str,
+        captured: Option<&ContainerBasicInfo>,
+        dispatched: Option<&std::sync::atomic::AtomicBool>,
     ) -> ContainerRuntimeResult<()> {
         use super::k8s_runtime_helpers::conditioned_delete_params;
         use kube::api::PropagationPolicy;
@@ -117,17 +178,77 @@ impl KubernetesRuntime {
             .await
             .map_err(map_error)?;
         let pod = self.pods().get_opt(pod_name).await.map_err(map_error)?;
+        if let Some(captured) = captured {
+            if sts
+                .as_ref()
+                .is_some_and(|sts| sts.metadata.uid.as_ref() != captured.workload_uid.as_ref())
+                || pod.as_ref().is_some_and(|pod| {
+                    pod.metadata.uid.as_deref() != Some(captured.container_id.as_str())
+                })
+            {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Idle builder physical target was replaced".into(),
+                ));
+            }
+            // Absence of the original Pod is an idempotent completion, not
+            // authority to delete a pending successor controller or its Services.
+            if pod.is_none() {
+                let mut cache = self.pod_cache.write().await;
+                if cache.get(identifier).is_some_and(|entry| {
+                    entry.service_type == ServiceType::UserappBuilder
+                        && entry.info.container_id == captured.container_id
+                }) {
+                    cache.remove(identifier);
+                }
+                return Ok(());
+            }
+            if sts.as_ref().is_none_or(|sts| {
+                let labels = sts.metadata.labels.as_ref();
+                labels
+                    .and_then(|labels| labels.get("rcoder.io/identifier"))
+                    .map(String::as_str)
+                    != Some(identifier)
+                    || labels
+                        .and_then(|labels| labels.get("rcoder.io/service-type"))
+                        .map(String::as_str)
+                        != Some(ServiceType::UserappBuilder.container_family_key())
+            }) || pod.as_ref().is_none_or(|pod| {
+                !pod.metadata
+                    .owner_references
+                    .as_ref()
+                    .is_some_and(|owners| {
+                        owners.iter().any(|owner| {
+                            owner.controller == Some(true)
+                                && owner.kind == "StatefulSet"
+                                && owner.name == sts_name
+                                && Some(&owner.uid) == captured.workload_uid.as_ref()
+                        })
+                    })
+            }) {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Captured idle builder ownership mismatch".into(),
+                ));
+            }
+        }
         let mut services = Vec::new();
-        for name in [
-            self.agent_service_name(identifier, &ServiceType::UserappBuilder)?,
-            self.agent_headless_svc_name(identifier, &ServiceType::UserappBuilder)?,
-        ] {
+        let service_names = if captured.is_some() {
+            [format!("{sts_name}-svc"), format!("{sts_name}-headless")]
+        } else {
+            [
+                self.agent_service_name(identifier, &ServiceType::UserappBuilder)?,
+                self.agent_headless_svc_name(identifier, &ServiceType::UserappBuilder)?,
+            ]
+        };
+        for (index, name) in service_names.into_iter().enumerate() {
             if let Some(service) = self
                 .services_api()
                 .get_opt(&name)
                 .await
                 .map_err(map_error)?
             {
+                if captured.is_some() {
+                    super::k8s_service::validate_builder_service(&service, identifier, index == 1)?;
+                }
                 services.push((name, conditioned_delete_params(&service.metadata, None)?));
             }
         }
@@ -154,6 +275,9 @@ impl KubernetesRuntime {
         {
             // Independent of business readiness. Failure must not prevent the
             // physical stop. The in-container UID check fences a replaced Pod.
+            if let Some(dispatched) = dispatched {
+                dispatched.store(true, std::sync::atomic::Ordering::Release);
+            }
             let drain = self.exec_pod_container(pod_name, "agent", vec![
                 "sh".into(), "-c".into(),
                 "[ \"$RCODER_PHYSICAL_POD_UID\" = \"$1\" ] || exit 75; exec app-cli --app-cli-container-stop \"$2\"".into(),
@@ -164,7 +288,32 @@ impl KubernetesRuntime {
                 warn!(%identifier, ?result, "Owner drain incomplete; continuing physical idle stop");
             }
         }
+        if let Some(captured) = captured {
+            match self.pods().get_opt(pod_name).await.map_err(map_error)? {
+                Some(live)
+                    if live.metadata.uid.as_deref() != Some(captured.container_id.as_str()) =>
+                {
+                    return Err(ContainerRuntimeError::Conflict(
+                        "Builder Pod replaced during idle owner drain".into(),
+                    ));
+                }
+                None => {
+                    let mut cache = self.pod_cache.write().await;
+                    if cache.get(identifier).is_some_and(|entry| {
+                        entry.service_type == ServiceType::UserappBuilder
+                            && entry.info.container_id == captured.container_id
+                    }) {
+                        cache.remove(identifier);
+                    }
+                    return Ok(());
+                }
+                Some(_) => {}
+            }
+        }
         if let Some(params) = deletion {
+            if let Some(dispatched) = dispatched {
+                dispatched.store(true, std::sync::atomic::Ordering::Release);
+            }
             match self.statefulsets().delete(sts_name, &params).await {
                 Ok(_) => {}
                 Err(kube::Error::Api(response)) if response.code == 404 => {}

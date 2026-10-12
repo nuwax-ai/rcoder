@@ -215,6 +215,7 @@ impl AgentCleaner {
             .state
             .get_project(project_id)
             .ok_or_else(|| anyhow::anyhow!("Agent does not exist: {}", project_id))?;
+        let captured_container = agent_info.container_info();
 
         // 🛡️ 竞态保护：scanner 扫描到 cleaner 处理之间有时间差（gRPC 二次确认等），
         // 期间 project 可能收到 keepalive/chat 刷新了 last_activity。
@@ -330,8 +331,63 @@ impl AgentCleaner {
         // 4. 如果需要销毁容器
         let mut container_destroyed = false;
         if let Some(reason) = destroy_reason
-            && let Some(container_info) = agent_info.container_info()
+            && let Some(container_info) = captured_container.as_ref()
         {
+            let _builder_retirement = if service_type == ServiceType::UserappBuilder {
+                let Some(guard) =
+                    crate::userapp_builder::try_idle_builder_retirement(project_id).await
+                else {
+                    return Ok(false);
+                };
+                // The earlier scan is only a snapshot. Recheck real target
+                // work immediately before retiring the captured compute.
+                let address = match crate::utils::extract_grpc_addr_with_port(
+                    &container_info.service_url,
+                    shared_types::GRPC_DEFAULT_PORT,
+                ) {
+                    Ok(address) => address,
+                    Err(error) => {
+                        warn!(project_id, %error, "skip builder retirement: activity endpoint unavailable");
+                        return Ok(false);
+                    }
+                };
+                match self
+                    .agent_scanner
+                    .status_checker
+                    .is_container_active(
+                        &address,
+                        agent_info.user_id().unwrap_or(project_id),
+                        project_id,
+                    )
+                    .await
+                {
+                    Ok(false) => {}
+                    Ok(true) => return Ok(false),
+                    Err(error) => {
+                        warn!(project_id, %error, "skip builder retirement: current work is unknown");
+                        return Ok(false);
+                    }
+                }
+                let Some(current) = self.state.get_project(project_id) else {
+                    return Ok(false);
+                };
+                if current.container_info().as_ref().is_none_or(|current| {
+                    current.container_id != container_info.container_id
+                        || current.workload_uid != container_info.workload_uid
+                }) || (Utc::now() - current.last_activity()).num_seconds()
+                    < self.config.idle_timeout.as_secs() as i64
+                    || builder_fenced_by_active_operations(
+                        self.state.userapp_store.as_ref(),
+                        project_id,
+                    )
+                    .await
+                {
+                    return Ok(false);
+                }
+                Some(guard)
+            } else {
+                None
+            };
             let project_info = super::strategies::ProjectInfo {
                 project_id: agent_info.project_id().to_string(),
                 user_id: agent_info.user_id().map(|s| s.to_string()),
@@ -341,19 +397,22 @@ impl AgentCleaner {
 
             let container_identifier = strategy.get_container_identifier(&project_info)?;
 
-            // 🔧 使用容器名称而不是 container_id 来销毁容器
-            // 容器名称更稳定，不会因为容器重启而改变
-            // Docker API 的 remove_container 既接受 ID 也接受名称
-            self.container_destroyer
-                .destroy_with_reason(
-                    &container_info.container_name,
-                    &service_type,
-                    &container_identifier,
-                    &reason,
-                    Some(project_id),
-                    &container_info.container_ip,
-                )
-                .await?;
+            if service_type == ServiceType::UserappBuilder {
+                self.container_destroyer
+                    .destroy_idle_builder_compute(&container_identifier, container_info, &reason)
+                    .await?;
+            } else {
+                self.container_destroyer
+                    .destroy_with_reason(
+                        &container_info.container_name,
+                        &service_type,
+                        &container_identifier,
+                        &reason,
+                        Some(project_id),
+                        &container_info.container_ip,
+                    )
+                    .await?;
+            }
 
             container_destroyed = true;
         }
@@ -361,8 +420,8 @@ impl AgentCleaner {
         // 5. 从存储中移除记录
         if container_destroyed {
             // 容器已销毁：删除容器记录及其关联的所有项目记录（避免孤立容器记录）
-            let container_id = agent_info
-                .container_info()
+            let container_id = captured_container
+                .as_ref()
                 .map(|c| c.container_id.clone())
                 .unwrap_or_default();
             // 先关闭该容器所有 project 的 SSE 共享流（delete_container_with_projects 会移除 project 记录）

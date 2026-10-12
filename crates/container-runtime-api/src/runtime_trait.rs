@@ -487,6 +487,19 @@ pub trait AgentContainerRuntime: Send + Sync {
         self.stop_container(identifier).await
     }
 
+    /// Retire only the idle builder compute captured by the caller. A stable
+    /// name is not deletion authority for a replacement container or Pod.
+    /// Implementations must preserve workspace data and all volumes/PVCs.
+    async fn stop_idle_builder_compute(
+        &self,
+        _identifier: &str,
+        _captured: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Captured idle builder retirement is unsupported".into(),
+        ))
+    }
+
     /// agent 容器镜像是否漂移（当前进程期望 vs 存量容器实际）。
     ///
     /// 空闲滚动升级判据：true = 该 agent 落后于当前版本，闲置回收时可提前

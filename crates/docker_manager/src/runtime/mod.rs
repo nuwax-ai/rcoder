@@ -16,6 +16,7 @@ mod docker_compute_receipt;
 mod docker_readiness;
 pub mod docker_runtime;
 pub(crate) mod docker_workspace;
+mod idle_builder_retirement;
 #[cfg(feature = "kubernetes")]
 mod k8s_builder_control;
 #[cfg(feature = "kubernetes")]

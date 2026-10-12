@@ -73,10 +73,23 @@ impl SupervisordHost {
                 Ok(runtime_supervisor::CleanupOutcome::Empty)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if Self::detect().await?.is_some() {
-                    return Err(record_outcome(root, runtime_supervisor::CleanupOutcome::ObservationFailed {
-                        reason: "supervisord is reachable but this generation has no engine ownership receipt".into(),
-                    }));
+                // A management-only generation may never have acquired a
+                // business engine. Reachability alone is not leftover work;
+                // detect() also registers a receipt and cannot prove emptiness.
+                let deadline = tokio::time::Instant::now() + admin_probe::CONFIRM_BUDGET;
+                if let Err(error) = observe_unregistered_engine_empty_until(
+                    &crate::xmlrpc::default_socket_path(),
+                    &cleanup_observer_conf_path(),
+                    deadline,
+                )
+                .await
+                {
+                    return Err(record_outcome(
+                        root,
+                        runtime_supervisor::CleanupOutcome::ObservationFailed {
+                            reason: format!("observe generation without engine receipt: {error:#}"),
+                        },
+                    ));
                 }
                 runtime_supervisor::CleanupOutcome::Empty.record(root)?;
                 Ok(runtime_supervisor::CleanupOutcome::Empty)
@@ -384,4 +397,143 @@ impl SupervisordHost {
         }
         Ok(groups.into_iter().collect())
     }
+}
+
+fn cleanup_observer_conf_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os("APP_CLI_TEST_CLEANUP_CONF") {
+        return path.into();
+    }
+    CONF_PATH.into()
+}
+
+/// The callback already owns the draining generation guard and has confirmed
+/// its commands/guardians quiescent. This observation grants no engine ownership
+/// and performs no stop, reload, configuration write or receipt registration.
+pub(super) async fn observe_unregistered_engine_empty_until(
+    socket: &Path,
+    conf_path: &Path,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    crate::proxy::compiler::wait_for_file_replacements_until(deadline).await?;
+    let client = SupervisorClient::new(socket);
+    client.wait_mutations_until(deadline).await?;
+    let before = empty_dynamic_fragments(conf_path)?;
+    crate::xmlrpc::require_deadline_budget("unregistered engine observation", deadline)?;
+    let original_socket = observed_supervisor_socket(socket)?;
+    if original_socket.is_some() {
+        client
+            .ping_until(deadline)
+            .await
+            .context("unregistered supervisord RPC unavailable")?;
+        ensure_no_managed_programs(&client, deadline).await?;
+    }
+    crate::proxy::compiler::wait_for_file_replacements_until(deadline).await?;
+    client.wait_mutations_until(deadline).await?;
+    anyhow::ensure!(
+        empty_dynamic_fragments(conf_path)? == before,
+        "unregistered supervisor configuration changed during cleanup observation"
+    );
+    anyhow::ensure!(
+        observed_supervisor_socket(socket)? == original_socket,
+        "supervisord socket identity changed during empty generation observation"
+    );
+    if original_socket.is_some() {
+        ensure_no_managed_programs(&client, deadline).await?;
+    }
+    anyhow::ensure!(
+        observed_supervisor_socket(socket)? == original_socket,
+        "supervisord socket identity changed before cleanup confirmation"
+    );
+    crate::xmlrpc::require_deadline_budget("unregistered engine cleanup confirmation", deadline)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SupervisorSocketIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn observed_supervisor_socket(socket: &Path) -> Result<Option<SupervisorSocketIdentity>> {
+    let metadata = match std::fs::symlink_metadata(socket) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("observe unregistered supervisor socket"),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        anyhow::ensure!(
+            metadata.file_type().is_socket(),
+            "unregistered supervisor endpoint is not a Unix socket"
+        );
+        Ok(Some(SupervisorSocketIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        anyhow::bail!("supervisord Unix socket observation is unsupported on this platform")
+    }
+}
+
+fn empty_dynamic_fragments(conf_path: &Path) -> Result<Vec<Option<Vec<u8>>>> {
+    let resident = conf_path
+        .parent()
+        .context("supervisor fragment has no parent")?
+        .join(RESIDENT_CONF_FILE);
+    [conf_path, &resident]
+        .into_iter()
+        .map(|path| {
+            let bytes = match std::fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("read unregistered supervisor fragment {}", path.display()));
+                }
+            };
+            let content = std::str::from_utf8(&bytes)
+                .with_context(|| format!("decode unregistered supervisor fragment {}", path.display()))?;
+            if let Some((index, _)) = content.lines().enumerate().find(|(_, line)| {
+                let line = line.trim();
+                !line.is_empty() && !line.starts_with('#') && !line.starts_with(';')
+            }) {
+                anyhow::bail!(
+                    "supervisor fragment {} contains executable or unclassified configuration without engine ownership (line {})",
+                    path.display(),
+                    index + 1
+                );
+            }
+            Ok(Some(bytes))
+        })
+        .collect()
+}
+
+async fn ensure_no_managed_programs(
+    client: &SupervisorClient,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    let managed = |name: &str| name == PINGAP_PROGRAM || name.starts_with(SVC_PROGRAM_PREFIX);
+    for info in client
+        .get_all_process_info_until(deadline)
+        .await
+        .context("observe unregistered supervisord programs")?
+    {
+        anyhow::ensure!(
+            !info.group.is_empty(),
+            "supervisord returned a process without group identity"
+        );
+        if managed(&info.group) || info.name.as_deref().is_some_and(managed) {
+            anyhow::bail!(
+                "supervisord managed program {} exists without this generation's engine ownership receipt",
+                info.name.as_deref().unwrap_or(&info.group)
+            );
+        }
+    }
+    Ok(())
 }

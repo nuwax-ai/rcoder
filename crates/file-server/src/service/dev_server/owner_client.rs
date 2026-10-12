@@ -287,6 +287,7 @@ impl OwnerClient {
         let instance_id = request.expected_runtime_instance_id.as_str();
         let kind = request.kind;
         let url = format!("http://{}/v1/runtime/operations", self.address);
+        super::stop_activity::external_dispatched(request)?;
         let response = self
             .client
             .post(&url)
@@ -373,9 +374,10 @@ impl OwnerClient {
             .get("data")
             .cloned()
             .context("operation response missing data")?;
-        serde_json::from_value(data)
-            .map(Some)
-            .context("decode operation view")
+        let view: RuntimeOperationView =
+            serde_json::from_value(data).context("decode operation view")?;
+        super::stop_activity::external_observed(&view)?;
+        Ok(Some(view))
     }
 
     /// 按 after_seq 游标重放操作事件（R06：端点是有限重放非长连流——

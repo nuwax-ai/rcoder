@@ -26,6 +26,7 @@ pub mod process;
 mod start;
 mod startup_contract;
 mod stop;
+mod stop_activity;
 pub mod supervise;
 // The real-process fixture uses POSIX flock, signals and executable scripts.
 #[cfg(all(test, unix))]
@@ -38,6 +39,7 @@ pub use error_classify::{STDERR_RING_CAP, StderrRing, ViteStartupError};
 pub use log::read_dev_log;
 pub use port_pool::{PortPool, PortPoolStatus};
 pub use process::{is_process_running, is_project_alive, kill_process_group, now_ms};
+pub use stop_activity::PendingStopActivity;
 pub use supervise::{ChildExit, DevEventHooks, StreamEndReason, SupervisedChild};
 pub use types::KeepAliveResult;
 pub use types::{DevServerManager, StartedDev, StoppedDev};

@@ -14,6 +14,7 @@ pub mod error;
 pub mod extract;
 pub(crate) mod handlers;
 pub mod models;
+mod request_activity;
 pub mod routes;
 pub mod service;
 pub mod state;
@@ -35,7 +36,9 @@ pub fn full_router(server: &file_server::FileServer) -> Result<Router> {
 /// agent_runner embed 消费（容器是 userApp 域本地实现的宿主）。
 pub fn container_router(server: &file_server::FileServer) -> Result<Router> {
     let base = server.router_container()?;
-    Ok(base.merge(userapp_subrouter(server)?))
+    Ok(base
+        .merge(userapp_subrouter(server)?)
+        .layer(axum::middleware::from_fn(request_activity::track)))
 }
 
 /// `/api/v1/userapp` 子树（独立 state：UserAppState；公共中间件栈与 file-server
@@ -87,7 +90,8 @@ pub fn full_router_with_lifecycle(
         .layer(axum::middleware::from_fn_with_state(
             workers.clone(),
             track_embedded_request,
-        ));
+        ))
+        .layer(axum::middleware::from_fn(request_activity::track));
     Ok((router, EmbeddedRuntimeHandle { workers }))
 }
 async fn track_embedded_request(

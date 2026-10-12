@@ -18,6 +18,7 @@ pub mod command_authority;
 pub mod command_context;
 pub mod managed_tree;
 pub mod observe;
+pub mod request_activity;
 pub mod workers;
 
 #[cfg(unix)]

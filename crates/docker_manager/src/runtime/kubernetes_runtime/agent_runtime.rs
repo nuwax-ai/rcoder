@@ -3,6 +3,15 @@ use super::*;
 #[cfg(feature = "kubernetes")]
 #[async_trait]
 impl AgentContainerRuntime for KubernetesRuntime {
+    async fn stop_idle_builder_compute(
+        &self,
+        identifier: &str,
+        captured: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<()> {
+        self.retire_captured_idle_builder(identifier, captured)
+            .await
+    }
+
     async fn get_bound_builder_file_credentials(
         &self,
         target: &shared_types::BuilderControlTarget,

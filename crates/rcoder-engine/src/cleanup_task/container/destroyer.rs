@@ -32,6 +32,44 @@ pub struct ContainerDestroyer {
 }
 
 impl ContainerDestroyer {
+    /// Retire only the captured builder compute. A same-name replacement is
+    /// never a deletion target; backend implementations preserve its PVC/data.
+    pub async fn destroy_idle_builder_compute(
+        &self,
+        identifier: &str,
+        captured: &shared_types::ContainerBasicInfo,
+        reason: &DestroyReason,
+    ) -> Result<()> {
+        self.runtime
+            .stop_idle_builder_compute(identifier, captured)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "retire captured builder {} ({}): {error}",
+                    captured.container_id,
+                    reason.as_str()
+                )
+            })?;
+        let address = shared_types::build_grpc_addr(
+            &captured.container_name,
+            &captured.container_ip,
+            &self.namespace,
+            &self.cluster_domain,
+        );
+        match address {
+            Ok(address) => {
+                self.grpc_pool.remove(&address).await;
+                if let Some(shutdown_sse) = &self.shutdown_sse {
+                    shutdown_sse(&address);
+                }
+            }
+            Err(error) => {
+                warn!(identifier, %error, "captured builder retired; old gRPC route unavailable")
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(
         runtime: Arc<dyn ContainerRuntime>,
         grpc_pool: Arc<crate::grpc::GrpcChannelPool>,

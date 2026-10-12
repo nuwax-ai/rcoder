@@ -291,6 +291,11 @@ impl DevServerManager {
             let client = super::owner_client::OwnerClient::new(&external.address, &token)?;
             if let Some(record) = pending {
                 // Legacy files only have an ID: never invent an original revision for replay.
+                super::stop_activity::prepare_legacy(
+                    &record.operation_id,
+                    &identity,
+                    &external.address,
+                )?;
                 let view = client
                     .wait_terminal(&record.operation_id, std::time::Duration::from_secs(120))
                     .await?;
@@ -365,6 +370,13 @@ impl DevServerManager {
                 &identity.application_id,
             )
             .map(|(root, _)| root);
+            super::stop_activity::prepare_external(
+                project_id,
+                &intent.request,
+                &external.address,
+                Path::new(&identity.source_root),
+                captured_state_root.clone(),
+            )?;
             let outcome = async {
                 self.resume_external_intent(project_id, &client, &intent, &request)
                     .await?;
@@ -405,6 +417,7 @@ impl DevServerManager {
                     }
                 }
             };
+            super::stop_activity::external_observed(&view)?;
             super::external_store::verify_view(&view, &intent.request)?;
             if matches!(
                 view.state,

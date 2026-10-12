@@ -3645,6 +3645,7 @@ dependencies = [
  "futures-util",
  "garde",
  "hex",
+ "http-body",
  "process_utils",
  "runtime-state-layout",
  "semver",
