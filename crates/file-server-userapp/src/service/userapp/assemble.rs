@@ -6,6 +6,9 @@
 //! 性能：`ZipWriter::raw_copy_file_rename` 搬运子项目 zip 条目的原始压缩字节 + 元数据
 //! （CRC/size/压缩方法），避免「解压到磁盘 → 再压缩」（Next.js standalone 含 node_modules，
 //! 上千文件二次压缩很慢）。
+//!
+//! 所有来源按最终包内路径统一收录：同类型同字节只保留首次条目及元数据；
+//! 内容或类型冲突时指出双方来源，不覆盖已发布的完整包。
 
 use std::path::Path;
 
@@ -14,8 +17,8 @@ use file_server::error::{AppError, AppResult};
 use super::BuiltProject;
 use super::manifest::ReleaseLock;
 
-/// ZipWriter 绑定磁盘文件（组装整体包用）。别名避免在多个 helper 签名里重复长类型。
-type ZipWriterFile = ::zip::ZipWriter<std::fs::File>;
+mod package_writer;
+use package_writer::PackageWriter;
 
 /// 组装整体包。写入经 `.part` 临时文件 + rename 原子落盘——最终名只承载完整包
 /// （GET static 按"最新文件名"选包，永不会命中写一半的半成品；中断残留的 `.part`
@@ -41,9 +44,14 @@ pub(super) async fn assemble_workspace_package(
             if let Some(parent) = part_for_task.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let out_file = std::fs::File::create(&part_for_task)
+            let out_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&part_for_task)
                 .map_err(|e| AppError::file(format!("create workspace package: {e}")))?;
-            let mut zw = ZipWriterFile::new(out_file);
+            let mut zw = PackageWriter::new(out_file);
 
             // 1. 各子项目产物：zip（raw copy 保留原始压缩字节）或 static 目录
             //（type=static 的 artifact 为静态内容目录——**保留 artifact 目录层**
@@ -73,10 +81,11 @@ pub(super) async fn assemble_workspace_package(
             // workspace 首页（可选）：.run 解压后由 app-cli 内置静态服务 serve +
             // pingap 兜底路由展示
             add_file_if_exists(&mut zw, &ws_for_task, "index.html")?;
-            zw.start_file("release.lock.toml", deflate_opts())
-                .map_err(|e| AppError::file(format!("start_file release.lock.toml: {e}")))?;
-            use std::io::Write;
-            zw.write_all(lock_toml.as_bytes())?;
+            zw.add_bytes(
+                "release.lock.toml",
+                lock_toml.as_bytes(),
+                "generated release.lock.toml",
+            )?;
             for proj in &built_for_task {
                 let rel = format!("{}/project.manifest.toml", proj.path);
                 add_file_if_exists(&mut zw, &ws_for_task, &rel)?;
@@ -88,7 +97,8 @@ pub(super) async fn assemble_workspace_package(
 
             // 4. database/ 目录（发布后平台自动按序执行其中的 .sql——见 rcoder 发布编排
             //    的 database_sql 阶段；失败仅日志不阻断）。workspace 根先（建库/扩展类），
-            //    各子项目源目录补收（build 产物 zip 不含 database/）。
+            //    各子项目源目录补收。子产物已含同路径同内容时只保留首次条目；
+            //    内容或类型不同则指出双方来源，不静默覆盖迁移文件。
             let database = ws_for_task.join("database");
             if database.is_dir() {
                 add_dir_entries(&mut zw, &database, "database")?;
@@ -100,8 +110,7 @@ pub(super) async fn assemble_workspace_package(
                 }
             }
 
-            zw.finish()
-                .map_err(|e| AppError::file(format!("zip finish: {e}")))?;
+            zw.finish()?;
             // 原子落盘：rename 同目录内生效，最终名瞬间从无到有完整包
             std::fs::rename(&part_for_task, &out_for_task)
                 .map_err(|e| AppError::file(format!("finalize workspace package: {e}")))?;
@@ -123,7 +132,7 @@ pub(super) async fn assemble_workspace_package(
 /// 把 `artifact` zip 的所有文件条目 raw copy 到 `zw`，条目名加 `prefix/` 前缀。
 /// raw copy 直接搬运原始压缩字节 + 元数据（CRC/size/压缩方法），不二次压缩、不解压到磁盘。
 fn merge_artifact_with_prefix(
-    zw: &mut ZipWriterFile,
+    zw: &mut PackageWriter,
     artifact: &Path,
     prefix: &str,
 ) -> AppResult<()> {
@@ -145,6 +154,7 @@ fn merge_artifact_with_prefix(
             continue;
         }
         let new_name = format!("{prefix}/{orig_name}");
+        let origin = format!("{} entry {orig_name}", artifact.display());
         if entry.is_symlink() {
             use std::io::Read;
             let mut target = String::new();
@@ -155,25 +165,20 @@ fn merge_artifact_with_prefix(
             validation
                 .record(Path::new(&new_name), &target)
                 .map_err(|e| AppError::validation(format!("artifact symbolic link: {e}")))?;
-            zw.add_symlink(&new_name, target, deflate_opts())
-                .map_err(|e| AppError::file(format!("copy artifact symbolic link: {e}")))?;
+            zw.add_symlink(&new_name, &target, origin)?;
             continue;
         }
-        zw.raw_copy_file_rename(entry, &new_name)
-            .map_err(|e| AppError::file(format!("raw_copy {orig_name}: {e}")))?;
+        zw.copy_artifact_entry(entry, &new_name, origin)?;
     }
     Ok(())
 }
 
 /// 把 workspace 根的入口文件写入 `zw`：`start.sh`（文件）+ `scripts/`（递归）。
 /// 这些是小文件，直接 `start_file` 写入（Deflated 压缩）。其它（manifest、源码、logs）不进包。
-fn add_entry_files(zw: &mut ZipWriterFile, ws: &Path) -> AppResult<()> {
+fn add_entry_files(zw: &mut PackageWriter, ws: &Path) -> AppResult<()> {
     let start = ws.join("start.sh");
     if start.is_file() {
-        zw.start_file("start.sh", deflate_opts())
-            .map_err(|e| AppError::file(format!("start_file start.sh: {e}")))?;
-        let mut f = std::fs::File::open(&start)?;
-        std::io::copy(&mut f, zw)?;
+        zw.add_file("start.sh", &start)?;
     }
     let scripts = ws.join("scripts");
     if scripts.is_dir() {
@@ -183,7 +188,7 @@ fn add_entry_files(zw: &mut ZipWriterFile, ws: &Path) -> AppResult<()> {
 }
 
 /// 递归把 `dir` 下普通文件作为 `{zip_prefix}/...` 条目写入 `zw`（跳过符号链接，不跟随）。
-fn add_dir_entries(zw: &mut ZipWriterFile, dir: &Path, zip_prefix: &str) -> AppResult<()> {
+fn add_dir_entries(zw: &mut PackageWriter, dir: &Path, zip_prefix: &str) -> AppResult<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let ft = entry.file_type()?;
@@ -195,10 +200,7 @@ fn add_dir_entries(zw: &mut ZipWriterFile, dir: &Path, zip_prefix: &str) -> AppR
         if ft.is_dir() {
             add_dir_entries(zw, &entry.path(), &zip_name)?;
         } else if ft.is_file() {
-            zw.start_file(&zip_name, deflate_opts())
-                .map_err(|e| AppError::file(format!("start_file {zip_name}: {e}")))?;
-            let mut f = std::fs::File::open(entry.path())?;
-            std::io::copy(&mut f, zw)?;
+            zw.add_file(&zip_name, &entry.path())?;
         }
     }
     Ok(())
@@ -211,16 +213,17 @@ fn deflate_opts() -> ::zip::write::SimpleFileOptions {
 }
 
 /// 如果 `ws_root/rel_path` 存在，作为 `rel_path` 条目写入 `zw`（manifest 文件打包）。
-fn add_file_if_exists(zw: &mut ZipWriterFile, ws_root: &Path, rel_path: &str) -> AppResult<()> {
+fn add_file_if_exists(zw: &mut PackageWriter, ws_root: &Path, rel_path: &str) -> AppResult<()> {
     let src = ws_root.join(rel_path);
     if src.is_file() {
-        zw.start_file(rel_path, deflate_opts())
-            .map_err(|e| AppError::file(format!("start_file {rel_path}: {e}")))?;
-        let mut f = std::fs::File::open(&src)?;
-        std::io::copy(&mut f, zw)?;
+        zw.add_file(rel_path, &src)?;
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "assemble_overlap_tests.rs"]
+mod overlap_tests;
 
 #[cfg(test)]
 mod tests {
@@ -549,7 +552,7 @@ mod tests {
         zip.finish().expect("finish");
         let destination = root.path().join("merged.zip");
         let mut writer =
-            ::zip::ZipWriter::new(std::fs::File::create(&destination).expect("destination"));
+            PackageWriter::new(std::fs::File::create(&destination).expect("destination"));
         merge_artifact_with_prefix(&mut writer, &source, "frontend").expect("merge");
         writer.finish().expect("finish");
         let mut merged =
