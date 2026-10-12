@@ -77,6 +77,31 @@ pub(crate) async fn reconcile_prior_until(
                 .as_ref()
                 .map(|value| serde_json::from_value::<crate::domain::PhysicalDomain>(value.clone()))
                 .transpose()?;
+            let previous_domain = old
+                .physical_domain
+                .as_ref()
+                .map(|value| serde_json::from_value::<crate::domain::PhysicalDomain>(value.clone()))
+                .transpose()?;
+            if !same_domain
+                && previous_domain
+                    .as_ref()
+                    .zip(current.as_ref())
+                    .is_some_and(|(before, now)| {
+                        before.authority == now.authority
+                            && before.volume == now.volume
+                            && before.instance != now.instance
+                    })
+            {
+                process_utils::command_authority::Gate::try_acquire(&previous)?.close()?;
+                if process_utils::guardian::is_scope_settled(&previous)
+                    .context("inspect prior physical-domain resident outcomes")?
+                {
+                    // Closed, observed outcomes are history even when the
+                    // resident scope's last informational phase was Running.
+                    // Preserve the original receipts and their business results.
+                    continue;
+                }
+            }
             let platform_exit = !same_domain
                 && crate::domain::has_confirmed_resident_exit(root, &old, current.as_ref())?;
             ensure!(
@@ -165,6 +190,252 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn settled_discovery(root: &Path, identity: &ResidentIdentity) {
+        crate::record::save(
+            &root.join("supervisor.json"),
+            &crate::control::Discovery {
+                version: crate::control::CONTROL_VERSION,
+                instance: identity.owner_instance.clone(),
+                address: "127.0.0.1:1".into(),
+                token: "protocol-fixture".into(),
+                requests: Vec::new(),
+                snapshot: crate::control::Snapshot {
+                    version: 1,
+                    binding: serde_json::from_value(identity.binding.clone()).unwrap(),
+                    supervisor_id: identity.owner_instance.clone(),
+                    generation: None,
+                    phase: crate::Phase::Reconciling,
+                    intent: crate::Intent::Stopped,
+                    operation_id: None,
+                    error: None,
+                    problem: None,
+                },
+            },
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn settled_previous_pod(observed_command: bool, settled_scope_record: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let binding = serde_json::json!({"component":"app-cli","resource":root});
+        let owner = OwnerLease::try_acquire(&root).unwrap().unwrap();
+        let mut original = identity("app", &uuid::Uuid::new_v4().to_string(), &binding);
+        let domain = crate::domain::PhysicalDomain {
+            authority: "k8s:one-cluster".into(),
+            instance_source_env: Some("RCODER_PHYSICAL_POD_UID".into()),
+            instance: "old-pod-uid".into(),
+            volume: "pvc:retained-workspace:mount-views".into(),
+        };
+        original.physical_domain = Some(serde_json::to_value(&domain).unwrap());
+        settled_discovery(&root, &original);
+        let scope = ResidentScope::initialize(&owner, original).unwrap();
+        if observed_command {
+            let record = process_utils::command_context::CommandRecord::prepare_in(
+                scope.root().join("commands"),
+            )
+            .unwrap();
+            let mut child = std::process::Command::new("sh")
+                .args(["-c", "sleep 0.05; exit 17"])
+                .spawn()
+                .unwrap();
+            record.running(Some(child.id())).unwrap();
+            let status = child.wait().unwrap();
+            assert_eq!(status.code(), Some(17));
+            record.quiescent().unwrap();
+        }
+        if settled_scope_record {
+            scope.close().unwrap();
+            scope.record_quiescent().unwrap();
+        } else {
+            let history: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(scope.root().join("resident-scope.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(history["phase"], "Running");
+            process_utils::command_authority::Gate::try_acquire(scope.root())
+                .unwrap()
+                .require_open()
+                .unwrap();
+        }
+        let previous = scope.root().to_path_buf();
+        let scope_bytes = std::fs::read(previous.join("resident-scope.json")).unwrap();
+        let command_bytes: Vec<_> = if previous.join("commands").exists() {
+            std::fs::read_dir(previous.join("commands"))
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    (path.clone(), std::fs::read(path).unwrap())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        drop(scope);
+        drop(owner);
+        let owner = OwnerLease::try_acquire(&root).unwrap().unwrap();
+        let mut next = identity("app", &uuid::Uuid::new_v4().to_string(), &binding);
+        let current = crate::domain::PhysicalDomain {
+            instance: "new-pod-uid".into(),
+            ..domain
+        };
+        next.physical_domain = Some(serde_json::to_value(&current).unwrap());
+        settled_discovery(&root, &next);
+        let successor = initialize(&root, &owner, next.clone())
+            .await
+            .unwrap_or_else(|error| {
+                panic!("settled previous Pod must be retained as history: {error:#}")
+            });
+        assert_eq!(successor.identity(), &next);
+        assert_eq!(
+            std::fs::read(previous.join("resident-scope.json")).unwrap(),
+            scope_bytes
+        );
+        assert!(
+            process_utils::command_authority::Gate::try_acquire(&previous)
+                .unwrap()
+                .require_open()
+                .is_err()
+        );
+        for (path, bytes) in command_bytes {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        assert!(!root.join("work").exists());
+        successor.close().unwrap();
+        successor.record_quiescent().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn settled_previous_pod_empty_range_allows_successor_without_exit_proof() {
+        settled_previous_pod(false, true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn settled_previous_pod_observed_command_exit_allows_successor_without_exit_proof() {
+        settled_previous_pod(true, true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn settled_previous_pod_empty_range_keeps_running_history_without_exit_proof() {
+        settled_previous_pod(false, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn settled_previous_pod_observed_command_exit_keeps_running_history_without_exit_proof() {
+        settled_previous_pod(true, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn settled_previous_pod_history_keeps_foreign_authority_volume_and_identity_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let binding = serde_json::json!({"component":"app-cli","resource":root});
+        let owner = OwnerLease::try_acquire(&root).unwrap().unwrap();
+        let mut original = identity("app", &uuid::Uuid::new_v4().to_string(), &binding);
+        let domain = crate::domain::PhysicalDomain {
+            authority: "k8s:one-cluster".into(),
+            instance_source_env: None,
+            instance: "old-pod".into(),
+            volume: "retained-pvc-view".into(),
+        };
+        original.physical_domain = Some(serde_json::to_value(&domain).unwrap());
+        settled_discovery(&root, &original);
+        let scope = ResidentScope::initialize(&owner, original).unwrap();
+        scope.close().unwrap();
+        scope.record_quiescent().unwrap();
+        let path = scope.root().join("resident-scope.json");
+        let original_bytes = std::fs::read(&path).unwrap();
+        drop(scope);
+        drop(owner);
+        let owner = OwnerLease::try_acquire(&root).unwrap().unwrap();
+        for change in ["authority", "volume", "app", "binding", "none"] {
+            let mut next = identity("app", &uuid::Uuid::new_v4().to_string(), &binding);
+            let mut current = domain.clone();
+            current.instance = "new-pod".into();
+            match change {
+                "authority" => current.authority = "another-cluster".into(),
+                "volume" => current.volume = "another-pvc".into(),
+                "app" => next.application_id = "another-app".into(),
+                "binding" => next.binding["resource"] = "/another-workspace".into(),
+                _ => {}
+            }
+            if change != "none" {
+                next.physical_domain = Some(serde_json::to_value(current).unwrap());
+            }
+            settled_discovery(&root, &next);
+            assert!(
+                initialize(&root, &owner, next).await.is_err(),
+                "foreign {change} was accepted"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn settled_previous_pod_unknown_or_live_commands_preserve_original_authorization() {
+        for live in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let binding = serde_json::json!({"component":"app-cli","resource":root});
+            let owner = OwnerLease::try_acquire(&root).unwrap().unwrap();
+            let mut original = identity("app", &uuid::Uuid::new_v4().to_string(), &binding);
+            let domain = crate::domain::PhysicalDomain {
+                authority: "k8s:one-cluster".into(),
+                instance_source_env: None,
+                instance: "old-pod".into(),
+                volume: "retained-pvc-view".into(),
+            };
+            original.physical_domain = Some(serde_json::to_value(&domain).unwrap());
+            settled_discovery(&root, &original);
+            let scope = ResidentScope::initialize(&owner, original).unwrap();
+            let record = process_utils::command_context::CommandRecord::prepare_in(
+                scope.root().join("commands"),
+            )
+            .unwrap();
+            let command = if live {
+                let command = ProcessCleanup(
+                    std::process::Command::new("sleep")
+                        .arg("30")
+                        .spawn()
+                        .unwrap(),
+                );
+                record.running(Some(command.0.id())).unwrap();
+                running_guardian(&scope, command.0.id());
+                Some(command)
+            } else {
+                None
+            };
+            scope.close().unwrap();
+            let before = std::fs::read(record.path().unwrap()).unwrap();
+            drop(scope);
+            drop(owner);
+            let owner = OwnerLease::try_acquire(&root).unwrap().unwrap();
+            let mut next = identity("app", &uuid::Uuid::new_v4().to_string(), &binding);
+            next.physical_domain = Some(
+                serde_json::to_value(crate::domain::PhysicalDomain {
+                    instance: "new-pod".into(),
+                    ..domain
+                })
+                .unwrap(),
+            );
+            settled_discovery(&root, &next);
+            let error = initialize(&root, &owner, next).await.err().unwrap();
+            assert!(format!("{error:#}").contains("another physical domain"));
+            assert_eq!(std::fs::read(record.path().unwrap()).unwrap(), before);
+            if let Some(command) = &command {
+                assert!(process_utils::process_exists(command.0.id()).unwrap());
+            }
+        }
     }
 
     #[cfg(unix)]

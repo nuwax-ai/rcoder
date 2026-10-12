@@ -225,22 +225,44 @@ pub fn create_durable_directory(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 pub fn require_quiescent(root: &Path) -> std::io::Result<()> {
+    if !is_quiescent(root)? {
+        return Err(std::io::Error::other(
+            "owned command cleanup remains unconfirmed",
+        ));
+    }
+    Ok(())
+}
+
+/// Read existing command outcomes without retiring or interpreting old PIDs.
+/// Known in-flight phases return false; malformed records and I/O errors keep
+/// their concrete error instead of becoming a guessed cleanup outcome.
+pub fn is_quiescent(root: &Path) -> std::io::Result<bool> {
     match std::fs::metadata(root) {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => return Err(std::io::Error::other("command journal is not a directory")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
         Err(error) => return Err(error),
     }
+    let mut settled = true;
     for entry in std::fs::read_dir(root)? {
         let path = entry?.path();
         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
-        if value["version"] != 1 || value["phase"] != "Quiescent" {
+        if value["version"] != 1 {
             return Err(std::io::Error::other(
-                "owned command cleanup remains unconfirmed",
+                "unknown command cleanup record version",
             ));
         }
+        match value["phase"].as_str() {
+            Some("Quiescent") => {}
+            Some("SpawnPending" | "Running") => settled = false,
+            _ => {
+                return Err(std::io::Error::other(
+                    "unknown command cleanup record phase",
+                ));
+            }
+        }
     }
-    Ok(())
+    Ok(settled)
 }
 
 /// Preserve the actual child/wrapper after an uncertain bounded stop. The

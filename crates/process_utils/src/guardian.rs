@@ -975,6 +975,42 @@ pub fn recover(work_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Observe whether all existing guardian and command outcomes have settled.
+/// The owner must already hold its lease and close the old admission gate.
+/// This never signals a PID, revokes Pending, repairs records or asserts that
+/// a whole physical container exited. A held guardian lock remains an error.
+pub fn is_scope_settled(work_root: &Path) -> Result<bool> {
+    let root = work_root.join("guardians");
+    let mut settled = true;
+    if root.try_exists()? {
+        for entry in std::fs::read_dir(root)? {
+            let path = entry?.path();
+            let _lock = lock(&path)?;
+            let receipt = read(&path)?;
+            ensure!(
+                work_root.file_name().and_then(|value| value.to_str())
+                    == Some(receipt.instance_id.as_str()),
+                "guardian belongs to different instance"
+            );
+            if let Some(expected) = &receipt.resident_identity {
+                ensure!(
+                    &crate::command_authority::read_resident_identity(work_root)? == expected,
+                    "resident guardian identity changed before observation"
+                );
+            }
+            if !matches!(receipt.phase.as_str(), "Quiescent" | "Revoked") {
+                settled = false;
+            }
+        }
+    }
+    let commands_settled = crate::command_context::is_quiescent(&work_root.join("commands"))?;
+    Ok(settled && commands_settled)
+}
+
+#[cfg(test)]
+#[path = "guardian/settled_scope_tests.rs"]
+mod settled_scope_tests;
+
 /// Platform-confirmed termination of the entire captured physical domain.
 /// Caller must hold the original scope/generation lock and close admission.
 /// Never use this for a refused port, missing PID or changed namespace alone.
