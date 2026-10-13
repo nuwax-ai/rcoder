@@ -368,6 +368,15 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             .await
     }
 
+    async fn observe_app_operation_lease(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<container_runtime_api::AppOperationLeaseObservation> {
+        self.observe_original_application_lease(context, receipt)
+            .await
+    }
+
     async fn inspect_app_deletion(
         &self,
         context: &shared_types::UserAppExecutionContext,

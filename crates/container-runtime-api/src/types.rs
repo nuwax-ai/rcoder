@@ -10,6 +10,16 @@ use utoipa::ToSchema;
 
 use crate::ContainerRuntime;
 
+/// Observation of an original coordinator lease, separate from write authority.
+/// No persisted or HTTP representation: unsupported/absent observations stay
+/// unconfirmed, while expiry alone never proves a completed runtime mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppOperationLeaseObservation {
+    Held,
+    ExpiredOriginalIdentity,
+    Unconfirmed,
+}
+
 /// Container runtime errors
 #[derive(Error, Debug)]
 pub enum ContainerRuntimeError {

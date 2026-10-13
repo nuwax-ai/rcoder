@@ -145,6 +145,109 @@ impl KubernetesRuntime {
             .await
     }
 
+    /// A retained original Lease can identify a completed result after its
+    /// holder stopped renewing. This observation never renews or acquires it.
+    pub(crate) async fn observe_original_application_lease(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<container_runtime_api::AppOperationLeaseObservation> {
+        use container_runtime_api::AppOperationLeaseObservation;
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        receipt
+            .validate()
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let shared_types::UserAppOperationLeaseReceipt::Kubernetes {
+            service_type,
+            namespace,
+            name,
+            uid,
+            token,
+            ..
+        } = receipt
+        else {
+            return Ok(AppOperationLeaseObservation::Unconfirmed);
+        };
+        if namespace != &self.namespace || name != &operation_name(&context.app_id, service_type)? {
+            return Err(ContainerRuntimeError::Conflict(
+                "Original operation lease scope changed".into(),
+            ));
+        }
+        let api: Api<Lease> = Api::namespaced(self.client.clone(), namespace);
+        let Some(current) = api.get_opt(name).await.map_err(|error| {
+            ContainerRuntimeError::K8sError(format!("Observe original operation lease: {error}"))
+        })?
+        else {
+            return Ok(AppOperationLeaseObservation::Unconfirmed);
+        };
+        let annotations = current.metadata.annotations.as_ref().ok_or_else(|| {
+            ContainerRuntimeError::Conflict(
+                "Original operation lease execution metadata missing".into(),
+            )
+        })?;
+        // Lease creation stores app identity in its operation-app label. The
+        // remaining execution fields are annotations; this normalizes only an
+        // omitted duplicate, retaining any contradictory existing annotation.
+        let mut execution_metadata = annotations.clone();
+        if !execution_metadata.contains_key("rcoder.io/application-id")
+            && let Some(app) = current
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("rcoder.io/operation-app"))
+        {
+            execution_metadata.insert("rcoder.io/application-id".into(), app.clone());
+        }
+        context
+            .validate_operation_metadata(&execution_metadata)
+            .map_err(ContainerRuntimeError::Conflict)?;
+        if annotations
+            .get("rcoder.io/compute-lease")
+            .map(String::as_str)
+            == Some("true")
+            && (token != &context.executor_id
+                || annotations.get("rcoder.io/lease-token") != Some(token))
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "Original compute lease attempt token changed".into(),
+            ));
+        }
+        let identity_matches = current.metadata.uid.as_deref() == Some(uid.as_str())
+            && holder_token(&current).as_deref() == Some(token.as_str())
+            && current
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("rcoder.io/operation-app"))
+                == Some(&context.app_id)
+            && current
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("rcoder.io/operation-family"))
+                == Some(&service_type.to_string())
+            && current
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.holder_identity.as_deref())
+                == Some(format!("{}:{}", context.executor_id, context.operation_id).as_str())
+            && current.metadata.deletion_timestamp.is_none();
+        if !identity_matches {
+            return Err(ContainerRuntimeError::Conflict(
+                "Original operation lease identity changed".into(),
+            ));
+        }
+        Ok(
+            if lease_expired_at(k8s_openapi::jiff::Timestamp::now(), &current) {
+                AppOperationLeaseObservation::ExpiredOriginalIdentity
+            } else {
+                AppOperationLeaseObservation::Held
+            },
+        )
+    }
+
     /// Legacy ConfigMap lease validation (pre-Lease migration stock): strict
     /// uid + resourceVersion + token match — ConfigMap revisions never churn.
     async fn validate_captured_configmap(

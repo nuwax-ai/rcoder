@@ -369,3 +369,200 @@ async fn absent_builder_restart_continuation_pg_keeps_original_receipt_and_cas()
     absent_builder_restart_continuation_contract(&store).await;
     store.shutdown().await.unwrap();
 }
+
+async fn observed_original_creation_finishes_atomically_contract(store: &ToastyUserAppStore) {
+    for recovery_required in [false, true] {
+        let app = store
+            .ensure_identity(&format!(
+                "observedcreation{}",
+                uuid::Uuid::new_v4().simple()
+            ))
+            .await
+            .unwrap();
+        let pending = store
+            .admit_compute_control(&request(
+                &app,
+                &format!("restart{}", uuid::Uuid::new_v4().simple()),
+                ComputeControlAction::Restart,
+            ))
+            .await
+            .unwrap();
+        let identity = compute_identity(&pending);
+        store
+            .claim_compute_control(&identity, pending.revision)
+            .await
+            .unwrap();
+        let mut original = store
+            .bind_compute_lease(&identity, &compute_receipt())
+            .await
+            .unwrap();
+        let target = BuilderControlTarget {
+            context: original.execution_context().unwrap(),
+            workload: None,
+            pod: None,
+            resource_binding: None,
+            restart_image: Some("frozen-image".into()),
+            restart_runtime_workspace: None,
+            builder_startup_mode: BuilderStartupMode::ManagementOnly,
+        };
+        let volume = AppResourceIdentity {
+            kind: AppResourceKind::PersistentVolumeClaim,
+            name: "retained-workspace".into(),
+            uid: "original-pvc".into(),
+            resource_version: None,
+        };
+        let mut checkpoint = serde_json::to_value(&target).unwrap();
+        checkpoint["builder_volumes"] = serde_json::json!([volume.clone()]);
+        for stage in [
+            ComputeControlStage::Stopping,
+            ComputeControlStage::Stopped,
+            ComputeControlStage::Starting,
+        ] {
+            let mut progress = compute_progress(&original, stage);
+            progress.checkpoint = checkpoint.clone();
+            original = store.advance_compute_control(&progress).await.unwrap();
+        }
+        if recovery_required {
+            let mut progress = compute_progress(&original, ComputeControlStage::Starting);
+            progress.state = ComputeControlState::RecoveryRequired;
+            progress.checkpoint = checkpoint.clone();
+            progress.error_code = Some("LOST_RESPONSE".into());
+            progress.error_message =
+                Some("original creation finished after the caller disconnected".into());
+            original = store.advance_compute_control(&progress).await.unwrap();
+        }
+        // Emulate an older ledger, after its original submitted stages. Strict
+        // current executor progress is deliberately not used to add history.
+        let operation = original.operation_id.clone();
+        let mut historical = original.checkpoint.clone();
+        historical["old_diagnostic"] = serde_json::json!({"opaque":"preserve"});
+        historical["builder_restart_template_history"] =
+            serde_json::json!({"legacy_archive":"opaque"});
+        let payload = serde_json::to_string(&historical).unwrap();
+        store
+            .run(false, move |tx, backend| {
+                let operation = operation.clone();
+                let payload = payload.clone();
+                Box::pin(async move {
+                    toasty::sql::statement(crate::userapp_lifecycle::common::repo::sql(backend,
+                    "UPDATE userapp_compute_controls SET checkpoint_json=$2 WHERE operation_id=$1"))
+                    .bind(operation).bind(payload).exec(tx).await.map_err(crate::userapp_lifecycle::storage)?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        original = store
+            .get_compute_control(&original.app_id, &original.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut observed = target.clone();
+        observed.workload = Some(AppResourceIdentity {
+            kind: AppResourceKind::StatefulSet,
+            name: "current-builder".into(),
+            uid: "actual-sts".into(),
+            resource_version: Some("10".into()),
+        });
+        observed.pod = Some(BuilderPodIdentity {
+            name: "current-builder-0".into(),
+            uid: "actual-pod".into(),
+            resource_version: "11".into(),
+        });
+        for variant in 0..6 {
+            let mut altered = observed.clone();
+            let mut volumes = vec![volume.clone()];
+            let mut snapshot = original.clone();
+            match variant {
+                0 => altered.context.executor_id = "foreign-executor".into(),
+                1 => altered.restart_image = Some("new-intent".into()),
+                2 => volumes[0].uid = "replacement-pvc".into(),
+                3 => altered.builder_startup_mode = BuilderStartupMode::PreserveBusinessIntent,
+                4 => snapshot.revision += 1,
+                5 => altered.pod = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                store
+                    .finalize_observed_builder_creation(&snapshot, &altered, &volumes)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                store
+                    .get_compute_control(&original.app_id, &original.operation_id)
+                    .await
+                    .unwrap(),
+                Some(original.clone())
+            );
+        }
+        let (first, second) = tokio::join!(
+            store.finalize_observed_builder_creation(
+                &original,
+                &observed,
+                std::slice::from_ref(&volume)
+            ),
+            store.finalize_observed_builder_creation(
+                &original,
+                &observed,
+                std::slice::from_ref(&volume)
+            ),
+        );
+        let completed = match (first, second) {
+            (Ok(r), Err(UserAppStoreError::VersionConflict))
+            | (Err(UserAppStoreError::VersionConflict), Ok(r)) => r,
+            other => panic!("one exact original completion transaction must win: {other:?}"),
+        };
+        assert_eq!(completed.state, ComputeControlState::Succeeded);
+        assert_eq!(completed.operation_id, original.operation_id);
+        assert_eq!(completed.executor_id, original.executor_id);
+        assert_eq!(completed.generation, original.generation);
+        assert_eq!(completed.request_id, original.request_id);
+        assert_eq!(completed.request_fingerprint, original.request_fingerprint);
+        assert_eq!(completed.lease, original.lease);
+        assert_eq!(
+            completed.checkpoint["old_diagnostic"],
+            original.checkpoint["old_diagnostic"]
+        );
+        assert_eq!(
+            completed.checkpoint["builder_volumes"],
+            original.checkpoint["builder_volumes"]
+        );
+        assert_eq!(
+            completed.checkpoint["builder_restart_template_history"],
+            original.checkpoint["builder_restart_template_history"]
+        );
+        assert!(
+            serde_json::from_value::<BuilderControlTarget>(completed.checkpoint.clone()).is_err()
+        );
+        let bound =
+            BuilderControlTarget::from_observation_checkpoint(&completed.checkpoint).unwrap();
+        assert_eq!(bound, observed);
+    }
+}
+
+#[tokio::test]
+async fn observed_builder_creation_completion_is_an_exact_original_atomic_transaction() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ToastyUserAppStore::open_exclusive(&root.path().join("observed-creation.db"))
+        .await
+        .unwrap();
+    observed_original_creation_finishes_atomically_contract(&store).await;
+    store.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "pg")]
+#[tokio::test]
+#[ignore = "requires explicit disposable PostgreSQL database"]
+async fn observed_builder_creation_completion_pg_is_an_exact_original_atomic_transaction() {
+    let config = crate::config::PostgresConfig {
+        url: Some(std::env::var("RCODER_USERAPP_PG_TEST_DSN").expect("disposable PG required")),
+        max_connections: Some(2),
+        min_connections: Some(1),
+        statement_timeout_secs: Some(5),
+        ..Default::default()
+    };
+    let store = ToastyUserAppStore::connect(&config).await.unwrap();
+    observed_original_creation_finishes_atomically_contract(&store).await;
+    store.shutdown().await.unwrap();
+}

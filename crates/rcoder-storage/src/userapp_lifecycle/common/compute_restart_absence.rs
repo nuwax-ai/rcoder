@@ -4,7 +4,7 @@ use shared_types::*;
 // The runtime proves actual absence/creation and exact retained PVC ownership.
 // This store only binds that evidence to the original intent and lease; a
 // multi-step creator must never be classified as an RV-fenced single write.
-fn retained_builder_volume_evidence(record: &ComputeControlRecord) -> bool {
+pub(super) fn retained_builder_volume_evidence(record: &ComputeControlRecord) -> bool {
     let Some(volumes) = record.checkpoint.get("builder_volumes") else {
         return false;
     };

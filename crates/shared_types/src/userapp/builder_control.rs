@@ -142,6 +142,39 @@ impl<'de> Deserialize<'de> for BuilderControlTarget {
 }
 
 impl BuilderControlTarget {
+    /// Read only the physical target and frozen intent needed to observe an
+    /// already submitted result. Historical diagnostics and archive references
+    /// remain opaque in the original checkpoint; they grant no write authority.
+    /// Direct request deserialization retains its strict wire contract.
+    pub fn from_observation_checkpoint(
+        checkpoint: &serde_json::Value,
+    ) -> Result<Self, serde_json::Error> {
+        #[derive(Deserialize)]
+        struct Observation {
+            #[serde(default)]
+            resource_binding: Option<crate::UserAppResourceBinding>,
+            context: crate::UserAppExecutionContext,
+            workload: Option<crate::AppResourceIdentity>,
+            pod: Option<BuilderPodIdentity>,
+            #[serde(default)]
+            restart_image: Option<String>,
+            #[serde(default)]
+            restart_runtime_workspace: Option<String>,
+            #[serde(default)]
+            builder_startup_mode: BuilderStartupMode,
+        }
+        let observed = serde_json::from_value::<Observation>(checkpoint.clone())?;
+        Ok(Self {
+            resource_binding: observed.resource_binding,
+            context: observed.context,
+            workload: observed.workload,
+            pod: observed.pod,
+            restart_image: observed.restart_image,
+            restart_runtime_workspace: observed.restart_runtime_workspace,
+            builder_startup_mode: observed.builder_startup_mode,
+        })
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.context.validate_identity(&self.context.app_id)?;
         if self
@@ -208,6 +241,42 @@ pub struct BuilderControlError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observation_checkpoint_keeps_history_opaque_but_target_strict() {
+        let target = BuilderControlTarget {
+            context: crate::UserAppExecutionContext {
+                app_id: "228".into(),
+                lifecycle_id: "life".into(),
+                operation_id: "restart".into(),
+                executor_id: "worker".into(),
+                request_fingerprint: "a".repeat(64),
+            },
+            workload: None,
+            pod: None,
+            resource_binding: None,
+            restart_image: Some("original-image".into()),
+            restart_runtime_workspace: None,
+            builder_startup_mode: Default::default(),
+        };
+        for history in [serde_json::json!({"old":"opaque"}), serde_json::json!(17)] {
+            let mut checkpoint = serde_json::to_value(&target).unwrap();
+            checkpoint["old_diagnostic"] = serde_json::json!({"extra":true});
+            checkpoint["builder_restart_template_history"] = history;
+            let original = checkpoint.clone();
+            assert_eq!(
+                BuilderControlTarget::from_observation_checkpoint(&checkpoint).unwrap(),
+                target
+            );
+            assert_eq!(checkpoint, original);
+            assert!(serde_json::from_value::<BuilderControlTarget>(checkpoint.clone()).is_err());
+            checkpoint["context"] = serde_json::json!("not-an-identity");
+            assert!(BuilderControlTarget::from_observation_checkpoint(&checkpoint).is_err());
+        }
+        let mut malformed = serde_json::to_value(target).unwrap();
+        malformed["builder_startup_mode"] = serde_json::json!("unknown-intent");
+        assert!(BuilderControlTarget::from_observation_checkpoint(&malformed).is_err());
+    }
 
     #[test]
     fn restart_workspace_wire_is_additive_and_rejects_foreign_root() {

@@ -1035,6 +1035,20 @@ pub trait UserAppLifecycleStore: Send + Sync {
         ))
     }
 
+    /// Complete an original missing-builder creation after the runtime verified
+    /// its complete acknowledgement, current resources and retained PVCs. The
+    /// original snapshot remains the CAS anchor; this grants no runtime writes.
+    async fn finalize_observed_builder_creation(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _observed: &crate::BuilderControlTarget,
+        _volumes: &[crate::AppResourceIdentity],
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Observed builder creation recovery is unsupported".into(),
+        ))
+    }
+
     /// Claim the remaining startup or a proven single-write retry of a restart.
     /// The caller verifies the retained lease, original volumes and conditional
     /// target before this exact CAS; committed startups are observation-only.

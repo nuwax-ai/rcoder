@@ -141,6 +141,135 @@ async fn client_for(address: std::net::SocketAddr) -> kube::Client {
     .expect("client")
 }
 
+#[tokio::test]
+async fn original_lease_observation_is_read_only_and_distinguishes_expiry_from_identity() {
+    use container_runtime_api::AppOperationLeaseObservation;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        for variant in 0..14 {
+            let context = context_for("takeover", "original-op");
+            let mut lease = lease_json("original-uid", "99", Some(&context.operation_id), 3600, 0);
+            let annotations = lease["metadata"]["annotations"].as_object_mut().unwrap();
+            annotations.insert(
+                "rcoder.io/lifecycle-id".into(),
+                context.lifecycle_id.clone().into(),
+            );
+            annotations.insert(
+                "rcoder.io/executor-id".into(),
+                context.executor_id.clone().into(),
+            );
+            annotations.insert(
+                "rcoder.io/request-fingerprint".into(),
+                context.request_fingerprint.clone().into(),
+            );
+            annotations.insert(
+                "rcoder.io/lease-token".into(),
+                context.executor_id.clone().into(),
+            );
+            annotations.insert("rcoder.io/compute-lease".into(), "true".into());
+            lease["spec"]["holderIdentity"] =
+                format!("{}:{}", context.executor_id, context.operation_id).into();
+            let mut token = context.executor_id.clone();
+            let mut code = 200;
+            match variant {
+                0 => {}
+                1 => {
+                    lease["spec"]["renewTime"] =
+                        k8s_openapi::jiff::Timestamp::now().to_string().into()
+                }
+                2 => lease["metadata"]["uid"] = "successor-uid".into(),
+                3 => {
+                    lease["metadata"]["annotations"]["rcoder.io/lease-token"] =
+                        "successor-token".into()
+                }
+                4 => {
+                    lease["metadata"]["annotations"]["rcoder.io/lifecycle-id"] =
+                        "foreign-lifecycle".into()
+                }
+                5 => {
+                    lease["metadata"]["annotations"]["rcoder.io/executor-id"] =
+                        "foreign-executor".into()
+                }
+                6 => {
+                    lease["metadata"]["annotations"]["rcoder.io/request-fingerprint"] =
+                        "cd".repeat(32).into()
+                }
+                7 => lease["spec"]["holderIdentity"] = "foreign:original-op".into(),
+                8 => {
+                    lease["metadata"]["annotations"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("rcoder.io/lifecycle-id");
+                }
+                9 => {
+                    lease["metadata"]["deletionTimestamp"] =
+                        k8s_openapi::jiff::Timestamp::now().to_string().into()
+                }
+                10 => {
+                    code = 404;
+                    lease = status(404, "absent");
+                }
+                11 => {
+                    // Existing ordinary locks use operation-id as their receipt
+                    // token, while holderIdentity is still executor:operation.
+                    token = context.operation_id.clone();
+                    let annotations = lease["metadata"]["annotations"].as_object_mut().unwrap();
+                    annotations.remove("rcoder.io/lease-token");
+                    annotations.remove("rcoder.io/compute-lease");
+                }
+                12 => {
+                    code = 500;
+                    lease = status(500, "transport unavailable");
+                }
+                13 => {
+                    lease["metadata"]["annotations"]["rcoder.io/application-id"] =
+                        "foreign-app".into()
+                }
+                _ => unreachable!(),
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (head, body) = read_request(&mut stream).await;
+                assert!(
+                    head.starts_with("GET ")
+                        && head.contains("/leases/rcoder-operation-prod-takeover"),
+                    "{head}"
+                );
+                assert!(body.is_empty(), "observation cannot submit a mutation body");
+                write_reply(&mut stream, code, &lease).await;
+            });
+            let runtime = runtime_for(client_for(address).await);
+            let receipt = shared_types::UserAppOperationLeaseReceipt::Kubernetes {
+                service_type: ServiceType::Userapp,
+                namespace: "lease-test".into(),
+                name: "rcoder-operation-prod-takeover".into(),
+                uid: "original-uid".into(),
+                resource_version: "old-acquisition-rv".into(),
+                token,
+            };
+            let result = runtime
+                .observe_original_application_lease(&context, &receipt)
+                .await;
+            match variant {
+                0 | 11 => assert_eq!(
+                    result.unwrap(),
+                    AppOperationLeaseObservation::ExpiredOriginalIdentity
+                ),
+                1 => assert_eq!(result.unwrap(), AppOperationLeaseObservation::Held),
+                10 => assert_eq!(result.unwrap(), AppOperationLeaseObservation::Unconfirmed),
+                _ => assert!(
+                    result.is_err(),
+                    "variant {variant} unexpectedly granted observation: {result:?}"
+                ),
+            }
+            server.await.unwrap();
+        }
+    })
+    .await
+    .expect("bounded readonly Lease HTTP fixture");
+}
+
 /// 过期租约被 CAS 接管：POST 409 → GET（过期持有者）→ PATCH（断言 RV
 /// 锚 + 身份改写 + transitions 递增）→ 获得租约；release 再走 GET→
 /// DELETE（实时 RV precondition）。修复前语义（409 一律 OperationInProgress、

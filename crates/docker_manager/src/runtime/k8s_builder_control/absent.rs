@@ -249,6 +249,76 @@ impl KubernetesRuntime {
         Ok(Some(receipt.registration_container()?))
     }
 
+    /// Confirm the original complete multi-step result without requiring a live
+    /// writer. Missing/partial receipts never authorize a factory continuation.
+    pub(crate) async fn observe_original_builder_creation(
+        &self,
+        target: &BuilderControlTarget,
+        original_lease: &UserAppOperationLeaseReceipt,
+    ) -> Result<Option<ContainerBasicInfo>> {
+        target.validate().map_err(Error::ConfigurationError)?;
+        if target.workload.is_some() || target.pod.is_some() || target.resource_binding.is_some() {
+            return Ok(None);
+        }
+        let Some(completion) = self.original_absent_creation_receipt(target).await? else {
+            return Ok(None);
+        };
+        let same_lease = matches!((&completion.lease, original_lease),
+            (UserAppOperationLeaseReceipt::Kubernetes { service_type: a_family, namespace: a_ns, name: a_name, uid: a_uid, token: a_token, .. },
+             UserAppOperationLeaseReceipt::Kubernetes { service_type: b_family, namespace: b_ns, name: b_name, uid: b_uid, token: b_token, .. })
+            if a_family == b_family && a_ns == b_ns && a_name == b_name && a_uid == b_uid && a_token == b_token);
+        if !same_lease {
+            return Err(Error::Conflict(
+                "Completed builder creation original lease differs".into(),
+            ));
+        }
+        let Some(info) = self.reconcile_absent_builder_creation(target).await? else {
+            return Ok(None);
+        };
+        let actual = self
+            .capture_builder_compute_with_binding(&target.context, None, false)
+            .await?;
+        self.verify_partial_builder_creation(target, &actual)
+            .await?;
+        let expected_pod = actual
+            .pod
+            .as_ref()
+            .ok_or_else(|| Error::Conflict("Completed builder Pod is missing".into()))?;
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let pod = pods
+            .get(&expected_pod.name)
+            .await
+            .map_err(|error| api_error("Observe completed builder Ready status", error))?;
+        if pod.metadata.uid.as_deref() != Some(info.container_id.as_str())
+            || !pod
+                .status
+                .as_ref()
+                .and_then(|status| status.conditions.as_ref())
+                .is_some_and(|conditions| {
+                    conditions
+                        .iter()
+                        .any(|condition| condition.type_ == "Ready" && condition.status == "True")
+                })
+        {
+            return Ok(None);
+        }
+        let Some(repeated) = self.original_absent_creation_receipt(target).await? else {
+            return Err(Error::Conflict(
+                "Original builder completion disappeared".into(),
+            ));
+        };
+        if serde_json::to_value(&repeated)
+            .map_err(|error| Error::ConfigurationError(error.to_string()))?
+            != serde_json::to_value(&completion)
+                .map_err(|error| Error::ConfigurationError(error.to_string()))?
+        {
+            return Err(Error::Conflict(
+                "Original builder completion changed during observation".into(),
+            ));
+        }
+        Ok(Some(info))
+    }
+
     async fn verify_partial_builder_creation(
         &self,
         target: &BuilderControlTarget,

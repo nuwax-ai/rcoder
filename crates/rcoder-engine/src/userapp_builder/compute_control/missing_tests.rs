@@ -17,6 +17,12 @@ struct Runtime {
     completion: AtomicBool,
     retry_partial: AtomicBool,
     held: AtomicBool,
+    original_lease: UserAppOperationLeaseReceipt,
+    original_identity_retained: AtomicBool,
+    observation_reads: AtomicUsize,
+    change_identity_during_observation: AtomicBool,
+    retries: AtomicUsize,
+    stopped: AtomicBool,
     call: Mutex<
         Option<(
             BuilderControlTarget,
@@ -80,6 +86,29 @@ impl UserAppDeploymentRuntime for Runtime {
         _: &UserAppOperationLeaseReceipt,
     ) -> ContainerRuntimeResult<bool> {
         Ok(self.held.load(Ordering::SeqCst))
+    }
+    async fn observe_app_operation_lease(
+        &self,
+        context: &UserAppExecutionContext,
+        receipt: &UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<container_runtime_api::AppOperationLeaseObservation> {
+        use container_runtime_api::AppOperationLeaseObservation;
+        let read = self.observation_reads.fetch_add(1, Ordering::SeqCst);
+        if !self.original_identity_retained.load(Ordering::SeqCst)
+            || (read > 0
+                && self
+                    .change_identity_during_observation
+                    .load(Ordering::SeqCst))
+            || *context != self.actual.lock().unwrap().context
+            || *receipt != self.original_lease
+        {
+            return Ok(AppOperationLeaseObservation::Unconfirmed);
+        }
+        Ok(if self.held.load(Ordering::SeqCst) {
+            AppOperationLeaseObservation::Held
+        } else {
+            AppOperationLeaseObservation::ExpiredOriginalIdentity
+        })
     }
     async fn release_app_operation_receipt(
         &self,
@@ -190,6 +219,7 @@ impl AgentContainerRuntime for Runtime {
         &self,
         target: &BuilderControlTarget,
     ) -> ContainerRuntimeResult<Option<BuilderControlTarget>> {
+        self.retries.fetch_add(1, Ordering::SeqCst);
         if !self.retry_partial.load(Ordering::SeqCst) {
             return Ok(None);
         }
@@ -201,6 +231,12 @@ impl AgentContainerRuntime for Runtime {
         }
         Ok(Some(target.clone()))
     }
+    async fn reconcile_builder_compute_stop(
+        &self,
+        _: &BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(self.stopped.load(Ordering::SeqCst))
+    }
     async fn builder_compute_write_acknowledged(
         &self,
         _: &BuilderControlTarget,
@@ -208,6 +244,19 @@ impl AgentContainerRuntime for Runtime {
     ) -> ContainerRuntimeResult<bool> {
         assert!(restart);
         Ok(self.completion.load(Ordering::SeqCst))
+    }
+    async fn observe_completed_builder_creation(
+        &self,
+        target: &BuilderControlTarget,
+        receipt: &UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        if *receipt != self.original_lease || target.context != self.actual.lock().unwrap().context
+        {
+            return Err(container_runtime_api::ContainerRuntimeError::Conflict(
+                "original creation receipt identity differs".into(),
+            ));
+        }
+        self.reconcile_builder_compute_start(target).await
     }
     async fn start_builder_control(
         &self,
@@ -267,6 +316,23 @@ async fn fixture_with_intent(
     ComputeControlRecord,
     tempfile::TempDir,
 ) {
+    fixture_with_canonical_binding(previous, starting, invalid_witness, mode, roll_image, false)
+        .await
+}
+
+async fn fixture_with_canonical_binding(
+    previous: bool,
+    starting: bool,
+    invalid_witness: Option<usize>,
+    mode: BuilderStartupMode,
+    roll_image: bool,
+    canonical_binding: bool,
+) -> (
+    Arc<AppState>,
+    Arc<Runtime>,
+    ComputeControlRecord,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
         rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
@@ -276,6 +342,66 @@ async fn fixture_with_intent(
         .unwrap(),
     );
     let app = store.ensure_identity("missingapp").await.unwrap();
+    if canonical_binding {
+        let input = UserAppExecutionInput::new(
+            serde_json::to_string(&AdoptBuilderRequest {
+                lifecycle_id: app.lifecycle_id.clone(),
+                request_id: "previous-adoption".into(),
+                expected_container_id: "real-new-sts-uid".into(),
+            })
+            .unwrap(),
+        );
+        let admitted = store
+            .admit_with_input(
+                &UserAppAdmission {
+                    runtime_policy_on_success: None,
+                    command: None,
+                    metadata: None,
+                    app_id: app.app_id.clone(),
+                    lifecycle_id: Some(app.lifecycle_id.clone()),
+                    operation_id: "previous-adoption".into(),
+                    request_id: Some("previous-adoption".into()),
+                    request_fingerprint: input.digest(),
+                    kind: UserAppOperationKind::AdoptBuilder,
+                },
+                Some(&input),
+            )
+            .await
+            .unwrap();
+        let accepted = match admitted {
+            UserAppAdmissionOutcome::Accepted(r) | UserAppAdmissionOutcome::Existing(r) => r,
+        };
+        let progress = UserAppOperationProgress {
+            app_id: app.app_id.clone(),
+            lifecycle_id: app.lifecycle_id.clone(),
+            operation_id: accepted.operation_id.clone(),
+            expected_revision: accepted.revision,
+            executor_id: "previous-adopter".into(),
+            state: UserAppOperationState::Running,
+            step: "verified".into(),
+            checkpoint: serde_json::Value::Null,
+            error_code: None,
+            error_message: None,
+        };
+        let running = store.advance(&progress).await.unwrap();
+        store
+            .commit_resource_binding(
+                &UserAppResourceBinding {
+                    app_id: app.app_id.clone(),
+                    lifecycle_id: app.lifecycle_id.clone(),
+                    service_type: ServiceType::UserappBuilder,
+                    physical_uid: "real-new-sts-uid".into(),
+                    adopted_by_operation: running.operation_id.clone(),
+                },
+                &UserAppOperationProgress {
+                    expected_revision: running.revision,
+                    state: UserAppOperationState::Succeeded,
+                    ..progress
+                },
+            )
+            .await
+            .unwrap();
+    }
     let pending = store
         .admit_compute_control(&ComputeControlRequest {
             app_id: app.app_id.clone(),
@@ -394,6 +520,12 @@ async fn fixture_with_intent(
         completion: AtomicBool::new(false),
         retry_partial: AtomicBool::new(false),
         held: AtomicBool::new(true),
+        original_lease: receipt,
+        original_identity_retained: AtomicBool::new(true),
+        observation_reads: AtomicUsize::new(0),
+        change_identity_during_observation: AtomicBool::new(false),
+        retries: AtomicUsize::new(0),
+        stopped: AtomicBool::new(false),
         call: Mutex::new(None),
     });
     let state = runtime_state(runtime.clone(), store, None).await;
@@ -672,4 +804,318 @@ async fn missing_workload_preserve_no_image_roll_reuses_its_frozen_recipe_on_par
         record.checkpoint["restart_image"]
     );
     state.userapp_store_control.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn completed_missing_builder_with_expired_original_lease_finishes_without_another_start() {
+    let (state, runtime, record, _dir) = fixture(false, true).await;
+    runtime.make_current();
+    runtime.completion.store(true, Ordering::SeqCst);
+    runtime.held.store(false, Ordering::SeqCst);
+
+    let observed = resume_restart_start(&state, &record).await;
+    assert!(
+        observed.is_ok(),
+        "the original completed creation must remain observable after lease expiry: {observed:?}"
+    );
+    let result = state
+        .userapp_store
+        .get_compute_control(&record.app_id, &record.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.state, ComputeControlState::Succeeded);
+    assert_eq!(result.operation_id, record.operation_id);
+    assert_eq!(result.executor_id, record.executor_id);
+    assert_eq!(result.generation, record.generation);
+    assert_eq!(result.request_id, record.request_id);
+    assert_eq!(result.request_fingerprint, record.request_fingerprint);
+    assert_eq!(
+        result.checkpoint["builder_volumes"],
+        record.checkpoint["builder_volumes"]
+    );
+    assert_eq!(runtime.creates.load(Ordering::SeqCst), 0);
+    assert!(runtime.call.lock().unwrap().is_none());
+    assert_eq!(runtime.retries.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.releases.load(Ordering::SeqCst), 1);
+    state.userapp_store_control.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn expired_builder_lease_does_not_complete_unknown_changed_or_partial_results() {
+    for variant in 0..5 {
+        let (state, runtime, record, _dir) = fixture(false, true).await;
+        runtime.make_current();
+        runtime.completion.store(true, Ordering::SeqCst);
+        runtime.held.store(false, Ordering::SeqCst);
+        match variant {
+            0 => runtime
+                .original_identity_retained
+                .store(false, Ordering::SeqCst),
+            1 => {
+                runtime.completion.store(false, Ordering::SeqCst);
+                runtime.retry_partial.store(true, Ordering::SeqCst);
+                runtime.actual.lock().unwrap().pod = None;
+            }
+            2 => runtime.volumes.lock().unwrap()[0].uid = "replacement-pvc".into(),
+            3 => runtime
+                .change_identity_during_observation
+                .store(true, Ordering::SeqCst),
+            4 => runtime.actual.lock().unwrap().context.executor_id = "foreign-executor".into(),
+            _ => unreachable!(),
+        }
+        assert!(resume_restart_start(&state, &record).await.is_err());
+        assert_eq!(runtime.creates.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.retries.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.releases.load(Ordering::SeqCst), 0);
+        assert!(state.get_project(&record.app_id).is_none());
+        assert_eq!(
+            state
+                .userapp_store
+                .get_compute_control(&record.app_id, &record.operation_id)
+                .await
+                .unwrap(),
+            Some(record)
+        );
+        state.userapp_store_control.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn completed_builder_observation_losing_original_snapshot_cas_never_publishes() {
+    let (state, runtime, record, _dir) = fixture(false, true).await;
+    runtime.make_current();
+    runtime.completion.store(true, Ordering::SeqCst);
+    runtime.held.store(false, Ordering::SeqCst);
+    // Use the original store claim to create a real competing revision, rather
+    // than weakening the completion's exact snapshot comparison.
+    let target: BuilderControlTarget = serde_json::from_value(record.checkpoint.clone()).unwrap();
+    let updated = state
+        .userapp_store
+        .resume_builder_restart_start(&record, &target)
+        .await
+        .unwrap();
+    assert!(resume_restart_start(&state, &record).await.is_err());
+    assert!(state.get_project(&record.app_id).is_none());
+    assert_eq!(runtime.creates.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.releases.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        state
+            .userapp_store
+            .get_compute_control(&record.app_id, &record.operation_id)
+            .await
+            .unwrap(),
+        Some(updated)
+    );
+    state.userapp_store_control.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn completed_builder_observation_preserves_existing_canonical_adoption_and_rejects_other_family()
+ {
+    for foreign_family in [false, true] {
+        let (state, runtime, record, _dir) = fixture_with_canonical_binding(
+            false,
+            true,
+            None,
+            BuilderStartupMode::ManagementOnly,
+            true,
+            true,
+        )
+        .await;
+        runtime.make_current();
+        runtime.completion.store(true, Ordering::SeqCst);
+        runtime.held.store(false, Ordering::SeqCst);
+        let binding = state
+            .userapp_store
+            .get_resource_binding(&ServiceType::UserappBuilder, "real-new-sts-uid")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut actual_binding = binding.clone();
+        if foreign_family {
+            actual_binding.service_type = ServiceType::Userapp;
+        }
+        runtime.actual.lock().unwrap().resource_binding = Some(actual_binding);
+        let result = resume_restart_start(&state, &record).await;
+        if foreign_family {
+            assert!(result.is_err());
+            assert!(state.get_project(&record.app_id).is_none());
+            assert_eq!(runtime.releases.load(Ordering::SeqCst), 0);
+        } else {
+            result.unwrap();
+            let completed = state
+                .userapp_store
+                .get_compute_control(&record.app_id, &record.operation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(completed.state, ComputeControlState::Succeeded);
+            let target: BuilderControlTarget =
+                serde_json::from_value(completed.checkpoint).unwrap();
+            assert_eq!(target.resource_binding, Some(binding.clone()));
+            assert_eq!(binding.adopted_by_operation, "previous-adoption");
+        }
+        assert_eq!(
+            state
+                .userapp_store
+                .get_resource_binding(&ServiceType::UserappBuilder, "real-new-sts-uid")
+                .await
+                .unwrap(),
+            Some(binding)
+        );
+        assert_eq!(runtime.creates.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.retries.load(Ordering::SeqCst), 0);
+        state.userapp_store_control.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn retained_builder_atomic_start_observation_preserves_its_original_checkpoint() {
+    for unknown in [false, true] {
+        let (state, runtime, record, _dir) = fixture(false, true).await;
+        runtime.make_current();
+        let identity = ComputeExecutorIdentity {
+            app_id: record.app_id.clone(),
+            lifecycle_id: record.lifecycle_id.clone(),
+            scope: record.scope,
+            operation_id: record.operation_id.clone(),
+            generation: record.generation,
+            executor_id: record.executor_id.clone().unwrap(),
+        };
+        let old: BuilderControlTarget = serde_json::from_value(record.checkpoint.clone()).unwrap();
+        let running = state
+            .userapp_store
+            .resume_builder_restart_start(&record, &old)
+            .await
+            .unwrap();
+        let mut bound = runtime.actual.lock().unwrap().clone();
+        bound.pod = None;
+        let mut checkpoint = serde_json::to_value(&bound).unwrap();
+        checkpoint["builder_volumes"] = record.checkpoint["builder_volumes"].clone();
+        checkpoint["builder_compute_single_write"] = true.into();
+        checkpoint["builder_restart_template"] =
+            record.checkpoint["builder_restart_template"].clone();
+        let original = state
+            .userapp_store
+            .advance_compute_control(&ComputeControlProgress {
+                identity,
+                expected_revision: running.revision,
+                state: ComputeControlState::RecoveryRequired,
+                stage: ComputeControlStage::Starting,
+                checkpoint,
+                error_code: Some("LOST_REPLY".into()),
+                error_message: Some("accepted original atomic start response was lost".into()),
+            })
+            .await
+            .unwrap();
+        runtime.held.store(false, Ordering::SeqCst);
+        runtime.completion.store(!unknown, Ordering::SeqCst);
+        let result = recover_confirmed(&state, &original).await;
+        if unknown {
+            assert!(result.is_err());
+            assert_eq!(
+                state
+                    .userapp_store
+                    .get_compute_control(&original.app_id, &original.operation_id)
+                    .await
+                    .unwrap(),
+                Some(original)
+            );
+        } else {
+            let completed = result.unwrap();
+            assert_eq!(completed.state, ComputeControlState::Succeeded);
+            assert_eq!(completed.checkpoint, original.checkpoint);
+            assert_eq!(completed.executor_id, original.executor_id);
+            assert_eq!(completed.generation, original.generation);
+        }
+        assert_eq!(runtime.creates.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.retries.load(Ordering::SeqCst), 0);
+        state.userapp_store_control.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn expired_original_stop_observes_existing_atomic_or_absence_proof_without_new_write() {
+    for absent in [false, true] {
+        let (state, runtime, record, _dir) = fixture(false, false).await;
+        resume_restart_start(&state, &record).await.unwrap();
+        let app = state
+            .userapp_store
+            .get_application(&record.app_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let pending = state
+            .userapp_store
+            .admit_compute_control(&ComputeControlRequest {
+                app_id: app.app_id.clone(),
+                lifecycle_id: app.lifecycle_id.clone(),
+                scope: UserAppOperationScope::Dev,
+                operation_id: "original-stop".into(),
+                request_id: "original-stop-request".into(),
+                request_fingerprint: "b".repeat(64),
+                action: ComputeControlAction::Stop,
+                restart_image_roll: false,
+                builder_startup_mode: Default::default(),
+            })
+            .await
+            .unwrap();
+        let identity = ComputeExecutorIdentity {
+            app_id: pending.app_id.clone(),
+            lifecycle_id: pending.lifecycle_id.clone(),
+            scope: pending.scope,
+            operation_id: pending.operation_id.clone(),
+            generation: pending.generation,
+            executor_id: "original-executor".into(),
+        };
+        state
+            .userapp_store
+            .claim_compute_control(&identity, pending.revision)
+            .await
+            .unwrap();
+        let bound = state
+            .userapp_store
+            .bind_compute_lease(&identity, &runtime.original_lease)
+            .await
+            .unwrap();
+        let context = bound.execution_context().unwrap();
+        runtime.actual.lock().unwrap().context = context.clone();
+        runtime.actual.lock().unwrap().pod = None;
+        let checkpoint = if absent {
+            runtime.actual.lock().unwrap().workload = None;
+            serde_json::to_value(ComputeAbsenceCheckpoint {
+                context,
+                compute_absent: true,
+            })
+            .unwrap()
+        } else {
+            serde_json::to_value(runtime.actual.lock().unwrap().clone()).unwrap()
+        };
+        let original = state
+            .userapp_store
+            .advance_compute_control(&ComputeControlProgress {
+                identity,
+                expected_revision: bound.revision,
+                state: ComputeControlState::RecoveryRequired,
+                stage: ComputeControlStage::Stopping,
+                checkpoint,
+                error_code: Some("LOST_REPLY".into()),
+                error_message: Some("accepted original stop response was lost".into()),
+            })
+            .await
+            .unwrap();
+        runtime.held.store(false, Ordering::SeqCst);
+        runtime.stopped.store(true, Ordering::SeqCst);
+        runtime.creates.store(0, Ordering::SeqCst);
+        runtime.releases.store(0, Ordering::SeqCst);
+        let completed = recover_confirmed(&state, &original).await.unwrap();
+        assert_eq!(completed.state, ComputeControlState::Succeeded);
+        assert_eq!(completed.operation_id, original.operation_id);
+        assert_eq!(completed.checkpoint, original.checkpoint);
+        assert_eq!(runtime.creates.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.retries.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.releases.load(Ordering::SeqCst), 1);
+        state.userapp_store_control.shutdown().await.unwrap();
+    }
 }

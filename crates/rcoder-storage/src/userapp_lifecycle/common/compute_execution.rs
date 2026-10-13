@@ -11,7 +11,9 @@ fn invalid(message: &str) -> Error {
 
 #[path = "compute_restart_absence.rs"]
 mod restart_absence;
-use restart_absence::{retained_builder_creation, stopped_builder_absence};
+use restart_absence::{
+    retained_builder_creation, retained_builder_volume_evidence, stopped_builder_absence,
+};
 
 fn owns(record: &ComputeControlRecord, identity: &ComputeExecutorIdentity) -> bool {
     record.app_id == identity.app_id
@@ -146,10 +148,22 @@ pub(super) async fn advance(
         && record.action == ComputeControlAction::Restart
         && record.checkpoint.get("context").is_some()
     {
-        let original: BuilderControlTarget =
-            serde_json::from_value(record.checkpoint.clone()).map_err(storage)?;
-        let next: BuilderControlTarget =
-            serde_json::from_value(progress.checkpoint.clone()).map_err(storage)?;
+        // A verified result can commit its unchanged historical checkpoint.
+        // This terminal-only path cannot prepare or submit another mutation.
+        let terminal_observation = ComputeControlStage::from_storage_value(&record.stage)
+            == Some(ComputeControlStage::Verifying)
+            && progress.stage == ComputeControlStage::Completed
+            && progress.state == ComputeControlState::Succeeded
+            && record.checkpoint == progress.checkpoint;
+        let read_target = |checkpoint: &serde_json::Value| {
+            if terminal_observation {
+                BuilderControlTarget::from_observation_checkpoint(checkpoint)
+            } else {
+                serde_json::from_value(checkpoint.clone())
+            }
+        };
+        let original = read_target(&record.checkpoint).map_err(storage)?;
+        let next = read_target(&progress.checkpoint).map_err(storage)?;
         let confirmed_absence = progress.stage == ComputeControlStage::Starting
             && stopped_builder_absence(&record, &next)
             && record.checkpoint.get("builder_volumes")
@@ -506,7 +520,7 @@ pub(super) async fn finalize_observed_stop(
     backend: Backend,
     snapshot: &ComputeControlRecord,
 ) -> Result<ComputeControlRecord, Error> {
-    finalize_observed(tx, backend, snapshot, ComputeControlAction::Stop).await
+    finalize_observed(tx, backend, snapshot, ComputeControlAction::Stop, None).await
 }
 
 pub(super) async fn finalize_observed_restart(
@@ -514,7 +528,59 @@ pub(super) async fn finalize_observed_restart(
     backend: Backend,
     snapshot: &ComputeControlRecord,
 ) -> Result<ComputeControlRecord, Error> {
-    finalize_observed(tx, backend, snapshot, ComputeControlAction::Restart).await
+    finalize_observed(tx, backend, snapshot, ComputeControlAction::Restart, None).await
+}
+
+pub(super) async fn finalize_observed_creation(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &ComputeControlRecord,
+    observed: &BuilderControlTarget,
+    volumes: &[AppResourceIdentity],
+) -> Result<ComputeControlRecord, Error> {
+    let original: BuilderControlTarget =
+        BuilderControlTarget::from_observation_checkpoint(&snapshot.checkpoint).map_err(storage)?;
+    original.validate().map_err(Error::InvalidOperation)?;
+    observed.validate().map_err(Error::InvalidOperation)?;
+    let expected: Vec<AppResourceIdentity> = serde_json::from_value(
+        snapshot
+            .checkpoint
+            .get("builder_volumes")
+            .cloned()
+            .ok_or_else(|| invalid("Original retained volumes missing"))?,
+    )
+    .map_err(storage)?;
+    if !retained_builder_volume_evidence(snapshot)
+        || original.workload.is_some()
+        || original.pod.is_some()
+        || original.resource_binding.is_some()
+        || observed.context != original.context
+        || observed
+            .workload
+            .as_ref()
+            .is_none_or(|workload| workload.kind != AppResourceKind::StatefulSet)
+        || observed.pod.is_none()
+        || observed
+            .resource_binding
+            .as_ref()
+            .is_some_and(|binding| binding.service_type != ServiceType::UserappBuilder)
+        || observed.restart_image != original.restart_image
+        || observed.restart_runtime_workspace != original.restart_runtime_workspace
+        || observed.builder_startup_mode != original.builder_startup_mode
+        || volumes != expected
+    {
+        return Err(invalid(
+            "Observed builder creation differs from original intent or retained data",
+        ));
+    }
+    finalize_observed(
+        tx,
+        backend,
+        snapshot,
+        ComputeControlAction::Restart,
+        Some(observed),
+    )
+    .await
 }
 
 async fn finalize_observed(
@@ -522,6 +588,7 @@ async fn finalize_observed(
     backend: Backend,
     snapshot: &ComputeControlRecord,
     action: ComputeControlAction,
+    creation: Option<&BuilderControlTarget>,
 ) -> Result<ComputeControlRecord, Error> {
     let (expected_stage, confirmed_stage) = match action {
         ComputeControlAction::Stop => ("stopping", "stopped"),
@@ -558,13 +625,15 @@ async fn finalize_observed(
             }
             UserAppOperationScope::Dev => {
                 let target: BuilderControlTarget =
-                    serde_json::from_value(snapshot.checkpoint.clone()).map_err(storage)?;
+                    BuilderControlTarget::from_observation_checkpoint(&snapshot.checkpoint)
+                        .map_err(storage)?;
                 target.validate().map_err(Error::InvalidOperation)?;
                 target.context == context
-                    && target.workload.as_ref().is_some_and(|workload| {
-                        workload.kind == AppResourceKind::StatefulSet
-                            || workload.kind == AppResourceKind::Container
-                    })
+                    && (creation.is_some()
+                        || target.workload.as_ref().is_some_and(|workload| {
+                            workload.kind == AppResourceKind::StatefulSet
+                                || workload.kind == AppResourceKind::Container
+                        }))
             }
             _ => false,
         }
@@ -595,9 +664,20 @@ async fn finalize_observed(
         .revision
         .checked_add(1)
         .ok_or_else(|| invalid("Compute revision exhausted"))?;
+    let mut checkpoint = snapshot.checkpoint.clone();
+    if let Some(observed) = creation {
+        let target = serde_json::to_value(observed).map_err(storage)?;
+        for (key, value) in target
+            .as_object()
+            .ok_or_else(|| invalid("Observed builder target is not an object"))?
+        {
+            checkpoint[key] = value.clone();
+        }
+    }
     let changed = toasty::sql::statement(repo::sql(backend,
-        "UPDATE userapp_compute_controls SET state='running',stage=$4,revision=$3 WHERE operation_id=$1 AND revision=$2"))
+        "UPDATE userapp_compute_controls SET state='running',stage=$4,revision=$3,checkpoint_json=$5 WHERE operation_id=$1 AND revision=$2"))
         .bind(&snapshot.operation_id).bind(snapshot.revision).bind(revision).bind(confirmed_stage)
+        .bind(serde_json::to_string(&checkpoint).map_err(storage)?)
         .exec(tx).await.map_err(storage)?;
     if changed != 1 {
         return Err(Error::VersionConflict);

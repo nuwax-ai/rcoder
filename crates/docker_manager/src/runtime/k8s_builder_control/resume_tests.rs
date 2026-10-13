@@ -1444,6 +1444,151 @@ async fn absent_builder_uses_original_control_lease_and_retains_pvc_through_real
 }
 
 #[tokio::test]
+async fn completed_builder_creation_is_observed_after_original_lease_expiry_without_any_write() {
+    use container_runtime_api::{AgentContainerRuntime as _, UserAppDeploymentRuntime as _};
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (runtime, params, state, server) = fixture(None).await;
+        let context = params.execution_context.as_ref().unwrap().clone();
+        {
+            let mut state = state.lock().unwrap();
+            state.pvc["spec"]["resources"]["requests"]["storage"] = "100Gi".into();
+            state.pvc["status"]["capacity"]["storage"] = "100Gi".into();
+            state.sts = serde_json::Value::Null;
+            state.pod = serde_json::Value::Null;
+            state.allow_writes = true;
+        }
+        let mut target = runtime
+            .capture_builder_compute_with_binding(&context, None, false)
+            .await
+            .unwrap();
+        target.restart_image = Some("paired-runner:frozen-original".into());
+        target.builder_startup_mode = shared_types::BuilderStartupMode::ManagementOnly;
+        let volumes = runtime
+            .capture_builder_volume_witness(&target)
+            .await
+            .unwrap();
+        let lease = runtime
+            .acquire_application_operation_with_context(
+                &context.app_id,
+                &ServiceType::UserappBuilder,
+                Some(&context),
+            )
+            .await
+            .unwrap();
+        let receipt = lease.receipt().unwrap();
+        runtime
+            .ensure_absent_builder_control(&target, &volumes, &receipt)
+            .await
+            .unwrap()
+            .unwrap();
+        let (original_sts, original_pod, original_service, original_archives) = {
+            let mut state = state.lock().unwrap();
+            state.allow_writes = false;
+            for lease in state.leases.values_mut() {
+                lease["spec"]["renewTime"] = (k8s_openapi::jiff::Timestamp::now()
+                    - k8s_openapi::jiff::SignedDuration::from_secs(3600))
+                .to_string()
+                .into();
+            }
+            (
+                state.sts.clone(),
+                state.pod.clone(),
+                state.service.clone(),
+                state.archives.clone(),
+            )
+        };
+        assert!(
+            !runtime
+                .validate_app_operation_receipt(&context, &receipt)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            runtime
+                .observe_app_operation_lease(&context, &receipt)
+                .await
+                .unwrap(),
+            container_runtime_api::AppOperationLeaseObservation::ExpiredOriginalIdentity
+        );
+        for variant in 0..8 {
+            {
+                let mut state = state.lock().unwrap();
+                state.sts = original_sts.clone();
+                state.pod = original_pod.clone();
+                state.service = original_service.clone();
+                state.archives = original_archives.clone();
+                state.requests.clear();
+                state.sts_reads = 0;
+                state.replace_uid_on_second_sts_read = false;
+                match variant {
+                    0 => {}
+                    1 => {
+                        for object in state.archives.values_mut() {
+                            if let Some(payload) = object["data"]["receipt"].as_str() {
+                                let mut ack: serde_json::Value =
+                                    serde_json::from_str(payload).unwrap();
+                                ack["lease"]["uid"] = "other-lease-uid".into();
+                                object["data"]["receipt"] = ack.to_string().into();
+                            }
+                        }
+                    }
+                    2 => {
+                        state.archives.clear();
+                        if let Some(annotations) =
+                            state.service["metadata"]["annotations"].as_object_mut()
+                        {
+                            annotations.remove("rcoder.io/builder-creation-completion");
+                        }
+                    }
+                    3 => {
+                        state.pod["status"]["conditions"] =
+                            serde_json::json!([{"type":"Ready","status":"False"}])
+                    }
+                    4 => state.pod["spec"]["containers"][0]["image"] = "other:image".into(),
+                    5 => {
+                        let env = state.sts["spec"]["template"]["spec"]["containers"][0]["env"]
+                            .as_array_mut()
+                            .unwrap();
+                        for entry in env {
+                            if entry["name"] == shared_types::APP_CLI_CONTROL_ONLY_ENV {
+                                entry["value"] = "false".into();
+                            }
+                        }
+                    }
+                    6 => state.pod["metadata"]["uid"] = "replacement-pod-uid".into(),
+                    7 => state.replace_uid_on_second_sts_read = true,
+                    _ => unreachable!(),
+                }
+            }
+            let result = runtime
+                .observe_completed_builder_creation(&target, &receipt)
+                .await;
+            if variant == 0 {
+                assert_eq!(result.unwrap().unwrap().container_id, "pod-created");
+            } else {
+                assert!(
+                    !matches!(result, Ok(Some(_))),
+                    "variant {variant} unexpectedly confirmed: {result:?}"
+                );
+            }
+            assert!(
+                state
+                    .lock()
+                    .unwrap()
+                    .requests
+                    .iter()
+                    .all(|r| r.starts_with("GET ")),
+                "completed result observation must not start, retry, reacquire or mutate"
+            );
+        }
+        server.abort();
+        drop(lease);
+    })
+    .await
+    .expect("bounded completed creation HTTP fixture");
+}
+
+#[tokio::test]
 async fn absent_builder_creation_refuses_replaced_volume_or_foreign_current_operation_before_mutation()
  {
     use container_runtime_api::AgentContainerRuntime as _;

@@ -341,33 +341,24 @@ pub(crate) async fn recover_confirmed(
     let observed_stop = record.action == ComputeControlAction::Stop && record.stage == "stopping";
     let observed_restart =
         record.action == ComputeControlAction::Restart && record.stage == "starting";
-    if observed_restart {
+    let mut observation_only = false;
+    if observed_restart || observed_stop {
         let context = record.execution_context().map_err(anyhow::Error::msg)?;
         let receipt = record
             .lease
             .as_ref()
-            .context("Startup recovery lease is missing")?;
-        ensure!(
-            state
-                .runtime()
-                .validate_app_operation_receipt(&context, receipt)
-                .await?,
-            "Startup recovery lease is not confirmed"
-        );
+            .context("Compute completion recovery lease is missing")?;
+        if !state
+            .runtime()
+            .validate_app_operation_receipt(&context, receipt)
+            .await?
+        {
+            require_original_lease_identity(state, &context, receipt).await?;
+            observation_only = true;
+        }
     }
     if observed_stop {
         let context = record.execution_context().map_err(anyhow::Error::msg)?;
-        let receipt = record
-            .lease
-            .as_ref()
-            .ok_or_else(|| anyhow!("Stop recovery lease is missing"))?;
-        ensure!(
-            state
-                .runtime()
-                .validate_app_operation_receipt(&context, receipt)
-                .await?,
-            "Stop recovery lease is not confirmed"
-        );
         let absence = serde_json::from_value::<ComputeAbsenceCheckpoint>(record.checkpoint.clone())
             .ok()
             .filter(|proof| proof.compute_absent && proof.context == context);
@@ -395,7 +386,8 @@ pub(crate) async fn recover_confirmed(
                 UserAppOperationScope::Application => false,
             }
         } else if record.scope == UserAppOperationScope::Dev {
-            let target: BuilderControlTarget = serde_json::from_value(record.checkpoint.clone())?;
+            let target: BuilderControlTarget =
+                BuilderControlTarget::from_observation_checkpoint(&record.checkpoint)?;
             ensure!(
                 target.context == context,
                 "Builder stop recovery context differs"
@@ -414,24 +406,63 @@ pub(crate) async fn recover_confirmed(
             "Original stop has no confirmed atomic runtime receipt; ownership retained"
         );
     }
+    let mut observed_builder = None;
+    let mut observed_checkpoint = None;
     if observed_restart && record.scope == UserAppOperationScope::Dev {
-        let target: BuilderControlTarget = serde_json::from_value(record.checkpoint.clone())?;
+        let target: BuilderControlTarget =
+            BuilderControlTarget::from_observation_checkpoint(&record.checkpoint)?;
         ensure!(
             target.context == record.execution_context().map_err(anyhow::Error::msg)?,
             "Builder start recovery context differs"
         );
-        let _info = state
-            .runtime()
-            .reconcile_builder_compute_start(&target)
-            .await?
-            .ok_or_else(|| {
-                anyhow!("Original builder startup receipt or running container is not confirmed")
-            })?;
-        state
-            .runtime()
-            .reconcile_builder_compute_start(&target)
+        let observe = || async {
+            if observation_only && target.workload.is_none() {
+                state
+                    .runtime()
+                    .observe_completed_builder_creation(
+                        &target,
+                        record
+                            .lease
+                            .as_ref()
+                            .context("Original builder receipt missing")?,
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)
+            } else {
+                state
+                    .runtime()
+                    .reconcile_builder_compute_start(&target)
+                    .await
+                    .map_err(anyhow::Error::from)
+            }
+        };
+        let info = observe().await?.ok_or_else(|| {
+            anyhow!("Original builder startup receipt or running container is not confirmed")
+        })?;
+        let repeated = observe()
             .await?
             .context("Builder startup identity or container state changed during recovery")?;
+        ensure!(
+            info.container_id == repeated.container_id
+                && info.workload_uid == repeated.workload_uid,
+            "Builder completion changed during observation"
+        );
+        if observation_only {
+            ensure!(
+                target
+                    .workload
+                    .as_ref()
+                    .is_none_or(|workload| info.workload_uid.as_ref() == Some(&workload.uid)),
+                "Observed builder differs from the original retained controller"
+            );
+            if target.workload.is_none() {
+                observed_checkpoint = Some(
+                    confirmed_missing_builder_checkpoint(state, &target, &record.checkpoint, &info)
+                        .await?,
+                );
+            }
+            observed_builder = Some(info);
+        }
         // Runtime observation must not refresh a cache before the terminal CAS.
     }
     if record.action == ComputeControlAction::Restart && record.scope == UserAppOperationScope::Prod
@@ -479,7 +510,37 @@ pub(crate) async fn recover_confirmed(
             );
         }
     }
-    let completed = if observed_stop {
+    let completed = if observation_only {
+        let context = record.execution_context().map_err(anyhow::Error::msg)?;
+        require_original_lease_identity(
+            state,
+            &context,
+            record
+                .lease
+                .as_ref()
+                .context("Original completion receipt disappeared")?,
+        )
+        .await?;
+        if let Some(checkpoint) = observed_checkpoint {
+            let target: BuilderControlTarget =
+                BuilderControlTarget::from_observation_checkpoint(&checkpoint)?;
+            let volumes = builder_start::retained_volumes(&checkpoint)?;
+            state
+                .userapp_store
+                .finalize_observed_builder_creation(record, &target, &volumes)
+                .await?
+        } else if observed_stop {
+            state
+                .userapp_store
+                .finalize_observed_compute_stop(record)
+                .await?
+        } else {
+            state
+                .userapp_store
+                .finalize_observed_compute_restart(record)
+                .await?
+        }
+    } else if observed_stop {
         state
             .userapp_store
             .finalize_observed_compute_stop(record)
@@ -495,6 +556,9 @@ pub(crate) async fn recover_confirmed(
             .finalize_confirmed_compute(record)
             .await?
     };
+    if let Some(info) = observed_builder {
+        super::register_builder(state, &completed.app_id, &info)?;
+    }
     // A release failure leaves terminal + receipt for the ordinary cleanup scan.
     // It must not turn the confirmed runtime outcome back into uncertainty.
     if let Some(receipt) = &completed.lease {
@@ -527,6 +591,26 @@ pub(crate) async fn recover_confirmed(
         }
     }
     Ok(completed)
+}
+
+async fn require_original_lease_identity(
+    state: &AppState,
+    context: &UserAppExecutionContext,
+    receipt: &UserAppOperationLeaseReceipt,
+) -> Result<()> {
+    use container_runtime_api::AppOperationLeaseObservation;
+    ensure!(
+        matches!(
+            state
+                .runtime()
+                .observe_app_operation_lease(context, receipt)
+                .await?,
+            AppOperationLeaseObservation::Held
+                | AppOperationLeaseObservation::ExpiredOriginalIdentity
+        ),
+        "Original compute lease identity is not confirmed for result observation"
+    );
+    Ok(())
 }
 
 async fn progress(
@@ -1334,13 +1418,14 @@ pub(crate) async fn resume_restart_start(
         .lease
         .as_ref()
         .context("Restart lease is missing")?;
-    ensure!(
-        state
-            .runtime()
-            .validate_app_operation_receipt(&context, receipt)
-            .await?,
-        "Original restart lease is not confirmed"
-    );
+    if !state
+        .runtime()
+        .validate_app_operation_receipt(&context, receipt)
+        .await?
+    {
+        recover_confirmed(state, snapshot).await?;
+        return Ok(());
+    }
     let prior: UserAppComputeStartTarget = serde_json::from_value(snapshot.checkpoint.clone())?;
     ensure!(
         prior.target.context == context,
@@ -1724,6 +1809,21 @@ pub(crate) async fn reconcile_superseded(
 
 async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord) -> Result<()> {
     let mut continuing = snapshot.clone();
+    let context = snapshot.execution_context().map_err(anyhow::Error::msg)?;
+    let receipt = snapshot
+        .lease
+        .as_ref()
+        .context("Builder continuation lease missing")?;
+    if !state
+        .runtime()
+        .validate_app_operation_receipt(&context, receipt)
+        .await?
+    {
+        recover_confirmed(state, snapshot).await?;
+        return Ok(());
+    }
+    // Result observation needs only the original submitted identity. New
+    // writes still require both the Held lease and the existing strict target.
     ensure!(
         snapshot.stage == "stopped"
             || (snapshot.stage == "starting"
@@ -1731,23 +1831,12 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
                     || builder_start::missing_creation(snapshot))),
         "Builder continuation requires a stopped boundary or conditional-write witness"
     );
-    let context = snapshot.execution_context().map_err(anyhow::Error::msg)?;
-    let receipt = snapshot
-        .lease
-        .as_ref()
-        .context("Builder continuation lease missing")?;
     let old: BuilderControlTarget = serde_json::from_value(snapshot.checkpoint.clone())?;
     ensure!(
         old.context == context,
         "Builder continuation context differs"
     );
-    ensure!(
-        state
-            .runtime()
-            .validate_app_operation_receipt(&context, receipt)
-            .await?,
-        "Original builder lease is not confirmed"
-    );
+
     if old.workload.is_none() {
         ensure!(
             builder_start::missing_creation(snapshot),

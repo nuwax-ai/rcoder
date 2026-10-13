@@ -219,6 +219,15 @@ impl AgentContainerRuntime for KubernetesRuntime {
         Ok(false)
     }
 
+    async fn observe_completed_builder_creation(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        self.observe_original_builder_creation(target, receipt)
+            .await
+    }
+
     async fn start_builder_control_with_restart(
         &self,
         target: &shared_types::BuilderControlTarget,

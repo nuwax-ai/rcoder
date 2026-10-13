@@ -389,6 +389,26 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         .await
     }
 
+    async fn finalize_observed_builder_creation(
+        &self,
+        snapshot: &ComputeControlRecord,
+        observed: &BuilderControlTarget,
+        volumes: &[AppResourceIdentity],
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let observed = observed.clone();
+        let volumes = volumes.to_vec();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_execution::finalize_observed_creation(
+                    tx, backend, &snapshot, &observed, &volumes,
+                )
+                .await
+            })
+        })
+        .await
+    }
+
     async fn resume_compute_restart_start(
         &self,
         snapshot: &ComputeControlRecord,

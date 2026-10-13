@@ -265,6 +265,17 @@ pub trait AgentContainerRuntime: Send + Sync {
         Ok(false)
     }
 
+    /// Read an immutable completed creation under its original receipt. This
+    /// never creates, retries or adopts a builder, and verifies the original
+    /// lease identity as well as the currently running physical resources.
+    async fn observe_completed_builder_creation(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+        _receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        Ok(None)
+    }
+
     /// Capture private original configuration before a compute-only restart.
     async fn archive_builder_restart(
         &self,
@@ -1294,6 +1305,17 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         _receipt: &shared_types::UserAppOperationLeaseReceipt,
     ) -> ContainerRuntimeResult<bool> {
         Ok(false)
+    }
+
+    /// Observe the retained original identity without granting write authority.
+    /// Validation's false result also includes absence and unsupported backends,
+    /// so it cannot be converted into a same-owner expiry observation.
+    async fn observe_app_operation_lease(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<super::types::AppOperationLeaseObservation> {
+        Ok(super::types::AppOperationLeaseObservation::Unconfirmed)
     }
 
     /// Holder-death proof for fenced-operation settlement: `Ok(true)` only
