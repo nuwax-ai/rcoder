@@ -643,10 +643,16 @@ mod inactive_entry_ownership_tests {
             let listener = tokio::net::UnixListener::bind(&socket).unwrap();
             let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let counted = calls.clone();
-            let (states, mut responses) = tokio::sync::mpsc::unbounded_channel::<(&'static str, i64)>();
+            let (states, mut responses) = tokio::sync::watch::channel(("STOPPED", 0_i64));
             let server = tokio::spawn(async move {
-                while let Some((state, code)) = responses.recv().await {
-                    let (mut stream, _) = listener.accept().await.unwrap();
+                loop {
+                    let (mut stream, _) = tokio::select! {
+                        accepted = listener.accept() => accepted.unwrap(),
+                        changed = responses.changed() => {
+                            if changed.is_err() { break; }
+                            continue;
+                        }
+                    };
                     let mut header = Vec::new();
                     while !header.ends_with(b"\r\n\r\n") {
                         header.push(stream.read_u8().await.unwrap());
@@ -664,6 +670,7 @@ mod inactive_entry_ownership_tests {
                     assert!(request.contains("supervisor.getAllProcessInfo"));
                     assert!(!request.contains("supervisor.startProcess"));
                     counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let (state, code) = *responses.borrow();
                     let body = format!(
                         r#"<methodResponse><params><param><value><array><data><value><struct>
                         <member><name>group</name><value><string>app-pingap</string></value></member>
@@ -678,13 +685,11 @@ mod inactive_entry_ownership_tests {
                 }
             });
             let host = SupervisordHost::protocol_fixture(socket, conf.clone());
-            for (index, (state, code, change)) in [
+            for (state, code, change) in [
                 ("STOPPED", 0, "application"),
                 ("FATAL", 200, "domain"),
                 ("EXITED", 100, "corrupt"),
             ]
-            .into_iter()
-            .enumerate()
             {
                 let mut foreign = identity.clone();
                 if change == "application" {
@@ -707,6 +712,7 @@ mod inactive_entry_ownership_tests {
                     serde_json::to_vec(&receipt).unwrap()
                 };
                 std::fs::write(runtime_root.join(RESIDENT_ENGINE_RECEIPT), &bytes).unwrap();
+                let before_calls = calls.load(std::sync::atomic::Ordering::SeqCst);
                 states.send((state, code)).unwrap();
                 let error = host
                     .drain_entry_until(
@@ -719,11 +725,8 @@ mod inactive_entry_ownership_tests {
                     error.downcast_ref::<EntryOwnershipUnconfirmed>().is_some(),
                     "{error:#}"
                 );
-                assert_eq!(
-                    calls.load(std::sync::atomic::Ordering::SeqCst),
-                    index + 1,
-                    "only the initial observation is allowed"
-                );
+                assert!(calls.load(std::sync::atomic::Ordering::SeqCst) > before_calls,
+                    "each rejection observes current execution; repeated read-only checks are permitted");
                 assert_eq!(std::fs::read(&active).unwrap(), original_active);
                 assert_eq!(std::fs::read(&conf).unwrap(), original_fragment);
                 assert_eq!(
@@ -864,6 +867,8 @@ mod owner_shutdown_domain_tests {
                     let mut request = vec![0; size];
                     stream.read_exact(&mut request).await.unwrap();
                     let request = String::from_utf8(request).unwrap();
+                    assert!(!request.contains("supervisor.reloadConfig") && !request.contains("supervisor.stopProcessGroup")
+                        && !request.contains("supervisor.removeProcessGroup"), "foreign/unconfirmed current resources must not mutate");
                     let state = *state_rpc.lock().unwrap();
                     let value = if request.contains("getAllProcessInfo") && state == "NONE" {
                         "<array><data></data></array>".to_string()
@@ -929,16 +934,9 @@ mod owner_shutdown_domain_tests {
                 .await
                 .unwrap()
                 .unwrap_err();
-                assert!(
-                    error.to_string().contains("receipt")
-                        || error.to_string().contains("another application"),
-                    "{error:#}"
-                );
-                assert_eq!(
-                    calls.load(std::sync::atomic::Ordering::SeqCst),
-                    0,
-                    "domain rejection must precede every RPC"
-                );
+                assert!(error.is::<supervisor::ShutdownUnconfirmed>() || error.to_string().contains("receipt"), "{error:#}");
+                assert!(calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                    "current physical observation precedes historical-metadata decisions");
                 assert_eq!(std::fs::read(&active).unwrap(), original_active);
                 assert_eq!(std::fs::read(&conf).unwrap(), fragment);
                 assert_eq!(std::fs::read(&standalone).unwrap(), standalone_bytes);
@@ -1256,3 +1254,7 @@ mod official_proxy_only_stop_tests {
         });
     }
 }
+
+#[cfg(unix)]
+#[path = "withdrawn_proxy_tests.rs"]
+mod withdrawn_proxy_tests;

@@ -204,6 +204,29 @@ def request_http(base, path, body=None):
         return error.code, error.read()
 
 
+def initializing_response(status, body):
+    """Only the declared startup gate permits a bounded read-only retry."""
+    if status != 503:
+        return False
+    try:
+        envelope = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return (isinstance(envelope, dict) and envelope.get('code') == 'ERR_INITIALIZING'
+            and envelope.get('success') is False)
+
+
+def record_readonly_response(operation, path, status, body):
+    raw = body.decode('utf-8', errors='replace').replace(TOKEN, '<redacted>')
+    try:
+        response = json.loads(raw)
+    except ValueError:
+        response = {'raw_body': raw}
+    with (REPORT / 'readonly-responses.jsonl').open('a') as stream:
+        stream.write(json.dumps({'operation_id': operation, 'path': path,
+                                 'status': status, 'response': response}) + '\n')
+
+
 def poll(fn, timeout=90):
     deadline = time.monotonic() + timeout
     last = None
@@ -265,8 +288,11 @@ def main():
 
         def terminal(op):
             status, data = request_http(base, '/v1/deploy/status')
+            record_readonly_response(op, '/v1/deploy/status', status, data)
+            if initializing_response(status, data):
+                return None
             if status != 200:
-                raise AssertionError('Status endpoint returned HTTP ' + str(status))
+                raise AssertionError('Status endpoint returned HTTP ' + str(status) + ': ' + data.decode(errors='replace'))
             data = json.loads(data)['data']
             operation = data.get('operation') or {}
             if data.get('protocol_version', 0) < 4:

@@ -77,3 +77,42 @@ pub(super) fn verify_resident_engine_receipt(
     );
     Ok(Some(receipt))
 }
+
+/// A withdrawn, physically stopped local registration is not a reusable
+/// process. Its old epoch/domain and optional PID are history; the current
+/// retained owner authorizes only removal inside the same application range.
+pub(super) fn verify_withdrawn_entry_receipt(
+    root: &Path,
+    identity: &process_utils::command_authority::ResidentIdentity,
+    socket: &Path,
+) -> Result<ResidentEngineReceipt> {
+    let receipt = read_resident_engine_receipt(root)?
+        .context("withdrawn proxy has no owner-domain receipt")?;
+    let root = std::fs::canonicalize(root)?;
+    anyhow::ensure!(
+        receipt.version == 1
+            && receipt.runtime_root == root
+            && receipt.socket == socket
+            && receipt.identity.application_id == identity.application_id
+            && receipt.identity.binding == identity.binding,
+        "withdrawn proxy belongs to another application, workspace, runtime root or socket"
+    );
+    anyhow::ensure!(
+        receipt.config.is_absolute()
+            && receipt.config.starts_with(&root)
+            && !receipt
+                .config
+                .components()
+                .any(|component| { matches!(component, std::path::Component::ParentDir) }),
+        "withdrawn proxy configuration is outside the owner range"
+    );
+    match std::fs::canonicalize(&receipt.config) {
+        Ok(config) => anyhow::ensure!(
+            config.starts_with(&root),
+            "withdrawn proxy configuration resolves outside the owner range"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("resolve withdrawn proxy configuration"),
+    }
+    Ok(receipt)
+}

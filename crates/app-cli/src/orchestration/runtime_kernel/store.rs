@@ -714,11 +714,10 @@ impl RuntimeStore {
                     operation.view.error_code = None;
                     operation.view.error_message = None;
                 } else {
+                    // State alone represents unknown execution. Keep any result
+                    // already persisted by the original request; recovery must
+                    // not replace its concrete failure with a generic restart.
                     operation.view.state = RuntimeOperationState::RecoveryRequired;
-                    operation.view.error_code = Some(ERR_RECOVERY_REQUIRED.into());
-                    operation.view.error_message = Some(
-                        "process restarted before the operation reached a terminal state".into(),
-                    );
                 }
                 self.store_operation(&operation)?;
                 scan.recovered.push(id);
@@ -760,15 +759,18 @@ impl RuntimeStore {
         operation: &mut StoredOperation,
     ) -> Result<()> {
         operation.view.state = RuntimeOperationState::Failed;
-        operation.view.error_code = Some(ERR_INTERRUPTED_OWNER_EXIT.into());
-        operation.view.error_message =
-            Some("operation result was not committed before runtime management recovery".into());
-        operation.view.failure_detail = Some(RuntimeFailureDetail {
-            stage: "startup_reconciled".into(),
-            exit_code: None,
-            stderr_tail: None,
-            cleanup_confirmed: false,
-        });
+        if !operation.has_recorded_diagnostic() {
+            operation.view.error_code = Some(ERR_INTERRUPTED_OWNER_EXIT.into());
+            operation.view.error_message = Some(
+                "operation result was not committed before runtime management recovery".into(),
+            );
+            operation.view.failure_detail = Some(RuntimeFailureDetail {
+                stage: "startup_reconciled".into(),
+                exit_code: None,
+                stderr_tail: None,
+                cleanup_confirmed: false,
+            });
+        }
         self.store_operation(operation)
     }
 
@@ -797,6 +799,16 @@ pub(crate) struct StoredOperation {
     pub view: RuntimeOperationView,
     /// 受理时的规范化请求（重放摘要比对的原始输入）。
     pub request: RuntimeOperationRequest,
+}
+
+impl StoredOperation {
+    /// Diagnostic fields describe the original request's result, independently
+    /// of whether its later physical cleanup still requires reconciliation.
+    pub(super) fn has_recorded_diagnostic(&self) -> bool {
+        self.view.error_code.is_some()
+            || self.view.error_message.is_some()
+            || self.view.failure_detail.is_some()
+    }
 }
 
 /// Persisted runtime authority, including credentials and discovery records.

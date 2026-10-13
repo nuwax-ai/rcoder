@@ -27,12 +27,15 @@ use crate::xmlrpc::{SupervisorClient, SupervisorProcessState, SupervisordProcess
 mod cleanup;
 #[cfg(test)]
 mod cleanup_empty_tests;
+#[cfg(all(test, unix))]
+mod current_domain_recovery_tests;
 #[cfg(test)]
 mod deadline_tests;
 mod legacy;
 mod official_host;
 mod receipt;
 mod resident;
+mod withdrawn;
 
 use legacy::*;
 use receipt::*;

@@ -95,5 +95,30 @@ class InitializationGuardTests(unittest.TestCase):
                     runner.wait_owner_initialized({"runtime_instance_id": "runtime-a"}, seconds=1)
 
 
+class AdmissionDiagnosticTests(unittest.TestCase):
+    def test_startup_rejection_is_recorded_with_status_and_body_without_replay(self):
+        runner = lifecycle.Acceptance("supervisord", "fixture-source")
+        runner.identity = lambda: {"runtime_instance_id": "runtime-a", "workspace_id": "workspace-a"}
+        runner.save = lambda: None
+        calls = []
+        rejection = {"success": False, "code": "ERR_INVALID_STATE",
+                     "message": "startup recovery has not completed", "data": None}
+        def request(path, method="GET", body=None, **kwargs):
+            calls.append((path, method))
+            if path == "/v1/runtime/status":
+                return 200, {"success": True, "data": {"revision": 0}}
+            if path == "/v1/runtime/operations":
+                return 409, rejection
+            raise AssertionError("a refused mutation must not be replayed")
+        runner.request = request
+        with self.assertRaisesRegex(AssertionError, "restart accepted"):
+            runner.operate("restart")
+        failed = runner.evidence["checks"][-1]
+        self.assertEqual(failed["status"], 409)
+        self.assertEqual(failed["response"], rejection)
+        self.assertFalse(failed["passed"])
+        self.assertEqual(calls.count(("/v1/runtime/operations", "POST")), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

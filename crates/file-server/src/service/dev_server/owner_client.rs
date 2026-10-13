@@ -206,6 +206,22 @@ pub(super) struct SubmissionNotDispatched {
     pub reason: String,
 }
 
+/// This call observed a typed zero-write initialization rejection, then the
+/// same ready owner and an absent original ID, but never polled another POST.
+/// It is distinct from a request that was never sent to HTTP at all.
+#[derive(Debug, thiserror::Error)]
+#[error("original runtime operation {operation_id} not admitted before launch deadline")]
+pub(super) struct SubmissionInitializingNotAdmitted {
+    pub operation_id: String,
+    pub runtime_instance_id: String,
+}
+
+enum InitializingObservation {
+    Existing(RuntimeOperationView),
+    Pending,
+    NotAdmitted,
+}
+
 /// 认证后的运行操作客户端。
 pub(crate) struct OwnerClient {
     address: String,
@@ -309,71 +325,191 @@ impl OwnerClient {
             }
         })?;
         let url = format!("http://{}/v1/runtime/operations", self.address);
-        let reply = tokio::time::timeout_at(deadline, async {
-            let response = self
-                .client
-                .post(&url)
-                .header("X-Deploy-Token", &self.token)
-                .json(request)
-                .send()
-                .await
-                .with_context(|| format!("submit runtime operation to {}", self.address))?;
-            let status = response.status();
-            let body: serde_json::Value = response.json().await.context("parse submit response")?;
-            if !status.is_success() {
-                return Err(SubmissionRejected {
-                    code: body
-                        .get("code")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("ERR")
-                        .to_string(),
-                    message: body
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    status,
-                }
-                .into());
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(unknown_submission(request));
             }
-            let data = body
-                .get("data")
-                .cloned()
-                .context("submit response missing data")?;
-            let accepted: shared_types::RuntimeOperationAccepted =
-                serde_json::from_value(data).context("decode accepted operation")?;
-            if accepted.operation_id != operation_id
-                || accepted.poll != format!("/v1/runtime/operations/{operation_id}")
-            {
-                return Err(SubmissionReceiptMismatch.into());
-            }
-            Ok::<_, anyhow::Error>(accepted)
-        })
-        .await;
-        match reply {
-            Ok(Ok(_accepted)) => {}
-            Ok(Err(error))
-                if error.downcast_ref::<SubmissionReceiptMismatch>().is_some()
-                    || error
-                        .downcast_ref::<SubmissionRejected>()
-                        .is_some_and(SubmissionRejected::proves_not_admitted) =>
-            {
-                return Err(error);
-            }
-            Ok(Err(error)) => {
-                // A broken reply or ambiguous server error cannot establish
-                // whether this already dispatched write was admitted.
-                tracing::warn!(%operation_id, "owner POST reply did not confirm admission; observing only the original operation");
-                return self
-                    .reconcile_dispatched_until(request, deadline)
+            let reply = tokio::time::timeout_at(deadline, async {
+                let response = self
+                    .client
+                    .post(&url)
+                    .header("X-Deploy-Token", &self.token)
+                    .json(request)
+                    .send()
                     .await
-                    .with_context(|| {
-                        format!("original owner POST did not confirm admission: {error:#}")
-                    });
+                    .with_context(|| format!("submit runtime operation to {}", self.address))?;
+                let status = response.status();
+                let body: serde_json::Value =
+                    response.json().await.context("parse submit response")?;
+                if !status.is_success() {
+                    return Err(SubmissionRejected {
+                        code: body
+                            .get("code")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("ERR")
+                            .to_string(),
+                        message: body
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        status,
+                    }
+                    .into());
+                }
+                let data = body
+                    .get("data")
+                    .cloned()
+                    .context("submit response missing data")?;
+                let accepted: shared_types::RuntimeOperationAccepted =
+                    serde_json::from_value(data).context("decode accepted operation")?;
+                if accepted.operation_id != operation_id
+                    || accepted.poll != format!("/v1/runtime/operations/{operation_id}")
+                {
+                    return Err(SubmissionReceiptMismatch.into());
+                }
+                Ok::<_, anyhow::Error>(accepted)
+            })
+            .await;
+            match reply {
+                Ok(Ok(_accepted)) => {
+                    return self.reconcile_dispatched_until(request, deadline).await;
+                }
+                Ok(Err(error))
+                    if error.downcast_ref::<SubmissionReceiptMismatch>().is_some()
+                        || error
+                            .downcast_ref::<SubmissionRejected>()
+                            .is_some_and(SubmissionRejected::proves_not_admitted) =>
+                {
+                    return Err(error);
+                }
+                Ok(Err(error))
+                    if error
+                        .downcast_ref::<SubmissionRejected>()
+                        .is_some_and(|rejected| {
+                            rejected.status == reqwest::StatusCode::CONFLICT
+                                && rejected.code == "ERR_INITIALIZING"
+                        }) =>
+                {
+                    // This response precedes admission writes, but initialization
+                    // is checked before history. Reconcile the original immutable
+                    // request before deciding whether it is safe to resend.
+                    if let Some(view) = self.reconcile_initializing_until(request, deadline).await?
+                    {
+                        return Ok(view);
+                    }
+                    tokio::time::sleep_until(
+                        deadline.min(
+                            tokio::time::Instant::now() + std::time::Duration::from_millis(200),
+                        ),
+                    )
+                    .await;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(SubmissionInitializingNotAdmitted {
+                            operation_id: request.operation_id.clone(),
+                            runtime_instance_id: request.expected_runtime_instance_id.clone(),
+                        }
+                        .into());
+                    }
+                    // Keep ID, expected revision, instance, public digest and
+                    // private configuration exactly as captured before dispatch.
+                }
+                Ok(Err(error)) => {
+                    // A broken reply or ambiguous server error cannot establish
+                    // whether this already dispatched write was admitted.
+                    tracing::warn!(%operation_id, "owner POST reply did not confirm admission; observing only the original operation");
+                    return self
+                        .reconcile_dispatched_until(request, deadline)
+                        .await
+                        .with_context(|| {
+                            format!("original owner POST did not confirm admission: {error:#}")
+                        });
+                }
+                Err(_elapsed) => return Err(unknown_submission(request)),
             }
-            Err(_elapsed) => return Err(unknown_submission(request)),
         }
-        self.reconcile_dispatched_until(request, deadline).await
+    }
+
+    /// Only a live, typed initialization rejection enters this path. Persisted
+    /// unknown dispatches never acquire this proof merely from a later 404.
+    async fn reconcile_initializing_until(
+        &self,
+        request: &RuntimeOperationRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<RuntimeOperationView>> {
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(unknown_submission(request));
+            }
+            let observation = tokio::time::timeout_at(deadline, async {
+                if let Some(view) = self.read_operation_if_exists(&request.operation_id).await? {
+                    return Ok(InitializingObservation::Existing(view));
+                }
+                let response = self
+                    .client
+                    .get(format!("http://{}/v1/runtime/recovery", self.address))
+                    .header("X-Deploy-Token", &self.token)
+                    .send()
+                    .await
+                    .context("query owner initialization for original operation")?;
+                let status = response.status();
+                let body: shared_types::HttpResult<shared_types::RuntimeRecoveryView> = response
+                    .json()
+                    .await
+                    .context("decode owner initialization evidence")?;
+                if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    && body.code == "ERR_INITIALIZING"
+                {
+                    return Ok(InitializingObservation::Pending);
+                }
+                ensure!(
+                    status.is_success(),
+                    "owner initialization evidence rejected with HTTP {status}: {}",
+                    body.code
+                );
+                let recovery = body.data.context("owner initialization evidence missing")?;
+                ensure!(
+                    recovery.runtime_instance_id == request.expected_runtime_instance_id,
+                    "owner runtime instance changed during original operation initialization"
+                );
+                // Ready can race with a same-ID dispatch. A fresh exact-ID lookup
+                // after readiness must precede another identical POST.
+                Ok::<_, anyhow::Error>(
+                    match self.read_operation_if_exists(&request.operation_id).await? {
+                        Some(view) => InitializingObservation::Existing(view),
+                        None => InitializingObservation::NotAdmitted,
+                    },
+                )
+            })
+            .await;
+            match observation {
+                Ok(Ok(observation)) => {
+                    ensure!(
+                        tokio::time::Instant::now() < deadline,
+                        "original initialization observation exceeded launch deadline; result remains unknown"
+                    );
+                    match observation {
+                        InitializingObservation::Existing(view) => {
+                            Self::verify_request_view(&view, request)?;
+                            super::stop_activity::external_observed(&view)?;
+                            return Ok(Some(view));
+                        }
+                        InitializingObservation::NotAdmitted => return Ok(None),
+                        InitializingObservation::Pending => {}
+                    }
+                }
+                Ok(Err(error)) if is_transport_timeout(&error) => {}
+                Ok(Err(error)) => {
+                    return Err(error)
+                        .context("reconcile original operation after initialization rejection");
+                }
+                Err(_elapsed) => return Err(unknown_submission(request)),
+            }
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(200)),
+            )
+            .await;
+        }
     }
 
     pub(super) fn verify_request_view(

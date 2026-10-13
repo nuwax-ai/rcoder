@@ -271,8 +271,23 @@ async fn recorded_registration_predecessors(
     let mut predecessors = Vec::new();
     for candidate in candidates {
         if let Some(recorded) = candidate.checkpoint.get("builder_creation_evidence") {
-            let recorded: BuilderCreationEvidence = serde_json::from_value(recorded.clone())
-                .context("Decode recorded builder replacement proof")?;
+            let recorded: BuilderCreationEvidence = match serde_json::from_value(recorded.clone()) {
+                Ok(recorded) => recorded,
+                Err(error) => {
+                    // This old succeeded row grants no current registration
+                    // authority. Preserve its opaque checkpoint and continue
+                    // checking the independent private completion and every
+                    // parsed predecessor constraint in this root transaction.
+                    // Serde error text may contain private rejected values.
+                    tracing::warn!(
+                        operation_id = %candidate.operation_id,
+                        app_id = %candidate.app_id,
+                        serde_category = ?error.classify(),
+                        "retained unreadable historical builder replacement proof during registration"
+                    );
+                    continue;
+                }
+            };
             recorded
                 .validate_registration_replacement(&candidate, volumes)
                 .map_err(anyhow::Error::msg)?;
@@ -561,6 +576,16 @@ async fn rebind_rows(
     Ok(old)
 }
 
+// Only stable ownership fields participate in legacy registration recovery.
+// Old routing, ports and timestamps remain opaque diagnostic history.
+#[derive(serde::Deserialize)]
+struct LegacyRegistrationIdentity {
+    project_id: String,
+    container_id: String,
+    container_name: String,
+    workload_uid: Option<String>,
+}
+
 async fn verify_legacy_registration_history(
     tx: &mut dyn Executor,
     context: &shared_types::UserAppExecutionContext,
@@ -571,30 +596,47 @@ async fn verify_legacy_registration_history(
         .container_id
         .as_deref()
         .context("Legacy builder registry has no Pod identity")?;
-    let rows = toasty::sql::query("SELECT checkpoint_json FROM userapp_operations WHERE app_id=$1 AND lifecycle_id=$2 AND kind='ensure_builder' AND state='succeeded' AND checkpoint_json::jsonb->>'container_id'=$3 AND checkpoint_json::jsonb->>'container_name'=$4")
+    let rows = toasty::sql::query("SELECT operation_id,checkpoint_json FROM userapp_operations WHERE app_id=$1 AND lifecycle_id=$2 AND kind='ensure_builder' AND state='succeeded' AND checkpoint_json::jsonb->>'container_id'=$3 AND checkpoint_json::jsonb->>'container_name'=$4")
         .bind(&context.app_id).bind(&context.lifecycle_id).bind(pod_uid).bind(&previous.container_name).exec(tx).await?;
     let mut identities = std::collections::BTreeSet::new();
     for row in rows {
         let toasty_core::stmt::Value::Record(row) = row else {
             anyhow::bail!("Invalid historical builder ownership result row");
         };
-        let [toasty_core::stmt::Value::String(checkpoint)] = row.fields.as_slice() else {
-            anyhow::bail!("Invalid historical builder ownership result column");
+        let [
+            toasty_core::stmt::Value::String(operation_id),
+            toasty_core::stmt::Value::String(checkpoint),
+        ] = row.fields.as_slice()
+        else {
+            anyhow::bail!("Invalid historical builder ownership result columns");
         };
-        let stored: shared_types::ContainerBasicInfo = serde_json::from_str(checkpoint)
-            .context("Decode historical builder registration ownership result")?;
+        let stored: LegacyRegistrationIdentity = match serde_json::from_str(checkpoint) {
+            Ok(stored) => stored,
+            Err(error) => {
+                tracing::warn!(
+                    operation_id = %operation_id,
+                    app_id = %context.app_id,
+                    serde_category = ?error.classify(),
+                    "retained unreadable historical builder identity; seeking independent old workload proof"
+                );
+                continue;
+            }
+        };
         ensure!(
             stored.project_id == context.app_id
                 && stored.container_id == pod_uid
                 && stored.container_name == previous.container_name,
             "Historical builder ownership result differs from the registry"
         );
-        identities.insert(
-            stored
-                .workload_uid
-                .filter(|uid| !uid.is_empty())
-                .context("Historical builder result has no workload UID")?,
-        );
+        let Some(workload_uid) = stored.workload_uid.filter(|uid| !uid.trim().is_empty()) else {
+            tracing::warn!(
+                operation_id = %operation_id,
+                app_id = %context.app_id,
+                "retained historical builder identity without a workload UID; seeking independent old workload proof"
+            );
+            continue;
+        };
+        identities.insert(workload_uid);
     }
     ensure!(
         identities.len() == 1,

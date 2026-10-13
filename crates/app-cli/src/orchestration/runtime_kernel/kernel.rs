@@ -580,34 +580,42 @@ impl RuntimeKernel {
         } else {
             RuntimeOperationState::Failed
         };
-        operation.view.error_code = Some(
-            if cancelled {
-                "ERR_CANCELLED"
-            } else if receipt.boundary == Boundary::Active || preparation_only {
-                "ERR_OPERATION_INTERRUPTED"
+        // Quiescence settles execution protection, not the original failure.
+        // Keep its recorded diagnosis (including its then-current cleanup
+        // evidence) even if the caller later cancelled or stopped the work.
+        if !operation.has_recorded_diagnostic() {
+            operation.view.error_code = Some(
+                if cancelled {
+                    "ERR_CANCELLED"
+                } else if receipt.boundary == Boundary::Active || preparation_only {
+                    "ERR_OPERATION_INTERRUPTED"
+                } else {
+                    "ERR_STARTUP_FAILED"
+                }
+                .into(),
+            );
+            operation.view.error_message = if preparation_only {
+                receipt.operation.error.clone().or_else(|| {
+                    Some(
+                        "Previous owner stopped during preparation before directory activation"
+                            .into(),
+                    )
+                })
+            } else if receipt.boundary == Boundary::Active {
+                Some(
+                    "Previous owner was stopped before the operation terminal result was committed"
+                        .into(),
+                )
             } else {
-                "ERR_STARTUP_FAILED"
-            }
-            .into(),
-        );
-        operation.view.error_message = if preparation_only {
-            receipt.operation.error.clone().or_else(|| {
-                Some("Previous owner stopped during preparation before directory activation".into())
-            })
-        } else if receipt.boundary == Boundary::Active {
-            Some(
-                "Previous owner was stopped before the operation terminal result was committed"
-                    .into(),
-            )
-        } else {
-            receipt.operation.error.clone()
-        };
-        operation.view.failure_detail = Some(RuntimeFailureDetail {
-            stage: "startup_reconciled".into(),
-            exit_code: None,
-            stderr_tail: None,
-            cleanup_confirmed: true,
-        });
+                receipt.operation.error.clone()
+            };
+            operation.view.failure_detail = Some(RuntimeFailureDetail {
+                stage: "startup_reconciled".into(),
+                exit_code: None,
+                stderr_tail: None,
+                cleanup_confirmed: true,
+            });
+        }
         self.store.store_operation(&operation)?;
         self.emit_terminal_record(&operation);
         self.refresh_recovery_protection(&mut guard);

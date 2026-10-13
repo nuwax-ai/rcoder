@@ -14,6 +14,7 @@ use super::{
 use crate::error::{AppError, AppResult};
 
 mod handover;
+mod native;
 mod official;
 
 pub(super) struct AvailableOwner {
@@ -50,21 +51,35 @@ impl DevServerManager {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "unknown-app".into());
-            owner_client::verify_project_identity(&identity, workspace, &app)?;
-            let (_, token) = owner_client::find_owner_token(Path::new(&identity.source_root), &app)
-                .context("recovered owner control credentials unavailable")?;
-            let client = OwnerClient::new(address, &token)?;
-            let evidence = client
-                .recovery()
-                .await
-                .context("successor startup cleanup is not confirmed")?;
-            ensure!(
-                evidence.runtime_instance_id == identity.runtime_instance_id,
-                "owner changed while reading recovery evidence"
-            );
-            // No replay of old writes. Unknown deployment/migration results stay
-            // in the authoritative owner's kernel and remain queryable there.
-            self.retire_replaced_registration(project, &snapshot, &identity.runtime_instance_id)?;
+            if owner_client::protocol_compatible(&identity) {
+                owner_client::verify_project_identity(&identity, workspace, &app)?;
+            }
+            if owner_client::protocol_compatible(&identity)
+                && let Some((_, token)) =
+                    owner_client::find_owner_token(Path::new(&identity.source_root), &app)
+            {
+                let client = OwnerClient::new(address, &token)?;
+                let evidence = client
+                    .recovery()
+                    .await
+                    .context("successor startup cleanup is not confirmed")?;
+                ensure!(
+                    evidence.runtime_instance_id == identity.runtime_instance_id,
+                    "owner changed while reading recovery evidence"
+                );
+                // No replay of old writes. Unknown deployment/migration results stay
+                // in the authoritative owner's kernel and remain queryable there.
+                self.retire_replaced_registration(
+                    project,
+                    &snapshot,
+                    &identity.runtime_instance_id,
+                )?;
+            } else {
+                // Preserve transport history until business preflight has retired
+                // this exact native owner and authenticated its successor.
+                tracing::info!(project, instance = %identity.runtime_instance_id,
+                    "owner transport metadata awaits native management recovery");
+            }
         }
         Ok(Some(AvailableOwner {
             address: address.to_owned(),
@@ -407,11 +422,23 @@ impl DevServerManager {
                             .context("bootstrap Shutdown has no unique completed request receipt")?;
                         ensure!(captured.binding == snapshot.binding,
                             "bootstrap Shutdown receipt belongs to another workspace");
-                        let generation = request.expected_generation.as_deref()
-                            .context("legacy bootstrap Shutdown did not capture an exact generation; retry with current management tooling")?;
-                        captured.generation = if generation.is_empty() { None } else { Some(generation.to_owned()) };
-                        runtime_supervisor::shutdown_captured_owner(root, &captured, &request,
-                            deadline.saturating_duration_since(tokio::time::Instant::now())).await?;
+                        if let Some(generation) = request.expected_generation.as_deref() {
+                            captured.generation = if generation.is_empty() { None } else { Some(generation.to_owned()) };
+                            runtime_supervisor::shutdown_captured_owner(root, &captured, &request,
+                                deadline.saturating_duration_since(tokio::time::Instant::now())).await?;
+                        } else {
+                            if let Err(error) = native::confirm_legacy_completed_shutdown(root, &captured, &request, deadline).await {
+                                if error.downcast_ref::<runtime_supervisor::Problem>().is_some_and(|problem| {
+                                    problem.code == runtime_supervisor::FailureCode::IdentityChanged
+                                }) {
+                                    // A concurrent successor is observed at the top
+                                    // of this loop; the legacy wildcard is never sent.
+                                    diagnostic = Some(format!("legacy owner retirement changed: {error:#}"));
+                                    continue;
+                                }
+                                return Err(error);
+                            }
+                        }
                         resumed_shutdown = true;
                         self.spawn_recovery_owner(project, workspace, address)
                             .await?;

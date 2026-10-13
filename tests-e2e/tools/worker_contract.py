@@ -86,17 +86,21 @@ def main():
         app = 'http://' + h.docker('port', cid, '9080/tcp')
         def initialized():
             status, body = h.request_http(base, '/v1/runtime/identity')
-            if status != 200:
+            h.record_readonly_response('worker-startup', '/v1/runtime/identity', status, body)
+            if h.initializing_response(status, body):
                 return None
+            if status != 200:
+                raise AssertionError(f'owner identity initialization: HTTP {status}: {body.decode(errors="replace")}')
             identity = json.loads(body)['data']
             # Identity is intentionally served before startup recovery finishes.
             # This read shares the write-admission initialization gate; never
             # retry a deployment mutation to paper over a premature submission.
             status, body = h.request_http(base, '/v1/runtime/recovery')
-            if status == 503 and json.loads(body).get('code') == 'ERR_INVALID_STATE':
+            h.record_readonly_response('worker-startup', '/v1/runtime/recovery', status, body)
+            if h.initializing_response(status, body):
                 return None
             if status != 200:
-                raise AssertionError(f'owner initialization: HTTP {status}: {body.decode()}')
+                raise AssertionError(f'owner initialization: HTTP {status}: {body.decode(errors="replace")}')
             return identity
         identity = h.poll(initialized)
         h.check('startup probe capability', 'startup-probe-v1' in identity['capabilities'], str(identity))

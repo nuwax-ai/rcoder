@@ -84,12 +84,18 @@ fn prepare_with(workspace: &Path, metadata: &Metadata) -> Result<()> {
     let projects = workspace_manifest::discover_projects(workspace)
         .context("discover current Source projects")?;
     let path = workspace.join("release.lock.toml");
+    let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+        .context("parse current app-cli version for Source cache derivation")?;
     let cached = match std::fs::read_to_string(&path) {
         Ok(content) => workspace_manifest::load_release_lock(&content)
             .ok()
             .filter(|lock| {
                 !lock.release_id.trim().is_empty()
-                    && semver::Version::parse(&lock.minimum_app_cli_version).is_ok()
+                    // A Source lock is derived cache. A newer producer's
+                    // version stamp cannot veto current, parseable manifests.
+                    // Immutable artifact restoration keeps its strict gate.
+                    && semver::Version::parse(&lock.minimum_app_cli_version)
+                        .is_ok_and(|minimum| minimum <= current)
             }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) if error.kind() == std::io::ErrorKind::InvalidData => None,
@@ -200,6 +206,61 @@ mod tests {
             std::fs::read(&lock_path).unwrap(),
             valid,
             "real project errors must preserve the last cache"
+        );
+    }
+    #[tokio::test]
+    async fn current_source_rebuilds_future_cached_minimum_after_code_only_change_without_weakening_artifact_gate()
+     {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("web")).unwrap();
+        std::fs::write(
+            root.path().join("workspace.manifest.toml"),
+            "schema_version=1\n[workspace]\nname='source-cache'\n",
+        )
+        .unwrap();
+        let project = root.path().join("web/project.manifest.toml");
+        let manifest = "schema_version=1\n[project]\nservice_id='web'\nname='one'\ntype='python'\n[build]\ncommand=['true']\nartifact='out.zip'\n[run]\ncommand=['python3','main.py']\n";
+        std::fs::write(&project, manifest).unwrap();
+        let metadata = Metadata {
+            pingap_version: Some("0.14.3".into()),
+            pingap_commit: Some("fixture-commit".into()),
+            runtime_image_digest: Some("same-image".into()),
+        };
+        prepare_with(root.path(), &metadata).unwrap();
+        let lock_path = root.path().join("release.lock.toml");
+        let mut artifact = crate::manifest::read_release_lock(root.path()).unwrap();
+        let current = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        artifact.minimum_app_cli_version =
+            semver::Version::new(current.major + 1, 0, 0).to_string();
+        std::fs::write(&lock_path, toml::to_string_pretty(&artifact).unwrap()).unwrap();
+        let cached = std::fs::read(&lock_path).unwrap();
+        assert!(
+            crate::supervisor::validate_runtime_compatibility(&artifact).is_err(),
+            "immutable future artifact must be rejected"
+        );
+        // Neither manifest nor runtime metadata changed. Only business code did.
+        std::fs::write(
+            root.path().join("web/main.py"),
+            "print('current source B')\n",
+        )
+        .unwrap();
+        prepare_with(root.path(), &metadata).unwrap();
+        let prepared = crate::manifest::read_release_lock(root.path()).unwrap();
+        assert_ne!(
+            std::fs::read(&lock_path).unwrap(),
+            cached,
+            "future cache minimum must not permanently veto current Source"
+        );
+        assert_ne!(
+            prepared.release_id, artifact.release_id,
+            "this original Source owns fresh derivation"
+        );
+        crate::supervisor::validate_runtime_compatibility(&prepared)
+            .expect("current Source must derive supported runtime requirements");
+        assert_eq!(std::fs::read_to_string(project).unwrap(), manifest);
+        assert!(
+            crate::supervisor::validate_runtime_compatibility(&artifact).is_err(),
+            "Source repair must never relax the immutable artifact minimum"
         );
     }
 }

@@ -178,6 +178,11 @@ pub(crate) fn owner_scope() -> Result<Option<ResidentScope>> {
     Ok(controller()?.map(|owner| owner.scope.clone()))
 }
 
+/// The proxy runtime belongs to the retained owner, not a historical receipt.
+pub(crate) fn owner_runtime_root() -> Result<Option<PathBuf>> {
+    Ok(controller()?.map(|owner| owner.runtime_root.clone()))
+}
+
 pub(crate) fn owner_is_closing() -> Result<bool> {
     Ok(controller()?.is_some_and(|owner| {
         owner.stopping.load(Ordering::Acquire) || owner.entry_closing.load(Ordering::Acquire)

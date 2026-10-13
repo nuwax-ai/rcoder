@@ -395,14 +395,91 @@ pub async fn publish_to_path(candidate: &Path, target: &Path) -> Result<()> {
 static FILE_REPLACEMENTS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
     std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Mutex::new(())));
 
+struct FilePersistenceStage {
+    target: Option<PathBuf>,
+    stage: &'static str,
+    started: std::time::Instant,
+    deadline: Option<tokio::time::Instant>,
+    finished: bool,
+}
+
+impl FilePersistenceStage {
+    fn start(
+        target: Option<&Path>,
+        stage: &'static str,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Self {
+        let trace = Self {
+            target: target.map(Path::to_path_buf),
+            stage,
+            started: std::time::Instant::now(),
+            deadline,
+            finished: false,
+        };
+        trace.log("started", None);
+        trace
+    }
+
+    fn log(&self, phase: &'static str, succeeded: Option<bool>) {
+        macro_rules! stage_event {
+            ($level:expr) => {
+                tracing::event!(
+                    $level,
+                    target_path = self
+                        .target
+                        .as_deref()
+                        .map(|target| tracing::field::display(target.display())),
+                    persistence_stage = self.stage,
+                    phase,
+                    elapsed_ms = self.started.elapsed().as_millis() as u64,
+                    remaining_budget_ms = self.deadline.map(|deadline| {
+                        deadline
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .as_millis() as u64
+                    }),
+                    succeeded,
+                    "file persistence stage"
+                );
+            };
+        }
+        if phase == "interrupted" || succeeded == Some(false) {
+            stage_event!(tracing::Level::WARN);
+        } else {
+            stage_event!(tracing::Level::DEBUG);
+        }
+    }
+
+    fn complete(mut self, succeeded: bool) {
+        self.log("finished", Some(succeeded));
+        self.finished = true;
+    }
+
+    fn finish<T, E>(self, result: std::result::Result<T, E>) -> std::result::Result<T, E> {
+        self.complete(result.is_ok());
+        result
+    }
+}
+
+impl Drop for FilePersistenceStage {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.log("interrupted", None);
+        }
+    }
+}
+
 pub async fn wait_for_file_replacements() {
+    let trace = FilePersistenceStage::start(None, "settle_lock_wait", None);
     let _guard = FILE_REPLACEMENTS.clone().lock_owned().await;
+    trace.complete(true);
 }
 
 pub(crate) async fn wait_for_file_replacements_until(deadline: tokio::time::Instant) -> Result<()> {
-    let _guard = tokio::time::timeout_at(deadline, FILE_REPLACEMENTS.clone().lock_owned())
+    let trace = FilePersistenceStage::start(None, "settle_lock_wait", Some(deadline));
+    let result = tokio::time::timeout_at(deadline, FILE_REPLACEMENTS.clone().lock_owned())
         .await
-        .context("proxy configuration writes remain unsettled before shutdown deadline")?;
+        .context("proxy configuration writes remain unsettled before shutdown deadline");
+    let _guard = trace.finish(result)?;
     Ok(())
 }
 
@@ -458,23 +535,38 @@ async fn replace_file_with_until<F>(
 where
     F: FnOnce(&Path, &[u8]) -> Result<()> + Send + 'static,
 {
-    let guard = tokio::time::timeout_at(deadline, FILE_REPLACEMENTS.clone().lock_owned())
-        .await
-        .context("file publication deadline exhausted before dispatch")?;
-    let task = tokio::task::spawn_blocking(move || {
-        let _guard = guard;
-        anyhow::ensure!(
-            tokio::time::Instant::now() < deadline,
-            "file publication deadline exhausted before dispatch"
-        );
-        writer(&target, &bytes)
-    });
-    // Expiry ends only the caller's wait. The blocking writer keeps its lease
-    // until real completion, so successors and owner retirement cannot race it.
-    tokio::time::timeout_at(deadline, task)
-        .await
-        .context("proxy file publication did not settle before its deadline")?
-        .context("proxy publication task failed")?
+    let trace = FilePersistenceStage::start(Some(&target), "replace_file", Some(deadline));
+    let result = async {
+        let lock_trace = FilePersistenceStage::start(Some(&target), "lock_wait", Some(deadline));
+        let result = tokio::time::timeout_at(deadline, FILE_REPLACEMENTS.clone().lock_owned())
+            .await
+            .context("file publication deadline exhausted before dispatch");
+        let guard = lock_trace.finish(result)?;
+        let queue_trace =
+            FilePersistenceStage::start(Some(&target), "blocking_queue", Some(deadline));
+        let task = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            queue_trace.complete(true);
+            let writer_trace =
+                FilePersistenceStage::start(Some(&target), "blocking_writer", Some(deadline));
+            let result = (|| {
+                anyhow::ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "file publication deadline exhausted before dispatch"
+                );
+                writer(&target, &bytes)
+            })();
+            writer_trace.finish(result)
+        });
+        // Expiry ends only the caller's wait. The blocking writer keeps its lease
+        // until real completion, so successors and owner retirement cannot race it.
+        tokio::time::timeout_at(deadline, task)
+            .await
+            .context("proxy file publication did not settle before its deadline")?
+            .context("proxy publication task failed")?
+    }
+    .await;
+    trace.finish(result)
 }
 
 /// Generic metadata writes do not change the applied configuration state.
@@ -488,36 +580,63 @@ async fn replace_file_with<F>(target: PathBuf, bytes: Vec<u8>, writer: F) -> Res
 where
     F: FnOnce(&Path, &[u8]) -> Result<()> + Send + 'static,
 {
-    let guard = FILE_REPLACEMENTS.clone().lock_owned().await;
-    tokio::task::spawn_blocking(move || {
-        let _guard = guard;
-        writer(&target, &bytes)
-    })
-    .await
-    .context("durable file replacement task failed")?
+    let trace = FilePersistenceStage::start(Some(&target), "replace_file", None);
+    let result = async {
+        let lock_trace = FilePersistenceStage::start(Some(&target), "lock_wait", None);
+        let guard = FILE_REPLACEMENTS.clone().lock_owned().await;
+        lock_trace.complete(true);
+        let queue_trace = FilePersistenceStage::start(Some(&target), "blocking_queue", None);
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            queue_trace.complete(true);
+            let writer_trace = FilePersistenceStage::start(Some(&target), "blocking_writer", None);
+            writer_trace.finish(writer(&target, &bytes))
+        })
+        .await
+        .context("durable file replacement task failed")?
+    }
+    .await;
+    trace.finish(result)
 }
 
 fn durable_replace(target: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write as _;
-    let parent = target
-        .parent()
-        .context("file replacement target has no parent")?;
-    std::fs::create_dir_all(parent).context("create replacement directory")?;
-    let mut temporary =
-        tempfile::NamedTempFile::new_in(parent).context("allocate file temporary")?;
-    temporary.write_all(bytes)?;
-    temporary.as_file().sync_all()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        temporary
-            .as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    process_utils::atomic_file::persist(temporary, target).context("publish durable file")?;
-    #[cfg(unix)]
-    std::fs::File::open(parent)?.sync_all()?;
-    Ok(())
+    let trace = FilePersistenceStage::start(Some(target), "durable_replace", None);
+    let result = (|| {
+        let parent = target
+            .parent()
+            .context("file replacement target has no parent")?;
+        let stage = FilePersistenceStage::start(Some(target), "create_directory", None);
+        stage.finish(std::fs::create_dir_all(parent).context("create replacement directory"))?;
+        let stage = FilePersistenceStage::start(Some(target), "allocate_temporary", None);
+        let mut temporary = stage
+            .finish(tempfile::NamedTempFile::new_in(parent).context("allocate file temporary"))?;
+        let stage = FilePersistenceStage::start(Some(target), "file_write", None);
+        stage.finish(temporary.write_all(bytes))?;
+        let stage = FilePersistenceStage::start(Some(target), "file_sync_all", None);
+        stage.finish(temporary.as_file().sync_all())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let stage = FilePersistenceStage::start(Some(target), "file_permissions", None);
+            stage.finish(
+                temporary
+                    .as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o600)),
+            )?;
+        }
+        let stage = FilePersistenceStage::start(Some(target), "rename", None);
+        stage.finish(
+            process_utils::atomic_file::persist(temporary, target).context("publish durable file"),
+        )?;
+        #[cfg(unix)]
+        {
+            let stage = FilePersistenceStage::start(Some(target), "directory_sync_all", None);
+            stage.finish(std::fs::File::open(parent).and_then(|directory| directory.sync_all()))?;
+        }
+        Ok(())
+    })();
+    trace.finish(result)
 }
 
 /// standby 兜底配置（P1 摘流态）：全部路径 → mock 直出 503。

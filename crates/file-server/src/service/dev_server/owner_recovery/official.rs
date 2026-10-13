@@ -11,7 +11,18 @@ impl DevServerManager {
         caller_deadline: tokio::time::Instant,
         preserve_build_expectation: bool,
     ) -> AppResult<AvailableOwner> {
-        if supports_official(&available.identity) {
+        let app = std::env::var("PROJECT_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "unknown-app".into());
+        // Credential discovery uses the caller's declared source authority,
+        // never an unverified path supplied by an observed HTTP identity.
+        let native_repair = native::known_legacy_protocol(&available.identity)
+            || owner_client::find_owner_token(workspace, &app).is_none();
+        if !native_repair
+            && owner_client::protocol_compatible(&available.identity)
+            && supports_official(&available.identity)
+        {
             return Ok(available);
         }
         if preserve_build_expectation
@@ -31,6 +42,17 @@ impl DevServerManager {
             caller_deadline,
             tokio::time::Instant::now() + Duration::from_secs(45),
         );
+        if native_repair {
+            return self
+                .restore_owner_metadata_before_start(project, workspace, available, deadline)
+                .await
+                .map_err(|error| {
+                    AppError::owner_error(
+                        "restore native management owner before business admission",
+                        error,
+                    )
+                });
+        }
         tokio::time::timeout_at(deadline, self.upgrade_official_owner(project, workspace, available, deadline))
             .await
             .map_err(|_| AppError::business("owner protocol upgrade timed out; management state is preserved and the original request may be retried"))?
@@ -244,7 +266,7 @@ fn supports_official(identity: &RuntimeIdentityView) -> bool {
         .any(|capability| capability == shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY)
 }
 
-fn same_identity(left: &RuntimeIdentityView, right: &RuntimeIdentityView) -> bool {
+pub(super) fn same_identity(left: &RuntimeIdentityView, right: &RuntimeIdentityView) -> bool {
     left.application_id == right.application_id
         && left.service_family == right.service_family
         && left.workspace_id == right.workspace_id

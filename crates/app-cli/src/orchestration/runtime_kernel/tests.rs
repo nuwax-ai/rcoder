@@ -2680,4 +2680,269 @@ mod cases {
             CommitBarrierOutcome::Committed
         );
     }
+
+    fn recorded_recovery_operation(diagnostic: &str) -> StoredOperation {
+        let mut input = request(RuntimeOperationKind::Restart, "recorded-recovery");
+        input.run_config = Some(shared_types::OperationRunConfig {
+            pg: Some(shared_types::StartPgCredential {
+                username: "fixture-user".into(),
+                password: "fixture-original-input".into(),
+            }),
+        });
+        let mut view = RuntimeOperationView {
+            operation_id: input.operation_id.clone(),
+            kind: input.kind,
+            state: RuntimeOperationState::RecoveryRequired,
+            request_digest: runtime_request_digest(&input).unwrap(),
+            revision: 0,
+            runtime_instance_id: "instance-1".into(),
+            error_code: None,
+            error_message: None,
+            failure_detail: None,
+        };
+        if matches!(diagnostic, "full" | "without-detail" | "code-only") {
+            view.error_code = Some("entry_preflight_failed".into());
+        }
+        if matches!(diagnostic, "full" | "without-detail" | "message-only") {
+            view.error_message = Some("original stop RPC exceeded its captured deadline".into());
+        }
+        if matches!(diagnostic, "full" | "detail-only") {
+            view.failure_detail = Some(RuntimeFailureDetail {
+                stage: "original_proxy_stop".into(),
+                exit_code: Some(17),
+                stderr_tail: Some("original bounded stderr".into()),
+                cleanup_confirmed: false,
+            });
+        }
+        StoredOperation {
+            view,
+            request: input,
+        }
+    }
+
+    fn assert_recovery_record_preserved(
+        actual: &StoredOperation,
+        original: &StoredOperation,
+        state: RuntimeOperationState,
+    ) {
+        let mut expected = original.clone();
+        expected.view.state = state;
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap(),
+            "recovery may settle state without rewriting the original failure or private input"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_settlement_preserves_recorded_diagnostics_and_reopens_start() {
+        for diagnostic in [
+            "full",
+            "without-detail",
+            "code-only",
+            "message-only",
+            "detail-only",
+        ] {
+            let (directory, store) = temp_store();
+            let original = recorded_recovery_operation(diagnostic);
+            store.store_operation(&original).unwrap();
+            let kernel = kernel(directory.path());
+            assert_eq!(kernel.recover().await.unwrap(), vec!["recorded-recovery"]);
+            let recovered = kernel
+                .store
+                .load_operation("recorded-recovery")
+                .unwrap()
+                .unwrap();
+            assert_recovery_record_preserved(
+                &recovered,
+                &original,
+                RuntimeOperationState::RecoveryRequired,
+            );
+            assert!(kernel.status().await.unwrap().recovery_protection);
+            assert_eq!(
+                kernel.settle_unresolved_recoveries().await.unwrap(),
+                vec!["recorded-recovery"]
+            );
+            let settled = kernel
+                .store
+                .load_operation("recorded-recovery")
+                .unwrap()
+                .unwrap();
+            assert_recovery_record_preserved(&settled, &original, RuntimeOperationState::Failed);
+            assert!(!kernel.status().await.unwrap().recovery_protection);
+            assert!(kernel.recover().await.unwrap().is_empty());
+            assert_recovery_record_preserved(
+                &kernel
+                    .store
+                    .load_operation("recorded-recovery")
+                    .unwrap()
+                    .unwrap(),
+                &original,
+                RuntimeOperationState::Failed,
+            );
+            kernel
+                .admit(request(
+                    RuntimeOperationKind::Start,
+                    "source-after-recovery",
+                ))
+                .await
+                .expect("a settled historical failure must allow a new source start");
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_without_recorded_result_uses_state_until_interruption_is_settled() {
+        for previous in [
+            RuntimeOperationState::Starting,
+            RuntimeOperationState::RecoveryRequired,
+        ] {
+            let (directory, store) = temp_store();
+            let mut original = recorded_recovery_operation("none");
+            original.view.state = previous;
+            store.store_operation(&original).unwrap();
+            let kernel = kernel(directory.path());
+            kernel.recover().await.unwrap();
+            let recovered = kernel.get("recorded-recovery").await.unwrap().unwrap();
+            assert_eq!(recovered.state, RuntimeOperationState::RecoveryRequired);
+            assert!(recovered.error_code.is_none());
+            assert!(recovered.error_message.is_none());
+            assert!(recovered.failure_detail.is_none());
+            assert!(
+                kernel.status().await.unwrap().recovery_protection,
+                "unknown state must keep protection even without an invented error code"
+            );
+            kernel.settle_unresolved_recoveries().await.unwrap();
+            let settled = kernel
+                .store
+                .load_operation("recorded-recovery")
+                .unwrap()
+                .unwrap();
+            assert_eq!(settled.view.state, RuntimeOperationState::Failed);
+            assert_eq!(
+                settled.view.error_code.as_deref(),
+                Some(ERR_INTERRUPTED_OWNER_EXIT)
+            );
+            assert_eq!(
+                settled.view.error_message.as_deref(),
+                Some("operation result was not committed before runtime management recovery")
+            );
+            let detail = settled.view.failure_detail.as_ref().unwrap();
+            assert_eq!(detail.stage, "startup_reconciled");
+            assert!(!detail.cleanup_confirmed);
+            assert_eq!(
+                serde_json::to_value(&settled.request).unwrap(),
+                serde_json::to_value(&original.request).unwrap()
+            );
+            kernel
+                .admit(request(
+                    RuntimeOperationKind::Start,
+                    "source-after-interruption",
+                ))
+                .await
+                .expect("confirmed recovery releases unknown-result protection");
+        }
+    }
+
+    #[tokio::test]
+    async fn journal_reconciliation_preserves_recorded_failure_even_after_cancellation() {
+        use crate::server::journal::{Boundary, Receipt};
+        for diagnostic in ["full", "without-detail", "none"] {
+            for boundary in [
+                Boundary::Preparing,
+                Boundary::Active,
+                Boundary::StartupFailed,
+            ] {
+                for cancelled in [false, true] {
+                    let (directory, store) = temp_store();
+                    let original = recorded_recovery_operation(diagnostic);
+                    store.store_operation(&original).unwrap();
+                    if cancelled {
+                        store.store_cancellation(&original).unwrap();
+                    }
+                    let kernel = kernel(directory.path());
+                    kernel.recover().await.unwrap();
+                    let preparing = boundary == Boundary::Preparing;
+                    let active = boundary == Boundary::Active;
+                    let receipt = Receipt {
+                        generation: "gen-1".into(),
+                        operation: shared_types::AppDeploymentOperation {
+                            operation_id: original.view.operation_id.clone(),
+                            deployment_generation_id: "gen-1".into(),
+                            deploy_stage: if preparing {
+                                shared_types::app_cli_deploy::AppDeploymentStage::Failed
+                            } else {
+                                shared_types::app_cli_deploy::AppDeploymentStage::Succeeded
+                            },
+                            persisted: !preparing,
+                            request_release_id: "fixture-release".into(),
+                            artifact_release_id: Some("fixture-release".into()),
+                            recovery: None,
+                            phase: if active {
+                                shared_types::AppCliDeployPhase::Running
+                            } else {
+                                shared_types::AppCliDeployPhase::Failed
+                            },
+                            error: Some("journal fallback startup failure".into()),
+                        },
+                        request: crate::server::DeployRequest {
+                            runtime_operation_id: Some(original.view.operation_id.clone()),
+                            url: "https://example.invalid/fixture.zip".into(),
+                            release_id: "fixture-release".into(),
+                            sha256: None,
+                            local_path: None,
+                            execution_target: None,
+                            run_pg: None,
+                        },
+                        boundary: boundary.clone(),
+                        active: None,
+                    };
+                    assert!(kernel.reconcile_quiesced_operation(&receipt).await.unwrap());
+                    let settled = kernel
+                        .store
+                        .load_operation("recorded-recovery")
+                        .unwrap()
+                        .unwrap();
+                    let expected_state = if cancelled {
+                        RuntimeOperationState::Cancelled
+                    } else {
+                        RuntimeOperationState::Failed
+                    };
+                    if diagnostic != "none" {
+                        assert_recovery_record_preserved(&settled, &original, expected_state);
+                    } else {
+                        assert_eq!(settled.view.state, expected_state);
+                        let code = if cancelled {
+                            "ERR_CANCELLED"
+                        } else if preparing || active {
+                            "ERR_OPERATION_INTERRUPTED"
+                        } else {
+                            "ERR_STARTUP_FAILED"
+                        };
+                        assert_eq!(settled.view.error_code.as_deref(), Some(code));
+                        assert!(
+                            settled
+                                .view
+                                .failure_detail
+                                .as_ref()
+                                .unwrap()
+                                .cleanup_confirmed
+                        );
+                        assert_eq!(
+                            serde_json::to_value(&settled.request).unwrap(),
+                            serde_json::to_value(&original.request).unwrap()
+                        );
+                    }
+                    assert!(!kernel.status().await.unwrap().recovery_protection);
+                    assert!(
+                        !kernel.reconcile_quiesced_operation(&receipt).await.unwrap(),
+                        "repeat reconciliation must preserve the captured terminal result"
+                    );
+                    kernel
+                        .admit(request(RuntimeOperationKind::Start, "source-after-journal"))
+                        .await
+                        .expect("settled journal diagnostics cannot block new source startup");
+                }
+            }
+        }
+    }
 }

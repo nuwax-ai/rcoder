@@ -158,9 +158,15 @@ class Acceptance:
                 raise AssertionError("initializing native owner belongs to another workspace")
             status, recovery = self.request("/v1/runtime/recovery", timeout=remaining(5))
             last = {"supervisor_id": snapshot["supervisor_id"], "phase": snapshot["phase"],
-                    "recovery_status": status, "recovery_code": recovery.get("code")}
-            initialized = owner_initialization_complete(snapshot, status, recovery,
-                                                        runtime_instance, supervisor)
+                    "recovery_status": status, "recovery_code": recovery.get("code"),
+                    "snapshot": snapshot, "recovery": recovery}
+            try:
+                initialized = owner_initialization_complete(snapshot, status, recovery,
+                                                            runtime_instance, supervisor)
+            except AssertionError:
+                self.evidence["owner_initialization_failure"] = last
+                self.save()
+                raise
             remaining(5)  # A late successful read cannot exceed the original budget.
             if initialized:
                 self.check("captured owner finished initialization before business admission", True,
@@ -178,7 +184,7 @@ class Acceptance:
                    APP_CLI_SPEC_DIR="/run/official-pingap-specs", APP_CLI_LOG_DIR=str(STATE / "logs"),
                    APP_CLI_PINGAP_RUNTIME_DIR=str(STATE / "logs/pingap"),
                    APP_CLI_DEPLOY_TOKEN=self.token, APP_CLI_REQUIRE_PG="0",
-                   APP_CLI_SUPERVISOR_SOCKET=("/var/run/supervisor.sock" if self.engine == "supervisord"
+                   APP_CLI_SUPERVISOR_SOCKET=(getattr(self, "owner_supervisor_socket", "/var/run/supervisor.sock") if self.engine == "supervisord"
                                               else str(STATE / "not-a-supervisor.sock")))
         env.pop("SERVICE_TYPE", None)
         env.pop("PROJECT_ID", None)
@@ -195,11 +201,12 @@ class Acceptance:
                                           stderr=subprocess.STDOUT, start_new_session=True)
         else:
             conf = STATE / "supervisord.conf"
-            conf.write_text("[unix_http_server]\nfile=/var/run/supervisor.sock\nchmod=0700\n"
+            real_socket = getattr(self, "real_supervisor_socket", "/var/run/supervisor.sock")
+            conf.write_text("[unix_http_server]\nfile=" + real_socket + "\nchmod=0700\n"
                             "[supervisord]\nnodaemon=true\nlogfile=/state/supervisord.log\n"
                             "pidfile=/state/supervisord.pid\n"
                             "[rpcinterface:supervisor]\nsupervisor.rpcinterface_factory=supervisor.rpcinterface:make_main_rpcinterface\n"
-                            "[supervisorctl]\nserverurl=unix:///var/run/supervisor.sock\n"
+                            "[supervisorctl]\nserverurl=unix://" + real_socket + "\n"
                             "[program:app-cli]\ncommand=" + " ".join(args) + "\n"
                             "autostart=true\nautorestart=true\nstartsecs=0\n"
                             "stopasgroup=true\nkillasgroup=true\nstopwaitsecs=3\n"
@@ -216,7 +223,7 @@ class Acceptance:
     def operate(self, kind: str, succeeds=True):
         identity = self.identity()
         status, envelope = self.request("/v1/runtime/status")
-        self.check("runtime status is readable", status == 200)
+        self.check("runtime status is readable", status == 200, status=status, response=envelope)
         operation_id = str(uuid.uuid4())
         request = {"operation_id": operation_id,
                    "expected_runtime_instance_id": identity["runtime_instance_id"],
@@ -225,7 +232,7 @@ class Acceptance:
                    "profile": {"profile": "source", "input": {"workspace_id": identity["workspace_id"]}}}
         status, accepted = self.request("/v1/runtime/operations", "POST", request)
         self.check(f"{kind} accepted with exact operation", status == 202 and accepted.get("success"),
-                   operation_id=operation_id)
+                   operation_id=operation_id, status=status, response=accepted)
         _, result = self.wait(lambda: self.request(f"/v1/runtime/operations/{operation_id}"),
                               lambda response: response[0] == 200 and response[1]["data"]["state"] in TERMINAL)
         view = result["data"]
@@ -497,7 +504,8 @@ class Acceptance:
                        starts_before=starts_before, starts_after=starts_after)
         return stopped
 
-    def run(self):
+    def prepare_fixture(self):
+        """Create the owned real service used by normal and fault acceptance."""
         WORK.mkdir(exist_ok=True)
         STATE.mkdir(exist_ok=True)
         (WORK / "web").mkdir(exist_ok=True)
@@ -531,6 +539,10 @@ class Acceptance:
         self.check("unmodified official 0.15.0 protocol", version.stdout.strip()==expected_version and private.returncode != 0,
                    version=(version.stdout + version.stderr).strip(),
                    binary_sha256=hashlib.sha256(PINGAP.read_bytes()).hexdigest())
+        return sentinel
+
+    def run(self):
+        sentinel = self.prepare_fixture()
         self.start_owner()
         original_identity = self.identity()["runtime_instance_id"]
         self.operate("start"); self.ready()

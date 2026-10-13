@@ -269,39 +269,65 @@ impl SupervisordHost {
             .verify_owner_for_cleanup()
             .context("verify retained owner scope before resident shutdown")?;
         crate::xmlrpc::require_deadline_budget("owner shutdown authorization", deadline)?;
-        self.client.wait_mutations_until(deadline).await?;
+        self.settle_entry_writes_until(deadline).await?;
         let configured = configured_entry_spec(&self.conf_path)?;
-        let receipt = verify_resident_engine_receipt(
-            runtime_root,
-            scope.identity(),
-            &crate::xmlrpc::default_socket_path(),
-        )?;
-        let Some(receipt) = receipt else {
-            anyhow::ensure!(
-                configured.is_none(),
-                "configured resident has no owner domain receipt; shutdown is not authorized"
-            );
-            anyhow::ensure!(
-                self.resident_entry_settled_until(deadline).await?.is_none()
-                    && self.dynamic_groups_until(deadline).await?.is_empty(),
-                "supervisord programs exist without owner domain provenance; shutdown is not authorized"
-            );
-            return Ok(());
-        };
-        if let Some(spec) = configured {
-            anyhow::ensure!(
-                entry_config_from_argv(&spec.argv)? == receipt.config,
-                "configured resident differs from its owner domain receipt"
-            );
+        if configured.is_none() {
+            match self.resident_entry_settled_until(deadline).await? {
+                Some(info)
+                    if info.checked_state(PINGAP_PROGRAM)? != SupervisorProcessState::Running =>
+                {
+                    self.reconcile_withdrawn_entry_until(runtime_root, scope, deadline)
+                        .await?;
+                    return self.stop_business_until(deadline).await;
+                }
+                None if self.dynamic_groups_until(deadline).await?.is_empty() => {
+                    // No local execution or restart source remains. Historical
+                    // receipt epochs, missing files or corruption grant no new
+                    // authority and must not prevent confirming this empty owner.
+                    crate::xmlrpc::require_deadline_budget("empty owner confirmation", deadline)?;
+                    return crate::proxy::compiler::clear_current_confirmation();
+                }
+                _ => {}
+            }
         }
-        if let Some(info) = self.resident_entry_settled_until(deadline).await?
-            && info.checked_state(PINGAP_PROGRAM)? == SupervisorProcessState::Running
-        {
-            let (config, _) = self.live_entry_binding_until(&info, deadline).await?;
+        if let Some(spec) = configured.as_ref() {
+            let config = entry_config_from_argv(&spec.argv)?;
+            match self.resident_entry_settled_until(deadline).await? {
+                Some(info)
+                    if info.checked_state(PINGAP_PROGRAM)? == SupervisorProcessState::Running =>
+                {
+                    let (live, actual_spec) =
+                        self.live_entry_binding_until(&info, deadline).await?;
+                    anyhow::ensure!(
+                        live == config,
+                        "shutdown actual proxy configuration changed"
+                    );
+                    self.authorize_entry_domain_until(
+                        runtime_root,
+                        &live,
+                        &actual_spec,
+                        &info,
+                        deadline,
+                    )
+                    .await?;
+                }
+                _ => {
+                    self.authorize_inactive_entry_with_scope_until(
+                        runtime_root,
+                        &config,
+                        scope,
+                        deadline,
+                    )
+                    .await?
+                }
+            }
+        } else {
             anyhow::ensure!(
-                config == receipt.config,
-                "resident configuration belongs to a different owner runtime root"
+                self.resident_entry_settled_until(deadline).await?.is_none(),
+                "unconfigured live proxy remains unconfirmed before owner shutdown"
             );
+            self.authorize_remaining_business_until(scope, deadline)
+                .await?;
         }
         self.close_entry_until(deadline).await?;
         self.stop_business_until(deadline).await
@@ -536,4 +562,129 @@ async fn ensure_no_managed_programs(
         }
     }
     Ok(())
+}
+
+impl SupervisordHost {
+    async fn authorize_remaining_business_until(
+        &self,
+        scope: &runtime_supervisor::ResidentScope,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        self.authorize_current_entry_domain_until(scope, deadline)
+            .await?;
+        let workspace: PathBuf = serde_json::from_value(
+            scope
+                .identity()
+                .binding
+                .get("resource")
+                .cloned()
+                .context("current business owner workspace missing")?,
+        )?;
+        let workspace = std::fs::canonicalize(workspace)?;
+        let owner_root = scope
+            .root()
+            .parent()
+            .and_then(Path::parent)
+            .context("current business owner root missing")?;
+        let private = runtime_state_layout::ManagedWorkspace::from_env(&workspace, owner_root)
+            .ok()
+            .flatten()
+            .is_some_and(|managed| managed.application_id == scope.identity().application_id);
+        let conf =
+            match tokio::time::timeout_at(deadline, tokio::fs::read_to_string(&self.conf_path))
+                .await
+                .context("current business configuration observation deadline exceeded")?
+            {
+                Ok(conf) => conf,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(error) => return Err(error).context("observe current business configuration"),
+            };
+        for info in self.client.get_all_process_info_until(deadline).await? {
+            if !info.group.starts_with(SVC_PROGRAM_PREFIX) {
+                continue;
+            }
+            let state = info.checked_state(&info.group)?;
+            if matches!(
+                state,
+                SupervisorProcessState::Stopped
+                    | SupervisorProcessState::Exited
+                    | SupervisorProcessState::Fatal
+            ) {
+                anyhow::ensure!(
+                    info.pid == Some(0),
+                    "terminal business PID remains unconfirmed"
+                );
+            }
+            if private {
+                continue;
+            }
+            let configured = match current_business_workspace(&conf, &info.group) {
+                Ok(configured) => configured,
+                Err(_) => {
+                    tracing::warn!(group = %info.group,
+                        "current launch proof unavailable; observing the actual business workspace");
+                    None
+                }
+            };
+            if let Some(cwd) = configured.as_ref() {
+                anyhow::ensure!(
+                    std::fs::canonicalize(cwd)?.starts_with(&workspace),
+                    "current configured business belongs to another workspace"
+                );
+            }
+            #[cfg(target_os = "linux")]
+            if state == SupervisorProcessState::Running {
+                let running = info.running_identity()?;
+                let cwd = std::fs::canonicalize(format!("/proc/{}/cwd", running.pid))
+                    .context("observe actual shared-engine business workspace")?;
+                anyhow::ensure!(
+                    cwd.starts_with(&workspace),
+                    "actual running business belongs to another workspace"
+                );
+                anyhow::ensure!(
+                    self.client
+                        .running_process_until(&info.group, deadline)
+                        .await?
+                        == running,
+                    "shared-engine business incarnation changed during workspace observation"
+                );
+                continue;
+            }
+            anyhow::ensure!(
+                configured.is_some(),
+                "shared-engine business has no current workspace ownership evidence"
+            );
+        }
+        scope.verify_owner_for_cleanup()?;
+        crate::xmlrpc::require_deadline_budget("current business shutdown authorization", deadline)
+    }
+}
+
+fn current_business_workspace(conf: &str, group: &str) -> Result<Option<PathBuf>> {
+    let mut current = false;
+    let service = group
+        .strip_prefix(SVC_PROGRAM_PREFIX)
+        .context("business service identity missing")?;
+    for line in conf.lines().map(str::trim) {
+        if line.starts_with('[') {
+            current = line == format!("[program:{group}]");
+        }
+        if current && let Some(command) = line.strip_prefix("command=") {
+            let fields: Vec<_> = command.split_whitespace().collect();
+            anyhow::ensure!(
+                fields.len() == 4 && fields[1] == "run-service" && fields[3] == service,
+                "current business wrapper identity is unconfirmed"
+            );
+            let mut parts = Path::new(fields[2]).components();
+            anyhow::ensure!(
+                matches!(parts.next(), Some(std::path::Component::Normal(_)))
+                    && parts.next().is_none(),
+                "current business release identity is unconfirmed"
+            );
+            return Ok(Some(PathBuf::from(
+                ServiceSpecFile::load(fields[2], service)?.cwd,
+            )));
+        }
+    }
+    Ok(None)
 }

@@ -276,6 +276,27 @@ impl Fixture {
         .unwrap()
     }
 
+    async fn replace_checkpoint(
+        &self,
+        operation: &UserAppOperationRecord,
+        checkpoint: serde_json::Value,
+    ) -> UserAppOperationRecord {
+        let app_id = operation.app_id.clone();
+        let lifecycle_id = operation.lifecycle_id.clone();
+        let operation_id = operation.operation_id.clone();
+        let bytes = checkpoint.to_string();
+        self.owner.execute(move |mut db| async move {
+            toasty::sql::statement("UPDATE userapp_operations SET checkpoint_json=$1 WHERE app_id=$2 AND lifecycle_id=$3 AND operation_id=$4 AND state='succeeded'")
+                .bind(bytes).bind(app_id).bind(lifecycle_id).bind(operation_id).exec(&mut db).await?;
+            Ok(())
+        }).await.unwrap();
+        self.control
+            .get_operation(&self.app.app_id, &operation.operation_id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
     async fn assert_unchanged(
         &self,
         before: &ProjectAndContainerInfo,
@@ -1074,4 +1095,430 @@ async fn null_confirmation_cannot_bypass_recorded_volume_preservation() {
             .flush_and_stop(Duration::from_secs(5))
             .await
     );
+}
+
+#[tokio::test]
+async fn unreadable_older_completion_does_not_rollback_current_pg_registration() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let old_basic = f.basic("historyoldpod", "historyoldsts");
+    let (previous, _) = f.completed(old_basic.clone(), false).await;
+    let old = f.register_old(old_basic).await;
+    let stale_peer = f.peer().await;
+    let next = f.basic("historynewpod", "historynewsts");
+    let (historical, _) = f.completed(next.clone(), true).await;
+    let mut checkpoint = historical.checkpoint.clone();
+    checkpoint["builder_creation_evidence"] =
+        serde_json::json!("private historical value must stay opaque");
+    let historical = f.replace_checkpoint(&historical, checkpoint).await;
+    let historical_bytes = f.operation_bytes(&historical.operation_id).await;
+    let (completed, evidence) = f.completed(next, false).await;
+    let completed_bytes = f.operation_bytes(&completed.operation_id).await;
+    let candidates = f
+        .store
+        .completed_builder_registration_candidates(
+            &f.app.app_id,
+            &f.app.lifecycle_id,
+            &evidence.container.container_id,
+            evidence.container.workload_uid.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        candidates.iter().any(|candidate| candidate == &historical),
+        "the real SQL scan must include the malformed older same-Pod completion"
+    );
+    assert!(
+        serde_json::from_value::<BuilderCreationEvidence>(
+            historical.checkpoint["builder_creation_evidence"].clone()
+        )
+        .is_err()
+    );
+
+    f.store
+        .register_completed_builder_replacement(&completed, &evidence, &f.volumes())
+        .await
+        .unwrap();
+    let current = f.store.get(&f.app.app_id).unwrap();
+    assert_eq!(current.container_info().unwrap(), evidence.container);
+    assert_eq!(
+        current.persistence_identity().generation,
+        old.persistence_identity().generation
+    );
+    assert_eq!(current.sessions(), old.sessions());
+    let generation = current
+        .persistence_identity()
+        .container
+        .as_ref()
+        .unwrap()
+        .generation
+        .clone();
+    // A replica with the old private view must repeat the same real root-CAS
+    // transaction, including the historical scan, without a second replacement.
+    stale_peer
+        .register_completed_builder_replacement(&completed, &evidence, &f.volumes())
+        .await
+        .unwrap();
+    f.store
+        .register_completed_builder_replacement(&completed, &evidence, &f.volumes())
+        .await
+        .unwrap();
+    for store in [&f.store, &stale_peer] {
+        let registered = store.get(&f.app.app_id).unwrap();
+        assert_eq!(registered.container_info().unwrap(), evidence.container);
+        assert_eq!(
+            registered
+                .persistence_identity()
+                .container
+                .as_ref()
+                .unwrap()
+                .generation,
+            generation
+        );
+    }
+    assert_eq!(
+        f.control
+            .get_resource_binding(&ServiceType::UserappBuilder, &f.uid("historynewsts"))
+            .await
+            .unwrap()
+            .unwrap()
+            .adopted_by_operation,
+        completed.operation_id
+    );
+    assert_eq!(
+        f.control
+            .get_operation(&f.app.app_id, &historical.operation_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        historical
+    );
+    assert_eq!(
+        f.operation_bytes(&historical.operation_id).await,
+        historical_bytes
+    );
+    assert_eq!(
+        f.operation_bytes(&completed.operation_id).await,
+        completed_bytes
+    );
+    assert_eq!(
+        f.control
+            .get_operation(&f.app.app_id, &previous.operation_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        previous
+    );
+    let persisted = f.peer().await;
+    assert_eq!(
+        persisted
+            .get(&f.app.app_id)
+            .unwrap()
+            .container_info()
+            .unwrap(),
+        evidence.container
+    );
+    assert!(
+        persisted
+            .writer()
+            .flush_and_stop(Duration::from_secs(5))
+            .await
+    );
+    assert!(
+        stale_peer
+            .writer()
+            .flush_and_stop(Duration::from_secs(5))
+            .await
+    );
+    assert!(
+        f.store
+            .writer()
+            .flush_and_stop(Duration::from_secs(5))
+            .await
+    );
+}
+
+#[tokio::test]
+async fn unreadable_history_keeps_parsed_pod_workload_and_pvc_conflicts_in_pg_protected() {
+    for conflict in ["pod", "workload", "pvc"] {
+        let Some(f) = Fixture::new().await else {
+            return;
+        };
+        let old_basic = f.basic("conflictoldpod", "conflictoldsts");
+        let (_, source) = f.completed(old_basic.clone(), false).await;
+        let old = f.register_old(old_basic).await;
+        let next = f.basic("conflictnewpod", "conflictnewsts");
+        let (unreadable, _) = f.completed(next.clone(), true).await;
+        let mut checkpoint = unreadable.checkpoint.clone();
+        checkpoint["builder_creation_evidence"] = serde_json::json!(17);
+        let unreadable = f.replace_checkpoint(&unreadable, checkpoint).await;
+        let unreadable_bytes = f.operation_bytes(&unreadable.operation_id).await;
+        let (parsed, mut constraint) = f
+            .completed_with_source(
+                next.clone(),
+                true,
+                Some(BuilderCreationPredecessor {
+                    target: source.target,
+                    volumes: f.volumes(),
+                }),
+            )
+            .await;
+        let expected_error = match conflict {
+            "pod" => {
+                constraint.container.container_id = "another-actual-pod".into();
+                "Builder completion physical identity mismatch"
+            }
+            "workload" => {
+                constraint.target.workload.as_mut().unwrap().uid = "another-actual-workload".into();
+                "Builder completion pod or workload identity missing"
+            }
+            "pvc" => {
+                constraint
+                    .registration_predecessor
+                    .as_mut()
+                    .unwrap()
+                    .volumes[0]
+                    .uid = "another-actual-pvc".into();
+                "volume identity changed"
+            }
+            _ => unreachable!(),
+        };
+        let mut checkpoint = parsed.checkpoint.clone();
+        checkpoint["builder_creation_evidence"] = serde_json::to_value(&constraint).unwrap();
+        let parsed = f.replace_checkpoint(&parsed, checkpoint).await;
+        let parsed_bytes = f.operation_bytes(&parsed.operation_id).await;
+        let (completed, evidence) = f.completed(next, false).await;
+        let completed_bytes = f.operation_bytes(&completed.operation_id).await;
+        let error = f
+            .store
+            .register_completed_builder_replacement(&completed, &evidence, &f.volumes())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(expected_error),
+            "{conflict}: {error:#}"
+        );
+        assert!(
+            f.control
+                .get_resource_binding(&ServiceType::UserappBuilder, &f.uid("conflictnewsts"))
+                .await
+                .unwrap()
+                .is_none(),
+            "conflicting actual identities must roll back the tentative binding"
+        );
+        f.assert_unchanged(&old, &completed, &completed_bytes).await;
+        for (operation, bytes) in [(&unreadable, unreadable_bytes), (&parsed, parsed_bytes)] {
+            assert_eq!(
+                f.control
+                    .get_operation(&f.app.app_id, &operation.operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                *operation
+            );
+            assert_eq!(f.operation_bytes(&operation.operation_id).await, bytes);
+        }
+        assert!(
+            f.store
+                .writer()
+                .flush_and_stop(Duration::from_secs(5))
+                .await
+        );
+    }
+}
+#[tokio::test]
+async fn legacy_identity_projection_recovers_corrupt_diagnostics_without_rewriting_history() {
+    for missing_uid in [false, true] {
+        let Some(f) = Fixture::new().await else {
+            return;
+        };
+        let basic = f.basic("projectionoldpod", "projectionoldsts");
+        let (historical, _) = f.completed(basic.clone(), false).await;
+        let mut checkpoint = historical.checkpoint.clone();
+        checkpoint["created_at"] = serde_json::json!({"old_format": true});
+        checkpoint["container_ip"] = serde_json::json!(["unreadable", "diagnostic"]);
+        checkpoint["internal_port"] = serde_json::Value::Null;
+        checkpoint["service_url"] = serde_json::json!({"private": "retained old URL"});
+        let historical = f.replace_checkpoint(&historical, checkpoint).await;
+        let historical_bytes = f.operation_bytes(&historical.operation_id).await;
+        let (unreadable, _) = f.completed(basic.clone(), false).await;
+        let mut checkpoint = unreadable.checkpoint.clone();
+        checkpoint["workload_uid"] = serde_json::json!(false);
+        let unreadable = f.replace_checkpoint(&unreadable, checkpoint).await;
+        let unreadable_bytes = f.operation_bytes(&unreadable.operation_id).await;
+        assert!(
+            serde_json::from_value::<ContainerBasicInfo>(historical.checkpoint.clone()).is_err()
+        );
+        let mut old_basic = basic;
+        if missing_uid {
+            old_basic.workload_uid = None;
+        }
+        let old = f.register_old(old_basic).await;
+        let (completed, evidence) = f
+            .completed(f.basic("projectionnewpod", "projectionnewsts"), false)
+            .await;
+        let completed_bytes = f.operation_bytes(&completed.operation_id).await;
+        f.store
+            .register_completed_builder_replacement(&completed, &evidence, &f.volumes())
+            .await
+            .unwrap();
+        let registered = f.store.get(&f.app.app_id).unwrap();
+        assert_eq!(registered.container_info().unwrap(), evidence.container);
+        assert_eq!(
+            registered.persistence_identity().generation,
+            old.persistence_identity().generation
+        );
+        assert_eq!(registered.sessions(), old.sessions());
+        assert_eq!(
+            registered
+                .persistence_identity()
+                .container
+                .as_ref()
+                .unwrap()
+                .predecessor
+                .as_deref(),
+            Some(
+                old.persistence_identity()
+                    .container
+                    .as_ref()
+                    .unwrap()
+                    .generation
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            f.control
+                .get_resource_binding(&ServiceType::UserappBuilder, &f.uid("projectionnewsts"))
+                .await
+                .unwrap()
+                .unwrap()
+                .adopted_by_operation,
+            completed.operation_id
+        );
+        for (operation, bytes) in [
+            (&historical, historical_bytes),
+            (&unreadable, unreadable_bytes),
+        ] {
+            assert_eq!(
+                f.control
+                    .get_operation(&f.app.app_id, &operation.operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                *operation
+            );
+            assert_eq!(f.operation_bytes(&operation.operation_id).await, bytes);
+        }
+        assert_eq!(
+            f.operation_bytes(&completed.operation_id).await,
+            completed_bytes
+        );
+        let persisted = f.peer().await;
+        assert_eq!(
+            persisted
+                .get(&f.app.app_id)
+                .unwrap()
+                .container_info()
+                .unwrap(),
+            evidence.container
+        );
+        assert_eq!(
+            persisted.get(&f.app.app_id).unwrap().sessions(),
+            old.sessions()
+        );
+        assert!(
+            persisted
+                .writer()
+                .flush_and_stop(Duration::from_secs(5))
+                .await
+        );
+        assert!(
+            f.store
+                .writer()
+                .flush_and_stop(Duration::from_secs(5))
+                .await
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_identity_projection_keeps_foreign_conflicting_and_unproved_history_protected() {
+    for conflict in ["foreign-project", "workload", "only-unreadable"] {
+        let Some(f) = Fixture::new().await else {
+            return;
+        };
+        let basic = f.basic("projectionguardpod", "projectionguardsts");
+        if conflict != "only-unreadable" {
+            f.completed(basic.clone(), false).await;
+        }
+        let (historical, _) = f.completed(basic.clone(), false).await;
+        let mut checkpoint = historical.checkpoint.clone();
+        let expected_error = match conflict {
+            "foreign-project" => {
+                checkpoint["project_id"] = serde_json::json!("different-actual-application");
+                "Historical builder ownership result differs from the registry"
+            }
+            "workload" => {
+                checkpoint["workload_uid"] = serde_json::json!("different-actual-workload");
+                "no unique successful lifecycle history"
+            }
+            "only-unreadable" => {
+                checkpoint["workload_uid"] = serde_json::json!(["no proven old UID"]);
+                "no unique successful lifecycle history"
+            }
+            _ => unreachable!(),
+        };
+        checkpoint["created_at"] = serde_json::Value::Null;
+        let historical = f.replace_checkpoint(&historical, checkpoint).await;
+        let historical_bytes = f.operation_bytes(&historical.operation_id).await;
+        let mut unbound_old = basic;
+        unbound_old.workload_uid = None;
+        let old = f.register_old(unbound_old).await;
+        let (completed, evidence) = f
+            .completed(
+                f.basic("projectionguardnewpod", "projectionguardnewsts"),
+                false,
+            )
+            .await;
+        let completed_bytes = f.operation_bytes(&completed.operation_id).await;
+        let error = f
+            .store
+            .register_completed_builder_replacement(&completed, &evidence, &f.volumes())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(expected_error),
+            "{conflict}: {error:#}"
+        );
+        assert!(
+            f.control
+                .get_resource_binding(
+                    &ServiceType::UserappBuilder,
+                    &f.uid("projectionguardnewsts")
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        f.assert_unchanged(&old, &completed, &completed_bytes).await;
+        assert_eq!(
+            f.control
+                .get_operation(&f.app.app_id, &historical.operation_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            historical
+        );
+        assert_eq!(
+            f.operation_bytes(&historical.operation_id).await,
+            historical_bytes
+        );
+        assert!(
+            f.store
+                .writer()
+                .flush_and_stop(Duration::from_secs(5))
+                .await
+        );
+    }
 }

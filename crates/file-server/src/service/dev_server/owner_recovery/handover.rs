@@ -26,6 +26,12 @@ impl DevServerManager {
         .context("managed owner recovery has no declared state authority")?;
         let managed = ManagedWorkspace::from_env(workspace, &root)?
             .context("managed builder declaration changed while inspecting owner identity")?;
+        if native::known_legacy_protocol(&identity) {
+            // Read-side observations retain this verified legacy identity. Only
+            // an explicit Source/build preflight retires it through native control.
+            verify_managed_identity(&identity, &managed)?;
+            return Ok(identity);
+        }
         if owner_client::verify_project_identity(&identity, workspace, &managed.application_id)
             .is_ok()
         {
@@ -43,7 +49,7 @@ impl DevServerManager {
             .await
     }
 
-    async fn handover_managed_owner(
+    pub(super) async fn handover_managed_owner(
         &self,
         project: &str,
         address: &str,
@@ -91,11 +97,12 @@ impl DevServerManager {
                 OwnerProbe::Ready(current) => current,
                 _ => anyhow::bail!("managed owner changed before handover; retry this request"),
             };
-            if owner_client::verify_project_identity(&current, &managed.source_root, &managed.application_id).is_ok() {
+            if current.runtime_instance_id != identity.runtime_instance_id {
                 return verified_successor(address, managed, &identity.runtime_instance_id).await?
                     .context("replacement changed during managed handover verification");
             }
-            ensure!(current.runtime_instance_id == identity.runtime_instance_id, "managed owner changed before handover; retry this request");
+            ensure!(official::same_identity(&current, &identity),
+                "managed owner changed before handover; retry this request");
             verify_managed_identity(&current, managed)?;
             let before = runtime_supervisor::control(root, Request::new(Action::Status)).await?;
             verify_supervisor_binding(&before, &current, managed)?;
@@ -191,7 +198,7 @@ fn verify_managed_identity(
     managed: &ManagedWorkspace,
 ) -> Result<()> {
     ensure!(
-        owner_client::protocol_compatible(identity)
+        native::retirement_protocol_supported(identity)
             && identity.application_id == managed.application_id
             && identity.service_family == "userapp-dev"
             && !identity.runtime_instance_id.trim().is_empty()

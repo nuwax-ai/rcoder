@@ -263,6 +263,10 @@ impl SupervisorClient {
         }
     }
 
+    pub(crate) fn socket_path(&self) -> &Path {
+        &self.socket
+    }
+
     fn default_deadline() -> tokio::time::Instant {
         tokio::time::Instant::now() + std::time::Duration::from_secs(60)
     }
@@ -355,7 +359,17 @@ impl SupervisorClient {
             Err(error) if is_no_such_process(&error) => return Ok(()),
             Err(error) => return Err(error),
         }
-        match self
+        self.remove_process_group_until(group, until).await
+    }
+
+    /// An already stopped group needs only registration removal. Repeating a
+    /// stop after its delayed RPC settled can fail with NOT_RUNNING instead.
+    pub(crate) async fn remove_process_group_until(
+        &self,
+        group: &str,
+        until: tokio::time::Instant,
+    ) -> Result<()> {
+        let value = match self
             .call_until(
                 "supervisor.removeProcessGroup",
                 &[group.into()],
@@ -364,10 +378,15 @@ impl SupervisorClient {
             )
             .await
         {
-            Ok(_) => Ok(()),
-            Err(error) if is_no_such_process(&error) => Ok(()),
-            Err(error) => Err(error),
-        }
+            Ok(value) => value,
+            Err(error) if is_no_such_process(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        anyhow::ensure!(
+            value.as_bool() == Some(true),
+            "supervisord did not confirm removing {group}"
+        );
+        Ok(())
     }
 
     pub(crate) async fn start_process_wait(&self, name: &str) -> Result<()> {

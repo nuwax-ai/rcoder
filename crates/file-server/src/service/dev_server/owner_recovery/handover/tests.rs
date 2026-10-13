@@ -633,9 +633,124 @@ async fn exited_bootstrap_candidate_waits_for_verified_owner_reconciliation() {
 
 #[cfg(unix)]
 async fn exercise_handover(has_generation: bool) {
+    exercise_native_retirement(has_generation, None).await;
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum MetadataRecovery {
+    ProtocolV4,
+    MissingToken,
+    EmptyToken,
+}
+
+#[cfg(unix)]
+mod scoped_environment {
+    #![allow(unsafe_code)] // nextest isolates these process-global fixture values.
+
+    pub(super) struct Guard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Guard {
+        pub(super) fn install(managed: &runtime_state_layout::ManagedWorkspace) -> Self {
+            let values = [
+                ("APP_CLI_MANAGED", Some("1".into())),
+                ("SERVICE_TYPE", Some("user-app-builder".into())),
+                ("PROJECT_ID", Some(managed.application_id.clone().into())),
+                (
+                    "USERAPP_WORKSPACE_DIR",
+                    managed
+                        .source_root
+                        .parent()
+                        .map(|p| p.as_os_str().to_owned()),
+                ),
+                (
+                    "APP_CLI_STATE_ROOT",
+                    Some(managed.state_root.as_os_str().to_owned()),
+                ),
+                ("APP_CLI_RUNTIME_WORKSPACE", None),
+                ("USERAPP_SINGLE_APP_ID", None),
+            ];
+            let original = values
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect();
+            for (key, value) in values {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+            Self(original)
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn source_build_retires_known_v4_owner_before_current_management_bootstrap() {
+    exercise_native_retirement(true, Some(MetadataRecovery::ProtocolV4)).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn source_build_retires_tokenless_live_owner_without_rotating_its_live_token() {
+    exercise_native_retirement(true, Some(MetadataRecovery::MissingToken)).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn source_build_retires_empty_token_owner_before_restoring_current_credentials() {
+    exercise_native_retirement(true, Some(MetadataRecovery::EmptyToken)).await;
+}
+
+#[cfg(unix)]
+async fn exercise_native_retirement(has_generation: bool, metadata: Option<MetadataRecovery>) {
     use std::os::unix::fs::PermissionsExt;
-    let (temp, managed, identity) = fixture();
+    let (temp, managed, mut identity) = fixture();
+    let _environment = metadata.map(|_| scoped_environment::Guard::install(&managed));
+    if let Some(kind) = metadata {
+        identity.source_root = managed.source_root.display().to_string();
+        identity.workspace_id = "11".into();
+        match kind {
+            MetadataRecovery::ProtocolV4 => identity.protocol_version = 4,
+            MetadataRecovery::MissingToken | MetadataRecovery::EmptyToken => identity
+                .capabilities
+                .push(shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into()),
+        }
+        save(
+            &managed.state_root.join("identity.json"),
+            &serde_json::to_value(&identity).unwrap(),
+        );
+    }
     let root = managed.state_root.clone();
+    if matches!(metadata, Some(MetadataRecovery::ProtocolV4)) {
+        std::fs::write(root.join("token"), b"original-owner-token").unwrap();
+    } else if matches!(metadata, Some(MetadataRecovery::EmptyToken)) {
+        std::fs::write(root.join("token"), b" \n").unwrap();
+    }
+    let original_token = std::fs::read(root.join("token")).ok();
+    let preserved_data = managed.source_root.join("user-data.txt");
+    std::fs::write(&preserved_data, b"retained application data").unwrap();
+    let migration = root.join("original-unknown-migration.json");
+    std::fs::write(
+        &migration,
+        b"{\"state\":\"unknown\",\"operation_id\":\"original-migration\"}",
+    )
+    .unwrap();
+    let original_migration = std::fs::read(&migration).unwrap();
     let launch = temp.path().join("launched-args");
     let program = temp.path().join("app-cli-fixture.sh");
     std::fs::write(
@@ -653,14 +768,33 @@ async fn exercise_handover(has_generation: bool) {
     successor.source_root = managed.source_root.display().to_string();
     successor.workspace_id = "11".into();
     successor.runtime_instance_id = "new-http-owner".into();
+    successor.protocol_version = shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION;
+    if metadata.is_some()
+        && !successor
+            .capabilities
+            .iter()
+            .any(|c| c == shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY)
+    {
+        successor
+            .capabilities
+            .push(shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into());
+    }
     let expected_successor = successor.clone();
+    let wire_calls_before_retirement = Arc::new(AtomicUsize::new(0));
     let http_root = root.clone();
     let http_launch = launch.clone();
     let http_retired = retired.clone();
+    let wire_launch = launch.clone();
+    let recovery_launch = launch.clone();
+    let premature_recovery = wire_calls_before_retirement.clone();
+    let premature_status = wire_calls_before_retirement.clone();
+    let new_recovery_id = successor.runtime_instance_id.clone();
+    let new_status_id = successor.runtime_instance_id.clone();
     let http = axum::Router::new().route(
         "/v1/runtime/identity",
         axum::routing::get(move || {
             let identity = if http_launch.exists() {
+                std::fs::write(http_root.join("token"), b"successor-owner-token").unwrap();
                 save(
                     &http_root.join("identity.json"),
                     &serde_json::to_value(&successor).unwrap(),
@@ -689,7 +823,27 @@ async fn exercise_handover(has_generation: bool) {
                 }
             }
         }),
-    );
+    ).route("/v1/runtime/recovery", axum::routing::get(move || {
+        let (launch, premature, id) = (recovery_launch.clone(), premature_recovery.clone(), new_recovery_id.clone());
+        async move {
+            if !launch.exists() { premature.fetch_add(1, Ordering::SeqCst); }
+            axum::Json(shared_types::HttpResult::success(shared_types::RuntimeRecoveryView {
+                runtime_instance_id:id, deployment_generation_id:"deployment".into(), revision:7,
+                kernel_protected:false, owner_protected:false, operation_id:None, boundary:None,
+                generation_matches:None, credentials_required:false,
+                migrations:shared_types::RuntimeMigrationRecoveryState::Unconfirmed,
+            }))
+        }
+    })).route("/v1/runtime/status", axum::routing::get(move || {
+        let (launch, premature, id) = (wire_launch.clone(), premature_status.clone(), new_status_id.clone());
+        async move {
+            if !launch.exists() { premature.fetch_add(1, Ordering::SeqCst); }
+            axum::Json(shared_types::HttpResult::success(shared_types::RuntimeStatusView {
+                desired:shared_types::DesiredState::Stopped, observed:shared_types::ObservedHealth::Stopped,
+                active_target:None, revision:7, active_operation_id:None, recovery_protection:false, runtime_instance_id:id,
+            }))
+        }
+    }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let http_task = tokio::spawn(async move { axum::serve(listener, http).await.unwrap() });
@@ -723,6 +877,12 @@ async fn exercise_handover(has_generation: bool) {
     let observed_calls = calls.clone();
     let native_launch = launch.clone();
     let successor_root = managed.source_root.clone();
+    let mut original_process = tokio::process::Command::new("/bin/sleep")
+        .arg("30")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let original_pid = original_process.id().unwrap();
     let native_task = tokio::spawn(async move {
         let mut request_identity = None;
         let mut current = before;
@@ -768,6 +928,19 @@ async fn exercise_handover(has_generation: bool) {
             if count == 0 {
                 continue;
             } // Lost first reply after durable admission.
+            assert!(
+                !native_launch.exists(),
+                "new management must wait for the old owner to exit"
+            );
+            assert_eq!(
+                std::fs::read(root.join("token")).ok(),
+                original_token,
+                "a live owner's credentials must never be rotated during retirement"
+            );
+            assert!(process_utils::process_exists(original_pid).unwrap());
+            original_process.kill().await.unwrap();
+            original_process.wait().await.unwrap();
+            assert!(!process_utils::process_exists(original_pid).unwrap());
             retired.store(true, Ordering::SeqCst);
             if let Some(work) = &work {
                 save(
@@ -812,12 +985,16 @@ async fn exercise_handover(has_generation: bool) {
             .open(root.join("owner.lock"))
             .unwrap();
         successor_lock.try_lock().unwrap();
+        let original_shutdown =
+            runtime_supervisor::completed_shutdown_for(&root, &current.supervisor_id)
+                .unwrap()
+                .unwrap();
         current.supervisor_id = "successor-supervisor".into();
         current.binding.resource = successor_root;
         current.phase = Phase::Ready;
         current.intent = Intent::Stopped;
         current.generation = Some(uuid::Uuid::new_v4().to_string());
-        discovery(&root, &next_address, &current, &[]);
+        discovery(&root, &next_address, &current, &[original_shutdown]);
         let (mut stream, _) = next_native.accept().await.unwrap();
         let mut line = String::new();
         BufReader::new(&mut stream)
@@ -837,11 +1014,24 @@ async fn exercise_handover(has_generation: bool) {
     let mut config = crate::Config::from_env().unwrap();
     config.app_cli_bin = Some(program.display().to_string());
     config.log_base_dir = temp.path().join("logs");
+    config.app_cli_admin_probe_addr = address.clone();
     let manager = DevServerManager::new(Arc::new(config));
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(6),
-        manager.handover_managed_owner("11", &address, identity, &managed),
-    )
+    let outcome = tokio::time::timeout(Duration::from_secs(6), async {
+        if metadata.is_some() {
+            manager
+                .preflight_userapp_build("11", &managed.source_root)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            match owner_client::observe_owner(&address).await? {
+                OwnerProbe::Ready(identity) => Ok(identity),
+                _ => anyhow::bail!("source preflight did not restore current management"),
+            }
+        } else {
+            manager
+                .handover_managed_owner("11", &address, identity, &managed)
+                .await
+        }
+    })
     .await;
     tokio::time::timeout(Duration::from_secs(1), native_task)
         .await
@@ -856,6 +1046,30 @@ async fn exercise_handover(has_generation: bool) {
         expected_successor.runtime_instance_id
     );
     assert_eq!(actual.source_root, expected_successor.source_root);
+    assert_eq!(
+        std::fs::read(&preserved_data).unwrap(),
+        b"retained application data"
+    );
+    assert_eq!(
+        std::fs::read(&migration).unwrap(),
+        original_migration,
+        "unknown migration is never replayed or rewritten"
+    );
+    assert_eq!(
+        wire_calls_before_retirement.load(Ordering::SeqCst),
+        0,
+        "old wire control cannot be reused for metadata retirement"
+    );
+    assert!(!process_utils::process_exists(original_pid).unwrap());
+    if metadata.is_some() {
+        assert!(
+            matches!(
+                lock(&manager.owner_expectations).unwrap().get("11"),
+                Some(super::super::super::types::OwnerExpectation::Captured { revision: 7, .. })
+            ),
+            "the original Source preflight must continue with its current management owner"
+        );
+    }
     if !has_generation {
         assert!(
             !managed.state_root.join("work").exists(),
@@ -877,5 +1091,344 @@ async fn exercise_handover(has_generation: bool) {
         !args
             .lines()
             .any(|arg| arg == managed.source_root.join("code").to_string_lossy())
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn source_metadata_recovery_preserves_foreign_and_future_protocol_owners() {
+    for changed in ["application", "workspace", "future_protocol"] {
+        let (_temp, managed, mut identity) = fixture();
+        let _environment = scoped_environment::Guard::install(&managed);
+        identity.source_root = managed.source_root.display().to_string();
+        identity.protocol_version = 4;
+        match changed {
+            "application" => identity.application_id = "another-application".into(),
+            "workspace" => {
+                identity.source_root = managed
+                    .source_root
+                    .with_file_name("foreign")
+                    .display()
+                    .to_string()
+            }
+            "future_protocol" => {
+                identity.protocol_version = shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION + 1
+            }
+            _ => unreachable!(),
+        }
+        save(
+            &managed.state_root.join("identity.json"),
+            &serde_json::to_value(&identity).unwrap(),
+        );
+        let before = snapshot(&managed, &identity);
+        discovery(&managed.state_root, "127.0.0.1:1", &before, &[]);
+        let original = std::fs::read(managed.state_root.join("supervisor.json")).unwrap();
+        let owner = identity.clone();
+        let http = axum::Router::new().route(
+            "/v1/runtime/identity",
+            axum::routing::get(move || {
+                let owner = owner.clone();
+                async move { axum::Json(shared_types::HttpResult::success(owner)) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move { axum::serve(listener, http).await.unwrap() });
+        let mut config = crate::Config::from_env().unwrap();
+        config.log_base_dir = managed.source_root.join("logs");
+        config.app_cli_admin_probe_addr = address;
+        config.app_cli_bin = Some("a-foreign-owner-bootstrap-must-not-run".into());
+        let manager = DevServerManager::new(Arc::new(config));
+        let result = manager
+            .preflight_userapp_build("11", &managed.source_root)
+            .await;
+        server.abort();
+        assert!(result.is_err(), "{changed}");
+        assert!(
+            lock(&manager.owner_children).unwrap().is_empty(),
+            "{changed}"
+        );
+        assert_eq!(
+            std::fs::read(managed.state_root.join("supervisor.json")).unwrap(),
+            original,
+            "{changed}"
+        );
+        assert!(
+            !managed.state_root.join("owner-bootstrap.lock").exists(),
+            "{changed}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn source_build_bootstraps_after_legacy_completed_shutdown_without_rewriting_its_request() {
+    exercise_legacy_completion(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn source_build_observes_concurrent_successor_without_replaying_legacy_shutdown() {
+    exercise_legacy_completion(true).await;
+}
+
+#[cfg(unix)]
+async fn exercise_legacy_completion(replacement: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let (temp, managed, mut identity) = fixture();
+    let _environment = scoped_environment::Guard::install(&managed);
+    identity.source_root = managed.source_root.display().to_string();
+    identity.workspace_id = "11".into();
+    let root = managed.state_root.clone();
+    let launch = temp.path().join("legacy-bootstrap-args");
+    let program = temp.path().join("legacy-management-fixture.sh");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nsleep 2\n",
+            launch.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let data = managed.source_root.join("application-data.bin");
+    std::fs::write(&data, b"keep the source and application data").unwrap();
+    let migration = root.join("unknown-migration.json");
+    std::fs::write(
+        &migration,
+        b"{\"state\":\"unknown\",\"operation_id\":\"original\"}",
+    )
+    .unwrap();
+    let original_migration = std::fs::read(&migration).unwrap();
+    let mut terminal = snapshot(&managed, &identity);
+    terminal.phase = Phase::Stopped;
+    terminal.intent = Intent::Shutdown;
+    terminal.generation = None;
+    let request = Request::new(Action::Shutdown);
+    discovery(
+        &root,
+        "127.0.0.1:1",
+        &terminal,
+        &[(request.clone(), terminal.clone())],
+    );
+    let original_shutdown = runtime_supervisor::saved_request_snapshot(&root, &request)
+        .unwrap()
+        .unwrap();
+    let owner_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join("owner.lock"))
+        .unwrap();
+    owner_lock.try_lock().unwrap();
+    let worker_root = root.join("work").join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&worker_root).unwrap();
+    let worker_lock = std::fs::File::create(worker_root.join("generation.lock")).unwrap();
+    worker_lock.try_lock().unwrap();
+    let mut worker = tokio::process::Command::new("/bin/sleep")
+        .arg("30")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let old_pid = worker.id().unwrap();
+    let mut successor = identity.clone();
+    successor.runtime_instance_id = "current-legacy-successor".into();
+    successor
+        .capabilities
+        .push(shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into());
+    let next_id = successor.runtime_instance_id.clone();
+    let status_id = next_id.clone();
+    let recovery_id = next_id.clone();
+    let observed = Arc::new(AtomicBool::new(false));
+    let http_observed = observed.clone();
+    let http_launch = launch.clone();
+    let http_root = root.clone();
+    let router = axum::Router::new()
+        .route("/v1/runtime/identity", axum::routing::get(move || {
+            let (identity, launch, root, observed) = (successor.clone(), http_launch.clone(), http_root.clone(), http_observed.clone());
+            async move {
+                observed.store(true, Ordering::SeqCst);
+                if !launch.exists() {
+                    return (axum::http::StatusCode::SERVICE_UNAVAILABLE, axum::Json(serde_json::json!({"code":"ERR_INITIALIZING","message":"retiring old process","data":null})));
+                }
+                save(&root.join("identity.json"), &serde_json::to_value(&identity).unwrap());
+                std::fs::write(root.join("token"), b"new-management-token").unwrap();
+                (axum::http::StatusCode::OK, axum::Json(serde_json::to_value(shared_types::HttpResult::success(identity)).unwrap()))
+            }
+        }))
+        .route("/v1/runtime/recovery", axum::routing::get(move || {
+            let id = recovery_id.clone();
+            async move { axum::Json(shared_types::HttpResult::success(shared_types::RuntimeRecoveryView {
+                runtime_instance_id:id, deployment_generation_id:"deployment".into(), revision:7,
+                kernel_protected:false, owner_protected:false, operation_id:None, boundary:None,
+                generation_matches:None, credentials_required:false,
+                migrations:shared_types::RuntimeMigrationRecoveryState::Unconfirmed,
+            })) }
+        }))
+        .route("/v1/runtime/status", axum::routing::get(move || {
+            let id = status_id.clone();
+            async move { axum::Json(shared_types::HttpResult::success(shared_types::RuntimeStatusView {
+                desired:shared_types::DesiredState::Stopped, observed:shared_types::ObservedHealth::Stopped,
+                active_target:None, revision:7, active_operation_id:None, recovery_protection:false, runtime_instance_id:id,
+            })) }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let http_task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let next_native = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let next_address = next_native.local_addr().unwrap().to_string();
+    let native_root = root.clone();
+    let native_launch = launch.clone();
+    let source_root = managed.source_root.clone();
+    let native_request = request.clone();
+    let mut current = terminal.clone();
+    let native_observed = observed.clone();
+    let native_statuses = Arc::new(AtomicUsize::new(0));
+    let recorded_statuses = native_statuses.clone();
+    let native_task = tokio::spawn(async move {
+        while !native_observed.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !native_launch.exists(),
+            "terminal metadata is insufficient while the old owner lease is held"
+        );
+        drop(owner_lock);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !native_launch.exists(),
+            "the real old worker must exit before management bootstrap"
+        );
+        assert!(process_utils::process_exists(old_pid).unwrap());
+        worker.kill().await.unwrap();
+        worker.wait().await.unwrap();
+        assert!(!process_utils::process_exists(old_pid).unwrap());
+        let successor_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(native_root.join("owner.lock"))
+            .unwrap();
+        if !replacement {
+            drop(worker_lock);
+            while !native_launch.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            successor_lock.try_lock().unwrap();
+        } else {
+            loop {
+                match successor_lock.try_lock() {
+                    Ok(()) => break,
+                    Err(std::fs::TryLockError::WouldBlock) => tokio::task::yield_now().await,
+                    Err(error) => panic!("replacement owner lease: {error}"),
+                }
+            }
+            drop(worker_lock);
+        }
+        current.supervisor_id = "new-legacy-native-supervisor".into();
+        current.binding.resource = source_root;
+        current.phase = Phase::Ready;
+        current.intent = Intent::Stopped;
+        current.operation_id = None;
+        discovery(
+            &native_root,
+            &next_address,
+            &current,
+            &[(native_request, terminal)],
+        );
+        if replacement {
+            std::fs::write(&native_launch, b"existing successor; no bootstrap").unwrap();
+        }
+        // The successor remains the live native owner throughout both initial
+        // discovery and business preflight revalidation. A one-response server
+        // would release its listener/lease and correctly be treated as absent.
+        loop {
+            let (mut stream, _) = next_native.accept().await.unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                frame["request"]["action"], "status",
+                "a legacy wildcard Shutdown must never be sent to the successor"
+            );
+            recorded_statuses.fetch_add(1, Ordering::SeqCst);
+            stream.write_all(format!("{}\n", serde_json::json!({"instance":current.supervisor_id,"snapshot":current,"error":null})).as_bytes()).await.unwrap();
+        }
+    });
+    let mut config = crate::Config::from_env().unwrap();
+    config.app_cli_admin_probe_addr = address;
+    config.app_cli_bin = Some(program.display().to_string());
+    config.log_base_dir = temp.path().join("logs");
+    let manager = DevServerManager::new(Arc::new(config));
+    let candidate = tokio::process::Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    let tracked = super::super::super::SupervisedChild::adopt(
+        candidate,
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+    );
+    assert!(tracked.wait_exit(Duration::from_secs(2)).await.is_some());
+    lock(&manager.owner_children)
+        .unwrap()
+        .insert("11".into(), tracked);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(6),
+        manager.preflight_userapp_build("11", &managed.source_root),
+    )
+    .await;
+    // Only fixture-owned protocol resources are retired after the complete
+    // operation; cleanup also runs before reporting a real product failure.
+    native_task.abort();
+    drop(native_task.await);
+    http_task.abort();
+    outcome
+        .expect("legacy recovery deadline")
+        .expect("the original source preflight must complete");
+    assert!(
+        native_statuses.load(Ordering::SeqCst) >= 2,
+        "the same successor must remain observable for preflight revalidation"
+    );
+    assert_eq!(
+        std::fs::read(&data).unwrap(),
+        b"keep the source and application data"
+    );
+    assert_eq!(std::fs::read(&migration).unwrap(), original_migration);
+    assert_eq!(
+        runtime_supervisor::saved_request_snapshot(&root, &request)
+            .unwrap()
+            .unwrap()
+            .supervisor_id,
+        original_shutdown.supervisor_id
+    );
+    let discovery_bytes: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("supervisor.json")).unwrap()).unwrap();
+    let old_request = &discovery_bytes["requests"][0][0];
+    assert!(
+        old_request["expected_generation"].is_null(),
+        "the historical request must keep its original parameters"
+    );
+    assert_eq!(old_request["request_id"], request.request_id);
+    let launched = std::fs::read_to_string(launch).unwrap();
+    if replacement {
+        assert_eq!(launched, "existing successor; no bootstrap");
+        assert!(
+            lock(&manager.owner_children)
+                .unwrap()
+                .get("11")
+                .unwrap()
+                .exited()
+                .is_some(),
+            "a concurrent successor must not spawn another management owner"
+        );
+    } else {
+        assert!(launched.starts_with("serve\n--control-only\n--workspace\n"));
+    }
+    assert!(
+        matches!(lock(&manager.owner_expectations).unwrap().get("11"), Some(super::super::super::types::OwnerExpectation::Captured { runtime_instance_id, .. }) if runtime_instance_id == &next_id)
     );
 }

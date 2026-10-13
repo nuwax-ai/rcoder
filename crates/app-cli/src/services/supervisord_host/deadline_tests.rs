@@ -102,6 +102,7 @@ fn start_phase_deadline(slow: &'static str) {
                     called.lock().unwrap().push(method.clone());
                     if method == slow { tokio::time::sleep(std::time::Duration::from_millis(1000)).await; }
                     let value = match method.as_str() {
+                        "supervisor.getAllProcessInfo" => "<array><data/></array>",
                         "supervisor.reloadConfig" => "<array><data><value><array><data><value><array><data/></array></value><value><array><data/></array></value><value><array><data/></array></value></data></array></value></data></array>",
                         "supervisor.getProcessInfo" => "<struct><member><name>group</name><value><string>app-pingap</string></value></member><member><name>name</name><value><string>app-pingap</string></value></member><member><name>statename</name><value><string>RUNNING</string></value></member><member><name>state</name><value><int>20</int></value></member><member><name>pid</name><value><int>42</int></value></member><member><name>start</name><value><int>123</int></value></member></struct>",
                         "supervisor.addProcessGroup" | "supervisor.startProcess" => "<boolean>1</boolean>",
@@ -119,7 +120,7 @@ fn start_phase_deadline(slow: &'static str) {
             let error = process_host.start_exact(&candidate, start + std::time::Duration::from_millis(500)).await.unwrap_err();
             assert!(start.elapsed() < std::time::Duration::from_millis(1000), "{slow}: {error:#}");
             assert!(process_host.current.is_none(), "late start cannot commit an incarnation");
-            let expected = ["supervisor.reloadConfig", "supervisor.addProcessGroup", "supervisor.startProcess", "supervisor.getProcessInfo"];
+            let expected = ["supervisor.getAllProcessInfo", "supervisor.reloadConfig", "supervisor.addProcessGroup", "supervisor.startProcess", "supervisor.getProcessInfo"];
             let through = expected.iter().position(|method| *method == slow).unwrap() + 1;
             assert_eq!(&*calls.lock().unwrap(), &expected[..through], "slow phase was not reached: {error:#}");
             host.client.wait_mutations_until(tokio::time::Instant::now() + std::time::Duration::from_secs(1)).await.unwrap();

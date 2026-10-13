@@ -255,21 +255,35 @@ async fn register_candidates(
         // Durable predecessor constraints survive receipt cleanup / Service
         // overwrite. Validate them before deciding whether this candidate has
         // a private confirmation available for registration authority.
-        let recorded = candidate
-            .checkpoint
-            .get("builder_creation_evidence")
-            .map(|value| {
-                serde_json::from_value::<shared_types::BuilderCreationEvidence>(value.clone())
-            })
-            .transpose()
-            .context("Decode recorded builder completion evidence")?;
+        let recorded = match candidate.checkpoint.get("builder_creation_evidence") {
+            Some(value) => {
+                match serde_json::from_value::<shared_types::BuilderCreationEvidence>(value.clone())
+                {
+                    Ok(evidence) => Some(evidence),
+                    Err(error) => {
+                        warn_unreadable_completion(&candidate, "builder_creation_evidence", &error);
+                        continue;
+                    }
+                }
+            }
+            None => None,
+        };
         if let Some(evidence) = &recorded {
-            validate_confirmation(&candidate, evidence, verified)?;
+            // Parsed physical/PVC constraints remain authoritative even if the
+            // surrounding historical legacy checkpoint can no longer decode.
+            validate_private_confirmation(&candidate, evidence, verified)?;
             check_predecessor_consistency(&mut predecessor, evidence)?;
             constraints.push((candidate.clone(), evidence.clone()));
-        } else {
-            validate_checkpoint(&candidate, verified)?;
         }
+        let checkpoint =
+            match serde_json::from_value::<ContainerBasicInfo>(candidate.checkpoint.clone()) {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => {
+                    warn_unreadable_completion(&candidate, "legacy_container_identity", &error);
+                    continue;
+                }
+            };
+        validate_checkpoint_identity(&candidate, &checkpoint, verified)?;
         let Some(receipt) = state.runtime().recover_builder_creation(&context).await? else {
             // The mutable Service confirmation can have been superseded by a
             // later successful ensure. Another independently validated private
@@ -314,6 +328,22 @@ async fn register_candidates(
         return Err(BuilderRegistrationConfirmationRequired.into());
     };
     publish_confirmation(state, &operation, &evidence, verified, &constraints).await
+}
+
+/// Old succeeded metadata is diagnostic. Do not log JSON or the serde error
+/// text: type errors can contain the rejected value, including private input.
+fn warn_unreadable_completion(
+    operation: &UserAppOperationRecord,
+    field: &'static str,
+    error: &serde_json::Error,
+) {
+    tracing::warn!(
+        operation_id = %operation.operation_id,
+        app_id = %operation.app_id,
+        completion_field = field,
+        serde_category = ?error.classify(),
+        "retained unreadable historical builder completion; seeking a current private confirmation"
+    );
 }
 
 fn check_predecessor_consistency(
@@ -376,6 +406,14 @@ fn validate_checkpoint(
 ) -> Result<()> {
     let checkpoint: ContainerBasicInfo = serde_json::from_value(operation.checkpoint.clone())
         .context("Decode succeeded builder registration identity")?;
+    validate_checkpoint_identity(operation, &checkpoint, verified)
+}
+
+fn validate_checkpoint_identity(
+    operation: &UserAppOperationRecord,
+    checkpoint: &ContainerBasicInfo,
+    verified: &ContainerBasicInfo,
+) -> Result<()> {
     if checkpoint.container_id != verified.container_id
         || checkpoint
             .workload_uid
@@ -398,13 +436,21 @@ fn validate_confirmation(
     evidence: &shared_types::BuilderCreationEvidence,
     verified: &ContainerBasicInfo,
 ) -> Result<()> {
+    validate_private_confirmation(operation, evidence, verified)?;
+    validate_checkpoint(operation, verified)
+}
+
+fn validate_private_confirmation(
+    operation: &UserAppOperationRecord,
+    evidence: &shared_types::BuilderCreationEvidence,
+    verified: &ContainerBasicInfo,
+) -> Result<()> {
     evidence
         .validate_operation(operation)
         .map_err(anyhow::Error::msg)?;
     if operation.state != UserAppOperationState::Succeeded {
         return Err(anyhow!("Builder registration operation is not succeeded"));
     }
-    validate_checkpoint(operation, verified)?;
     if evidence.target.workload.as_ref().is_some_and(|workload| {
         workload.kind == shared_types::AppResourceKind::StatefulSet
             && (verified.workload_uid.as_deref() != Some(workload.uid.as_str())

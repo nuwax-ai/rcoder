@@ -216,7 +216,7 @@ pub(super) async fn status(
     ),
     responses(
         (status = 202, description = "Operation accepted or idempotent replay. Fresh Source Start/Restart uses current input and can replace a redacted-credential or missing-history hold without requiring the old artifact release. Artifact restoration retains its original identity checks. While a normal build/deploy is active, a newer Start/Restart supersedes it. While a Stop/Restart control is physically executing, a different Start/Restart is rejected Busy with the active operation identity instead of being queued; same-id retries replay recorded progress and terminal state.", body = serde_json::Value),
-        (status = 409, description = "Conflict: id/replay/busy/revision/instance/recovery. Invalid current credentials, physical cleanup or independent platform write outcomes retain their specific protection. Application migration receipts are advisory and never block admission. Stop retains kernel safety checks.", body = serde_json::Value),
+        (status = 409, description = "Conflict: ERR_INITIALIZING while business startup recovery is active (zero-write rejection); id/replay/busy/revision/instance/recovery. Invalid current credentials, physical cleanup or independent platform write outcomes retain their specific protection. Application migration receipts are advisory and never block admission. Stop retains kernel safety checks.", body = serde_json::Value),
         (status = 503, description = "Management kernel not available: ERR_INITIALIZING during assembly; ERR_RECOVERY_REQUIRED after assembly/credential failure; ERR_PROTOCOL_UNSUPPORTED in a mode without the kernel. No operation is accepted."),
     ),
     tag = "Runtime Control"
@@ -242,8 +242,11 @@ pub(super) async fn submit_operation(
     let kernel = kernel_of(&state)?;
     let is_stop = body.request.kind == shared_types::RuntimeOperationKind::Stop;
     if state.server.initializing() && !is_stop {
+        // Same owner can re-enter startup after a Ready/status observation.
+        // This rejection precedes all admission writes and uses the existing
+        // bounded, original-ID reconciliation category understood by clients.
         return Err(reject(
-            "ERR_INVALID_STATE",
+            "ERR_INITIALIZING",
             "startup recovery has not completed; retry after initialization",
             StatusCode::CONFLICT,
         ));

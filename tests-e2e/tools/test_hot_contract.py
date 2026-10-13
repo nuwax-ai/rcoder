@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import tomllib
 import zipfile
 from pathlib import Path
@@ -70,6 +71,48 @@ class DeploymentIdentityTests(unittest.TestCase):
                     incomplete = dict(operation)
                     del incomplete[field]
                     self.assertFalse(predicate(incomplete, 'new-op', 'manifest-B'))
+
+class ExplicitStartupResponseTests(unittest.TestCase):
+    def setUp(self):
+        self.report = tempfile.TemporaryDirectory()
+        self.addCleanup(self.report.cleanup)
+        with patch.dict(os.environ, {'E2E_REPORT_DIR': self.report.name, 'E2E_RUN_ID': 'startup-response-test'}):
+            self.module = runpy.run_path(str(Path(__file__).with_name('hot_contract.py')))
+
+    def response(self, status, envelope):
+        return self.module['initializing_response'](status, json.dumps(envelope).encode())
+
+    def test_declared_initialization_for_deploy_and_runtime_endpoints_can_wait(self):
+        deploy = {'code': 'ERR_INITIALIZING', 'success': False, 'message': 'runtime owner is initializing', 'data': None, 'tid': None}
+        runtime = {'code': 'ERR_INITIALIZING', 'success': False, 'message': 'startup recovery has not completed'}
+        self.assertTrue(self.response(503, deploy))
+        self.assertTrue(self.response(503, runtime))
+
+    def test_generic_or_old_503_codes_are_not_initialization(self):
+        for code in ('ERR_INVALID_STATE', 'ERR_RECOVERY_REQUIRED', 'ERR_BACKEND_ERROR', 'ERR_FORBIDDEN', ''):
+            with self.subTest(code=code):
+                self.assertFalse(self.response(503, {'code': code, 'success': False, 'message': 'initializing'}))
+
+    def test_other_status_and_invalid_envelope_cannot_be_ignored(self):
+        for status in (200, 400, 409, 500):
+            with self.subTest(status=status):
+                self.assertFalse(self.response(status, {'code': 'ERR_INITIALIZING', 'success': False}))
+        for payload in ({'code': 'ERR_INITIALIZING'}, {'code': 'ERR_INITIALIZING', 'success': True},
+                        {'code': 'ERR_INITIALIZING', 'success': 0}, ['ERR_INITIALIZING']):
+            with self.subTest(payload=payload):
+                self.assertFalse(self.response(503, payload))
+        self.assertFalse(self.module['initializing_response'](503, b'not JSON'))
+        self.assertFalse(self.module['initializing_response'](503, b'\xff'))
+
+    def test_readonly_response_evidence_preserves_status_and_redacts_fixture_token(self):
+        token = self.module['TOKEN']
+        self.module['record_readonly_response']('initial-A', '/v1/deploy/status', 503,
+            json.dumps({'code': 'ERR_INITIALIZING', 'success': False, 'message': 'fixture token=' + token}).encode())
+        path = self.module['REPORT'] / 'readonly-responses.jsonl'
+        recorded = json.loads(path.read_text())
+        self.assertEqual(recorded['status'], 503)
+        self.assertEqual(recorded['response']['code'], 'ERR_INITIALIZING')
+        self.assertNotIn(token, path.read_text())
 
 
 if __name__ == '__main__':

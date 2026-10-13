@@ -737,3 +737,492 @@ async fn unconfirmed_reply_case(reply: &'static str, should_reconcile: bool) {
     }
     assert_eq!(wire.lock().unwrap().posts.len(), 1);
 }
+
+// This fixture exercises the durable external intent entry point, including the
+// disk dispatch marker, rather than calling a synthetic admission helper.
+#[derive(Default)]
+struct InitializingWire {
+    posts: Vec<serde_json::Value>,
+    queried: Vec<String>,
+    accepted: Option<RuntimeOperationRequest>,
+    executions: usize,
+    marker_checks: usize,
+    recovery_polls: usize,
+    initializing_polls: usize,
+    permanent_initializing: bool,
+    recovery_instance: Option<&'static str>,
+    recovery_error: Option<&'static str>,
+    rejection: Option<&'static str>,
+    existing_after_rejection: bool,
+    mismatch_digest: bool,
+    second_server_error: bool,
+    ready_observed: bool,
+    hold_ready_absence_until: Option<tokio::time::Instant>,
+    events: Vec<&'static str>,
+}
+
+async fn initializing_fixture(
+    root: &Path,
+    wire: InitializingWire,
+) -> (
+    String,
+    Arc<Mutex<InitializingWire>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::response::IntoResponse as _;
+    let state = Arc::new(Mutex::new(wire));
+    let posted = state.clone();
+    let queried = state.clone();
+    let recovering = state.clone();
+    let root = root.to_path_buf();
+    let router = axum::Router::new()
+        .route("/v1/runtime/status", axum::routing::get(|| async {
+            axum::Json(serde_json::json!({"success":true,"code":"OK","message":"ok","data": {
+                "desired":"running", "observed":"ready", "revision":7,
+                "recovery_protection":false, "runtime_instance_id":"original-owner",
+            }}))
+        }))
+        .route("/v1/runtime/recovery", axum::routing::get(move |headers: axum::http::HeaderMap| {
+            let recovering = recovering.clone();
+            async move {
+                assert_eq!(headers["x-deploy-token"], "test-token");
+                let mut wire = recovering.lock().unwrap();
+                wire.recovery_polls += 1;
+                if let Some(code) = wire.recovery_error {
+                    wire.events.push("recovery-error");
+                    return (axum::http::StatusCode::SERVICE_UNAVAILABLE, axum::Json(serde_json::json!({"success":false,"code":code,"message":"actual recovery error"}))).into_response();
+                }
+                if wire.permanent_initializing || wire.initializing_polls > 0 {
+                    wire.initializing_polls = wire.initializing_polls.saturating_sub(1);
+                    wire.events.push("recovery-initializing");
+                    return (axum::http::StatusCode::SERVICE_UNAVAILABLE, axum::Json(serde_json::json!({"success":false,"code":"ERR_INITIALIZING","message":"startup not complete"}))).into_response();
+                }
+                wire.ready_observed = true;
+                wire.events.push("recovery-ready");
+                axum::Json(serde_json::json!({"success":true,"code":"OK","message":"ok","data": {
+                    "runtime_instance_id":wire.recovery_instance.unwrap_or("original-owner"),
+                    "deployment_generation_id":"captured-generation", "revision":99,
+                    "kernel_protected":false,"owner_protected":false,
+                    "operation_id":null,"boundary":null,"generation_matches":null,
+                    "credentials_required":false,
+                }})).into_response()
+            }
+        }))
+        .route("/v1/runtime/operations", axum::routing::post(move |headers: axum::http::HeaderMap, axum::Json(request): axum::Json<RuntimeOperationRequest>| {
+            let posted = posted.clone();
+            let root = root.clone();
+            async move {
+                assert_eq!(headers["x-deploy-token"], "test-token");
+                let disk = read(&root.join("dev-server-external.json")).unwrap();
+                assert!(disk.intents.values().any(|intent| intent.request.operation_id == request.operation_id && intent.dispatch_pending), "the original marker must be durable before each POST, including a known zero-write retry");
+                let mut wire = posted.lock().unwrap();
+                wire.marker_checks += 1;
+                wire.posts.push(serde_json::to_value(&request).unwrap());
+                if wire.posts.len() == 1 {
+                    wire.events.push("post-initializing");
+                    if wire.existing_after_rejection { wire.accepted = Some(request); }
+                    return (axum::http::StatusCode::CONFLICT, axum::Json(serde_json::json!({"success":false,"code":wire.rejection.unwrap_or("ERR_INITIALIZING"),"message":"zero new admission writes"}))).into_response();
+                }
+                assert!(wire.ready_observed, "another POST requires successful recovery observation, not just status Ready");
+                assert_eq!(wire.posts.len(), 2, "an ambiguous second reply must never cause a third POST");
+                wire.events.push("post-accepted");
+                wire.executions += 1;
+                wire.accepted = Some(request.clone());
+                if wire.second_server_error {
+                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, axum::Json(serde_json::json!({"success":false,"code":"ERR_BACKEND_ERROR","message":"write happened but reply failed"}))).into_response();
+                }
+                (axum::http::StatusCode::ACCEPTED, axum::Json(serde_json::json!({"data":shared_types::RuntimeOperationAccepted {
+                    operation_id:request.operation_id.clone(),state:RuntimeOperationState::Accepted,poll:format!("/v1/runtime/operations/{}",request.operation_id),
+                }}))).into_response()
+            }
+        }))
+        .route("/v1/runtime/operations/{id}", axum::routing::get(move |headers: axum::http::HeaderMap, axum::extract::Path(id): axum::extract::Path<String>| {
+            let queried = queried.clone();
+            async move {
+                assert_eq!(headers["x-deploy-token"], "test-token");
+                let (response, hold_until) = {
+                    let mut wire = queried.lock().unwrap();
+                    wire.queried.push(id.clone());
+                    match wire.accepted.clone().filter(|request| request.operation_id == id) {
+                        None => {
+                            wire.events.push("original-404");
+                            let hold_until = if wire.ready_observed { wire.hold_ready_absence_until } else { None };
+                            (axum::http::StatusCode::NOT_FOUND.into_response(), hold_until)
+                        }
+                        Some(original) => {
+                            wire.events.push("original-found");
+                            (axum::Json(serde_json::json!({"data": RuntimeOperationView {
+                                operation_id:original.operation_id.clone(),runtime_instance_id:original.expected_runtime_instance_id.clone(),
+                                kind:original.kind,state:RuntimeOperationState::Succeeded,revision:8,
+                                request_digest:if wire.mismatch_digest { "foreign-digest".into() } else { shared_types::runtime_request_digest(&original).unwrap() },
+                                error_code:None,error_message:None,failure_detail:None,
+                            }})).into_response(), None)
+                        }
+                    }
+                };
+                if let Some(until) = hold_until { tokio::time::sleep_until(until).await; }
+                response
+            }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (address, state, server)
+}
+
+#[tokio::test]
+async fn initializing_rejection_resumes_persisted_intent_with_identical_original_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (address, wire, server) = initializing_fixture(
+        dir.path(),
+        InitializingWire {
+            initializing_polls: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+    let manager = manager(dir.path());
+    let owner = client(&address);
+    assert_eq!(
+        owner.status().await.unwrap().observed,
+        shared_types::ObservedHealth::Ready
+    );
+    let mut original = request();
+    original.run_config = Some(shared_types::OperationRunConfig {
+        pg: Some(shared_types::StartPgCredential {
+            username: "original-private-user".into(),
+            password: "original-private-password".into(),
+        }),
+    });
+    let intent = manager
+        .prepare_external_intent("project", dir.path(), &self::owner(&address), &original)
+        .unwrap();
+    assert!(intent.request.run_config.is_none());
+    let result = manager
+        .resume_external_intent_until(
+            "project",
+            &owner,
+            &intent,
+            &original,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+    server.abort();
+    let view = result.expect("typed zero-write initialization rejection must resume the same durable intent within its original deadline");
+    OwnerClient::verify_request_view(&view, &original).unwrap();
+    assert_eq!(view.state, RuntimeOperationState::Succeeded);
+    let wire = wire.lock().unwrap();
+    assert_eq!(
+        wire.posts,
+        vec![serde_json::to_value(&original).unwrap(); 2]
+    );
+    assert_eq!(wire.executions, 1);
+    assert_eq!(wire.marker_checks, 2);
+    assert_eq!(wire.recovery_polls, 3);
+    assert!(wire.queried.iter().all(|id| id == &original.operation_id));
+    let ready = wire
+        .events
+        .iter()
+        .position(|event| *event == "recovery-ready")
+        .unwrap();
+    let repost = wire
+        .events
+        .iter()
+        .position(|event| *event == "post-accepted")
+        .unwrap();
+    assert!(
+        wire.events[ready + 1..repost].contains(&"original-404"),
+        "readiness alone does not prove absence of the original operation"
+    );
+    drop(wire);
+    manager
+        .finish_external_intent("project", &intent.request, false)
+        .unwrap();
+    assert!(manager.read_external_state().unwrap().intents.is_empty());
+    let disk = std::fs::read_to_string(manager.external_state_path()).unwrap();
+    assert!(!disk.contains("original-private-user") && !disk.contains("original-private-password"));
+}
+
+#[tokio::test]
+async fn initializing_rejection_observes_existing_original_without_reposting() {
+    let dir = tempfile::tempdir().unwrap();
+    let (address, wire, server) = initializing_fixture(
+        dir.path(),
+        InitializingWire {
+            existing_after_rejection: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let manager = manager(dir.path());
+    let original = request();
+    let intent = manager
+        .prepare_external_intent("project", dir.path(), &owner(&address), &original)
+        .unwrap();
+    let result = manager
+        .resume_external_intent_until("project", &client(&address), &intent, &original, deadline())
+        .await;
+    server.abort();
+    let view = result.expect("initializing is checked before history: an already existing matching original must be observed, not reposted");
+    OwnerClient::verify_request_view(&view, &original).unwrap();
+    let wire = wire.lock().unwrap();
+    assert_eq!(wire.posts.len(), 1);
+    assert_eq!(wire.recovery_polls, 0);
+    assert_eq!(wire.executions, 0);
+}
+
+#[tokio::test]
+async fn initializing_rejection_preserves_owner_and_original_digest_protection() {
+    for changed_owner in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let (address, wire, server) = initializing_fixture(
+            dir.path(),
+            InitializingWire {
+                recovery_instance: changed_owner.then_some("successor-owner"),
+                existing_after_rejection: !changed_owner,
+                mismatch_digest: !changed_owner,
+                ..Default::default()
+            },
+        )
+        .await;
+        let manager = manager(dir.path());
+        let original = request();
+        let intent = manager
+            .prepare_external_intent("project", dir.path(), &owner(&address), &original)
+            .unwrap();
+        let result = manager
+            .resume_external_intent_until(
+                "project",
+                &client(&address),
+                &intent,
+                &original,
+                deadline(),
+            )
+            .await;
+        server.abort();
+        let error = result.unwrap_err();
+        assert!(
+            format!("{error:#}").contains(if changed_owner {
+                "instance"
+            } else {
+                "digest mismatch"
+            }),
+            "{error:#}"
+        );
+        assert_eq!(wire.lock().unwrap().posts.len(), 1);
+        assert!(
+            manager.read_external_state().unwrap().intents[&key("project", original.kind)]
+                .dispatch_pending
+        );
+    }
+}
+
+#[tokio::test]
+async fn initializing_wait_keeps_original_budget_and_later_unknown_resume_readonly() {
+    let dir = tempfile::tempdir().unwrap();
+    let (address, wire, server) = initializing_fixture(
+        dir.path(),
+        InitializingWire {
+            permanent_initializing: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let first = manager(dir.path());
+    let original = request();
+    let intent = first
+        .prepare_external_intent("project", dir.path(), &owner(&address), &original)
+        .unwrap();
+    let started = tokio::time::Instant::now();
+    let result = first
+        .resume_external_intent_until(
+            "project",
+            &client(&address),
+            &intent,
+            &original,
+            started + Duration::from_millis(700),
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(
+        started.elapsed() < Duration::from_millis(1400),
+        "initialization cannot replace the original deadline with a new 90s budget"
+    );
+    assert!(
+        wire.lock().unwrap().recovery_polls > 0,
+        "the explicit rejection must enter bounded initialization waiting"
+    );
+    assert_eq!(wire.lock().unwrap().posts.len(), 1);
+    assert!(
+        first.read_external_state().unwrap().intents[&key("project", original.kind)]
+            .dispatch_pending
+    );
+    let before = wire.lock().unwrap().recovery_polls;
+    drop(first);
+    let restarted = manager(dir.path());
+    let mut supplied = original.clone();
+    supplied.operation_id = "must-not-refresh-id".into();
+    supplied.expected_revision = 99;
+    let recovered = restarted
+        .prepare_external_intent("project", dir.path(), &owner(&address), &supplied)
+        .unwrap();
+    assert_eq!(recovered.request.operation_id, original.operation_id);
+    let result = restarted
+        .resume_external_intent_until(
+            "project",
+            &client(&address),
+            &recovered,
+            &supplied,
+            tokio::time::Instant::now() + Duration::from_millis(300),
+        )
+        .await;
+    server.abort();
+    assert!(result.is_err());
+    let wire = wire.lock().unwrap();
+    assert_eq!(
+        wire.posts.len(),
+        1,
+        "persisted pending without a live typed rejection remains observation only"
+    );
+    assert_eq!(wire.recovery_polls, before);
+}
+
+#[tokio::test]
+async fn generic_conflict_and_recovery_error_never_authorize_original_repost() {
+    for generic_conflict in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let (address, wire, server) = initializing_fixture(
+            dir.path(),
+            InitializingWire {
+                rejection: generic_conflict.then_some("ERR_INVALID_STATE"),
+                recovery_error: (!generic_conflict).then_some("ERR_BACKEND_ERROR"),
+                ..Default::default()
+            },
+        )
+        .await;
+        let manager = manager(dir.path());
+        let original = request();
+        let intent = manager
+            .prepare_external_intent("project", dir.path(), &owner(&address), &original)
+            .unwrap();
+        let result = manager
+            .resume_external_intent_until(
+                "project",
+                &client(&address),
+                &intent,
+                &original,
+                tokio::time::Instant::now() + Duration::from_millis(600),
+            )
+            .await;
+        server.abort();
+        assert!(result.is_err());
+        let wire = wire.lock().unwrap();
+        assert_eq!(wire.posts.len(), 1);
+        assert_eq!(wire.recovery_polls, if generic_conflict { 0 } else { 1 });
+    }
+}
+
+#[tokio::test]
+async fn initializing_then_ambiguous_reply_only_observes_the_original_second_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (address, wire, server) = initializing_fixture(
+        dir.path(),
+        InitializingWire {
+            second_server_error: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let manager = manager(dir.path());
+    let original = request();
+    let intent = manager
+        .prepare_external_intent("project", dir.path(), &owner(&address), &original)
+        .unwrap();
+    let result = manager
+        .resume_external_intent_until("project", &client(&address), &intent, &original, deadline())
+        .await;
+    server.abort();
+    OwnerClient::verify_request_view(
+        &result.expect("a later ambiguous reply can only observe the already admitted original"),
+        &original,
+    )
+    .unwrap();
+    let wire = wire.lock().unwrap();
+    assert_eq!(
+        wire.posts,
+        vec![serde_json::to_value(&original).unwrap(); 2]
+    );
+    assert_eq!(wire.executions, 1);
+}
+
+#[tokio::test]
+async fn initializing_confirmed_absent_at_deadline_releases_marker_for_original_entry_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let launch_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let (address, wire, server) = initializing_fixture(
+        dir.path(),
+        InitializingWire {
+            // Keep enough initial budget for durable dispatch; complete the final
+            // no-admission proof just before the bounded POST retry backoff expires.
+            hold_ready_absence_until: Some(launch_deadline - Duration::from_millis(100)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let first = manager(dir.path());
+    let original = request();
+    let intent = first
+        .prepare_external_intent("project", dir.path(), &owner(&address), &original)
+        .unwrap();
+    let bounded_owner = OwnerClient::new(&address, "test-token").unwrap();
+    let result = first
+        .resume_external_intent_until(
+            "project",
+            &bounded_owner,
+            &intent,
+            &original,
+            launch_deadline,
+        )
+        .await;
+    let error = result.unwrap_err();
+    let marker = first.read_external_state().unwrap().intents[&key("project", original.kind)]
+        .dispatch_pending;
+    let posts_before_retry = wire.lock().unwrap().posts.len();
+    assert!(format!("{error:#}").contains("not admitted"), "{error:#}");
+    assert!(
+        !marker,
+        "an authenticated same-owner Ready plus final original-ID404, without another POST, must not become a phantom pending dispatch"
+    );
+    assert_eq!(posts_before_retry, 1);
+    drop(first);
+    let restarted = manager(dir.path());
+    let recovered = restarted
+        .prepare_external_intent("project", dir.path(), &owner(&address), &original)
+        .unwrap();
+    assert_eq!(recovered.request.operation_id, original.operation_id);
+    let result = restarted
+        .resume_external_intent_until(
+            "project",
+            &client(&address),
+            &recovered,
+            &original,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+    server.abort();
+    OwnerClient::verify_request_view(
+        &result.expect(
+            "the original entry must continue after a proven zero-admission budget boundary",
+        ),
+        &original,
+    )
+    .unwrap();
+    let wire = wire.lock().unwrap();
+    assert_eq!(
+        wire.posts,
+        vec![serde_json::to_value(&original).unwrap(); 2]
+    );
+    assert_eq!(wire.executions, 1);
+}

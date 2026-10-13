@@ -362,6 +362,17 @@ async fn completed(
     recorded: bool,
     predecessor: bool,
 ) -> (UserAppOperationRecord, BuilderCreationEvidence) {
+    completed_with_checkpoint(state, runtime, id, recorded, predecessor, None).await
+}
+
+async fn completed_with_checkpoint(
+    state: &AppState,
+    runtime: &ConfirmationRuntime,
+    id: &str,
+    recorded: bool,
+    predecessor: bool,
+    malformed: Option<&str>,
+) -> (UserAppOperationRecord, BuilderCreationEvidence) {
     let pending = match state
         .userapp_store
         .admit(&UserAppAdmission {
@@ -404,18 +415,33 @@ async fn completed(
             volumes: runtime.volumes.clone(),
         }
     });
-    let evidence = BuilderCreationEvidence {
+    let mut evidence = BuilderCreationEvidence {
         creation_lease_released: true,
         target,
         container: runtime.info.clone(),
         registration_predecessor: source,
     };
+    if malformed == Some("legacy-volume-conflict") {
+        evidence.registration_predecessor.as_mut().unwrap().volumes[0].uid =
+            "different-live-pvc".into();
+    }
     let mut checkpoint = serde_json::to_value(&evidence.container).unwrap();
     if recorded {
         checkpoint.as_object_mut().unwrap().insert(
             "builder_creation_evidence".into(),
             serde_json::to_value(&evidence).unwrap(),
         );
+    }
+    match malformed {
+        Some("nested") => {
+            checkpoint["builder_creation_evidence"] =
+                serde_json::json!("fixture-private-history-that-must-not-be-logged")
+        }
+        Some("legacy" | "legacy-volume-conflict") => {
+            checkpoint["container_id"] = serde_json::json!(17)
+        }
+        None => {}
+        _ => panic!("unknown malformed checkpoint fixture"),
     }
     let operation = progress(
         &state.userapp_store,
@@ -794,4 +820,260 @@ async fn checkpoint_and_private_receipt_identity_conflicts_never_publish_an_addr
         );
     }
     assert_eq!(runtime.writes.load(Ordering::SeqCst), 0);
+}
+
+async fn assert_original_completed_row(state: &AppState, original: &UserAppOperationRecord) {
+    let saved = state
+        .userapp_store
+        .get_operation(&original.app_id, &original.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(saved).unwrap(),
+        serde_json::to_value(original).unwrap(),
+        "diagnostic-only old checkpoint must remain byte-equivalent as a stored row"
+    );
+}
+
+#[tokio::test]
+async fn malformed_older_nested_or_legacy_completion_allows_later_private_confirmation() {
+    for malformed in ["nested", "legacy"] {
+        let (state, runtime, _directory) = fixture().await;
+        let (old, _) = completed_with_checkpoint(
+            &state,
+            &runtime,
+            "op-a-malformed",
+            true,
+            false,
+            Some(malformed),
+        )
+        .await;
+        let (later, _) = completed(&state, &runtime, "op-z-valid", false, false).await;
+        runtime.receipts.lock().unwrap().remove("op-a-malformed");
+        seed_stale(&state, &runtime);
+        for _ in 0..2 {
+            register_candidates(
+                &state,
+                "receipt-app",
+                &runtime.info,
+                vec![later.clone(), old.clone()],
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                crate::userapp_builder::registered_builder(&state, "receipt-app")
+                    .unwrap()
+                    .container_id,
+                "pod-current"
+            );
+            assert_original_completed_row(&state, &old).await;
+        }
+        assert_eq!(runtime.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.confirmation_requests.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn only_malformed_history_returns_to_admitted_same_resource_confirmation() {
+    for malformed in ["nested", "legacy"] {
+        let (state, runtime, _directory) = fixture().await;
+        let (old, _) = completed_with_checkpoint(
+            &state,
+            &runtime,
+            "op-a-malformed",
+            true,
+            false,
+            Some(malformed),
+        )
+        .await;
+        runtime.receipts.lock().unwrap().remove("op-a-malformed");
+        seed_stale(&state, &runtime);
+        let error = register_candidates(&state, "receipt-app", &runtime.info, vec![old.clone()])
+            .await
+            .unwrap_err();
+        assert!(
+            error.is::<BuilderRegistrationConfirmationRequired>(),
+            "{error:#}"
+        );
+        assert_original_completed_row(&state, &old).await;
+        assert_eq!(runtime.writes.load(Ordering::SeqCst), 0);
+        let before_workload = runtime.current.workload.clone();
+        let before_volumes = volume_identities(&runtime.volumes);
+        #[cfg(feature = "deploy-host")]
+        let (info, later) = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            shared_types::published::register(
+                &runtime.info.container_name,
+                HashMap::from([(60000, port)]),
+            );
+            struct MappingGuard(String);
+            impl Drop for MappingGuard {
+                fn drop(&mut self) {
+                    shared_types::published::unregister(&self.0);
+                }
+            }
+            let _mapping = MappingGuard(runtime.info.container_name.clone());
+            let probes = Arc::new(AtomicUsize::new(0));
+            let counted = probes.clone();
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    axum::Router::new().route(
+                        "/api/version",
+                        axum::routing::get(move || {
+                            let counted = counted.clone();
+                            async move {
+                                counted.fetch_add(1, Ordering::SeqCst);
+                                axum::http::StatusCode::OK
+                            }
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
+            });
+            runtime.allow_confirmation.store(true, Ordering::SeqCst);
+            let info = crate::userapp_builder::ensure_userapp_builder(&state, "receipt-app")
+                .await
+                .unwrap();
+            assert_eq!(info.container_id, runtime.info.container_id);
+            assert_eq!(info.workload_uid, runtime.info.workload_uid);
+            assert!(probes.load(Ordering::SeqCst) > 0);
+            assert_eq!(runtime.confirmation_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(runtime.writes.load(Ordering::SeqCst), 0);
+            let later_id = runtime
+                .receipts
+                .lock()
+                .unwrap()
+                .keys()
+                .find(|id| id.as_str() != old.operation_id)
+                .unwrap()
+                .clone();
+            let later = state
+                .userapp_store
+                .get_operation("receipt-app", &later_id)
+                .await
+                .unwrap()
+                .unwrap();
+            server.abort();
+            let _ = server.await;
+            (info, later)
+        };
+        #[cfg(not(feature = "deploy-host"))]
+        let (info, later) = {
+            // Default deployments have no host-port mapping. Exercise the real
+            // lifecycle admission/progress store and private-confirmation join;
+            // deploy-host also runs the original HTTP probe/creation worker.
+            let (later, _) =
+                completed(&state, &runtime, "op-z-admitted-confirmation", false, false).await;
+            (runtime.info.clone(), later)
+        };
+        assert_eq!(runtime.current.workload, before_workload);
+        assert_eq!(volume_identities(&runtime.volumes), before_volumes);
+        assert_eq!(later.state, UserAppOperationState::Succeeded);
+        // Ordinary candidate scans still see the old row. The full ensure's
+        // new completion must keep closing the gap without another ensure.
+        register_candidates(&state, "receipt-app", &info, vec![old.clone(), later])
+            .await
+            .unwrap();
+        assert_original_completed_row(&state, &old).await;
+        assert_eq!(
+            runtime.confirmation_requests.load(Ordering::SeqCst),
+            usize::from(cfg!(feature = "deploy-host"))
+        );
+        assert_eq!(runtime.writes.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn malformed_legacy_shape_keeps_parsed_pvc_conflicts_protected() {
+    let (state, runtime, _directory) = fixture().await;
+    let (old, _) = completed_with_checkpoint(
+        &state,
+        &runtime,
+        "op-a-malformed",
+        true,
+        true,
+        Some("legacy-volume-conflict"),
+    )
+    .await;
+    let (later, _) = completed(&state, &runtime, "op-z-valid", false, false).await;
+    runtime.receipts.lock().unwrap().remove("op-a-malformed");
+    seed_stale(&state, &runtime);
+    let error = register_candidates(
+        &state,
+        "receipt-app",
+        &runtime.info,
+        vec![later, old.clone()],
+    )
+    .await
+    .unwrap_err();
+    assert!(!error.is::<BuilderRegistrationConfirmationRequired>());
+    assert!(
+        error.to_string().contains("volume identity changed"),
+        "{error:#}"
+    );
+    assert_eq!(
+        crate::userapp_builder::registered_builder(&state, "receipt-app")
+            .unwrap()
+            .container_id,
+        "pod-old"
+    );
+    assert_original_completed_row(&state, &old).await;
+    assert_eq!(runtime.writes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn malformed_history_does_not_hide_unknown_or_actual_uid_conflicts() {
+    for conflict in ["unknown-state", "actual-uid"] {
+        let (state, runtime, _directory) = fixture().await;
+        let (old, _) = completed_with_checkpoint(
+            &state,
+            &runtime,
+            "op-a-malformed",
+            true,
+            false,
+            Some("nested"),
+        )
+        .await;
+        let (mut later, _) = completed(&state, &runtime, "op-z-valid", false, false).await;
+        if conflict == "unknown-state" {
+            later.state = UserAppOperationState::RecoveryRequired;
+        } else {
+            runtime
+                .receipts
+                .lock()
+                .unwrap()
+                .get_mut(&later.operation_id)
+                .unwrap()
+                .target
+                .workload
+                .as_mut()
+                .unwrap()
+                .uid = "foreign-live-sts".into();
+        }
+        seed_stale(&state, &runtime);
+        let error = register_candidates(
+            &state,
+            "receipt-app",
+            &runtime.info,
+            vec![old.clone(), later],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !error.is::<BuilderRegistrationConfirmationRequired>(),
+            "{conflict}: {error:#}"
+        );
+        assert_eq!(
+            crate::userapp_builder::registered_builder(&state, "receipt-app")
+                .unwrap()
+                .container_id,
+            "pod-old"
+        );
+        assert_original_completed_row(&state, &old).await;
+        assert_eq!(runtime.writes.load(Ordering::SeqCst), 0);
+    }
 }

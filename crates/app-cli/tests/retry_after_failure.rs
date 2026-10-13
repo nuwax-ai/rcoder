@@ -52,6 +52,9 @@ fn spawn_owner(workspace: &Path, logs: &Path, token: &str) -> (OwnedServer, Stri
     let child = Command::new(env!("CARGO_BIN_EXE_app-cli"))
         .args([
             "serve",
+            // Isolate explicit Start/retry from the default serve autostart.
+            // Platform management recovery uses this same control-only entry.
+            "--control-only",
             "--workspace",
             workspace.to_str().expect("workspace path"),
             "--log-dir",
@@ -107,37 +110,84 @@ async fn wait_identity(base: &str, token: &str) -> serde_json::Value {
 }
 
 /// identity 视图不含 revision——从 /v1/runtime/status 读出并合并。
+/// 首次请求先只读确认 startup gate；失败后的 revision 查询保留真实恢复保护状态。
 async fn with_revision(
     base: &str,
     token: &str,
     mut identity: serde_json::Value,
+    await_startup: bool,
 ) -> serde_json::Value {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(500))
         .build()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last_recovery = None;
     loop {
-        if let Ok(response) = client
-            .get(format!("{base}/v1/runtime/status"))
-            .header("x-deploy-token", token)
-            .send()
-            .await
+        let mut startup_complete = !await_startup;
+        if await_startup {
+            match client
+                .get(format!("{base}/v1/runtime/recovery"))
+                .header("x-deploy-token", token)
+                .timeout(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(500)),
+                )
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    let status = response.status();
+                    let value: serde_json::Value = response.json().await.unwrap_or_default();
+                    startup_complete = status.is_success()
+                        && value["success"] == true
+                        && identity["runtime_instance_id"]
+                            .as_str()
+                            .is_some_and(|id| !id.is_empty())
+                        && value["data"]["runtime_instance_id"] == identity["runtime_instance_id"];
+                    last_recovery =
+                        Some(serde_json::json!({"status": status.as_u16(), "response": value}));
+                }
+                Err(error) => {
+                    last_recovery = Some(serde_json::json!({"transport_error": error.to_string()}))
+                }
+            }
+        }
+        if startup_complete
+            && let Ok(response) = client
+                .get(format!("{base}/v1/runtime/status"))
+                .header("x-deploy-token", token)
+                .timeout(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(500)),
+                )
+                .send()
+                .await
             && response.status().is_success()
         {
             let status: serde_json::Value = response.json().await.unwrap_or_default();
             let data = status.get("data").cloned().unwrap_or_default();
             if let Some(revision) = data.get("revision").and_then(|v| v.as_u64()) {
+                assert!(
+                    Instant::now() < deadline,
+                    "late status cannot enlarge the startup/revision budget"
+                );
                 identity["revision"] = serde_json::json!(revision);
                 return identity;
             } else if let Some(revision) = status.get("revision").and_then(|v| v.as_u64()) {
+                assert!(
+                    Instant::now() < deadline,
+                    "late status cannot enlarge the startup/revision budget"
+                );
                 identity["revision"] = serde_json::json!(revision);
                 return identity;
             }
         }
         assert!(
             Instant::now() < deadline,
-            "runtime status did not report revision"
+            "runtime startup/status did not open admission/report revision: {last_recovery:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -288,7 +338,7 @@ async fn retry_after_startup_failure_reexecutes_and_replay_returns_original() {
     let token = "probe-token";
 
     let identity = wait_identity(&base, token).await;
-    let identity = with_revision(&base, token, identity).await;
+    let identity = with_revision(&base, token, identity, true).await;
 
     // 第一次 Start：注入的 run command 失败 → 真实 Failed
     let first = submit_start(&base, token, &identity, "op-fail-1")
@@ -325,7 +375,8 @@ async fn retry_after_startup_failure_reexecutes_and_replay_returns_original() {
     // ② 新操作 ID：不得瞬时 completed——两条合法路径：
     //    a) 第一次 clean Failed → 新受理真实执行（事件序列 + 再次终态）；
     //    b) 第一次 RecoveryRequired → 恢复保护明确拒绝（ERR_RECOVERY_REQUIRED）。
-    let fresh_identity = with_revision(&base, token, wait_identity(&base, token).await).await;
+    let fresh_identity =
+        with_revision(&base, token, wait_identity(&base, token).await, false).await;
     match submit_start(&base, token, &fresh_identity, "op-fail-2").await {
         Ok(second) => {
             let submitted_state = second["data"]["state"].as_str().unwrap_or_default();

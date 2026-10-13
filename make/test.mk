@@ -224,3 +224,22 @@ test-e2e-app-cli-k8s-lock test-e2e-app-cli-cephfs-lock:
 	  --storage-class "$${K8S_LOCK_RBD_CLASS:-ceph-rbd}" \
 	  --cephfs-class "$${K8S_LOCK_CEPHFS_CLASS:-cephfs}" \
 	  "$$@" --report "tests-e2e/reports/app-cli-$$scenario-$$(date +%Y%m%d-%H%M%S).json"
+
+# 独立真实 supervisord：透明转发迟到 Stop/Remove，原 StopWork/Restart 恢复。
+# 先写源码回执，再构建 Linux app-cli，再登记产物；不依赖 Compose/LLM。
+OFFICIAL_PROXY_RECOVERY_PYTHON ?= python3
+OFFICIAL_PROXY_RECOVERY_BIN ?= tests-e2e/reports/_bin/app-cli-linux
+OFFICIAL_PROXY_RECOVERY_BUILD_SOURCE ?= tests-e2e/reports/official-proxy-recovery-source.json
+OFFICIAL_PROXY_RECOVERY_IMAGE ?= dev-app-runtime:latest
+OFFICIAL_PROXY_RECOVERY_PLATFORM ?= linux/amd64
+OFFICIAL_PROXY_RECOVERY_REPORT ?= tests-e2e/reports/official-proxy-recovery-$(shell date +%Y%m%d-%H%M%S)
+.PHONY: test-e2e-official-proxy-recovery-source test-e2e-official-proxy-recovery-register test-e2e-official-proxy-recovery
+
+test-e2e-official-proxy-recovery-source:
+	$(OFFICIAL_PROXY_RECOVERY_PYTHON) tests-e2e/tools/official_pingap_recovery_contract.py --write-build-source "$(OFFICIAL_PROXY_RECOVERY_BUILD_SOURCE)"
+
+test-e2e-official-proxy-recovery-register:
+	$(OFFICIAL_PROXY_RECOVERY_PYTHON) tests-e2e/tools/official_pingap_recovery_contract.py --register-binary --app-cli "$(OFFICIAL_PROXY_RECOVERY_BIN)" --build-source "$(OFFICIAL_PROXY_RECOVERY_BUILD_SOURCE)"
+
+test-e2e-official-proxy-recovery:
+	$(OFFICIAL_PROXY_RECOVERY_PYTHON) tests-e2e/tools/official_pingap_recovery_contract.py --app-cli "$(OFFICIAL_PROXY_RECOVERY_BIN)" --build-source "$(OFFICIAL_PROXY_RECOVERY_BUILD_SOURCE)" --image "$(OFFICIAL_PROXY_RECOVERY_IMAGE)" --platform "$(OFFICIAL_PROXY_RECOVERY_PLATFORM)" --report "$(OFFICIAL_PROXY_RECOVERY_REPORT)"

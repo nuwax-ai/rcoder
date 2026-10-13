@@ -312,13 +312,31 @@ impl DevServerManager {
         match client.submit_request_until(&original, deadline).await {
             Ok(view) => Ok(view),
             Err(error) => {
-                if error.downcast_ref::<crate::service::dev_server::owner_client::SubmissionNotDispatched>().is_some() {
+                let undispatched = error.downcast_ref::<crate::service::dev_server::owner_client::SubmissionNotDispatched>().is_some();
+                let initializing_not_admitted = error.downcast_ref::<crate::service::dev_server::owner_client::SubmissionInitializingNotAdmitted>();
+                if let Some(proof) = initializing_not_admitted {
+                    ensure!(
+                        proof.operation_id == original.operation_id
+                            && proof.runtime_instance_id == original.expected_runtime_instance_id,
+                        "initialization no-admission proof changed original identity"
+                    );
+                }
+                if undispatched || initializing_not_admitted.is_some() {
                     self.external_transaction(|state| {
-                        let current = state.intents.get_mut(&key(project, original.kind))
-                            .context("runtime intent disappeared before releasing undispatched request")?;
-                        ensure!(current.request.operation_id == original.operation_id
-                            && current.request.expected_runtime_instance_id == original.expected_runtime_instance_id,
-                            "runtime intent changed before releasing undispatched request");
+                        let current = state
+                            .intents
+                            .get_mut(&key(project, original.kind))
+                            .context(
+                                "runtime intent disappeared before releasing unadmitted request",
+                            )?;
+                        ensure!(
+                            current.request.operation_id == original.operation_id
+                                && current.request.expected_runtime_instance_id
+                                    == original.expected_runtime_instance_id
+                                && current.address == intent.address
+                                && current.digest == intent.digest,
+                            "runtime intent changed before releasing unadmitted request"
+                        );
                         current.dispatch_pending = false;
                         Ok(())
                     })?;

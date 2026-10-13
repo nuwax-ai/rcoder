@@ -50,6 +50,9 @@ fn same_uuid_is_not_sufficient_for_owner_upgrade_identity() {
 #[tokio::test]
 async fn current_official_owner_is_observed_without_bootstrap_or_project_files() {
     let root = tempfile::tempdir().unwrap();
+    let state = runtime_state_layout::ensure_state_root(root.path(), None, None).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("token"), b"existing-owner-token").unwrap();
     let manager = manager(root.path());
     let mut owner = identity(root.path());
     owner

@@ -734,6 +734,20 @@ mod tests {
             // lacks startup-probe-v1: that is the preflight contract under test.
             capabilities: vec![shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into()],
         };
+        // A healthy current owner has a declared source authority and usable
+        // API credentials. Missing-token retirement is a different contract,
+        // covered by owner_recovery's real native handover counterexamples.
+        let project_id = (identity.application_id != "unknown-app")
+            .then(|| std::ffi::OsString::from(&identity.application_id));
+        let state_root = runtime_state_layout::ensure_state_root(&ws, None, project_id.as_deref())
+            .expect("declare the fixture's current source state authority");
+        fs::create_dir_all(&state_root).unwrap();
+        fs::write(
+            state_root.join("identity.json"),
+            serde_json::to_vec(&identity).unwrap(),
+        )
+        .unwrap();
+        fs::write(state_root.join("token"), b"healthy-owner-fixture-token\n").unwrap();
         let posts = Arc::new(AtomicUsize::new(0));
         let count = posts.clone();
         let router = axum::Router::new()

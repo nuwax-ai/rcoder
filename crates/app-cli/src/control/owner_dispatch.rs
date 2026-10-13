@@ -1424,4 +1424,200 @@ mod tests {
         assert_eq!(std::fs::read(ws.join("release.lock.toml")).unwrap(), cached);
         task.abort();
     }
+    #[tokio::test]
+    async fn source_dispatch_reconciles_original_id_when_startup_reopens_after_status() {
+        use crate::runtime_kernel::{DispatchAction, RuntimeKernel, RuntimeStore};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let state_root = root.path().join("control");
+        let state = Arc::new(crate::server::ServerState::new(
+            crate::runtime_status::RuntimeStatusService::default(),
+        ));
+        state.initialize_owner_token().unwrap();
+        let application = std::env::var("PROJECT_ID")
+            .ok()
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| "unknown-app".into());
+        let store = RuntimeStore::open_with_root(state_root.clone(), &workspace).unwrap();
+        let identity = store
+            .load_or_init_identity(
+                application.clone(),
+                "userapp-dev".into(),
+                "workspace".into(),
+                workspace.to_string_lossy().into_owned(),
+                "fixture-generation".into(),
+            )
+            .unwrap();
+        store.store_token(&state.control_token().unwrap()).unwrap();
+        let (commands, mut executions) = tokio::sync::mpsc::unbounded_channel();
+        let kernel = Arc::new(RuntimeKernel::new(
+            store,
+            identity.clone(),
+            Box::new(move |action| {
+                commands.send(action).unwrap();
+            }),
+        ));
+        assert!(state.set_runtime_kernel(kernel.clone()));
+        state.mark_initialized();
+        let (listener, router) = crate::api::bind(
+            "127.0.0.1:0",
+            workspace.clone(),
+            root.path().join("logs"),
+            root.path().join("unused-pingap"),
+            state.clone(),
+        )
+        .await
+        .unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let posts = Arc::new(Mutex::new(Vec::new()));
+        let not_found = Arc::new(AtomicUsize::new(0));
+        let observed_posts = posts.clone();
+        let observed_missing = not_found.clone();
+        let observed_kernel = kernel.clone();
+        let gate = state.clone();
+        let router = router.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let posts = observed_posts.clone();
+                let missing = observed_missing.clone();
+                let gate = gate.clone();
+                let kernel = observed_kernel.clone();
+                async move {
+                    let is_post = request.method() == axum::http::Method::POST
+                        && request.uri().path() == "/v1/runtime/operations";
+                    let lookup = request.method() == axum::http::Method::GET
+                        && request.uri().path().starts_with("/v1/runtime/operations/");
+                    let (request, operation, first) = if is_post {
+                        let (parts, body) = request.into_parts();
+                        let bytes = axum::body::to_bytes(body, 65536).await.unwrap();
+                        let operation: RuntimeOperationRequest =
+                            serde_json::from_slice(&bytes).unwrap();
+                        let first = posts.lock().unwrap().is_empty();
+                        if first {
+                            // Same owner, after Ready/status reads, before admission.
+                            gate.begin_business_session("renewed-management".into(), false, || {
+                                false
+                            });
+                        }
+                        (
+                            axum::http::Request::from_parts(parts, axum::body::Body::from(bytes)),
+                            Some(operation),
+                            first,
+                        )
+                    } else {
+                        (request, None, false)
+                    };
+                    let response = next.run(request).await;
+                    if lookup && response.status() == axum::http::StatusCode::NOT_FOUND {
+                        missing.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if let Some(operation) = operation {
+                        let (parts, body) = response.into_parts();
+                        let bytes = axum::body::to_bytes(body, 65536).await.unwrap();
+                        let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        posts.lock().unwrap().push((
+                            operation.clone(),
+                            parts.status,
+                            envelope["code"].clone(),
+                        ));
+                        if first {
+                            assert!(
+                                kernel.get(&operation.operation_id).await.unwrap().is_none(),
+                                "startup rejection must be zero-write"
+                            );
+                            gate.mark_initialized();
+                        }
+                        axum::http::Response::from_parts(parts, axum::body::Body::from(bytes))
+                    } else {
+                        response
+                    }
+                }
+            },
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let executed = Arc::new(AtomicUsize::new(0));
+        let counted = executed.clone();
+        let executing_kernel = kernel.clone();
+        let worker = tokio::spawn(async move {
+            while let Some(action) = executions.recv().await {
+                let DispatchAction::OrchestrateSource { operation_id, .. } = action else {
+                    panic!("unexpected fixture command: {action:?}")
+                };
+                counted.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    executing_kernel
+                        .mark_execution_consumed(&operation_id)
+                        .await
+                        .unwrap()
+                );
+                executing_kernel
+                    .finish(
+                        &operation_id,
+                        RuntimeOperationState::Succeeded,
+                        None,
+                        None,
+                        0,
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            dispatch_to_owner(&address, &workspace, &state_root, &application),
+        )
+        .await;
+        server.abort();
+        worker.abort();
+        let _ = server.await;
+        let _ = worker.await;
+        let OwnerDispatch::Terminal(view) = result
+            .expect("fixture deadline")
+            .expect("same original run must await reopened initialization")
+        else {
+            panic!("expected terminal")
+        };
+        assert_eq!(view.state, RuntimeOperationState::Succeeded);
+        let posted = posts.lock().unwrap();
+        assert_eq!(
+            posted.len(),
+            2,
+            "one zero-write rejection plus one real admission"
+        );
+        assert_eq!(posted[0].1, axum::http::StatusCode::CONFLICT);
+        assert_eq!(posted[0].2, "ERR_INITIALIZING");
+        assert_eq!(posted[1].1, axum::http::StatusCode::ACCEPTED);
+        assert_eq!(posted[0].0.operation_id, posted[1].0.operation_id);
+        assert_eq!(posted[1].0.operation_id, view.operation_id);
+        assert_eq!(
+            posted[0].0.expected_runtime_instance_id,
+            identity.runtime_instance_id
+        );
+        assert_eq!(
+            posted[1].0.expected_runtime_instance_id,
+            identity.runtime_instance_id
+        );
+        assert_eq!(
+            not_found.load(Ordering::SeqCst),
+            1,
+            "original ID must be reconciled before retry"
+        );
+        assert_eq!(
+            executed.load(Ordering::SeqCst),
+            1,
+            "only the admitted original request executes"
+        );
+        assert_eq!(
+            std::fs::read_dir(state_root.join("operations"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
 }

@@ -410,6 +410,10 @@ pub(crate) fn reconcile_foreign(
         }
         // Mirror reconcile_local's retirement/classification for the rest.
         if previous_container(&value, current.as_ref()) {
+            if let Err(error) = reconcile_previous_container_exit(&root, &value, current.as_ref()) {
+                tracing::warn!(generation = %value.id, %error,
+                    "previous container retirement metadata remains unsettled; current management is independent");
+            }
             continue;
         }
         let generation_lock = lock(&root.join("generation.lock"))?;
@@ -463,6 +467,49 @@ pub(crate) fn reconcile_foreign(
     Ok(abandoned)
 }
 
+/// An old container is excluded from local execution either way. Its matched
+/// platform exit can additionally settle retained metadata, under original
+/// leases, without replaying business work or making old history a new fence.
+fn reconcile_previous_container_exit(
+    root: &Path,
+    captured: &Generation,
+    current: Option<&crate::domain::PhysicalDomain>,
+) -> Result<()> {
+    if !previous_container(captured, current)
+        || !matches!(
+            captured.phase,
+            GenerationPhase::Running | GenerationPhase::Draining
+        )
+        || !crate::domain::has_confirmed_exit(root, captured)?
+    {
+        return Ok(());
+    }
+    let _generation_lock = lock(&root.join("generation.lock"))?;
+    let mut value = generation(root)?;
+    ensure!(
+        value.id == captured.id
+            && value.supervisor == captured.supervisor
+            && value.physical_domain == captured.physical_domain
+            && previous_container(&value, current)
+            && matches!(
+                value.phase,
+                GenerationPhase::Running | GenerationPhase::Draining
+            ),
+        "previous container generation identity changed during exit reconciliation"
+    );
+    ensure!(
+        crate::domain::has_confirmed_exit(root, &value)?,
+        "previous container platform exit evidence changed during reconciliation"
+    );
+    process_utils::command_authority::Gate::try_acquire(root)?.close()?;
+    process_utils::guardian::confirm_physical_domain_exit(root)?;
+    retire_confirmed(&mut value);
+    save(&root.join("generation.json"), &value)?;
+    tracing::info!(generation = %value.id,
+        "matched platform exit settled previous container generation; business results preserved");
+    Ok(())
+}
+
 fn reconcile_local(
     scope: &Path,
     current: Option<&crate::domain::PhysicalDomain>,
@@ -481,11 +528,12 @@ fn reconcile_local(
             continue;
         };
         if previous_container(&value, current) {
-            // Keep foreign process and command receipts unchanged. A replacement
-            // container must not interpret them as live work in its own process
-            // namespace, or depend on a deleted Pod to bootstrap management.
-            tracing::debug!(generation = %value.id,
-                "previous container execution retained as history; recovering local management");
+            if let Err(error) = reconcile_previous_container_exit(&root, &value, current) {
+                tracing::warn!(generation = %value.id, %error,
+                    "previous container retirement metadata remains unsettled; current management is independent");
+            }
+            // Without exact platform exit evidence this remains opaque history.
+            // Never inspect old PIDs in the replacement's process namespace.
             continue;
         }
         let generation_lock = lock(&root.join("generation.lock"))?;
@@ -650,8 +698,9 @@ fn verify_abandoned_worker(
 /// business journal is edited; cleanup is process evidence, not success.
 fn retire_confirmed(value: &mut Generation) {
     value.phase = GenerationPhase::Quiescent;
-    value.error =
-        Some("physical runtime confirmed exit; business outcomes remain unchanged".into());
+    value.error.get_or_insert_with(|| {
+        "physical runtime confirmed exit; business outcomes remain unchanged".into()
+    });
 }
 
 /// The generation's process space (OS boot or PID namespace) was replaced
@@ -1172,5 +1221,321 @@ mod tests {
         assert!(!process_space_ended_with(&foreign, Some(&current)));
         // No current domain (native reader) cannot speak for stamped records.
         assert!(!process_space_ended_with(&foreign, None));
+    }
+    fn previous_container_retirement_fixture() -> (
+        tempfile::TempDir,
+        String,
+        PathBuf,
+        PathBuf,
+        crate::domain::Retirement,
+    ) {
+        let original = domain_fixture("retired-container");
+        let (scope, id) = stuck_scope(Some(original.clone()), Some("retired-process-space".into()));
+        let work = work_root(scope.path(), &id).unwrap();
+        let mut value = generation(&work).unwrap();
+        // Deliberately reuse a live current PID. A platform proof must never
+        // inspect or signal a recorded PID from another container's namespace.
+        value.worker_pid = Some(std::process::id());
+        value.error = Some("original startup failed with exit 37".into());
+        value.exit_code = Some(37);
+        save(&work.join("generation.json"), &value).unwrap();
+        let guardian_id = uuid::Uuid::new_v4().to_string();
+        let guardian = work.join("guardians").join(&guardian_id);
+        save(
+            &guardian.join("receipt.json"),
+            &serde_json::json!({
+                "version":1,"id":guardian_id,"instance_id":id,"phase":"Running",
+                "command_record":null,"command_digest":"original-command",
+                "root_status":null,"diagnostic_pid":std::process::id(),
+            }),
+        )
+        .unwrap();
+        let binding = crate::Binding {
+            component: "app-cli".into(),
+            resource: scope.path().to_path_buf(),
+        };
+        save(
+            &scope.path().join("supervisor.json"),
+            &crate::control::Discovery {
+                version: crate::control::CONTROL_VERSION,
+                instance: "successor-supervisor".into(),
+                address: "127.0.0.1:1".into(),
+                token: "protocol-fixture".into(),
+                requests: Vec::new(),
+                snapshot: crate::Snapshot {
+                    version: 1,
+                    binding: binding.clone(),
+                    supervisor_id: "successor-supervisor".into(),
+                    generation: None,
+                    phase: crate::Phase::Reconciling,
+                    intent: Intent::Stopped,
+                    operation_id: None,
+                    error: None,
+                    problem: None,
+                },
+            },
+        )
+        .unwrap();
+        let proof = crate::domain::Retirement {
+            binding,
+            generation: id.clone(),
+            supervisor_id: value.supervisor,
+            domain: original,
+        };
+        (scope, id, work, guardian, proof)
+    }
+
+    fn reconcile_retired_container_case(
+        scope: &Path,
+        foreign_path: bool,
+    ) -> Result<Option<AbandonedGeneration>> {
+        if foreign_path {
+            reconcile_foreign(scope, "successor-supervisor")
+        } else {
+            reconcile_local(scope, Some(&domain_fixture("current-container")))
+        }
+    }
+
+    // Child libtest processes receive an explicit domain through Command::env,
+    // avoiding process-global env mutation or new unsafe test exemptions.
+    fn run_previous_container_case_in_both_paths(case: &str, child: impl Fn(bool)) {
+        const CHILD_CASE: &str = "RCODER_PREVIOUS_CONTAINER_PROOF_TEST_PATH";
+        if let Ok(path) = std::env::var(CHILD_CASE) {
+            child(path == "foreign");
+            return;
+        }
+        let case = case.strip_prefix("runtime_supervisor::").unwrap_or(case);
+        for path in ["local", "foreign"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", case, "--nocapture"])
+                .env(CHILD_CASE, path)
+                .env(
+                    crate::domain::DOMAIN_ENV,
+                    serde_json::to_string(&domain_fixture("current-container")).unwrap(),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+                "child must execute exactly the registered test: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(
+                output.status.success(),
+                "{path} path failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn previous_container_matching_platform_exit_reconciles_both_paths_without_rewriting_business_failure()
+     {
+        run_previous_container_case_in_both_paths(
+            concat!(
+                module_path!(),
+                "::previous_container_matching_platform_exit_reconciles_both_paths_without_rewriting_business_failure"
+            ),
+            |foreign_path| {
+                for phase in [GenerationPhase::Running, GenerationPhase::Draining] {
+                    let (scope, id, work, guardian, proof) =
+                        previous_container_retirement_fixture();
+                    let mut old = generation(&work).unwrap();
+                    old.phase = phase;
+                    save(&work.join("generation.json"), &old).unwrap();
+                    save(&work.join("physical-exit.json"), &proof).unwrap();
+                    let proof_bytes = std::fs::read(work.join("physical-exit.json")).unwrap();
+                    let business = scope.path().join("business-migration-journal.json");
+                    let business_bytes=br#"{"operation_id":"original-migration","state":"unknown","error":"SQL 37","receipt":{"applied":true,"rollback":null}}"#;
+                    std::fs::write(&business, business_bytes).unwrap();
+                    save(
+                        &work.join("commands/command.json"),
+                        &serde_json::json!({
+                            "version":1,"phase":"Running","identity":{"task_id":"original"},
+                            "error":"original command error","exit_code":37,
+                        }),
+                    )
+                    .unwrap();
+                    assert!(
+                        reconcile_retired_container_case(scope.path(), foreign_path)
+                            .unwrap()
+                            .is_none()
+                    );
+                    let retired = generation(&work).unwrap();
+                    assert_eq!(
+                        retired.phase,
+                        GenerationPhase::Quiescent,
+                        "an exact platform physical-exit must settle old retained generation metadata"
+                    );
+                    assert_eq!(retired.id, id);
+                    assert_eq!(retired.supervisor, old.supervisor);
+                    assert_eq!(retired.physical_domain, old.physical_domain);
+                    assert_eq!(retired.process_epoch, old.process_epoch);
+                    assert_eq!(retired.worker_pid, old.worker_pid);
+                    assert_eq!(retired.exit_code, Some(37));
+                    assert_eq!(retired.error, old.error);
+                    assert!(
+                        process_utils::command_authority::Gate::try_acquire(&work)
+                            .unwrap()
+                            .require_open()
+                            .is_err()
+                    );
+                    let guardian_after: serde_json::Value =
+                        read(&guardian.join("receipt.json")).unwrap();
+                    assert_eq!(guardian_after["phase"], "Quiescent");
+                    assert!(
+                        guardian_after["root_status"].is_null(),
+                        "physical exit is no command success/exit-code evidence"
+                    );
+                    let command: serde_json::Value =
+                        read(&work.join("commands/command.json")).unwrap();
+                    assert_eq!(command["phase"], "Quiescent");
+                    assert_eq!(command["termination"], "PhysicalDomainExited");
+                    assert_eq!(command["error"], "original command error");
+                    assert_eq!(command["exit_code"], 37);
+                    assert_eq!(command["identity"]["task_id"], "original");
+                    assert_eq!(std::fs::read(business).unwrap(), business_bytes);
+                    assert_eq!(
+                        std::fs::read(work.join("physical-exit.json")).unwrap(),
+                        proof_bytes
+                    );
+                    let generation_after = std::fs::read(work.join("generation.json")).unwrap();
+                    assert!(
+                        reconcile_retired_container_case(scope.path(), foreign_path)
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(
+                        std::fs::read(work.join("generation.json")).unwrap(),
+                        generation_after,
+                        "confirmed retirement is idempotent"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn previous_container_absent_bad_or_foreign_platform_proof_keeps_history_without_fencing_new_owner()
+     {
+        run_previous_container_case_in_both_paths(
+            concat!(
+                module_path!(),
+                "::previous_container_absent_bad_or_foreign_platform_proof_keeps_history_without_fencing_new_owner"
+            ),
+            |foreign_path| {
+                for mismatch in [
+                    "absent",
+                    "malformed",
+                    "generation",
+                    "supervisor",
+                    "binding",
+                    "domain-instance",
+                    "domain-authority",
+                    "domain-volume",
+                ] {
+                    let (scope, _id, work, guardian, mut proof) =
+                        previous_container_retirement_fixture();
+                    let proof_path = work.join("physical-exit.json");
+                    match mismatch {
+                        "absent" => {}
+                        "malformed" => std::fs::write(&proof_path, b"{malformed proof").unwrap(),
+                        other => {
+                            match other {
+                                "generation" => proof.generation = uuid::Uuid::new_v4().to_string(),
+                                "supervisor" => proof.supervisor_id = "another-owner".into(),
+                                "binding" => {
+                                    proof.binding.resource = scope.path().join("another-workspace")
+                                }
+                                "domain-instance" => {
+                                    proof.domain.instance = "another-container".into()
+                                }
+                                "domain-authority" => {
+                                    proof.domain.authority = "another-runtime".into()
+                                }
+                                "domain-volume" => proof.domain.volume = "another-volume".into(),
+                                _ => panic!("fixture mismatch {other}"),
+                            }
+                            save(&proof_path, &proof).unwrap();
+                        }
+                    }
+                    let paths = [
+                        work.join("generation.json"),
+                        work.join("commands/command.json"),
+                        guardian.join("receipt.json"),
+                        work.join("command-admission.json"),
+                    ];
+                    let before: Vec<_> = paths
+                        .iter()
+                        .map(|path| std::fs::read(path).unwrap())
+                        .collect();
+                    let proof_before = std::fs::read(&proof_path).ok();
+                    assert!(
+                        reconcile_retired_container_case(scope.path(), foreign_path)
+                            .unwrap()
+                            .is_none(),
+                        "{mismatch}: unconfirmed history cannot fence current management"
+                    );
+                    for (path, bytes) in paths.iter().zip(before) {
+                        assert_eq!(
+                            std::fs::read(path).unwrap(),
+                            bytes,
+                            "{mismatch}: unauthorized history mutation {path:?}"
+                        );
+                    }
+                    assert_eq!(std::fs::read(proof_path).ok(), proof_before);
+                    assert_eq!(generation(&work).unwrap().phase, GenerationPhase::Running);
+                    process_utils::command_authority::Gate::try_acquire(&work)
+                        .unwrap()
+                        .require_open()
+                        .unwrap();
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn previous_container_matched_exit_retries_locked_history_without_fencing_new_container() {
+        run_previous_container_case_in_both_paths(
+            concat!(
+                module_path!(),
+                "::previous_container_matched_exit_retries_locked_history_without_fencing_new_container"
+            ),
+            |foreign_path| {
+                for hold_generation in [true, false] {
+                    let (scope, _id, work, guardian, proof) =
+                        previous_container_retirement_fixture();
+                    save(&work.join("physical-exit.json"), &proof).unwrap();
+                    let path = if hold_generation {
+                        work.join("generation.lock")
+                    } else {
+                        guardian.join("guardian.lock")
+                    };
+                    let held = lock(&path).unwrap();
+                    let result = reconcile_retired_container_case(scope.path(), foreign_path);
+                    drop(held);
+                    assert!(
+                        result.unwrap().is_none(),
+                        "a locked old history range must not fence the independent current container"
+                    );
+                    assert_eq!(generation(&work).unwrap().phase, GenerationPhase::Running);
+                    assert_eq!(
+                        read::<serde_json::Value>(&guardian.join("receipt.json")).unwrap()["phase"],
+                        "Running"
+                    );
+                    assert_eq!(
+                        read::<serde_json::Value>(&work.join("commands/command.json")).unwrap()["phase"],
+                        "Running"
+                    );
+                    assert!(
+                        reconcile_retired_container_case(scope.path(), foreign_path)
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(generation(&work).unwrap().phase, GenerationPhase::Quiescent);
+                }
+            },
+        );
     }
 }

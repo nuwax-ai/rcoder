@@ -203,7 +203,7 @@ async fn ready_kernel_keeps_identity_and_precise_stop_during_business_recovery()
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body["code"], "ERR_INVALID_STATE");
+    assert_eq!(body["code"], "ERR_INITIALIZING");
     assert!(
         published
             .status()
