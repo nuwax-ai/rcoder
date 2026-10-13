@@ -10,6 +10,108 @@ use crate::userapp_lifecycle::PgUserAppStore;
 use shared_types::*;
 use std::time::Duration;
 
+#[tokio::test]
+async fn completed_builder_registration_retries_a_rolled_back_root_token_race() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (completed, evidence) = f.completed(f.basic("racepod", "racests"), true).await;
+    let original_bytes = f.operation_bytes(&completed.operation_id).await;
+    let volumes = f.volumes();
+
+    let (mut competing_writer, connection) = tokio_postgres::connect(&f.dsn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let connection = tokio::spawn(connection);
+    let writer_pid: i32 = competing_writer
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let competing = competing_writer.transaction().await.unwrap();
+    competing
+        .query_one(
+            "SELECT control_revision FROM userapps WHERE app_id=$1 FOR UPDATE",
+            &[&f.app.app_id],
+        )
+        .await
+        .unwrap();
+
+    // The production registration reads the old root token, then its UPDATE
+    // waits on this actual PostgreSQL row lock. Observe that wait before the
+    // other writer commits a new token; no mocked conflict or sleep ordering.
+    let release_competing_writer = async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let blocked: bool = competing
+                    .query_one(
+                        "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND $1=ANY(pg_blocking_pids(pid)))",
+                        &[&writer_pid],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                if blocked {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("registration must reach the real blocked root-token UPDATE");
+        assert_eq!(
+            competing
+                .execute(
+                    "UPDATE userapps SET control_revision=control_revision+1 WHERE app_id=$1",
+                    &[&f.app.app_id],
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        competing.commit().await.unwrap();
+    };
+    let (registration, ()) = tokio::join!(
+        f.store
+            .register_completed_builder_replacement(&completed, &evidence, &volumes),
+        release_competing_writer
+    );
+    registration.expect("known rolled-back root-token race must reread and confirm the builder");
+    assert_eq!(
+        f.store.get(&f.app.app_id).unwrap().container_info(),
+        Some(evidence.container.clone())
+    );
+    let peer = f.peer().await;
+    assert_eq!(
+        peer.get(&f.app.app_id).unwrap().container_info(),
+        Some(evidence.container.clone()),
+        "another replica must observe the committed registration"
+    );
+    assert_eq!(
+        f.control
+            .get_operation(&f.app.app_id, &completed.operation_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        completed,
+        "registration retry must not rewrite the original succeeded operation"
+    );
+    assert_eq!(
+        f.operation_bytes(&completed.operation_id).await,
+        original_bytes
+    );
+    assert!(peer.writer().flush_and_stop(Duration::from_secs(5)).await);
+    assert!(
+        f.store
+            .writer()
+            .flush_and_stop(Duration::from_secs(5))
+            .await
+    );
+    f.owner.shutdown().await.unwrap();
+    drop(competing_writer);
+    connection.await.unwrap().unwrap();
+}
+
 struct Fixture {
     dsn: String,
     owner: DatabaseOwner,

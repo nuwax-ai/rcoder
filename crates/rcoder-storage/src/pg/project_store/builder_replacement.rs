@@ -73,18 +73,14 @@ impl PgStore {
         let operation = operation.clone();
         let evidence = evidence.clone();
         let volumes = volumes.to_vec();
-        let committed = self.database.execute(move |mut db| async move {
-            let mut tx = db.transaction().await?;
-            let result = rebind(&mut tx, &operation, &evidence, &volumes).await;
-            match result {
-                Ok(info) => { tx.commit().await?; Ok(info) }
-                Err(error) => {
-                    tx.rollback().await.map_err(|rollback| anyhow::anyhow!(
-                        "Builder registration rollback failed: {rollback}; original error: {error}"))?;
-                    Err(error)
-                }
-            }
-        }).await.context("Commit verified builder registry replacement")?;
+        let committed = super::database::write_with_conflict_retry(&self.database, move |tx| {
+            let operation = operation.clone();
+            let evidence = evidence.clone();
+            let volumes = volumes.clone();
+            Box::pin(async move { rebind(tx, &operation, &evidence, &volumes).await })
+        })
+        .await
+        .context("Commit verified builder registry replacement")?;
         self.publish_rebound_builder(baseline, committed)
     }
 
@@ -147,20 +143,34 @@ impl PgStore {
         let target = target.clone();
         let container = container.clone();
         let progress = progress.clone();
-        let committed = self.database.execute(move |mut db| async move {
-            let mut tx = db.transaction().await?;
-            let result = async {
-                crate::userapp_lifecycle::commit_builder_registration_adoption(&mut tx, &target, &expected_source_uid, &progress).await?;
-                rebind_rows(&mut tx, &target.context, &target, &container, None, &[], Some(&expected)).await
-            }.await;
-            match result {
-                Ok(info) => { tx.commit().await?; Ok(info) }
-                Err(error) => {
-                    tx.rollback().await.map_err(|rollback| anyhow::anyhow!("Builder adoption rollback failed: {rollback}; original error: {error}"))?;
-                    Err(error)
-                }
-            }
-        }).await.context("Commit explicit builder registration adoption")?;
+        let committed = super::database::write_with_conflict_retry(&self.database, move |tx| {
+            let target = target.clone();
+            let expected_source_uid = expected_source_uid.clone();
+            let progress = progress.clone();
+            let container = container.clone();
+            let expected = expected.clone();
+            Box::pin(async move {
+                crate::userapp_lifecycle::commit_builder_registration_adoption(
+                    tx,
+                    &target,
+                    &expected_source_uid,
+                    &progress,
+                )
+                .await?;
+                rebind_rows(
+                    tx,
+                    &target.context,
+                    &target,
+                    &container,
+                    None,
+                    &[],
+                    Some(&expected),
+                )
+                .await
+            })
+        })
+        .await
+        .context("Commit explicit builder registration adoption")?;
         self.publish_rebound_builder(baseline, committed)
     }
 
