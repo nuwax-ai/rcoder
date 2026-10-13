@@ -19,6 +19,7 @@ use std::time::Duration;
 // 无跨模块路径引用——helpers 私有 glob 仅供 mod.rs 作用域（子模块经
 // `use super::*` 互见）。
 
+mod absent;
 mod configuration;
 mod helpers;
 #[cfg(test)]

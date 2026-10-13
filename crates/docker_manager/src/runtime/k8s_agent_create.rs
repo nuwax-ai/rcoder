@@ -253,7 +253,14 @@ impl KubernetesRuntime {
         // 家族归一：容器身份/环境（SERVICE_TYPE env 等）按家族值——agent_runner
         // 的 cwd 由 gRPC service_type 决定，不消费该 env
         let service_type_str = service_type.container_family_key().to_string();
-        let image = self.select_image(service_type);
+        let image = if *service_type == ServiceType::UserappBuilder {
+            params
+                .image_override
+                .clone()
+                .unwrap_or_else(|| self.select_image(service_type))
+        } else {
+            self.select_image(service_type)
+        };
 
         // Build resource requirements if limits are provided; agent 族容器
         // （ensure/chat 等全部创建入口）未显式传入时用统一常量默认

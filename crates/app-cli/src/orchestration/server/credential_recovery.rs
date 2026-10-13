@@ -1,9 +1,10 @@
-//! New Source input is independent from an older artifact's continued existence.
+//! Explicit new input is independent from an older artifact's continued existence.
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CredentialRecoveryPurpose {
     StartCurrentSource,
+    DeployCurrentArtifact,
     RestoreConfirmedArtifact,
 }
 
@@ -182,6 +183,12 @@ impl ServerState {
                 // Validate the source binding independently of diagnostic
                 // application migration history.
                 resolved_execution_workspace(project, Some(ExecutionTarget::Source), self)?;
+                Ok(CredentialRecovery::SupplyCurrentInput { hold })
+            }
+            // Only an explicitly admitted Deploy uses this policy. Preparation
+            // still validates its own download/hash/CLI/migrations and actual
+            // old-process cleanup; unavailable old recipes are diagnostic.
+            CredentialRecoveryPurpose::DeployCurrentArtifact => {
                 Ok(CredentialRecovery::SupplyCurrentInput { hold })
             }
             CredentialRecoveryPurpose::RestoreConfirmedArtifact => {

@@ -58,10 +58,9 @@ impl KubernetesRuntime {
         target: &BuilderControlTarget,
     ) -> Result<Vec<AppResourceIdentity>> {
         target.validate().map_err(Error::ConfigurationError)?;
-        let workload = target
-            .workload
-            .as_ref()
-            .ok_or_else(|| Error::Conflict("Builder volume workload missing".into()))?;
+        let Some(workload) = target.workload.as_ref() else {
+            return self.capture_absent_builder_volumes(target).await;
+        };
         if workload.kind != AppResourceKind::StatefulSet {
             return Err(Error::ConfigurationError(
                 "Builder volume witness requires StatefulSet".into(),
@@ -141,10 +140,9 @@ impl KubernetesRuntime {
         target: &BuilderControlTarget,
     ) -> Result<Option<BuilderControlTarget>> {
         target.validate().map_err(Error::ConfigurationError)?;
-        let workload = target
-            .workload
-            .as_ref()
-            .ok_or_else(|| Error::Conflict("Original builder target missing".into()))?;
+        let Some(workload) = target.workload.as_ref() else {
+            return self.prepare_absent_builder_retry(target).await;
+        };
         if workload.kind != AppResourceKind::StatefulSet {
             return Err(Error::ConfigurationError(
                 "Builder retry requires a StatefulSet".into(),
@@ -283,7 +281,7 @@ impl KubernetesRuntime {
     ) -> Result<Option<ContainerBasicInfo>> {
         target.validate().map_err(Error::ConfigurationError)?;
         let Some(workload) = target.workload.as_ref() else {
-            return Ok(None);
+            return self.reconcile_absent_builder_creation(target).await;
         };
         if workload.kind != AppResourceKind::StatefulSet {
             return Ok(None);

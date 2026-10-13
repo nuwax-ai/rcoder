@@ -1229,7 +1229,7 @@ impl ServerState {
         let evaluated_recovery = self
             .credential_recovery(
                 req.run_pg.as_ref(),
-                CredentialRecoveryPurpose::RestoreConfirmedArtifact,
+                CredentialRecoveryPurpose::DeployCurrentArtifact,
             )
             .map_err(|error| {
                 AdmissionError::Busy(format!("verify deployment credential recovery: {error:#}"))

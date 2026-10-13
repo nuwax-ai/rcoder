@@ -2,6 +2,9 @@ use super::*;
 use axum::{body::Body, http::Request};
 use tower::ServiceExt as _;
 
+#[path = "artifact_recovery_tests.rs"]
+mod artifact_recovery_tests;
+
 fn release(id: &str) -> ReleaseLock {
     let mut lock: ReleaseLock = toml::from_str(
         "schema_version=1\nrelease_id='initial'\nworkspace_name='source-recovery'\nminimum_app_cli_version='0.1.3'\nruntime_image_digest='registry.example/runtime:fixture'\n[pingap]\nmode='managed'\nversion='0.14.3'\ncommit='fixture'\n[[services]]\nservice_id='web'\nname='Web'\ndir='web'\ntype='python'\nkind='web'\nenabled=true\nport=4200\nlogs=[]\n[services.run]\ncommand=['python3','main.py']\nmigrate=[]\ndepends_on=[]\nshutdown_timeout_seconds=3\n[services.health]\nreadiness_path='/ready'\n[services.env]\n",

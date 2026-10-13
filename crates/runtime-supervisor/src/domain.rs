@@ -130,7 +130,9 @@ pub fn pending(root: &Path, binding: &Binding) -> Result<Vec<Retirement>> {
         return Ok(result);
     }
     for entry in std::fs::read_dir(work)? {
-        let path = entry?.path();
+        let Some(path) = record::generation_entry_root(entry?)? else {
+            continue;
+        };
         if !path.join("generation.json").try_exists()? {
             continue;
         }
@@ -242,7 +244,9 @@ pub(crate) fn has_confirmed_resident_exit(
         return Ok(false);
     }
     for entry in std::fs::read_dir(work)? {
-        let root = entry?.path();
+        let Some(root) = record::generation_entry_root(entry?)? else {
+            continue;
+        };
         if !root.join("generation.json").try_exists()? {
             continue;
         }

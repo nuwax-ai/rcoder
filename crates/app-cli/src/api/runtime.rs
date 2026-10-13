@@ -264,7 +264,7 @@ pub(super) async fn submit_operation(
         shared_types::RuntimeOperationKind::Deploy => match &body.request.profile {
             shared_types::RunProfileInput::Source { .. } => None,
             shared_types::RunProfileInput::Artifact { .. } => {
-                Some(CredentialRecoveryPurpose::RestoreConfirmedArtifact)
+                Some(CredentialRecoveryPurpose::DeployCurrentArtifact)
             }
         },
         shared_types::RuntimeOperationKind::Stop => None,

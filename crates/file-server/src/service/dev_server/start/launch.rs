@@ -114,7 +114,7 @@ impl DevServerManager {
     }
 
     /// 共享启动管线（legacy start 与协调票据模式共用）：npmrc → dev-inject →
-    /// 依赖安装 → spawn → 就绪轮询 → 登记。
+    /// 依赖安装 → 类型检查 → spawn → 就绪轮询 → 登记。
     ///
     /// `registry_key`：processes 表键（legacy=project_id；协调票据=preview_key）。
     /// `log_key`：日志目录命名键（恒 project_id，get-dev-log 兼容）。
@@ -148,7 +148,14 @@ impl DevServerManager {
         // N08：注入命令是 sh 语法（set +e/; 分隔）——Windows 无 sh，显式跳过
         // （非阻塞语义下 warn 可见，不假装执行成功）
         #[cfg(not(windows))]
-        if let Err(e) = process::run_command_to_log(
+        {
+            let completion = Mutex::new(None);
+            let completed = |value| {
+                *completion
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(value);
+            };
+            if let Err(e) = process::run_command_to_log(
             "sh",
             &[
                 "-c",
@@ -158,23 +165,31 @@ impl DevServerManager {
             &main_log,
             &temp_log,
             self.config.dev_command_timeout_secs,
-            Default::default(),
+            process::CommandObservers { on_completed: Some(&completed), ..Default::default() },
         )
         .await
         {
-            tracing::warn!(error = %e, "dev-inject/design-mode preCmd failed (non-blocking)");
+            if completion.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none() {
+                return Err(e);
+            }
+            tracing::warn!(error = %e, "dev-inject/design-mode preCmd failed after confirmed cleanup (non-blocking)");
+        }
         }
         #[cfg(windows)]
         tracing::warn!(
             "dev-inject/design-mode preCmd skipped on Windows (shell-script based              injector); design mode unavailable in this environment"
         );
 
-        let (child, stdout, stderr) = match ovr {
+        enum PreparedDev {
+            Override(String),
+            Package(process::DevArgs),
+        }
+        let prepared = match ovr {
             Some(ovr) => {
                 let cmd = ovr
                     .replace("{PORT}", &port.to_string())
                     .replace("{BASE}", base_path.unwrap_or("/").trim_end_matches('/'));
-                process::spawn_override_shell(&cmd, project_path)?
+                PreparedDev::Override(cmd)
             }
             None => {
                 let dev_script = read_dev_script(project_path)?;
@@ -192,13 +207,16 @@ impl DevServerManager {
                 .map_err(|error| {
                     AppError::system(format!("Dependency installation failed: {error}"))
                 })?;
-                let dev_args = process::build_dev_args(&dev_script, port, base_path)?;
-                process::spawn_dev(
-                    dev_args.program,
-                    &dev_args.args,
-                    project_path,
-                    &dev_args.env_extra,
-                )?
+                PreparedDev::Package(process::build_dev_args(&dev_script, port, base_path)?)
+            }
+        };
+        crate::service::dev_typecheck::run(project_path, log_key, &main_log, &temp_log).await?;
+        let (child, stdout, stderr) = match prepared {
+            PreparedDev::Override(command) => {
+                process::spawn_override_shell(&command, project_path)?
+            }
+            PreparedDev::Package(args) => {
+                process::spawn_dev(args.program, &args.args, project_path, &args.env_extra)?
             }
         };
         let pid = child

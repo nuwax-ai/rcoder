@@ -236,7 +236,9 @@ impl Owner {
                 .map_err(|e| format!("native owner already held or inaccessible: {e}"))?;
             Some(lock)
         };
-        if let Some(previous) = read(&root)?.filter(|r| r.phase != "Stopped") {
+        if let Some(previous) = native_receipt::read_before_launch(&root, worker.as_ref())?
+            .filter(|r| r.phase != "Stopped")
+        {
             if worker.is_some() {
                 native_previous::reconcile(&root, &previous)?;
             } else {
@@ -642,16 +644,19 @@ fn recover_under_owner_lock(
     if workers.try_exists().map_err(|e| e.to_string())? {
         for entry in std::fs::read_dir(&workers).map_err(|e| e.to_string())? {
             let path = entry.map_err(|e| e.to_string())?.path();
-            let mut value: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(&path).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?;
+            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+            let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                tracing::warn!(path = %path.display(), "retired native owner's damaged worker history preserved");
+                continue;
+            };
             if value["version"] != 1
                 || !matches!(
                     value["phase"].as_str(),
                     Some("SpawnPending" | "Running" | "Quiescent")
                 )
             {
-                return Err("worker receipt damaged/unknown; recovery protected".into());
+                tracing::warn!(path = %path.display(), "retired native owner's unknown worker history preserved");
+                continue;
             }
             if value["phase"] != "Quiescent" {
                 value["phase"] = "Quiescent".into();
@@ -872,6 +877,10 @@ pub async fn control_with_request(
         .await
         .map_err(|_| "owner response unknown; receipt preserved".to_owned())?
 }
+
+#[cfg(test)]
+#[path = "native_recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {

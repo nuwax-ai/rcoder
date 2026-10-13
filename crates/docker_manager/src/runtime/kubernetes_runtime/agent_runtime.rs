@@ -198,6 +198,27 @@ impl AgentContainerRuntime for KubernetesRuntime {
         self.start_builder_compute(target).await
     }
 
+    async fn ensure_absent_builder_control(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        volumes: &[shared_types::AppResourceIdentity],
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        self.ensure_absent_builder_compute(target, volumes, receipt)
+            .await
+    }
+
+    async fn builder_compute_write_acknowledged(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        starting: bool,
+    ) -> ContainerRuntimeResult<bool> {
+        if starting && target.workload.is_none() {
+            return self.absent_builder_creation_acknowledged(target).await;
+        }
+        Ok(false)
+    }
+
     async fn start_builder_control_with_restart(
         &self,
         target: &shared_types::BuilderControlTarget,

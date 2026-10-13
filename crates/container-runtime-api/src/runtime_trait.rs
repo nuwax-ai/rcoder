@@ -360,6 +360,20 @@ pub trait AgentContainerRuntime: Send + Sync {
         ))
     }
 
+    /// Restore actually absent builder compute under the original control lease.
+    /// Retained workspace witnesses are verified before and after creation;
+    /// this never opens another operation or reacquires the application lease.
+    async fn ensure_absent_builder_control(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+        _volumes: &[shared_types::AppResourceIdentity],
+        _receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Absent builder creation under the original lease is unsupported".into(),
+        ))
+    }
+
     /// Start using the restart archive captured before stopping old compute.
     /// Runtimes that freeze a candidate configuration consume that same archive;
     /// legacy archives retain their original startup semantics.

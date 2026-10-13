@@ -27,6 +27,8 @@ pub enum AppError {
     ValidationI18n(String, &'static str),
     /// BUSINESS_ERROR (400)
     Business(String),
+    /// 业务错误的 TypeScript details（保留原信封；可携带 TYPECHECK_FAILED）。
+    BusinessWithDetails(String, Value),
     /// CONFLICT (409): an existing identified operation must be resolved first.
     Conflict(String),
     /// Management recovery needs physical cleanup evidence (409), with the
@@ -137,6 +139,9 @@ impl AppError {
     pub fn business(msg: impl Into<String>) -> Self {
         AppError::Business(msg.into())
     }
+    pub fn business_with_details(msg: impl Into<String>, details: Value) -> Self {
+        AppError::BusinessWithDetails(msg.into(), details)
+    }
     pub fn permission(msg: impl Into<String>) -> Self {
         AppError::Permission(msg.into())
     }
@@ -162,7 +167,7 @@ impl AppError {
     fn type_name(&self) -> &'static str {
         match self {
             AppError::Validation(..) | AppError::ValidationI18n(..) => "VALIDATION_ERROR",
-            AppError::Business(_) => "BUSINESS_ERROR",
+            AppError::Business(_) | AppError::BusinessWithDetails(..) => "BUSINESS_ERROR",
             AppError::Conflict(_) | AppError::RuntimeRecovery(..) => "CONFLICT",
             AppError::Permission(_) => "PERMISSION_ERROR",
             AppError::Resource(_) => "RESOURCE_ERROR",
@@ -178,9 +183,10 @@ impl AppError {
     fn status_code(&self) -> StatusCode {
         match self {
             AppError::RuntimeDiagnostic(error) => error.status_code(),
-            AppError::Validation(..) | AppError::ValidationI18n(..) | AppError::Business(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            AppError::Validation(..)
+            | AppError::ValidationI18n(..)
+            | AppError::Business(_)
+            | AppError::BusinessWithDetails(..) => StatusCode::BAD_REQUEST,
             AppError::Permission(_) => StatusCode::FORBIDDEN,
             AppError::Conflict(_) | AppError::RuntimeRecovery(..) => StatusCode::CONFLICT,
             AppError::Resource(_) => StatusCode::NOT_FOUND,
@@ -194,7 +200,9 @@ impl AppError {
             AppError::Validation(m, _) => m,
             // 返回英文 fallback; 实际翻译在 into_response 里按 locale 做。
             AppError::ValidationI18n(fallback, _) => fallback,
-            AppError::Business(m) | AppError::Conflict(m) => m,
+            AppError::Business(m) | AppError::BusinessWithDetails(m, _) | AppError::Conflict(m) => {
+                m
+            }
             AppError::RuntimeRecovery(m, _) => m,
             AppError::Permission(m) => m,
             AppError::Resource(m) => m,
@@ -216,7 +224,7 @@ impl AppError {
     fn details(&self) -> Option<&Value> {
         match self {
             AppError::Validation(_, d) => d.as_ref(),
-            AppError::RuntimeRecovery(_, d) => Some(d),
+            AppError::RuntimeRecovery(_, d) | AppError::BusinessWithDetails(_, d) => Some(d),
             _ => None,
         }
     }
@@ -336,9 +344,15 @@ impl IntoResponse for AppError {
         if let Some(d) = self.details() {
             error["details"] = d.clone();
         }
-        // code 恒 "UNKNOWN_ERROR" (对齐 nuwax: AppError 不设 code, formatErrorResponse
-        // 兜底 UNKNOWN_ERROR; 具体类型在 error.type)。
-        let body = json!({ "success": false, "code": "UNKNOWN_ERROR", "error": error });
+        // 新业务 details.code 对齐 TS formatErrorResponse；既有错误代码不变。
+        let code = match &self {
+            AppError::BusinessWithDetails(_, details) => details
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("UNKNOWN_ERROR"),
+            _ => "UNKNOWN_ERROR",
+        };
+        let body = json!({ "success": false, "code": code, "error": error });
         (status, Json(body)).into_response()
     }
 }

@@ -66,12 +66,52 @@ pub fn directory(host: &str, port: u16) -> Result<PathBuf, String> {
     Ok(root.join(format!("native-{host_key}-{port}")))
 }
 pub(super) fn read(root: &Path) -> Result<Option<Receipt>, String> {
+    read_bytes(root)?.as_deref().map(decode).transpose()
+}
+
+/// Control still requires a readable exact owner. A freshly authorized worker
+/// may replace opaque history only after independent execution checks; bytes
+/// are preserved before the new owner's normal publication.
+pub(super) fn read_before_launch(
+    root: &Path,
+    worker: Option<&runtime_supervisor::Worker>,
+) -> Result<Option<Receipt>, String> {
+    let Some(bytes) = read_bytes(root)? else {
+        return Ok(None);
+    };
+    match decode(&bytes) {
+        Ok(receipt) => {
+            if receipt.phase != "Stopped"
+                && receipt.supervisor_id.is_none()
+                && let Some(worker) = worker
+            {
+                super::native_previous::preserve_opaque(root, worker, &bytes)?;
+                Ok(None)
+            } else {
+                Ok(Some(receipt))
+            }
+        }
+        Err(error) => {
+            let Some(worker) = worker else {
+                return Err(error);
+            };
+            super::native_previous::preserve_opaque(root, worker, &bytes)?;
+            Ok(None)
+        }
+    }
+}
+
+fn read_bytes(root: &Path) -> Result<Option<Vec<u8>>, String> {
     let bytes = match std::fs::read(root.join("owner.json")) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("read owner receipt: {error}")),
     };
-    let receipt: Receipt = serde_json::from_slice(&bytes)
+    Ok(Some(bytes))
+}
+
+fn decode(bytes: &[u8]) -> Result<Receipt, String> {
+    let receipt: Receipt = serde_json::from_slice(bytes)
         .map_err(|e| format!("invalid owner receipt (preserved): {e}"))?;
     if receipt.version != VERSION
         || receipt.instance_id.is_empty()
@@ -90,7 +130,7 @@ pub(super) fn read(root: &Path) -> Result<Option<Receipt>, String> {
     if !address.ip().is_loopback() {
         return Err("owner control address is not loopback".into());
     }
-    Ok(Some(receipt))
+    Ok(receipt)
 }
 pub(super) fn write(root: &Path, receipt: &Receipt) -> Result<(), String> {
     use std::io::Write;

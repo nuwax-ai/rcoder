@@ -150,3 +150,6 @@ impl preview_coordinator::HostEvidence for KubeHostEvidence {
         }
     }
 }
+
+#[cfg(test)]
+mod dev_typecheck_tests;

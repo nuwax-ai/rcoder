@@ -346,6 +346,9 @@ pub enum PreviewCoordinationError {
     /// 参数/身份非法。
     #[error("invalid preview request: {0}")]
     Invalid(String),
+    /// 已确认执行器退出后的源码业务拒绝；只传代码和真实诊断，不是运行时不可用。
+    #[error("preview business rejection ({code}): {message}")]
+    Business { code: String, message: String },
 }
 
 /// start/restart 的项目身份（handler 先经 WorkspaceResolver 解析真实目录再进协调）。
@@ -487,6 +490,9 @@ pub enum PreviewExecutorError {
     /// 端口被占（strictPort 失败语义）——协调器换端口有界重试。
     #[error("preview port in use: {0}")]
     PortInUse(String),
+    /// 类型检查等已确认完成的源码拒绝；未知进程或清理失败必须仍为 Failed。
+    #[error("preview business rejection ({code}): {message}")]
+    Business { code: String, message: String },
 }
 
 #[async_trait::async_trait]

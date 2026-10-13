@@ -323,7 +323,7 @@ impl SupervisordHost {
             ) {
                 Ok(Some(receipt)) if receipt.config == config => Ok(()),
                 _ => {
-                    self.authorize_current_entry_domain_until(&scope, deadline)
+                    self.authorize_current_entry_domain_until(scope, deadline)
                         .await?;
                     self.preserve_resident_history_until(runtime_root, deadline)
                         .await
@@ -557,7 +557,7 @@ impl SupervisordHost {
                 "resident program changed while binding its command"
             );
             admin_probe::register_verified_legacy_endpoint(&spec)?;
-            return Ok((config, spec));
+            Ok((config, spec))
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -618,10 +618,9 @@ impl SupervisordHost {
             runtime_root,
             identity,
             &crate::xmlrpc::default_socket_path(),
-        ) {
-            if receipt.config == config {
-                return Ok(());
-            }
+        ) && receipt.config == config
+        {
+            return Ok(());
         }
         self.authorize_live_supervisor_owner_until(&scope, deadline)
             .await?;
@@ -711,18 +710,18 @@ impl SupervisordHost {
         scope.record_running_until(deadline).await?;
         self.settle_entry_writes_until(deadline).await?;
         validate_entry_configuration_domain(runtime_root, config)?;
-        if process.is_none() {
-            if let Some(info) = self.resident_entry_settled_until(deadline).await? {
-                anyhow::ensure!(
-                    matches!(
-                        info.checked_state(PINGAP_PROGRAM)?,
-                        SupervisorProcessState::Stopped
-                            | SupervisorProcessState::Exited
-                            | SupervisorProcessState::Fatal
-                    ) && info.pid == Some(0),
-                    "proxy bootstrap cannot rewrite a live or unconfirmed execution claim"
-                );
-            }
+        if process.is_none()
+            && let Some(info) = self.resident_entry_settled_until(deadline).await?
+        {
+            anyhow::ensure!(
+                matches!(
+                    info.checked_state(PINGAP_PROGRAM)?,
+                    SupervisorProcessState::Stopped
+                        | SupervisorProcessState::Exited
+                        | SupervisorProcessState::Fatal
+                ) && info.pid == Some(0),
+                "proxy bootstrap cannot rewrite a live or unconfirmed execution claim"
+            );
         }
         if let Err(history) = verify_resident_engine_receipt(
             runtime_root,

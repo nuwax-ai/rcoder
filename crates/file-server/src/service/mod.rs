@@ -8,6 +8,7 @@ pub mod build_manager;
 pub mod code;
 pub mod computer_ws;
 pub mod dev_server;
+pub(crate) mod dev_typecheck;
 pub mod fs_browser;
 pub mod fs_util;
 pub mod git;

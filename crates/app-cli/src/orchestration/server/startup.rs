@@ -1800,7 +1800,7 @@ pub(super) async fn assemble_runtime_kernel(
             DispatchAction::DeployArtifact { pg, .. }
             | DispatchAction::DeployLocalArtifact { pg, .. } => dispatch_state.credential_recovery(
                 pg.as_ref(),
-                CredentialRecoveryPurpose::RestoreConfirmedArtifact,
+                CredentialRecoveryPurpose::DeployCurrentArtifact,
             ),
             DispatchAction::StopBusiness { .. } | DispatchAction::CancelSource { .. } => {
                 Ok(CredentialRecovery::NotRequired)
@@ -2240,7 +2240,7 @@ fn dispatch_artifact_after_management(
             // remain protected by the existing recovery handoff.
             let evaluated = state.credential_recovery(
                 request.run_pg.as_ref(),
-                CredentialRecoveryPurpose::RestoreConfirmedArtifact,
+                CredentialRecoveryPurpose::DeployCurrentArtifact,
             )?;
             if evaluated.supplies_credentials() {
                 state.consume_credentials_hold(&operation_id, evaluated)?;
@@ -2663,6 +2663,17 @@ pub(super) async fn initialize_startup(
     }
     let restored = restored_runtime_args(&stopped_args, state)?;
     let args = &restored;
+    if !env_deploy_requested(state) {
+        let pg = state
+            .pending_run_config
+            .lock()
+            .map_err(|_| anyhow::anyhow!("pending run credential lock poisoned"))?
+            .clone();
+        state.credential_recovery(
+            pg.as_ref(),
+            CredentialRecoveryPurpose::RestoreConfirmedArtifact,
+        )?;
+    }
     if env_deploy_requested(state) {
         let generation = std::env::var(shared_types::APP_DEPLOY_GENERATION_ID)
             .context("APP_DEPLOY_GENERATION_ID is required")?;

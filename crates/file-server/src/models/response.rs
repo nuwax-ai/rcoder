@@ -57,16 +57,44 @@ pub struct VersionResponse {
 // ── computer 工作区 ─────────────────────────────────────────────────────────────
 
 /// 单个 skill URL 推送失败 (best-effort 语义下收集, 透传给调用方)。
-#[derive(serde::Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct SkillFailure {
-    /// 推送失败的 skill URL
+    /// skillUrlMap 指定的技能名；未指定时为 null（与 TypeScript 相同）。
+    pub name: Option<String>,
+    /// 推送失败的 skill URL。
     pub url: String,
-    /// 失败原因
+    /// TypeScript failedSkills 的失败原因。
+    pub reason: String,
+    /// 保留既有 Rust 客户端使用的错误明细。
     pub error: String,
+}
+impl SkillFailure {
+    pub(crate) fn from_error(
+        name: Option<String>,
+        url: &str,
+        stage: &str,
+        error: &crate::error::AppError,
+    ) -> Self {
+        let detail = error.to_string();
+        let reason = match error {
+            crate::error::AppError::Validation(message, _)
+                if message == "No skill directory found in downloaded zip" =>
+            {
+                message.clone()
+            }
+            _ => format!("{stage}: {detail}"),
+        };
+        Self {
+            name,
+            url: url.to_string(),
+            reason,
+            error: detail,
+        }
+    }
 }
 
 /// create-workspace 响应 (对齐 nuwax createWorkspace 响应字段)。
-/// workspaceRoot = COMPUTER_WORKSPACE_DIR; updatedSkills/failedSkills 空时不输出。
+/// workspaceRoot = COMPUTER_WORKSPACE_DIR; failedSkills 恒为数组（与 TypeScript 相同）。
 #[derive(serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateWorkspaceResponse {
@@ -79,8 +107,7 @@ pub struct CreateWorkspaceResponse {
     /// 已推送的技能目录名列表（空时不输出）
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub updated_skills: Vec<String>,
-    /// best-effort 透传: 推送失败的 skill URL 明细 (空则不输出)。
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// 单技能失败明细；全部成功时为 []，不会阻断工作区创建。
     pub failed_skills: Vec<SkillFailure>,
     /// Agent Store v2 字段；legacy workspace 模式不输出。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -805,6 +832,8 @@ pub struct PushSkillsResult {
     pub workspace_root: String,
     /// 已推送的技能目录名列表
     pub updated_skills: Vec<String>,
+    /// 单技能 URL 失败明细；推送其他技能与聊天可继续。
+    pub failed_skills: Vec<SkillFailure>,
     /// agent 实体存储路径（未走实体存储时无该键）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_store_path: Option<String>,
@@ -1347,6 +1376,8 @@ pub struct ProjectPushSkillsResult {
     pub project_path: String,
     /// 已推送技能目录名列表
     pub updated_skills: Vec<String>,
+    /// 单技能 URL 失败明细；推送其他技能与聊天可继续。
+    pub failed_skills: Vec<SkillFailure>,
 }
 
 /// backup-current-version（git 未启用分支）响应。
@@ -1808,9 +1839,16 @@ mod wire_shape_tests {
                 message: "m".into(),
                 workspace_root: "w".into(),
                 updated_skills: Vec::new(),
+                failed_skills: Vec::new(),
                 agent_store_path: None,
             }),
-            ["success", "message", "workspaceRoot", "updatedSkills"],
+            [
+                "success",
+                "message",
+                "workspaceRoot",
+                "updatedSkills",
+                "failedSkills"
+            ],
             "agentStorePath 仅实体存储存在时携带"
         );
         assert_eq!(

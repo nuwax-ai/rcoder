@@ -9,6 +9,10 @@ fn invalid(message: &str) -> Error {
     Error::InvalidOperation(message.into())
 }
 
+#[path = "compute_restart_absence.rs"]
+mod restart_absence;
+use restart_absence::{retained_builder_creation, stopped_builder_absence};
+
 fn owns(record: &ComputeControlRecord, identity: &ComputeExecutorIdentity) -> bool {
     record.app_id == identity.app_id
         && record.lifecycle_id == identity.lifecycle_id
@@ -146,7 +150,18 @@ pub(super) async fn advance(
             serde_json::from_value(record.checkpoint.clone()).map_err(storage)?;
         let next: BuilderControlTarget =
             serde_json::from_value(progress.checkpoint.clone()).map_err(storage)?;
-        if original.restart_runtime_workspace != next.restart_runtime_workspace {
+        let confirmed_absence = progress.stage == ComputeControlStage::Starting
+            && stopped_builder_absence(&record, &next)
+            && record.checkpoint.get("builder_volumes")
+                == progress.checkpoint.get("builder_volumes");
+        if original.workload.is_some() && next.workload.is_none() && !confirmed_absence {
+            return Err(invalid(
+                "Builder recreation requires a stopped retained-volume boundary",
+            ));
+        }
+        if original.restart_runtime_workspace != next.restart_runtime_workspace
+            && !confirmed_absence
+        {
             return Err(invalid("Builder restart workspace intent is immutable"));
         }
     }
@@ -241,7 +256,8 @@ pub(super) async fn acknowledge_drain(
                 && matches!(record.stage.as_str(), "starting" | "stopping")
                 && record.lease.is_some()
                 && *checkpoint == record.checkpoint
-                && record.has_docker_compute_target() => {}
+                && (record.has_docker_compute_target()
+                    || (record.stage == "starting" && retained_builder_creation(&record))) => {}
         ComputeControlDrainEvidence::NoMutationSubmitted if record.stage == "draining_previous" => {
         }
         ComputeControlDrainEvidence::MutationCompleted { checkpoint }
@@ -811,39 +827,52 @@ pub(super) async fn resume_builder_restart(
         serde_json::from_value(snapshot.checkpoint.clone()).map_err(storage)?;
     old.validate().map_err(Error::InvalidOperation)?;
     target.validate().map_err(Error::InvalidOperation)?;
-    let original = old
-        .workload
-        .as_ref()
-        .ok_or_else(|| invalid("Original builder workload missing"))?;
-    let workload = target
-        .workload
-        .as_ref()
-        .ok_or_else(|| invalid("Continuation builder workload missing"))?;
-    let restored = if snapshot.stage == "stopped" && original.uid != workload.uid {
-        let template: BuilderRestartTemplate = serde_json::from_value(
-            snapshot
-                .checkpoint
-                .get("builder_restart_template")
-                .ok_or_else(|| invalid("Restart template missing"))?
-                .clone(),
-        )
-        .map_err(storage)?;
-        template.source == old
-            && matches!(
-                (original.kind, template.archive.kind),
-                (AppResourceKind::StatefulSet, AppResourceKind::Secret)
-                    | (AppResourceKind::Container, AppResourceKind::File)
-            )
-            && !template.archive.uid.is_empty()
-            && !template.volumes.is_empty()
-            && target.resource_binding.is_none()
-    } else {
-        false
+    let same_physical_intent = match (&old.workload, &target.workload) {
+        (Some(original), Some(workload)) => {
+            let restored = if snapshot.stage == "stopped" && original.uid != workload.uid {
+                let template: BuilderRestartTemplate = serde_json::from_value(
+                    snapshot
+                        .checkpoint
+                        .get("builder_restart_template")
+                        .ok_or_else(|| invalid("Restart template missing"))?
+                        .clone(),
+                )
+                .map_err(storage)?;
+                template.source == old
+                    && matches!(
+                        (original.kind, template.archive.kind),
+                        (AppResourceKind::StatefulSet, AppResourceKind::Secret)
+                            | (AppResourceKind::Container, AppResourceKind::File)
+                    )
+                    && !template.archive.uid.is_empty()
+                    && !template.volumes.is_empty()
+                    && target.resource_binding.is_none()
+            } else {
+                false
+            };
+            (workload.kind == AppResourceKind::StatefulSet
+                || (snapshot.stage == "stopped" && workload.kind == AppResourceKind::Container))
+                && original.kind == workload.kind
+                && (original.uid == workload.uid || restored)
+                && original.name == workload.name
+                && (old.resource_binding == target.resource_binding || restored)
+        }
+        (None, None) => {
+            // An absent Kubernetes controller can be recreated against its
+            // retained PVC without inventing an old workload UID or archive.
+            // Runtime I/O verifies absence, ownership and these exact PVC UIDs
+            // before this CAS and before the original receipt authorizes create.
+            retained_builder_creation(snapshot) && target.resource_binding.is_none()
+        }
+        (Some(_), None) => stopped_builder_absence(snapshot, target),
+        _ => false,
     };
     if snapshot.action != ComputeControlAction::Restart
         || snapshot.scope != UserAppOperationScope::Dev
         || !(snapshot.stage == "stopped"
-            || (snapshot.stage == "starting" && snapshot.has_conditional_compute_write()))
+            || (snapshot.stage == "starting"
+                && (snapshot.has_conditional_compute_write()
+                    || (old.workload.is_none() && target.workload.is_none()))))
         || snapshot.lease.is_none()
         || !matches!(
             snapshot.state,
@@ -851,15 +880,12 @@ pub(super) async fn resume_builder_restart(
         )
         || old.context != context
         || target.context != context
-        || !(workload.kind == AppResourceKind::StatefulSet
-            || (snapshot.stage == "stopped" && workload.kind == AppResourceKind::Container))
-        || original.kind != workload.kind
-        || (original.uid != workload.uid && !restored)
-        || original.name != workload.name
+        || !same_physical_intent
         || target.restart_image != old.restart_image
-        || target.restart_runtime_workspace != old.restart_runtime_workspace
+        || (target.restart_runtime_workspace != old.restart_runtime_workspace
+            && !stopped_builder_absence(snapshot, target))
+        || target.builder_startup_mode != old.builder_startup_mode
         || target.pod.is_some()
-        || (old.resource_binding != target.resource_binding && !restored)
     {
         return Err(invalid("Invalid stopped builder continuation witness"));
     }
@@ -879,7 +905,7 @@ pub(super) async fn resume_builder_restart(
         .checked_add(1)
         .ok_or_else(|| invalid("Compute revision exhausted"))?;
     let mut checkpoint = serde_json::to_value(target).map_err(storage)?;
-    if snapshot.has_conditional_compute_write() {
+    if target.workload.is_some() && snapshot.has_conditional_compute_write() {
         checkpoint["builder_compute_single_write"] = serde_json::Value::Bool(true);
     }
     if let Some(volumes) = snapshot.checkpoint.get("builder_volumes") {

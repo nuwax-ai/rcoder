@@ -273,22 +273,20 @@ async fn create_workspace_locked(
     for url in &skill_urls {
         let downloader =
             downloader.ok_or_else(|| AppError::system("skill downloader is not configured"))?;
-        match process_skill_url(url, &skills_dir, workspace, downloader).await {
-            Ok(names) => {
-                if !names.is_empty() {
-                    if !updated_dirs.contains(&"skills") {
-                        updated_dirs.push("skills");
-                    }
-                    updated_skills.extend(names);
-                }
-            }
-            Err(e) => {
-                tracing::warn!(url = %url, error = %e, "skill url processing failed");
-                failed_skills.push(SkillFailure {
-                    url: url.to_string(),
-                    error: e.to_string(),
-                });
-            }
+        let before = updated_skills.len();
+        if let Err(error) =
+            process_skill_url(url, &skills_dir, workspace, downloader, &mut updated_skills).await
+        {
+            tracing::warn!(error = %error, "skill URL failed; workspace creation continues");
+            failed_skills.push(SkillFailure::from_error(
+                None,
+                url,
+                "Download/extract skill zip failed",
+                &error,
+            ));
+        }
+        if updated_skills.len() != before && !updated_dirs.contains(&"skills") {
+            updated_dirs.push("skills");
         }
     }
 
@@ -340,7 +338,8 @@ async fn process_skill_url(
     skills_dir: &Path,
     workspace: &Path,
     downloader: &crate::service::skill_download::SkillDownloader,
-) -> AppResult<Vec<String>> {
+    updated: &mut Vec<String>,
+) -> AppResult<()> {
     let downloaded = downloader.download(url).await?;
     let parent = workspace.parent().unwrap_or(workspace).to_path_buf();
     let extract_guard =
@@ -366,25 +365,21 @@ async fn process_skill_url(
     let mut candidates: Vec<(String, PathBuf)> = Vec::new();
     // 读目录失败上抛 → 调用方落入 failed_skills 明细; 权限错误不再伪装成"无 skill"
     let mut rd = fs::read_dir(&base).await?;
-    loop {
-        let entry = match rd.next_entry().await {
-            Ok(Some(e)) => e,
-            Ok(None) => break,
-            Err(e) => {
-                tracing::warn!(error = %e, "list extracted skill entries interrupted, partial candidates");
-                break;
-            }
-        };
+    while let Some(entry) = rd.next_entry().await? {
         let name = entry.file_name().to_string_lossy().to_string();
         if name.starts_with('.') {
             continue;
         }
-        if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+        if entry.file_type().await?.is_dir() {
             candidates.push((name, entry.path()));
         }
     }
+    if candidates.is_empty() {
+        return Err(AppError::validation(
+            "No skill directory found in downloaded zip",
+        ));
+    }
     fs::create_dir_all(skills_dir).await?;
-    let mut updated = Vec::new();
     for (name, src) in candidates {
         let dst = skills_dir.join(&name);
         if let Err(e) = fs::remove_dir_all(&dst).await
@@ -395,7 +390,7 @@ async fn process_skill_url(
         move_dir(&src, &dst).await?;
         updated.push(name);
     }
-    Ok(updated)
+    Ok(())
 }
 
 /// 创建权威 agent 目录 `.agents/{skills,agents}` (对齐 nuwax ensurePrimaryAgentDirs;

@@ -414,6 +414,7 @@ pub(crate) async fn push_skills_to_workspace(
         "message": message,
         "workspace_root": ws.display().to_string(),
         "updated_skills": r.updated,
+        "failed_skills": r.failed_skills,
     })))
 }
 

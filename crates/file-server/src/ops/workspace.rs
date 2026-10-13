@@ -56,6 +56,7 @@ pub async fn init_project_template_impl(
 /// push-skills 结果（updated 为已推送的技能目录名列表）。
 pub struct PushedSkills {
     pub updated: Vec<String>,
+    pub failed_skills: Vec<crate::models::SkillFailure>,
     pub agent_store_path: Option<String>,
 }
 
@@ -199,7 +200,8 @@ pub async fn push_skills_core_with_store(
         .await?
     };
     Ok(PushedSkills {
-        updated,
+        updated: updated.updated_skills,
+        failed_skills: updated.failed_skills,
         agent_store_path,
     })
 }
@@ -218,6 +220,7 @@ pub async fn push_skills_impl(
         message,
         workspace_root: response_workspace_root.display().to_string(),
         updated_skills: r.updated,
+        failed_skills: r.failed_skills,
         agent_store_path,
     }))
 }

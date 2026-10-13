@@ -285,7 +285,9 @@ pub async fn recover(
     let flight = state.userapp_op_flight.guard()?;
     if current.action == ComputeControlAction::Restart
         && (current.stage == "stopped"
-            || (current.stage == "starting" && current.has_conditional_compute_write()))
+            || (current.stage == "starting"
+                && (current.has_conditional_compute_write()
+                    || builder_start::missing_creation(&current))))
     {
         let worker = current.clone();
         let state = state.clone();
@@ -953,7 +955,8 @@ async fn execute_claimed(
             .context("Decode captured builder startup mode")?
             .unwrap_or_default();
         if record.action == ComputeControlAction::Restart
-            && (captured.builder_startup_mode == BuilderStartupMode::ManagementOnly
+            && (captured.workload.is_none()
+                || captured.builder_startup_mode == BuilderStartupMode::ManagementOnly
                 || record
                     .checkpoint
                     .get("restart_image_roll")
@@ -1003,7 +1006,9 @@ async fn execute_claimed(
     {
         let captured: BuilderControlTarget = serde_json::from_value(target.clone())?;
         state.userapp_store.check_compute_executor(identity).await?;
-        if let Some(template) = state.runtime().archive_builder_restart(&captured).await? {
+        if captured.workload.is_some()
+            && let Some(template) = state.runtime().archive_builder_restart(&captured).await?
+        {
             target["builder_restart_template"] = serde_json::to_value(template)?;
         }
     }
@@ -1044,13 +1049,30 @@ async fn execute_claimed(
     }
     if record.action == ComputeControlAction::Restart {
         // Scale-down changed resourceVersion. Refresh only the SAME physical UID.
-        let fresh = if identity.scope == UserAppOperationScope::Dev {
+        let mut fresh = if identity.scope == UserAppOperationScope::Dev {
             let old: BuilderControlTarget = serde_json::from_value(target.clone())?;
             let mut fresh = super::adoption::capture_bound_target(state, &context).await?;
             fresh.restart_image = old.restart_image.clone();
             fresh.restart_runtime_workspace = old.restart_runtime_workspace.clone();
             fresh.builder_startup_mode = old.builder_startup_mode;
-            if old.workload.as_ref().map(|r| &r.uid) != fresh.workload.as_ref().map(|r| &r.uid)
+            if old.workload.is_none() {
+                ensure!(
+                    fresh.workload.is_none()
+                        && fresh.pod.is_none()
+                        && fresh.resource_binding.is_none(),
+                    "A builder appeared before the original missing-compute startup"
+                );
+            } else if fresh.workload.is_none() {
+                fresh = builder_start::prepare_missing_restart_target(
+                    state.runtime().as_ref(),
+                    &old,
+                    &fresh,
+                    &target,
+                    &receipt,
+                )
+                .await?;
+            } else if old.workload.as_ref().map(|r| &r.uid)
+                != fresh.workload.as_ref().map(|r| &r.uid)
                 || state
                     .runtime()
                     .builder_image_replacement_needed(&fresh)
@@ -1071,12 +1093,10 @@ async fn execute_claimed(
                 fresh.builder_startup_mode = old.builder_startup_mode;
                 *settled = true;
             }
-            ensure!(
-                fresh.workload.is_some(),
-                "Restart cannot create an absent builder"
-            );
             let mut prepared = builder_compute_checkpoint(state, &fresh, true).await?;
-            if let Some(template) = target.get("builder_restart_template") {
+            if fresh.workload.is_none() {
+                builder_start::retain_template_history(&target, &mut prepared)?;
+            } else if let Some(template) = target.get("builder_restart_template") {
                 prepared["builder_restart_template"] = template.clone();
             }
             verify_builder_volume_witness(&target, &prepared)?;
@@ -1126,13 +1146,20 @@ async fn execute_claimed(
             let options = builder_options
                 .as_ref()
                 .context("Prepared builder startup options missing")?;
-            let info = state
-                .runtime()
-                .start_builder_control_with_options(&target, options)
-                .await?
-                .ok_or_else(|| anyhow!("Restart did not return a builder"))?;
+            let info = builder_start::start_with_options(
+                state.runtime().as_ref(),
+                &target,
+                options,
+                &fresh,
+                &receipt,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("Restart did not return a builder"))?;
             *settled = true;
             state.userapp_store.check_compute_executor(identity).await?;
+            if target.workload.is_none() {
+                fresh = confirmed_missing_builder_checkpoint(state, &target, &fresh, &info).await?;
+            }
             super::register_builder(state, &record.app_id, &info)?;
         } else {
             state
@@ -1354,6 +1381,8 @@ pub(crate) async fn resume_restart_start(
 enum RestartContinuation {
     Prod(UserAppComputeStartTarget),
     Dev(BuilderControlTarget),
+    ObservedMissing(BuilderControlTarget, ContainerBasicInfo),
+    PartialMissing(BuilderControlTarget, Box<BuilderControlTarget>),
 }
 
 async fn run_restart_continuation(
@@ -1362,7 +1391,7 @@ async fn run_restart_continuation(
     prepared: RestartContinuation,
 ) -> Result<()> {
     let context = record.execution_context().map_err(anyhow::Error::msg)?;
-    let checkpoint = match &prepared {
+    let mut checkpoint = match &prepared {
         RestartContinuation::Prod(target) => {
             let mut value = serde_json::to_value(target)?;
             // Preserve the restart archive reference through later stages.
@@ -1371,7 +1400,9 @@ async fn run_restart_continuation(
             }
             value
         }
-        RestartContinuation::Dev(_) => record.checkpoint.clone(),
+        RestartContinuation::Dev(_)
+        | RestartContinuation::ObservedMissing(_, _)
+        | RestartContinuation::PartialMissing(_, _) => record.checkpoint.clone(),
     };
     let identity = ComputeExecutorIdentity {
         app_id: record.app_id.clone(),
@@ -1396,19 +1427,35 @@ async fn run_restart_continuation(
                 unknown_write = true;
                 state.runtime().start_app_compute(target).await?
             },
-            RestartContinuation::Dev(target) => {
-                let options = prepare_start_options(state.runtime().as_ref(), target, &checkpoint).await?;
-                unknown_write = true;
-                let info = state.runtime().start_builder_control_with_options(target, &options)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow!("Builder continuation did not return a ready instance")
-                    })?;
+            RestartContinuation::Dev(target) | RestartContinuation::ObservedMissing(target, _) | RestartContinuation::PartialMissing(target, _) => {
+                let info = if let RestartContinuation::ObservedMissing(_, observed) = &prepared {
+                    observed.clone()
+                } else {
+                    let options = if let RestartContinuation::PartialMissing(_, partial) = &prepared {
+                        let current = capture_missing_partial(state, target, &checkpoint).await?;
+                        ensure!(same_partial_controller(partial, &current),
+                            "Original partial builder changed before continuation dispatch");
+                        // Whole absence is intentionally not required here: only
+                        // the positively owned original partial may finish.
+                        BuilderStartOptions { startup_mode: target.builder_startup_mode, restart_template: None }
+                    } else {
+                        prepare_start_options(state.runtime().as_ref(), target, &checkpoint).await?
+                    };
+                    let receipt = record.lease.as_ref().context("Builder continuation lease missing")?;
+                    unknown_write = true;
+                    builder_start::start_with_options(state.runtime().as_ref(), target, &options, &checkpoint, receipt).await?
+                        .context("Builder continuation did not return a ready instance")?
+                };
+                state.userapp_store.check_compute_executor(&identity).await?;
+                if target.workload.is_none() {
+                    checkpoint = confirmed_missing_builder_checkpoint(state, target, &checkpoint, &info).await?;
+                    if let RestartContinuation::PartialMissing(_, partial) = &prepared {
+                        let actual: BuilderControlTarget = serde_json::from_value(checkpoint.clone())?;
+                        ensure!(same_partial_controller(partial, &actual),
+                            "Original partial builder identity changed while completing creation");
+                    }
+                }
                 unknown_write = false;
-                state
-                    .userapp_store
-                    .check_compute_executor(&identity)
-                    .await?;
                 super::register_builder(state, &record.app_id, &info)?;
             }
         }
@@ -1515,6 +1562,10 @@ async fn run_restart_continuation(
     result
 }
 
+pub(crate) fn missing_builder_creation(record: &ComputeControlRecord) -> bool {
+    builder_start::missing_creation(record)
+}
+
 /// Close only a superseded execution with a durable boundary or a verified
 /// remote conditional-write fence. The store CAS is shared by scanning and Stop.
 pub(crate) async fn reconcile_superseded(
@@ -1526,7 +1577,32 @@ pub(crate) async fn reconcile_superseded(
         "Compute operation is not a superseded restart"
     );
     let context = old.execution_context().map_err(anyhow::Error::msg)?;
-    let evidence = if matches!(old.stage.as_str(), "starting" | "stopping")
+    let evidence = if old.stage == "starting" && missing_builder_creation(old) {
+        let receipt = old
+            .lease
+            .as_ref()
+            .context("Original missing builder lease unavailable")?;
+        ensure!(
+            state
+                .runtime()
+                .validate_app_operation_receipt(&context, receipt)
+                .await?,
+            "Original missing builder lease cannot be verified"
+        );
+        let target: BuilderControlTarget = serde_json::from_value(old.checkpoint.clone())?;
+        // Complete immutable creation receipts prove the multi-step writer has
+        // exited. Readiness is separate: Stop also drains a later absent Pod.
+        ensure!(
+            state
+                .runtime()
+                .builder_compute_write_acknowledged(&target, true)
+                .await?,
+            "Original missing-builder pipeline has no complete acknowledgement"
+        );
+        ComputeControlDrainEvidence::PersistedRuntimeAcknowledgement {
+            checkpoint: old.checkpoint.clone(),
+        }
+    } else if matches!(old.stage.as_str(), "starting" | "stopping")
         && old.has_docker_compute_target()
     {
         let receipt = old
@@ -1619,8 +1695,8 @@ pub(crate) async fn reconcile_superseded(
             checkpoint: old.checkpoint.clone(),
         }
     };
-    // Completed boundaries need no new runtime write. Starting
-    // instead requires the exact remote precondition fence above;
+    // Completed boundaries and exact completion acknowledgements need no
+    // new runtime write. Unknown requests still require their original fence;
     // supersession alone cannot drain an in-flight request.
     state
         .userapp_store
@@ -1644,7 +1720,9 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
     let mut continuing = snapshot.clone();
     ensure!(
         snapshot.stage == "stopped"
-            || (snapshot.stage == "starting" && snapshot.has_conditional_compute_write()),
+            || (snapshot.stage == "starting"
+                && (snapshot.has_conditional_compute_write()
+                    || builder_start::missing_creation(snapshot))),
         "Builder continuation requires a stopped boundary or conditional-write witness"
     );
     let context = snapshot.execution_context().map_err(anyhow::Error::msg)?;
@@ -1664,6 +1742,57 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
             .await?,
         "Original builder lease is not confirmed"
     );
+    if old.workload.is_none() {
+        ensure!(
+            builder_start::missing_creation(snapshot),
+            "Missing builder continuation has no original retained PVC/lease witness"
+        );
+        let prepared = if snapshot.stage == "starting" {
+            if let Some(info) = state
+                .runtime()
+                .reconcile_builder_compute_start(&old)
+                .await?
+            {
+                RestartContinuation::ObservedMissing(old.clone(), info)
+            } else {
+                // A lost accepted POST can be completed only when current actual
+                // compute proves the same original partial creator. None/unknown
+                // grants no fresh creation and never reaches the factory.
+                let retry = state.runtime().prepare_builder_compute_retry(&old).await?
+                    .context("Original missing-builder creation remains unknown; no owned partial exists to resume")?;
+                ensure!(
+                    retry == old,
+                    "Missing builder retry changed its original intent"
+                );
+                let partial = capture_missing_partial(state, &old, &snapshot.checkpoint).await?;
+                RestartContinuation::PartialMissing(old.clone(), Box::new(partial))
+            }
+        } else {
+            let mut current = super::adoption::capture_bound_target(state, &context).await?;
+            current.restart_image = old.restart_image.clone();
+            current.restart_runtime_workspace = old.restart_runtime_workspace.clone();
+            current.builder_startup_mode = old.builder_startup_mode;
+            ensure!(
+                current == old,
+                "Missing builder target changed before continuation"
+            );
+            let prepared = builder_compute_checkpoint(state, &current, true).await?;
+            verify_builder_volume_witness(&snapshot.checkpoint, &prepared)?;
+            RestartContinuation::Dev(old.clone())
+        };
+        ensure!(
+            state
+                .runtime()
+                .validate_app_operation_receipt(&context, receipt)
+                .await?,
+            "Original missing builder lease changed before continuation claim"
+        );
+        let record = state
+            .userapp_store
+            .resume_builder_restart_start(snapshot, &old)
+            .await?;
+        return run_restart_continuation(state, record, prepared).await;
+    }
     let target = if snapshot.stage == "starting" {
         if state
             .runtime()
@@ -1684,7 +1813,16 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
         fresh.restart_image = old.restart_image.clone();
         fresh.restart_runtime_workspace = old.restart_runtime_workspace.clone();
         fresh.builder_startup_mode = old.builder_startup_mode;
-        if fresh.workload.as_ref().map(|r| &r.uid) != old.workload.as_ref().map(|r| &r.uid)
+        if fresh.workload.is_none() {
+            builder_start::prepare_missing_restart_target(
+                state.runtime().as_ref(),
+                &old,
+                &fresh,
+                &snapshot.checkpoint,
+                receipt,
+            )
+            .await?
+        } else if fresh.workload.as_ref().map(|r| &r.uid) != old.workload.as_ref().map(|r| &r.uid)
             || state
                 .runtime()
                 .builder_image_replacement_needed(&fresh)
@@ -1762,7 +1900,7 @@ async fn builder_compute_checkpoint(
     capture_volumes: bool,
 ) -> Result<serde_json::Value> {
     let mut checkpoint = serde_json::to_value(target)?;
-    if state.runtime().supports_builder_compute_fencing() {
+    if target.workload.is_some() && state.runtime().supports_builder_compute_fencing() {
         checkpoint["builder_compute_single_write"] = serde_json::Value::Bool(true);
     }
     if capture_volumes {
@@ -1774,6 +1912,86 @@ async fn builder_compute_checkpoint(
         )?;
     }
     Ok(checkpoint)
+}
+
+fn same_partial_controller(original: &BuilderControlTarget, actual: &BuilderControlTarget) -> bool {
+    original.context == actual.context
+        && original
+            .workload
+            .as_ref()
+            .map(|resource| (resource.kind, &resource.name, &resource.uid))
+            == actual
+                .workload
+                .as_ref()
+                .map(|resource| (resource.kind, &resource.name, &resource.uid))
+}
+
+async fn capture_missing_partial(
+    state: &AppState,
+    original: &BuilderControlTarget,
+    checkpoint: &serde_json::Value,
+) -> Result<BuilderControlTarget> {
+    let expected = builder_start::retained_volumes(checkpoint)?;
+    let actual = super::adoption::capture_bound_target(state, &original.context).await?;
+    actual.validate().map_err(anyhow::Error::msg)?;
+    ensure!(
+        actual.context == original.context
+            && actual
+                .workload
+                .as_ref()
+                .is_some_and(|workload| workload.kind == AppResourceKind::StatefulSet),
+        "Original missing-builder creation has no current owned partial controller"
+    );
+    ensure!(
+        state
+            .runtime()
+            .capture_builder_compute_volumes(&actual)
+            .await?
+            == expected,
+        "Original partial builder changed the retained workspace PVC"
+    );
+    Ok(actual)
+}
+
+/// Publish the new real controller identity only after the original creation
+/// returned or its completion was physically reconciled, preserving its data.
+async fn confirmed_missing_builder_checkpoint(
+    state: &AppState,
+    original: &BuilderControlTarget,
+    checkpoint: &serde_json::Value,
+    info: &ContainerBasicInfo,
+) -> Result<serde_json::Value> {
+    let expected = builder_start::retained_volumes(checkpoint)?;
+    let mut actual = super::adoption::capture_bound_target(state, &original.context).await?;
+    actual.restart_image = original.restart_image.clone();
+    actual.restart_runtime_workspace = original.restart_runtime_workspace.clone();
+    actual.builder_startup_mode = original.builder_startup_mode;
+    let workload = actual
+        .workload
+        .as_ref()
+        .context("Ensured builder has no actual controller")?;
+    let pod = actual
+        .pod
+        .as_ref()
+        .context("Ensured builder has no actual running Pod")?;
+    ensure!(
+        workload.kind == AppResourceKind::StatefulSet
+            && info.project_id == original.context.app_id
+            && info.workload_uid.as_ref() == Some(&workload.uid)
+            && info.container_id == pod.uid,
+        "Ensured builder differs from the original operation's actual resource"
+    );
+    let mut prepared = builder_compute_checkpoint(state, &actual, true).await?;
+    ensure!(
+        builder_start::retained_volumes(&prepared)? == expected,
+        "Ensured builder changed the original retained workspace PVC"
+    );
+    prepared
+        .as_object_mut()
+        .context("Builder checkpoint is not an object")?
+        .remove("builder_compute_single_write");
+    builder_start::retain_template_history(checkpoint, &mut prepared)?;
+    Ok(prepared)
 }
 
 fn verify_builder_volume_witness(
@@ -1951,3 +2169,6 @@ mod restart_workspace_tests {
         assert_eq!(docker.restart_runtime_workspace, None);
     }
 }
+
+#[cfg(all(test, feature = "userapp-turso"))]
+mod missing_tests;

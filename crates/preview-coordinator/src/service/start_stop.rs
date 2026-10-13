@@ -150,6 +150,12 @@ impl PreviewCoordinator {
                 return Err(StartExecError::PortInUse(port))
                     .inspect_err(|_| tracing::warn!(key, port, "preview port in use: {detail}"));
             }
+            Ok(Err(shared_types::PreviewExecutorError::Business { code, message })) => {
+                return Err(StartExecError::Fatal(PreviewCoordinationError::Business {
+                    code,
+                    message,
+                }));
+            }
             Ok(Err(error)) => {
                 return Err(StartExecError::Fatal(unavailable(error.to_string())));
             }

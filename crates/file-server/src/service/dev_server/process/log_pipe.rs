@@ -76,13 +76,23 @@ pub(super) async fn pipe_stream<R>(
     main: PathBuf,
     temp: PathBuf,
     on_line: Option<super::OnLineCallback>,
-) where
+) -> bool
+where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut lines = BufReader::new(reader).lines();
     let mut noise = ViteNoiseFilter::new();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut complete = true;
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => return complete,
+            Err(error) => {
+                tracing::warn!(%error, "command output stream could not be completely drained");
+                return false;
+            }
+        };
         if noise.should_skip(&line) {
             continue;
         }
@@ -94,9 +104,11 @@ pub(super) async fn pipe_stream<R>(
         let prefixed = format!("[{}] {}", Local::now().format("%Y/%m/%d %H:%M:%S"), line);
         // 日志写失败告警(#17):磁盘满/权限错误时可见,不再静默吞掉。
         if let Err(e) = crate::service::dev_server::log::append_line(&main, &prefixed).await {
+            complete = false;
             tracing::warn!(error = %e, "append_line (main log) failed");
         }
         if let Err(e) = crate::service::dev_server::log::append_line(&temp, &prefixed).await {
+            complete = false;
             tracing::warn!(error = %e, "append_line (temp log) failed");
         }
     }

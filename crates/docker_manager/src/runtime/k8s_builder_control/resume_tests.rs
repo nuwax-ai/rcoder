@@ -14,6 +14,7 @@ pub(super) struct ApiState {
     pub(super) advance_status_rv: bool,
     pub(super) allow_writes: bool,
     pub(super) lose_next_put_response: bool,
+    lose_next_create_response: bool,
     pub(super) archives: std::collections::BTreeMap<String, serde_json::Value>,
     leases: std::collections::BTreeMap<String, serde_json::Value>,
     pub(super) puts: Vec<serde_json::Value>,
@@ -24,7 +25,7 @@ pub(super) struct ApiState {
     resume_replicas_on_second_sts_read: bool,
     fail_pod_list: bool,
     replace_uid_on_sts_read: Option<usize>,
-    replace_pvc_on_read: Option<usize>,
+    pub(super) replace_pvc_on_read: Option<usize>,
     pvc_reads: usize,
     fail_next_creation_receipt: bool,
 }
@@ -148,6 +149,29 @@ async fn connection(mut stream: tokio::net::TcpStream, state: Arc<Mutex<ApiState
                 status = 404;
                 serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","message":"Archive not found","code":404})
             }
+        } else if method == "POST" && resource_path.ends_with("/statefulsets") {
+            assert!(
+                state.sts.is_null(),
+                "Missing recovery cannot overwrite another StatefulSet"
+            );
+            let mut object: serde_json::Value =
+                serde_json::from_slice(request_body).expect("create StatefulSet");
+            object["metadata"]["uid"] = "sts-created".into();
+            object["metadata"]["resourceVersion"] = "10".into();
+            object["metadata"]["generation"] = 1.into();
+            object["status"] =
+                serde_json::json!({"observedGeneration":1,"replicas":1,"readyReplicas":1});
+            let mut pod = state.pod_seed.clone();
+            pod["metadata"]["uid"] = "pod-created".into();
+            pod["metadata"]["ownerReferences"][0]["uid"] = "sts-created".into();
+            pod["metadata"]["annotations"] = object["metadata"]["annotations"].clone();
+            pod["spec"] = object["spec"]["template"]["spec"].clone();
+            state.pod = pod;
+            state.sts = object.clone();
+            state.puts.push(object.clone());
+            lose_response = state.lose_next_create_response;
+            state.lose_next_create_response = false;
+            object
         } else if resource_path.contains("/persistentvolumeclaims/") {
             state.pvc_reads += 1;
             if state
@@ -160,6 +184,11 @@ async fn connection(mut stream: tokio::net::TcpStream, state: Arc<Mutex<ApiState
                 let patch: serde_json::Value =
                     serde_json::from_slice(request_body).expect("PVC patch");
                 assert_eq!(patch["metadata"]["uid"], state.pvc["metadata"]["uid"]);
+                if let Some(annotations) = patch["metadata"]["annotations"].as_object() {
+                    for (key, value) in annotations {
+                        state.pvc["metadata"]["annotations"][key] = value.clone();
+                    }
+                }
             }
             state.pvc.clone()
         } else if method == "PATCH" && resource_path.contains("/statefulsets/") {
@@ -235,6 +264,9 @@ async fn connection(mut stream: tokio::net::TcpStream, state: Arc<Mutex<ApiState
             lose_response = state.lose_next_put_response;
             state.lose_next_put_response = false;
             object
+        } else if resource_path.contains("/statefulsets/") && state.sts.is_null() {
+            status = 404;
+            serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","message":"StatefulSet not found","code":404})
         } else if resource_path.contains("/statefulsets/") {
             state.sts_reads += 1;
             if state.resume_replicas_on_second_sts_read && state.sts_reads >= 2 {
@@ -262,7 +294,7 @@ async fn connection(mut stream: tokio::net::TcpStream, state: Arc<Mutex<ApiState
             if watch {
                 serde_json::json!({"type":"MODIFIED","object":state.sts})
             } else {
-                serde_json::json!({"apiVersion":"apps/v1","kind":"StatefulSetList","metadata":{"resourceVersion":"8"},"items":[state.sts]})
+                serde_json::json!({"apiVersion":"apps/v1","kind":"StatefulSetList","metadata":{"resourceVersion":"8"},"items":if state.sts.is_null() { vec![] } else { vec![state.sts.clone()] }})
             }
         } else if resource_path.contains("/pods/") {
             if state.pod.is_null() {
@@ -534,6 +566,7 @@ pub(super) async fn fixture(
         pvc,
         allow_writes: false,
         lose_next_put_response: false,
+        lose_next_create_response: false,
         archives: Default::default(),
         leases: Default::default(),
         puts: vec![],
@@ -1136,5 +1169,485 @@ async fn running_reuse_accepts_controller_status_version_changes_without_writes(
             .iter()
             .all(|request| request.starts_with("GET "))
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn absent_builder_captures_current_retained_pvc_without_requiring_old_workload_uid() {
+    let (runtime, params, state, server) = fixture(None).await;
+    let original = state.lock().unwrap().pvc.clone();
+    {
+        let mut state = state.lock().unwrap();
+        state.sts = serde_json::Value::Null;
+        state.pod = serde_json::Value::Null;
+    }
+    let target = runtime
+        .capture_builder_compute_with_binding(
+            params.execution_context.as_ref().unwrap(),
+            params.resource_binding.as_ref(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(target.workload.is_none() && target.pod.is_none() && target.resource_binding.is_none());
+    let result = runtime.capture_builder_volume_witness(&target).await;
+    server.abort();
+    let volumes=result.expect("confirmed absent compute must retain a real owned PVC witness, independently of the old registry controller UID");
+    assert_eq!(volumes.len(), 1);
+    assert_eq!(volumes[0].kind, AppResourceKind::PersistentVolumeClaim);
+    assert_eq!(volumes[0].name, original["metadata"]["name"]);
+    assert_eq!(volumes[0].uid, "pvc-original");
+    let state = state.lock().unwrap();
+    assert_eq!(
+        state.pvc, original,
+        "read-only missing-workload observation cannot mutate storage"
+    );
+    assert!(
+        state
+            .requests
+            .iter()
+            .all(|request| request.starts_with("GET "))
+    );
+}
+
+#[tokio::test]
+async fn absent_builder_volume_witness_rejects_foreign_scope_and_racing_pvc_without_mutation() {
+    for changed in [
+        "application",
+        "lifecycle",
+        "family",
+        "namespace",
+        "name",
+        "uid-race",
+        "deleting",
+        "pod-present",
+    ] {
+        let (runtime, params, state, server) = fixture(None).await;
+        let context = params.execution_context.as_ref().unwrap();
+        {
+            let mut state = state.lock().unwrap();
+            state.sts = serde_json::Value::Null;
+            state.pod = serde_json::Value::Null;
+        }
+        let target = runtime
+            .capture_builder_compute_with_binding(context, None, false)
+            .await
+            .unwrap();
+        {
+            let mut state = state.lock().unwrap();
+            match changed {
+                "application" => {
+                    state.pvc["metadata"]["annotations"]["rcoder.io/application-id"] =
+                        "foreign-app".into()
+                }
+                "lifecycle" => {
+                    state.pvc["metadata"]["annotations"]["rcoder.io/lifecycle-id"] =
+                        "foreign-life".into()
+                }
+                "family" => {
+                    state.pvc["metadata"]["labels"]["service_type"] =
+                        ServiceType::Userapp.to_string().into()
+                }
+                "namespace" => state.pvc["metadata"]["namespace"] = "another-namespace".into(),
+                "name" => state.pvc["metadata"]["name"] = "another-workspace".into(),
+                "uid-race" => state.replace_pvc_on_read = Some(2),
+                "deleting" => {
+                    state.pvc["metadata"]["deletionTimestamp"] = "2026-10-13T00:00:00Z".into()
+                }
+                "pod-present" => state.pod = state.pod_seed.clone(),
+                _ => unreachable!(),
+            }
+        }
+        let result = runtime.capture_builder_volume_witness(&target).await;
+        server.abort();
+        assert!(
+            result.is_err(),
+            "{changed}: absence cannot replace volume/ownership confirmation"
+        );
+        let state = state.lock().unwrap();
+        assert!(
+            state
+                .requests
+                .iter()
+                .all(|request| request.starts_with("GET ")),
+            "{changed}: must reject before any resource write"
+        );
+    }
+}
+
+#[tokio::test]
+async fn absent_builder_uses_original_control_lease_and_retains_pvc_through_real_factory() {
+    use container_runtime_api::{AgentContainerRuntime as _, UserAppDeploymentRuntime as _};
+    let (runtime, params, state, server) = fixture(None).await;
+    let context = params.execution_context.as_ref().unwrap().clone();
+    {
+        let mut state = state.lock().unwrap();
+        state.pvc["spec"]["resources"]["requests"]["storage"] = "100Gi".into();
+        state.pvc["status"]["capacity"]["storage"] = "100Gi".into();
+    }
+    let original_pvc = state.lock().unwrap().pvc.clone();
+    {
+        let mut state = state.lock().unwrap();
+        state.sts = serde_json::Value::Null;
+        state.pod = serde_json::Value::Null;
+        state.allow_writes = true;
+    }
+    let mut target = runtime
+        .capture_builder_compute_with_binding(&context, None, false)
+        .await
+        .unwrap();
+    target.restart_image = Some("paired-runner:frozen-original".into());
+    target.builder_startup_mode = shared_types::BuilderStartupMode::ManagementOnly;
+    let volumes = runtime
+        .capture_builder_volume_witness(&target)
+        .await
+        .unwrap();
+    let lease = runtime
+        .acquire_application_operation_with_context(
+            &context.app_id,
+            &ServiceType::UserappBuilder,
+            Some(&context),
+        )
+        .await
+        .unwrap();
+    let receipt = lease.receipt().unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        runtime.ensure_absent_builder_control(&target, &volumes, &receipt),
+    )
+    .await;
+    let first = result
+        .expect("fixture deadline")
+        .expect("original Missing control must create under its already held lease")
+        .expect("running builder");
+    assert_eq!(first.container_id, "pod-created");
+    assert_eq!(first.workload_uid.as_deref(), Some("sts-created"));
+    let before_retry = state.lock().unwrap().requests.len();
+    let repeat = runtime
+        .ensure_absent_builder_control(&target, &volumes, &receipt)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeat.container_id, first.container_id);
+    assert!(
+        runtime
+            .builder_compute_write_acknowledged(&target, true)
+            .await
+            .unwrap()
+    );
+    assert!(
+        runtime
+            .reconcile_builder_compute_start(&target)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    {
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.pvc["metadata"]["uid"],
+            original_pvc["metadata"]["uid"]
+        );
+        assert_eq!(state.pvc["spec"], original_pvc["spec"]);
+        assert_eq!(
+            state.pvc["metadata"]["labels"],
+            original_pvc["metadata"]["labels"]
+        );
+        assert_eq!(
+            state.sts["spec"]["template"]["spec"]["containers"][0]["image"],
+            "paired-runner:frozen-original"
+        );
+        let env = state.sts["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap();
+        assert!(env.iter().any(
+            |item| item["name"] == shared_types::APP_CLI_CONTROL_ONLY_ENV
+                && item["value"] == "true"
+        ));
+        assert!(env.iter().any(|item| item["name"]
+            == shared_types::APP_CLI_MANAGEMENT_BOOT_ID_ENV
+            && item["value"] == context.operation_id));
+        assert_eq!(
+            state
+                .requests
+                .iter()
+                .filter(|request| request.starts_with("POST ")
+                    && request
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .split('?')
+                        .next()
+                        .unwrap()
+                        .ends_with("/leases"))
+                .count(),
+            1,
+            "must not reacquire the existing application lease; actual POSTs: {:?}",
+            state
+                .requests
+                .iter()
+                .filter(|request| request.starts_with("POST "))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            state.leases.len(),
+            1,
+            "the original live lease is still held"
+        );
+        assert_eq!(
+            state
+                .puts
+                .iter()
+                .filter(|object| object["metadata"]["uid"] == "sts-created")
+                .count(),
+            1,
+            "one actual StatefulSet allocation"
+        );
+        assert_eq!(
+            state
+                .requests
+                .iter()
+                .filter(|request| request.starts_with("POST ")
+                    && request
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .split('?')
+                        .next()
+                        .unwrap()
+                        .ends_with("/statefulsets"))
+                .count(),
+            1
+        );
+        assert!(
+            state.requests[before_retry..]
+                .iter()
+                .all(|request| request.starts_with("GET ")),
+            "completed original creation is reconciled read-only"
+        );
+        assert!(
+            !state
+                .requests
+                .iter()
+                .any(|request| request.starts_with("DELETE ")
+                    || (request.starts_with("POST ")
+                        && request.contains("/persistentvolumeclaims"))),
+            "must not delete/recreate PVC or other workloads"
+        );
+    }
+    runtime
+        .release_app_operation_receipt(&context, &receipt)
+        .await
+        .unwrap();
+    drop(lease);
+    server.abort();
+}
+
+#[tokio::test]
+async fn absent_builder_creation_refuses_replaced_volume_or_foreign_current_operation_before_mutation()
+ {
+    use container_runtime_api::AgentContainerRuntime as _;
+    for changed in ["pvc", "foreign-operation", "lease"] {
+        let (runtime, params, state, server) = fixture(None).await;
+        let context = params.execution_context.as_ref().unwrap().clone();
+        let original_sts = state.lock().unwrap().sts.clone();
+        {
+            let mut state = state.lock().unwrap();
+            state.sts = serde_json::Value::Null;
+            state.pod = serde_json::Value::Null;
+            state.allow_writes = true;
+        }
+        let target = runtime
+            .capture_builder_compute_with_binding(&context, None, false)
+            .await
+            .unwrap();
+        let volumes = runtime
+            .capture_builder_volume_witness(&target)
+            .await
+            .unwrap();
+        let lease = runtime
+            .acquire_application_operation_with_context(
+                &context.app_id,
+                &ServiceType::UserappBuilder,
+                Some(&context),
+            )
+            .await
+            .unwrap();
+        let mut receipt = lease.receipt().unwrap();
+        {
+            let mut state = state.lock().unwrap();
+            match changed {
+                "pvc" => state.pvc["metadata"]["uid"] = "replacement-pvc".into(),
+                "foreign-operation" => state.sts = original_sts,
+                "lease" => {
+                    if let shared_types::UserAppOperationLeaseReceipt::Kubernetes { uid, .. } =
+                        &mut receipt
+                    {
+                        *uid = "foreign-lease".into();
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        let before = state.lock().unwrap().requests.len();
+        let result = runtime
+            .ensure_absent_builder_control(&target, &volumes, &receipt)
+            .await;
+        assert!(result.is_err(), "{changed}");
+        {
+            let state = state.lock().unwrap();
+            assert!(
+                state.requests[before..]
+                    .iter()
+                    .all(|request| request.starts_with("GET ")),
+                "{changed}: no storage/compute mutation authorized"
+            );
+        }
+        drop(lease);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn absent_builder_partial_original_creation_finishes_once_and_ack_is_independent_of_readiness()
+ {
+    use container_runtime_api::{AgentContainerRuntime as _, UserAppDeploymentRuntime as _};
+    let (runtime, params, state, server) = fixture(None).await;
+    let context = params.execution_context.as_ref().unwrap().clone();
+    {
+        let mut state = state.lock().unwrap();
+        state.sts = serde_json::Value::Null;
+        state.pod = serde_json::Value::Null;
+        state.allow_writes = true;
+        state.lose_next_create_response = true;
+        state.pvc["spec"]["resources"]["requests"]["storage"] = "100Gi".into();
+        state.pvc["status"]["capacity"]["storage"] = "100Gi".into();
+    }
+    let mut target = runtime
+        .capture_builder_compute_with_binding(&context, None, false)
+        .await
+        .unwrap();
+    target.builder_startup_mode = shared_types::BuilderStartupMode::ManagementOnly;
+    let volumes = runtime
+        .capture_builder_volume_witness(&target)
+        .await
+        .unwrap();
+    let lease = runtime
+        .prepare_compute_k8s_lease(&context, shared_types::UserAppOperationScope::Dev)
+        .await
+        .unwrap();
+    let receipt = lease.receipt().unwrap();
+    assert!(
+        runtime
+            .prepare_builder_compute_retry(&target)
+            .await
+            .unwrap()
+            .is_none(),
+        "unknown actual absence never authorizes blind creation replay"
+    );
+    let first = tokio::time::timeout(
+        Duration::from_secs(15),
+        runtime.ensure_absent_builder_control(&target, &volumes, &receipt),
+    )
+    .await
+    .expect("initial budget");
+    assert!(
+        first.is_err(),
+        "a real accepted StatefulSet with lost reply remains unconfirmed"
+    );
+    assert_eq!(state.lock().unwrap().sts["metadata"]["uid"], "sts-created");
+    assert!(
+        !runtime
+            .builder_compute_write_acknowledged(&target, true)
+            .await
+            .unwrap(),
+        "partial create is not a completed multi-step acknowledgement"
+    );
+    assert_eq!(
+        runtime
+            .prepare_builder_compute_retry(&target)
+            .await
+            .unwrap()
+            .unwrap(),
+        target,
+        "the same recorded partial controller and active original compute holder permit completing only that original intent"
+    );
+    let resumed = tokio::time::timeout(
+        Duration::from_secs(15),
+        runtime.ensure_absent_builder_control(&target, &volumes, &receipt),
+    )
+    .await
+    .expect("continuation budget")
+    .expect("same original physical operation can complete idempotently")
+    .expect("ready");
+    assert_eq!(resumed.container_id, "pod-created");
+    assert_eq!(state.lock().unwrap().pvc["metadata"]["uid"], "pvc-original");
+    assert_eq!(
+        state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| request.starts_with("POST ")
+                && request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .split('?')
+                    .next()
+                    .unwrap()
+                    .ends_with("/statefulsets"))
+            .count(),
+        1,
+        "owned partial creation must not launch a second controller"
+    );
+    {
+        let mut state = state.lock().unwrap();
+        state.pod = serde_json::Value::Null;
+        state.sts["spec"]["replicas"] = 0.into();
+    }
+    assert!(
+        runtime
+            .builder_compute_write_acknowledged(&target, true)
+            .await
+            .unwrap(),
+        "completed original writes can drain despite stopped/not-ready current compute"
+    );
+    assert!(
+        runtime
+            .reconcile_builder_compute_start(&target)
+            .await
+            .unwrap()
+            .is_none(),
+        "completed mutation is not proof of present readiness"
+    );
+    {
+        let mut state = state.lock().unwrap();
+        state.sts = serde_json::Value::Null;
+    }
+    assert!(
+        runtime
+            .builder_compute_write_acknowledged(&target, true)
+            .await
+            .unwrap(),
+        "whole actual absence does not revive a completed old writer"
+    );
+    {
+        let mut state = state.lock().unwrap();
+        state.sts = state.puts[0].clone();
+        state.sts["metadata"]["uid"] = "another-controller".into();
+    }
+    assert!(
+        runtime
+            .builder_compute_write_acknowledged(&target, true)
+            .await
+            .is_err(),
+        "foreign current compute cannot be borrowed as original completion"
+    );
+    runtime
+        .release_app_operation_receipt(&context, &receipt)
+        .await
+        .unwrap();
+    drop(lease);
     server.abort();
 }

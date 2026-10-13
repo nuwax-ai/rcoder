@@ -207,19 +207,20 @@ pub async fn create_workspace_with_agent_store(
                 &install_ctx,
                 &session_workspace,
                 dl,
+                &mut updated_skills,
+                &mut skipped_skills,
             )
             .await
             {
-                Ok((updated, skipped)) => {
-                    updated_skills.extend(updated);
-                    skipped_skills.extend(skipped);
-                }
+                Ok(()) => {}
                 Err(e) => {
                     tracing::warn!(url = %skill_url, error = %e, "skill url processing failed");
-                    failed_skills.push(SkillFailure {
-                        url: skill_url.clone(),
-                        error: e.to_string(),
-                    });
+                    failed_skills.push(SkillFailure::from_error(
+                        Some(skill_name.clone()),
+                        skill_url,
+                        "Download/extract/install skill zip failed",
+                        &e,
+                    ));
                 }
             }
         }
@@ -227,17 +228,26 @@ pub async fn create_workspace_with_agent_store(
         let dl = downloader
             .ok_or_else(|| crate::error::AppError::system("skill downloader is not configured"))?;
         for url in &skill_urls {
-            match download_and_install_skill(url, "", &install_ctx, &session_workspace, dl).await {
-                Ok((updated, skipped)) => {
-                    updated_skills.extend(updated);
-                    skipped_skills.extend(skipped);
-                }
+            match download_and_install_skill(
+                url,
+                "",
+                &install_ctx,
+                &session_workspace,
+                dl,
+                &mut updated_skills,
+                &mut skipped_skills,
+            )
+            .await
+            {
+                Ok(()) => {}
                 Err(e) => {
                     tracing::warn!(url = %url, error = %e, "skill url processing failed");
-                    failed_skills.push(SkillFailure {
-                        url: url.to_string(),
-                        error: e.to_string(),
-                    });
+                    failed_skills.push(SkillFailure::from_error(
+                        None,
+                        url,
+                        "Download/extract/install skill zip failed",
+                        &e,
+                    ));
                 }
             }
         }
@@ -355,7 +365,9 @@ async fn download_and_install_skill(
     ctx: &InstallContext<'_>,
     session_workspace: &Path,
     downloader: &crate::service::skill_download::SkillDownloader,
-) -> AppResult<(Vec<String>, Vec<String>)> {
+    updated: &mut Vec<String>,
+    skipped: &mut Vec<String>,
+) -> AppResult<()> {
     let downloaded = downloader.download(url).await?;
     let tmp = session_workspace.join(".tmp");
     fs::create_dir_all(&tmp).await?;
@@ -379,41 +391,34 @@ async fn download_and_install_skill(
     let mut candidates: Vec<(String, PathBuf)> = Vec::new();
     // 读目录失败上抛 → 调用方落入 failed_skills 明细（权限错误不伪装成"无 skill"）
     let mut rd = fs::read_dir(&base).await?;
-    loop {
-        let entry = match rd.next_entry().await {
-            Ok(Some(e)) => e,
-            Ok(None) => break,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "list extracted skill entries interrupted, partial candidates"
-                );
-                break;
-            }
-        };
+    while let Some(entry) = rd.next_entry().await? {
         let name = entry.file_name().to_string_lossy().to_string();
         if name.starts_with('.') {
             continue;
         }
-        if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+        if entry.file_type().await?.is_dir() {
             candidates.push((name, entry.path()));
         }
     }
 
-    let mut updated = Vec::new();
-    let mut skipped = Vec::new();
-    if !dest_name.is_empty() {
-        // 按名安装: 找匹配候选; 若无匹配但只有一个候选, 用它
-        let matched = candidates.iter().find(|(n, _)| n == dest_name).or_else(|| {
+    if candidates.is_empty() {
+        return Err(crate::error::AppError::validation(
+            "No skill directory found in downloaded zip",
+        ));
+    }
+    let matched = if dest_name.is_empty() {
+        None
+    } else {
+        candidates.iter().find(|(n, _)| n == dest_name).or_else(|| {
             if candidates.len() == 1 {
                 candidates.first()
             } else {
                 None
             }
-        });
-        if let Some((_, src)) = matched
-            && ctx.should_install(dest_name)
-        {
+        })
+    };
+    if let Some((_, src)) = matched {
+        if ctx.should_install(dest_name) {
             crate::service::agent_store::install_skill_dir(
                 src,
                 ctx.agent_skills_dir,
@@ -422,7 +427,7 @@ async fn download_and_install_skill(
             )
             .await?;
             updated.push(dest_name.to_string());
-        } else if matched.is_some() {
+        } else {
             skipped.push(dest_name.to_string());
         }
     } else {
@@ -442,7 +447,7 @@ async fn download_and_install_skill(
             }
         }
     }
-    Ok((updated, skipped))
+    Ok(())
 }
 
 #[cfg(test)]

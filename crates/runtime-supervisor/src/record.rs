@@ -307,6 +307,24 @@ pub(crate) enum LaunchHistory {
     CurrentOrUnknown,
 }
 
+/// 普通历史诊断文件不是 generation；保留原字节，不向其拼接执行路径。
+/// 不跟随符号链接，目录及无法确认的文件类型仍保留原执行保护。
+pub(crate) fn generation_entry_root(entry: std::fs::DirEntry) -> Result<Option<PathBuf>> {
+    let root = entry.path();
+    let kind = std::fs::symlink_metadata(&root)
+        .with_context(|| format!("inspect execution work entry {}", root.display()))?
+        .file_type();
+    if kind.is_file() {
+        return Ok(None);
+    }
+    ensure!(
+        kind.is_dir(),
+        "execution work entry is not a directory: {}",
+        root.display()
+    );
+    Ok(Some(root))
+}
+
 /// Inspect all receipts: discovery can lag generation creation after a crash.
 /// Empty history is not proof that a pending control belongs to an old container.
 pub(crate) fn work_history_for_launch(
@@ -330,7 +348,14 @@ pub(crate) fn work_history_for_launch(
                 return LaunchHistory::CurrentOrUnknown;
             }
         };
-        let root = entry.path();
+        let root = match generation_entry_root(entry) {
+            Ok(Some(root)) => root,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(%error, "work entry type unconfirmed; assuming local work exists");
+                return LaunchHistory::CurrentOrUnknown;
+            }
+        };
         match root.join("generation.json").try_exists() {
             Ok(false) => continue, // legacy adapter owns legacy receipts
             Ok(true) => {}
@@ -397,7 +422,9 @@ pub(crate) fn reconcile_foreign(
     }
     let mut abandoned = None;
     for entry in std::fs::read_dir(dir)? {
-        let root = entry?.path();
+        let Some(root) = generation_entry_root(entry?)? else {
+            continue;
+        };
         if !root.join("generation.json").try_exists()? {
             continue;
         }
@@ -520,7 +547,9 @@ fn reconcile_local(
     }
     let mut abandoned = None;
     for entry in std::fs::read_dir(dir)? {
-        let root = entry?.path();
+        let Some(root) = generation_entry_root(entry?)? else {
+            continue;
+        };
         if !root.join("generation.json").try_exists()? {
             continue;
         } // legacy adapter owns legacy receipts
@@ -1026,6 +1055,125 @@ mod tests {
             temp.path(),
             Some(&domain_fixture("pod-new"))
         ));
+    }
+
+    #[test]
+    fn regular_work_history_files_preserve_bytes_without_fencing_reconciliation() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let diagnostic = work.join("old-diagnostic.json");
+        let uuid_file = work.join(uuid::Uuid::new_v4().to_string());
+        for file in [&diagnostic, &uuid_file] {
+            std::fs::write(file, b"{original historical bytes\0").unwrap();
+        }
+        assert_eq!(
+            work_history_for_launch(temp.path(), None),
+            LaunchHistory::Empty
+        );
+        assert!(reconcile_local(temp.path(), None).unwrap().is_none());
+        assert!(
+            reconcile_foreign(temp.path(), "current-supervisor")
+                .unwrap()
+                .is_none()
+        );
+        for file in [&diagnostic, &uuid_file] {
+            assert_eq!(
+                std::fs::read(file).unwrap(),
+                b"{original historical bytes\0"
+            );
+        }
+    }
+
+    #[test]
+    fn regular_work_history_files_do_not_bypass_held_or_unreadable_generation() {
+        let (temp, id) = stuck_scope(None, None);
+        let diagnostic = temp.path().join("work/old-diagnostic.json");
+        std::fs::write(&diagnostic, "original historical diagnostic").unwrap();
+        let root = work_root(temp.path(), &id).unwrap();
+        let original = std::fs::read(root.join("generation.json")).unwrap();
+        let held = lock(&root.join("generation.lock")).unwrap();
+        assert!(reconcile_local(temp.path(), None).is_err());
+        assert!(reconcile_foreign(temp.path(), "different-supervisor").is_err());
+        assert_eq!(
+            work_history_for_launch(temp.path(), None),
+            LaunchHistory::CurrentOrUnknown
+        );
+        drop(held);
+        assert_eq!(
+            std::fs::read(root.join("generation.json")).unwrap(),
+            original
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("work")).unwrap();
+        let diagnostic = temp.path().join("work/old-diagnostic.json");
+        std::fs::write(&diagnostic, "original historical diagnostic").unwrap();
+        let unknown = work_root(temp.path(), &uuid::Uuid::new_v4().to_string()).unwrap();
+        std::fs::create_dir_all(unknown.join("generation.json")).unwrap();
+        assert!(reconcile_local(temp.path(), None).is_err());
+        assert!(reconcile_foreign(temp.path(), "different-supervisor").is_err());
+        assert_eq!(
+            work_history_for_launch(temp.path(), None),
+            LaunchHistory::CurrentOrUnknown
+        );
+        assert!(unknown.join("generation.json").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(diagnostic).unwrap(),
+            "original historical diagnostic"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn work_entry_symlinks_are_not_followed_or_ignored_as_regular_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("work")).unwrap();
+        let diagnostic = outside.path().join("diagnostic.json");
+        std::fs::write(&diagnostic, "external original diagnostic").unwrap();
+        let link = temp.path().join("work/old-diagnostic.json");
+        std::os::unix::fs::symlink(&diagnostic, &link).unwrap();
+        assert!(reconcile_local(temp.path(), None).is_err());
+        assert!(reconcile_foreign(temp.path(), "current-supervisor").is_err());
+        assert_eq!(
+            work_history_for_launch(temp.path(), None),
+            LaunchHistory::CurrentOrUnknown
+        );
+        assert_eq!(
+            std::fs::read_to_string(&diagnostic).unwrap(),
+            "external original diagnostic"
+        );
+        std::fs::remove_file(&link).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let external = outside.path().join(&id);
+        std::fs::create_dir_all(external.join("generation.json")).unwrap();
+        let link = temp.path().join("work").join(id);
+        std::os::unix::fs::symlink(&external, &link).unwrap();
+        let entry = std::fs::read_dir(temp.path().join("work"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert!(
+            generation_entry_root(entry)
+                .unwrap_err()
+                .to_string()
+                .contains("not a directory")
+        );
+        assert!(reconcile_local(temp.path(), None).is_err());
+        assert!(reconcile_foreign(temp.path(), "current-supervisor").is_err());
+        assert!(external.join("generation.json").is_dir());
+        assert!(!external.join("generation.lock").exists());
+        std::fs::remove_file(&link).unwrap();
+        let socket = temp.path().join("work/current.sock");
+        let _socket = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(reconcile_local(temp.path(), None).is_err());
+        assert!(reconcile_foreign(temp.path(), "current-supervisor").is_err());
+        assert_eq!(
+            work_history_for_launch(temp.path(), None),
+            LaunchHistory::CurrentOrUnknown
+        );
     }
 
     #[test]

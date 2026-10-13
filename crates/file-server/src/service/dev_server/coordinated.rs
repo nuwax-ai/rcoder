@@ -213,6 +213,15 @@ fn executor_error(error: AppError) -> PreviewExecutorError {
         AppError::ProcessPortInUse { port, detail } => {
             PreviewExecutorError::PortInUse(format!("port {port} in use: {detail}"))
         }
+        AppError::BusinessWithDetails(message, details)
+            if details.get("code").and_then(serde_json::Value::as_str)
+                == Some("TYPECHECK_FAILED") =>
+        {
+            PreviewExecutorError::Business {
+                code: "TYPECHECK_FAILED".into(),
+                message,
+            }
+        }
         other => PreviewExecutorError::Failed(other.to_string()),
     }
 }

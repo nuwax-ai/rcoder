@@ -94,28 +94,15 @@ pub(crate) async fn build_project_impl(
     } else {
         vec!["run", "build"]
     };
-    let build_result = crate::service::dev_server::process::run_command_to_log(
+    crate::service::dev_typecheck::run_build_script(
         "pnpm",
         &build_args,
         path,
         &main_log,
         &temp_log,
         timeout,
-        Default::default(),
     )
-    .await;
-    if let Err(build_error) = build_result {
-        // 失败: 读 build 日志用 build_error 解析友好消息 (对齐 nuwax BuildErrorParser)
-        let log_content = crate::service::fs_util::read_to_string_bounded(
-            &temp_log,
-            state.config.log_read_max_bytes,
-            "build log",
-        )
-        .await
-        .unwrap_or_else(|_| build_error.to_string());
-        let friendly = crate::service::build_error::parse(&log_content);
-        return Err(AppError::system(friendly));
-    }
+    .await?;
 
     // 拷贝 dist → {DIST_TARGET_DIR}/{projectId}/dist/ (Rust fs, 无 rm -rf shell;
     // 错误为类型化 io::Error, 路径经 PathBuf::join 无注入)

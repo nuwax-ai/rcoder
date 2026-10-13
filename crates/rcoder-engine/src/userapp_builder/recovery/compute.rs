@@ -199,7 +199,10 @@ pub(super) async fn discover_pending(
             && (matches!(record.stage.as_str(), "stopped" | "verifying")
                 || (matches!(record.stage.as_str(), "starting" | "stopping")
                     && (record.has_conditional_compute_write()
-                        || record.has_docker_compute_target())))
+                        || record.has_docker_compute_target()
+                        || crate::userapp_builder::compute_control::missing_builder_creation(
+                            &record,
+                        ))))
         {
             let flight = state.userapp_op_flight.guard()?;
             let state = state.clone();
@@ -244,7 +247,11 @@ pub(super) async fn discover_pending(
         }
         if record.action == shared_types::ComputeControlAction::Restart
             && (record.stage == "stopped"
-                || (record.stage == "starting" && record.has_conditional_compute_write()))
+                || (record.stage == "starting"
+                    && (record.has_conditional_compute_write()
+                        || crate::userapp_builder::compute_control::missing_builder_creation(
+                            &record,
+                        ))))
             && matches!(
                 record.state,
                 shared_types::ComputeControlState::Running

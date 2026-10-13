@@ -7,12 +7,20 @@ use futures_util::future::try_join_all;
 use tokio::fs;
 
 use crate::error::{AppError, AppResult};
+use crate::models::SkillFailure;
 use crate::service::skill_download::SkillDownloader;
 use crate::workspace::{ProjectContext, WorkspaceResolver};
 
 pub struct PushResult {
     pub project_path: String,
     pub updated_skills: Vec<String>,
+    pub failed_skills: Vec<SkillFailure>,
+}
+
+#[derive(Default)]
+pub struct SkillUpdates {
+    pub updated_skills: Vec<String>,
+    pub failed_skills: Vec<SkillFailure>,
 }
 
 /// 推送 skills 到权威源 `.agents/skills`, 再 sync_agents fan-out 到五家 ACP 目录。
@@ -35,7 +43,8 @@ pub async fn push_skills(
     let updated = push_skills_at(&project_path, zip_path, skill_urls, downloader).await?;
     Ok(PushResult {
         project_path: project_path.to_string_lossy().to_string(),
-        updated_skills: updated,
+        updated_skills: updated.updated_skills,
+        failed_skills: updated.failed_skills,
     })
 }
 
@@ -46,7 +55,7 @@ pub async fn push_skills_at(
     zip_path: Option<&Path>,
     skill_urls: Vec<String>,
     downloader: &SkillDownloader,
-) -> AppResult<Vec<String>> {
+) -> AppResult<SkillUpdates> {
     if zip_path.is_none() && skill_urls.is_empty() {
         return Err(AppError::validation(
             "file or skillUrls cannot both be empty",
@@ -58,17 +67,47 @@ pub async fn push_skills_at(
     fs::create_dir_all(&primary_skills).await?;
     fs::create_dir_all(&primary_agents).await?;
 
-    let mut updated = Vec::new();
+    let mut result = SkillUpdates::default();
     if let Some(source) = zip_path {
-        updated.extend(import_skill_archive(workspace, &primary_skills, source).await?);
+        import_skill_archive(
+            workspace,
+            &primary_skills,
+            source,
+            false,
+            &mut result.updated_skills,
+        )
+        .await?;
     }
     for url in skill_urls {
-        let downloaded = downloader.download(&url).await?;
-        updated.extend(import_skill_archive(workspace, &primary_skills, downloaded.path()).await?);
+        let imported = async {
+            let downloaded = downloader.download(&url).await?;
+            import_skill_archive(
+                workspace,
+                &primary_skills,
+                downloaded.path(),
+                true,
+                &mut result.updated_skills,
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = imported {
+            tracing::warn!(error = %error, "skill URL failed; remaining skills continue");
+            result.failed_skills.push(SkillFailure::from_error(
+                None,
+                &url,
+                "Download/extract skill zip failed",
+                &error,
+            ));
+        }
     }
 
     sync_agents(workspace).await?;
-    Ok(updated)
+    let mut seen = std::collections::HashSet::new();
+    result
+        .updated_skills
+        .retain(|name| seen.insert(name.clone()));
+    Ok(result)
 }
 
 /// push_skills_to_agent_store 参数 (结构化入参, 避免 too_many_arguments)。
@@ -91,7 +130,7 @@ pub struct PushToStoreParams<'a> {
 /// push-skills to agent-store (对齐 TS pushSkillsToAgentStore)。
 /// 动态技能写入实体目录 (打 `.dynamic_add.lock`), 并确保会话工作区软链。
 /// 调用前提: 会话工作区 `.agents/skills` 已是软链 (由 create_workspace_with_agent_store 建立)。
-pub async fn push_skills_to_agent_store(params: PushToStoreParams<'_>) -> AppResult<Vec<String>> {
+pub async fn push_skills_to_agent_store(params: PushToStoreParams<'_>) -> AppResult<SkillUpdates> {
     let PushToStoreParams {
         user_root,
         session_workspace,
@@ -111,26 +150,43 @@ pub async fn push_skills_to_agent_store(params: PushToStoreParams<'_>) -> AppRes
     let (agent_skills_dir, agent_agents_dir) =
         crate::service::agent_store::ensure_agent_store_dirs(user_root, agent_id).await?;
 
-    let mut updated: Vec<String> = Vec::new();
+    let mut result = SkillUpdates::default();
 
     // 处理上传 zip
     if let Some(zip) = zip_path {
-        updated.extend(
-            install_skills_from_zip_dynamic(zip, &agent_skills_dir, session_workspace).await?,
-        );
+        install_skills_from_zip_dynamic(
+            zip,
+            &agent_skills_dir,
+            session_workspace,
+            false,
+            &mut result.updated_skills,
+        )
+        .await?;
     }
 
     // 处理 skill_urls
     for url in &skill_urls {
-        let downloaded = downloader.download(url).await?;
-        updated.extend(
+        let imported = async {
+            let downloaded = downloader.download(url).await?;
             install_skills_from_zip_dynamic(
                 downloaded.path(),
                 &agent_skills_dir,
                 session_workspace,
+                true,
+                &mut result.updated_skills,
             )
-            .await?,
-        );
+            .await
+        }
+        .await;
+        if let Err(error) = imported {
+            tracing::warn!(error = %error, "dynamic skill URL failed; remaining skills continue");
+            result.failed_skills.push(SkillFailure::from_error(
+                None,
+                url,
+                "Download/extract/install skill zip failed",
+                &error,
+            ));
+        }
     }
 
     // 共享工作区 → 自愈式视图同步（动态加技能不改变配置清单——不传清单，
@@ -155,10 +211,14 @@ pub async fn push_skills_to_agent_store(params: PushToStoreParams<'_>) -> AppRes
 
     tracing::info!(
         op = "push_skills_to_agent_store",
-        updated_skills = updated.len(),
+        updated_skills = result.updated_skills.len(),
         "pushed skills to agent store"
     );
-    Ok(updated)
+    let mut seen = std::collections::HashSet::new();
+    result
+        .updated_skills
+        .retain(|name| seen.insert(name.clone()));
+    Ok(result)
 }
 
 /// 解压 zip → 安装所有 skill 子目录到 agent-store (as_dynamic = true)。
@@ -167,7 +227,9 @@ async fn install_skills_from_zip_dynamic(
     zip_path: &Path,
     agent_skills_dir: &Path,
     session_workspace: &Path,
-) -> AppResult<Vec<String>> {
+    from_url: bool,
+    updated: &mut Vec<String>,
+) -> AppResult<()> {
     let tmp = session_workspace.join(".tmp");
     fs::create_dir_all(&tmp).await?;
     let extract_guard = crate::service::temp_file::tempdir_in(tmp, ".push-skill-").await?;
@@ -187,16 +249,17 @@ async fn install_skills_from_zip_dynamic(
     } else {
         extract_root
     };
-    let mut updated = Vec::new();
+    let mut candidates = 0;
     let mut rd = fs::read_dir(&base).await?;
     while let Some(entry) = rd.next_entry().await? {
         let name = entry.file_name().to_string_lossy().to_string();
         if name.starts_with('.') {
             continue;
         }
-        if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+        if !entry.file_type().await?.is_dir() {
             continue;
         }
+        candidates += 1;
         crate::service::agent_store::install_skill_dir(
             &entry.path(),
             agent_skills_dir,
@@ -206,24 +269,40 @@ async fn install_skills_from_zip_dynamic(
         .await?;
         updated.push(name);
     }
-    Ok(updated)
+    if from_url && candidates == 0 {
+        return Err(AppError::validation(
+            "No skill directory found in downloaded zip",
+        ));
+    }
+    Ok(())
 }
 
 async fn import_skill_archive(
     workspace: &Path,
     primary_skills: &Path,
     source: &Path,
-) -> AppResult<Vec<String>> {
+    from_url: bool,
+    imported: &mut Vec<String>,
+) -> AppResult<()> {
     let parent = workspace.parent().unwrap_or(workspace).to_path_buf();
     let extract_guard = crate::service::temp_file::tempdir_in(parent, ".skills-extract-").await?;
     let extract_root = extract_guard.path().join("content");
     fs::create_dir_all(&extract_root).await?;
     crate::service::zip::extract_to(source.to_path_buf(), extract_root.clone()).await?;
-    let mut imported = Vec::new();
-    if let Some(skills_dir) = find_skills_dir(&extract_root).await? {
+    let skills_dir = match find_skills_dir(&extract_root).await? {
+        Some(path) => Some(path),
+        None if from_url => Some(extract_root),
+        None => None,
+    };
+    let mut candidates = 0;
+    if let Some(skills_dir) = skills_dir {
         let mut entries = fs::read_dir(&skills_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name().to_string_lossy().to_string();
+            if from_url && (name.starts_with('.') || !entry.file_type().await?.is_dir()) {
+                continue;
+            }
+            candidates += 1;
             let src = entry.path();
             let dst = primary_skills.join(&name);
             remove_dir_if_exists(&dst).await?;
@@ -231,20 +310,35 @@ async fn import_skill_archive(
             imported.push(name);
         }
     }
-    Ok(imported)
+    if from_url && candidates == 0 {
+        return Err(AppError::validation(
+            "No skill directory found in downloaded zip",
+        ));
+    }
+    Ok(())
 }
 
 /// 在 extract_root 下找 skills 目录 (优先根 skills/, 再查一层子目录 skills/)。
 async fn find_skills_dir(root: &Path) -> AppResult<Option<PathBuf>> {
     let direct = root.join("skills");
-    if fs::try_exists(&direct).await? {
-        return Ok(Some(direct));
+    match fs::metadata(&direct).await {
+        Ok(metadata) if metadata.is_dir() => return Ok(Some(direct)),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     let mut entries = fs::read_dir(root).await?;
     while let Some(entry) = entries.next_entry().await? {
+        // 与 TS Dirent.isDirectory 一致：README 等普通文件不可作为父目录扫描。
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
         let sub = entry.path().join("skills");
-        if fs::try_exists(&sub).await? {
-            return Ok(Some(sub));
+        match fs::metadata(&sub).await {
+            Ok(metadata) if metadata.is_dir() => return Ok(Some(sub)),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(None)
@@ -521,3 +615,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod best_effort_tests;

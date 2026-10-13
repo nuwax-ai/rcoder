@@ -20,6 +20,17 @@ pub(super) fn coordination_error(error: shared_types::PreviewCoordinationError) 
         shared_types::PreviewCoordinationError::Unavailable(message) => AppError::system(message),
         shared_types::PreviewCoordinationError::Conflict(message) => AppError::business(message),
         shared_types::PreviewCoordinationError::Invalid(message) => AppError::validation(message),
+        shared_types::PreviewCoordinationError::Business { code, message }
+            if code == "TYPECHECK_FAILED" =>
+        {
+            AppError::business_with_details(message, serde_json::json!({ "code": code }))
+        }
+        shared_types::PreviewCoordinationError::Business { code, message } => {
+            // 旧/未知业务代码没有已验证的放行语义，仍按不可用保护。
+            AppError::system(format!(
+                "unsupported preview business code {code}: {message}"
+            ))
+        }
     }
 }
 
@@ -418,4 +429,35 @@ pub(crate) async fn port_pool_status(
         total_allocated: status.total_allocated,
         allocations: status.allocations,
     }))
+}
+
+#[cfg(test)]
+mod typecheck_error_tests {
+    use super::*;
+    use axum::response::IntoResponse as _;
+
+    #[tokio::test]
+    async fn dev_typecheck_coordination_unknown_codes_and_unavailability_remain_500() {
+        for error in [
+            shared_types::PreviewCoordinationError::Business {
+                code: "FUTURE_UNKNOWN_CODE".into(),
+                message: "unknown classification".into(),
+            },
+            shared_types::PreviewCoordinationError::Unavailable(
+                "TYPECHECK_FAILED text is not a typed business result".into(),
+            ),
+        ] {
+            let response = coordination_error(error).into_response();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+            let body = axum::body::to_bytes(response.into_body(), 100_000)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["code"], "UNKNOWN_ERROR");
+            assert_eq!(body["error"]["type"], "SYSTEM_ERROR");
+        }
+    }
 }

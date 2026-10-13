@@ -74,6 +74,7 @@ pub async fn build_generic(
             crate::service::dev_server::process::CommandObservers {
                 on_pid: req.on_pid,
                 on_line: req.on_line.clone(),
+                ..Default::default()
             },
         ))
         .await?;

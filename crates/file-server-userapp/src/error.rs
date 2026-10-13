@@ -48,9 +48,10 @@ pub(crate) fn app_error_code(error: &AppError) -> &str {
             shared_types::AppError::Structured(detail) => &detail.code,
             _ => ec::ERR_INTERNAL_SERVER_ERROR,
         },
-        AppError::Validation(..) | AppError::ValidationI18n(..) | AppError::Business(_) => {
-            ec::ERR_VALIDATION
-        }
+        AppError::Validation(..)
+        | AppError::ValidationI18n(..)
+        | AppError::Business(_)
+        | AppError::BusinessWithDetails(..) => ec::ERR_VALIDATION,
         AppError::Conflict(_) | AppError::RuntimeRecovery(..) => ec::ERR_CONFLICT,
         AppError::Resource(_) => ec::ERR_NOT_FOUND,
         AppError::Network(_) => ec::ERR_SERVICE_UNAVAILABLE,

@@ -87,6 +87,56 @@ async fn signal_fixture(pid: u32, signal: &str) -> Result<()> {
 }
 
 #[tokio::test]
+async fn regular_work_history_preserves_bytes_and_authorizes_real_successor_worker() {
+    use runtime_supervisor::Phase;
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    std::fs::create_dir_all(root.join("work")).unwrap();
+    let diagnostic = root.join("work/old-diagnostic.json");
+    let bytes = b"{retained diagnostic bytes\0";
+    std::fs::write(&diagnostic, bytes).unwrap();
+    let mut parent = start(&root).unwrap();
+    let result = async {
+        let initial = until(&root, |s| s.phase == Phase::Ready).await?;
+        ensure!(
+            initial.generation.is_some(),
+            "management worker was not authorized"
+        );
+        ensure!(
+            runtime_supervisor::Owner::try_acquire(&root)?.is_none(),
+            "actual supervisor released its owner lease"
+        );
+        ensure!(
+            runtime_supervisor::domain::pending(&root, &initial.binding)?.is_empty(),
+            "regular history became a platform retirement proposal"
+        );
+        control(&root, Request::new(Action::Recover)).await?;
+        let successor = until(&root, |s| {
+            s.phase == Phase::Ready && s.generation != initial.generation
+        })
+        .await?;
+        ensure!(
+            successor.supervisor_id == initial.supervisor_id && successor.generation.is_some(),
+            "ordinary recovery did not retain the same actual owner"
+        );
+        let address = leaf(&root).await?;
+        ensure!(
+            tokio::net::TcpStream::connect(&address).await.is_ok(),
+            "new worker did not execute actual business"
+        );
+        ensure!(
+            std::fs::read(&diagnostic)? == bytes,
+            "historical file was changed"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    shutdown(&root, &mut parent).await;
+    result.unwrap();
+    assert_eq!(std::fs::read(diagnostic).unwrap(), bytes);
+}
+
+#[tokio::test]
 async fn replacement_container_does_not_replay_stale_shutdown_or_block_new_stop() {
     use runtime_supervisor::{Binding, Intent, Phase, domain::PhysicalDomain};
     let temp = tempfile::tempdir().unwrap();

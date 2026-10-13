@@ -252,9 +252,18 @@ pub fn spawn_dev(
 /// spawn task（'static）。供上层实时推送 SSE `log` 事件。
 pub type OnLineCallback = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
-/// 运行一次性非 pnpm-install 命令 (build/preprocess), arg 数组 + stdout/stderr 管道到日志, 阻塞等待。
-/// 用 current_dir 替代 `cd ... &&`, arg 数组替代 shell 拼接; 错误为类型化 io::Error/退出码。
-///
+/// 仅在实际进程树退出、命令回执持久化为 Quiescent 后发出的完成分类。
+/// 取消、等待结果未知、清理或持久化失败不提供可放行的完成证据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandCompletion {
+    Exited {
+        code: Option<i32>,
+        output_complete: bool,
+    },
+    TimedOut,
+    NotStarted,
+}
+
 /// 一次性命令的过程回调集合（pid 回写供 cancel；行回调供 SSE 实时日志）。
 #[derive(Default)]
 pub struct CommandObservers<'a> {
@@ -262,6 +271,8 @@ pub struct CommandObservers<'a> {
     pub on_pid: Option<&'a (dyn Fn(u32) + Send + Sync)>,
     /// 每行输出回调（见 [`OnLineCallback`]）；None 不回调。
     pub on_line: Option<OnLineCallback>,
+    /// 精确完成分类；无回调表示原副作用仍需保护，而非普通工具失败。
+    pub on_completed: Option<&'a (dyn Fn(CommandCompletion) + Send + Sync)>,
 }
 
 /// 运行一次性非 pnpm-install 命令 (build/preprocess), arg 数组 + stdout/stderr 管道到日志, 阻塞等待。
@@ -308,23 +319,62 @@ pub async fn run_command_to_log(
             "previous command process-tree cleanup is still pending",
         ));
     }
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(timeout_secs))
+        .ok_or_else(|| AppError::validation("command timeout exceeds the clock range"))?;
     let record = process_utils::command_context::CommandRecord::prepare()
         .map_err(|e| AppError::system(format!("persist command intent: {e}")))?;
-    let mut child = match process_utils::guardian::spawn_owned(cmd, record.as_ref()).await {
-        Ok(child) => child,
-        Err(error) => {
-            if let Some(record) = &record {
-                record
-                    .quiescent()
-                    .map_err(|e| AppError::system(format!("persist spawn failure: {e}")))?;
+    let (mut child, spawn_error) = match process_utils::guardian::spawn_owned_checked_until(
+        cmd,
+        record.as_ref(),
+        true,
+        deadline,
+    )
+    .await
+    {
+        Ok(child) => (child, None),
+        Err(failure) => {
+            let unstarted_tool = context
+                .as_ref()
+                .is_none_or(|context| context.journal_root.is_none())
+                && process_utils::command_authority::current_root().is_none()
+                && failure
+                    .source
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| {
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                        )
+                    });
+            let error = AppError::system(format!(
+                "spawn command failed (program={program}, cwd={}): {:#}",
+                cwd.display(),
+                failure.source
+            ));
+            match failure.child {
+                Some(child) => (child, Some(error)),
+                None => {
+                    // Checked spawn proves no OS Child was started. A failed
+                    // durable acknowledgement still denies environment pass-through.
+                    if let Some(record) = &record {
+                        record
+                            .quiescent()
+                            .map_err(|e| AppError::system(format!("persist spawn failure: {e}")))?;
+                    }
+                    if unstarted_tool
+                        && !cancellation.is_cancelled()
+                        && let Some(callback) = observers.on_completed
+                    {
+                        callback(CommandCompletion::NotStarted);
+                    }
+                    return Err(error);
+                }
             }
-            return Err(AppError::system(format!(
-                "spawn command failed (program={program}, cwd={}): {error}",
-                cwd.display()
-            )));
         }
     };
-    if let Some(receipt) = &record
+    if spawn_error.is_none()
+        && let Some(receipt) = &record
         && let Err(error) = receipt.running(child.id())
     {
         crate::service::build_manager::BuildGuard::retain_command_cleanup(child, record);
@@ -353,19 +403,27 @@ pub async fn run_command_to_log(
         let on_line = observers.on_line.clone();
         tokio::spawn(async move { pipe_stream(err, main, temp, on_line).await })
     });
-    let result = tokio::select! {
-        result = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_root()) => {
-            match result {
-                Ok(Ok(status)) if status.success() => Ok(()),
-                Ok(Ok(status)) => Err(AppError::system(format!("command exited non-zero: {status}"))),
-                Ok(Err(error)) => Err(AppError::system(format!("command wait failed: {error}"))),
-                Err(_) => Err(AppError::system(format!("command timed out after {timeout_secs}s"))),
+    let (result, completion) = if let Some(error) = spawn_error {
+        (Err(error), None)
+    } else {
+        tokio::select! {
+            result = tokio::time::timeout_at(deadline, child.wait_root()) => {
+                match result {
+                    Ok(Ok(status)) => {
+                        let completion = Some(CommandCompletion::Exited { code: status.code(), output_complete: false });
+                        let result = if status.success() { Ok(()) } else { Err(AppError::system(format!("command exited non-zero: {status}"))) };
+                        (result, completion)
+                    }
+                    Ok(Err(error)) => (Err(AppError::system(format!("command wait failed: {error}"))), None),
+                    Err(_) => (Err(AppError::system(format!("command timed out after {timeout_secs}s"))), Some(CommandCompletion::TimedOut)),
+                }
             }
+            () = cancellation.cancelled() => (Err(AppError::business("owned command cancelled")), None),
         }
-        () = cancellation.cancelled() => Err(AppError::business("owned command cancelled")),
     };
     // Root exit alone cannot release the workspace while descendants still run.
     let cleanup = child.stop(Duration::from_secs(1)).await;
+    let mut confirmed = false;
     let outcome = if matches!(
         cleanup,
         process_utils::managed_tree::StopOutcome::Unconfirmed
@@ -376,7 +434,10 @@ pub async fn run_command_to_log(
         ))
     } else if let Some(record) = record {
         match record.quiescent() {
-            Ok(()) => result,
+            Ok(()) => {
+                confirmed = true;
+                result
+            }
             Err(error) => {
                 process_utils::command_context::retain_cleanup(None, Some(record));
                 Err(AppError::system(format!(
@@ -385,11 +446,26 @@ pub async fn run_command_to_log(
             }
         }
     } else {
+        confirmed = true;
         result
     };
 
     // 等日志管道 drain(超时放弃,不阻塞返回;尾部日志可能截断但会告警)。
-    drain_log_pipes(stdout_handle, stderr_handle).await;
+    let output_complete = drain_log_pipes(stdout_handle, stderr_handle).await;
+    if confirmed
+        && !cancellation.is_cancelled()
+        && let Some(callback) = observers.on_completed
+        && let Some(completion) = completion
+    {
+        let completion = match completion {
+            CommandCompletion::Exited { code, .. } => CommandCompletion::Exited {
+                code,
+                output_complete,
+            },
+            other => other,
+        };
+        callback(completion);
+    }
 
     // 失败时把本次运行输出尾部嵌入错误信息——只报退出码的笼统错误
     // （"command exited non-zero: exit status: 1"）无法定位是哪条命令、
@@ -453,13 +529,21 @@ async fn append_run_log_tail(err: AppError, temp_log: &Path) -> AppError {
 
 /// 等待 stdout/stderr 日志管道 task 结束,确保 child 退出后尾部日志写完(#17)。
 /// 两个 handle 共用 2s drain 窗口；超时/panic 仅告警，不影响构建结果。
-async fn drain_log_pipes(stdout: Option<JoinHandle<()>>, stderr: Option<JoinHandle<()>>) {
+async fn drain_log_pipes(
+    stdout: Option<JoinHandle<bool>>,
+    stderr: Option<JoinHandle<bool>>,
+) -> bool {
+    let mut complete = true;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     for mut handle in stdout.into_iter().chain(stderr) {
         match tokio::time::timeout_at(deadline, &mut handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "log pipe task ended with error"),
+            Ok(Ok(observed)) => complete &= observed,
+            Ok(Err(e)) => {
+                complete = false;
+                tracing::warn!(error = %e, "log pipe task ended with error");
+            }
             Err(_) => {
+                complete = false;
                 handle.abort();
                 // Drop its log callback as well, so the caller can close its
                 // progress channel instead of waiting forever on an orphan.
@@ -468,6 +552,7 @@ async fn drain_log_pipes(stdout: Option<JoinHandle<()>>, stderr: Option<JoinHand
             }
         }
     }
+    complete
 }
 
 /// 轮询等待进程退出 (对齐 nuwax waitForProcessStop)。

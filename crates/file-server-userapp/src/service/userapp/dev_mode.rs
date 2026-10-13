@@ -188,6 +188,7 @@ async fn run_devbuild_once(
         CommandObservers {
             on_pid: pid_ref,
             on_line: Some(line_cb.clone()),
+            ..Default::default()
         },
     )
     .await;

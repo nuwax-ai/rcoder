@@ -90,5 +90,6 @@ pub(crate) async fn push_skills_to_workspace(
         message: pushed_skills_message(&result.updated_skills, false),
         project_path: result.project_path,
         updated_skills: result.updated_skills,
+        failed_skills: result.failed_skills,
     }))
 }
