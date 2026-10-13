@@ -980,6 +980,33 @@ pub fn recover(work_root: &Path) -> Result<()> {
 /// This never signals a PID, revokes Pending, repairs records or asserts that
 /// a whole physical container exited. A held guardian lock remains an error.
 pub fn is_scope_settled(work_root: &Path) -> Result<bool> {
+    scope_settled(work_root, None)
+}
+
+/// Observe a captured historical resident range after its owner lease is held
+/// and old admission is closed. Only scope header diagnostics are ignored;
+/// guardian identities, real locks and known command outcomes remain required.
+/// No original record is repaired, revoked or rewritten by this observation.
+pub fn is_historical_resident_scope_settled(
+    work_root: &Path,
+    captured: &crate::command_authority::ResidentIdentity,
+) -> Result<bool> {
+    ensure!(
+        crate::command_authority::read_historical_resident_identity(work_root)? == *captured,
+        "historical resident identity changed before observation"
+    );
+    let settled = scope_settled(work_root, Some(captured))?;
+    ensure!(
+        crate::command_authority::read_historical_resident_identity(work_root)? == *captured,
+        "historical resident identity changed during observation"
+    );
+    Ok(settled)
+}
+
+fn scope_settled(
+    work_root: &Path,
+    historical: Option<&crate::command_authority::ResidentIdentity>,
+) -> Result<bool> {
     let root = work_root.join("guardians");
     let mut settled = true;
     if root.try_exists()? {
@@ -993,10 +1020,16 @@ pub fn is_scope_settled(work_root: &Path) -> Result<bool> {
                 "guardian belongs to different instance"
             );
             if let Some(expected) = &receipt.resident_identity {
-                ensure!(
-                    &crate::command_authority::read_resident_identity(work_root)? == expected,
-                    "resident guardian identity changed before observation"
-                );
+                match historical {
+                    Some(captured) => ensure!(
+                        captured == expected,
+                        "historical resident guardian identity changed before observation"
+                    ),
+                    None => ensure!(
+                        &crate::command_authority::read_resident_identity(work_root)? == expected,
+                        "resident guardian identity changed before observation"
+                    ),
+                }
             }
             if !matches!(receipt.phase.as_str(), "Quiescent" | "Revoked") {
                 settled = false;
@@ -1010,6 +1043,10 @@ pub fn is_scope_settled(work_root: &Path) -> Result<bool> {
 #[cfg(test)]
 #[path = "guardian/settled_scope_tests.rs"]
 mod settled_scope_tests;
+
+#[cfg(all(test, unix))]
+#[path = "guardian/historical_resident_tests.rs"]
+mod historical_resident_tests;
 
 /// Platform-confirmed termination of the entire captured physical domain.
 /// Caller must hold the original scope/generation lock and close admission.

@@ -360,6 +360,7 @@ pub use operation_flight::{FlightAdmissionClosed, FlightGuard, OperationFlightGa
 
 pub use userapp::compute_control::*;
 pub use userapp::compute_recovery::*;
+pub use userapp::recovery_scan::UserAppRecoveryScanPage;
 
 pub use userapp::discovery::UserAppDiscoveredIdentity;
 

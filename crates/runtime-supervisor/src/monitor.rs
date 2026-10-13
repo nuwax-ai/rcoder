@@ -21,6 +21,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod historical_stop;
+
 #[derive(Clone)]
 pub struct Policy {
     pub probe_interval: Duration,
@@ -182,6 +184,7 @@ impl Owner {
         let old = if let Some(expected) = supervisor_id {
             // A retained request may not repair or overwrite a replacement's
             // discovery before checking its identity, even if generation=None.
+            self.repair_verified_stop_discovery(binding, request, expected)?;
             let discovery: Discovery = record::read(&self.root.join("supervisor.json"))?;
             if discovery.instance != expected
                 || discovery.snapshot.supervisor_id != expected

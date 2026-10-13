@@ -172,6 +172,47 @@ pub(crate) async fn unfinished_operations(
         .map(|result| result.map_err(storage))
         .collect()
 }
+
+pub(crate) async fn scan_unfinished_operations(
+    tx: &mut dyn Executor,
+    _backend: Backend,
+    after: Option<&str>,
+    limit: u32,
+) -> Result<UserAppRecoveryScanPage<UserAppOperationRecord>, Error> {
+    if limit == 0 || limit > 1000 {
+        return Err(Error::InvalidOperation(
+            "Invalid recovery scan page size".into(),
+        ));
+    }
+    let rows = models::Operation::filter(
+        models::Operation::fields()
+            .operation_id()
+            .gt(after.unwrap_or(""))
+            .and(models::Operation::fields().terminal_at_us().is_none()),
+    )
+    .order_by(models::Operation::fields().operation_id().asc())
+    .limit(usize::try_from(limit).map_err(storage)?)
+    .exec(tx)
+    .await
+    .map_err(storage)?;
+    let next_after = rows.last().map(|row| row.operation_id.clone());
+    let exhausted = u64::try_from(rows.len()).unwrap_or(u64::MAX) < u64::from(limit);
+    let mut records = Vec::with_capacity(rows.len());
+    for row in rows {
+        let app_id = row.app_id.clone();
+        let operation_id = row.operation_id.clone();
+        match codec::operation(row) {
+            Ok(record) => records.push(record),
+            Err(_) => tracing::warn!(%app_id, %operation_id,
+                "Recovery scan retained malformed operation row; direct reads and execution checks remain strict"),
+        }
+    }
+    Ok(UserAppRecoveryScanPage {
+        records,
+        next_after,
+        exhausted,
+    })
+}
 pub(crate) async fn advance(
     tx: &mut dyn Executor,
     backend: Backend,
@@ -331,6 +372,65 @@ pub(crate) async fn terminal_operation_leases(
         result.push(binding);
     }
     Ok(result)
+}
+
+pub(crate) async fn scan_terminal_operation_leases(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    after: Option<&str>,
+    limit: u32,
+) -> Result<UserAppRecoveryScanPage<UserAppOperationLeaseBinding>, Error> {
+    if limit == 0 || limit > 1000 {
+        return Err(Error::InvalidOperation(
+            "Invalid recovery scan page size".into(),
+        ));
+    }
+    let ids = repo::strings(toasty::sql::query(repo::sql(backend,
+        "SELECT l.operation_id FROM userapp_operation_leases l JOIN userapp_operations o ON o.operation_id=l.operation_id AND o.app_id=l.app_id AND o.lifecycle_id=l.lifecycle_id WHERE o.terminal_at_us IS NOT NULL AND l.operation_id>$1 ORDER BY l.operation_id LIMIT $2"))
+        .bind(after.unwrap_or("")).bind(i64::from(limit)).exec(tx).await.map_err(storage)?)?;
+    let next_after = ids.last().cloned();
+    let exhausted = u64::try_from(ids.len()).unwrap_or(u64::MAX) < u64::from(limit);
+    let mut records = Vec::with_capacity(ids.len());
+    for operation_id in ids {
+        // Database/transport failures still fail the page. Only successfully
+        // read row decoding and ownership inconsistencies are isolated.
+        let row = models::OperationLease::get_by_operation_id(tx, &operation_id)
+            .await
+            .map_err(storage)?;
+        let app_id = row.app_id.clone();
+        let binding = match lease_binding(row) {
+            Ok(binding) => binding,
+            Err(_) => {
+                tracing::warn!(%app_id, %operation_id,
+                    "Recovery scan retained malformed lease row; ordinary receipt reads remain strict");
+                continue;
+            }
+        };
+        let row = models::Operation::filter_by_operation_id(&operation_id)
+            .first()
+            .exec(tx)
+            .await
+            .map_err(storage)?;
+        let operation = match row.filter(|row| row.app_id == app_id).map(codec::operation) {
+            Some(Ok(operation)) => operation,
+            _ => {
+                tracing::warn!(%app_id, %operation_id,
+                    "Recovery scan retained lease whose original operation is unavailable or malformed");
+                continue;
+            }
+        };
+        if !operation.state.is_terminal() || !owns(&binding.context, &operation) {
+            tracing::warn!(%app_id, %operation_id,
+                "Recovery scan retained lease whose terminal ownership differs");
+            continue;
+        }
+        records.push(binding);
+    }
+    Ok(UserAppRecoveryScanPage {
+        records,
+        next_after,
+        exhausted,
+    })
 }
 pub(crate) async fn forget_operation_lease(
     tx: &mut dyn Executor,

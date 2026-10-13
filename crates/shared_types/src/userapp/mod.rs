@@ -43,6 +43,7 @@ pub mod builder_recovery;
 
 pub mod compute_control;
 pub mod compute_recovery;
+pub mod recovery_scan;
 
 pub mod discovery;
 

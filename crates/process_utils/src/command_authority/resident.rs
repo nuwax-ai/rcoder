@@ -246,6 +246,25 @@ pub fn read_identity(root: &Path) -> Result<ResidentIdentity> {
     Ok(receipt.identity)
 }
 
+/// Discover the original identity of a historical resident range. Header
+/// version, informational phase and extra diagnostics do not grant execution
+/// authority and cannot invalidate independently observed settled outcomes.
+/// Current spawn and permission checks continue to use `read_identity`.
+pub fn read_historical_identity(root: &Path) -> Result<ResidentIdentity> {
+    #[derive(Deserialize)]
+    struct HistoricalReceipt {
+        identity: ResidentIdentity,
+    }
+    let receipt: HistoricalReceipt =
+        serde_json::from_slice(&std::fs::read(root.join("resident-scope.json"))?)?;
+    ensure!(
+        root.file_name().and_then(|value| value.to_str())
+            == Some(receipt.identity.owner_instance.as_str()),
+        "historical resident instance differs from scope"
+    );
+    Ok(receipt.identity)
+}
+
 pub(crate) fn validate_resident_spawn(root: &Path) -> Result<()> {
     if !root.join("resident-scope.json").try_exists()? {
         return Ok(());
@@ -279,6 +298,10 @@ fn require_owner(root: &Path, identity: &ResidentIdentity) -> Result<()> {
         Err(error) => Err(error).context("verify resident owner lock"),
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "resident/historical_identity_tests.rs"]
+mod historical_identity_tests;
 
 #[cfg(test)]
 mod tests {

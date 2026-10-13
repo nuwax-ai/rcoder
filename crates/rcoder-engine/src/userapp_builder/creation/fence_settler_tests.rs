@@ -70,6 +70,8 @@ pub(crate) struct FenceRuntime {
     pub(crate) compute_release_succeeds: std::sync::atomic::AtomicBool,
     pub(crate) compute_stall: std::sync::atomic::AtomicBool,
     pub(crate) compute_inspection: Mutex<Option<shared_types::ComputeLeaseInspection>>,
+    /// Optional actual OS lease fixture; other runtime behavior stays unchanged.
+    pub(crate) physical_compute_runtime: Mutex<Option<Arc<dyn UserAppDeploymentRuntime>>>,
     pub(crate) compute_prepares: std::sync::atomic::AtomicUsize,
     pub(crate) compute_releases: std::sync::atomic::AtomicUsize,
     status: Mutex<Option<Option<DeploymentStatus>>>,
@@ -92,6 +94,7 @@ impl FenceRuntime {
             compute_release_succeeds: Default::default(),
             compute_stall: Default::default(),
             compute_inspection: Default::default(),
+            physical_compute_runtime: Default::default(),
             compute_prepares: Default::default(),
             compute_releases: Default::default(),
             status: Mutex::new(Some(status)),
@@ -232,10 +235,16 @@ impl UserAppDeploymentRuntime for FenceRuntime {
     }
     async fn inspect_compute_drain_lease(
         &self,
-        _: &shared_types::UserAppExecutionContext,
-        _: shared_types::UserAppOperationScope,
+        context: &shared_types::UserAppExecutionContext,
+        scope: shared_types::UserAppOperationScope,
         receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
     ) -> ContainerRuntimeResult<shared_types::ComputeLeaseInspection> {
+        let physical = self.physical_compute_runtime.lock().expect("lock").clone();
+        if let Some(physical) = physical {
+            return physical
+                .inspect_compute_drain_lease(context, scope, receipt)
+                .await;
+        }
         if self.compute_stall.load(std::sync::atomic::Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
@@ -257,9 +266,15 @@ impl UserAppDeploymentRuntime for FenceRuntime {
     }
     async fn release_app_operation_receipt(
         &self,
-        _: &shared_types::UserAppExecutionContext,
-        _: &shared_types::UserAppOperationLeaseReceipt,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
     ) -> ContainerRuntimeResult<()> {
+        let physical = self.physical_compute_runtime.lock().expect("lock").clone();
+        if let Some(physical) = physical {
+            return physical
+                .release_app_operation_receipt(context, receipt)
+                .await;
+        }
         self.compute_releases
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self
@@ -352,6 +367,12 @@ impl UserAppDeploymentRuntime for FenceRuntime {
         context: &shared_types::UserAppExecutionContext,
         receipt: &shared_types::UserAppOperationLeaseReceipt,
     ) -> ContainerRuntimeResult<bool> {
+        let physical = self.physical_compute_runtime.lock().expect("lock").clone();
+        if let Some(physical) = physical {
+            return physical
+                .app_operation_receipt_holder_dead(context, receipt)
+                .await;
+        }
         if let Some(dead) = *self.receipt_holder_dead.lock().expect("lock") {
             return Ok(dead);
         }

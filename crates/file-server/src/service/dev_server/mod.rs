@@ -15,6 +15,8 @@ pub mod coordinated;
 mod discovery;
 pub mod error_classify;
 mod external_store;
+#[cfg(all(test, unix))]
+mod historical_discovery_tests;
 mod local_stop;
 pub mod log;
 mod migration_receipts;

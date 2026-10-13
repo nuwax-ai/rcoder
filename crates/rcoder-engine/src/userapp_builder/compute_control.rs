@@ -818,6 +818,12 @@ pub(super) async fn drain_previous_once(
                     .await?;
                 old.lease = None;
             }
+            if !super::compute_drain_recovery::observe_unsubmitted_predecessor(state, &old, record)
+                .await?
+            {
+                drained = false;
+                continue;
+            }
             drained &= (matches!(
                 old.state,
                 ComputeControlState::Succeeded | ComputeControlState::Failed

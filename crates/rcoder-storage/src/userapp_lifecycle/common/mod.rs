@@ -30,6 +30,8 @@ mod local_tests;
 mod ops;
 #[cfg(all(test, feature = "pg"))]
 mod pg_commit_reply_tests;
+#[cfg(test)]
+mod recovery_scan_tests;
 mod repo;
 #[cfg(test)]
 mod transaction_fault_tests;
@@ -763,6 +765,19 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         })
         .await
     }
+    async fn scan_terminal_operation_leases(
+        &self,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<UserAppRecoveryScanPage<UserAppOperationLeaseBinding>, UserAppStoreError> {
+        let after = after.map(str::to_owned);
+        self.run(true, move |tx, backend| {
+            Box::pin(async move {
+                ops::scan_terminal_operation_leases(tx, backend, after.as_deref(), limit).await
+            })
+        })
+        .await
+    }
     async fn forget_operation_lease(
         &self,
         binding: &UserAppOperationLeaseBinding,
@@ -1057,6 +1072,19 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         self.run(true, move |tx, backend| {
             Box::pin(async move {
                 ops::unfinished_operations(tx, backend, after_operation_id.as_deref(), limit).await
+            })
+        })
+        .await
+    }
+    async fn scan_unfinished_operations(
+        &self,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<UserAppRecoveryScanPage<UserAppOperationRecord>, UserAppStoreError> {
+        let after = after.map(str::to_owned);
+        self.run(true, move |tx, backend| {
+            Box::pin(async move {
+                ops::scan_unfinished_operations(tx, backend, after.as_deref(), limit).await
             })
         })
         .await

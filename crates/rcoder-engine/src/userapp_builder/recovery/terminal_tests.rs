@@ -6,9 +6,9 @@ use container_runtime_api::{
     ContainerRuntimeError, ContainerRuntimeResult, UserAppDeploymentRuntime,
 };
 use shared_types::{
-    AppFileMutationMarker, ServiceType, UserAppAdmission, UserAppAdmissionOutcome,
-    UserAppExecutionContext, UserAppLifecycleStore, UserAppOperationLeaseReceipt,
-    UserAppOperationProgress, UserAppOperationRecord,
+    AppFileMutationMarker, ComputeLeaseInspection, ServiceType, UserAppAdmission,
+    UserAppAdmissionOutcome, UserAppExecutionContext, UserAppLifecycleStore,
+    UserAppOperationLeaseReceipt, UserAppOperationProgress, UserAppOperationRecord,
 };
 use std::{fs::OpenOptions, os::unix::fs::MetadataExt as _, path::PathBuf, sync::Arc};
 
@@ -18,6 +18,62 @@ struct FileLeaseAdapter {
 
 #[async_trait]
 impl UserAppDeploymentRuntime for FileLeaseAdapter {
+    async fn inspect_compute_drain_lease(
+        &self,
+        context: &UserAppExecutionContext,
+        _scope: shared_types::UserAppOperationScope,
+        receipt: Option<&UserAppOperationLeaseReceipt>,
+    ) -> ContainerRuntimeResult<ComputeLeaseInspection> {
+        let file = match OpenOptions::new().read(true).write(true).open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ComputeLeaseInspection::Absent);
+            }
+            Err(error) => return Err(ContainerRuntimeError::Conflict(error.to_string())),
+        };
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(ComputeLeaseInspection::Held),
+            Err(error) => return Err(ContainerRuntimeError::Conflict(error.to_string())),
+        }
+        let metadata = file.metadata().unwrap();
+        let marker = std::fs::read_to_string(&self.path).unwrap();
+        let actual = UserAppOperationLeaseReceipt::Docker {
+            service_type: ServiceType::UserappBuilder,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            token: context.executor_id.clone(),
+        };
+        if receipt.is_some_and(|expected| expected != &actual)
+            || (!marker.is_empty() && marker != context.executor_id)
+        {
+            return Ok(ComputeLeaseInspection::IdentityChanged(
+                "Actual fixture inode/token differs".into(),
+            ));
+        }
+        Ok(if marker.is_empty() {
+            ComputeLeaseInspection::Absent
+        } else {
+            ComputeLeaseInspection::Releasable(actual)
+        })
+    }
+
+    async fn app_operation_receipt_holder_dead(
+        &self,
+        context: &UserAppExecutionContext,
+        receipt: &UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(matches!(
+            self.inspect_compute_drain_lease(
+                context,
+                shared_types::UserAppOperationScope::Dev,
+                Some(receipt)
+            )
+            .await?,
+            ComputeLeaseInspection::Absent | ComputeLeaseInspection::Releasable(_)
+        ))
+    }
+
     async fn release_app_operation_receipt(
         &self,
         context: &UserAppExecutionContext,
@@ -37,7 +93,10 @@ impl UserAppDeploymentRuntime for FileLeaseAdapter {
                 *service_type == ServiceType::UserappBuilder,
                 "Unexpected family"
             );
-            anyhow::ensure!(token == &context.operation_id, "Unexpected operation");
+            anyhow::ensure!(
+                token == &context.operation_id || token == &context.executor_id,
+                "Unexpected operation/attempt"
+            );
             let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
             file.try_lock()?;
             let identity = file.metadata()?;
@@ -350,3 +409,5 @@ async fn compute_terminal_scan_preserves_uncertain_then_releases_confirmed_recei
     assert_eq!(after.state, ComputeControlState::Succeeded);
     assert!(after.lease.is_none());
 }
+
+mod historical_compute_tests;

@@ -195,7 +195,7 @@ async fn discover_terminal_leases(
     let query_cursor = cursor.clone();
     let read = tokio::time::timeout(
         SCAN_READ_TIMEOUT,
-        store.terminal_operation_leases(query_cursor.as_deref(), SCAN_PAGE_SIZE),
+        store.scan_terminal_operation_leases(query_cursor.as_deref(), SCAN_PAGE_SIZE),
     );
     tokio::pin!(read);
     let page = loop {
@@ -208,12 +208,21 @@ async fn discover_terminal_leases(
             }
         }
     };
-    if page.is_empty() {
-        *cursor = None;
+    if page.records.is_empty() {
+        // A page of retained malformed rows is not end-of-scan. Advance by the
+        // raw tail, leaving each bad row protected while other apps can recover.
+        *cursor = if page.exhausted {
+            None
+        } else {
+            page.next_after
+        };
         return Ok(());
     }
-    for binding in page {
+    let raw_tail = page.next_after;
+    let mut consumed_all = true;
+    for binding in page.records {
         if tasks.reject_if_full("terminal_lease_push") {
+            consumed_all = false;
             break;
         }
         *cursor = Some(binding.context.operation_id.clone());
@@ -226,6 +235,9 @@ async fn discover_terminal_leases(
             store.forget_operation_lease(&binding).await?;
             Ok(())
         });
+    }
+    if consumed_all {
+        *cursor = raw_tail;
     }
     Ok(())
 }
@@ -246,7 +258,7 @@ async fn discover(
             SCAN_READ_TIMEOUT,
             state
                 .userapp_store
-                .unfinished_operations(query_cursor.as_deref(), SCAN_PAGE_SIZE),
+                .scan_unfinished_operations(query_cursor.as_deref(), SCAN_PAGE_SIZE),
         );
         tokio::pin!(read);
         let page = loop {
@@ -259,11 +271,19 @@ async fn discover(
                 }
             }
         };
-        if page.is_empty() {
-            *cursor = None;
-            return Ok(());
+        if page.records.is_empty() {
+            *cursor = if page.exhausted {
+                None
+            } else {
+                page.next_after
+            };
+            if page.exhausted {
+                return Ok(());
+            }
+            continue;
         }
-        for operation in page {
+        let raw_tail = page.next_after;
+        for operation in page.records {
             if tasks.reject_if_full("dispatch") {
                 return Ok(());
             }
@@ -471,6 +491,9 @@ async fn discover(
                 Ok(())
             });
         }
+        // All valid rows were considered. Include any malformed suffix in the
+        // cursor, rather than repeatedly rediscovering that historical tail.
+        *cursor = raw_tail;
     }
     Ok(())
 }

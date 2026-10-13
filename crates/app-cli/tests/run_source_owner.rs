@@ -38,25 +38,64 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let directory = tempfile::tempdir().unwrap();
-        let app = format!("run-{}", uuid::Uuid::new_v4().simple());
-        let source = directory.path().canonicalize().unwrap().join(&app);
-        let state = directory.path().join("state").join(&app);
-        std::fs::create_dir_all(source.join("web")).unwrap();
-        let pingap = protocol_support::write_pingap(&source);
-        let fixture = Self {
-            _directory: directory,
-            source,
-            state,
-            app,
-            pingap,
-            admin_addr: "127.0.0.1:0".into(),
-            clients: vec![],
-            owner: None,
-            owner_pid: None,
-        };
-        fixture.manifests("first");
-        fixture
+        // Each native fixture uses the production deterministic allocator. A
+        // random service ID can map to an occupied host port (e.g. system UI).
+        // Select another ID before any CLI/owner execution; do not rewrite the
+        // immutable lock or signal the unrelated listener. The test group
+        // serializes these fixtures; availability is still checked by bind.
+        let candidates = usize::from(
+            workspace_manifest::INTERNAL_PORT_MAX - workspace_manifest::INTERNAL_PORT_MIN + 1,
+        );
+        for _ in 0..candidates {
+            let directory = tempfile::tempdir().unwrap();
+            let app = format!("run-{}", uuid::Uuid::new_v4().simple());
+            let source = directory.path().canonicalize().unwrap().join(&app);
+            let state = directory.path().join("state").join(&app);
+            std::fs::create_dir_all(source.join("web")).unwrap();
+            let pingap = protocol_support::write_pingap(&source);
+            let fixture = Self {
+                _directory: directory,
+                source,
+                state,
+                app,
+                pingap,
+                admin_addr: "127.0.0.1:0".into(),
+                clients: vec![],
+                owner: None,
+                owner_pid: None,
+            };
+            fixture.manifests("first");
+            match std::net::TcpListener::bind(("0.0.0.0", fixture.planned_business_port())) {
+                Ok(listener) => {
+                    drop(listener);
+                    return fixture;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(error) => panic!("inspect actual fixture business port: {error}"),
+            }
+        }
+        panic!("no available native fixture business port from the production range");
+    }
+
+    fn planned_business_port(&self) -> u16 {
+        let workspace = workspace_manifest::parse_workspace(
+            &std::fs::read_to_string(self.source.join("workspace.manifest.toml")).unwrap(),
+        )
+        .unwrap();
+        let projects = workspace_manifest::discover_projects(&self.source).unwrap();
+        let lock = workspace_manifest::build_release_lock(
+            &workspace,
+            &projects,
+            workspace_manifest::ReleaseMetadata {
+                release_id: "native-port-probe",
+                pingap_version: "0.14.3",
+                pingap_commit: "cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8",
+                minimum_app_cli_version: workspace_manifest::MINIMUM_APP_CLI_VERSION,
+                runtime_image_digest: "native-test-fixture",
+            },
+        )
+        .unwrap();
+        lock.services[0].port
     }
 
     fn manifests(&self, marker: &str) {

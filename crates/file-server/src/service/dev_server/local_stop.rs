@@ -20,6 +20,107 @@ use crate::error::{AppError, AppResult};
 use crate::models::KilledPid;
 
 impl DevServerManager {
+    /// Rebuild locator metadata only under its actual owner lock. The owning
+    /// CLI still drains every retained execution before a new start is allowed.
+    pub(super) async fn recover_unreadable_local_roots(
+        &self,
+        project_id: &str,
+        workspace: &Path,
+        unreadable: &[(PathBuf, String)],
+        budget: Duration,
+    ) -> AppResult<()> {
+        let binding = runtime_supervisor::Binding {
+            component: discovery::ORCHESTRATOR_COMPONENT.into(),
+            resource: runtime_state_layout::resolve_project_origin(workspace).map_err(|error| {
+                AppError::owner_error("resolve local recovery workspace", error)
+            })?,
+        };
+        for (root, diagnostic) in unreadable {
+            // Use the same continuation lock as an ordinary Stop. Reload the
+            // persisted target after acquiring it; a delayed Start cannot repair
+            // a target already replaced by another caller.
+            let key = format!("{project_id}|{}", root.display());
+            let target_lock = self.userapp_stop_lock(&format!("local-stop:{key}"))?;
+            let _continuation = target_lock.try_lock().map_err(|_| {
+                AppError::business(
+                    "local stop is already being observed; retry resumes the same request",
+                )
+            })?;
+            let pending = self.pending_local_stops(project_id)?;
+            let mut retained = pending
+                .iter()
+                .find(|(_, attempt)| attempt.root == *root)
+                .cloned();
+            let owner = runtime_supervisor::Owner::try_acquire(root)
+                .map_err(|error| AppError::owner_error("claim unreadable local owner", error))?
+                .ok_or_else(|| {
+                    AppError::business(format!(
+                        "local owner still holds its execution lock; recovery is pending ({})",
+                        root.display()
+                    ))
+                })?;
+            if retained
+                .as_ref()
+                .is_some_and(|(_, attempt)| attempt.binding != binding)
+            {
+                return Err(AppError::business(
+                    "retained local stop belongs to another workspace",
+                ));
+            }
+            let cleanup = self
+                .owner_cleanup_command(workspace, root)
+                .map_err(|error| {
+                    AppError::owner_error("prepare unreadable owner cleanup", error)
+                })?;
+            let result = tokio::time::timeout(budget, async {
+                if let Some((key, attempt)) = &mut retained {
+                    if attempt.mode == runtime_supervisor::StopMode::Unresolved {
+                        owner.capture_unresolved_stop_target(attempt)?;
+                        // Capture and sync before cleanup or the original Stop
+                        // write. Crash recovery cannot retarget a dispatched Stop.
+                        self.persist_captured_stop(key, attempt)?;
+                        super::stop_activity::native_dispatched(attempt)?;
+                    } else {
+                        owner.validate_captured_stop_target(attempt)?;
+                    }
+                }
+                owner
+                    .drain_previous_ranges(
+                        &binding,
+                        project_id,
+                        &cleanup,
+                        tokio::time::Instant::now() + budget,
+                    )
+                    .await?;
+                let request = if let Some((_, attempt)) = &retained {
+                    owner.repair_captured_stop_discovery(attempt)?;
+                    attempt.request.clone()
+                } else {
+                    runtime_supervisor::Request::new(runtime_supervisor::Action::StopWork)
+                };
+                owner
+                    .stop_offline_with_cleanup(&binding, &request, &cleanup)
+                    .await
+            })
+            .await
+            .map_err(|error| {
+                AppError::owner_error("wait for unreadable local execution", error.into())
+            })?
+            .map_err(|error| {
+                AppError::owner_error("recover unreadable local supervision", error)
+            })?;
+            if result.phase != runtime_supervisor::Phase::Stopped {
+                return Err(AppError::owner_error(
+                    "recover unreadable local supervision",
+                    result.recovery_error(),
+                ));
+            }
+            tracing::info!(project_id, root = %root.display(), %diagnostic,
+                "Recovered historical local discovery after actual execution drain");
+        }
+        Ok(())
+    }
+
     /// Disk is authoritative across manager/process restarts. Do not let a
     /// stale in-memory snapshot omit a Stop captured by another caller.
     pub(super) fn pending_local_stops(
@@ -86,7 +187,17 @@ impl DevServerManager {
             .collect();
         extra_roots.extend(persisted_roots);
 
-        let report = discovery::discover_targets_with(project_path, &extra_roots);
+        let mut report = discovery::discover_targets_with(project_path, &extra_roots);
+        if !report.unreadable.is_empty() {
+            self.recover_unreadable_local_roots(
+                project_id,
+                project_path,
+                &report.unreadable,
+                supervision_budget,
+            )
+            .await?;
+            report = discovery::discover_targets_with(project_path, &extra_roots);
+        }
 
         let mut stopped_live = false;
         // 持久 attempt（按 key 在座）与发现的活目标统一走同一续行入口；

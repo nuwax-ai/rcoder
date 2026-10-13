@@ -12,7 +12,9 @@ use std::{
 mod resident;
 pub(crate) use resident::validate_resident_spawn;
 pub use resident::{
-    OwnerLease, ResidentIdentity, ResidentScope, read_identity as read_resident_identity,
+    OwnerLease, ResidentIdentity, ResidentScope,
+    read_historical_identity as read_historical_resident_identity,
+    read_identity as read_resident_identity,
 };
 
 pub const WORK_ROOT_ENV: &str = "RCODER_COMMAND_WORK_ROOT";

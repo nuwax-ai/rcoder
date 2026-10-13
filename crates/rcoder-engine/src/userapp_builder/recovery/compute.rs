@@ -43,44 +43,56 @@ pub(super) async fn discover_compute_leases(
         ) {
             continue;
         }
-        if record.state == shared_types::ComputeControlState::Succeeded
-            && let Some(value) = record.checkpoint.get("builder_restart_template")
-        {
-            let template: shared_types::BuilderRestartTemplate =
-                match serde_json::from_value(value.clone()) {
-                    Ok(template) => template,
-                    Err(error) => {
-                        tracing::error!(%error, operation_id = %record.operation_id,
-                            "Invalid restart archive checkpoint; retaining its lease and archive");
-                        continue;
+        // Terminal physical authority is independent of an old private archive.
+        // Retain malformed/foreign archive bytes for diagnosis, while the exact
+        // confirmed terminal lease still has its normal release/forget path.
+        let template = if record.state == shared_types::ComputeControlState::Succeeded {
+            record.checkpoint.get("builder_restart_template").and_then(|value| {
+                match serde_json::from_value::<shared_types::BuilderRestartTemplate>(value.clone()) {
+                    Ok(template) if template.source.context.app_id == record.app_id
+                        && template.source.context.lifecycle_id == record.lifecycle_id
+                        && template.source.context.operation_id == record.operation_id => Some(template),
+                    Ok(_) => {
+                        tracing::warn!(operation_id = %record.operation_id,
+                            "Retaining foreign historical restart archive; terminal lease cleanup remains available");
+                        None
                     }
-                };
-            if template.source.context.app_id != record.app_id
-                || template.source.context.lifecycle_id != record.lifecycle_id
-                || template.source.context.operation_id != record.operation_id
-            {
-                tracing::error!(operation_id = %record.operation_id,
-                    "Restart archive checkpoint belongs to another operation; retaining its lease and archive");
-                continue;
-            }
-            let store = store.clone();
-            let runtime = runtime.clone();
-            tasks.push(format!("compute:{}", record.operation_id), async move {
-                let context = record.execution_context().map_err(anyhow::Error::msg)?;
-                if let Some(receipt) = &record.lease {
-                    runtime
-                        .release_app_operation_receipt(&context, receipt)
-                        .await?;
-                    let identity = shared_types::ComputeExecutorIdentity {
-                        app_id: record.app_id.clone(),
-                        lifecycle_id: record.lifecycle_id.clone(),
-                        scope: record.scope,
-                        operation_id: record.operation_id.clone(),
-                        generation: record.generation,
-                        executor_id: context.executor_id.clone(),
-                    };
-                    store.forget_compute_lease(&identity, receipt).await?;
+                    Err(error) => {
+                        tracing::warn!(%error, operation_id = %record.operation_id,
+                            "Retaining undecodable historical restart archive; terminal lease cleanup remains available");
+                        None
+                    }
                 }
+            })
+        } else {
+            None
+        };
+        if record.lease.is_none() && template.is_none() {
+            continue;
+        }
+        let store = store.clone();
+        let runtime = runtime.clone();
+        tasks.push(format!("compute:{}", record.operation_id), async move {
+            let context = record.execution_context().map_err(anyhow::Error::msg)?;
+            if let Some(receipt) = &record.lease {
+                runtime
+                    .release_app_operation_receipt(&context, receipt)
+                    .await?;
+                store
+                    .forget_compute_lease(
+                        &shared_types::ComputeExecutorIdentity {
+                            app_id: record.app_id.clone(),
+                            lifecycle_id: record.lifecycle_id.clone(),
+                            scope: record.scope,
+                            operation_id: record.operation_id.clone(),
+                            generation: record.generation,
+                            executor_id: context.executor_id.clone(),
+                        },
+                        receipt,
+                    )
+                    .await?;
+            }
+            if let Some(template) = template {
                 runtime.cleanup_builder_restart_archive(&template).await?;
                 let current = store
                     .get_compute_control(&record.app_id, &record.operation_id)
@@ -92,35 +104,9 @@ pub(super) async fn discover_compute_leases(
                     "Archive cleanup checkpoint changed"
                 );
                 store.mark_restart_archive_cleaned(&current).await?;
-                runtime.cleanup_compute_receipt_files(&context).await?;
-                Ok(())
-            });
-            continue;
-        }
-        let Some(receipt) = record.lease.clone() else {
-            // A terminal record without a lease has no live compute receipt to
-            // release; its stop/start files (if any) were cleaned by the pass
-            // that released the lease.
-            continue;
-        };
-        let context = record.execution_context().map_err(anyhow::Error::msg)?;
-        let identity = shared_types::ComputeExecutorIdentity {
-            app_id: record.app_id,
-            lifecycle_id: record.lifecycle_id,
-            scope: record.scope,
-            operation_id: record.operation_id,
-            generation: record.generation,
-            executor_id: context.executor_id.clone(),
-        };
-        let store = store.clone();
-        let runtime = runtime.clone();
-        tasks.push(format!("compute:{}", identity.operation_id), async move {
-            runtime
-                .release_app_operation_receipt(&context, &receipt)
-                .await?;
-            store.forget_compute_lease(&identity, &receipt).await?;
-            // The record is terminal: its durable outcome no longer depends on
-            // the per-operation stop/start receipt files.
+            }
+            // These per-operation receipts no longer grant execution authority.
+            // A malformed archive above was not edited, deleted or marked clean.
             runtime.cleanup_compute_receipt_files(&context).await?;
             Ok(())
         });
@@ -193,6 +179,28 @@ pub(super) async fn discover_pending(
             break;
         }
         *cursor = Some(record.operation_id.clone());
+        if record.can_observe_superseded_compute_drain() {
+            let flight = state.userapp_op_flight.guard()?;
+            let state = state.clone();
+            tasks.push(
+                format!("compute-superseded-drain:{}", record.operation_id),
+                async move {
+                    let _flight = flight;
+                    tokio::time::timeout(
+                        Duration::from_secs(30),
+                        crate::userapp_builder::compute_drain_recovery::recover_superseded_early(
+                            &state, &record,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("Superseded early compute observation timed out")
+                    })??;
+                    Ok(())
+                },
+            );
+            continue;
+        }
         if record.state == shared_types::ComputeControlState::Superseded
             && record.action == shared_types::ComputeControlAction::Restart
             && record.lease.is_some()

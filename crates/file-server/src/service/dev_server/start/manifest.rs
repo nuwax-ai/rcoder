@@ -376,6 +376,18 @@ impl DevServerManager {
         {
             roots.push(root);
         }
+        let report = discovery::discover_targets_with(workspace, &roots);
+        if !report.unreadable.is_empty() {
+            self.recover_unreadable_local_roots(
+                project_id,
+                workspace,
+                &report.unreadable,
+                Duration::from_secs(self.config.dev_supervision_stop_budget_secs.max(1)),
+            )
+            .await?;
+        }
+        // Repair an unreadable locator for the captured request before control
+        // continuation tries to read it. This never replaces the old target.
         // Continue retained requests even if their latest snapshot is Stopped
         // or their root is absent from the current registry/layout.
         for (key, attempt) in pending {

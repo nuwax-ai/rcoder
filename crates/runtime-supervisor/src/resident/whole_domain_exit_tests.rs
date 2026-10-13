@@ -225,7 +225,7 @@ async fn whole_physical_exit_covers_older_resident_owned_by_previous_supervisor(
 }
 
 #[tokio::test]
-async fn whole_domain_retirement_keeps_foreign_application_and_workspace_rejected() {
+async fn whole_domain_retirement_allows_application_metadata_and_protects_workspace() {
     for foreign_application in [true, false] {
         let fixture = Fixture::new();
         let mut next = fixture.next.clone();
@@ -239,12 +239,26 @@ async fn whole_domain_retirement_keeps_foreign_application_and_workspace_rejecte
             .unwrap();
         }
         fixture.discovery(&next);
-        assert!(
-            initialize(&fixture.root, &fixture.lease, next)
-                .await
-                .is_err()
-        );
-        fixture.assert_guardians_running();
+        let result = initialize(&fixture.root, &fixture.lease, next.clone()).await;
+        if foreign_application {
+            let successor = result.unwrap();
+            assert_eq!(successor.identity(), &next);
+            for guardian in &fixture.guardians {
+                let receipt: serde_json::Value =
+                    record::read(&guardian.join("receipt.json")).unwrap();
+                assert_eq!(receipt["phase"], "Quiescent");
+                assert!(
+                    receipt["root_status"].is_null(),
+                    "retirement cannot invent business success"
+                );
+            }
+            assert!(OwnerLease::try_acquire(&fixture.root).unwrap().is_none());
+            successor.close().unwrap();
+            successor.record_quiescent().unwrap();
+        } else {
+            assert!(result.is_err());
+            fixture.assert_guardians_running();
+        }
         fixture.assert_original_identity_bytes_preserved();
     }
 }

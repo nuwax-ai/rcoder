@@ -54,11 +54,13 @@ pub(crate) async fn reconcile_prior_until(
                 std::fs::canonicalize(&previous)? == previous,
                 "resident range resolves outside owner root"
             );
-            let old = process_utils::command_authority::read_resident_identity(&previous)?;
-            ensure!(
-                old.application_id == identity.application_id,
-                "resident belongs to another application"
-            );
+            let old =
+                process_utils::command_authority::read_historical_resident_identity(&previous)?;
+            if old.application_id != identity.application_id {
+                tracing::debug!(previous_application_id = %old.application_id,
+                    current_application_id = %identity.application_id,
+                    "Resident application metadata changed; inspect the original workspace and execution range");
+            }
             if old.binding != identity.binding {
                 let permitted = settled_previous.map(serde_json::to_value).transpose()?;
                 ensure!(
@@ -82,8 +84,8 @@ pub(crate) async fn reconcile_prior_until(
                 .as_ref()
                 .map(|value| serde_json::from_value::<crate::domain::PhysicalDomain>(value.clone()))
                 .transpose()?;
-            if !same_domain
-                && previous_domain
+            if same_domain
+                || previous_domain
                     .as_ref()
                     .zip(current.as_ref())
                     .is_some_and(|(before, now)| {
@@ -93,9 +95,26 @@ pub(crate) async fn reconcile_prior_until(
                     })
             {
                 process_utils::command_authority::Gate::try_acquire(&previous)?.close()?;
-                if process_utils::guardian::is_scope_settled(&previous)
-                    .context("inspect prior physical-domain resident outcomes")?
-                {
+                let settled = match process_utils::guardian::is_historical_resident_scope_settled(
+                    &previous, &old,
+                ) {
+                    Ok(settled) => settled,
+                    Err(error)
+                        if same_domain
+                            && error.downcast_ref::<std::fs::TryLockError>().is_some_and(
+                                |error| matches!(error, std::fs::TryLockError::WouldBlock),
+                            ) =>
+                    {
+                        // The ordinary same-domain recovery owns the bounded
+                        // wait for a real guardian still retaining its lock.
+                        false
+                    }
+                    Err(error) => {
+                        return Err(error)
+                            .context("inspect prior physical-domain resident outcomes");
+                    }
+                };
+                if settled {
                     // Closed, observed outcomes are history even when the
                     // resident scope's last informational phase was Running.
                     // Preserve the original receipts and their business results.
@@ -160,6 +179,10 @@ async fn recover_previous(
 #[cfg(test)]
 #[path = "resident/whole_domain_exit_tests.rs"]
 mod whole_domain_exit_tests;
+
+#[cfg(all(test, unix))]
+#[path = "resident/legacy_application_tests.rs"]
+mod legacy_application_tests;
 
 #[cfg(test)]
 mod tests {
@@ -357,14 +380,13 @@ mod tests {
         drop(scope);
         drop(owner);
         let owner = OwnerLease::try_acquire(&root).unwrap().unwrap();
-        for change in ["authority", "volume", "app", "binding", "none"] {
+        for change in ["authority", "volume", "binding", "none"] {
             let mut next = identity("app", &uuid::Uuid::new_v4().to_string(), &binding);
             let mut current = domain.clone();
             current.instance = "new-pod".into();
             match change {
                 "authority" => current.authority = "another-cluster".into(),
                 "volume" => current.volume = "another-pvc".into(),
-                "app" => next.application_id = "another-app".into(),
                 "binding" => next.binding["resource"] = "/another-workspace".into(),
                 _ => {}
             }
@@ -615,7 +637,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resident_recovery_rejects_cross_application_domain_and_unknown_prior_tree() {
+    async fn resident_recovery_allows_history_metadata_and_protects_domain_and_unknown_prior_tree()
+    {
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let binding = serde_json::json!({"component": "app-cli", "resource": root});
@@ -631,13 +654,12 @@ mod tests {
         drop(old_owner);
 
         let successor = OwnerLease::try_acquire(&root).unwrap().unwrap();
-        let foreign_app = identity("app-b", &uuid::Uuid::new_v4().to_string(), &binding);
-        discovery(&root, &foreign_app);
-        let error = initialize(&root, &successor, foreign_app)
-            .await
-            .err()
-            .unwrap();
-        assert!(format!("{error:#}").contains("another application"));
+        let current_app = identity("app-b", &uuid::Uuid::new_v4().to_string(), &binding);
+        discovery(&root, &current_app);
+        let scope = initialize(&root, &successor, current_app).await.unwrap();
+        scope.close().unwrap();
+        scope.record_quiescent().unwrap();
+        drop(scope);
         assert_eq!(
             std::fs::read(old_root.join("resident-scope.json")).unwrap(),
             receipt_before

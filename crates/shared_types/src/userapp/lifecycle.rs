@@ -1251,6 +1251,27 @@ pub trait UserAppLifecycleStore: Send + Sync {
         after: Option<&str>,
         limit: u32,
     ) -> Result<Vec<crate::UserAppOperationLeaseBinding>, UserAppStoreError>;
+    /// Internal bounded recovery scan. SQL stores advance from raw identities
+    /// even when an individual historical receipt cannot be decoded safely.
+    async fn scan_terminal_operation_leases(
+        &self,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<
+        crate::UserAppRecoveryScanPage<crate::UserAppOperationLeaseBinding>,
+        UserAppStoreError,
+    > {
+        let records = self.terminal_operation_leases(after, limit).await?;
+        let next_after = records
+            .last()
+            .map(|binding| binding.context.operation_id.clone());
+        let exhausted = u64::try_from(records.len()).unwrap_or(u64::MAX) < u64::from(limit);
+        Ok(crate::UserAppRecoveryScanPage {
+            records,
+            next_after,
+            exhausted,
+        })
+    }
     /// Forgets a receipt only after conditional runtime release and a terminal
     /// SQL result; exact-receipt match only, never bulk cleanup by app_id.
     async fn forget_operation_lease(
@@ -1475,6 +1496,24 @@ pub trait UserAppLifecycleStore: Send + Sync {
         after_operation_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<UserAppOperationRecord>, UserAppStoreError>;
+    /// Decode failures stay scoped to their original row; callers must use
+    /// next_after/exhausted rather than treating an empty valid page as EOF.
+    async fn scan_unfinished_operations(
+        &self,
+        after_operation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<crate::UserAppRecoveryScanPage<UserAppOperationRecord>, UserAppStoreError> {
+        let records = self
+            .unfinished_operations(after_operation_id, limit)
+            .await?;
+        let next_after = records.last().map(|record| record.operation_id.clone());
+        let exhausted = u64::try_from(records.len()).unwrap_or(u64::MAX) < u64::from(limit);
+        Ok(crate::UserAppRecoveryScanPage {
+            records,
+            next_after,
+            exhausted,
+        })
+    }
     /// Creates a new lifecycle generation atomically against the expected old
     /// lifecycle and request id; repeated requests keep the existing idempotency.
     async fn recreate(

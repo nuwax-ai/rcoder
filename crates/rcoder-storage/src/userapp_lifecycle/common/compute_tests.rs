@@ -1019,12 +1019,17 @@ async fn compute_uncertain_write_cannot_be_downgraded_to_failure_or_reclaimed() 
 }
 
 #[tokio::test]
-async fn compute_drain_recovery_accepts_only_initial_policy_checkpoint() {
+async fn compute_drain_recovery_uses_stage_and_explicit_outcome_preserving_diagnostics() {
     let dir = tempfile::tempdir().unwrap();
     let store = ToastyUserAppStore::open_exclusive(&dir.path().join("drain-recovery.db"))
         .await
         .unwrap();
-    for (app_id, extra_evidence) in [("cleanrecovery", false), ("uncertainrecovery", true)] {
+    for (app_id, diagnostic, unknown, submitted) in [
+        ("cleanrecovery", false, false, false),
+        ("diagnosticrecovery", true, false, false),
+        ("unknownrecovery", false, true, false),
+        ("submittedrecovery", false, false, true),
+    ] {
         let app = store.ensure_identity(app_id).await.unwrap();
         let mut input = request(
             &app,
@@ -1034,28 +1039,59 @@ async fn compute_drain_recovery_accepts_only_initial_policy_checkpoint() {
         input.restart_image_roll = true;
         let pending = store.admit_compute_control(&input).await.unwrap();
         let identity = compute_identity(&pending);
-        let claimed = store
+        let mut claimed = store
             .claim_compute_control(&identity, pending.revision)
             .await
             .unwrap();
-        let mut failure = compute_progress(&claimed, ComputeControlStage::DrainingPrevious);
+        if submitted {
+            claimed = store
+                .bind_compute_lease(&identity, &compute_receipt())
+                .await
+                .unwrap();
+        }
+        let mut failure = compute_progress(
+            &claimed,
+            if submitted {
+                ComputeControlStage::Stopping
+            } else {
+                ComputeControlStage::DrainingPrevious
+            },
+        );
         failure.state = ComputeControlState::RecoveryRequired;
-        failure.checkpoint = if extra_evidence {
-            serde_json::json!({"restart_image_roll": true, "runtime_write": "unknown"})
+        failure.checkpoint = if diagnostic {
+            // A diagnostic name alone says nothing about a submitted RPC.
+            serde_json::json!({"restart_image_roll":true,"runtime_write":"old diagnostic","new_diagnostic":{"epoch":3}})
+        } else if unknown {
+            serde_json::json!({"restart_image_roll":true,"unknown_write":true})
         } else {
             claimed.checkpoint.clone()
         };
         failure.error_code = Some("ERR_BACKEND_ERROR".into());
         failure.error_message = Some("Drain interrupted".into());
         let uncertain = store.advance_compute_control(&failure).await.unwrap();
-        let resumed = store.resume_released_compute_drain(&uncertain, None).await;
-        if extra_evidence {
-            assert!(resumed.is_err(), "runtime evidence needs inspection");
+        let resumed = store
+            .resume_released_compute_drain(&uncertain, uncertain.lease.as_ref())
+            .await;
+        if unknown || submitted {
+            assert!(
+                resumed.is_err(),
+                "unknown outcome or submitted stage needs actual reconciliation"
+            );
+            assert_eq!(
+                store
+                    .get_compute_control(app_id, &pending.operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                uncertain
+            );
         } else {
             let resumed = resumed.unwrap();
             assert_eq!(resumed.operation_id, pending.operation_id);
+            assert_eq!(resumed.request_id, pending.request_id);
+            assert_eq!(resumed.generation, pending.generation);
             assert_eq!(resumed.state, ComputeControlState::Pending);
-            assert_eq!(resumed.checkpoint, pending.checkpoint);
+            assert_eq!(resumed.checkpoint, uncertain.checkpoint);
         }
     }
     store.shutdown().await.unwrap();

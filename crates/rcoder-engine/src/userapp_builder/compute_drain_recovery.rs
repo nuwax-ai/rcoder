@@ -6,6 +6,7 @@ use shared_types::*;
 use std::time::Duration;
 
 mod previous_owner;
+mod superseded;
 
 // A prepared lease cannot authorize a container write. Cancellation here may
 // release it, including an uncertain DB bind: the next executor still checks CAS.
@@ -232,4 +233,43 @@ async fn inspect_and_resume(
         .resume_released_compute_drain(current, current.lease.as_ref())
         .await?;
     Ok(Resume::Ready(Box::new(pending)))
+}
+
+/// Observe a superseded early controller without admitting a new operation.
+pub(super) async fn recover_superseded_early(
+    state: &AppState,
+    snapshot: &ComputeControlRecord,
+) -> Result<()> {
+    superseded::recover(state, snapshot).await
+}
+
+/// The successor retains the original interrupted ID, so late prepared lease
+/// creation is reconciled along the same original Stop/Restart entry point.
+pub(super) async fn observe_unsubmitted_predecessor(
+    state: &AppState,
+    previous: &ComputeControlRecord,
+    current: &ComputeControlRecord,
+) -> Result<bool> {
+    if !previous.has_unsubmitted_compute_drain_ack() {
+        return Ok(true);
+    }
+    anyhow::ensure!(
+        previous.app_id == current.app_id
+            && previous.lifecycle_id == current.lifecycle_id
+            && previous.scope == current.scope,
+        "Interrupted prepared compute scope differs from its successor"
+    );
+    if let Some(receipt) = &current.lease {
+        let context = current.execution_context().map_err(anyhow::Error::msg)?;
+        if state
+            .runtime()
+            .validate_app_operation_receipt(&context, receipt)
+            .await?
+        {
+            // Exact current scope mutex cannot simultaneously be occupied by
+            // the predecessor. The stored receipt alone never proves this.
+            return Ok(true);
+        }
+    }
+    superseded::release_prepared_mutex(state, previous).await
 }
