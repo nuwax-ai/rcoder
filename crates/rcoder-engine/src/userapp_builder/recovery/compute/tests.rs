@@ -5,6 +5,8 @@ use crate::userapp_builder::creation::fence_settler_tests::{
 use shared_types::*;
 use std::sync::{Arc, atomic::Ordering};
 
+mod previous_owner_tests;
+
 async fn seed(state: &AppState, name: &str, bound: bool, unknown: bool) -> ComputeControlRecord {
     let app = state.userapp_store.ensure_identity(name).await.unwrap();
     let pending = state

@@ -59,6 +59,14 @@ impl TerminalSeed {
 /// 物理租约 validate 判定 + 可选死亡探针覆写。
 #[derive(Default)]
 pub(crate) struct FenceRuntime {
+    pub(crate) previous_compute_releases: std::sync::atomic::AtomicUsize,
+    pub(crate) previous_compute_arguments: Mutex<
+        Vec<(
+            shared_types::UserAppExecutionContext,
+            shared_types::UserAppExecutionContext,
+            shared_types::UserAppOperationLeaseReceipt,
+        )>,
+    >,
     pub(crate) compute_release_succeeds: std::sync::atomic::AtomicBool,
     pub(crate) compute_stall: std::sync::atomic::AtomicBool,
     pub(crate) compute_inspection: Mutex<Option<shared_types::ComputeLeaseInspection>>,
@@ -79,6 +87,8 @@ impl FenceRuntime {
         generation: Option<&str>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            previous_compute_releases: Default::default(),
+            previous_compute_arguments: Mutex::new(Vec::new()),
             compute_release_succeeds: Default::default(),
             compute_stall: Default::default(),
             compute_inspection: Default::default(),
@@ -260,6 +270,35 @@ impl UserAppDeploymentRuntime for FenceRuntime {
         } else {
             Err(ContainerRuntimeError::K8sError(
                 "injected lease release failure".into(),
+            ))
+        }
+    }
+    async fn release_previous_compute_lease(
+        &self,
+        current: &shared_types::UserAppExecutionContext,
+        scope: shared_types::UserAppOperationScope,
+        owner: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<()> {
+        assert_eq!(
+            receipt.service_type(),
+            &shared_types::compute_lease_family(scope).unwrap()
+        );
+        self.previous_compute_releases
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.previous_compute_arguments.lock().unwrap().push((
+            current.clone(),
+            owner.clone(),
+            receipt.clone(),
+        ));
+        if self
+            .compute_release_succeeds
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            Ok(())
+        } else {
+            Err(ContainerRuntimeError::Conflict(
+                "previous lease changed during conditional release".into(),
             ))
         }
     }

@@ -60,7 +60,9 @@ impl DockerRuntime {
                 return Ok(Observation::ForeignIdentity(message));
             }
             ComputeLeaseInspection::Absent | ComputeLeaseInspection::Releasable(_) => {}
-            ComputeLeaseInspection::Discovered { .. } => {
+            ComputeLeaseInspection::Discovered { .. }
+            | ComputeLeaseInspection::PreviousOwner { .. }
+            | ComputeLeaseInspection::PreviousOperation { .. } => {
                 return Ok(Observation::Unknown(
                     "Deletion lease inspection unexpectedly discovered another attempt".into(),
                 ));

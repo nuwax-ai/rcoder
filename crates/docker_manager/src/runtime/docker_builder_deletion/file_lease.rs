@@ -54,7 +54,7 @@ impl shared_types::PreparedComputeLease for BuilderFileLease {
 }
 
 #[cfg(unix)]
-fn open_inactive_file_receipt(
+pub(super) fn open_inactive_file_receipt(
     path: &std::path::Path,
     receipt: &shared_types::UserAppOperationLeaseReceipt,
 ) -> Result<std::fs::File> {

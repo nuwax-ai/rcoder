@@ -1362,6 +1362,22 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         ))
     }
 
+    /// The coordinator has verified this exact previous ordinary owner is
+    /// terminal and has no execution authority. Release only an unchanged,
+    /// expired mutex using the observed UID/token/resourceVersion. This never
+    /// authorizes compute mutations or releases a successor's lease.
+    async fn release_previous_compute_lease(
+        &self,
+        _current: &shared_types::UserAppExecutionContext,
+        _scope: shared_types::UserAppOperationScope,
+        _owner: &shared_types::UserAppExecutionContext,
+        _receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Previous compute lease release is unsupported".into(),
+        ))
+    }
+
     /// Builder-family runtime mutex for dev-scope operations. Durable receipts
     /// must carry the UserappBuilder service family. Named distinctly from
     /// AgentContainerRuntime::acquire_builder_operation so `dyn ContainerRuntime`

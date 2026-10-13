@@ -349,6 +349,17 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             .await
     }
 
+    async fn release_previous_compute_lease(
+        &self,
+        current: &shared_types::UserAppExecutionContext,
+        scope: shared_types::UserAppOperationScope,
+        owner: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<()> {
+        self.release_previous_compute_file_lease(current, scope, owner, receipt)
+            .await
+    }
+
     async fn acquire_app_operation(
         &self,
         app_id: &str,

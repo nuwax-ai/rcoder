@@ -64,6 +64,21 @@ pub enum ComputeLeaseInspection {
         receipt: UserAppOperationLeaseReceipt,
         attempt: crate::UserAppExecutionContext,
     },
+    /// An expired ordinary operation mutex remains after its durable receipt
+    /// was forgotten. This read-only candidate grants no cleanup or new write:
+    /// the coordinator must prove that this exact owner is terminal and fenced,
+    /// then conditionally release only the unchanged observed mutex.
+    PreviousOwner {
+        receipt: UserAppOperationLeaseReceipt,
+        owner: crate::UserAppExecutionContext,
+    },
+    /// A free Docker mutex records an ordinary operation ID, not a compute
+    /// executor token. Resolve its old owner from the control store before
+    /// conditional cleanup; the marker alone grants no execution authority.
+    PreviousOperation {
+        receipt: UserAppOperationLeaseReceipt,
+        operation_id: String,
+    },
     Held,
     IdentityChanged(String),
 }

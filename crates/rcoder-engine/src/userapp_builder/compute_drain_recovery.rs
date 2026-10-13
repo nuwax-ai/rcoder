@@ -5,6 +5,8 @@ use anyhow::{Context, Result, anyhow};
 use shared_types::*;
 use std::time::Duration;
 
+mod previous_owner;
+
 // A prepared lease cannot authorize a container write. Cancellation here may
 // release it, including an uncertain DB bind: the next executor still checks CAS.
 struct Preparing(Option<Box<dyn PreparedComputeLease>>);
@@ -186,6 +188,25 @@ async fn inspect_and_resume(
                 .release_app_operation_receipt(&attempt, &receipt)
                 .await
                 .context("Release recovered prepared compute lease")?;
+        }
+        ComputeLeaseInspection::PreviousOwner { receipt, owner } => {
+            if !previous_owner::release(state, current, &owner, &receipt).await? {
+                return Ok(Resume::Deferred(
+                    "COMPUTE_PREVIOUS_OWNER_PENDING",
+                    "Previous ordinary lease owner is not confirmed terminal and fenced".into(),
+                ));
+            }
+        }
+        ComputeLeaseInspection::PreviousOperation {
+            receipt,
+            operation_id,
+        } => {
+            if !previous_owner::release_operation(state, current, &operation_id, &receipt).await? {
+                return Ok(Resume::Deferred(
+                    "COMPUTE_PREVIOUS_OWNER_PENDING",
+                    "Previous ordinary marker owner is not confirmed terminal and fenced".into(),
+                ));
+            }
         }
         ComputeLeaseInspection::Releasable(receipt) => {
             if current.lease.is_none() {

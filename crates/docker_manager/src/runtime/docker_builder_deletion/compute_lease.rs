@@ -68,6 +68,49 @@ impl DockerRuntime {
             .await
             .map_err(|error| Error::DockerError(format!("Inspect compute lease worker: {error}")))?
     }
+
+    pub(crate) async fn release_previous_compute_file_lease(
+        &self,
+        current: &UserAppExecutionContext,
+        scope: UserAppOperationScope,
+        owner: &UserAppExecutionContext,
+        receipt: &UserAppOperationLeaseReceipt,
+    ) -> Result<()> {
+        let (family, name) = lease_name(current, scope)?;
+        owner
+            .validate_identity(&current.app_id)
+            .map_err(Error::ConfigurationError)?;
+        receipt.validate().map_err(Error::ConfigurationError)?;
+        let UserAppOperationLeaseReceipt::Docker {
+            service_type,
+            token,
+            ..
+        } = receipt
+        else {
+            return Err(Error::Conflict(
+                "Previous operation lease runtime differs".into(),
+            ));
+        };
+        if *service_type != family
+            || owner.lifecycle_id != current.lifecycle_id
+            || owner.operation_id == current.operation_id
+            || token != &owner.operation_id
+        {
+            return Err(Error::Conflict(
+                "Previous operation lease scope or owner differs".into(),
+            ));
+        }
+        let path = ops::application_lease_root()
+            .await?
+            .join(".app-operation-locks")
+            .join(name);
+        let receipt = receipt.clone();
+        tokio::task::spawn_blocking(move || release_previous_file_receipt(&path, &receipt))
+            .await
+            .map_err(|error| {
+                Error::DockerError(format!("Release previous compute lease worker: {error}"))
+            })?
+    }
 }
 
 #[cfg(unix)]
@@ -155,9 +198,23 @@ pub(super) fn inspect(
         return Ok(Absent);
     }
     if owner != attempt {
-        return Ok(IdentityChanged(
-            "Unregistered compute lease lacks this executor's attempt identity".into(),
-        ));
+        if shared_types::validate_identifier(&owner, "operation_id").is_err() {
+            return Ok(IdentityChanged(
+                "Unregistered operation lease has an invalid marker".into(),
+            ));
+        }
+        // An ordinary operation writes its operation ID, while a prepared
+        // compute writes its executor ID. Only the coordinator can resolve
+        // this marker to a terminal, fenced ordinary operation.
+        return Ok(PreviousOperation {
+            receipt: UserAppOperationLeaseReceipt::Docker {
+                service_type: family,
+                device: meta.dev(),
+                inode: meta.ino(),
+                token: owner.clone(),
+            },
+            operation_id: owner,
+        });
     }
     Ok(Releasable(UserAppOperationLeaseReceipt::Docker {
         service_type: family,
@@ -166,6 +223,63 @@ pub(super) fn inspect(
         token: owner,
     }))
 }
+
+#[cfg(unix)]
+fn release_previous_file_receipt(
+    path: &std::path::Path,
+    receipt: &UserAppOperationLeaseReceipt,
+) -> Result<()> {
+    use std::io::Read as _;
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(Error::DockerError(format!(
+                "Inspect previous operation lease: {error}"
+            )));
+        }
+        Ok(_) => {}
+    }
+    // This reopens with O_NOFOLLOW, acquires the actual flock, and compares
+    // both the opened FD and current path with the captured device/inode.
+    let file = open_inactive_file_receipt(path, receipt)?;
+    let UserAppOperationLeaseReceipt::Docker { token, .. } = receipt else {
+        return Err(Error::Conflict(
+            "Previous operation lease runtime differs".into(),
+        ));
+    };
+    let mut marker = Vec::new();
+    (&file)
+        .take(token.len() as u64 + 1)
+        .read_to_end(&mut marker)
+        .map_err(|error| Error::DockerError(format!("Read previous operation marker: {error}")))?;
+    if marker.is_empty() {
+        // A concurrent exact cleanup already completed. Do not rewrite it.
+        return Ok(());
+    }
+    if marker != token.as_bytes() {
+        return Err(Error::Conflict("Previous operation marker changed".into()));
+    }
+    shared_types::AppFileMutationMarker::for_operation(token)
+        .map_err(|error| Error::ConfigurationError(error.to_string()))?
+        .complete(&file)
+        .map_err(|error| Error::Conflict(format!("Complete previous operation marker: {error}")))?;
+    file.unlock()
+        .map_err(|error| Error::DockerError(format!("Unlock previous operation lease: {error}")))
+}
+
+#[cfg(not(unix))]
+fn release_previous_file_receipt(
+    _: &std::path::Path,
+    _: &UserAppOperationLeaseReceipt,
+) -> Result<()> {
+    Err(Error::ConfigurationError(
+        "Physical operation lease recovery requires Unix".into(),
+    ))
+}
+
+#[cfg(all(test, unix))]
+#[path = "previous_operation_tests.rs"]
+mod previous_operation_tests;
 
 #[cfg(not(unix))]
 pub(super) fn inspect(

@@ -2,6 +2,9 @@ use super::*;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[path = "previous_owner_wire_tests.rs"]
+mod previous_owner_wire_tests;
+
 fn runtime_for(client: kube::Client) -> KubernetesRuntime {
     use crate::runtime::kubernetes_runtime::{KubernetesRuntime, KubernetesRuntimeConfig};
     KubernetesRuntime {
