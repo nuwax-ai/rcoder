@@ -43,6 +43,7 @@ pub(super) struct GetStatusParams<'a> {
     pub(super) namespace: &'a str,
     /// 项目 ID
     pub(super) project_id: &'a str,
+    pub(super) session_id: Option<&'a str>,
     /// 最大重试次数
     pub(super) max_retries: u32,
     /// 语言设置
@@ -65,21 +66,40 @@ pub(super) async fn call_grpc_get_status_with_retry(
         params.cluster_domain,
     )?;
 
-    crate::grpc::retry::call_grpc_with_retry(
+    call_grpc_get_status_at_addr(
         params.pool,
         &grpc_addr,
+        params.project_id,
+        params.session_id,
+        params.max_retries,
+        params.locale,
+    )
+    .await
+}
+
+pub(super) async fn call_grpc_get_status_at_addr(
+    pool: &Arc<crate::grpc::GrpcChannelPool>,
+    grpc_addr: &str,
+    project_id: &str,
+    session_id: Option<&str>,
+    max_retries: u32,
+    locale: &'static str,
+) -> anyhow::Result<shared_types::grpc::GetStatusResponse> {
+    crate::grpc::retry::call_grpc_with_retry(
+        pool,
+        grpc_addr,
         crate::grpc::retry::GrpcRetryPolicy {
-            attempts: params.max_retries,
+            attempts: max_retries,
             backoff: crate::grpc::retry::exponential_backoff,
             retry_on: crate::grpc::retry::retry_on_transport_errors,
             log_tag: "GRPC_GET_STATUS",
         },
         |mut client| async move {
             let request = shared_types::grpc::GetStatusRequest {
-                project_id: params.project_id.to_string(),
-                session_id: String::new(), // 查询项目级别状态
+                project_id: project_id.to_string(),
+                session_id: session_id.unwrap_or_default().to_string(),
             };
-            let mut tonic_request = crate::grpc::new_request_with_locale(request, params.locale);
+            let mut tonic_request = crate::grpc::new_request_with_locale(request, locale);
             tonic_request.set_timeout(std::time::Duration::from_secs(GRPC_REQUEST_TIMEOUT_SECS));
             client.get_status(tonic_request).await
         },

@@ -136,8 +136,13 @@ pub async fn subscribe_progress(
                 "[gRPC] Creating new SSE connection: session_id={}",
                 session_id_clone
             );
-            match session_data.create_new_connection(100, from_seq).await {
-                Ok((conn_id, replay_messages, message_rx, cancellation_token)) => {
+            match session_data.create_new_connection_with_terminal(100, from_seq).await {
+                Ok(subscription) => {
+                    let conn_id = subscription.conn_id;
+                    let replay_messages = subscription.replay_messages;
+                    let message_rx = subscription.rx;
+                    let cancellation_token = subscription.token;
+                    let terminal = subscription.terminal;
                     info!(
                         "[gRPC] Session connection created successfully: session_id={}, replay_count={}",
                         session_id_clone, replay_messages.len()
@@ -161,6 +166,7 @@ pub async fn subscribe_progress(
                         &session_id_clone,
                         message_rx,
                         cancellation_token,
+                        Some(terminal),
                         &tx,
                         locale,
                     )
@@ -207,6 +213,7 @@ async fn run_stream_loop(
     session_id: &str,
     mut message_rx: mpsc::Receiver<(u64, shared_types::UnifiedSessionMessage)>,
     cancellation_token: tokio_util::sync::CancellationToken,
+    terminal: Option<tokio::sync::watch::Receiver<Option<shared_types::UnifiedSessionMessage>>>,
     tx: &mpsc::Sender<Result<ProgressEvent, Status>>,
     locale: &'static str,
 ) -> ExitReason {
@@ -215,19 +222,20 @@ async fn run_stream_loop(
 
     loop {
         tokio::select! {
+            biased;
             _ = cancellation_token.cancelled() => {
                 info!("[gRPC] Session connection cancelled, sending SessionPromptEnd: session_id={}", session_id);
 
                 use agent_client_protocol::schema::v1::StopReason;
                 use shared_types::{SessionNotify, SessionPromptEnd};
 
-                let notify = SessionNotify::SessionPromptEnd(SessionPromptEnd {
+                let captured = terminal.as_ref().and_then(|terminal| terminal.borrow().clone());
+                let unified_message = captured.unwrap_or_else(|| SessionNotify::SessionPromptEnd(SessionPromptEnd {
                     session_id: session_id.to_string(),
                     stop_reason: StopReason::Cancelled,
                     error_message: Some(shared_types_i18n::get_i18n_message("grpc.subscribe.user_cancelled", locale)),
                     request_id: None,
-                });
-                let unified_message = notify.to_unified_message();
+                }).to_unified_message());
                 let end_event = unified_message_to_progress_event(0, &unified_message);
 
                 if let Err(e) = tx.send(Ok(end_event)).await {
@@ -275,6 +283,12 @@ async fn run_stream_loop(
                     }
                     None => {
                         debug!("[gRPC] Session channel closed, sending SessionPromptEnd event");
+                        if let Some(captured) = terminal.as_ref().and_then(|terminal| terminal.borrow().clone()) {
+                            if let Err(error) = tx.send(Ok(unified_message_to_progress_event(0, &captured))).await {
+                                warn!(session_id, %error, "failed to send captured channel-close terminal");
+                            }
+                            return ExitReason::ChannelClosed;
+                        }
                         let end_event = ProgressEvent {
                             message_type: "SessionPromptEnd".to_string(),
                             sub_type: "end_turn".to_string(),
@@ -388,6 +402,129 @@ fn unified_message_to_progress_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn queued_control_terminal_token_fallback_keeps_captured_request_id() {
+        use super::super::cleanup::CapturedSessionCleanup;
+        let sid = format!("control-token-fallback-{}", uuid::Uuid::new_v4());
+        let data = crate::service::SessionData::new(64).await;
+        let old = data
+            .create_new_connection_with_terminal(8, 0)
+            .await
+            .unwrap();
+        SESSION_CACHE.insert(sid.clone(), data.clone());
+        let cleanup = CapturedSessionCleanup::capture(&sid, Some("original-control-rid".into()));
+        let new = data
+            .create_new_connection_with_terminal(8, 0)
+            .await
+            .unwrap();
+        // Push 只入队，未开始 poll 流即关闭；token 分支先于消息读取。
+        let terminal = cleanup
+            .send_prompt_end(
+                agent_client_protocol::schema::v1::StopReason::Cancelled,
+                None,
+            )
+            .await;
+        cleanup.close(&terminal);
+        let (tx, mut rx) = mpsc::channel(8);
+        let reason =
+            run_stream_loop(&sid, old.rx, old.token, Some(old.terminal), &tx, "en-US").await;
+        assert_eq!(reason, ExitReason::Cancelled);
+        let event = rx.recv().await.unwrap().unwrap();
+        assert_eq!(
+            event.seq, 0,
+            "the token fallback, not sequenced Push, must win"
+        );
+        assert_eq!(event.sub_type, "cancelled");
+        assert_eq!(event.request_id.as_deref(), Some("original-control-rid"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&event.payload).unwrap()["request_id"],
+            "original-control-rid"
+        );
+        assert!(!new.token.is_cancelled());
+        assert!(new.terminal.borrow().is_none());
+        SESSION_CACHE.remove(&sid);
+    }
+
+    #[tokio::test]
+    async fn backpressured_control_terminal_records_identity_before_worker_cancel() {
+        use super::super::cleanup::CapturedSessionCleanup;
+        let sid = format!("control-full-fallback-{}", uuid::Uuid::new_v4());
+        let data = crate::service::SessionData::new(64).await;
+        let old = data
+            .create_new_connection_with_terminal(1, 0)
+            .await
+            .unwrap();
+        SESSION_CACHE.insert(sid.clone(), data.clone());
+        data.push_message(
+            shared_types::SessionNotify::SessionPromptStart(shared_types::SessionPromptStart {
+                session_id: sid.clone(),
+                request_id: Some("queued-original-rid".into()),
+            })
+            .to_unified_message(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(data.message_count().await, 1); // 满队列保留第一条，终态无法 try_send。
+        let cleanup = CapturedSessionCleanup::capture(&sid, Some("queued-original-rid".into()));
+        let new = data
+            .create_new_connection_with_terminal(8, 0)
+            .await
+            .unwrap();
+        let terminal = cleanup
+            .send_prompt_end(
+                agent_client_protocol::schema::v1::StopReason::Cancelled,
+                None,
+            )
+            .await;
+        let _ = data.message_count().await; // worker 处理 terminal 后移除慢连接并 cancel。
+        assert!(old.token.is_cancelled());
+        assert_eq!(
+            old.terminal.borrow().as_ref().unwrap().data["request_id"],
+            "queued-original-rid"
+        );
+        cleanup.close(&terminal); // 此时旧 conn 已不在 registry 中，不能靠这里补写 RID。
+        let (tx, mut rx) = mpsc::channel(8);
+        let reason =
+            run_stream_loop(&sid, old.rx, old.token, Some(old.terminal), &tx, "en-US").await;
+        assert_eq!(reason, ExitReason::Cancelled);
+        assert_eq!(
+            rx.recv().await.unwrap().unwrap().request_id.as_deref(),
+            Some("queued-original-rid")
+        );
+        assert!(!new.token.is_cancelled());
+        assert!(new.terminal.borrow().is_none());
+        SESSION_CACHE.remove(&sid);
+    }
+
+    #[tokio::test]
+    async fn channel_closed_fallback_uses_captured_terminal_instead_of_latest_request() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(sender);
+        let terminal =
+            shared_types::SessionNotify::SessionPromptEnd(shared_types::SessionPromptEnd {
+                session_id: "captured-channel-close".into(),
+                stop_reason: agent_client_protocol::schema::v1::StopReason::Cancelled,
+                error_message: None,
+                request_id: Some("captured-channel-rid".into()),
+            })
+            .to_unified_message();
+        let (_terminal_sender, terminal_receiver) = tokio::sync::watch::channel(Some(terminal));
+        let (tx, mut rx) = mpsc::channel(8);
+        let reason = run_stream_loop(
+            "captured-channel-close",
+            receiver,
+            tokio_util::sync::CancellationToken::new(),
+            Some(terminal_receiver),
+            &tx,
+            "en-US",
+        )
+        .await;
+        assert_eq!(reason, ExitReason::ChannelClosed);
+        let event = rx.recv().await.unwrap().unwrap();
+        assert_eq!(event.sub_type, "cancelled");
+        assert_eq!(event.request_id.as_deref(), Some("captured-channel-rid"));
+    }
     use std::sync::Arc;
 
     fn make_agent_info(status: shared_types::AgentStatus) -> shared_types::ProjectAndAgentInfo {
@@ -417,7 +554,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             let tx = ev_tx.clone();
-            run_stream_loop("ses-none", msg_rx, cancel, &tx, "en-US").await
+            run_stream_loop("ses-none", msg_rx, cancel, None, &tx, "en-US").await
         });
 
         let reason = handle.await.unwrap();
@@ -450,7 +587,8 @@ mod tests {
         let cancel_clone = cancel.clone();
         let handle = tokio::spawn(async move {
             let tx = ev_tx.clone();
-            let reason = run_stream_loop("ses-active", msg_rx, cancel_clone, &tx, "en-US").await;
+            let reason =
+                run_stream_loop("ses-active", msg_rx, cancel_clone, None, &tx, "en-US").await;
             drop(ev_tx);
             reason
         });
@@ -493,7 +631,7 @@ mod tests {
         let cancel_clone = cancel.clone();
         let handle = tokio::spawn(async move {
             let tx = ev_tx.clone();
-            run_stream_loop("ses-pending", msg_rx, cancel_clone, &tx, "en-US").await
+            run_stream_loop("ses-pending", msg_rx, cancel_clone, None, &tx, "en-US").await
         });
 
         tokio::time::advance(Duration::from_secs(600)).await;

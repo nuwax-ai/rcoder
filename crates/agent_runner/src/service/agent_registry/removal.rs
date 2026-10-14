@@ -85,12 +85,38 @@ impl AgentSessionRegistry {
         project_id: &str,
         expected_session_id: &str,
     ) -> Option<ProjectAndAgentInfo> {
+        self.remove_matching_execution(project_id, expected_session_id, None)
+    }
+
+    /// 同 sid 也可能经 LoadSession 被新进程恢复，清理还需匹配原取消通道。
+    pub fn remove_by_project_if_session_and_channel_matches(
+        &self,
+        project_id: &str,
+        expected_session_id: &str,
+        expected_cancel_tx: &tokio::sync::mpsc::Sender<
+            shared_types::CancelNotificationRequestWrapper,
+        >,
+    ) -> Option<ProjectAndAgentInfo> {
+        self.remove_matching_execution(project_id, expected_session_id, Some(expected_cancel_tx))
+    }
+
+    fn remove_matching_execution(
+        &self,
+        project_id: &str,
+        expected_session_id: &str,
+        expected_cancel_tx: Option<
+            &tokio::sync::mpsc::Sender<shared_types::CancelNotificationRequestWrapper>,
+        >,
+    ) -> Option<ProjectAndAgentInfo> {
         use dashmap::mapref::entry::Entry;
 
         match self.agent_info_map.entry(project_id.to_string()) {
             Entry::Occupied(entry) => {
                 let current_session_id = entry.get().session_id.to_string();
-                if current_session_id != expected_session_id {
+                if current_session_id != expected_session_id
+                    || expected_cancel_tx
+                        .is_some_and(|sender| !entry.get().cancel_tx.same_channel(sender))
+                {
                     info!(
                         "🔄 [Registry] Session mismatch, skip removal: project={}, expected={}, current={}",
                         project_id, expected_session_id, current_session_id
@@ -164,5 +190,36 @@ impl AgentSessionRegistry {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_client_protocol::schema::v1::SessionId;
+
+    #[test]
+    fn delayed_cleanup_cannot_remove_replacement_loading_the_same_session() {
+        let registry = AgentSessionRegistry::new();
+        registry.set_pending("p");
+        let mut first = registry.view_agent_info("p", Clone::clone).unwrap();
+        first.session_id = SessionId::from("same-session");
+        let (old_cancel, _old_receiver) = tokio::sync::mpsc::channel(1);
+        first.cancel_tx = old_cancel.clone();
+        registry.register("p", "same-session", first.clone());
+        let (new_cancel, _new_receiver) = tokio::sync::mpsc::channel(1);
+        first.cancel_tx = new_cancel.clone();
+        registry.register("p", "same-session", first);
+        assert!(
+            registry
+                .remove_by_project_if_session_and_channel_matches("p", "same-session", &old_cancel)
+                .is_none()
+        );
+        assert!(registry.get_agent_info_by_session("same-session").is_some());
+        assert!(
+            registry
+                .remove_by_project_if_session_and_channel_matches("p", "same-session", &new_cancel)
+                .is_some()
+        );
     }
 }

@@ -217,6 +217,9 @@ async fn process_prompt<N: SessionNotifier>(
     let cancel_timeout = tokio::time::sleep(std::time::Duration::from_secs(3600)); // 初始设置一个很长的超时
     tokio::pin!(cancel_timeout);
     let mut is_cancelled = false;
+    // 本地正常停止 cause 与真实 ACP application error 分开，不能靠数值 code 推断。
+    let mut normal_transport_cancelled = false;
+    let mut cancel_wait_timed_out = false;
     // 保存待发送的 cancel 结果，等待 Prompt 响应完成后再发送
     let mut pending_cancel_tx: Option<tokio::sync::oneshot::Sender<shared_types::CancelResult>> =
         None;
@@ -251,6 +254,7 @@ async fn process_prompt<N: SessionNotifier>(
                     ));
                 } else {
                     // 正常取消（用户主动取消或 Agent 正常退出）
+                    normal_transport_cancelled = true;
                     info!(
                         "[SACP] Received cancel signal during prompt processing: project_id={}, session_id={}",
                         project_id, session_id
@@ -263,6 +267,7 @@ async fn process_prompt<N: SessionNotifier>(
             }
             // 取消后的超时保护（只有 is_cancelled 为 true 时才有意义）
             _ = &mut cancel_timeout, if is_cancelled => {
+                cancel_wait_timed_out = true;
                 // 取消后超时，强制返回错误
                 warn!("[SACP] cancel message Prompt response timeout (15s), force exit");
 
@@ -364,11 +369,12 @@ async fn process_prompt<N: SessionNotifier>(
             false
         }
         Err(e) => {
-            // 🎯 区分"取消超时"和"真正的错误"
-            if is_cancelled {
-                // 取消超时：发送 PromptEnd (Cancelled) 而非 PromptError
+            // 受控正常停止或取消等待超时发 Cancelled；异常退出及真正的 ACP 错误仍发 error。
+            if (normal_transport_cancelled || cancel_wait_timed_out)
+                && !abnormal_exit_flag.load(Ordering::SeqCst)
+            {
                 info!(
-                    "[SACP] cancel timeout, send PromptEnd (Cancelled): session_id={}",
+                    "[SACP] controlled cancellation, send PromptEnd (Cancelled): session_id={}",
                     session_id
                 );
                 if let Err(notify_err) = notifier
@@ -377,7 +383,11 @@ async fn process_prompt<N: SessionNotifier>(
                         &session_id.to_string(),
                         agent_client_protocol::schema::v1::StopReason::Cancelled,
                         Some(error_codes::get_i18n_message_default(
-                            "error.session_cancelled_timeout",
+                            if normal_transport_cancelled {
+                                "error.session_cancelled"
+                            } else {
+                                "error.session_cancelled_timeout"
+                            },
                         )),
                         request_id.clone(),
                     )

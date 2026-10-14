@@ -1,15 +1,21 @@
 //! Chat Handler 取消逻辑
 //!
-//! 从 `chat_handler.rs` 拆出的取消相关辅助逻辑，行为与原实现完全一致。
+//! 区分取消结果与已关闭运行时；后者交由 session manager 停旧并恢复历史。
 
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{CancelNotification, SessionId};
 use shared_types::{CancelNotificationRequestWrapper, CancelResult, error_codes};
 use tokio::time::Duration;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::chat_handler::ChatHandlerOutput;
+
+/// 运行时关闭不是取消成功：由后续 session manager 确认退出并恢复。
+pub(super) enum CancelCurrentTaskOutcome {
+    Cancelled,
+    RuntimeChannelClosed,
+}
 
 /// 取消当前正在执行的 Agent 任务
 ///
@@ -21,13 +27,14 @@ use super::chat_handler::ChatHandlerOutput;
 /// * `project_id` - 项目 ID
 ///
 /// # Returns
-/// * `Ok(())` - 取消成功，Agent 状态已恢复为 Idle
+/// * `Ok(Cancelled)` - 取消成功
+/// * `Ok(RuntimeChannelClosed)` - 当前运行时已关闭，必须进入停旧与历史恢复
 /// * `Err(ChatHandlerOutput)` - 取消失败，包含错误响应
 pub(super) async fn cancel_current_task(
     cancel_tx: &tokio::sync::mpsc::Sender<CancelNotificationRequestWrapper>,
     session_id: &str,
     project_id: &str,
-) -> Result<(), Box<ChatHandlerOutput>> {
+) -> Result<CancelCurrentTaskOutcome, Box<ChatHandlerOutput>> {
     info!(
         "[ChatHandler] Cancelling current task: project_id={}, session_id={}",
         project_id, session_id
@@ -35,16 +42,11 @@ pub(super) async fn cancel_current_task(
 
     // 1. 检查 cancel_tx 是否有效
     if cancel_tx.is_closed() {
-        error!(
+        warn!(
             "[ChatHandler] Cancel channel closed: project_id={}, session_id={}",
             project_id, session_id
         );
-        return Err(Box::new(ChatHandlerOutput::error(
-            project_id.to_string(),
-            session_id.to_string(),
-            error_codes::get_i18n_message_default("error.cancel_channel_closed"),
-            error_codes::ERR_SERVICE_UNAVAILABLE.to_string(),
-        )));
+        return Ok(CancelCurrentTaskOutcome::RuntimeChannelClosed);
     }
 
     // 2. 创建 oneshot channel 等待取消结果
@@ -57,20 +59,12 @@ pub(super) async fn cancel_current_task(
 
     // 3. 发送取消通知
     if let Err(e) = cancel_tx.send(cancel_request).await {
-        error!(
+        warn!(
             "[ChatHandler] Failed to send cancel notification: project_id={}, error={}",
             project_id, e
         );
-        return Err(Box::new(ChatHandlerOutput::error(
-            project_id.to_string(),
-            session_id.to_string(),
-            format!(
-                "{}: {}",
-                error_codes::get_i18n_message_default("error.cancel_failed"),
-                e
-            ),
-            error_codes::ERR_INTERNAL_SERVER_ERROR.to_string(),
-        )));
+        // mpsc SendError 明确表示 receiver 已关闭，包含检查到 send 之间的竞态。
+        return Ok(CancelCurrentTaskOutcome::RuntimeChannelClosed);
     }
 
     // 4. 等待取消结果（超时 10 秒）
@@ -98,7 +92,7 @@ pub(super) async fn cancel_current_task(
                 // 5. 同一 Agent 子进程处理新 prompt → 上下文连续
                 //
                 // 最坏情况延迟：inner cancel timeout (10s) — Agent 不响应 cancel 时
-                Ok(())
+                Ok(CancelCurrentTaskOutcome::Cancelled)
             } else {
                 let error_msg = cancel_result.error_message().unwrap_or("Unknown error");
                 error!(
@@ -118,6 +112,14 @@ pub(super) async fn cancel_current_task(
             }
         }
         Ok(Err(_)) => {
+            if cancel_tx.is_closed() {
+                warn!(
+                    project_id,
+                    session_id,
+                    "cancel response lost with closed runtime; session manager must reconcile exit"
+                );
+                return Ok(CancelCurrentTaskOutcome::RuntimeChannelClosed);
+            }
             error!(
                 "[ChatHandler] Cancel result channel dropped: project_id={}",
                 project_id
@@ -141,5 +143,60 @@ pub(super) async fn cancel_current_task(
                 error_codes::ERR_CANCEL_FAILED.to_string(),
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn runtime_closes_between_check_and_send_enters_recovery() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (result_tx, _result_rx) = tokio::sync::oneshot::channel();
+        tx.send(CancelNotificationRequestWrapper {
+            cancel_notification: CancelNotification::new(SessionId::from("queued")),
+            result_tx,
+        })
+        .await
+        .unwrap();
+        assert!(!tx.is_closed());
+        // 第一轮 poll 完成 is_closed 检查后在满队列上等待，再关闭 receiver。
+        let (outcome, ()) = tokio::join!(
+            biased;
+            cancel_current_task(&tx, "historical", "closed-send-project"),
+            async {
+                drop(rx);
+            }
+        );
+        assert!(matches!(
+            outcome.unwrap(),
+            CancelCurrentTaskOutcome::RuntimeChannelClosed
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_cancel_failure_remains_an_error_even_if_runtime_then_closes() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (outcome, ()) = tokio::join!(
+            biased;
+            cancel_current_task(&tx, "historical", "explicit-failure-project"),
+            async {
+                let request = rx.recv().await.unwrap();
+                request
+                    .result_tx
+                    .send(CancelResult::Failed(
+                        "controlled cancellation rejected".into(),
+                    ))
+                    .unwrap();
+                drop(rx);
+            }
+        );
+        assert!(tx.is_closed());
+        let error = match outcome {
+            Err(error) => error,
+            Ok(_) => panic!("an explicit cancel failure must not become historical recovery"),
+        };
+        assert!(format!("{error:?}").contains("controlled cancellation rejected"));
     }
 }

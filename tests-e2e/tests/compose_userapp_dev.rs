@@ -10,7 +10,7 @@
 //! - x-user-id owner 显式档懒创建（无注册前置的拦截分流；502 故障钉住 +
 //!   白名单 400——生产 192.168.1.19 cannot resolve owner user_id 回归）
 //! - `/api/userapp/db/dev/reset-password`（PG 改密；凭据对齐已内嵌 start 链）
-//! - userApp 开发对话全轮：session 创建（project_id=app_id 回显）+ SSE 事件流
+//! - userApp 开发对话全轮：session 创建（project_id 保留会话身份）+ SSE 事件流
 //!   （/computer/progress/{sid} 经 session→project 映射路由到开发容器）
 
 use std::sync::OnceLock;
@@ -1007,12 +1007,11 @@ async fn scenario_userapp_chat_full_turn(backend: Backend) {
     };
     let sid = data.session_id.clone();
     report.assert_hard("session_id 非空", !sid.is_empty(), sid.clone());
-    // userApp 特有：project_id 回显 = 纯 app_id（应用共享，session 映射/路由
-    // 锚点按 (stage, app_id) 实例化——用户绑定移除）
+    // app_id selects the shared builder; project_id identifies this conversation.
     report.assert_hard(
-        "project_id 回显 = 纯 app_id",
-        data.project_id == app,
-        format!("回显 {:?}，期望 {app:?}", data.project_id),
+        "project_id 回显保留独立会话身份",
+        !data.project_id.is_empty() && data.project_id != app,
+        format!("conversation={:?}, app={app:?}", data.project_id),
     );
 
     tokio::time::sleep(Duration::from_millis(800)).await;
@@ -1118,9 +1117,9 @@ async fn scenario_userapp_chat_workdir_agent_work_dir(backend: Backend) {
     let sid = data.session_id.clone();
     report.assert_hard("session_id 非空", !sid.is_empty(), sid.clone());
     report.assert_hard(
-        "project_id 回显 = 纯 app_id",
-        data.project_id == app,
-        format!("回显 {:?}，期望 {app:?}", data.project_id),
+        "project_id 回显保留独立会话身份",
+        !data.project_id.is_empty() && data.project_id != app,
+        format!("conversation={:?}, app={app:?}", data.project_id),
     );
 
     tokio::time::sleep(Duration::from_millis(800)).await;
@@ -2153,7 +2152,7 @@ print(json.dumps(roots))"#,
 
 // ============================================================
 // 场景 5：agent 族接口 userApp 分派（service_type=userapp +
-// project_id 兼任 app_id + app_stage 缺省 dev）
+// app_id 定位共享资源，project_id 保留独立会话身份 + app_stage 缺省 dev）
 // ============================================================
 /// 分派正向链：dev chat 建会话 → status 分派（is_alive + session 回显）→
 /// cancel 分派（幂等 success）→ stop 分派 → cache-clean 分派（owner 显式）
@@ -2176,17 +2175,18 @@ async fn scenario_userapp_agent_dispatch(backend: Backend) {
     let mut req = env.base_payload(backend, "只回复 ok", &format!("{}-adp", env.run_tag), user);
     req.service_type = Some(shared_types::ServiceType::Userapp);
     req.app_id = Some(app.clone());
-    let sid = match chat_reported(&env, &report, "dispatch_chat", &env.rcoder, &req).await {
-        Ok(d) if !d.session_id.is_empty() => d.session_id,
-        _ => {
-            report.assert_hard("chat 建会话", false, "chat 失败".into());
-            assert_hard_all(report).await;
-            cleanup_builder(user, &app);
-            return;
-        }
-    };
+    let (sid, project_id) =
+        match chat_reported(&env, &report, "dispatch_chat", &env.rcoder, &req).await {
+            Ok(d) if !d.session_id.is_empty() => (d.session_id, d.project_id),
+            _ => {
+                report.assert_hard("chat 建会话", false, "chat 失败".into());
+                assert_hard_all(report).await;
+                cleanup_builder(user, &app);
+                return;
+            }
+        };
     report.assert_hard("chat 建会话", true, sid.clone());
-    // 等 turn 收尾（会话映射在响应后写入；status 读取依赖其落库）
+    // 等短 prompt 收尾；响应成功时会话绑定已经提交。
     tokio::time::sleep(Duration::from_secs(6)).await;
 
     // 通用 POST（信封解析；五接口全部 HTTP 200 + code/success 判定）
@@ -2208,7 +2208,7 @@ async fn scenario_userapp_agent_dispatch(backend: Backend) {
     let (st, body) = post(
         &env,
         "computer/agent/status",
-        json!({"service_type": "userapp", "app_id": app}),
+        json!({"service_type": "userapp", "app_id": app, "user_id":user, "project_id":project_id}),
     )
     .await;
     let ok = st.is_success()
@@ -2225,7 +2225,7 @@ async fn scenario_userapp_agent_dispatch(backend: Backend) {
     let (st, body) = post(
         &env,
         "computer/agent/session/cancel",
-        json!({"service_type": "userapp", "app_id": app, "session_id": sid}),
+        json!({"service_type": "userapp", "app_id": app, "user_id":user, "project_id":project_id, "session_id": sid}),
     )
     .await;
     let ok = st.is_success() && http_ok(&body) && body["data"]["success"].as_bool() == Some(true);
@@ -2235,11 +2235,11 @@ async fn scenario_userapp_agent_dispatch(backend: Backend) {
         format!("HTTP {st}, {}", trunc(&body, 160)),
     );
 
-    // ③ stop 分派：停掉 app 会话的 agent（builder 容器继续运行）
+    // ③ stop 分派：停止指定会话的 agent（builder 容器继续运行）。
     let (st, body) = post(
         &env,
         "computer/agent/stop",
-        json!({"service_type": "userapp", "app_id": app}),
+        json!({"service_type": "userapp", "app_id": app, "user_id":user, "project_id":project_id, "session_id":sid}),
     )
     .await;
     let ok = st.is_success() && http_ok(&body) && body["data"]["success"].as_bool() == Some(true);
@@ -2270,7 +2270,7 @@ async fn scenario_userapp_agent_dispatch(backend: Backend) {
         json!({"user_id": user, "project_id": app}),
     )
     .await;
-    let ok = st.is_success() && body["success"].is_boolean();
+    let ok = st.is_success() && body["code"].is_string();
     report.assert_hard(
         "computer 旧形态回归（无 service_type）",
         ok,
@@ -3753,7 +3753,7 @@ async fn scenario_two_users_share_app() {
         format!("期望容器数=1（{shared_name}）"),
     );
 
-    // 文件互不可见：u1 写文件，u2 的列表不应见到（独立 PVC subPath 工作区）
+    // 文件共享：u1写入后u2从同一应用工作区读取。
     let w1 = env
         .http
         .post(format!("{}/api/v1/userapp/generate-file", env.rcoder))
@@ -3791,8 +3791,7 @@ async fn scenario_two_users_share_app() {
         "owner-only.txt 应出现在共享文件列表".into(),
     );
 
-    // chat workdir：两用户各自 chat 回显复合键 project（session 映射实例化）
-    // ——信封级断言（完整 chat 需 LLM，双用户文件/容器断言已覆盖核心语义）
+    // 此无LLM场景覆盖双用户文件和单builder；独立agent由并行AI场景验证。
 
     // D5 正向：无显式 user_id → 回落 metadata owner 实例（老调用兼容），
     // 幂等受理且不新建第二容器（owner 容器数恒 1）
@@ -3869,7 +3868,7 @@ async fn scenario_two_users_share_app() {
 
     cleanup_builder(u1, &hyphen_app);
 
-    // purge：owner 删除 app（连协作者实例一起清——capture 排除法全清语义）
+    // purge：owner删除本case应用的共享builder。
     let del = post_json(
         &env,
         &format!("/api/v1/userapp/{app}/prod/delete"),
@@ -3883,7 +3882,7 @@ async fn scenario_two_users_share_app() {
         format!("HTTP {}, {}", del.0, trunc(&del.1, 120)),
     );
     if del_ok {
-        // 删除是异步编排：轮询两容器消失（上限 180s）
+        // 删除是异步编排：轮询实际应用标签下的共享builder消失。
         let mut gone = false;
         for _ in 0..36 {
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -3892,9 +3891,7 @@ async fn scenario_two_users_share_app() {
                     "ps",
                     "-a",
                     "--filter",
-                    &format!("name=rcoder-app-builder-{u1}-{app}"),
-                    "--filter",
-                    &format!("name=rcoder-app-builder-{u2}-{app}"),
+                    &format!("label=rcoder.io/application-id={app}"),
                     "--format",
                     "{{.Names}}",
                 ])
@@ -3907,9 +3904,9 @@ async fn scenario_two_users_share_app() {
             }
         }
         report.assert_hard(
-            "purge 后两实例容器全清（owner+协作者）",
+            "purge 后共享 builder 容器已清理",
             gone,
-            "docker ps 无 rcoder-app-builder-{u1|u2}-{app}".into(),
+            format!("docker ps 无 application-id={app} 的实际容器"),
         );
     }
 
@@ -4030,4 +4027,49 @@ async fn userapp_dev_idle_recycle_owner_recovery() {
         );
     }
     assert!(report.finish(), "idle owner recovery failed");
+}
+
+async fn scenario_userapp_parallel_agents(backend: Backend) {
+    let Some((env, report)) =
+        Env::compose_or_skip("userapp_dev_parallel_agents", backend.as_str()).await
+    else {
+        return;
+    };
+    let app = scoped_app(&env, &format!("parallel-{}", backend.as_str()));
+    let user = "e2e-parallel-user";
+    if create_workspace(&env, &report, &app, user).await {
+        let outcome = rcoder_e2e::common::userapp_agent_parallel::verify(
+            &env,
+            &report,
+            &app,
+            user,
+            backend,
+            std::slice::from_ref(&env.rcoder),
+        )
+        .await;
+        report.assert_hard(
+            "并行会话主流程完成",
+            outcome.is_ok(),
+            outcome
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "real AI flow completed".into()),
+        );
+    }
+    cleanup_builder(user, &app);
+    assert_hard_all(report).await;
+}
+
+#[tokio::test]
+async fn userapp_dev_parallel_agents_openai() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    scenario_userapp_parallel_agents(Backend::Openai).await;
+}
+
+#[tokio::test]
+async fn userapp_dev_parallel_agents_anthropic() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let _gate = scenario_gate().await;
+    scenario_userapp_parallel_agents(Backend::Anthropic).await;
 }

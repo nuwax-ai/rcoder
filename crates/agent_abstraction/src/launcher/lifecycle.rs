@@ -66,6 +66,55 @@ impl std::fmt::Debug for AgentLifecycleGuard {
     }
 }
 
+impl AgentLifecycleGuard {
+    /// 启动阶段把转换租约保持到 handshake 成功或真实 child.wait 成功。
+    /// 只克隆退出观察通道，避免共享 inner 妨碍 session_id 初始化。
+    pub(crate) fn retain_startup_transition(
+        &self,
+        transition: Arc<crate::session::ExecutionTransitionGuard>,
+    ) -> tokio::sync::oneshot::Sender<()> {
+        let (completed, completion) = tokio::sync::oneshot::channel();
+        let mut exit = self.inner.exit_result.clone();
+        let project_id = self.inner.project_id.clone();
+        tokio::spawn(async move {
+            let _transition = transition;
+            if completion.await.is_ok() {
+                return;
+            }
+            // 启动 future 被取消时 lifecycle Drop 负责发信号，这里保留准入锁直到
+            // reaper 的实际成功证据。观察通道丢失或 reaper 错误不能授权双实例。
+            loop {
+                let result = exit.borrow().clone();
+                match result {
+                    Some(Ok(())) => return,
+                    Some(Err(error)) => {
+                        tracing::error!(project_id, %error, "startup exit unconfirmed; retaining execution transition");
+                        std::future::pending::<()>().await;
+                    }
+                    None => {}
+                }
+                if exit.changed().await.is_err() {
+                    tracing::error!(
+                        project_id,
+                        "startup reaper observation closed; retaining execution transition"
+                    );
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+        completed
+    }
+
+    /// handshake 前守卫尚未共享；完成后再记录真实 ACP session 身份。
+    pub(crate) fn set_session_id(&mut self, session_id: SessionId) -> Result<()> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
+            anyhow::anyhow!("agent lifecycle was shared before session initialization")
+        })?;
+        inner.session_id = session_id;
+        Ok(())
+    }
+}
+
 pub(crate) struct AgentLifecycleInner {
     pub(crate) project_id: String,
     pub(crate) session_id: SessionId,
@@ -79,6 +128,8 @@ pub(crate) struct AgentLifecycleInner {
     pub(crate) cancel_token: CancellationToken,
     pub(crate) resources: AgentResources,
     pub(crate) stopped: AtomicBool,
+    /// reaper 完成 child.wait() 后发布的结果，多次停止共享同一退出证据。
+    pub(crate) exit_result: tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>,
     /// 🔥 共享的 API 密钥管理器引用（用于自动清理）
     pub(crate) shared_api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
     /// 🔥 project_id -> service_uuid 映射（用于清理时查找 UUID）
@@ -113,6 +164,10 @@ pub(crate) enum AgentResources {
 impl AgentLifecycle for AgentLifecycleGuard {
     fn graceful_stop(&self) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move { AgentLifecycleGuard::graceful_stop(self).await })
+    }
+
+    fn wait_for_exit(&self) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move { AgentLifecycleGuard::wait_for_exit(self).await })
     }
 
     fn cancel(&self) {
@@ -210,3 +265,6 @@ mod shutdown;
 mod spawn;
 
 pub use spawn::ClaudeProcessParams;
+
+#[cfg(all(test, unix))]
+mod tests;

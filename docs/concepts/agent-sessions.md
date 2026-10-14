@@ -84,6 +84,16 @@ Computer Agent（容器化代理环境，带 VNC 桌面/音频/IME）的会话�
 
 该目录承载 agent 读写的项目文件；文件级操作（浏览/上传/版本备份等）由[文件服务](file-services.md)提供。
 
+## UserApp 并行会话
+
+UserApp 开发对话通过 `POST /computer/chat` 传入 `service_type=userapp`、`app_id` 和 `project_id`。`app_id` 定位共享的开发容器和源码目录，`project_id` 保留调用方的会话身份；同一应用的不同 `project_id` 可以并行运行独立 agent，返回各自的 `session_id`。
+
+续聊只复用当前会话的 session，不按应用查找其他会话的最新 session。历史 session 无法确认归属时会记录原因并新建；属于当前会话但加载失败或超时时，也会尝试新建。响应中的实际 session ID 可能与输入不同，客户端应保存返回值。运行时内存记录缺失不等于历史会话失效。
+
+状态、取消、停止和权限回调支持现有的 `user_id + project_id/session_id` 请求格式，由会话绑定解析所属 UserApp。控制操作只作用于对应 agent；停止一个 agent 不停止应用开发容器，也不删除数据卷。SSE 订阅地址保持 `/computer/progress/{session_id}`，不同会话的事件和请求身份独立。
+
+PG 项目存储升级至 schema v2，新增会话绑定和 session 归属表，保留既有项目、容器注册与基线数据。主服务和 builder 的 agent_runner 需要配套升级；旧共享 session 不批量导入或删除，无法复用时由 chat 自动新建。升级 builder 使用既有停止、退出确认和恢复流程，并保留数据卷。
+
 ## 相关文档
 
 - [gRPC 内部通信](../architecture/grpc.md)：chat 主链的 gRPC 细节

@@ -25,6 +25,7 @@ struct CapturedDeletion {
     runtime: Arc<dyn container_runtime_api::ContainerRuntime>,
     projects: Arc<crate::storage::ProjectStoreBackend>,
     snapshot: BuilderDeletionSnapshot,
+    lifecycle_id: String,
     registry_identity: Option<(String, String)>,
     operation: BuilderOperation,
     /// 协作者实例（owner 实例之外的全部 `{user_id}-{app_id}` 实例）：
@@ -322,6 +323,7 @@ impl UserappDevResourcesCleanup {
             runtime: self.runtime.clone(),
             projects: self.projects.clone(),
             snapshot,
+            lifecycle_id: app.lifecycle_id,
             registry_identity,
             operation,
             extra_instances,
@@ -430,6 +432,19 @@ impl CapturedDeletion {
                 })?;
             }
         }
+        // Physical deletion has returned before logical SID ownership is
+        // retired. A delayed old-lifecycle receipt never targets a replacement.
+        self.projects
+            .invalidate_userapp_agent_bindings_durable(
+                &self.snapshot.app_id,
+                &self.lifecycle_id,
+                &format!(
+                    "builder-agent-cleanup:{}:{}",
+                    self.snapshot.operation_id, self.lifecycle_id
+                ),
+            )
+            .await
+            .map_err(|error| format!("Retire captured UserApp agent bindings: {error:#}"))?;
         match &self.registry_identity {
             Some((generation, container_id)) => {
                 if !self

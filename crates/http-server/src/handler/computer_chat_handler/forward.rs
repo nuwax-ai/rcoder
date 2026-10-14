@@ -30,6 +30,7 @@ pub(super) struct ComputerForwardParams<'a> {
     /// 诊断通道的容器 identifier（container_identifier 语义：
     /// ComputerAgentRunner=user_id；UserappBuilder=app_id）
     pub(super) diagnostic_identifier: String,
+    pub(super) force_new_session: bool,
 }
 
 /// 与 RCoder 的 forward_request_to_container_service 类似，
@@ -148,9 +149,11 @@ pub(super) async fn forward_computer_request_to_container(
             is_devcomputer: params.is_devcomputer,
             agent_work_dir: agent_work_dir.clone(),
             app_id: app_id.clone(),
+            force_new_session: params.force_new_session,
         },
         params.locale,
         crate::handler::chat_forward::ForwardChatOpts {
+            retry_chat_rpc: params.service_type != shared_types::ServiceType::UserappBuilder,
             log_tag: "COMPUTER_FORWARD",
             // 重试前等待 3s，给容器内 gRPC 服务启动时间（保持原有行为）
             retry_delay: Some(std::time::Duration::from_secs(3)),

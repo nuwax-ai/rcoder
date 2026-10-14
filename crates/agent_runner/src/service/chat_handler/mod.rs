@@ -20,7 +20,7 @@ mod types;
 
 pub use types::{ChatHandlerContext, ChatHandlerInput, ChatHandlerOutput};
 
-use tracing::info;
+use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
 // 编排主入口
@@ -30,9 +30,19 @@ use tracing::info;
 // Hotpath 埋点：HTTP 与 gRPC 双协议漏斗点（feature 关闭时 no-op）
 #[hotpath::measure]
 pub async fn handle_chat_core(
-    input: ChatHandlerInput,
+    mut input: ChatHandlerInput,
     context: &ChatHandlerContext,
 ) -> ChatHandlerOutput {
+    if let Some(sid) = input.session_id.as_deref()
+        && let Some(owner) = crate::service::AGENT_REGISTRY.get_project_by_session(sid)
+        && owner != input.project_id
+    {
+        warn!(project_id = %input.project_id, session_id = sid, owner, "foreign session hint ignored before chat preparation");
+        input.force_new_session = true;
+    }
+    if input.force_new_session {
+        input.session_id = None;
+    }
     let project_id = input.project_id.clone();
     let session_id = input.session_id.clone();
     let request_id = input.request_id.clone();

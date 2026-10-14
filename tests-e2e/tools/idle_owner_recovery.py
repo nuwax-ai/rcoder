@@ -157,12 +157,19 @@ def docker(*args, **kwargs):
 
 
 def inspect(cid):
-    # A failed inspect could be a daemon outage, not absence. A successful list
-    # distinguishes that from a positively absent captured container.
-    ids = docker('ps', '-aq', '--no-trunc', '--filter', 'id=' + cid).stdout.split()
-    if not ids:
-        return None
-    return json.loads(docker('inspect', cid).stdout)[0]
+    # The captured immutable ID may disappear between idle scans. Inspect it
+    # directly; only an exact Docker not-found response proves absence.
+    result = docker('inspect', cid, check=False)
+    if result.returncode:
+        missing = re.fullmatch(
+            r'(?:Error response from daemon:\s*|error:\s*)?'
+            r'No such (?:object|container):\s*' + re.escape(cid),
+            result.stderr.strip(), flags=re.IGNORECASE)
+        if result.returncode == 1 and missing and result.stdout.strip() in ('', '[]'):
+            return None
+        raise RuntimeError(f'docker inspect failed ({result.returncode}): '
+                           f'{result.stderr[-2000:]} {result.stdout[-2000:]}')
+    return json.loads(result.stdout)[0]
 
 
 def fixture_layout(app_id, source_root):

@@ -23,6 +23,7 @@ pub mod pod_handler;
 pub mod proxy_api;
 pub mod proxy_handler_api;
 mod sse_builder;
+pub(crate) mod userapp_agent_target;
 pub mod userapp_terminal_proxy_api;
 pub mod utils;
 pub mod validation_rules;

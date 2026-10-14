@@ -86,12 +86,14 @@ impl SessionWorker {
                     // 原子 seam：此刻无并发 Push——快照与注册之间零窗口。
                     let (tx, rx) = mpsc::channel(buffer_size);
                     let token = CancellationToken::new();
+                    let (terminal_tx, terminal) = tokio::sync::watch::channel(None);
                     let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
                     self.connections.insert(
                         conn_id,
                         ConnectionState {
                             sender: tx,
                             cancel: token.clone(),
+                            terminal: terminal_tx,
                         },
                     );
                     // 超上限逐最旧（conn_id 单调，最小 id 即最早）
@@ -132,6 +134,7 @@ impl SessionWorker {
                             replay_messages: snapshot,
                             rx,
                             token: token.clone(),
+                            terminal,
                         })
                         .is_err()
                     {
@@ -142,7 +145,10 @@ impl SessionWorker {
                         );
                     }
                 }
-                SessionCommand::Push { message } => {
+                SessionCommand::Push {
+                    message,
+                    connection_ids,
+                } => {
                     debug!(
                         "[SessionWorker] Push message: message_type={:?}, sub_type={}, data={}",
                         message.message_type, message.sub_type, message.data
@@ -179,6 +185,17 @@ impl SessionWorker {
                     // （不在迭代中 remove——DashMap 迭代持 shard 锁，同 shard remove 会死锁）
                     let mut disconnected_conns: Vec<u64> = Vec::new();
                     for entry in self.connections.iter() {
+                        if connection_ids
+                            .as_ref()
+                            .is_some_and(|ids| !ids.contains(entry.key()))
+                        {
+                            continue;
+                        }
+                        if connection_ids.is_some() {
+                            // 控制终态必须先记录，再投递；队列已满会直接 cancel 并移除
+                            // connection，届时 cleanup.close 已无法再给它写回执。
+                            entry.value().terminal.send_replace(Some(message.clone()));
+                        }
                         use tokio::sync::mpsc::error::TrySendError;
                         if let Err(send_err) = entry.value().sender.try_send((seq, message.clone()))
                         {
@@ -289,11 +306,14 @@ pub(crate) struct SubscribeResult {
     pub(crate) replay_messages: Vec<(u64, UnifiedSessionMessage)>,
     pub(crate) rx: mpsc::Receiver<(u64, UnifiedSessionMessage)>,
     pub(crate) token: CancellationToken,
+    pub(crate) terminal: tokio::sync::watch::Receiver<Option<UnifiedSessionMessage>>,
 }
 
 pub(crate) enum SessionCommand {
     Push {
         message: UnifiedSessionMessage,
+        /// 控制终态只向受理时捕获的连接投递；普通事件向当前全部连接投递。
+        connection_ids: Option<Vec<u64>>,
     },
     /// 原子化订阅：在 worker 单线程内完成「replay 快照 + sender 注册」——
     /// Push 与 Subscribe 串行处理，消除"注册后、快照前"窗口内消息既进 ring

@@ -60,18 +60,23 @@ fn migration_ddl(component: Component, backend: Backend, version: i64) -> Result
     if component == Component::Userapp && version == 3 {
         return Ok(include_str!("../../schema/userapp-recovery-witness-v3.sql"));
     }
+    if component == Component::Project && version == 2 {
+        return Ok(include_str!("../../schema/project-agent-bindings-v2.sql"));
+    }
     bail!("unsupported/future database schema version")
 }
 fn latest_version(component: Component) -> i64 {
-    if component == Component::Userapp {
-        3
-    } else {
-        1
+    match component {
+        Component::Userapp => 3,
+        Component::Project => 2,
+        Component::Preview => 1,
     }
 }
-fn migration_name(version: i64) -> &'static str {
+fn migration_name(component: Component, version: i64) -> &'static str {
     if version == 1 {
         "baseline-v1"
+    } else if component == Component::Project && version == 2 {
+        "agent-bindings-v2"
     } else if version == 2 {
         "compute-control-v2"
     } else {
@@ -248,7 +253,7 @@ async fn initialize_component(
         let version: i64 = version.parse().context("invalid schema version")?;
         let ddl = migration_ddl(known, backend, version)?;
         ensure!(
-            migration_name == self::migration_name(version),
+            migration_name == self::migration_name(known, version),
             "unsupported/future database schema version"
         );
         ensure!(
@@ -314,7 +319,7 @@ async fn initialize_component(
         toasty::sql::statement(sql)
             .bind(component.name())
             .bind(version)
-            .bind(migration_name(version))
+            .bind(migration_name(component, version))
             .bind(digest(ddl))
             .bind(fingerprint)
             .bind(now)

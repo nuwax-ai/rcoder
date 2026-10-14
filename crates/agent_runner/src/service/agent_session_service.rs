@@ -99,6 +99,7 @@ impl AgentSessionService {
         // 改由"新请求清理"保证不泄漏）。
         if let Some(sid) = request.prompt_message.session_id.as_deref()
             && !sid.trim().is_empty()
+            && AGENT_REGISTRY.get_project_by_session(sid).as_deref() == Some(project_id.as_str())
         {
             let cancelled = PERMISSION_MANAGER.cancel_session_permissions(sid);
             if cancelled > 0 {
@@ -195,6 +196,7 @@ impl AgentSessionService {
                     project_id.clone(),
                     response_session_id.clone(),
                     handles.lifecycle_handle.clone(),
+                    handles.cancel_tx.clone(),
                 );
             }
         } else {
@@ -222,6 +224,7 @@ fn spawn_lifecycle_watcher(
     project_id: String,
     session_id: String,
     lifecycle_handle: Option<Arc<dyn shared_types::AgentLifecycle>>,
+    cancel_tx: tokio::sync::mpsc::Sender<shared_types::CancelNotificationRequestWrapper>,
 ) {
     tokio::spawn(async move {
         // 等待 Agent 生命周期结束（进程级 shutdown 由 SIGTERM→process::exit 直接终止进程，
@@ -231,7 +234,10 @@ fn spawn_lifecycle_watcher(
                 "🔄 [SACP] 新会话：等待 Agent 生命周期 - project_id={}, session_id={}",
                 project_id, session_id
             );
-            lifecycle.cancellation_token().cancelled().await;
+            if let Err(error) = lifecycle.wait_for_exit().await {
+                error!(project_id, session_id, %error, "agent exit is unconfirmed; retaining registry identity");
+                return;
+            }
             info!(
                 "[SACP] Agent lifecycle ended naturally: project_id={}, session_id={}",
                 project_id, session_id
@@ -243,8 +249,18 @@ fn spawn_lifecycle_watcher(
             );
         }
 
+        let _transition = agent_abstraction::session::lock_execution_transition(&project_id).await;
         // Agent 子进程生命周期结束时，清理该 session 残留的 pending permission。
         // 防止 Agent 在 await permission responder 时异常退出，导致 pending 永远无法被 consume 而泄漏。
+        if AGENT_REGISTRY
+            .view_agent_info(&project_id, |info| {
+                info.session_id.to_string() == session_id
+                    && !info.cancel_tx.same_channel(&cancel_tx)
+            })
+            .unwrap_or(false)
+        {
+            return;
+        }
         let cancelled_permissions = PERMISSION_MANAGER.cancel_session_permissions(&session_id);
         if cancelled_permissions > 0 {
             warn!(
@@ -255,7 +271,11 @@ fn spawn_lifecycle_watcher(
         // 同时清理该 session 的动态权限状态（防止 session_state 泄漏）。
         PERMISSION_MANAGER.clear_session_state(&session_id);
 
-        AGENT_REGISTRY.remove_by_project_if_session_matches(&project_id, &session_id);
+        AGENT_REGISTRY.remove_by_project_if_session_and_channel_matches(
+            &project_id,
+            &session_id,
+            &cancel_tx,
+        );
         info!(
             "🛑 [SACP] Agent 生命周期结束，已清理 Registry - project_id={}, session_id={}",
             project_id, session_id

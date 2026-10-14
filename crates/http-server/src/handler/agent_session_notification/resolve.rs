@@ -22,10 +22,36 @@ pub(super) async fn validate_and_get_session_context(
     state: Arc<crate::router::AppState>,
     session_id: &str,
 ) -> Result<(String, String, String), AppError> {
+    if let Some(target) =
+        super::super::userapp_agent_target::resolve_userapp_session_target(&state, session_id)
+            .await?
+    {
+        let container = target.container_info.ok_or_else(|| {
+            create_session_error("CONTAINER_NOT_FOUND", "UserApp builder is not running")
+        })?;
+        info!(
+            session_id,
+            project_id = %target.binding.project_id,
+            app_id = %target.binding.app_id,
+            container_name = %container.container_name,
+            "[SSE_PROXY] resolved independent UserApp agent session"
+        );
+        return Ok((
+            target.binding.project_id,
+            container.container_name,
+            container.container_ip,
+        ));
+    }
     // ========== 阶段 1: 获取项目信息（所有分支都需要） ==========
     // 🔧 优化：提前获取 project_info，避免后续重复查询
     // 同时获取 DockerManager（用于容器验证和降级查询）
     let project_info = lookup_project_info_by_session(&state, session_id).await?;
+    if project_info.service_type() == Some(shared_types::ServiceType::UserappBuilder) {
+        return Err(create_session_error(
+            "SESSION_NOT_FOUND",
+            "Historical shared UserApp session has no conversation binding; submit a new chat to recover",
+        ));
+    }
 
     let runtime = state.runtime().clone();
 

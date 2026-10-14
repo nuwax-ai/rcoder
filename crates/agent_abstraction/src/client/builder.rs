@@ -11,7 +11,7 @@ use shared_types::{AgentMode, ChatAgentServerConfig, ModelProviderConfig, Projec
 use crate::client::acp_client::{AcpClient, PromptCompletionSignal};
 use crate::diagnostics::DiagnosticsListener;
 use crate::launcher::model_env::{DirectModelRuntimeEnvResolver, ModelRuntimeEnvResolver};
-use crate::session::AcpSessionManager;
+use crate::session::{AcpSessionManager, SessionCreationConfig};
 use crate::traits::permission_handler::PermissionRequestHandler;
 use crate::traits::session_notifier::SessionNotifier;
 use crate::traits::session_registry::SessionRegistry;
@@ -310,9 +310,12 @@ where
                 &project_id,
                 self.working_dir.clone(),
                 self.session_id_hint.clone(),
-                self.model_provider.clone(),
-                start_config,
-                None, // service_uuid
+                SessionCreationConfig {
+                    model_provider: self.model_provider.clone(),
+                    start_config,
+                    service_uuid: None,
+                    force_new_session: false,
+                },
             )
             .await?;
 

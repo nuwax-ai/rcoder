@@ -25,7 +25,7 @@ fn send_signal_to_group(
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
     // 🔥 pgid 不能为 0：kill(0, SIGKILL) 会杀死调用者自己的进程组
-    if pgid == 0 {
+    if pgid <= 1 {
         debug!(
             "[LifecycleGuard] 进程组 ID 为 0，跳过进程组信号（可能是初始化失败）: project_id={project_id}"
         );
@@ -56,18 +56,21 @@ fn send_signal_to_group(
 /// - 所有孙进程（同一进程组中的进程）
 impl AgentLifecycleGuard {
     pub async fn graceful_stop(&self) -> Result<()> {
+        if self.is_stopped() {
+            return self.wait_for_exit().await;
+        }
         // 🔥 使用原子 CAS 操作确保只执行一次清理
         // compare_exchange 返回 Ok 表示成功将 false 改为 true，即当前线程获得清理权
         // 返回 Err 表示已经被其他地方清理（Drop 或其他 graceful_stop 调用）
-        let should_cleanup = self
-            .inner
-            .stopped
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
+        let should_cleanup = !self.is_stopped()
+            && self
+                .inner
+                .stopped
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
 
         if !should_cleanup {
-            debug!("Agent already stopped, skipping graceful stop");
-            return Ok(());
+            return self.wait_for_exit().await;
         }
 
         info!(
@@ -78,8 +81,19 @@ impl AgentLifecycleGuard {
         // 1. 发送取消信号
         self.inner.cancel_token.cancel();
 
-        // 2. 终止进程组
-        self.kill_process_group(false).await?;
+        // 停止受理后由独立任务收束；取消 HTTP/gRPC 等待不能截断 TERM→KILL→wait。
+        let guard = Self {
+            inner: Arc::clone(&self.inner),
+        };
+        tokio::spawn(async move {
+            if let Err(error) = guard.kill_process_group(false).await {
+                guard.inner.stopped.store(false, Ordering::Release);
+                return Err(error);
+            }
+            guard.wait_for_exit().await
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("agent stop worker failed: {error}"))??;
 
         info!(
             "Gracefully stopped Claude agent for project: {}",
@@ -96,7 +110,23 @@ impl AgentLifecycleGuard {
 
     /// 检查是否已停止
     pub fn is_stopped(&self) -> bool {
-        self.inner.stopped.load(Ordering::SeqCst)
+        matches!(&*self.inner.exit_result.borrow(), Some(Ok(())))
+    }
+
+    /// 只认 reaper 的 child.wait() 结果，取消已受理并不表示退出。
+    pub async fn wait_for_exit(&self) -> Result<()> {
+        let mut receiver = self.inner.exit_result.clone();
+        loop {
+            if let Some(result) = receiver.borrow().clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            receiver.changed().await.map_err(|_| {
+                anyhow::anyhow!(
+                    "agent reaper ended without an exit result: {}",
+                    self.inner.project_id
+                )
+            })?;
+        }
     }
 
     /// 获取取消令牌
@@ -168,8 +198,17 @@ impl AgentLifecycleGuard {
                     if !force {
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
+                        // 已回收的 PID/PGID 可能被系统复用，不能再向其发信号。
+                        if self.is_stopped() {
+                            return Ok(());
+                        }
+
                         // 强制杀死进程组
-                        let _ = kill(target, Signal::SIGKILL);
+                        if let Err(error) = kill(target, Signal::SIGKILL)
+                            && error != Errno::ESRCH
+                        {
+                            return Err(error.into());
+                        }
                         debug!("already force killed: pgid={}", pgid);
                     }
                 }
@@ -183,10 +222,12 @@ impl AgentLifecycleGuard {
                         "[LifecycleGuard] 权限不足，无法终止进程组: pgid={}, project_id={}",
                         pgid, self.inner.project_id
                     );
+                    return Err(Errno::EPERM.into());
                 }
                 Err(e) => {
                     // 其他错误（如 EINVAL、EFAULT 等）
                     debug!(" kill failed: pgid={}, error={:?}", pgid, e);
+                    return Err(e.into());
                 }
             }
 
@@ -223,11 +264,12 @@ impl Drop for AgentLifecycleGuard {
         // 不再依赖引用计数，因为引用计数可能因为多处 clone 而不准确
         // compare_exchange 返回 Ok 表示成功将 false 改为 true，即当前线程获得清理权
         // 返回 Err 表示已经被其他线程清理，当前线程无需操作
-        let should_cleanup = self
-            .inner
-            .stopped
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
+        let should_cleanup = !self.is_stopped()
+            && self
+                .inner
+                .stopped
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
 
         if should_cleanup {
             debug!(

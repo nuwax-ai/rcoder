@@ -484,3 +484,80 @@ async fn gate_k8s_or_skip_smoke() {
         report.skip("smoke: gate passed, no scenario body");
     }
 }
+
+async fn scenario_userapp_parallel(backend: Backend) {
+    use rcoder_e2e::common::userapp_agent_k8s::{BuilderProbe, scoped_app_id};
+    let scenario = "lb_userapp_parallel_agents";
+    let Some((env, report, entries)) = k8s_or_skip(scenario).await else {
+        return;
+    };
+    let case = std::env::var("E2E_CASE_ID").expect("registered K8s case identity");
+    let app = scoped_app_id(&case, backend).expect("legal per-case app ID");
+    let user = env.scoped_user("uappar");
+    let mut probe = match BuilderProbe::prepare(&env, &report, &app).await {
+        Ok(probe) => probe,
+        Err(error) => {
+            report.assert_hard("K8s case 资源归属与创建前不存在", false, error.to_string());
+            assert_hard_all(report).await;
+            return;
+        }
+    };
+    report.assert_hard("K8s case 资源归属与创建前不存在", true, app.clone());
+    probe.mark_admission_attempt();
+    let outcome = async {
+        let response = env
+            .http
+            .post(format!("{}/api/v1/userapp/workspace", entries[0]))
+            .timeout(Duration::from_secs(600))
+            .json(&json!({"app_id":app,"user_id":user}))
+            .send()
+            .await?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await?;
+        let ok = status.is_success() && body["success"] == true;
+        probe.capture(&env, &report, ok).await?;
+        report.assert_hard(
+            "create-workspace（ensure 开发容器+建目录+owner 注册）",
+            ok,
+            format!("HTTP {status}"),
+        );
+        anyhow::ensure!(ok, "UserApp builder admission failed");
+        rcoder_e2e::common::userapp_agent_parallel::verify(
+            &env, &report, &app, &user, backend, &entries,
+        )
+        .await
+    }
+    .await;
+    report.assert_hard(
+        "并行会话主流程完成",
+        outcome.is_ok(),
+        outcome
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "real AI flow completed".into()),
+    );
+    let cleanup = probe.cleanup(&env, &report, &user, &entries[0]).await;
+    report.assert_hard(
+        "K8s 本 case builder 清理成功",
+        cleanup.is_ok(),
+        cleanup
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "controlled stop and retained volume evidence complete".into()),
+    );
+    assert_hard_all(report).await;
+}
+
+#[tokio::test]
+#[ignore = "explicit K8s real-AI environment"]
+async fn lb_userapp_parallel_agents_openai() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    scenario_userapp_parallel(Backend::Openai).await;
+}
+
+#[tokio::test]
+#[ignore = "explicit K8s real-AI environment"]
+async fn lb_userapp_parallel_agents_anthropic() {
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    scenario_userapp_parallel(Backend::Anthropic).await;
+}

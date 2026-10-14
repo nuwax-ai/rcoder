@@ -58,6 +58,7 @@ pub(super) async fn dispatch_task(
         .project_id(project_id.to_string())
         .project_path(project_dir)
         .session_id(session_id_for_prompt)
+        .force_new_session(input.force_new_session)
         .prompt(input.prompt)
         .attachments(input.attachments)
         .data_source_attachments(input.data_source_attachments)

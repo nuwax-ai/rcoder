@@ -550,5 +550,29 @@
       "scenario": "userapp_prod_readiness_contract",
       "backend": "compose"
     }
+  ],
+  "userapp_dev_parallel_agents_openai": [
+    {
+      "scenario": "userapp_dev_parallel_agents",
+      "backend": "openai"
+    }
+  ],
+  "lb_userapp_parallel_agents_openai": [
+    {
+      "scenario": "lb_userapp_parallel_agents",
+      "backend": "k8s"
+    }
+  ],
+  "userapp_dev_parallel_agents_anthropic": [
+    {
+      "scenario": "userapp_dev_parallel_agents",
+      "backend": "anthropic"
+    }
+  ],
+  "lb_userapp_parallel_agents_anthropic": [
+    {
+      "scenario": "lb_userapp_parallel_agents",
+      "backend": "k8s"
+    }
   ]
 }

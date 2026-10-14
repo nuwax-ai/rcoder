@@ -12,8 +12,7 @@ use crate::router::AppState;
 use crate::service::{AGENT_REGISTRY, PERMISSION_MANAGER};
 
 use super::cleanup::{
-    CancelAndWaitResult, cleanup_session_full, close_session_connection, send_cancel_and_wait,
-    send_session_prompt_end,
+    CancelAndWaitResult, CapturedSessionCleanup, cleanup_session_full, send_cancel_and_wait,
 };
 use super::locale::locale_from_grpc_request;
 
@@ -25,6 +24,20 @@ pub async fn cancel_session(
     let locale = locale_from_grpc_request(&request);
     shared_types::scope_request_locale(locale, async move {
         let req = request.into_inner();
+        // legacy sid-only 请求先解析 owner，再在锁内重新做全部身份校验。
+        let lock_project = if req.project_id.is_empty() {
+            let Some(owner) = AGENT_REGISTRY.get_project_by_session(&req.session_id) else {
+                return Ok(Response::new(CancelResponse {
+                    success: true,
+                    result: CancelResultType::CancelResultSuccess as i32,
+                    message: Some(shared_types_i18n::get_i18n_message("grpc.cancel.session_not_found", locale)),
+                }));
+            };
+            owner
+        } else {
+            req.project_id.clone()
+        };
+        let _transition = agent_abstraction::session::lock_execution_transition(&lock_project).await;
         info!(
             "🛑 [gRPC] CancelSession: session_id={}, project_id={}, reason={}",
             req.session_id, req.project_id, req.reason
@@ -61,38 +74,18 @@ pub async fn cancel_session(
             req.session_id.clone()
         };
 
-        let cancelled_permissions =
-            PERMISSION_MANAGER.cancel_session_permissions(&actual_session_id);
-        PERMISSION_MANAGER.clear_session_state(&actual_session_id);
-        if cancelled_permissions > 0 {
-            info!(
-                "[gRPC] cancelled {} pending permission request(s): session_id={}",
-                cancelled_permissions, actual_session_id
-            );
-        }
-
-        let project_id = match AGENT_REGISTRY.get_project_by_session(&actual_session_id) {
-            Some(pid) => {
-                debug!(
-                    "✅ [gRPC] found project_id={} for session_id={}",
-                    actual_session_id, pid
-                );
-                pid
-            }
-            None => {
-                warn!(
-                    "⚠️ [gRPC] found no project for session_id={}",
-                    actual_session_id
-                );
-                return Ok(Response::new(CancelResponse {
-                    success: true,
-                    result: CancelResultType::CancelResultSuccess as i32,
-                    message: Some(shared_types_i18n::get_i18n_message("grpc.cancel.session_not_found", locale)),
-                }));
-            }
+        let Some(project_id) = AGENT_REGISTRY.get_project_by_session(&actual_session_id) else {
+            // 未找到执行时不修改权限状态；请求目标已经不存在。
+            return Ok(Response::new(CancelResponse {
+                success: true,
+                result: CancelResultType::CancelResultSuccess as i32,
+                message: Some(shared_types_i18n::get_i18n_message("grpc.cancel.session_not_found", locale)),
+            }));
         };
-
-        let (status, cancel_tx) = {
+        if project_id != lock_project {
+            return Err(Status::failed_precondition("session_id belongs to a different project"));
+        }
+        let (status, cancel_tx, request_id) = {
             let agent_info = match AGENT_REGISTRY.get_agent_info(&project_id) {
                 Some(info) => info,
                 None => {
@@ -108,11 +101,26 @@ pub async fn cancel_session(
                 }
             };
 
+            if agent_info.session_id.to_string() != actual_session_id {
+                return Err(Status::failed_precondition("session_id no longer matches this project execution"));
+            }
             let status = agent_info.status;
             let cancel_tx = agent_info.cancel_tx.clone();
+            let request_id = agent_info.request_id.clone();
             drop(agent_info);
-            (status, cancel_tx)
+            (status, cancel_tx, request_id)
         };
+        // SDK cancel await 前同时捕获终态回合和 SSE 实例，后续分支不读当前 request。
+        let cleanup = CapturedSessionCleanup::capture(&actual_session_id, request_id);
+        let cancelled_permissions =
+            PERMISSION_MANAGER.cancel_session_permissions(&actual_session_id);
+        PERMISSION_MANAGER.clear_session_state(&actual_session_id);
+        if cancelled_permissions > 0 {
+            info!(
+                "[gRPC] cancelled {} pending permission request(s): session_id={}",
+                cancelled_permissions, actual_session_id
+            );
+        }
 
         match status {
             AgentStatus::Idle => {
@@ -186,9 +194,7 @@ pub async fn cancel_session(
                     actual_session_id, e
                 );
 
-                send_session_prompt_end(
-                    &project_id,
-                    &actual_session_id,
+                let terminal = cleanup.send_prompt_end(
                     StopReason::Cancelled,
                     Some(format!(
                         "{}: {}",
@@ -197,7 +203,7 @@ pub async fn cancel_session(
                     )),
                 )
                 .await;
-                close_session_connection(&actual_session_id).await;
+                cleanup.close(&terminal);
 
                 return Ok(Response::new(CancelResponse {
                     success: false,
@@ -217,11 +223,12 @@ pub async fn cancel_session(
 
                 cleanup_session_full(
                     &project_id,
-                    &actual_session_id,
+                    &cleanup,
                     StopReason::Cancelled,
                     Some(shared_types_i18n::get_i18n_message("grpc.cancel.timeout_cleanup", locale)),
                     true,
                     &[AgentStatus::Active],
+                    &cancel_tx,
                 )
                 .await;
 
@@ -247,11 +254,12 @@ pub async fn cancel_session(
 
         cleanup_session_full(
             &project_id,
-            &actual_session_id,
+            &cleanup,
             StopReason::Cancelled,
             None,
             true,
             &[AgentStatus::Active, AgentStatus::Pending],
+            &cancel_tx,
         )
         .await;
 

@@ -5,7 +5,7 @@
 //! 构造本模块私有 struct 字面量，随私有类型同档（prompt_channel_tests 已归
 //! session_manager.rs——其测试对象 send_prompt_to_entry 属 session 域）。
 
-use super::AcpSessionManager;
+use super::{AcpSessionManager, SessionCreationConfig};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::launcher::ClaudeCodeLauncher;
 use crate::traits::{AgentStartConfig, SessionNotifier, SessionRegistry};
@@ -46,9 +46,29 @@ where
         project_path: PathBuf,
         _session_id_hint: Option<String>,
         model_provider: Option<ModelProviderConfig>,
-        start_config: AgentStartConfig,
+        mut start_config: AgentStartConfig,
         service_uuid: Option<String>,
     ) -> Result<R::Entry> {
+        let deadline = start_config.session_create_deadline.unwrap_or_else(|| {
+            tokio::time::Instant::now()
+                + Duration::from_secs(
+                    start_config
+                        .acp_session_create_timeout_secs
+                        .unwrap_or(shared_types::DEFAULT_ACP_SESSION_CREATE_TIMEOUT_SECS),
+                )
+        });
+        let transition = Arc::new(
+            tokio::time::timeout_at(
+                deadline,
+                crate::session::lock_execution_transition(&project_id),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("agent execution transition timed out for project {project_id}")
+            })?,
+        );
+        start_config.session_create_deadline = Some(deadline);
+        start_config.startup_transition = Some(transition.clone());
         let agent_info = self
             .create_session_internal(
                 project_id.clone(),
@@ -98,7 +118,8 @@ where
         }
 
         // 启动 Agent (SACP 版本)
-        // 如果 resume 失败，直接返回错误，让上层（rcoder）决定是否降级重试
+        // launcher 在总预算内尝试 LoadSession，再以 NewSession 降级；
+        // 最终创建失败时确认子进程退出后返回真实错误。
         let connection_info = launcher
             .launch(
                 project_id.clone(),
@@ -148,9 +169,7 @@ where
     /// - `project_id`: 项目 ID
     /// - `project_path`: 项目路径
     /// - `session_id_hint`: 会话 ID 提示（用于恢复现有会话）
-    /// - `model_provider`: 模型提供者配置
-    /// - `start_config`: Agent 启动配置
-    /// - `service_uuid`: 与此 Agent 关联的唯一 UUID
+    /// - `config`: 模型、启动环境、关联 UUID 与 Fresh 策略
     ///
     /// # 返回值
     /// - `R::Entry`: 会话条目
@@ -158,35 +177,46 @@ where
     ///
     /// # 并发安全性
     ///
-    /// 使用"检查-创建-插入"三阶段模式避免在持有 entry 期间调用 `.await`：
-    ///
-    /// 1. **快速检查**：检查会话是否已存在且有效
-    /// 2. **创建会话**：如果需要创建，在**不持有锁**的情况下创建会话（.await）
-    /// 3. **原子性插入**：使用 entry API 原子性插入，如果其他线程已创建则使用已存在的
-    ///
-    /// 这样确保：
-    /// - 不会在持有 DashMap entry 期间跨越 await 点
-    /// - 同一 project_id 最多只会创建一个会话
-    /// - 高并发下不会阻塞其他 project_id 的访问（DashMap 分段锁特性）
+    /// 快速复用后，创建请求按 project_id 合流为 leader/follower；leader 在
+    /// 执行转换锁内完成停旧、退出确认、启动和登记。DashMap guard 不跨 await，
+    /// 不同 project 独立；控制请求在相同锁内完成旧实例清理。
     pub async fn get_or_create_session(
         &self,
         project_id: &str,
         project_path: PathBuf,
         session_id_hint: Option<String>,
-        model_provider: Option<ModelProviderConfig>,
-        start_config: AgentStartConfig,
-        service_uuid: Option<String>,
+        mut config: SessionCreationConfig,
     ) -> Result<(R::Entry, bool)> {
         let project_id_key = project_id.to_string();
+        if let Some(hint) = session_id_hint.as_deref()
+            && let Some(owner) = self.registry.get_project_by_session(hint)
+            && owner != project_id
+        {
+            tracing::warn!(
+                project_id,
+                session_id = hint,
+                owner,
+                "foreign session hint ignored; creating a fresh session"
+            );
+            config.force_new_session = true;
+        }
+        if config.force_new_session {
+            config.start_config.resume_session_id = None;
+        }
 
         // Phase A：session_id_hint 快速复用。不可复用（通道死/模型变）时统一进入
         // 下方的创建合流——停旧由 Leader 独占执行（并发下只有一人停+建，不变式
         // 从概率性变确定性）。
-        if let Some(ref hint_sid) = session_id_hint
+        if !config.force_new_session
+            && let Some(ref hint_sid) = session_id_hint
             && let Some(existing) = self.registry.get_entry_by_session(hint_sid)
             && existing.project_id() == project_id
+            && *existing.status() != AgentStatus::Terminating
             && !existing.is_channel_closed()
-            && !existing.is_model_config_changed(&model_provider)
+            && !existing.is_model_config_changed(&config.model_provider)
+            && session_id_hint
+                .as_deref()
+                .is_none_or(|hint| existing.session_id().to_string() == hint)
         {
             info!(
                 "[SESSION] Reusing existing session via session_id_hint: project_id={}, session_id={}",
@@ -196,10 +226,15 @@ where
         }
 
         // Phase B：project entry 快速复用（Pending 占位符除外——它需要被替换）
-        if let Some(existing) = self.registry.get(&project_id_key)
+        if !config.force_new_session
+            && let Some(existing) = self.registry.get(&project_id_key)
             && *existing.status() != AgentStatus::Pending
+            && *existing.status() != AgentStatus::Terminating
             && !existing.is_channel_closed()
-            && !existing.is_model_config_changed(&model_provider)
+            && !existing.is_model_config_changed(&config.model_provider)
+            && session_id_hint
+                .as_deref()
+                .is_none_or(|hint| existing.session_id().to_string() == hint)
         {
             info!("Reuse Agent session, project ID: {}", project_id);
             return Ok((existing, false));
@@ -219,22 +254,19 @@ where
                 SessionCreateRole::Leader(handle)
             }
         };
-        let timeout =
-            Duration::from_secs(start_config.acp_session_create_timeout_secs.unwrap_or(60));
+        let timeout = Duration::from_secs(
+            config
+                .start_config
+                .acp_session_create_timeout_secs
+                .unwrap_or(shared_types::DEFAULT_ACP_SESSION_CREATE_TIMEOUT_SECS),
+        );
         match role {
             SessionCreateRole::Leader(handle) => {
-                self.create_as_leader(
-                    handle,
-                    &project_id_key,
-                    project_path,
-                    model_provider,
-                    start_config,
-                    service_uuid,
-                )
-                .await
+                self.create_as_leader(handle, &project_id_key, project_path, config)
+                    .await
             }
             SessionCreateRole::Follower(handle) => {
-                self.join_as_follower(handle, &project_id_key, timeout, &model_provider)
+                self.join_as_follower(handle, &project_id_key, timeout, &config.model_provider)
                     .await
             }
         }
@@ -246,23 +278,45 @@ where
         handle: Arc<SessionCreateHandle<R::Entry>>,
         project_id: &str,
         project_path: PathBuf,
-        model_provider: Option<ModelProviderConfig>,
-        start_config: AgentStartConfig,
-        service_uuid: Option<String>,
+        mut config: SessionCreationConfig,
     ) -> Result<(R::Entry, bool)> {
         let mut guard = SessionCreateGuard {
             map: self.in_flight.clone(),
             key: project_id.to_string(),
-            handle: handle.clone(),
+            handle,
             outcome: None,
         };
+        let budget = Duration::from_secs(
+            config
+                .start_config
+                .acp_session_create_timeout_secs
+                .unwrap_or(shared_types::DEFAULT_ACP_SESSION_CREATE_TIMEOUT_SECS),
+        );
+        let deadline = config
+            .start_config
+            .session_create_deadline
+            .unwrap_or_else(|| tokio::time::Instant::now() + budget);
+        config.start_config.session_create_deadline = Some(deadline);
+        let transition = tokio::time::timeout_at(
+            deadline,
+            crate::session::lock_execution_transition(project_id),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("agent execution transition timed out for project {project_id}")
+        })?;
+        let transition = Arc::new(transition);
+        config.start_config.startup_transition = Some(transition.clone());
+        // launcher 自己处理 handshake deadline 并等待失败子进程退出。
+        // 这里不再用同一 deadline 抢先 drop launcher，single-flight 保持到清理完成。
         let result = self
             .create_session_leader_path(
                 project_id,
                 project_path,
-                model_provider,
-                start_config,
-                service_uuid,
+                config.model_provider,
+                config.start_config,
+                config.service_uuid,
+                config.force_new_session,
             )
             .await;
         guard.outcome = Some(result.clone());
@@ -281,40 +335,62 @@ where
         model_provider: Option<ModelProviderConfig>,
         start_config: AgentStartConfig,
         service_uuid: Option<String>,
+        force_new_session: bool,
     ) -> Result<(R::Entry, bool), String> {
         // 停旧（若需）：Pending 占位符（dummy 通道）跳过；通道死/模型变才停。
         // model_changed 停旧是切模型正确性的关键：双 opencode 进程同时持有同一
         // session 会导致新进程 prompt 立即 service failure（切模型场景实测）。
-        if let Some(existing) = self.registry.get(project_id)
-            && *existing.status() != AgentStatus::Pending
-        {
+        if let Some(existing) = self.registry.get(project_id) {
             let session_id_str = existing.session_id().to_string();
             let channel_closed = existing.is_channel_closed();
             let model_changed = existing.is_model_config_changed(&model_provider);
+            let resume_changed = start_config
+                .resume_session_id
+                .as_deref()
+                .is_some_and(|hint| existing.session_id().to_string() != hint);
+            let stopping = *existing.status() == AgentStatus::Terminating;
+            if !force_new_session
+                && !channel_closed
+                && !model_changed
+                && !resume_changed
+                && !stopping
+            {
+                return Ok((existing, false));
+            }
             if channel_closed {
                 info!(
                     "⚠️ [SESSION] Session channel closed, rebuilding: project_id={}, old session_id={}",
                     project_id, session_id_str
                 );
             }
-            if model_changed {
+            if model_changed || force_new_session || channel_closed || resume_changed || stopping {
                 info!(
                     "🔄 [SESSION] Model config changed, restarting Agent session: project_id={}, old session_id={}",
                     project_id, session_id_str
                 );
                 // 🔪 显式停止旧 Agent 进程（graceful_stop 内部 CAS 幂等）
                 if let Some(handle) = existing.lifecycle_handle() {
-                    if let Err(e) = handle.graceful_stop().await {
-                        warn!(
-                            "[SESSION] graceful_stop old agent failed (continuing rebuild): {}",
-                            e
-                        );
-                    } else {
-                        info!(
-                            "[SESSION] old agent stopped before rebuild: project_id={}, old session_id={}",
-                            project_id, session_id_str
-                        );
-                    }
+                    let deadline = start_config.session_create_deadline.ok_or_else(|| {
+                        format!("session creation deadline missing for project {project_id}")
+                    })?;
+                    self.registry.update_agent_status_for_session(
+                        project_id,
+                        &session_id_str,
+                        None,
+                        AgentStatus::Terminating,
+                    );
+                    // stop 内部脱离调用者执行 TERM/KILL/reaper。预算耗尽不移除
+                    // registry，后续重试仍必须观察这一个旧执行并确认退出。
+                    tokio::time::timeout_at(deadline, async {
+                        handle.graceful_stop().await?;
+                        handle.wait_for_exit().await
+                    }).await
+                        .map_err(|_| format!("old agent exit deadline exceeded for project {project_id}, session {session_id_str}"))?
+                        .map_err(|error| format!("old agent exit unconfirmed for project {project_id}, session {session_id_str}: {error}"))?;
+                    info!(
+                        "[SESSION] old agent exited before rebuild: project_id={}, old session_id={}",
+                        project_id, session_id_str
+                    );
                 }
             }
         }
@@ -333,6 +409,23 @@ where
 
         // 全量提交（三 map：覆盖 Pending 占位符/死 entry，正反向映射一致）
         let new_session_id = new_session.session_id().to_string();
+        if let Some(owner) = self.registry.get_project_by_session(&new_session_id)
+            && owner != project_id
+        {
+            if let Some(handle) = new_session.lifecycle_handle() {
+                handle
+                    .graceful_stop()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                handle
+                    .wait_for_exit()
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            return Err(format!(
+                "agent returned session {new_session_id} already owned by project {owner}"
+            ));
+        }
         self.registry
             .insert(project_id, &new_session_id, new_session.clone());
         info!(

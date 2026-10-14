@@ -186,6 +186,16 @@ pub trait SessionRegistry: Send + Sync + 'static {
         // Default no-op — implementations that need status tracking should override
     }
 
+    /// 仅更新通知所属 session/回合，过期进程不能把替代执行改成 Idle。
+    fn update_agent_status_for_session(
+        &self,
+        _project_id: &str,
+        _session_id: &str,
+        _request_id: Option<&str>,
+        _status: AgentStatus,
+    ) {
+    }
+
     /// 更新最后活动时间
     ///
     /// 默认实现为空操作（no-op），需要活动追踪的实现应覆盖此方法。
@@ -242,6 +252,16 @@ impl<R: SessionRegistry> SessionRegistry for Arc<R> {
 
     fn update_agent_status(&self, project_id: &str, status: AgentStatus) {
         (**self).update_agent_status(project_id, status)
+    }
+
+    fn update_agent_status_for_session(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        request_id: Option<&str>,
+        status: AgentStatus,
+    ) {
+        (**self).update_agent_status_for_session(project_id, session_id, request_id, status)
     }
 
     fn update_last_activity(&self, project_id: &str, activity: DateTime<Utc>) {

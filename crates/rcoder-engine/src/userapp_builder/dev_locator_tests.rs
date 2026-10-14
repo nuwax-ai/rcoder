@@ -6,9 +6,9 @@ use container_runtime_api::{
 };
 use shared_types::{
     AppResourceIdentity, AppResourceKind, BuilderControlTarget, BuilderPodIdentity,
-    ContainerBasicInfo, UserAppAdmission, UserAppAdmissionOutcome, UserAppExecutionContext,
-    UserAppLifecycleStore, UserAppOperationKind, UserAppOperationProgress, UserAppOperationState,
-    UserAppResourceBinding,
+    ContainerBasicInfo, FileServerRequestCredentials, ProjectAndContainerInfo, UserAppAdmission,
+    UserAppAdmissionOutcome, UserAppExecutionContext, UserAppLifecycleStore, UserAppOperationKind,
+    UserAppOperationProgress, UserAppOperationState, UserAppResourceBinding,
 };
 use std::sync::{
     Mutex,
@@ -21,6 +21,7 @@ struct LocatorRuntime {
     observations: Mutex<Vec<Option<RuntimeContainerInfo>>>,
     reads: AtomicUsize,
     captures: AtomicUsize,
+    credential_reads: AtomicUsize,
     writes: AtomicUsize,
     native_context: UserAppExecutionContext,
     pod_uid: String,
@@ -119,6 +120,13 @@ impl AgentContainerRuntime for LocatorRuntime {
     }
     async fn health_check(&self) -> ContainerRuntimeResult<()> {
         Ok(())
+    }
+    async fn get_bound_builder_file_credentials(
+        &self,
+        _: &BuilderControlTarget,
+    ) -> ContainerRuntimeResult<FileServerRequestCredentials> {
+        self.credential_reads.fetch_add(1, Ordering::SeqCst);
+        Err(ContainerRuntimeError::ManagementNotRunning)
     }
     async fn inspect_builder_candidate(
         &self,
@@ -259,6 +267,7 @@ async fn fixture_on_application(
         observations: Mutex::new(observations),
         reads: AtomicUsize::new(0),
         captures: AtomicUsize::new(0),
+        credential_reads: AtomicUsize::new(0),
         writes: AtomicUsize::new(0),
         native_context: UserAppExecutionContext {
             app_id: APP_ID.into(),
@@ -843,4 +852,93 @@ async fn dev_locator_missing_pod_replacement_cannot_become_absent() {
         Err(shared_types::DevEnsureError::ObserveFailed { .. })
     ));
     assert_eq!(runtime.writes.load(Ordering::SeqCst), 0);
+}
+
+/// A parseable old address is not a live file peer. The original ensure must
+/// observe absence before trying to read that vanished peer's credentials.
+#[tokio::test]
+async fn registered_builder_with_valid_old_address_yields_missing_before_file_credentials() {
+    let (state, runtime, _directory) = fixture_on_runtime(vec![None], false, true).await;
+    let registered = ContainerBasicInfo {
+        container_id: "removed-builder-id".into(),
+        container_name: format!("rcoder-app-builder-{APP_ID}"),
+        container_ip: "192.0.2.9".into(),
+        internal_port: shared_types::AGENT_FILE_SERVER_PORT,
+        external_port: 0,
+        project_id: APP_ID.into(),
+        status: "Running".into(),
+        created_at: chrono::Utc::now(),
+        service_url: "http://192.0.2.9:60000".into(),
+        workload_uid: None,
+    };
+    #[cfg(feature = "deploy-host")]
+    let published_key = {
+        use std::collections::HashMap;
+        let key = shared_types::build_backend_addr(
+            &registered.container_name,
+            &registered.container_ip,
+            &state.config.app_manager.namespace,
+            &state.cluster_domain,
+        );
+        // Published mode needs the old peer's actual address-layer mapping.
+        // It only makes the cached address parseable; Runtime still proves the
+        // physical container absent and the test must not read credentials.
+        assert!(
+            shared_types::published::begin_physical_observation(&registered.container_id).register(
+                &[key.as_str()],
+                registered.created_at,
+                shared_types::published::Reach::Published {
+                    ports: HashMap::from([(shared_types::AGENT_FILE_SERVER_PORT, 16000)]),
+                }
+            )
+        );
+        key
+    };
+    assert!(dev_file_server_addr(&state, &registered).is_ok());
+    let mut project = ProjectAndContainerInfo::new(APP_ID.into());
+    project.set_service_type(Some(ServiceType::UserappBuilder));
+    project.set_container(Some(registered.clone()));
+    state
+        .insert_project(APP_ID.into(), Arc::new(project))
+        .unwrap();
+    let captured_project = state.get_project(APP_ID).unwrap();
+    let captured_app = state.userapp_store.get_application(APP_ID).await.unwrap();
+
+    let actual = super::super::registered_or_discovered_builder(&state, APP_ID)
+        .await
+        .unwrap();
+    assert!(
+        actual.is_none(),
+        "the vanished peer must reach ordinary creation: {actual:?}"
+    );
+    assert_eq!(
+        runtime.reads.load(Ordering::SeqCst),
+        1,
+        "real runtime observation is required"
+    );
+    assert_eq!(
+        runtime.credential_reads.load(Ordering::SeqCst),
+        0,
+        "no missing peer credential wait"
+    );
+    assert_eq!(
+        runtime.writes.load(Ordering::SeqCst),
+        0,
+        "discovery must not mutate compute or storage"
+    );
+    let current_project = state.get_project(APP_ID).unwrap();
+    assert!(
+        Arc::ptr_eq(&captured_project, &current_project),
+        "read-side absence cannot retire a replacement registration"
+    );
+    assert_eq!(current_project.container_info(), Some(registered));
+    assert_eq!(
+        state.userapp_store.get_application(APP_ID).await.unwrap(),
+        captured_app
+    );
+    #[cfg(feature = "deploy-host")]
+    assert!(shared_types::published::unregister_if_physical(
+        &published_key,
+        "removed-builder-id"
+    ));
 }

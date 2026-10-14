@@ -195,7 +195,7 @@ pub async fn agent_session_cancel(
     tag = "computer",
     operation_id = "computer_agent_session_cancel",
     summary = "取消 Computer Agent 任务",
-    description = "将 Computer Agent 取消请求通过 gRPC 转发到容器内的 agent_runner 服务，支持通过 user_id 或 pod_id 定位用户容器。支持 userApp 分派：service_type=userapp + app_id 定位 UserappBuilder 开发容器，agent 会话仅 dev 阶段。"
+    description = "将 Computer Agent 取消请求通过 gRPC 转发到容器内的 agent_runner 服务，支持通过 user_id 或 pod_id 定位用户容器。UserApp 保留 project_id 的独立 agent 身份；显式 service_type=userapp + app_id 或现有 user_id/project_id/session_id 请求的持久绑定均可定位共享 UserappBuilder，agent 会话仅 dev 阶段。"
 )]
 #[instrument(skip(state), fields(user_id = ?request.user_id.as_deref(), project_id = ?request.project_id.as_deref(), pod_id = ?request.pod_id.as_deref()))]
 pub async fn computer_agent_session_cancel(
@@ -206,9 +206,8 @@ pub async fn computer_agent_session_cancel(
     let locale = get_locale_from_headers(&headers);
 
     // 0. userApp 分派（service_type=userapp + app_id；agent 会话仅存在于
-    //    dev 的 UserappBuilder）。CancelIdentifier::Project 的定位 = project
-    //    映射优先——正是 builder 容器的注册位置（app_id 即映射键），容器
-    //    miss 走幂等成功
+    //    dev 的 UserappBuilder）。持久绑定选择本 conversation 的 agent，
+    //    app_id 只定位共享容器；没有该执行目标时走幂等成功。
     match super::pod_handler::parse_app_target(
         request.app_id.as_deref(),
         request.app_stage.as_deref(),
@@ -220,10 +219,17 @@ pub async fn computer_agent_session_cancel(
                 "🛑 [COMPUTER_CANCEL] userApp dev dispatch: app_id={app_id}, session_id={:?}",
                 request.session_id
             );
-            return handle_session_cancel_internal_v2(
+            let target = super::userapp_agent_target::resolve_agent_target(
                 &state,
-                CancelIdentifier::Project(app_id.clone()),
-                app_id,
+                request.user_id.as_deref(),
+                request.project_id.as_deref(),
+                request.session_id.as_deref(),
+                Some(&app_id),
+            )
+            .await?;
+            return forward::cancel_userapp_agent_target(
+                &state,
+                target,
                 request.session_id,
                 locale,
             )
@@ -255,6 +261,24 @@ pub async fn computer_agent_session_cancel(
             locale,
         ));
     };
+
+    if let Some(target) = super::userapp_agent_target::resolve_agent_target(
+        &state,
+        request.user_id.as_deref(),
+        Some(&project_id),
+        request.session_id.as_deref(),
+        None,
+    )
+    .await?
+    {
+        return forward::cancel_userapp_agent_target(
+            &state,
+            Some(target),
+            request.session_id,
+            locale,
+        )
+        .await;
+    }
 
     info!(
         "🚀 [COMPUTER_CANCEL] Starting to process cancel request: user_id={:?}, pod_id={:?}, project_id={}, session_id={:?}",

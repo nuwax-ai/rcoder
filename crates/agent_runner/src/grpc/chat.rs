@@ -119,6 +119,7 @@ pub async fn chat(
         project_id,
         project_dir,
         session_id,
+        force_new_session: req.force_new_session,
         prompt: req.prompt,
         request_id,
         attachments: convert_attachments(req.attachments),

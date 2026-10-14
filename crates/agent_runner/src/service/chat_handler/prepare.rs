@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 
 use super::types::{ChatHandlerInput, ChatHandlerOutput, SessionPreparation};
 use crate::agent_mgmt::checker;
-use crate::service::cancel::cancel_current_task;
+use crate::service::cancel::{CancelCurrentTaskOutcome, cancel_current_task};
 use crate::service::{AGENT_REGISTRY, PendingGuard, SESSION_CACHE};
 
 /// 会话准备:Agent 状态查询、版本检测、Busy 取消、PendingGuard、session 清理、Auto-Reload。
@@ -193,7 +193,8 @@ pub(super) async fn prepare_session(
 
     // ========== 步骤2: 检查 Agent Busy 状态，如果忙则取消当前任务 ==========
     use crate::model::AgentStatus;
-    if let Some((status, cancel_tx, agent_session_id)) = agent_busy
+    if !input.force_new_session
+        && let Some((status, cancel_tx, agent_session_id)) = agent_busy
         && (status == AgentStatus::Active || status == AgentStatus::Pending)
     {
         info!(
@@ -201,28 +202,24 @@ pub(super) async fn prepare_session(
             project_id, status, session_id
         );
 
-        // cancel_tx 已 owned(上面 clone 出来);actual_session_id 优先用请求里的,空则用 agent 的
-        let actual_session_id = session_id
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(agent_session_id);
+        // 只取消本 project 捕获的执行，不改变同归属历史恢复提示。
+        let actual_session_id = agent_session_id;
 
-        // 取消当前任务
-        if let Err(cancel_error) =
-            cancel_current_task(&cancel_tx, &actual_session_id, project_id).await
-        {
-            // 取消失败，返回错误
-            error!(
-                "[ChatHandler] Failed to cancel current task: project_id={}, error={:?}",
-                project_id, cancel_error
-            );
-            return Err(cancel_error);
+        match cancel_current_task(&cancel_tx, &actual_session_id, project_id).await {
+            Ok(CancelCurrentTaskOutcome::Cancelled) => info!(
+                "[ChatHandler] Current task cancelled, proceeding with new request: project_id={}",
+                project_id
+            ),
+            Ok(CancelCurrentTaskOutcome::RuntimeChannelClosed) => warn!(
+                project_id,
+                session_id = actual_session_id,
+                "closed runtime retained for session manager stop/reap and historical Load/New recovery"
+            ),
+            Err(cancel_error) => {
+                error!(project_id, error = ?cancel_error, "failed to cancel current task");
+                return Err(cancel_error);
+            }
         }
-
-        info!(
-            "[ChatHandler] Current task cancelled, proceeding with new request: project_id={}",
-            project_id
-        );
     }
 
     // ========== 步骤3: 创建 PendingGuard（RAII）==========
@@ -297,12 +294,14 @@ pub(super) async fn prepare_session(
     let mut was_reloaded = false;
     let mut old_session_id_for_resume = None;
 
-    if let Some(agent_config) = &input.agent_config_override
+    if !input.force_new_session
+        && let Some(agent_config) = &input.agent_config_override
         && let Some(auto_reload_config) = &agent_config.auto_reload
         && auto_reload_config.enabled
         && let Some(agent_server) = &agent_config.agent_server
         && let Some(_command) = agent_server.command.as_deref()
     {
+        let _transition = agent_abstraction::session::lock_execution_transition(project_id).await;
         // Re-lookup from registry (original binding may have been consumed in Step 2)
         let agent_info_for_reload = AGENT_REGISTRY.get_agent_info(project_id);
 
@@ -326,15 +325,16 @@ pub(super) async fn prepare_session(
             if let Some(handle) = &stop_handle
                 && let Err(e) = handle.graceful_stop().await
             {
-                warn!(
-                    "[ChatHandler] graceful_stop failed during reload: {}, forcing cancel",
-                    e
-                );
-                handle.cancel(); // CancellationToken fallback — infallible, no process signal dependency
+                return Err(Box::new(ChatHandlerOutput::error(
+                    project_id.to_string(),
+                    old_session_id.clone(),
+                    format!("agent exit unconfirmed during reload: {e}"),
+                    error_codes::ERR_AGENT_ERROR.to_string(),
+                )));
             }
 
             // 2. Remove from AGENT_REGISTRY
-            AGENT_REGISTRY.remove_by_project(project_id);
+            AGENT_REGISTRY.remove_by_project_if_session_matches(project_id, &old_session_id);
 
             // 3. Notify SSE stream + clean SESSION_CACHE
             if !old_session_id.is_empty() {

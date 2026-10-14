@@ -219,6 +219,37 @@ async fn forward_cancel_request_to_container_service(
     }
 }
 
+pub(super) async fn cancel_userapp_agent_target(
+    state: &AppState,
+    target: Option<crate::handler::userapp_agent_target::UserAppAgentTarget>,
+    session_id: Option<String>,
+    locale: &'static str,
+) -> Result<HttpResult<AgentCancelResponse>, AppError> {
+    let Some(target) = target else {
+        return Ok(HttpResult::success(AgentCancelResponse {
+            success: true,
+            session_id: session_id.unwrap_or_default(),
+        }));
+    };
+    let Some(container_info) = target.container_info else {
+        return Ok(HttpResult::success(AgentCancelResponse {
+            success: true,
+            session_id: session_id.unwrap_or_default(),
+        }));
+    };
+    forward_cancel_request_to_container_service(CancelForwardParams {
+        project_id: &target.binding.project_id,
+        session_id: session_id.as_deref(),
+        container_info: &container_info,
+        grpc_pool: &state.grpc_pool,
+        locale,
+        runtime: state.runtime(),
+        rcoder_prefix: &state.container_prefix_rcoder,
+        computer_prefix: &state.container_prefix_computer,
+    })
+    .await
+}
+
 /// 检查容器是否真实存在（通过 Docker API）
 ///
 /// 用于区分 Unavailable 错误的原因：

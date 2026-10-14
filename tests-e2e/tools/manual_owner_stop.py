@@ -96,8 +96,12 @@ strip_prefix = true
         docker('exec', cid, 'python3', '-c', writer, ws, json.dumps(files))
         execute('app-cli gen-lock --workspace "$1" && app-cli build --workspace "$1" --deploy-dir "$1/.local-deploy"', ws)
         # Reproduce old agent-created directories, which have no origin metadata.
+        # The builder was created for a management-only workspace request. This
+        # independent manual Artifact Serve explicitly uses its normal startup
+        # contract instead of inheriting that one-time management bootstrap.
         execute('rm -f "$1/.local-deploy/.app-cli-project-origin.json"; '
-                'setsid app-cli serve --workspace "$1/.local-deploy" '
+                'setsid env -u APP_CLI_CONTROL_ONLY -u APP_CLI_MANAGEMENT_BOOT_ID '
+                'app-cli serve --workspace "$1/.local-deploy" '
                 '> /tmp/manual-owner.log 2>&1 < /dev/null & echo $! > /tmp/manual-owner.pid', ws)
         def service_ready():
             deadline = time.monotonic() + 120
@@ -157,6 +161,12 @@ print(json.dumps({'supervisor_id': discovery['instance'], 'generation': active[0
             check(f'cycle {cycle}: service stopped', execute('curl -fsS --max-time 2 http://127.0.0.1:9080/api/go/ready', check=False).returncode != 0)
             body = post('/api/v1/userapp/dev/stop')
             check(f'cycle {cycle}: independent caller repeats stop', (body.get('data') or {}).get('message') == 'Stopped', body)
+            # Preserve the initial Artifact Serve/Stop test, then provide real
+            # current Source manifests for the independent run client's scope.
+            # This does not recreate origin metadata or change owner identity.
+            if cycle == 1:
+                execute('cp "$1/workspace.manifest.toml" "$1/.local-deploy/workspace.manifest.toml"; '
+                        'cp "$1/backend/project.manifest.toml" "$1/.local-deploy/backend/project.manifest.toml"', ws)
             # A new app-cli process forwards Start to the existing owner and exits.
             result = execute('app-cli run --workspace "$1/.local-deploy"', ws, check=False)
             check(f'cycle {cycle}: new CLI client starts services', result.returncode == 0, result.stderr[-2000:])

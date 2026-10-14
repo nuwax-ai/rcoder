@@ -24,6 +24,7 @@ mod db;
 mod adapter;
 mod backend;
 pub mod config;
+mod userapp_agent;
 
 #[cfg(feature = "pg")]
 pub mod pg;

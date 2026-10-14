@@ -410,7 +410,23 @@ async fn sse_notification_impl(
         .or(params.last_seq)
         .unwrap_or(0);
 
-    let route = route_ctx(&state, &project_id);
+    let route = match state
+        .projects
+        .get_userapp_agent_session(session_id)
+        .await
+        .map_err(|error| {
+            AppError::internal_server_error(&format!("Read SSE agent binding: {error:#}"))
+        })? {
+        Some((binding, _)) => SseRouteContext {
+            service_type: shared_types::ServiceType::UserappBuilder,
+            diag_ctx: Some(Arc::new(crate::handler::utils::DiagCtx {
+                runtime: state.runtime().clone(),
+                identifier: binding.app_id,
+                service_type: shared_types::ServiceType::UserappBuilder,
+            })),
+        },
+        None => route_ctx(&state, &project_id),
+    };
     let stream_params = SseStreamParams {
         container_name,
         container_ip,
@@ -428,6 +444,9 @@ async fn sse_notification_impl(
     };
     build_sse_stream_from_container_name(stream_params).await
 }
+
+#[cfg(all(test, feature = "userapp-turso"))]
+mod tests;
 
 /// 创建错误（渲染交 [`AppError::into_response`]：status 由错误码推导、body 为
 /// HttpResult 信封 + locale 感知，具体 message 进响应与 `error!` 日志）。

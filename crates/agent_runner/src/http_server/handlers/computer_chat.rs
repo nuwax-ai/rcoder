@@ -150,6 +150,7 @@ pub(crate) async fn handle_computer_chat_internal(
         project_id: project_id.clone(),
         project_dir,
         session_id,
+        force_new_session: false,
         prompt: request.prompt,
         request_id: request_id.clone(),
         attachments: request.attachments,

@@ -419,6 +419,7 @@ async fn cancellation_interrupts_a_backpressured_enqueue() {
                 .command_tx
                 .try_send(SessionCommand::Push {
                     message: make_msg("queued"),
+                    connection_ids: None,
                 })
                 .is_ok()
         );

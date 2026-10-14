@@ -667,7 +667,10 @@ async fn registered_or_discovered_builder(
 ) -> Result<Option<ContainerBasicInfo>> {
     if let Some(info) = registered_builder(state, instance) {
         if dev_file_server_addr(state, &info).is_ok() {
-            return Ok(Some(info));
+            // A parseable cached address does not prove the file peer exists.
+            // Verify before credentials can wait on a captured missing workload;
+            // confirmed absence enters the existing admitted creation path.
+            return cross_verify_registration(state, instance, instance, &info).await;
         }
         match state.runtime().refresh_container_reach(&info).await {
             Ok(()) => return Ok(Some(info)),

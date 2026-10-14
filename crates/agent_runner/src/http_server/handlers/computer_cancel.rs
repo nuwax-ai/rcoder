@@ -72,6 +72,7 @@ pub async fn handle_computer_cancel(
         ));
     };
 
+    let _transition = agent_abstraction::session::lock_execution_transition(project_id).await;
     // 查找 session_id (如果未提供,从 AGENT_REGISTRY 获取)
     let session_id = if let Some(sid) = request.session_id {
         sid
@@ -91,6 +92,12 @@ pub async fn handle_computer_cancel(
 
     // 从 AGENT_REGISTRY 获取 Agent 信息并发送取消信号
     if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(project_id) {
+        if agent_info.session_id.to_string() != session_id {
+            return Err(AppError::with_message(
+                ERR_VALIDATION,
+                "session_id belongs to a different execution",
+            ));
+        }
         let cancel_tx = agent_info.cancel_tx.clone();
         drop(agent_info);
 
@@ -158,8 +165,13 @@ pub async fn handle_computer_cancel(
     }
 
     // 清理该 session 的 pending permissions
-    PERMISSION_MANAGER.cancel_session_permissions(&session_id);
-    PERMISSION_MANAGER.clear_session_state(&session_id);
+    if AGENT_REGISTRY
+        .view_agent_info(project_id, |info| info.session_id.to_string() == session_id)
+        .unwrap_or(false)
+    {
+        PERMISSION_MANAGER.cancel_session_permissions(&session_id);
+        PERMISSION_MANAGER.clear_session_state(&session_id);
+    }
 
     // 注意：不在这里清空 ring buffer 和关闭 SSE 连接
     // 因为 cancel 后 Agent 还需要通过 SSE 发送 SessionPromptEnd 给客户端

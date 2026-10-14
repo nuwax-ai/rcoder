@@ -130,6 +130,7 @@ impl AgentLifecycleGuard {
         let command_for_reaper = process_command.clone();
         let args_for_reaper = process_args.clone();
         let working_dir_for_reaper = working_dir.clone();
+        let (exit_tx, exit_result) = tokio::sync::watch::channel(None);
         let reaper_task = tokio::spawn(async move {
             info!(
                 "[ProcessReaper] 开始监控 Agent 进程: project_id={}, pid={}, pgid={}",
@@ -138,7 +139,22 @@ impl AgentLifecycleGuard {
 
             // 🔥 优先等待子进程退出，而不是响应取消信号
             // 这确保了即使收到取消信号，也能正确检测进程是否已退出
+            #[cfg(unix)]
             let wait_result = child_process.wait().await;
+            #[cfg(not(unix))]
+            let wait_result = tokio::select! {
+                result = child_process.wait() => result,
+                _ = cancel_token_for_reaper.cancelled() => {
+                    match child_process.start_kill() {
+                        Ok(()) => child_process.wait().await,
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+            let exit_outcome = wait_result
+                .as_ref()
+                .map(|_| ())
+                .map_err(ToString::to_string);
 
             // 检查是否是外部取消（用户主动 stop）
             let was_cancelled = cancel_token_for_reaper.is_cancelled();
@@ -251,6 +267,7 @@ impl AgentLifecycleGuard {
                     project_id_for_reaper, pid
                 );
             }
+            exit_tx.send_replace(Some(exit_outcome));
         });
 
         let resources = AgentResources::Claude {
@@ -265,6 +282,7 @@ impl AgentLifecycleGuard {
             cancel_token,
             resources,
             stopped: AtomicBool::new(false),
+            exit_result,
             shared_api_key_manager,
             project_uuid_map,
             service_uuid,

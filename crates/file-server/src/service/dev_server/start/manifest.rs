@@ -17,6 +17,17 @@ impl DevServerManager {
         project_path: &Path,
         launch: super::super::DevLaunch<'_>,
     ) -> AppResult<StartedDev> {
+        self.start_dev_manifest_with_readiness_probe(project_id, project_path, launch, None)
+            .await
+    }
+
+    pub(super) async fn start_dev_manifest_with_readiness_probe(
+        &self,
+        project_id: &str,
+        project_path: &Path,
+        launch: super::super::DevLaunch<'_>,
+        readiness_probe: Option<AliveProbe<'_>>,
+    ) -> AppResult<StartedDev> {
         let (mut hooks, pg, request_context, artifact_release_id) = (
             launch.hooks.clone(),
             launch.pg,
@@ -57,14 +68,33 @@ impl DevServerManager {
                 })
         };
         if let Some((pid, captured_launch, supervised)) = retained {
-            let successful_exit = supervised.as_ref().filter(|child| child.pid() == pid).and_then(|child| child.exited())
-                .is_some_and(|exit| matches!(exit,
-                    crate::service::dev_server::supervise::ChildExit::Exited(status) if status.success()));
+            // A ready HTTP endpoint can win the race with the original run's
+            // wait/reap worker. Observe that captured child within the existing
+            // handover budget instead of treating its pending snapshot as a
+            // permanent requirement for an explicit Restart. The same deadline
+            // covers both exit observation and owner identity confirmation.
+            let handover_deadline =
+                deadline.min(tokio::time::Instant::now() + HANDOVER_CONFIRM_BUDGET);
+            let exit = match supervised
+                .as_ref()
+                .filter(|child| child.pid() == pid && captured_launch.is_some())
+            {
+                Some(child) => {
+                    child
+                        .wait_exit(
+                            handover_deadline
+                                .saturating_duration_since(tokio::time::Instant::now()),
+                        )
+                        .await
+                }
+                None => None,
+            };
+            let successful_exit = exit.is_some_and(|exit| matches!(exit,
+                crate::service::dev_server::supervise::ChildExit::Exited(status) if status.success()));
             let identity = if successful_exit {
                 self.confirm_owner_handover(
                     project_path,
-                    HANDOVER_CONFIRM_BUDGET
-                        .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                    handover_deadline.saturating_duration_since(tokio::time::Instant::now()),
                 )
                 .await
             } else {
@@ -266,17 +296,37 @@ impl DevServerManager {
         // 移交后正常退出；9080 按 [proxy] path 路由时根路径 404，HTTP 判不
         // 通但编排主体存活即通过。移交判据 = 监督退出码 0 + owner 身份核验
         // （R2：非零退出不再被 owner 存活掩盖）。
-        match self
-            .wait_manifest_alive(
-                pid,
-                PINGAP_ENTRY_PORT,
-                project_path,
-                &supervised,
-                &stderr_ring,
-                Some(deadline),
-            )
-            .await
-        {
+        let observation = match readiness_probe {
+            Some(probe) => {
+                self.wait_alive(
+                    pid,
+                    AliveWatch {
+                        port: PINGAP_ENTRY_PORT,
+                        base_path: None,
+                        stderr_ring: &stderr_ring,
+                        probe,
+                        launch_deadline: Some(deadline),
+                        exit_policy: &ExitPolicy::ConfirmOwner {
+                            workspace: project_path,
+                            supervised: &supervised,
+                        },
+                    },
+                )
+                .await
+            }
+            None => {
+                self.wait_manifest_alive(
+                    pid,
+                    PINGAP_ENTRY_PORT,
+                    project_path,
+                    &supervised,
+                    &stderr_ring,
+                    Some(deadline),
+                )
+                .await
+            }
+        };
+        match observation {
             Ok(LaunchObservation::Ready) => {}
             Ok(LaunchObservation::HandedOver { identity }) => {
                 // R3：移交成立——本地登记从"run PID"转换为"外部 owner"，

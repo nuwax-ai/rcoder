@@ -9,7 +9,7 @@ use std::sync::{
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::{ModelProviderConfig, ModelProviderSafeInfo};
 use agent_client_protocol::schema::v1::{CancelNotification, PromptRequest, SessionId};
@@ -309,6 +309,7 @@ struct AgentLifecycleInner {
     cancel_token: CancellationToken,
     resources: AgentResources,
     stopped: AtomicBool,
+    stop_requested: AtomicBool,
 }
 
 /// Agent资源管理枚举
@@ -339,6 +340,7 @@ impl AgentLifecycleGuard {
             cancel_token,
             resources,
             stopped: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
         });
 
         Self { inner }
@@ -346,8 +348,8 @@ impl AgentLifecycleGuard {
 
     /// 优雅停止agent
     pub async fn graceful_stop(&self) -> Result<()> {
-        if self.inner.stopped.swap(true, Ordering::SeqCst) {
-            return Ok(()); // 已经停止
+        if self.inner.stop_requested.swap(true, Ordering::SeqCst) {
+            return <Self as AgentLifecycle>::wait_for_exit(self).await;
         }
 
         info!(
@@ -358,11 +360,18 @@ impl AgentLifecycleGuard {
         // 1. 发送取消信号
         self.inner.cancel_token.cancel();
 
-        // 2. 等待任务自然退出
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-        // 3. 强制清理资源
-        self.force_cleanup().await?;
+        let guard = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            if let Err(error) = guard.force_cleanup().await {
+                guard.inner.stop_requested.store(false, Ordering::Release);
+                return Err(error);
+            }
+            guard.inner.stopped.store(true, Ordering::Release);
+            Ok(())
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("agent stop worker failed: {error}"))??;
 
         info!(
             "[Claude] agentgracefulstoppedcompleted: {}",
@@ -385,10 +394,11 @@ impl AgentLifecycleGuard {
                 }
 
                 // 终止子进程
-                if let Some(mut child) = child_process.lock().await.take()
-                    && let Err(e) = child.kill().await
-                {
-                    warn!("Claude child process failed: {}", e);
+                let mut child_guard = child_process.lock().await;
+                if let Some(child) = child_guard.as_mut() {
+                    child.kill().await?;
+                    child.wait().await?;
+                    child_guard.take();
                 }
             }
         }
@@ -467,8 +477,11 @@ impl Drop for AgentLifecycleGuard {
 ///
 /// 定义了Agent生命周期管理的基本接口
 pub trait AgentLifecycle: Send + Sync + 'static {
-    /// 优雅停止Agent
+    /// 优雅停止 Agent；成功表示真实子进程已经退出并被回收。
     fn graceful_stop(&self) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// 等待真实执行退出。取消令牌只表示停止意图，不能作为退出证据。
+    fn wait_for_exit(&self) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 
     /// 发送取消信号（非阻塞）
     fn cancel(&self);
@@ -511,6 +524,28 @@ impl std::ops::Deref for AgentStopHandle {
 impl AgentLifecycle for AgentLifecycleGuard {
     fn graceful_stop(&self) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move { self.graceful_stop().await })
+    }
+
+    fn wait_for_exit(&self) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            loop {
+                let AgentResources::Claude { child_process, .. } = &self.inner.resources;
+                {
+                    let mut child = child_process.lock().await;
+                    if let Some(process) = child.as_mut() {
+                        if process.try_wait()?.is_some() {
+                            child.take();
+                            self.inner.stopped.store(true, Ordering::Release);
+                            return Ok(());
+                        }
+                    } else {
+                        self.inner.stopped.store(true, Ordering::Release);
+                        return Ok(());
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+            }
+        })
     }
 
     fn cancel(&self) {

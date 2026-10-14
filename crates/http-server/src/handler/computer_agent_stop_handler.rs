@@ -68,7 +68,7 @@ use super::utils::{I18nJsonOrQuery, extract_grpc_addr, get_locale_from_headers};
     tag = "computer",
     operation_id = "computer_agent_stop",
     summary = "停止 Computer Agent",
-    description = "停止特定 project_id 的 Agent，不销毁容器。支持 userApp 分派：service_type=userapp + app_id 定位 UserappBuilder 开发容器，agent 会话仅 dev 阶段。"
+    description = "停止特定 project_id 的 Agent，不销毁容器。UserApp 保留 project_id 的独立 agent 身份；显式 service_type=userapp + app_id 或现有 user_id/project_id/session_id 请求的持久绑定均可定位共享 UserappBuilder，agent 会话仅 dev 阶段。"
 )]
 #[instrument(skip(state))]
 pub async fn computer_agent_stop(
@@ -92,7 +92,15 @@ pub async fn computer_agent_stop(
                 "🛑 [COMPUTER_STOP] userApp dev dispatch: app_id={}, session_id={:?}",
                 app_id, request.session_id
             );
-            return stop_userapp_dev(&state, locale, &app_id, &request).await;
+            let target = super::userapp_agent_target::resolve_agent_target(
+                &state,
+                request.user_id.as_deref(),
+                request.project_id.as_deref(),
+                request.session_id.as_deref(),
+                Some(&app_id),
+            )
+            .await?;
+            return stop_userapp_dev(&state, locale, target, &request).await;
         }
         Ok(super::pod_handler::AppTarget::Prod(_)) => {
             return Ok(super::pod_handler::agent_prod_unsupported(locale));
@@ -122,6 +130,18 @@ pub async fn computer_agent_stop(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
         ));
+    }
+
+    if let Some(target) = super::userapp_agent_target::resolve_agent_target(
+        &state,
+        request.user_id.as_deref(),
+        Some(project_id),
+        request.session_id.as_deref(),
+        None,
+    )
+    .await?
+    {
+        return stop_userapp_dev(&state, locale, Some(target), &request).await;
     }
 
     let user_id = request.user_id.clone();
@@ -187,16 +207,14 @@ pub async fn computer_agent_stop(
     info!("[COMPUTER_STOP] gRPC addr: {}", grpc_addr);
 
     // 调用 StopAgent RPC
-    match crate::grpc::grpc_stop_agent_with_pool(
+    match crate::grpc::grpc_stop_agent_with_pool_and_session(
         &state.grpc_pool,
         &grpc_addr,
         project_id.to_string(),
-        request
-            .session_id
-            .clone()
-            .or_else(|| Some("User requested stop".to_string())),
+        Some("User requested stop".to_string()),
         false, // force=false，优雅停止
-        None,  // 使用默认超时 (GRPC_STOP_AGENT_TIMEOUT_SECS)
+        request.session_id.clone(),
+        None, // 使用默认超时 (GRPC_STOP_AGENT_TIMEOUT_SECS)
     )
     .await
     {
@@ -298,109 +316,86 @@ pub async fn computer_agent_stop(
 async fn stop_userapp_dev(
     state: &AppState,
     locale: &'static str,
-    app_id: &str,
+    target: Option<super::userapp_agent_target::UserAppAgentTarget>,
     request: &ComputerAgentStopRequest,
 ) -> Result<HttpResult<ComputerAgentStopResponse>, AppError> {
-    let Some(container_info) =
-        super::pod_handler::resolve_userapp_dev_container(state, app_id, "COMPUTER_STOP][USERAPP")
-            .await?
-    else {
-        warn!("[COMPUTER_STOP][USERAPP] dev builder container not found: app_id={app_id}");
+    let Some(target) = target else {
+        return Ok(HttpResult::error_with_locale(
+            shared_types::error_codes::ERR_AGENT_NOT_FOUND,
+            locale,
+        ));
+    };
+    let Some(container_info) = target.container_info else {
         return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
             locale,
         ));
     };
-
-    info!(
-        "📦 [COMPUTER_STOP][USERAPP] dev builder container found: container_id={}, ip={}",
-        container_info.container_id, container_info.container_ip
-    );
-
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(shared_types::GRPC_STOP_AGENT_TIMEOUT_SECS);
     let grpc_addr = extract_grpc_addr(&container_info.service_url)?;
-    match crate::grpc::grpc_stop_agent_with_pool(
+    let response = match crate::grpc::grpc_stop_agent_with_pool_and_session(
         &state.grpc_pool,
         &grpc_addr,
-        app_id.to_string(),
+        target.binding.project_id.clone(),
+        Some("User requested stop".to_string()),
+        false,
         request
             .session_id
             .clone()
-            .or_else(|| Some("User requested stop".to_string())),
-        false, // force=false，优雅停止
-        None,
+            .or_else(|| target.binding.current_session_id.clone()),
+        Some(deadline.saturating_duration_since(tokio::time::Instant::now())),
     )
     .await
     {
-        Ok(response) => {
-            info!(
-                "📥 [COMPUTER_STOP][USERAPP] Received StopAgent response: result={}, success={}",
-                response.result, response.success
-            );
-            if response.success {
-                state.clear_session_durable(app_id).await;
-                let message = format!(
-                    "Agent {app_id} stopped successfully, container {} continues running",
-                    container_info.container_id
-                );
-                return Ok(HttpResult::success(ComputerAgentStopResponse {
-                    success: true,
-                    message,
-                    user_id: request.user_id.clone(),
-                    pod_id: None,
-                    project_id: app_id.to_string(),
-                }));
-            }
-            match response.result.as_str() {
-                "not_found" => {
-                    warn!("[COMPUTER_STOP][USERAPP] agent not found: app_id={app_id}");
-                    Ok(HttpResult::error_with_locale(
-                        shared_types::error_codes::ERR_AGENT_NOT_FOUND,
-                        locale,
-                    ))
-                }
-                "already_stopped" => {
-                    info!("[COMPUTER_STOP][USERAPP] agent already stopped: app_id={app_id}");
-                    state.clear_session_durable(app_id).await;
-                    let message =
-                        shared_types::get_i18n_message("success.agent_already_stopped", locale);
-                    Ok(HttpResult::success(ComputerAgentStopResponse {
-                        success: true,
-                        message,
-                        user_id: request.user_id.clone(),
-                        pod_id: None,
-                        project_id: app_id.to_string(),
-                    }))
-                }
-                "error" => {
-                    let err_msg = response
-                        .message
-                        .unwrap_or_else(|| "Unknown error".to_string());
-                    error!("[COMPUTER_STOP][USERAPP] agent stop failed: {err_msg}");
-                    Ok(HttpResult::error_with_locale(
-                        shared_types::error_codes::ERR_STOP_FAILED,
-                        locale,
-                    ))
-                }
-                _ => {
-                    warn!(
-                        "[COMPUTER_STOP][USERAPP] unexpected result: {}",
-                        response.result
-                    );
-                    Ok(HttpResult::error_with_locale(
-                        shared_types::error_codes::ERR_UNKNOWN,
-                        locale,
-                    ))
-                }
-            }
-        }
-        Err(e) => {
+        Ok(response) => response,
+        Err(error) => {
             error!(
-                "❌ [COMPUTER_STOP][USERAPP] StopAgent RPC call failed: app_id={app_id}, error={e}"
+                "[COMPUTER_STOP][USERAPP] StopAgent RPC failed: app_id={}, project_id={}, error={error}",
+                target.binding.app_id, target.binding.project_id
             );
-            Ok(HttpResult::error_with_locale(
+            return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_GRPC_ERROR,
                 locale,
-            ))
+            ));
         }
+    };
+    if response.result == "not_found" || response.result == "session_mismatch" {
+        return Ok(HttpResult::error_with_locale(
+            shared_types::error_codes::ERR_AGENT_NOT_FOUND,
+            locale,
+        ));
     }
+    if !response.success && response.result != "already_stopped" {
+        return Ok(HttpResult::error_with_locale(
+            shared_types::error_codes::ERR_STOP_FAILED,
+            locale,
+        ));
+    }
+    let cleared = state
+        .projects
+        .clear_userapp_agent_sessions(&target.binding, &request_id, deadline)
+        .await
+        .map_err(|error| {
+            AppError::internal_server_error(&format!(
+                "Persist stopped UserApp agent session: {error:#}"
+            ))
+        })?;
+    if !cleared {
+        info!(
+            "[COMPUTER_STOP][USERAPP] binding changed after captured session stopped; preserving replacement sessions: project_id={}",
+            target.binding.project_id
+        );
+    }
+    Ok(HttpResult::success(ComputerAgentStopResponse {
+        success: true,
+        message: format!(
+            "Agent {} stopped successfully, container {} continues running",
+            target.binding.project_id, container_info.container_id
+        ),
+        user_id: request.user_id.clone(),
+        pod_id: None,
+        project_id: target.binding.project_id,
+    }))
 }

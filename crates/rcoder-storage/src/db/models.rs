@@ -221,7 +221,9 @@ pub(crate) fn storage_models() -> toasty::ModelSet {
         ProjectTombstone,
         SessionTombstone,
         ContainerTombstone,
-        ProjectWriteReceipt
+        ProjectWriteReceipt,
+        UserAppAgentBinding,
+        UserAppAgentSession
     )
 }
 
@@ -361,6 +363,31 @@ pub(crate) struct ProjectWriteReceipt {
     pub fingerprint: String,
     pub outcome: String,
     pub recorded_at_us: i64,
+}
+
+#[derive(toasty::Model)]
+#[table = "userapp_agent_bindings"]
+pub(crate) struct UserAppAgentBinding {
+    #[key]
+    pub binding_generation: String,
+    pub app_id: String,
+    pub lifecycle_id: String,
+    pub project_id: String,
+    pub user_id: String,
+    pub revision: i64,
+    pub current_session_id: Option<String>,
+    pub created_at_us: i64,
+    pub updated_at_us: i64,
+}
+
+#[derive(toasty::Model)]
+#[table = "userapp_agent_sessions"]
+pub(crate) struct UserAppAgentSession {
+    #[key]
+    pub session_id: String,
+    pub session_generation: String,
+    pub binding_generation: String,
+    pub created_at_us: i64,
 }
 
 #[derive(toasty::Model)]

@@ -371,6 +371,11 @@ async fn isolate_poison_ops(
 /// （保住数据可人工恢复）危害大得多——schema 类错误保留在瞬态重试路径，
 /// 由持续 error 日志暴露人工介入。
 fn is_deterministic_pg_error(e: &anyhow::Error) -> bool {
+    if e.downcast_ref::<crate::userapp_agent::MappingRequestConflict>()
+        .is_some()
+    {
+        return true;
+    }
     for cause in e.chain() {
         if let Some(error) = cause.downcast_ref::<tokio_postgres::Error>()
             && let Some(code) = error.code()
@@ -389,6 +394,13 @@ pub(in crate::pg) async fn lock_ops(
     let mut keys = std::collections::BTreeSet::new();
     for op in ops {
         match op {
+            PersistOp::UserAppAgentMapping {
+                request_id,
+                command,
+            } => {
+                keys.insert(format!("project-write:{request_id}"));
+                keys.extend(super::userapp_agent::command_locks(command));
+            }
             PersistOp::RegisterProject {
                 project: p,
                 request_id,
@@ -490,6 +502,10 @@ pub(in crate::pg) async fn execute_op(
     use PersistOp as Op;
     let db = tx;
     let outcome = match op {
+        Op::UserAppAgentMapping {
+            request_id,
+            command,
+        } => super::userapp_agent::execute_command(db, request_id, command).await?,
         Op::RegisterProject {
             request_id,
             container,

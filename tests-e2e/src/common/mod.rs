@@ -11,6 +11,8 @@ pub mod sse;
 pub mod fixtures;
 pub mod resources;
 pub mod retry;
+pub mod userapp_agent_k8s;
+pub mod userapp_agent_parallel;
 pub mod userapp_compute;
 pub mod userapp_compute_docker;
 

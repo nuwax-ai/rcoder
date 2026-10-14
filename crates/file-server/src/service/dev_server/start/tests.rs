@@ -1638,8 +1638,10 @@ mod owner_reuse_tests {
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
+        let posted = Arc::new(Mutex::new(Vec::new()));
         let router = mock_owner_router("hashed-workspace", &workspace)
             .with_state(Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let router = record_runtime_operations(router, posted.clone());
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let manager = DevServerManager::new(Arc::new(wait_test_config(
             &address,
@@ -1647,6 +1649,7 @@ mod owner_reuse_tests {
         )));
         let flag = workspace.join("exit-flag");
         let child = tokio::process::Command::new("sh")
+            .kill_on_drop(true)
             .args([
                 "-c",
                 "while [ ! -f \"$1\" ]; do sleep 0.01; done; exit 0",
@@ -1701,24 +1704,37 @@ mod owner_reuse_tests {
             .await
             .unwrap();
         assert!(matches!(ready, LaunchObservation::Ready));
+        assert!(supervised.exited().is_none());
+        let repeat = manager.start_dev_manifest(
+            key,
+            &workspace,
+            crate::service::dev_server::DevLaunch {
+                base_path: None,
+                hooks: None,
+                pg: None,
+                request_context: None,
+                artifact_release_id: None,
+            },
+        );
+        tokio::pin!(repeat);
+        // Poll the real Start while the captured launcher is still awaiting its
+        // flag. The old snapshot-only guard returns an immediate error here.
+        tokio::select! {
+            result = &mut repeat => panic!("repeat Start finished before the original run exited: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
+        assert!(supervised.exited().is_none());
+        assert!(
+            posted.lock().unwrap().is_empty(),
+            "no Restart before run exit"
+        );
         std::fs::write(flag, "").unwrap();
-        assert!(matches!(supervised.wait_exit(Duration::from_secs(2)).await,
-            Some(crate::service::dev_server::supervise::ChildExit::Exited(status)) if status.success()));
-        let started = manager
-            .start_dev(
-                key,
-                &workspace,
-                crate::service::dev_server::DevLaunch {
-                    base_path: None,
-                    hooks: None,
-                    pg: None,
-                    request_context: None,
-                    artifact_release_id: None,
-                },
-            )
+        let started = repeat
             .await
-            .expect("a finished launcher must route a new Start to its verified owner");
+            .expect("repeat Start must await the captured run and reuse its verified owner");
         assert_eq!(started.pid, 0);
+        assert!(matches!(supervised.exited(),
+            Some(crate::service::dev_server::supervise::ChildExit::Exited(status)) if status.success()));
         assert!(
             lock(&manager.processes)
                 .unwrap()
@@ -1726,6 +1742,246 @@ mod owner_reuse_tests {
                 .unwrap()
                 .external_owner
                 .is_some()
+        );
+        let posted = posted.lock().unwrap();
+        assert_eq!(posted.len(), 1, "exactly one owner Restart");
+        assert_eq!(posted[0].kind, shared_types::RuntimeOperationKind::Restart);
+        server.abort();
+    }
+
+    fn record_runtime_operations(
+        router: axum::Router,
+        captured: Arc<Mutex<Vec<shared_types::RuntimeOperationRequest>>>,
+    ) -> axum::Router {
+        router.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let captured = captured.clone();
+                async move {
+                    if request.method() == axum::http::Method::POST {
+                        let (parts, body) = request.into_parts();
+                        let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                        captured
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::from_slice(&bytes).unwrap());
+                        next.run(axum::extract::Request::from_parts(
+                            parts,
+                            axum::body::Body::from(bytes),
+                        ))
+                        .await
+                    } else {
+                        next.run(request).await
+                    }
+                }
+            },
+        ))
+    }
+
+    #[derive(Clone, Copy)]
+    enum RetainedRunRefusal {
+        FailedExit,
+        ForeignOwner,
+        UnconfirmedExit,
+        ReplacedLaunch,
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn manifest_repeat_wait_rejects_failed_run_without_owner_restart() {
+        retained_run_refusal_case(RetainedRunRefusal::FailedExit).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn manifest_repeat_wait_rejects_foreign_owner_without_restart() {
+        retained_run_refusal_case(RetainedRunRefusal::ForeignOwner).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn manifest_repeat_wait_honors_parent_deadline_and_retains_original_run() {
+        retained_run_refusal_case(RetainedRunRefusal::UnconfirmedExit).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn manifest_repeat_wait_never_promotes_replaced_launch() {
+        retained_run_refusal_case(RetainedRunRefusal::ReplacedLaunch).await;
+    }
+
+    async fn retained_run_refusal_case(case: RetainedRunRefusal) {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("source");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("workspace.manifest.toml"), "# fixture\n").unwrap();
+        let foreign = dir.path().join("foreign");
+        std::fs::create_dir_all(&foreign).unwrap();
+        let root = dir.path().join(".app-cli-state/unknown-app");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("token"), "test-token").unwrap();
+        let canonical = std::fs::canonicalize(&workspace).unwrap();
+        std::fs::write(
+            dir.path().join(".app-cli-state/registry.json"),
+            serde_json::to_vec(&std::collections::BTreeMap::from([(
+                canonical.to_string_lossy().into_owned(),
+                "unknown-app",
+            )]))
+            .unwrap(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let owner_workspace = if matches!(case, RetainedRunRefusal::ForeignOwner) {
+            &foreign
+        } else {
+            &workspace
+        };
+        let posted = Arc::new(Mutex::new(Vec::new()));
+        let router = record_runtime_operations(
+            mock_owner_router("hashed-workspace", owner_workspace)
+                .with_state(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+            posted.clone(),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let manager = DevServerManager::new(Arc::new(wait_test_config(
+            &address,
+            &dir.path().join("logs"),
+        )));
+        let flag = workspace.join("exit-flag");
+        let exit_code = if matches!(case, RetainedRunRefusal::FailedExit) {
+            "17"
+        } else {
+            "0"
+        };
+        let child = tokio::process::Command::new("sh")
+            .kill_on_drop(true)
+            .args([
+                "-c",
+                "while [ ! -f \"$1\" ]; do sleep 0.01; done; exit \"$2\"",
+                "fixture",
+            ])
+            .arg(&flag)
+            .arg(exit_code)
+            .spawn()
+            .unwrap();
+        let supervised = SupervisedChild::adopt(
+            child,
+            Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        );
+        let pid = supervised.pid();
+        let key = "userapp:retained-refusal";
+        lock(&manager.launches).unwrap().insert(
+            key.into(),
+            super::super::super::types::LocalLaunch {
+                launch_id: "original-launch".into(),
+                state_root: None,
+            },
+        );
+        lock(&manager.processes).unwrap().insert(
+            key.into(),
+            DevProcess {
+                pid,
+                port: shared_types::APP_ENTRY_PORT,
+                project_id: key.into(),
+                instance_id: None,
+                base_path: None,
+                started_at: 0,
+                log_dir: dir.path().join("logs"),
+                temp_log_name: String::new(),
+                external_owner: None,
+            },
+        );
+        lock(&manager.supervised)
+            .unwrap()
+            .insert(key.into(), supervised.clone());
+        let short_deadline = matches!(case, RetainedRunRefusal::UnconfirmedExit);
+        let hooks = short_deadline.then(|| crate::service::dev_server::DevEventHooks {
+            launch_deadline: Some(tokio::time::Instant::now() + Duration::from_millis(80)),
+            ..crate::service::dev_server::DevEventHooks::noop()
+        });
+        let repeat = manager.start_dev_manifest(
+            key,
+            &workspace,
+            crate::service::dev_server::DevLaunch {
+                base_path: None,
+                hooks,
+                pg: None,
+                request_context: None,
+                artifact_release_id: None,
+            },
+        );
+        tokio::pin!(repeat);
+        tokio::select! {
+            result = &mut repeat => panic!("captured run has not exited yet: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
+        assert!(supervised.exited().is_none());
+        assert!(posted.lock().unwrap().is_empty());
+        if matches!(case, RetainedRunRefusal::ReplacedLaunch) {
+            // The same numeric PID deliberately remains; only the launch
+            // identity changes while the original exit is being observed.
+            lock(&manager.launches)
+                .unwrap()
+                .get_mut(key)
+                .unwrap()
+                .launch_id = "successor-launch".into();
+        }
+        if !short_deadline {
+            std::fs::write(&flag, "").unwrap();
+        }
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(if short_deadline { 250 } else { 4_000 }),
+            &mut repeat,
+        )
+        .await
+        .expect("retained observation must respect its existing deadline");
+        assert!(
+            outcome.is_err(),
+            "unconfirmed/failed/foreign/replaced handover must fail: {outcome:?}"
+        );
+        assert!(
+            posted.lock().unwrap().is_empty(),
+            "refused handover must not submit owner Restart"
+        );
+        assert!(
+            lock(&manager.processes)
+                .unwrap()
+                .get(key)
+                .unwrap()
+                .external_owner
+                .is_none()
+        );
+        assert_eq!(lock(&manager.processes).unwrap().get(key).unwrap().pid, pid);
+        assert!(Arc::ptr_eq(
+            lock(&manager.supervised).unwrap().get(key).unwrap(),
+            &supervised
+        ));
+        assert_eq!(
+            lock(&manager.launches).unwrap().get(key).unwrap().launch_id,
+            if matches!(case, RetainedRunRefusal::ReplacedLaunch) {
+                "successor-launch"
+            } else {
+                "original-launch"
+            }
+        );
+        if short_deadline {
+            assert!(
+                supervised.exited().is_none(),
+                "unconfirmed exit must remain unconfirmed"
+            );
+            assert!(
+                process::is_process_running(pid),
+                "deadline must not kill the captured child"
+            );
+            std::fs::write(&flag, "").unwrap();
+        }
+        let exit = supervised
+            .wait_exit(Duration::from_secs(2))
+            .await
+            .expect("fixture child must be reaped");
+        assert!(
+            matches!(exit, crate::service::dev_server::supervise::ChildExit::Exited(status)
+            if status.code() == Some(if matches!(case, RetainedRunRefusal::FailedExit) { 17 } else { 0 }))
         );
         server.abort();
     }
@@ -1821,6 +2077,29 @@ mod owner_reuse_tests {
                 },
             ));
 
+        // The fake run has no business server. Own a random HTTP 503 endpoint
+        // for readiness instead of relying on the host's fixed port 9080.
+        let readiness_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let readiness_addr = readiness_listener.local_addr().unwrap();
+        let readiness_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded_hits = readiness_hits.clone();
+        let readiness_router = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let hits = recorded_hits.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        );
+        let readiness_server = tokio::spawn(async move {
+            axum::serve(readiness_listener, readiness_router)
+                .await
+                .unwrap()
+        });
+        let readiness_client = reqwest::Client::builder().no_proxy().build().unwrap();
+
         let mut config = wait_test_config(&reserved.to_string(), &dir.path().join("logs"));
         // 宽松就绪窗覆盖脚本等待 + owner 上线 + 移交核验。
         config.dev_alive_max_wait_ms = 4_000;
@@ -1835,38 +2114,67 @@ mod owner_reuse_tests {
             artifact_release_id: None,
         };
         let first_workspace = workspace.clone();
+        let (submitted_tx, submitted_rx) = tokio::sync::oneshot::channel();
+        let submitted_tx = Arc::new(Mutex::new(Some(submitted_tx)));
         let first = {
             let manager = manager.clone();
             tokio::spawn(async move {
-                let hooks = if retire_before_handover {
-                    let retired = manager.clone();
-                    Some(crate::service::dev_server::DevEventHooks {
-                        on_submitted: Some(Arc::new(move || {
+                let submitted_manager = manager.clone();
+                let hooks = Some(crate::service::dev_server::DevEventHooks {
+                    on_submitted: Some(Arc::new(move || {
+                        let original_child = {
                             // A controlled retirement barrier after atomic
                             // publication, before launcher exit/owner handover.
-                            let mut launches = lock(&retired.launches).unwrap();
-                            let mut processes = lock(&retired.processes).unwrap();
-                            let mut children = lock(&retired.supervised).unwrap();
-                            launches.remove("userapp:handover-reg");
-                            processes.remove("userapp:handover-reg");
-                            children.remove("userapp:handover-reg");
-                        })),
-                        ..crate::service::dev_server::DevEventHooks::noop()
-                    })
-                } else {
-                    None
-                };
+                            let mut launches = lock(&submitted_manager.launches).unwrap();
+                            let mut processes = lock(&submitted_manager.processes).unwrap();
+                            let mut children = lock(&submitted_manager.supervised).unwrap();
+                            let child = children.get("userapp:handover-reg").unwrap().clone();
+                            if retire_before_handover {
+                                launches.remove("userapp:handover-reg");
+                                processes.remove("userapp:handover-reg");
+                                children.remove("userapp:handover-reg");
+                            }
+                            child
+                        };
+                        assert!(
+                            submitted_tx
+                                .lock()
+                                .unwrap()
+                                .take()
+                                .unwrap()
+                                .send(original_child)
+                                .is_ok()
+                        );
+                    })),
+                    ..crate::service::dev_server::DevEventHooks::noop()
+                });
                 manager
-                    .start_dev(
+                    .start_dev_manifest_with_readiness_probe(
                         "userapp:handover-reg",
                         &first_workspace,
                         crate::service::dev_server::DevLaunch { hooks, ..launch() },
+                        Some(&|_, _, timeout_ms| {
+                            let client = readiness_client.clone();
+                            Box::pin(async move {
+                                client
+                                    .get(format!("http://{readiness_addr}/"))
+                                    .timeout(Duration::from_millis(timeout_ms))
+                                    .send()
+                                    .await
+                                    .is_ok_and(|response| response.status().is_success())
+                            })
+                        }),
                     )
                     .await
             })
         };
-        // 前置探测 + spawn 完成后（脚本挂起等 flag），owner 上线并放行脚本。
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        // A real submission signal proves preflight missed the owner, spawn
+        // completed, and all three registration tables were published.
+        let original_child = tokio::time::timeout(Duration::from_secs(10), submitted_rx)
+            .await
+            .expect("original launch must be submitted")
+            .unwrap();
+        assert!(original_child.exited().is_none());
         let listener = tokio::net::TcpListener::bind(reserved)
             .await
             .expect("rebind reserved owner port");
@@ -1875,9 +2183,24 @@ mod owner_reuse_tests {
                 tracing::warn!(%error, "test owner server terminated");
             }
         });
+        assert!(
+            crate::service::dev_server::owner_client::probe_owner(&reserved.to_string())
+                .await
+                .unwrap()
+                .is_some()
+        );
         std::fs::write(workspace.join(".release-flag"), "").unwrap();
 
         let result = first.await.expect("start task join");
+        assert!(
+            matches!(original_child.exited(),
+            Some(crate::service::dev_server::supervise::ChildExit::Exited(status)) if status.success()),
+            "original run must really exit before handover is reported"
+        );
+        assert!(
+            readiness_hits.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "startup must use the owned HTTP readiness endpoint"
+        );
         if retire_before_handover {
             let error = result.expect_err("a retired launch cannot report a successful handover");
             assert!(matches!(error, AppError::Conflict(_)), "{error}");
@@ -1897,10 +2220,19 @@ mod owner_reuse_tests {
                     .contains_key("userapp:handover-reg")
             );
             server.abort();
+            readiness_server.abort();
             return;
         }
         let started = result.expect("handover startup must succeed (run exit 0 + verified owner)");
         assert_ne!(started.pid, 0, "首启走 spawn 路径（pid 为真实引导进程）");
+        assert!(
+            lock(&manager.processes)
+                .unwrap()
+                .get("userapp:handover-reg")
+                .unwrap()
+                .external_owner
+                .is_some()
+        );
 
         // R3 核心：重复 Start 不被死 run 的本地登记 guard 拒绝——登记已转换为
         // 外部 owner，复用链受理并提交 Restart。
@@ -1913,6 +2245,7 @@ mod owner_reuse_tests {
         assert_eq!(posted.len(), 1, "恰好一次复用 Restart 提交: {posted:?}");
         assert_eq!(posted[0].kind, shared_types::RuntimeOperationKind::Restart);
         server.abort();
+        readiness_server.abort();
     }
 }
 

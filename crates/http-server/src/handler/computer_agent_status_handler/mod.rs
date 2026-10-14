@@ -81,7 +81,7 @@ use shared_types::{ComputerAgentStatusRequest, ComputerAgentStatusResponse};
     tag = "computer",
     operation_id = "computer_agent_status",
     summary = "查询 Computer Agent 状态",
-    description = "查询指定 user_id + project_id 对应的 Computer Agent 是否已启动。通过主动调用子容器的 gRPC GetStatus 接口确认 Agent 真实状态。支持 userApp 分派：service_type=userapp + app_id 定位 UserappBuilder 开发容器，agent 会话仅 dev 阶段。"
+    description = "查询指定 user_id + project_id 对应的 Computer Agent 是否已启动。通过主动调用子容器的 gRPC GetStatus 接口确认 Agent 真实状态。UserApp 保留 project_id 的独立 agent 身份；显式 service_type=userapp + app_id 或现有 user_id/project_id/session_id 请求的持久绑定均可定位共享 UserappBuilder，agent 会话仅 dev 阶段。"
 )]
 #[instrument(skip(state))]
 pub async fn computer_agent_status(
@@ -102,7 +102,15 @@ pub async fn computer_agent_status(
         Ok(super::pod_handler::AppTarget::NotApp) => {}
         Ok(super::pod_handler::AppTarget::Dev(app_id)) => {
             info!("[COMPUTER_AGENT_STATUS] userApp dev dispatch: app_id={app_id}");
-            return status_userapp_dev(&state, locale, &app_id, &request).await;
+            let target = super::userapp_agent_target::resolve_agent_target(
+                &state,
+                request.user_id.as_deref(),
+                request.project_id.as_deref(),
+                request.session_id.as_deref(),
+                Some(&app_id),
+            )
+            .await?;
+            return status_userapp_dev(&state, locale, target, &request).await;
         }
         Ok(super::pod_handler::AppTarget::Prod(_)) => {
             return Ok(super::pod_handler::agent_prod_unsupported(locale));
@@ -140,6 +148,18 @@ pub async fn computer_agent_status(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
         ));
+    }
+
+    if let Some(target) = super::userapp_agent_target::resolve_agent_target(
+        &state,
+        request.user_id.as_deref(),
+        Some(project_id),
+        request.session_id.as_deref(),
+        None,
+    )
+    .await?
+    {
+        return status_userapp_dev(&state, locale, Some(target), &request).await;
     }
 
     // 用于日志输出的标识符（has_user_id / has_pod_id 已确保至少一个非空）
@@ -246,6 +266,7 @@ pub async fn computer_agent_status(
         container_ip: &container_info.container_ip,
         namespace: &state.config.app_manager.namespace,
         project_id,
+        session_id: request.session_id.as_deref(),
         max_retries: GRPC_MAX_RETRIES,
         locale,
         cluster_domain: &state.cluster_domain,
@@ -286,7 +307,10 @@ pub async fn computer_agent_status(
             user_id: request.user_id.clone(),
             project_id: project_id.to_string(),
             is_alive: true,
-            session_id: project_info.session_id().map(|s| s.to_string()),
+            session_id: request
+                .session_id
+                .clone()
+                .or_else(|| project_info.session_id().map(|s| s.to_string())),
             status: Some(grpc_response.status.clone()),
             last_activity: Some(project_info.last_activity()),
             created_at: Some(project_info.created_at()),

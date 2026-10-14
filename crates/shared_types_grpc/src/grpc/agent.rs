@@ -50,10 +50,12 @@ pub struct ChatRequest {
     #[prost(string, optional, tag = "14")]
     pub agent_work_dir: ::core::option::Option<::prost::alloc::string::String>,
     /// 🆕 UserApp 开发对话定位键（UserappBuilder 场景必填，缺失即拒绝；语义独立于
-    /// project_id——userapp 流程中 project_id 亦承载 app_id 值作会话映射键，本字段使
-    /// 工作目录定位键显式化。其他 service_type 不填）
+    /// project_id 承载会话执行身份，app_id 仅定位共享开发工作目录。其他 service_type 不填）
     #[prost(string, optional, tag = "15")]
     pub app_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// 内部创建意图：忽略旧会话提示，只替换本 project 的执行并创建全新 ACP session。
+    #[prost(bool, tag = "16")]
+    pub force_new_session: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChatResponse {
@@ -225,6 +227,9 @@ pub struct StopAgentRequest {
     /// 是否强制停止（不等待当前任务完成）
     #[prost(bool, tag = "3")]
     pub force: bool,
+    /// 只停止仍匹配该 session 的 project 执行，防止延迟请求误停替代实例。
+    #[prost(string, optional, tag = "4")]
+    pub expected_session_id: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StopAgentResponse {

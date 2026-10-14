@@ -125,6 +125,7 @@ impl PgStore {
 
         let (inner, cleanup_rx) = ProjectAdapter::new(namespace, cluster_domain);
         let container_registration = project_store::load::load_all(&database, &inner).await?;
+        project_store::userapp_agent::validate_snapshot(&database).await?;
         let (ops_tx, ops_rx) = mpsc::unbounded_channel();
         let pending_ops = Arc::new(AtomicI64::new(0));
         let writer = PersistWriter::spawn(database.clone(), ops_rx, Arc::clone(&pending_ops));

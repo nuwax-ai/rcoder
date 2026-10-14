@@ -170,8 +170,15 @@ pub(super) async fn create_or_load_session(
     };
 
     // 3. 创建或加载会话
-    // 从配置获取超时值，默认 60 秒
-    let timeout_secs = start_config.acp_session_create_timeout_secs.unwrap_or(60);
+    // 包含停旧、命令解析、Initialize 和 Load→New 的同一总预算。
+    let timeout_secs = start_config
+        .acp_session_create_timeout_secs
+        .unwrap_or(shared_types::DEFAULT_ACP_SESSION_CREATE_TIMEOUT_SECS);
+    let deadline = start_config.session_create_deadline.unwrap_or_else(|| {
+        tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs)
+    });
+    let available = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let recovery_pause = tokio::time::Duration::from_millis(500).min(available.div_f64(4.0));
     info!(
         "[SACP] Step 3/4: Creating/loading session, project_id={}, timeout={}s, has_resume={}",
         project_id,
@@ -194,14 +201,12 @@ pub(super) async fn create_or_load_session(
 
         debug!("load_session_request: {:?}", load_request);
 
+        // LoadSession 只是恢复尝试，需要在总创建预算内为 NewSession 留下时间。
+        let load_timeout = available.saturating_sub(recovery_pause).div_f64(2.0);
         let load_outcome = {
             let _resuming_guard =
                 crate::launcher::claude_code_sacp::connection::ResumingGuard::new(resuming.clone());
-            tokio::time::timeout(
-                tokio::time::Duration::from_secs(timeout_secs),
-                cx.send_request(load_request).block_task(),
-            )
-            .await
+            tokio::time::timeout(load_timeout, cx.send_request(load_request).block_task()).await
         };
         match load_outcome {
             Ok(Ok(response)) => {
@@ -232,7 +237,7 @@ pub(super) async fn create_or_load_session(
                     );
                 }
                 // 等待一小段时间让 agent 有机会清理
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(recovery_pause).await;
 
                 let new_request = NewSessionRequest::new(project_path.clone())
                     .mcp_servers(mcp_servers.clone())
@@ -241,11 +246,8 @@ pub(super) async fn create_or_load_session(
                 debug!("new_session_request: {:?}", new_request);
 
                 // 🔥 尝试 NewSession，不要用 ? 操作符
-                match tokio::time::timeout(
-                    tokio::time::Duration::from_secs(timeout_secs),
-                    cx.send_request(new_request).block_task(),
-                )
-                .await
+                match tokio::time::timeout_at(deadline, cx.send_request(new_request).block_task())
+                    .await
                 {
                     Ok(Ok(response)) => Ok(SessionSetupOutcome {
                         session_id: response.session_id,
@@ -263,8 +265,8 @@ pub(super) async fn create_or_load_session(
             Err(_) => {
                 // LoadSession 超时，降级到 NewSessionRequest
                 warn!(
-                    "[SACP] LoadSession timeout ({}s), falling back to NewSession",
-                    timeout_secs
+                    "[SACP] LoadSession timeout ({:?}), falling back to NewSession",
+                    load_timeout
                 );
 
                 let cancel_notification =
@@ -276,7 +278,7 @@ pub(super) async fn create_or_load_session(
                     );
                 }
                 // 等待一小段时间让 agent 有机会清理
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(recovery_pause).await;
 
                 let new_request = NewSessionRequest::new(project_path.clone())
                     .mcp_servers(mcp_servers.clone())
@@ -285,11 +287,8 @@ pub(super) async fn create_or_load_session(
                 debug!("new_session_request: {:?}", new_request);
 
                 // 🔥 尝试 NewSession，不要用 ? 操作符
-                match tokio::time::timeout(
-                    tokio::time::Duration::from_secs(timeout_secs),
-                    cx.send_request(new_request).block_task(),
-                )
-                .await
+                match tokio::time::timeout_at(deadline, cx.send_request(new_request).block_task())
+                    .await
                 {
                     Ok(Ok(response)) => Ok(SessionSetupOutcome {
                         session_id: response.session_id,
@@ -314,12 +313,7 @@ pub(super) async fn create_or_load_session(
         debug!("new_session_request: {:?}", new_request);
 
         // 🔥 尝试 NewSession，不要用 ? 操作符
-        match tokio::time::timeout(
-            tokio::time::Duration::from_secs(timeout_secs),
-            cx.send_request(new_request).block_task(),
-        )
-        .await
-        {
+        match tokio::time::timeout_at(deadline, cx.send_request(new_request).block_task()).await {
             Ok(Ok(response)) => Ok(SessionSetupOutcome {
                 session_id: response.session_id,
                 config_options: None,

@@ -19,6 +19,8 @@ pub struct ChatHandlerInput {
     pub project_dir: PathBuf,
     /// 会话 ID（可选，用于复用会话）
     pub session_id: Option<String>,
+    /// 内部创建意图：不复用旧的 ACP session。
+    pub force_new_session: bool,
     /// 用户提示词
     pub prompt: String,
     /// 请求 ID（用于追踪）

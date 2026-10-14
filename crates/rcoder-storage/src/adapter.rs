@@ -88,6 +88,7 @@ pub struct ProjectAdapter {
     /// 消除跨 DashMap（projects ↔ containers）的 TOCTOU 竞态。
     /// `Arc<LockMap>` 保证 clone 后共享同一锁实例。
     project_locks: Arc<LockMap<String, ()>>,
+    pub(crate) userapp_agents: Arc<std::sync::Mutex<crate::userapp_agent::MemoryBindings>>,
 }
 
 impl ProjectAdapter {
@@ -112,6 +113,7 @@ impl ProjectAdapter {
             user_id_to_project_ids: DashMap::new(),
             pod_id_to_project_id: DashMap::new(),
             project_locks: Arc::new(LockMap::new()),
+            userapp_agents: Arc::new(std::sync::Mutex::new(Default::default())),
         };
         info!("[STORAGE] ProjectAdapter initialized (DashMap, RAII enabled)");
         (adapter, rx)

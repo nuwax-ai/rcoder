@@ -63,6 +63,8 @@
     "userapp_dev_idle_recycle_owner_recovery",
     "userapp_dev_new_endpoint_body_query_locate",
     "userapp_dev_owner_header_lazy_ensure",
+    "userapp_dev_parallel_agents_anthropic",
+    "userapp_dev_parallel_agents_openai",
     "userapp_dev_pg_reset_password",
     "userapp_dev_pod_identity_list_and_status",
     "userapp_dev_poll_storm_keeps_container",
@@ -98,7 +100,9 @@
   "k8s_lb": [
     "lb_cross_entry_cursor_reconnect",
     "lb_entry_rotation",
-    "lb_new_session_cross_entry"
+    "lb_new_session_cross_entry",
+    "lb_userapp_parallel_agents_anthropic",
+    "lb_userapp_parallel_agents_openai"
   ],
   "native_lifecycle_crash": [
     "native_terminal_release_crash_contract"

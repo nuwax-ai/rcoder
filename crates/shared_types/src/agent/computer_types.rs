@@ -13,17 +13,17 @@ use crate::{Attachment, ChatAgentConfig, ModelProviderConfig, ServiceType};
 ///
 /// 与标准 ChatRequest 的主要区别：
 /// - `user_id` 是必填字段（用于容器标识）
-/// - 一个 user_id 对应一个容器，容器内可以有多个 project_id 的 Agent 实例
+/// - Computer 容器按 user_id 定位；UserApp builder 按 app_id 定位。
+///   同一容器内的不同 project_id 对应独立 Agent 实例。
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
 pub struct ComputerChatRequest {
-    /// 用户 ID (必填) - 一个用户对应一个容器
+    /// 用户 ID（必填），用于会话归属；UserApp 容器和源码目录由 app_id 定位。
     #[schema(example = "user_123")]
     pub user_id: String,
 
-    /// 项目 ID (可选) - 一个容器内可以有多个项目
-    /// 若未提供，系统自动生成 UUID
-    /// 项目 ID（computer 路径语义：缺省自动生成；userApp 场景不读本字段
-    /// ——定位走 app_id）
+    /// Agent 会话身份（可选）；userApp 的不同 project_id 独立执行，
+    /// app_id 仅定位共享开发容器和工作目录。未提供时，若 session_id 归属
+    /// 可确认则沿用其会话身份，否则生成 UUID，并在本轮请求及内部重试中保持一致。
     #[schema(example = "proj_456")]
     pub project_id: Option<String>,
 
@@ -157,11 +157,19 @@ pub struct ComputerAgentStatusRequest {
     #[schema(example = "user_123")]
     pub user_id: Option<String>,
 
-    /// 项目 ID（必填）
+    /// 调用方会话/project ID（Computer 路径必填）。UserApp 控制保留此身份，
+    /// 按持久会话绑定定位共享 builder；app_id 不替代 agent 会话身份。
     #[garde(required, length(min = 1))]
     #[serde(default)]
     #[schema(example = "project_456")]
     pub project_id: Option<String>,
+
+    /// Optional exact session identity. Omitted queries the current project agent;
+    /// provided queries only that session and cannot report a replacement as alive.
+    #[garde(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "session_789")]
+    pub session_id: Option<String>,
 
     /// Pod ID，用于共享容器模式下的容器定位（可与 user_id 二选一）
     #[garde(skip)]
@@ -199,7 +207,7 @@ pub struct ComputerAgentStatusRequest {
     /// `app`（同义变体，均大小写不敏感）——与 app_id 搭配启用分派，定位
     /// UserappBuilder 开发容器，agent 会话仅存在于 dev 阶段。userApp 容器
     /// 类型由 app_stage 推导（dev=UserappBuilder / prod=Userapp），**勿传
-    /// `user-app-builder`**。不传时走既有 computer 路径
+    /// `user-app-builder`**。省略时先按会话绑定识别 UserApp，未绑定再走既有 Computer 路径
     #[garde(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "userapp")]
@@ -280,7 +288,8 @@ pub struct ComputerAgentStopRequest {
     #[schema(example = "user_123")]
     pub user_id: Option<String>,
 
-    /// 项目 ID（必填）
+    /// 调用方会话/project ID（Computer 路径必填）。UserApp 按持久会话绑定
+    /// 控制独立 agent；app_id 只定位共享 builder，不替代此字段。
     #[garde(required, length(min = 1))]
     #[serde(default)]
     #[schema(example = "project_456")]
@@ -328,7 +337,7 @@ pub struct ComputerAgentStopRequest {
     /// `app`（同义变体，均大小写不敏感）——与 app_id 搭配启用分派，定位
     /// UserappBuilder 开发容器，agent 会话仅存在于 dev 阶段。userApp 容器
     /// 类型由 app_stage 推导（dev=UserappBuilder / prod=Userapp），**勿传
-    /// `user-app-builder`**。不传时走既有 computer 路径
+    /// `user-app-builder`**。省略时先按会话绑定识别 UserApp，未绑定再走既有 Computer 路径
     #[garde(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "userapp")]
@@ -384,8 +393,9 @@ pub struct ComputerAgentCancelRequest {
     #[schema(example = "user_123")]
     pub user_id: Option<String>,
 
-    /// 项目 ID（computer 路径必填，服务端校验非空；userApp 分派形态不读
-    /// 本字段——定位走 app_id）
+    /// 调用方会话/project ID（Computer 路径必填，服务端校验非空）。
+    /// UserApp 按会话绑定控制独立 agent，app_id 只定位共享 builder；
+    /// 不携带 app_id 的 user_id/project_id/session_id 请求也可由绑定解析。
     #[serde(default)]
     #[param(example = "project_456")]
     #[schema(example = "project_456")]
@@ -433,7 +443,7 @@ pub struct ComputerAgentCancelRequest {
     /// `app`（同义变体，均大小写不敏感）——与 app_id 搭配启用分派，定位
     /// UserappBuilder 开发容器，agent 会话仅存在于 dev 阶段。userApp 容器
     /// 类型由 app_stage 推导（dev=UserappBuilder / prod=Userapp），**勿传
-    /// `user-app-builder`**。不传时走既有 computer 路径
+    /// `user-app-builder`**。省略时先按会话绑定识别 UserApp，未绑定再走既有 Computer 路径
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[param(example = "userapp")]
     #[schema(example = "userapp")]
@@ -537,8 +547,8 @@ mod userapp_dispatch_tests {
 
     /// 契约钉住：agent 族接口（status/stop/cancel）的 userApp wire 形态 =
     /// service_type=userapp + app_id + app_stage（可缺省），
-    /// 对齐 /computer/chat 契约——不设独立 app_id 字段，Java 侧统一传
-    /// project_id。缺 service_type 时 app_stage 缺省字段也不影响既有形态。
+    /// app_id 定位共享 builder，project_id 保留独立会话身份；
+    /// Java 仅传 user_id/project_id 时也可由持久绑定定位。
     #[test]
     fn agent_requests_deserialize_userapp_wire_form() {
         let raw = r#"{"service_type":"userapp","app_id":"app-1","app_stage":"dev"}"#;

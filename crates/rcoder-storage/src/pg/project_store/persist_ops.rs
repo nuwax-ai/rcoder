@@ -182,6 +182,10 @@ impl ContainerSnapshot {
 #[derive(Debug, Clone)]
 pub enum PersistOp {
     // ===== 结构性（永不丢弃） =====
+    UserAppAgentMapping {
+        request_id: String,
+        command: Box<crate::userapp_agent::MappingCommand>,
+    },
     /// One queue item and one rollback boundary for the entire registration.
     RegisterProject {
         request_id: String,
@@ -277,6 +281,7 @@ impl PersistOp {
     /// 日志用的简短标签
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::UserAppAgentMapping { .. } => "userapp_agent_mapping",
             Self::RegisterProject { .. } => "register_project",
             #[cfg(test)]
             Self::UpsertContainer(_) => "upsert_container",

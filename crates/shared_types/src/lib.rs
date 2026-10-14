@@ -22,6 +22,8 @@ pub use container::{
 // project/session/container 映射存储契约（内存与 PG 双后端统一接口）
 pub mod project_store;
 pub use project_store::ProjectStore;
+pub mod userapp_agent;
+pub use userapp_agent::{UserAppAgentBinding, UserAppAgentSession};
 
 // Userapp 域（高内聚收拢于 userapp/ 模块）—— 活动追踪/唤醒 + 业务元数据 + build 进度事件 + 开发资源回收契约
 pub use userapp::activity::{

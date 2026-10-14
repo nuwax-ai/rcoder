@@ -42,6 +42,7 @@ const AGENT_READY_RETRY_BUFFER: Duration = Duration::from_secs(1);
 /// - [`ChatFlowExit::Response`]：业务校验/容器错误，按原语义以 `Ok(HttpResult::error...)`
 ///   形式返回客户端（HTTP 200 + 错误体）；
 /// - [`ChatFlowExit::Fatal`]：基础设施错误，按原语义以 `Err(AppError)` 向上传播。
+#[derive(Debug)]
 pub enum ChatFlowExit {
     /// 以业务错误响应提前结束（保持原 `Ok(HttpResult::...)` 语义）。
     /// 装箱：`HttpResult<ChatResponse>` 较大（>128B），Result 按 `?` 传播时按指针
@@ -98,6 +99,8 @@ pub struct ForwardChatOpts<'a> {
     pub re_resolve: Option<ReResolveCtx<'a>>,
     /// 连接失败时定位真实根因(OOM/CrashLoop/缺失)+ 智能等待 ready。None=不诊断(原行为)。
     pub diagnostic: Option<DiagnosticCtx<'a>>,
+    /// A dispatched write with an unknown response must not be replayed.
+    pub retry_chat_rpc: bool,
 }
 
 /// 统一的 chat gRPC 转发（带重试）
@@ -161,7 +164,7 @@ pub async fn forward_chat(
                 );
 
                 // ✅ 使用 GrpcError 的 should_retry 方法，无需 downcast_ref
-                let should_retry = grpc_err.should_retry();
+                let should_retry = opts.retry_chat_rpc && grpc_err.should_retry();
 
                 if should_retry && attempt < MAX_RETRIES {
                     // 🧠 智能等待:若诊断出容器启动中/OOM 重启,等 pod ready 再重试

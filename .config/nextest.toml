@@ -1,0 +1,8 @@
+# These HTTP protocol fixtures and readiness checks use agent gRPC port 50051.
+# Serialize only these test processes; unrelated tests retain normal concurrency.
+[test-groups.userapp-http-protocol]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = '(package(http-server) & (test(handler::userapp_agent_target::tests::) | test(handler::computer_chat_handler::userapp::tests::) | test(handler::computer_chat_handler::userapp::forward_protocol_tests::) | test(handler::agent_session_notification::tests::))) | (package(agent_runner) & (test(handler::health_handler::tests::ready_check_503_when_grpc_not_listening) | test(handler::health_handler::tests::ready_check_200_when_grpc_listening)))'
+test-group = 'userapp-http-protocol'

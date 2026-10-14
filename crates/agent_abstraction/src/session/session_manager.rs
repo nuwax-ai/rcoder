@@ -63,8 +63,18 @@ use crate::PromptMessage;
 use crate::diagnostics::DiagnosticsListener;
 use crate::launcher::ModelRuntimeEnvResolver;
 use crate::traits::{
-    PermissionRequestHandler, SessionNotifier, SessionRegistry, YoloPermissionRequestHandler,
+    AgentStartConfig, PermissionRequestHandler, SessionNotifier, SessionRegistry,
+    YoloPermissionRequestHandler,
 };
+
+/// 会话创建使用的运行配置。模型与其 UUID、agent 启动配置及 Fresh 策略一起传递。
+#[derive(Clone)]
+pub struct SessionCreationConfig {
+    pub model_provider: Option<shared_types::ModelProviderConfig>,
+    pub start_config: AgentStartConfig,
+    pub service_uuid: Option<String>,
+    pub force_new_session: bool,
+}
 
 /// ACP 会话管理器 (SACP 版本)
 ///

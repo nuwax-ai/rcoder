@@ -57,8 +57,15 @@ impl<R: SessionRegistry> StateAwareNotifier<R> {
     /// # 参数
     /// - `project_id`: 项目 ID
     /// - `status`: 新的 Agent 状态
-    fn update_agent_status(&self, project_id: &str, status: AgentStatus) {
-        self.registry.update_agent_status(project_id, status);
+    fn update_agent_status(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        request_id: Option<&str>,
+        status: AgentStatus,
+    ) {
+        self.registry
+            .update_agent_status_for_session(project_id, session_id, request_id, status);
         debug!(
             "🔄 [StateAwareNotifier] Requested status update for Project[{}] to {:?}",
             project_id, status
@@ -85,7 +92,12 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
         );
 
         // 1. 更新状态为 Active（在推送 SSE 之前）
-        self.update_agent_status(project_id, AgentStatus::Active);
+        self.update_agent_status(
+            project_id,
+            session_id,
+            request_id.as_deref(),
+            AgentStatus::Active,
+        );
 
         // 2. 推送 SSE 消息
         self.inner
@@ -112,6 +124,7 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
         );
 
         // 1. 推送 SSE 消息（在恢复状态之前）
+        let expected_request_id = request_id.clone();
         let result = self
             .inner
             .notify_prompt_end(
@@ -124,7 +137,12 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
             .await;
 
         // 2. 恢复状态为 Idle
-        self.update_agent_status(project_id, AgentStatus::Idle);
+        self.update_agent_status(
+            project_id,
+            session_id,
+            expected_request_id.as_deref(),
+            AgentStatus::Idle,
+        );
 
         result
     }
@@ -147,13 +165,19 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
         );
 
         // 1. 推送错误消息（在恢复状态之前）
+        let expected_request_id = request_id.clone();
         let result = self
             .inner
             .notify_prompt_error(project_id, session_id, error, request_id)
             .await;
 
         // 2. 恢复状态为 Idle
-        self.update_agent_status(project_id, AgentStatus::Idle);
+        self.update_agent_status(
+            project_id,
+            session_id,
+            expected_request_id.as_deref(),
+            AgentStatus::Idle,
+        );
 
         result
     }

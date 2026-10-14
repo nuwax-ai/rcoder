@@ -379,6 +379,9 @@ pub const GRPC_REQUEST_TIMEOUT_SECS: u64 = 300;
 /// 进度推送不依赖这个超时，走 SubscribeProgress 流（长连接，独立超时）。
 pub const GRPC_CHAT_TIMEOUT_SECS: u64 = 120;
 
+/// ACP 创建的总预算：替代旧执行、初始化、历史恢复及新会话均共享该 deadline。
+pub const DEFAULT_ACP_SESSION_CREATE_TIMEOUT_SECS: u64 = 100;
+
 /// CancelSession 请求超时（秒）
 ///
 /// 取消会话应该是快速操作（仅发送取消信号），10 秒足够

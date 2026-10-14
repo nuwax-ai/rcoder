@@ -52,6 +52,8 @@ pub struct GrpcChatParams {
     pub agent_work_dir: Option<String>,
     /// UserApp 开发对话定位键（仅 UserappBuilder 场景填充；语义独立于 project_id）
     pub app_id: Option<String>,
+    /// Explicitly replace this project's session after an unusable resume hint.
+    pub force_new_session: bool,
 }
 
 /// 通过 gRPC 发送 Chat 请求到 agent_runner (使用连接池)
@@ -122,9 +124,16 @@ pub async fn grpc_chat_with_pool(
         is_devcomputer: params.is_devcomputer, // 🆕 传递 is_devcomputer
         agent_work_dir: params.agent_work_dir, // 🆕 传递 agent_work_dir
         app_id: params.app_id,                 // 🆕 UserappBuilder 定位键
+        force_new_session: params.force_new_session,
     };
 
-    debug!("[gRPC_CHAT] sendrequest: {:?}", grpc_request);
+    debug!(
+        project_id = %grpc_request.project_id,
+        session_id = %grpc_request.session_id,
+        prompt_len = grpc_request.prompt.len(),
+        force_new_session = grpc_request.force_new_session,
+        "[gRPC_CHAT] request prepared"
+    );
 
     // 构建 tonic Request（locale + 可选请求级超时）
     let request = locale_request_opt_timeout(grpc_request, params.request_timeout);
@@ -272,6 +281,28 @@ pub async fn grpc_stop_agent_with_pool(
     force: bool,
     request_timeout: Option<std::time::Duration>,
 ) -> Result<shared_types::grpc::StopAgentResponse, GrpcError> {
+    grpc_stop_agent_with_pool_and_session(
+        pool,
+        grpc_addr,
+        project_id,
+        reason,
+        force,
+        None,
+        request_timeout,
+    )
+    .await
+}
+
+/// Stop only the captured session when the caller supplies a session identity.
+pub async fn grpc_stop_agent_with_pool_and_session(
+    pool: &Arc<GrpcChannelPool>,
+    grpc_addr: &str,
+    project_id: String,
+    reason: Option<String>,
+    force: bool,
+    expected_session_id: Option<String>,
+    request_timeout: Option<std::time::Duration>,
+) -> Result<shared_types::grpc::StopAgentResponse, GrpcError> {
     info!(
         "[gRPC_STOP_AGENT] Sending stop Agent request (connection pool): addr={}, project_id={}, force={}",
         grpc_addr, project_id, force
@@ -285,6 +316,7 @@ pub async fn grpc_stop_agent_with_pool(
         project_id: project_id.clone(),
         reason,
         force,
+        expected_session_id,
     };
 
     debug!("[gRPC_STOP_AGENT] sendrequest: {:?}", grpc_request);

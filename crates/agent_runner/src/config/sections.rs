@@ -83,7 +83,7 @@ pub struct GrpcTimeoutConfig {
     #[serde(default = "default_cancel_timeout")]
     pub cancel_session_timeout_secs: u64,
 
-    /// ACP session creation timeout (seconds), default 100
+    /// ACP 总创建预算（秒，默认 100）：停止旧执行、初始化、恢复/新建共享 deadline。
     #[serde(default = "default_acp_session_timeout")]
     pub acp_session_create_timeout_secs: u64,
 
@@ -223,7 +223,7 @@ fn default_cancel_timeout() -> u64 {
 }
 
 fn default_acp_session_timeout() -> u64 {
-    100 // 100 秒
+    shared_types::DEFAULT_ACP_SESSION_CREATE_TIMEOUT_SECS
 }
 
 fn default_agent_cancel_timeout() -> u64 {

@@ -78,13 +78,22 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         project_id: String,
         project_path: PathBuf,
         model_provider: Option<ModelProviderConfig>,
-        start_config: AgentStartConfig,
+        mut start_config: AgentStartConfig,
         _registry: Arc<R>,
         service_uuid: Option<String>,
     ) -> Result<SacpLauncherConnectionInfo>
     where
         R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
     {
+        let session_create_timeout_secs = start_config
+            .acp_session_create_timeout_secs
+            .unwrap_or(shared_types::DEFAULT_ACP_SESSION_CREATE_TIMEOUT_SECS);
+        let creation_deadline = start_config.session_create_deadline.unwrap_or_else(|| {
+            tokio::time::Instant::now()
+                + std::time::Duration::from_secs(session_create_timeout_secs)
+        });
+        start_config.session_create_deadline = Some(creation_deadline);
+        let startup_transition = start_config.startup_transition.take();
         info!(
             "[SACP] LAUNCH FUNCTION CALLED: project_id={}, has_agent_server_override={}, has_model_provider={}, service_uuid={:?}",
             project_id,
@@ -95,13 +104,19 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
 
         // 解析 Agent 命令与基础环境（模型环境解析、agent_server 覆盖合并、
         // {PREFIX_WORKSPACE_DIR} 占位符渲染）
-        let resolved_command = resolve_agent_command(
-            self.model_env_resolver.as_ref(),
-            model_provider.as_ref(),
-            &start_config,
-            service_uuid.as_deref(),
+        let resolved_command = tokio::time::timeout_at(
+            creation_deadline,
+            resolve_agent_command(
+                self.model_env_resolver.as_ref(),
+                model_provider.as_ref(),
+                &start_config,
+                service_uuid.as_deref(),
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("agent command resolution deadline exceeded for project {project_id}")
+        })??;
 
         // 创建通道（使用有界通道防止 OOM）
         // 容量由常量定义，足够处理突发请求，同时提供背压保护
@@ -152,6 +167,9 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         );
 
         // 构建并启动子进程（平台 cfg 分支集中于 launch_spawn）
+        if tokio::time::Instant::now() >= creation_deadline {
+            anyhow::bail!("agent startup deadline exceeded before spawn for project {project_id}");
+        }
         let spawned = spawn_agent_process(
             &finalized_env.command_path,
             &finalized_env.command_args,
@@ -219,10 +237,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         let spawn_project_id = project_id.clone();
         let spawn_command_line = finalized_env.full_command_line.clone();
         let diagnostics_listener_for_task = self.diagnostics_listener.clone();
-        // 🔥 提前取出 session 创建超时：start_config 随即被 move 进 spawn task，之后不可读。
-        // 值来自 AgentStartConfig（由 GrpcTimeoutConfig.acp_session_create_timeout_secs 注入），默认 60s。
-        let session_create_timeout_secs =
-            start_config.acp_session_create_timeout_secs.unwrap_or(60);
+        // start_config 的绝对 deadline 与 waiter 共享，初始化和恢复不各自重开预算。
         let connection_task_handle = rcoder_obs::spawn(async move {
             info!(
                 "[SACP] Spawned ACP connection task, project_id={}",
@@ -314,27 +329,11 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             }
         });
 
-        // 等待会话 ID（超时取自 start_config / GrpcTimeoutConfig，默认 60s），同时监听连接失败
-        let session_id = wait_for_session_id(
-            &project_id,
-            session_create_timeout_secs,
-            session_id_rx,
-            connection_failed_rx,
-            &connection_task_handle,
-            &stderr_output_shared,
-            &connection_error_shared,
-            &finalized_env.full_command_line,
-            child_pid,
-        )
-        .await?;
-
-        // stderr 任务已在子进程启动后立即创建（stderr_task_handle），无需重复创建
-
         // 创建生命周期守卫（带异常退出标志 + 诊断监听器）
-        let lifecycle_guard = AgentLifecycleGuard::new_claude_full(
+        let mut lifecycle_guard = AgentLifecycleGuard::new_claude_full(
             crate::launcher::lifecycle::ClaudeProcessParams {
                 project_id: project_id.clone(),
-                session_id: session_id.clone(),
+                session_id: SessionId::from("initializing"),
                 child_process: spawned.child,
                 stderr_task: stderr_task_handle,
                 cancel_token: cancel_token.clone(),
@@ -349,6 +348,39 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 working_dir: project_path,
             },
         )?;
+
+        let startup_completed = startup_transition
+            .map(|transition| lifecycle_guard.retain_startup_transition(transition));
+
+        // 同一绝对 deadline 等待会话 ID，同时监听连接失败。
+        let session_id = wait_for_session_id(
+            &project_id,
+            session_create_timeout_secs,
+            session_id_rx,
+            connection_failed_rx,
+            &connection_task_handle,
+            &stderr_output_shared,
+            &connection_error_shared,
+            &finalized_env.full_command_line,
+            child_pid,
+            creation_deadline,
+        )
+        .await;
+        let session_id = match session_id {
+            Ok(session_id) => session_id,
+            Err(error) => {
+                lifecycle_guard.graceful_stop().await.map_err(|stop_error| {
+                    anyhow::anyhow!("ACP initialization failed ({error}); child exit unconfirmed: {stop_error}")
+                })?;
+                return Err(error);
+            }
+        };
+        lifecycle_guard.set_session_id(session_id.clone())?;
+        if let Some(completed) = startup_completed {
+            let _ = completed.send(());
+        }
+
+        // stderr 任务已在子进程启动后立即创建（stderr_task_handle），无需重复创建
 
         Ok(SacpLauncherConnectionInfo {
             session_id,

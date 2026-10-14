@@ -109,6 +109,7 @@ type SessionMessageSender = mpsc::Sender<(u64, UnifiedSessionMessage)>;
 struct ConnectionState {
     sender: SessionMessageSender,
     cancel: CancellationToken,
+    terminal: tokio::sync::watch::Sender<Option<UnifiedSessionMessage>>,
 }
 
 /// 并发订阅者注册表（P2-M2 多订阅者改造）。
@@ -322,6 +323,23 @@ impl SessionData {
         mpsc::Receiver<(u64, UnifiedSessionMessage)>,
         CancellationToken,
     )> {
+        let subscription = self
+            .create_new_connection_with_terminal(buffer_size, from_seq)
+            .await?;
+        Ok((
+            subscription.conn_id,
+            subscription.replay_messages,
+            subscription.rx,
+            subscription.token,
+        ))
+    }
+
+    /// 内部 gRPC 订阅使用独立的关闭回执；新连接不继承旧连接的终态。
+    pub(crate) async fn create_new_connection_with_terminal(
+        &self,
+        buffer_size: usize,
+        from_seq: u64,
+    ) -> Result<worker::SubscribeResult> {
         // 原子化订阅：快照与 sender 注册在 worker 单线程内完成（SessionCommand::Subscribe），
         // 消除旧实现「先注册后快照」窗口内消息既进 ring 又进 sender 的双路投递
         // （gRPC 流重复 → rcoder ring 重复条目 → 无游标重连吐给客户端的根因）。
@@ -344,7 +362,7 @@ impl SessionData {
         )
         .await
         {
-            Ok(Ok(r)) => Ok((r.conn_id, r.replay_messages, r.rx, r.token)),
+            Ok(Ok(r)) => Ok(r),
             Ok(Err(_)) => anyhow::bail!("worker dropped subscribe ack"),
             Err(_) => anyhow::bail!("subscribe ack timeout ({WORKER_REPLY_TIMEOUT_SECS}s)"),
         }
@@ -370,7 +388,25 @@ impl SessionData {
     /// Enqueue reliably. Dropping this future before admission cancels the send.
     pub async fn push_message(&self, message: UnifiedSessionMessage) -> Result<()> {
         self.command_tx
-            .send(SessionCommand::Push { message })
+            .send(SessionCommand::Push {
+                message,
+                connection_ids: None,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("session worker has exited"))
+    }
+
+    /// 控制终态保留正常 seq/ring 语义，但不投递给受理后建立的新连接。
+    pub(crate) async fn push_captured_terminal(
+        &self,
+        message: UnifiedSessionMessage,
+        connection_ids: &[u64],
+    ) -> Result<()> {
+        self.command_tx
+            .send(SessionCommand::Push {
+                message,
+                connection_ids: Some(connection_ids.to_vec()),
+            })
             .await
             .map_err(|_| anyhow::anyhow!("session worker has exited"))
     }
@@ -413,6 +449,21 @@ impl SessionData {
         self.connections.clear();
         if count > 0 {
             info!("[SessionData] Closed all {count} SSE subscriber connection(s)");
+        }
+    }
+
+    /// 控制请求受理时捕获的订阅集合；不持有 guard 跨 await。
+    pub(crate) fn capture_connection_ids(&self) -> Vec<u64> {
+        self.connections.iter().map(|entry| *entry.key()).collect()
+    }
+
+    /// 仅关闭受理时已有连接。先存终态回执，再触发该连接的取消 token。
+    pub(crate) fn close_captured_connections(&self, ids: &[u64], terminal: &UnifiedSessionMessage) {
+        for id in ids {
+            if let Some((_, connection)) = self.connections.remove(id) {
+                connection.terminal.send_replace(Some(terminal.clone()));
+                connection.cancel.cancel();
+            }
         }
     }
 }

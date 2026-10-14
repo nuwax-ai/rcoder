@@ -28,6 +28,7 @@ pub(super) async fn finalize_response(
         was_reloaded,
         ..
     } = preparation;
+    let expected_uuid = agent_request.service_uuid.clone();
     // ========== 步骤9: 等待响应（5 分钟超时）==========
     match tokio::time::timeout(
         Duration::from_secs(300),
@@ -70,8 +71,13 @@ pub(super) async fn finalize_response(
             // PendingGuard 自动清理（在 drop 时）
             error!("[ChatHandler] Agent session processing failed: {}", e);
             // 回滚 step7 写入的 API key 配置，避免失败累积泄漏（DashMap::remove 幂等）
-            if let Some((_, uuid)) = context.project_uuid_map.remove(&project_id) {
-                context.shared_api_key_manager.remove(&uuid);
+            if let Some(uuid) = expected_uuid.as_ref()
+                && context
+                    .project_uuid_map
+                    .remove_if(&project_id, |_, current| current == uuid)
+                    .is_some()
+            {
+                context.shared_api_key_manager.remove(uuid);
             }
             ChatHandlerOutput::error(
                 project_id,
@@ -91,8 +97,13 @@ pub(super) async fn finalize_response(
                 project_id
             );
             // 回滚 step7 写入的 API key 配置，避免失败累积泄漏（DashMap::remove 幂等）
-            if let Some((_, uuid)) = context.project_uuid_map.remove(&project_id) {
-                context.shared_api_key_manager.remove(&uuid);
+            if let Some(uuid) = expected_uuid.as_ref()
+                && context
+                    .project_uuid_map
+                    .remove_if(&project_id, |_, current| current == uuid)
+                    .is_some()
+            {
+                context.shared_api_key_manager.remove(uuid);
             }
             ChatHandlerOutput::error(
                 project_id,

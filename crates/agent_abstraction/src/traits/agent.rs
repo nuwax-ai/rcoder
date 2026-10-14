@@ -47,9 +47,15 @@ pub struct AgentStartConfig {
 
     /// 🆕 ACP session creation timeout (seconds), default 100
     ///
-    /// Maximum wait time for Agent to create a new session
-    /// (may require more time when there are many MCP tools)
+    /// 总创建预算，覆盖旧执行退出、初始化、LoadSession 与 NewSession。
+    /// Load 恢复尝试在剩余预算内为清理和 NewSession 预留份额。
     pub acp_session_create_timeout_secs: Option<u64>,
+
+    /// 内部绝对 deadline；由创建 leader 设置，不能经 ACP meta/wire 传给 agent。
+    pub session_create_deadline: Option<tokio::time::Instant>,
+
+    /// 内部启动转换租约；启动 future 取消时保留到真实 reaper 完成。
+    pub startup_transition: Option<std::sync::Arc<crate::session::ExecutionTransitionGuard>>,
 
     /// 🆕 Agent cancel call timeout (seconds), default 10
     ///
@@ -83,6 +89,8 @@ impl AgentStartConfig {
             resume_session_id: None,
             agent_server_override: None,
             acp_session_create_timeout_secs: None,
+            session_create_deadline: None,
+            startup_transition: None,
             agent_cancel_timeout_secs: None,
             tool_approval_rules: None,
             is_devcomputer: false,
@@ -336,6 +344,9 @@ pub struct PromptMessage {
     /// Session ID (optional, if None the Agent will create a new session)
     pub session_id: Option<String>,
 
+    /// 内部创建意图：仅替换本 project 的执行，创建全新会话。
+    pub force_new_session: bool,
+
     /// Request tracking ID
     pub request_id: String,
 
@@ -389,6 +400,7 @@ impl PromptMessage {
             project_id,
             project_path,
             session_id: None,
+            force_new_session: false,
             request_id,
             attachments: Vec::new(),
             data_source_attachments: Vec::new(),
@@ -465,6 +477,7 @@ impl From<shared_types::ChatPrompt> for PromptMessage {
             project_id: chat_prompt.project_id,
             project_path: chat_prompt.project_path,
             session_id: chat_prompt.session_id,
+            force_new_session: chat_prompt.force_new_session,
             request_id: chat_prompt.request_id.unwrap_or_else(|| {
                 // Generate one if ChatPrompt doesn't have request_id
                 uuid::Uuid::new_v4().to_string().replace("-", "")

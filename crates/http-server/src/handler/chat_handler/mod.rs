@@ -288,6 +288,7 @@ async fn forward_request_to_container_service(
         ctx.grpc_pool,
         grpc_addr,
         || grpc::GrpcChatParams {
+            force_new_session: false,
             project_id: project_id.clone(),
             session_id: request.session_id.clone(),
             prompt: request.prompt.clone(),
@@ -309,6 +310,7 @@ async fn forward_request_to_container_service(
         },
         ctx.locale,
         handler::chat_forward::ForwardChatOpts {
+            retry_chat_rpc: true,
             log_tag: "FORWARD",
             retry_delay: None,
             re_resolve: Some(handler::chat_forward::ReResolveCtx {

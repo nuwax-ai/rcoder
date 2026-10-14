@@ -14,7 +14,10 @@ use anyhow::Result;
 use shared_types::{ProjectAndAgentInfo, SessionEntry};
 use tracing::{debug, error, info, warn};
 
-use super::{AcpSessionManager, AgentWorker, SessionHandles, WorkerRequest, WorkerResponse};
+use super::{
+    AcpSessionManager, AgentWorker, SessionCreationConfig, SessionHandles, WorkerRequest,
+    WorkerResponse,
+};
 use crate::launcher::convert_context_servers;
 use crate::traits::{AgentStartConfig, SessionNotifier, SessionRegistry};
 
@@ -182,7 +185,9 @@ where
         // - Agent 层面统一处理，无需本地检查文件
         // - 与 Agent 行为保持一致
         // - 自动降级（有会话就恢复，没有就创建）
-        if let Some(ref session_id) = request.prompt_message.session_id {
+        if !request.prompt_message.force_new_session
+            && let Some(ref session_id) = request.prompt_message.session_id
+        {
             info!("Setting resume_session_id: {}", session_id);
             start_config = start_config.with_resume_session_id(session_id.clone());
         }
@@ -199,6 +204,11 @@ where
         // 重走的 get_or_create_session 会检测死通道触发重建。
         let mut session_entry = None;
         let mut is_new = false;
+        // 投递前的两次创建共用绝对 deadline，死通道重试不能重新获得整段预算。
+        start_config.session_create_deadline = Some(
+            tokio::time::Instant::now()
+                + std::time::Duration::from_secs(self.acp_session_create_timeout_secs),
+        );
         for attempt in 1..=2 {
             let (entry, new) = self
                 .session_manager
@@ -206,9 +216,12 @@ where
                     &project_id,
                     normalized_path.clone(),
                     prompt_message.session_id.clone(),
-                    request.model_provider.clone(),
-                    start_config.clone(),
-                    request.service_uuid.clone(),
+                    SessionCreationConfig {
+                        model_provider: request.model_provider.clone(),
+                        start_config: start_config.clone(),
+                        service_uuid: request.service_uuid.clone(),
+                        force_new_session: prompt_message.force_new_session,
+                    },
                 )
                 .await
                 .map_err(|e| {

@@ -30,8 +30,9 @@ pub async fn get_status(
 
         let project_id = if !req.session_id.is_empty() {
             AGENT_REGISTRY.get_project_by_session(&req.session_id)
+                .filter(|owner| req.project_id.is_empty() || *owner == req.project_id)
         } else if !req.project_id.is_empty() {
-            Some(req.project_id)
+            Some(req.project_id.clone())
         } else {
             info!("[gRPC] GetStatus: all parameters are empty, returning not_found");
             return Ok(Response::new(GetStatusResponse {
@@ -42,7 +43,8 @@ pub async fn get_status(
         };
 
         let (status_str, is_found) = if let Some(ref pid) = project_id {
-            if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(pid) {
+            if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(pid)
+                .filter(|info| req.session_id.is_empty() || info.session_id.to_string() == req.session_id) {
                 let status_str = match agent_info.status {
                     AgentStatus::Pending => "busy",
                     AgentStatus::Active => "busy",
@@ -73,7 +75,7 @@ pub async fn get_status(
         );
 
         // session 的 stream epoch(供 rcoder 判断 seq epoch 是否变化,#15)。
-        let stream_epoch = if !req.session_id.is_empty() {
+        let stream_epoch = if is_found && !req.session_id.is_empty() {
             crate::service::SESSION_CACHE.view(&req.session_id, |_, d| d.epoch().to_string())
         } else {
             None

@@ -95,6 +95,46 @@ impl ProjectAdapter {
         true
     }
 
+    /// Append routing to the exact captured builder generation without replacing
+    /// its metadata or physical container. All project mutation occurs in one entry.
+    pub(crate) fn add_userapp_session_if_generation(
+        &self,
+        app_id: &str,
+        expected_generation: &str,
+        session_id: &str,
+        session_generation: &str,
+    ) -> anyhow::Result<bool> {
+        let key = match self.projects.entry(app_id.to_owned()) {
+            Entry::Occupied(mut entry) => {
+                let current = entry.get();
+                if current.persistence_identity().generation != expected_generation
+                    || current.service_type() != Some(shared_types::ServiceType::UserappBuilder)
+                {
+                    return Ok(false);
+                }
+                anyhow::ensure!(
+                    current
+                        .persistence_identity()
+                        .sessions
+                        .get(session_id)
+                        .is_none_or(|generation| generation == session_generation),
+                    "Physical UserApp SID already has another generation"
+                );
+                let info = Arc::make_mut(entry.get_mut());
+                info.restore_session_identity(session_id, session_generation.to_owned());
+                info.add_session(session_id);
+                container_entry_key(info)
+            }
+            Entry::Vacant(_) => return Ok(false),
+        };
+        // The project guard has ended before touching the reverse/container maps.
+        self.session_index
+            .insert(session_id.to_owned(), (key.clone(), app_id.to_owned()));
+        self.containers
+            .view(&key, |_, entry| entry.update_activity());
+        Ok(true)
+    }
+
     /// 恢复专用变体（boot 加载 / 回源 hydrate）：session 集合与索引登记语义
     /// 与 [`Self::add_session_to_project`] 一致，但不刷新 `last_activity` 与
     /// 容器活跃——恢复动作不代表用户活跃，时间戳以持久化行为准。
@@ -210,6 +250,34 @@ impl ProjectAdapter {
                 "[STORAGE] cleared one session: project_id={}, sid={}, from_index={}, from_project={}",
                 project_id, session_id, was_in_index, removed_from_project
             );
+        }
+        removed
+    }
+
+    /// A delayed logical cleanup cannot clear a later physical SID generation.
+    pub(crate) fn clear_session_one_if_generation(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        generation: &str,
+    ) -> bool {
+        let _project_guard = self.project_locks.entry_by_ref(project_id);
+        let removed = match self.projects.entry(project_id.to_owned()) {
+            Entry::Occupied(mut entry)
+                if entry
+                    .get()
+                    .persistence_identity()
+                    .sessions
+                    .get(session_id)
+                    .is_some_and(|current| current == generation) =>
+            {
+                Arc::make_mut(entry.get_mut()).remove_session(session_id)
+            }
+            _ => false,
+        };
+        if removed {
+            self.session_index
+                .remove_if(session_id, |_, (_, owner)| owner == project_id);
         }
         removed
     }

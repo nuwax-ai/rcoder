@@ -54,24 +54,6 @@ fn rcoder_container(
         })
 }
 
-/// userApp dev 分派的容器定位：app_id 即 project 映射键（UserappBuilder
-/// 容器注册于 `state.projects[app_id]`），与 `rcoder_container` 的映射定位
-/// 同源、但键直接取分派解析出的 app_id（不依赖 body 的 project_id 字段）。
-fn rcoder_container_for_app(
-    state: &AppState,
-    app_id: &str,
-) -> Result<ContainerBasicInfo, AppError> {
-    state
-        .get_project(app_id)
-        .and_then(|info| info.container_info())
-        .ok_or_else(|| {
-            AppError::with_message(
-                shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
-                "container not found for app_id",
-            )
-        })
-}
-
 fn computer_container(
     state: &AppState,
     input: &ResolvePermissionRequestDto,
@@ -160,6 +142,28 @@ async fn forward_permission_resolution(
             success: false,
         }))
     }
+}
+
+async fn forward_userapp_permission_resolution(
+    state: &AppState,
+    target: Option<super::userapp_agent_target::UserAppAgentTarget>,
+    mut input: ResolvePermissionRequestDto,
+    locale: &'static str,
+) -> Result<Json<HttpResult<ResolvePermissionResponseDto>>, AppError> {
+    let Some(target) = target else {
+        return Err(AppError::with_message(
+            shared_types::error_codes::ERR_PERMISSION_NOT_FOUND,
+            "UserApp agent session not found",
+        ));
+    };
+    let Some(container) = target.container_info else {
+        return Err(AppError::with_message(
+            shared_types::error_codes::ERR_PERMISSION_NOT_FOUND,
+            "UserApp agent session not found",
+        ));
+    };
+    input.project_id = Some(target.binding.project_id);
+    forward_permission_resolution(state, container, input, locale).await
 }
 
 /// 处理 RCoder project 容器的权限审批结果。
@@ -326,7 +330,7 @@ pub async fn agent_notify_resolved(
     tag = "computer",
     operation_id = "computer_notify_resolved",
     summary = "处理 Computer Agent 权限审批结果",
-    description = "将用户权限审批结果转发到 Computer Agent 容器内的 agent_runner 服务。支持 userApp 分派：service_type=userapp + app_id 定位 UserappBuilder 开发容器，agent 会话仅 dev 阶段。"
+    description = "将用户权限审批结果转发到 Computer Agent 容器内的 agent_runner 服务。UserApp 保留 project_id 的独立 agent 身份；显式 service_type=userapp + app_id 或现有 user_id/project_id/session_id 请求的持久绑定均可定位共享 UserappBuilder，agent 会话仅 dev 阶段。"
 )]
 pub async fn computer_notify_resolved(
     State(state): State<Arc<AppState>>,
@@ -338,8 +342,8 @@ pub async fn computer_notify_resolved(
     validate_common(&dto)?;
 
     // 0. userApp 分派（service_type=userapp + app_id；agent 会话仅存在于
-    //    dev 的 UserappBuilder）。定位 = project 映射优先（app_id 即映射键，
-    //    与 builder 容器注册同源）；此形态下 user_id/pod_id/project_id 不再必填
+    //    dev 的 UserappBuilder）。持久绑定保留独立 agent project；app_id
+    //    只定位共享 builder，省略 project 时由所属 session 反查。
     match super::pod_handler::parse_app_target(
         input.app_id.as_deref(),
         input.app_stage.as_deref(),
@@ -351,8 +355,15 @@ pub async fn computer_notify_resolved(
                 "[PERMISSION] userApp dev dispatch: app_id={}, session_id={}",
                 app_id, dto.session_id
             );
-            let container = rcoder_container_for_app(&state, &app_id)?;
-            return forward_permission_resolution(&state, container, dto, locale).await;
+            let target = super::userapp_agent_target::resolve_agent_target(
+                &state,
+                dto.user_id.as_deref(),
+                dto.project_id.as_deref(),
+                Some(&dto.session_id),
+                Some(&app_id),
+            )
+            .await?;
+            return forward_userapp_permission_resolution(&state, target, dto, locale).await;
         }
         Ok(super::pod_handler::AppTarget::Prod(_)) => {
             return Ok(Json(super::pod_handler::agent_prod_unsupported(locale)));
@@ -377,6 +388,17 @@ pub async fn computer_notify_resolved(
             shared_types::error_codes::ERR_VALIDATION,
             "user_id or pod_id is required",
         ));
+    }
+    if let Some(target) = super::userapp_agent_target::resolve_agent_target(
+        &state,
+        dto.user_id.as_deref(),
+        dto.project_id.as_deref(),
+        Some(&dto.session_id),
+        None,
+    )
+    .await?
+    {
+        return forward_userapp_permission_resolution(&state, Some(target), dto, locale).await;
     }
     let container = computer_container(&state, &dto)?;
     forward_permission_resolution(&state, container, dto, locale).await

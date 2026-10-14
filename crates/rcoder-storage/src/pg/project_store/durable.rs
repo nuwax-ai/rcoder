@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Dropping a cancelled durable request queues its immutable registered operations.
-struct PendingWrite<'a> {
+pub(super) struct PendingWrite<'a> {
     store: &'a PgStore,
     ops: Option<Vec<PersistOp>>,
 }
@@ -32,7 +32,7 @@ impl Drop for PendingWrite<'_> {
 }
 
 impl PgStore {
-    fn register_durable(&self, ops: Vec<PersistOp>) -> PendingWrite<'_> {
+    pub(super) fn register_durable(&self, ops: Vec<PersistOp>) -> PendingWrite<'_> {
         for op in &ops {
             self.register_container_intent(op);
         }
@@ -314,7 +314,7 @@ impl PgStore {
         result
     }
 
-    async fn execute_durable(
+    pub(super) async fn execute_durable(
         &self,
         mut registered: PendingWrite<'_>,
         name: &str,

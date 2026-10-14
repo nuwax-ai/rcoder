@@ -699,11 +699,23 @@ impl AgentContainerRuntime for DockerRuntime {
         project_id: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
-        let result = self
-            .inner
-            .find_project_container(project_id, service_type)
-            .await
-            .map_err(|e| ContainerRuntimeError::ConnectionError(e.to_string()))?;
+        // UserAppBuilder discovery feeds lifecycle verification and lazy ensure.
+        // An actor/Moka snapshot can still say Running after its physical container
+        // disappeared. Read Docker here; ownership remains checked by the existing
+        // bound-capture and lifecycle gates before any routing or compute write.
+        let result = if *service_type == ServiceType::UserappBuilder {
+            let name = crate::utils::DockerUtils::generate_container_name(
+                service_type.container_prefix(),
+                project_id,
+            )
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+            self.inner.find_container_authoritative(&name).await
+        } else {
+            self.inner
+                .find_project_container(project_id, service_type)
+                .await
+        }
+        .map_err(|e| ContainerRuntimeError::ConnectionError(e.to_string()))?;
 
         Ok(result.map(|r| {
             // Docker find 按类型化精确名查询——入参即创建时的派生主键
@@ -903,3 +915,7 @@ impl AgentContainerRuntime for DockerRuntime {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "agent_runtime_tests.rs"]
+mod tests;

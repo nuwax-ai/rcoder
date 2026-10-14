@@ -351,7 +351,9 @@ impl AgentSessionRegistry {
         let project_id_str = self.session_to_project.view(session_id, |_, v| v.clone())?;
 
         // 再通过 project_id 获取 agent_info
-        self.agent_info_map.get(&project_id_str)
+        self.agent_info_map
+            .get(&project_id_str)
+            .filter(|info| info.session_id.to_string() == session_id)
     }
 
     /// 通过 project_id 在闭包内访问 agent_info;闭包返回即释放读锁(无 Ref 暴露,
@@ -372,7 +374,11 @@ impl AgentSessionRegistry {
         f: impl FnOnce(&ProjectAndAgentInfo) -> R,
     ) -> Option<R> {
         let project_id_str = self.session_to_project.view(session_id, |_, v| v.clone())?;
-        self.agent_info_map.view(&project_id_str, |_, info| f(info))
+        self.agent_info_map
+            .view(&project_id_str, |_, info| {
+                (info.session_id.to_string() == session_id).then(|| f(info))
+            })
+            .flatten()
     }
 
     /// 检查 project 是否存在
@@ -513,6 +519,32 @@ impl SessionRegistry for AgentSessionRegistry {
             } else {
                 false
             }
+        });
+    }
+
+    fn update_agent_status_for_session(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        request_id: Option<&str>,
+        status: shared_types::AgentStatus,
+    ) {
+        self.try_update_agent_info(project_id, |info| {
+            if info.session_id.to_string() != session_id
+                || (status == shared_types::AgentStatus::Idle
+                    && (info.status == shared_types::AgentStatus::Terminating
+                        || request_id.is_some_and(|request_id| {
+                            info.request_id.as_deref() != Some(request_id)
+                        })))
+            {
+                return false;
+            }
+            if status == shared_types::AgentStatus::Active {
+                info.request_id = request_id.map(str::to_string);
+            }
+            info.status = status;
+            info.last_activity = chrono::Utc::now();
+            true
         });
     }
 

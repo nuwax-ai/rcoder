@@ -66,7 +66,13 @@ pub async fn handle_computer_status(
     );
 
     // 从 AGENT_REGISTRY 查询 Agent 状态
-    let agent_info = AGENT_REGISTRY.get_agent_info(project_id);
+    let agent_info = AGENT_REGISTRY.get_agent_info(project_id).filter(|info| {
+        request
+            .session_id
+            .as_deref()
+            .filter(|sid| !sid.is_empty())
+            .is_none_or(|sid| info.session_id.to_string() == sid)
+    });
 
     let response = match agent_info {
         Some(info) => {
