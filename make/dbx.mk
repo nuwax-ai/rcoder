@@ -11,7 +11,18 @@ wrap-github-url = $(if $(findstring github.com,$(1)),$(if $(findstring true,$(US
 DBX_FORK_REPO ?= https://github.com/nuwax-ai/dbx.git
 DBX_FORK_BRANCH ?= test
 DBX_PERSIST_ROOT ?= $(abspath $(DBX_REPO_ROOT)/../.cache/nuwax-build/dbx)
-DBX_FORK_PIP_INDEX ?= https://mirrors.aliyun.com/pypi/simple
+DBX_FORK_PIP_INDEX ?= https://mirrors.cloud.tencent.com/pypi/simple
+# DBX 构建的 Docker Hub 镜像前缀：imagetools digest 锁定是 buildx 客户端直连 Hub，
+# 不走 daemon registry-mirrors，国内直连必超时（与 build-agent-docker 16-app-runtime.mk
+# 的 --docker-mirror 同步）。优先级：make 变量 > .env.local DOCKER_MIRROR（与
+# file-server-ab 同一约定）> daocloud（与本地 daemon mirrors 首选一致）。
+DBX_DOCKER_MIRROR ?= $(DOCKER_MIRROR)
+ifeq ($(strip $(DBX_DOCKER_MIRROR)),)
+DBX_DOCKER_MIRROR := $(shell sed -n 's/^DOCKER_MIRROR=//p' .env.local 2>/dev/null | head -n 1)
+endif
+ifeq ($(strip $(DBX_DOCKER_MIRROR)),)
+DBX_DOCKER_MIRROR := docker.m.daocloud.io
+endif
 DBX_FORK_REPO_WRAPPED := $(call wrap-github-url,$(DBX_FORK_REPO))
 DBX_CONTEXTS ?= docker/rcoder-agent-runner/downloads docker/app-runtime-base/downloads
 DBX_HELPER := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../tools/build/dbx_cache.py)
@@ -22,7 +33,7 @@ else
 endif
 DBX_ARGS = --root "$(DBX_PERSIST_ROOT)" --repo "$(DBX_FORK_REPO)" \
     --fetch-repo "$(DBX_FORK_REPO_WRAPPED)" --ref "$(DBX_FORK_BRANCH)" \
-    --builder "$(DBX_BUILDER)" --pip-index "$(DBX_FORK_PIP_INDEX)" \
+    --builder "$(DBX_BUILDER)" --docker-mirror "$(DBX_DOCKER_MIRROR)" --pip-index "$(DBX_FORK_PIP_INDEX)" \
     --ziglang-version "$(DBX_ZIGLANG_VERSION)" --cargo-zigbuild-version "$(DBX_CARGO_ZIGBUILD_VERSION)"
 DBX_DISTRIBUTION_ARGS = $(foreach ctx,$(DBX_CONTEXTS),--context "$(ctx)") \
     $(if $(DBX_OUTPUT_REF),--output-ref "$(DBX_OUTPUT_REF)")

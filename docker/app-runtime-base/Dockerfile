@@ -37,16 +37,20 @@ ENV RCODER_PINGAP_VERSION=${PINGAP_VERSION} \
 WORKDIR /app
 
 
-# 使用 LinuxMirrors 一键配置阿里云镜像源（rust:trixie 基于 Debian trixie，已预装 curl）
-RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
-    --source mirrors.aliyun.com \
+# 使用 LinuxMirrors 配置 apt 源（默认腾讯云，可用 APT_MIRROR_HOST 构建参数切换；rust:trixie 基于 Debian trixie，已预装 curl）
+ARG APT_MIRROR_HOST=mirrors.cloud.tencent.com
+RUN printf '%s\n' "${APT_MIRROR_HOST}" | LC_ALL=C grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' || { echo "ERROR: APT_MIRROR_HOST must be a hostname, without URL scheme or path" >&2; exit 2; }; \
+    curl -fsSL https://linuxmirrors.cn/main.sh -o /tmp/nuwax-apt-mirror.sh && \
+    bash /tmp/nuwax-apt-mirror.sh \
+    --source "${APT_MIRROR_HOST}" \
     --protocol https \
     --use-intranet-source false \
     --install-epel false \
     --backup false \
     --upgrade-software false \
     --clean-cache true \
-    --ignore-backup-tips
+    --ignore-backup-tips && \
+    rm -f /tmp/nuwax-apt-mirror.sh
 
 # 安装基础依赖和常用排查工具（去掉 software-properties-common —— 不再用 deadsnakes PPA/add-apt-repository）
 RUN apt-get update && apt-get install -y \

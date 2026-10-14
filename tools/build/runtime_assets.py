@@ -22,8 +22,13 @@ import zipfile
 
 
 def digest(path):
+    # 分块读取而非 hashlib.file_digest：后者要求 Python 3.11，macOS 默认
+    # /usr/bin/python3 可能是 3.9；两者对同一文件产生相同的 sha256。
+    hasher = hashlib.sha256()
     with open(path, 'rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            hasher.update(block)
+    return hasher.hexdigest()
 
 
 def atomic_json(path, value):

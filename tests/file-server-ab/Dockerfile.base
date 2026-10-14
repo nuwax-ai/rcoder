@@ -13,7 +13,7 @@ COPY --from=node_runtime /usr/local /usr/local
 # Match the rcoder image's domestic Debian mirror; do not upgrade the base OS.
 # pipefail prevents a failed download from being hidden by an empty bash stdin.
 RUN bash -o pipefail -c 'curl -fsSL --connect-timeout 15 --max-time 120 --retry 3 https://linuxmirrors.cn/main.sh | bash -s -- \
-    --source mirrors.aliyun.com \
+    --source mirrors.cloud.tencent.com \
     --protocol https \
     --use-intranet-source false \
     --install-epel false \

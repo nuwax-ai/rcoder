@@ -155,35 +155,77 @@ def pin_toolchain_commands(original, versions):
     return pinned
 
 
+def effective_image(image, docker_mirror=''):
+    """Replace only Docker Hub's registry, keeping its canonical repository."""
+    mirror = docker_mirror.strip().rstrip('/')
+    if not mirror or image.lower() == 'scratch':
+        return image
+    if '://' in mirror or '@' in mirror or re.search(r'\s', mirror):
+        raise CacheError('Docker mirror must be a registry prefix, without scheme or credentials')
+    first, separator, remainder = image.partition('/')
+    if separator and first.lower() in ('docker.io', 'index.docker.io', 'registry-1.docker.io'):
+        repository = remainder
+    elif separator and ('.' in first or ':' in first or first.lower() == 'localhost'):
+        return image
+    else:
+        repository = image
+    if '/' not in repository:
+        repository = 'library/' + repository
+    return mirror + '/' + repository
+
+
+def resolve_image(image, docker_mirror=''):
+    source = effective_image(image, docker_mirror)
+    # A pre-pinned reference is already immutable; do not resolve its tag again.
+    image_digest = source.split('@', 1)[1] if '@' in source else image_identity(source)
+    if not isinstance(image_digest, str) or not re.fullmatch(r'sha256:[0-9a-f]{64}', image_digest):
+        raise CacheError('base image inspection returned an invalid digest')
+    return {'source': source, 'digest': image_digest}
+
+
 def resolve_inputs(args, source, commit):
     dockerfile = source / 'deploy/Dockerfile'
     versions = toolchain_versions(args)
     original = pin_toolchain_commands(dockerfile.read_text(), versions)
+    frontend = None
+    # BuildKit reads the leading parser directive before it reads any FROM.
+    # Pin that loader too, otherwise a mirrored recipe still contacts Hub.
+    syntax = re.match(r'(?i)^([ \t]*#[ \t]*syntax[ \t]*=[ \t]*)(\S+)([ \t]*(?:\r?\n|$))', original)
+    if syntax:
+        image = syntax.group(2)
+        if '$' in image:
+            raise CacheError('DBX Dockerfile syntax variables need explicit resolution')
+        frontend = resolve_image(image, getattr(args, 'docker_mirror', ''))
+        pinned_frontend = frontend['source'].split('@', 1)[0] + '@' + frontend['digest']
+        start, end = syntax.span(2)
+        original = original[:start] + pinned_frontend + original[end:]
     references = {}
     stages = set()
-    for line in original.splitlines():
-        match = re.match(r'(?i)^FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?\s*$', line)
+    pinned_lines = []
+    stage_count = 0
+    for line in original.splitlines(keepends=True):
+        match = re.match(r'(?i)^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?\s*$', line)
         if not match:
+            pinned_lines.append(line)
             continue
         image, stage = match.groups()
-        if image.lower() not in stages and image != 'scratch':
+        if image.lower() not in stages and image.lower() != 'scratch':
             if '$' in image:
                 raise CacheError('DBX Dockerfile FROM variables need explicit resolution')
-            if '@sha256:' in image:
-                image_digest = image.split('@', 1)[1]
-            else:
-                image_digest = image_identity(image)
-            if not isinstance(image_digest, str) or not re.fullmatch(r'sha256:[0-9a-f]{64}', image_digest):
-                raise CacheError('base image inspection returned an invalid digest')
-            references[image] = image_digest
+            if image not in references:
+                references[image] = resolve_image(image, getattr(args, 'docker_mirror', ''))
+            reference = references[image]
+            pinned_image = reference['source'].split('@', 1)[0] + '@' + reference['digest']
+            start, end = match.span(1)
+            line = line[:start] + pinned_image + line[end:]
+        pinned_lines.append(line)
+        stages.add(str(stage_count))
+        stage_count += 1
         if stage:
             stages.add(stage.lower())
     if not references:
         raise CacheError('DBX Dockerfile has no resolved base images')
-    pinned = original
-    for image, image_digest in references.items():
-        pinned = re.sub(r'(?im)^(FROM\s+(?:--platform=\S+\s+)?)' + re.escape(image) + r'(?=\s|$)',
-                        lambda match: match.group(1) + image.split('@')[0] + '@' + image_digest, pinned)
+    pinned = ''.join(pinned_lines)
     # Follow the source project's pinned package manager, not npm's moving
     # latest. This keeps Node 22 builds and the declared frontend input aligned.
     package = json.loads((source / 'package.json').read_text())
@@ -206,6 +248,7 @@ def resolve_inputs(args, source, commit):
         'architectures': list(ARCHES),
         'dockerfile_sha256': digest(pinned.encode()),
         'dockerignore_sha256': digest(IGNORE.encode()),
+        'dockerfile_frontend': frontend,
         'base_images': references,
         'build_args': {'PIP_INDEX_URL': safe_text(args.pip_index)},
         'build_args_sha256': digest(canonical({'PIP_INDEX_URL': args.pip_index})),
@@ -419,11 +462,11 @@ def build(args):
 
 def official(args):
     # Resolve a mutable tag once, then pull/create that exact multiarch digest.
-    resolved = image_identity(args.image)
-    image = args.image.split('@')[0] + '@' + resolved
+    reference = resolve_image(args.image, getattr(args, 'docker_mirror', ''))
+    image = reference['source'].split('@', 1)[0] + '@' + reference['digest']
     inputs = {'protocol': PROTOCOL, 'kind': 'official-image',
               'recipe_sha256': digest(Path(__file__).read_bytes()),
-              'image': image, 'architectures': list(ARCHES)}
+              **reference, 'image': image, 'architectures': list(ARCHES)}
     key = digest(canonical(inputs))
     args.root.mkdir(parents=True, exist_ok=True)
     with lock(args.root / 'locks' / ('build-' + key + '.lock')):
@@ -479,7 +522,9 @@ def main():
     parser.add_argument('--fetch-repo')
     parser.add_argument('--ref', default='test')
     parser.add_argument('--builder', default='default')
-    parser.add_argument('--pip-index', default='https://mirrors.aliyun.com/pypi/simple')
+    parser.add_argument('--docker-mirror', default=os.environ.get('DOCKER_MIRROR', ''),
+                        help='Docker Hub registry prefix; defaults to exported DOCKER_MIRROR or direct Hub')
+    parser.add_argument('--pip-index', default='https://mirrors.cloud.tencent.com/pypi/simple')
     parser.add_argument('--ziglang-version')
     parser.add_argument('--cargo-zigbuild-version')
     parser.add_argument('--context', action='append', type=Path, default=[])

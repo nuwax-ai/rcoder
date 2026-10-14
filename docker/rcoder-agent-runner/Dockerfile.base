@@ -32,18 +32,22 @@ ENV \
     PIP_DEFAULT_TIMEOUT=100 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# 使用 LinuxMirrors 一键配置阿里云镜像源
+# 使用 LinuxMirrors 配置 apt 源（默认腾讯云，可用 APT_MIRROR_HOST 构建参数切换）
 # 参考: https://github.com/SuperManito/LinuxMirrors
 # rust:trixie (基于 buildpack-deps) 已预装 curl，可直接执行脚本配置镜像源
-RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
-    --source mirrors.aliyun.com \
+ARG APT_MIRROR_HOST=mirrors.cloud.tencent.com
+RUN printf '%s\n' "${APT_MIRROR_HOST}" | LC_ALL=C grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' || { echo "ERROR: APT_MIRROR_HOST must be a hostname, without URL scheme or path" >&2; exit 2; }; \
+    curl -fsSL https://linuxmirrors.cn/main.sh -o /tmp/nuwax-apt-mirror.sh && \
+    bash /tmp/nuwax-apt-mirror.sh \
+    --source "${APT_MIRROR_HOST}" \
     --protocol https \
     --use-intranet-source false \
     --install-epel false \
     --backup false \
     --upgrade-software false \
     --clean-cache true \
-    --ignore-backup-tips
+    --ignore-backup-tips && \
+    rm -f /tmp/nuwax-apt-mirror.sh
 
 # 钉死 postgres uid/gid=111:121（=bookworm 时代值），必须在任何 apt 包安装之前：
 # Debian 系统用户 uid 按包安装顺序动态分配，包集/基底变化即漂移——trixie 0.1.253 中
@@ -163,22 +167,17 @@ RUN mkdir -p /etc/pulse && \
 # ============================================================================
 # 🐍 配置 pip 镜像源 (系统级配置，所有用户共享)
 # ============================================================================
-# 使用阿里云 PyPI 镜像源（稳定可靠，无限流限制）
+# 默认腾讯云；构建参数可切换 PyPI 源，不设置全局 PIP_INDEX_URL。
+ARG PYPI_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple
 RUN mkdir -p /etc/pip && \
-    printf '[global]\n\
-    index-url = https://mirrors.aliyun.com/pypi/simple/\n\
-    trusted-host = mirrors.aliyun.com\n\
-    timeout = 120\n\
-    \n\
-    [install]\n\
-    trusted-host = mirrors.aliyun.com\n' > /etc/pip/pip.conf && \
+    printf '[global]\nindex-url = %s\ntimeout = 120\n' "${PYPI_INDEX_URL}" > /etc/pip/pip.conf && \
     # 同时为 root 用户创建配置（备用）
     mkdir -p /root/.config/pip && \
     cp /etc/pip/pip.conf /root/.config/pip/pip.conf && \
     # 为 user 用户创建配置目录（后续会设置权限）
     mkdir -p /home/user/.config/pip && \
     cp /etc/pip/pip.conf /home/user/.config/pip/pip.conf && \
-    echo "✅ pip 镜像源配置完成: https://mirrors.aliyun.com/pypi/simple/"
+    echo "✅ pip 镜像源配置完成"
 
 # ============================================================================
 # 📦 安装常用 Python 数据科学库 (系统级，所有用户可用)
@@ -198,8 +197,8 @@ COPY requirements.txt /tmp/requirements.txt
 # 升级基础工具并安装依赖
 # --ignore-installed: trixie 的 Debian 自带 python3-wheel/setuptools 无 pip RECORD 文件,
 # 直接 --upgrade 会报 uninstall-no-record-file; 新装到 /usr/local 遮蔽 dist-packages 副本
-RUN pip3 install --no-cache-dir --break-system-packages --ignore-installed --upgrade pip setuptools wheel && \
-    pip3 install --no-cache-dir --break-system-packages --ignore-installed -r /tmp/requirements.txt && \
+RUN pip3 install --no-cache-dir --break-system-packages --ignore-installed --upgrade pip setuptools wheel -i "${PYPI_INDEX_URL}" && \
+    pip3 install --no-cache-dir --break-system-packages --ignore-installed -r /tmp/requirements.txt -i "${PYPI_INDEX_URL}" && \
     echo "✅ Python 数据科学库安装完成" && \
     echo "已安装的包:" && \
     pip3 list | grep -E '(numpy|pandas|scipy|matplotlib|openpyxl|python-docx|PyMuPDF|xlrd|xlwt|seaborn|requests|BeautifulSoup|lxml|scikit-learn)'
@@ -833,15 +832,15 @@ EOF
 
 # 安装 uv 到全局路径（需要 root）
 # 注意：UV_CACHE_DIR 在后续会根据 root/user 模式分别设置，这里不设置全局默认
-# 使用阿里云 PyPI 镜像源（与 pip 保持一致，稳定可靠，无限流限制）
+# PyPI 源与 pip 保持一致（PYPI_INDEX_URL，默认腾讯云）
 # 使用 pip 安装（避免从 astral.sh/GitHub 下载二进制慢/不稳定），pip 全局安装默认放 /usr/local/bin
-ENV UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
-RUN pip3 install --break-system-packages --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple uv && \
+ENV UV_INDEX_URL=${PYPI_INDEX_URL}
+RUN pip3 install --break-system-packages --no-cache-dir -i "${PYPI_INDEX_URL}" uv && \
     uv --version && \
     # 创建 uv 环境配置脚本（用户通过终端使用时会加载）
     echo '#!/bin/sh' > /etc/profile.d/uv-env.sh && \
     echo '# UV environment configuration' >> /etc/profile.d/uv-env.sh && \
-    echo 'export UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple' >> /etc/profile.d/uv-env.sh && \
+    python3 -c 'import shlex, sys; print("export UV_INDEX_URL=" + shlex.quote(sys.argv[1]))' "${PYPI_INDEX_URL}" >> /etc/profile.d/uv-env.sh && \
     echo 'export UV_TOOL_DIR=/home/user/.local/share/uv/tools' >> /etc/profile.d/uv-env.sh && \
     echo 'export UV_CACHE_DIR=/home/user/.cache/uv' >> /etc/profile.d/uv-env.sh && \
     chmod +x /etc/profile.d/uv-env.sh

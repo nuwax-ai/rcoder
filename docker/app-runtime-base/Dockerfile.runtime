@@ -21,9 +21,13 @@ ARG DOCKER_MIRROR
 FROM ${DOCKER_MIRROR}rust:trixie AS app-cli-builder
 WORKDIR /build
 # builder 阶段先换国内 apt 源(默认 deb.debian.org 从国内拉易 stall),与 base 主 stage 的换源对齐
-RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
-        --source mirrors.aliyun.com --protocol https --use-intranet-source false \
+ARG APT_MIRROR_HOST=mirrors.cloud.tencent.com
+RUN printf '%s\n' "${APT_MIRROR_HOST}" | LC_ALL=C grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' || { echo "ERROR: APT_MIRROR_HOST must be a hostname, without URL scheme or path" >&2; exit 2; }; \
+    curl -fsSL https://linuxmirrors.cn/main.sh -o /tmp/nuwax-apt-mirror.sh && \
+    bash /tmp/nuwax-apt-mirror.sh \
+        --source "${APT_MIRROR_HOST}" --protocol https --use-intranet-source false \
         --install-epel false --backup false --upgrade-software false --clean-cache true --ignore-backup-tips && \
+    rm -f /tmp/nuwax-apt-mirror.sh && \
     apt-get update && apt-get install -y --no-install-recommends cmake libclang-dev protobuf-compiler python3 git pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 COPY --from=rcoder / .
 ARG RCODER_SOURCE_COMMIT

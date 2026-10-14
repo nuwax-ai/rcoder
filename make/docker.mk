@@ -3,6 +3,12 @@ AGENT_BASE_IMAGE ?= dev-rcoder-agent-base:latest
 # Docker 镜像构建
 # ============================================================================
 
+# 国内镜像源（与 build-agent-docker 生产仓库 versions.mk 同步）：apt/PyPI 默认腾讯云，
+# 命令行可覆盖（如 make docker-build-master-base APT_MIRROR_HOST=mirrors.aliyun.com）。
+# 仅作 --build-arg 传递；各 Dockerfile 内的 ARG 默认值与其保持一致。
+APT_MIRROR_HOST ?= mirrors.cloud.tencent.com
+PYPI_INDEX_URL ?= https://mirrors.cloud.tencent.com/pypi/simple
+
 # 镜像推送开关：构建后是否自动推送到阿里云仓库
 #   - false（默认）: 仅本地构建，不推送，适合 make dev-restart 快速构建
 #   - true          : 构建完成后自动推送
@@ -77,6 +83,7 @@ docker-build-master:
 		--build-arg CARGO_FLAGS="$$MASTER_CARGO_FLAGS" \
 		--build-arg RUSTFLAGS="$$DIAL9_RUSTFLAGS" \
 		--build-arg CACHEBUST=$(AGENT_TOOLS_CACHE_KEY) \
+		--build-arg APT_MIRROR_HOST=$(APT_MIRROR_HOST) \
 		-f docker/rcoder-master/Dockerfile -t dev-master-rcoder:latest .;)
 	@echo "✅ master-rcoder 镜像构建完成！"
 	@if [ "$(PUSH_IMAGE)" = "true" ]; then \
@@ -93,6 +100,8 @@ docker-build-master-base:
 	@echo "📍 镜像名称: dev-master-rcoder-base:latest"
 	@echo "⏳ 这可能需要较长时间（包含所有运行时依赖安装）..."
 	@docker build --build-arg RCODER_MASTER_BASE_SOURCE_SHA=$$(python3 docker/master-base-contract.py fingerprint) \
+		--build-arg APT_MIRROR_HOST=$(APT_MIRROR_HOST) \
+		--build-arg PYPI_INDEX_URL=$(PYPI_INDEX_URL) \
 		-f docker/rcoder-master/Dockerfile.base -t dev-master-rcoder-base:latest .
 	@echo "✅ master-rcoder-base 基础镜像构建完成！"
 	@if [ "$(PUSH_IMAGE)" = "true" ]; then \

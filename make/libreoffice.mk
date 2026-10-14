@@ -130,11 +130,15 @@ docker-build-agent-base: docker-pre-download-libreoffice
 			docker buildx build --builder $(BUILDX_BUILDER) --platform linux/$(LIBREOFFICE_ARCH) --load \
 			--build-arg LIBREOFFICE_FILE=$(LIBREOFFICE_FILE) \
 			--build-arg CACHEBUST_NOVNC=$$(date +%s) \
+			--build-arg APT_MIRROR_HOST=$(APT_MIRROR_HOST) \
+			--build-arg PYPI_INDEX_URL=$(PYPI_INDEX_URL) \
 			-f Dockerfile.base -t dev-rcoder-agent-base:latest . ; \
 		else \
 			docker build \
 			--build-arg LIBREOFFICE_FILE=$(LIBREOFFICE_FILE) \
 			--build-arg CACHEBUST_NOVNC=$$(date +%s) \
+			--build-arg APT_MIRROR_HOST=$(APT_MIRROR_HOST) \
+			--build-arg PYPI_INDEX_URL=$(PYPI_INDEX_URL) \
 			-f Dockerfile.base -t dev-rcoder-agent-base:latest . ; \
 		fi
 	@echo "✅ rcoder-agent-base 基础镜像构建完成！"
