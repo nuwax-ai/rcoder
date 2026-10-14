@@ -23,6 +23,7 @@ struct Runtime {
     change_identity_during_observation: AtomicBool,
     retries: AtomicUsize,
     stopped: AtomicBool,
+    orphan: Mutex<Option<BuilderOrphanStopTarget>>,
     call: Mutex<
         Option<(
             BuilderControlTarget,
@@ -233,9 +234,34 @@ impl AgentContainerRuntime for Runtime {
     }
     async fn reconcile_builder_compute_stop(
         &self,
-        _: &BuilderControlTarget,
+        target: &BuilderControlTarget,
     ) -> ContainerRuntimeResult<bool> {
-        Ok(self.stopped.load(Ordering::SeqCst))
+        let actual = self.actual.lock().unwrap();
+        Ok(self.stopped.load(Ordering::SeqCst)
+            && target.context == actual.context
+            && target.workload.as_ref().is_some_and(|workload| {
+                actual
+                    .workload
+                    .as_ref()
+                    .is_some_and(|current| current.uid == workload.uid)
+            }))
+    }
+    async fn confirm_builder_orphan_stopped(
+        &self,
+        target: &BuilderOrphanStopTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        let expected = self.orphan.lock().unwrap();
+        let actual = self.actual.lock().unwrap();
+        Ok(self.stopped.load(Ordering::SeqCst)
+            && actual.workload.is_none()
+            && actual.pod.is_none()
+            && target.context == actual.context
+            && expected.as_ref().is_some_and(|expected| {
+                target.orphan_pod == expected.orphan_pod
+                    && target.controller_name == expected.controller_name
+                    && target.controller_uid == expected.controller_uid
+                    && target.resource_binding == expected.resource_binding
+            }))
     }
     async fn builder_compute_write_acknowledged(
         &self,
@@ -526,6 +552,7 @@ async fn fixture_with_canonical_binding(
         change_identity_during_observation: AtomicBool::new(false),
         retries: AtomicUsize::new(0),
         stopped: AtomicBool::new(false),
+        orphan: Mutex::new(None),
         call: Mutex::new(None),
     });
     let state = runtime_state(runtime.clone(), store, None).await;
@@ -1035,87 +1062,198 @@ async fn retained_builder_atomic_start_observation_preserves_its_original_checkp
     }
 }
 
-#[tokio::test]
-async fn expired_original_stop_observes_existing_atomic_or_absence_proof_without_new_write() {
-    for absent in [false, true] {
-        let (state, runtime, record, _dir) = fixture(false, false).await;
-        resume_restart_start(&state, &record).await.unwrap();
-        let app = state
-            .userapp_store
-            .get_application(&record.app_id)
-            .await
-            .unwrap()
-            .unwrap();
-        let pending = state
-            .userapp_store
-            .admit_compute_control(&ComputeControlRequest {
-                app_id: app.app_id.clone(),
-                lifecycle_id: app.lifecycle_id.clone(),
-                scope: UserAppOperationScope::Dev,
-                operation_id: "original-stop".into(),
-                request_id: "original-stop-request".into(),
-                request_fingerprint: "b".repeat(64),
-                action: ComputeControlAction::Stop,
-                restart_image_roll: false,
-                builder_startup_mode: Default::default(),
-            })
-            .await
-            .unwrap();
-        let identity = ComputeExecutorIdentity {
-            app_id: pending.app_id.clone(),
-            lifecycle_id: pending.lifecycle_id.clone(),
-            scope: pending.scope,
-            operation_id: pending.operation_id.clone(),
-            generation: pending.generation,
-            executor_id: "original-executor".into(),
-        };
-        state
-            .userapp_store
-            .claim_compute_control(&identity, pending.revision)
-            .await
-            .unwrap();
-        let bound = state
-            .userapp_store
-            .bind_compute_lease(&identity, &runtime.original_lease)
-            .await
-            .unwrap();
-        let context = bound.execution_context().unwrap();
-        runtime.actual.lock().unwrap().context = context.clone();
-        runtime.actual.lock().unwrap().pod = None;
-        let checkpoint = if absent {
+#[derive(Clone, Copy)]
+enum StopShape {
+    Retained,
+    Absent,
+    Orphan,
+}
+
+async fn stop_fixture(
+    shape: StopShape,
+    historical: bool,
+) -> (
+    Arc<AppState>,
+    Arc<Runtime>,
+    ComputeControlRecord,
+    tempfile::TempDir,
+) {
+    let (state, runtime, record, dir) = fixture(false, false).await;
+    resume_restart_start(&state, &record).await.unwrap();
+    let app = state
+        .userapp_store
+        .get_application(&record.app_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let pending = state
+        .userapp_store
+        .admit_compute_control(&ComputeControlRequest {
+            app_id: app.app_id.clone(),
+            lifecycle_id: app.lifecycle_id.clone(),
+            scope: UserAppOperationScope::Dev,
+            operation_id: "original-stop".into(),
+            request_id: "original-stop-request".into(),
+            request_fingerprint: "b".repeat(64),
+            action: ComputeControlAction::Stop,
+            restart_image_roll: false,
+            builder_startup_mode: Default::default(),
+        })
+        .await
+        .unwrap();
+    let identity = ComputeExecutorIdentity {
+        app_id: pending.app_id.clone(),
+        lifecycle_id: pending.lifecycle_id.clone(),
+        scope: pending.scope,
+        operation_id: pending.operation_id.clone(),
+        generation: pending.generation,
+        executor_id: "original-executor".into(),
+    };
+    state
+        .userapp_store
+        .claim_compute_control(&identity, pending.revision)
+        .await
+        .unwrap();
+    let bound = state
+        .userapp_store
+        .bind_compute_lease(&identity, &runtime.original_lease)
+        .await
+        .unwrap();
+    let context = bound.execution_context().unwrap();
+    let current = runtime.actual.lock().unwrap().clone();
+    runtime.actual.lock().unwrap().context = context.clone();
+    runtime.actual.lock().unwrap().pod = None;
+    let mut checkpoint = match shape {
+        StopShape::Absent => {
             runtime.actual.lock().unwrap().workload = None;
             serde_json::to_value(ComputeAbsenceCheckpoint {
                 context,
                 compute_absent: true,
             })
             .unwrap()
-        } else {
+        }
+        StopShape::Orphan => {
+            let controller = current.workload.unwrap();
+            let orphan = BuilderOrphanStopTarget {
+                context,
+                resource_binding: None,
+                orphan_pod: current.pod.unwrap(),
+                controller_name: controller.name,
+                controller_uid: controller.uid,
+            };
+            runtime.actual.lock().unwrap().workload = None;
+            let checkpoint = serde_json::to_value(&orphan).unwrap();
+            *runtime.orphan.lock().unwrap() = Some(orphan);
+            checkpoint
+        }
+        StopShape::Retained => {
             serde_json::to_value(runtime.actual.lock().unwrap().clone()).unwrap()
-        };
-        let original = state
-            .userapp_store
-            .advance_compute_control(&ComputeControlProgress {
-                identity,
-                expected_revision: bound.revision,
-                state: ComputeControlState::RecoveryRequired,
-                stage: ComputeControlStage::Stopping,
-                checkpoint,
-                error_code: Some("LOST_REPLY".into()),
-                error_message: Some("accepted original stop response was lost".into()),
-            })
-            .await
-            .unwrap();
-        runtime.held.store(false, Ordering::SeqCst);
-        runtime.stopped.store(true, Ordering::SeqCst);
-        runtime.creates.store(0, Ordering::SeqCst);
-        runtime.releases.store(0, Ordering::SeqCst);
-        let completed = recover_confirmed(&state, &original).await.unwrap();
-        assert_eq!(completed.state, ComputeControlState::Succeeded);
-        assert_eq!(completed.operation_id, original.operation_id);
-        assert_eq!(completed.checkpoint, original.checkpoint);
-        assert_eq!(runtime.creates.load(Ordering::SeqCst), 0);
-        assert_eq!(runtime.retries.load(Ordering::SeqCst), 0);
-        assert_eq!(runtime.releases.load(Ordering::SeqCst), 1);
-        state.userapp_store_control.shutdown().await.unwrap();
+        }
+    };
+    if historical {
+        checkpoint["old_diagnostic"] = serde_json::json!({"previous_owner_epoch": 4});
+        if matches!(shape, StopShape::Absent) {
+            checkpoint["resource_binding"] = "retired metadata from an older version".into();
+        } else {
+            checkpoint["compute_absent"] = false.into();
+        }
+        if !matches!(shape, StopShape::Orphan) {
+            checkpoint["controller_name"] = serde_json::json!({"old_format":4});
+            checkpoint["controller_uid"] = "retired controller metadata".into();
+        }
+    }
+    let original = state
+        .userapp_store
+        .advance_compute_control(&ComputeControlProgress {
+            identity,
+            expected_revision: bound.revision,
+            state: ComputeControlState::RecoveryRequired,
+            stage: ComputeControlStage::Stopping,
+            checkpoint,
+            error_code: Some("LOST_REPLY".into()),
+            error_message: Some("accepted original stop response was lost".into()),
+        })
+        .await
+        .unwrap();
+    runtime.held.store(false, Ordering::SeqCst);
+    runtime.stopped.store(true, Ordering::SeqCst);
+    runtime.creates.store(0, Ordering::SeqCst);
+    runtime.releases.store(0, Ordering::SeqCst);
+    (state, runtime, original, dir)
+}
+
+#[tokio::test]
+async fn expired_original_stop_observes_existing_atomic_or_absence_proof_without_new_write() {
+    for historical in [false, true] {
+        for shape in [StopShape::Retained, StopShape::Absent, StopShape::Orphan] {
+            let (state, runtime, original, _dir) = stop_fixture(shape, historical).await;
+            let completed = recover_confirmed(&state, &original).await.unwrap();
+            assert_eq!(completed.state, ComputeControlState::Succeeded);
+            assert_eq!(completed.operation_id, original.operation_id);
+            assert_eq!(completed.checkpoint, original.checkpoint);
+            assert_eq!(completed.executor_id, original.executor_id);
+            assert_eq!(completed.generation, original.generation);
+            assert_eq!(runtime.creates.load(Ordering::SeqCst), 0);
+            assert_eq!(runtime.retries.load(Ordering::SeqCst), 0);
+            assert_eq!(runtime.releases.load(Ordering::SeqCst), 1);
+            state.userapp_store_control.shutdown().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn expired_original_stop_history_cannot_authorize_foreign_or_unconfirmed_completion() {
+    for shape in [StopShape::Retained, StopShape::Absent, StopShape::Orphan] {
+        for variant in 0..5 {
+            let (state, runtime, original, _dir) = stop_fixture(shape, true).await;
+            let mut snapshot = original.clone();
+            match variant {
+                0 => snapshot.checkpoint["context"]["app_id"] = "foreign-app".into(),
+                1 => runtime
+                    .original_identity_retained
+                    .store(false, Ordering::SeqCst),
+                2 => {
+                    runtime.make_current();
+                    runtime.stopped.store(false, Ordering::SeqCst);
+                }
+                3 => {
+                    snapshot.lease = Some(UserAppOperationLeaseReceipt::Kubernetes {
+                        uid: "replacement-lease".into(),
+                        service_type: ServiceType::UserappBuilder,
+                        namespace: "test-ns".into(),
+                        name: "original-lease".into(),
+                        resource_version: "2".into(),
+                        token: "original-executor".into(),
+                    })
+                }
+                4 => match shape {
+                    StopShape::Retained => {
+                        snapshot.checkpoint["workload"]["uid"] = "wrong-uid".into()
+                    }
+                    StopShape::Orphan => {
+                        snapshot.checkpoint["orphan_pod"]["uid"] = "wrong-uid".into()
+                    }
+                    StopShape::Absent => {
+                        snapshot.checkpoint["orphan_pod"] = serde_json::json!({
+                            "name":"invented-pod", "uid":"wrong-uid", "resource_version":"1"
+                        })
+                    }
+                },
+                _ => unreachable!(),
+            }
+            assert!(recover_confirmed(&state, &snapshot).await.is_err());
+            assert_eq!(
+                state
+                    .userapp_store
+                    .get_compute_control(&original.app_id, &original.operation_id)
+                    .await
+                    .unwrap(),
+                Some(original)
+            );
+            assert_eq!(runtime.creates.load(Ordering::SeqCst), 0);
+            assert_eq!(runtime.retries.load(Ordering::SeqCst), 0);
+            assert_eq!(runtime.releases.load(Ordering::SeqCst), 0);
+            state.userapp_store_control.shutdown().await.unwrap();
+        }
     }
 }

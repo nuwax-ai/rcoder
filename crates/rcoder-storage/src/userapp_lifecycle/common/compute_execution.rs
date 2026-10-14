@@ -598,22 +598,35 @@ async fn finalize_observed(
     let context = snapshot
         .execution_context()
         .map_err(|error| invalid(&error))?;
-    let absence = serde_json::from_value::<ComputeAbsenceCheckpoint>(snapshot.checkpoint.clone())
-        .ok()
-        .is_some_and(|proof| proof.compute_absent && proof.context == context);
-    let orphan =
-        serde_json::from_value::<BuilderOrphanStopTarget>(snapshot.checkpoint.clone()).ok();
-    let valid_target = if let Some(orphan) = orphan {
-        orphan.validate().map_err(Error::InvalidOperation)?;
-        action == ComputeControlAction::Stop
-            && snapshot.scope == UserAppOperationScope::Dev
-            && orphan.context == context
-    } else if absence {
-        action == ComputeControlAction::Stop
-            && matches!(
-                snapshot.scope,
-                UserAppOperationScope::Dev | UserAppOperationScope::Prod
-            )
+    let valid_target = if action == ComputeControlAction::Stop {
+        let observed =
+            ComputeStopObservation::from_checkpoint(&snapshot.checkpoint, snapshot.scope)
+                .map_err(storage)?;
+        let same_context = observed.context() == &context;
+        match observed {
+            ComputeStopObservation::Absent(_) => same_context,
+            ComputeStopObservation::Orphan(orphan) => {
+                orphan.validate().map_err(Error::InvalidOperation)?;
+                same_context
+            }
+            ComputeStopObservation::Builder(target) => {
+                target.validate().map_err(Error::InvalidOperation)?;
+                same_context
+                    && target.workload.as_ref().is_some_and(|workload| {
+                        matches!(
+                            workload.kind,
+                            AppResourceKind::StatefulSet | AppResourceKind::Container
+                        )
+                    })
+            }
+            ComputeStopObservation::Application(target) => {
+                same_context
+                    && matches!(
+                        target.resource.kind,
+                        AppResourceKind::Deployment | AppResourceKind::Container
+                    )
+            }
+        }
     } else {
         match snapshot.scope {
             UserAppOperationScope::Prod => {

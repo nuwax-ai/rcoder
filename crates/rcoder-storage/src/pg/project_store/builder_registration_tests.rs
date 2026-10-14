@@ -1624,3 +1624,353 @@ async fn legacy_identity_projection_keeps_foreign_conflicting_and_unproved_histo
         );
     }
 }
+async fn commit_registration_without_publishing(
+    f: &Fixture,
+    operation: &UserAppOperationRecord,
+    evidence: &BuilderCreationEvidence,
+) -> ProjectAndContainerInfo {
+    let operation = operation.clone();
+    let evidence = evidence.clone();
+    let volumes = f.volumes();
+    super::super::database::write_with_conflict_retry(&f.store.database, move |tx| {
+        let operation = operation.clone();
+        let evidence = evidence.clone();
+        let volumes = volumes.clone();
+        Box::pin(async move { rebind(tx, &operation, &evidence, &volumes).await })
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires explicit disposable PostgreSQL test database"]
+async fn committed_builder_registration_acknowledges_a_delayed_old_mirror_snapshot() {
+    let f = Fixture::new().await.expect("disposable PG DSN required");
+    let old_basic = f.basic("mirroroldpod", "mirroroldsts");
+    let (historical, _) = f.completed(old_basic.clone(), false).await;
+    let original = f.register_old(old_basic).await;
+    let historical_bytes = f.operation_bytes(&historical.operation_id).await;
+    // This real snapshot was fetched before the newer verified registration,
+    // as can happen in sync_once after its drain/baseline observation.
+    let (containers, projects, _) = super::super::database::snapshot(&f.store.database)
+        .await
+        .unwrap();
+    let row = projects
+        .iter()
+        .find(|row| row.project_id == f.app.app_id)
+        .unwrap();
+    let old_snapshot =
+        load::hydrate_project(row, &load::container_rows_to_map(containers)).unwrap();
+    assert_eq!(old_snapshot.container_info(), original.container_info());
+    let (completed, evidence) = f
+        .completed(f.basic("mirrornewpod", "mirrornewsts"), false)
+        .await;
+    let original_completed_bytes = f.operation_bytes(&completed.operation_id).await;
+    let committed = commit_registration_without_publishing(&f, &completed, &evidence).await;
+    let durable_peer = f.peer().await;
+    assert_eq!(
+        durable_peer.get(&f.app.app_id).unwrap().container_info(),
+        Some(evidence.container.clone())
+    );
+    // Apply exactly those old persisted rows as a different Arc, not a forged
+    // physical identity or a mocked database success.
+    f.store
+        .inner
+        .insert(f.app.app_id.clone(), Arc::new(old_snapshot))
+        .unwrap();
+    let current = f.store.get(&f.app.app_id).unwrap();
+    assert!(!Arc::ptr_eq(&original, &current));
+    assert_eq!(current.container_info(), original.container_info());
+    f.store
+        .publish_rebound_builder(Some(original), committed)
+        .expect("a cache snapshot race cannot turn a verified committed registration into failure");
+    assert!(
+        Arc::ptr_eq(&current, &f.store.get(&f.app.app_id).unwrap()),
+        "keep the mirror which won the local publication race"
+    );
+    super::super::sync::sync_once(&f.store, &f.store.inner, &f.store.database)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store.get(&f.app.app_id).unwrap().container_info(),
+        Some(evidence.container)
+    );
+    assert_eq!(
+        f.operation_bytes(&completed.operation_id).await,
+        original_completed_bytes
+    );
+    assert_eq!(
+        f.operation_bytes(&historical.operation_id).await,
+        historical_bytes
+    );
+    assert!(
+        durable_peer
+            .writer()
+            .flush_and_stop(Duration::from_secs(5))
+            .await
+    );
+    assert!(
+        f.store
+            .writer()
+            .flush_and_stop(Duration::from_secs(5))
+            .await
+    );
+    f.owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires explicit disposable PostgreSQL test database"]
+async fn committed_builder_registration_preserves_a_later_mirror_generation_and_metadata() {
+    let f = Fixture::new().await.expect("disposable PG DSN required");
+    let old_basic = f.basic("mirrorfirstpod", "mirrorfirststs");
+    f.completed(old_basic.clone(), false).await;
+    let original = f.register_old(old_basic).await;
+    let (completed, evidence) = f
+        .completed(f.basic("mirrorsecondpod", "mirrorsecondsts"), false)
+        .await;
+    let committed = commit_registration_without_publishing(&f, &completed, &evidence).await;
+    let completed_bytes = f.operation_bytes(&completed.operation_id).await;
+    let (later, later_evidence) = f
+        .completed(f.basic("mirrorlaterpod", "mirrorlatersts"), false)
+        .await;
+    f.store
+        .register_completed_builder_replacement(&later, &later_evidence, &f.volumes())
+        .await
+        .unwrap();
+    let latest = f.store.get(&f.app.app_id).unwrap();
+    assert_ne!(
+        latest
+            .persistence_identity()
+            .container
+            .as_ref()
+            .unwrap()
+            .generation,
+        committed
+            .persistence_identity()
+            .container
+            .as_ref()
+            .unwrap()
+            .generation
+    );
+    let mut local = (*latest).clone();
+    local.set_request_id(Some("later-local-metadata".into()));
+    f.store
+        .insert(f.app.app_id.clone(), Arc::new(local))
+        .unwrap();
+    assert!(f.store.wait_drained(Duration::from_secs(5)).await);
+    let current = f.store.get(&f.app.app_id).unwrap();
+    assert_eq!(current.request_id(), Some("later-local-metadata"));
+    f.store.publish_rebound_builder(Some(original), committed)
+        .expect("an older committed response must acknowledge success without overwriting a newer local registration");
+    assert!(Arc::ptr_eq(&current, &f.store.get(&f.app.app_id).unwrap()));
+    assert_eq!(
+        f.store.get(&f.app.app_id).unwrap().container_info(),
+        Some(later_evidence.container.clone())
+    );
+    assert_eq!(
+        f.operation_bytes(&completed.operation_id).await,
+        completed_bytes
+    );
+    super::super::sync::sync_once(&f.store, &f.store.inner, &f.store.database)
+        .await
+        .unwrap();
+    let synchronized = f.store.get(&f.app.app_id).unwrap();
+    assert_eq!(
+        synchronized.container_info(),
+        Some(later_evidence.container)
+    );
+    assert_eq!(synchronized.request_id(), Some("later-local-metadata"));
+    assert!(
+        f.store
+            .writer()
+            .flush_and_stop(Duration::from_secs(5))
+            .await
+    );
+    f.owner.shutdown().await.unwrap();
+}
+struct RegistrationCommitReplyRelay {
+    port: u16,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    observe_commits: Arc<std::sync::atomic::AtomicBool>,
+    commits: Arc<std::sync::atomic::AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RegistrationCommitReplyRelay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl RegistrationCommitReplyRelay {
+    async fn start(host: String, port: u16) -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_port = listener.local_addr().unwrap().port();
+        let armed = Arc::new(AtomicBool::new(false));
+        let observe_commits = Arc::new(AtomicBool::new(false));
+        let commits = Arc::new(AtomicUsize::new(0));
+        let (drop_commit, observing, count) =
+            (armed.clone(), observe_commits.clone(), commits.clone());
+        let task = tokio::spawn(async move {
+            let mut sessions = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (client, _) = accepted.unwrap();
+                        let host = host.clone();
+                        let (drop_commit, observing, count) = (drop_commit.clone(), observing.clone(), count.clone());
+                        sessions.spawn(async move {
+                            let server = TcpStream::connect((host.as_str(), port)).await.unwrap();
+                            let (mut cr, mut cw) = client.into_split();
+                            let (mut sr, mut sw) = server.into_split();
+                            tokio::select! {
+                                _ = tokio::io::copy(&mut cr, &mut sw) => {},
+                                _ = async {
+                                    loop {
+                                        // The exact backend COMMIT response proves the
+                                        // server committed before its acknowledgement
+                                        // is deliberately lost. No guessed SQL timing.
+                                        let mut header = [0u8; 5];
+                                        sr.read_exact(&mut header).await?;
+                                        let length = u32::from_be_bytes(header[1..].try_into().unwrap());
+                                        assert!((4..=1_048_576).contains(&length));
+                                        let mut body = vec![0u8; (length - 4) as usize];
+                                        sr.read_exact(&mut body).await?;
+                                        if header[0] == b'C' && body == b"COMMIT\0" {
+                                            if observing.load(Ordering::Acquire) { count.fetch_add(1, Ordering::AcqRel); }
+                                            if drop_commit.swap(false, Ordering::AcqRel) { return Ok::<(), std::io::Error>(()); }
+                                        }
+                                        cw.write_all(&header).await?;
+                                        cw.write_all(&body).await?;
+                                    }
+                                } => {},
+                            }
+                        });
+                    },
+                    Some(result) = sessions.join_next(), if !sessions.is_empty() => { result.unwrap(); }
+                }
+            }
+        });
+        Self {
+            port: listen_port,
+            armed,
+            observe_commits,
+            commits,
+            task,
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires explicit disposable PostgreSQL fault fixture"]
+async fn builder_registration_unknown_commit_does_not_publish_or_replay() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new().await.expect("disposable PG DSN required");
+    let old_basic = f.basic("ackoldpod", "ackoldsts");
+    f.completed(old_basic.clone(), false).await;
+    let old = f.register_old(old_basic).await;
+    let (completed, evidence) = f.completed(f.basic("acknewpod", "acknewsts"), false).await;
+    let operation_bytes = f.operation_bytes(&completed.operation_id).await;
+    let parsed: tokio_postgres::Config = f.dsn.parse().unwrap();
+    let [tokio_postgres::config::Host::Tcp(host)] = parsed.get_hosts() else {
+        panic!("real commit fault fixture requires exactly one TCP host");
+    };
+    let relay = RegistrationCommitReplyRelay::start(
+        host.clone(),
+        parsed.get_ports().first().copied().unwrap_or(5432),
+    )
+    .await;
+    let mut config = crate::config::PostgresConfig {
+        host: Some("127.0.0.1".into()),
+        port: Some(relay.port),
+        username: parsed.get_user().map(str::to_owned),
+        password: parsed
+            .get_password()
+            .map(|value| String::from_utf8(value.to_vec()).unwrap()),
+        database: parsed.get_dbname().map(str::to_owned),
+        max_connections: Some(1),
+        min_connections: Some(1),
+        connect_timeout_secs: Some(2),
+        ..Default::default()
+    };
+    // This protocol fault fixture inspects plaintext PG frames, matching the
+    // existing userApp commit-reply relay; TLS negotiation is out of scope.
+    config.url = Some(format!(
+        "{}?sslmode=disable&application_name=registrationcommit{}",
+        config.to_dsn().unwrap(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let (uncertain, _) = PgStore::connect(
+        &config,
+        "registration-commit-loss".into(),
+        "cluster.local".into(),
+    )
+    .await
+    .unwrap();
+    let before = uncertain.get(&f.app.app_id).unwrap();
+    let before_container = uncertain.container_registration.lock().unwrap().clone();
+    relay.observe_commits.store(true, Ordering::Release);
+    relay.armed.store(true, Ordering::Release);
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        uncertain.register_completed_builder_replacement(&completed, &evidence, &f.volumes()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        result.is_err(),
+        "an unacknowledged commit cannot be reported successful"
+    );
+    assert!(
+        !relay.armed.load(Ordering::Acquire),
+        "the server's actual COMMIT response was intercepted"
+    );
+    assert_eq!(
+        relay.commits.load(Ordering::Acquire),
+        1,
+        "unknown commit must never replay the database registration"
+    );
+    relay.observe_commits.store(false, Ordering::Release);
+    assert!(
+        Arc::ptr_eq(&before, &uncertain.get(&f.app.app_id).unwrap()),
+        "unknown commit cannot publish a guessed memory result"
+    );
+    assert_eq!(
+        *uncertain.container_registration.lock().unwrap(),
+        before_container
+    );
+    assert_eq!(
+        uncertain.get(&f.app.app_id).unwrap().container_info(),
+        old.container_info()
+    );
+    // A separate real connection observes the commit. These facts belong to
+    // this fault fixture; they do not turn the unknown caller response success.
+    let peer = f.peer().await;
+    let committed = peer.get(&f.app.app_id).unwrap();
+    assert_eq!(committed.container_info(), Some(evidence.container));
+    assert_eq!(
+        committed.persistence_identity().revision,
+        old.persistence_identity().revision + 1
+    );
+    assert_eq!(
+        f.operation_bytes(&completed.operation_id).await,
+        operation_bytes
+    );
+    assert!(peer.writer().flush_and_stop(Duration::from_secs(5)).await);
+    assert!(
+        uncertain
+            .writer()
+            .flush_and_stop(Duration::from_secs(5))
+            .await
+    );
+    assert!(
+        f.store
+            .writer()
+            .flush_and_stop(Duration::from_secs(5))
+            .await
+    );
+    f.owner.shutdown().await.unwrap();
+}

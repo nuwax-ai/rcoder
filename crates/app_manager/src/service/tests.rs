@@ -5518,3 +5518,5 @@ mod activation_final_query_identity_tests {
         acknowledged_activation_query_failure_keeps_original_receipt(true, true).await;
     }
 }
+#[path = "startup_wake_fence_tests.rs"]
+mod startup_wake_fence_tests;

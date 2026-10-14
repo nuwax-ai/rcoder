@@ -68,3 +68,5 @@ pub(crate) use deletion_recovery::*;
 pub(crate) use observed::*;
 pub(crate) use operation::*;
 pub(crate) use recovery::*;
+mod wake_fences;
+pub(crate) use wake_fences::list_wake_fence_snapshots;

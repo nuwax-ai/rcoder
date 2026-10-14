@@ -175,34 +175,22 @@ impl AppService {
     /// Recover deletion fences from authoritative lifecycle state, including
     /// applications whose compute container has already disappeared.
     async fn pending_deletion_fences(&self) -> AppResult<std::collections::HashSet<String>> {
-        use shared_types::{UserAppLifecycleState, UserAppOperationKind};
+        use shared_types::UserAppWakeFenceState;
         let mut blocked = std::collections::HashSet::new();
         let mut cursor = None;
         loop {
             let page = self
                 .metadata
                 .store
-                .list_control_snapshots(cursor.as_deref(), 128)
+                .list_wake_fence_snapshots(cursor.as_deref(), 128)
                 .await?;
             if page.is_empty() {
                 break;
             }
-            cursor = page
-                .last()
-                .map(|snapshot| snapshot.application.app_id.clone());
+            cursor = page.last().map(|snapshot| snapshot.app_id.clone());
             for snapshot in page {
-                let identity = snapshot.application;
-                if identity.state != UserAppLifecycleState::Active
-                    || snapshot.operations.iter().any(|operation| {
-                        matches!(
-                            operation.kind,
-                            UserAppOperationKind::DeleteCompute
-                                | UserAppOperationKind::PurgeResources
-                                | UserAppOperationKind::DeleteApplication
-                        )
-                    })
-                {
-                    blocked.insert(identity.app_id);
+                if snapshot.state != UserAppWakeFenceState::Clear {
+                    blocked.insert(snapshot.app_id);
                 }
             }
         }
@@ -216,8 +204,16 @@ impl AppService {
         let mut deploys = self.runtime.list_deployments().await.map_err(|e| {
             map_runtime_error("[APP] list_deployments failed (rebuild_stopped_apps)", e)
         })?;
-        self.overlay_stored_runtime_policies(&mut deploys).await?;
         let deletion_fences = self.pending_deletion_fences().await?;
+        // Startup has already isolated an unconfirmed current header to its
+        // own app. Do not re-read that app through the full metadata projection
+        // (or a global policy page) and turn its local fence into a global error.
+        // Clear apps retain their original strict policy and lifecycle reads.
+        for status in &mut deploys {
+            if !deletion_fences.contains(&status.app_id) {
+                self.overlay_stored_runtime_policy(status).await?;
+            }
+        }
         // All reads must succeed before publishing a partially restored state.
         for app_id in &deletion_fences {
             self.activity.mark_wake_blocked(app_id);
@@ -225,15 +221,15 @@ impl AppService {
         let mut stopped = 0u32;
         let mut running = 0u32;
         for s in deploys {
+            if deletion_fences.contains(&s.app_id) {
+                continue;
+            }
             if let Some(identity) = self.metadata.store.get_application(&s.app_id).await? {
                 self.activity.bind_lifecycle(
                     &s.app_id,
                     &identity.lifecycle_id,
                     identity.lifecycle_epoch,
                 );
-            }
-            if deletion_fences.contains(&s.app_id) {
-                continue;
             }
             if s.replicas == 0 {
                 // 拍板 2026-09-23：手动 stop 与闲置回收统一——stopped 一律

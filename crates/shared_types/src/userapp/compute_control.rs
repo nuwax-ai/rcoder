@@ -4,6 +4,9 @@ use super::lifecycle::UserAppOperationScope;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+mod stop_observation;
+pub use stop_observation::ComputeStopObservation;
+
 /// Request IDs in this namespace are issued only by idle repair admission.
 pub const AUTOMATIC_REPAIR_REQUEST_PREFIX: &str = "auto-repair-";
 

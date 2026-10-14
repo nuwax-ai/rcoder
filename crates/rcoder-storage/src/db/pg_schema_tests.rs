@@ -150,7 +150,12 @@ async fn compute_pg_v1_upgrade_preserves_existing_lifecycle_and_baseline() {
         .await
         .unwrap();
     owner.shutdown().await.unwrap();
-    client.batch_execute(&format!("SET search_path TO {schema}; DROP TABLE userapp_compute_controls; DROP TABLE userapp_compute_intents; DELETE FROM rcoder_schema_migrations WHERE component='userapp' AND version=2; INSERT INTO userapps(app_id,lifecycle_id,lifecycle_epoch,lifecycle_state,metadata_revision,created_at_us,updated_at_us) VALUES('keptapp','keptlife',1,'active',1,1,1); INSERT INTO userapp_active_operations(app_id,lifecycle_id) VALUES('keptapp','keptlife');")).await.unwrap();
+    let expected_versions: Vec<i64> = client
+        .query(&format!("SELECT version FROM {schema}.rcoder_schema_migrations WHERE component='userapp' ORDER BY version"), &[])
+        .await.unwrap().iter().map(|row| row.get(0)).collect();
+    // Reconstruct an actual v1 catalog. Leaving the later witness migration
+    // while removing v2 creates a deliberate gap, not an upgrade fixture.
+    client.batch_execute(&format!("SET search_path TO {schema}; DROP TABLE userapp_recovery_witnesses; DROP TABLE userapp_compute_controls; DROP TABLE userapp_compute_intents; DELETE FROM rcoder_schema_migrations WHERE component='userapp' AND version>1; INSERT INTO userapps(app_id,lifecycle_id,lifecycle_epoch,lifecycle_state,metadata_revision,created_at_us,updated_at_us) VALUES('keptapp','keptlife',1,'active',1,1,1); INSERT INTO userapp_active_operations(app_id,lifecycle_id) VALUES('keptapp','keptlife');")).await.unwrap();
     let query = "SELECT checksum,schema_fingerprint FROM rcoder_schema_migrations WHERE component='userapp' AND version=1";
     let before = client.query_one(query, &[]).await.unwrap();
     let before: (String, String) = (before.get(0), before.get(1));
@@ -170,15 +175,10 @@ async fn compute_pg_v1_upgrade_preserves_existing_lifecycle_and_baseline() {
         .await
         .unwrap();
     assert_eq!(app.get::<_, String>(0), "keptlife");
-    let count: i64 = client
-        .query_one(
-            "SELECT count(*) FROM rcoder_schema_migrations WHERE component='userapp'",
-            &[],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(count, 2);
+    let after_versions: Vec<i64> = client.query(
+        "SELECT version FROM rcoder_schema_migrations WHERE component='userapp' ORDER BY version", &[]
+    ).await.unwrap().iter().map(|row| row.get(0)).collect();
+    assert_eq!(after_versions, expected_versions);
     client
         .batch_execute(&format!(
             "SET search_path TO public; DROP SCHEMA {schema} CASCADE"

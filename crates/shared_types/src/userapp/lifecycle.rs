@@ -514,6 +514,47 @@ pub struct UserAppControlSnapshot {
     pub operations: UserAppActiveOperationRecords,
 }
 
+/// Startup observation only; this grants no admission or runtime authority.
+/// Historical operation payloads are irrelevant to restoring a wake fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserAppWakeFenceSnapshot {
+    pub app_id: String,
+    pub state: UserAppWakeFenceState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserAppWakeFenceState {
+    Clear,
+    Blocked,
+    Unconfirmed,
+}
+
+impl UserAppWakeFenceSnapshot {
+    pub fn from_confirmed_headers(
+        app_id: String,
+        lifecycle_state: UserAppLifecycleState,
+        active_kinds: impl IntoIterator<Item = UserAppOperationKind>,
+    ) -> Self {
+        let blocked = lifecycle_state != UserAppLifecycleState::Active
+            || active_kinds.into_iter().any(|kind| {
+                matches!(
+                    kind,
+                    UserAppOperationKind::DeleteCompute
+                        | UserAppOperationKind::PurgeResources
+                        | UserAppOperationKind::DeleteApplication
+                )
+            });
+        Self {
+            app_id,
+            state: if blocked {
+                UserAppWakeFenceState::Blocked
+            } else {
+                UserAppWakeFenceState::Clear
+            },
+        }
+    }
+}
+
 /// Per-scope in-flight operation records aligned with the application's
 /// active_operations slots. Slots are never populated with terminal records.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1168,6 +1209,28 @@ pub trait UserAppLifecycleStore: Send + Sync {
         after_app_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<UserAppControlSnapshot>, UserAppStoreError>;
+
+    /// Every app, including clear ones, participates in the app-ID cursor.
+    /// A consistent current root/slot/operation header is sufficient; this
+    /// reader never authorizes writes or manufactures full operation records.
+    async fn list_wake_fence_snapshots(
+        &self,
+        after_app_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<UserAppWakeFenceSnapshot>, UserAppStoreError> {
+        Ok(self
+            .list_control_snapshots(after_app_id, limit)
+            .await?
+            .into_iter()
+            .map(|snapshot| {
+                UserAppWakeFenceSnapshot::from_confirmed_headers(
+                    snapshot.application.app_id,
+                    snapshot.application.state,
+                    snapshot.operations.iter().map(|operation| operation.kind),
+                )
+            })
+            .collect())
+    }
 
     /// Creates or reads identity in one transaction; repeated calls never
     /// overwrite an existing identity or tombstone.

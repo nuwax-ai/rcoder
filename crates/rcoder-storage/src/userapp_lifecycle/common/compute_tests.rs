@@ -1469,6 +1469,9 @@ async fn stopped_restart_replacement_uid_requires_witness_and_single_cas_winner(
 #[path = "compute_restart_absence_tests.rs"]
 mod absence;
 
+#[path = "compute_stop_observation_tests.rs"]
+mod stop_observation;
+
 /// Runs the same CAS protocol on Turso and two independent PG connections.
 async fn early_handoff_contract(
     first: &dyn UserAppLifecycleStore,

@@ -35,6 +35,8 @@ mod recovery_scan_tests;
 mod repo;
 #[cfg(test)]
 mod transaction_fault_tests;
+#[cfg(test)]
+mod wake_fence_tests;
 
 use super::storage;
 use crate::db::{owner::DatabaseOwner, schema::Backend};
@@ -600,6 +602,19 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         self.run(true, move |tx, backend| {
             Box::pin(async move {
                 ops::list_control_snapshots(tx, backend, after_app_id.as_deref(), limit).await
+            })
+        })
+        .await
+    }
+    async fn list_wake_fence_snapshots(
+        &self,
+        after_app_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<UserAppWakeFenceSnapshot>, UserAppStoreError> {
+        let after_app_id = after_app_id.map(str::to_owned);
+        self.run(true, move |tx, backend| {
+            Box::pin(async move {
+                ops::list_wake_fence_snapshots(tx, backend, after_app_id.as_deref(), limit).await
             })
         })
         .await

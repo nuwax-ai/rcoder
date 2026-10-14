@@ -63,22 +63,29 @@ pub(super) fn strings(rows: Vec<toasty_core::stmt::Value>) -> Result<Vec<String>
 }
 /// Every lifecycle writer competes on the same root token before reading child
 /// rows. The token is independent from metadata and never resets on recreation.
-/// A losing transaction must roll back and re-read; an UPDATE is still subject
-/// to the database lock timeout. No runtime I/O may occur in this transaction.
+/// PostgreSQL locks the root before reading its token, so waiting for a peer
+/// cannot turn an otherwise valid claim into a stale SELECT/UPDATE conflict.
+/// The lock keeps the existing database timeout. Turso's immediate transaction
+/// already serializes writers. No runtime I/O may occur in this transaction.
 pub(super) async fn claim_app(
     tx: &mut dyn Executor,
     backend: Backend,
     app_id: &str,
 ) -> Result<(), Error> {
     use toasty_core::stmt::Value;
-    let rows = toasty::sql::query(sql(
-        backend,
-        "SELECT lifecycle_id,lifecycle_state,control_revision FROM userapps WHERE app_id=$1",
-    ))
-    .bind(app_id)
-    .exec(tx)
-    .await
-    .map_err(storage)?;
+    let query = match backend {
+        Backend::Postgres => {
+            "SELECT lifecycle_id,lifecycle_state,control_revision FROM userapps WHERE app_id=$1 FOR UPDATE"
+        }
+        Backend::Turso => {
+            "SELECT lifecycle_id,lifecycle_state,control_revision FROM userapps WHERE app_id=$1"
+        }
+    };
+    let rows = toasty::sql::query(sql(backend, query))
+        .bind(app_id)
+        .exec(tx)
+        .await
+        .map_err(storage)?;
     let Some(Value::Record(row)) = rows.first() else {
         if rows.is_empty() {
             return Ok(());
@@ -342,3 +349,6 @@ mod sql_tests {
         assert_eq!(sql(Backend::Postgres, source), source);
     }
 }
+#[cfg(all(test, feature = "pg"))]
+#[path = "root_claim_tests.rs"]
+mod root_claim_tests;

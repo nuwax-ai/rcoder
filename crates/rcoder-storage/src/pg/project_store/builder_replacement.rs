@@ -211,14 +211,6 @@ impl PgStore {
             // Keep any later metadata changes and acknowledge the same result.
             return Ok(());
         }
-        ensure!(
-            match (&baseline, &current) {
-                (Some(before), Some(now)) => Arc::ptr_eq(before, now),
-                (None, None) => true,
-                _ => false,
-            },
-            "Builder registration changed while its replacement committed; retry the original operation"
-        );
         let basic = committed
             .container_info()
             .context("Committed builder container missing")?;
@@ -227,6 +219,22 @@ impl PgStore {
             .container
             .clone()
             .context("Committed builder registration identity missing")?;
+        if !match (&baseline, &current) {
+            (Some(before), Some(now)) => Arc::ptr_eq(before, now),
+            (None, None) => true,
+            _ => false,
+        } {
+            // The authoritative transaction already committed. A delayed
+            // sync snapshot or a newer local intent may replace its cache
+            // baseline; neither invalidates that confirmed result. Preserve
+            // the winning memory view and let normal sync converge it, rather
+            // than overwrite newer metadata or report a committed write failed.
+            tracing::debug!(
+                project_id = committed.project_id(),
+                "Committed builder registration retained concurrent memory view"
+            );
+            return Ok(());
+        }
         self.inner
             .insert(committed.project_id().into(), Arc::new(committed))?;
         self.container_registration

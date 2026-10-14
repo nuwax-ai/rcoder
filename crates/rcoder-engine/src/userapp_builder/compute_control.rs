@@ -359,23 +359,20 @@ pub(crate) async fn recover_confirmed(
     }
     if observed_stop {
         let context = record.execution_context().map_err(anyhow::Error::msg)?;
-        let absence = serde_json::from_value::<ComputeAbsenceCheckpoint>(record.checkpoint.clone())
-            .ok()
-            .filter(|proof| proof.compute_absent && proof.context == context);
-        let orphan =
-            serde_json::from_value::<BuilderOrphanStopTarget>(record.checkpoint.clone()).ok();
-        let confirmed = if let Some(orphan) = orphan {
-            orphan.validate().map_err(anyhow::Error::msg)?;
-            ensure!(
-                record.scope == UserAppOperationScope::Dev && orphan.context == context,
-                "Orphan stop recovery context differs"
-            );
-            state
-                .runtime()
-                .confirm_builder_orphan_stopped(&orphan)
-                .await?
-        } else if absence.is_some() {
-            match record.scope {
+        let observed = ComputeStopObservation::from_checkpoint(&record.checkpoint, record.scope)?;
+        ensure!(
+            observed.context() == &context,
+            "Stop recovery context differs"
+        );
+        let confirmed = match observed {
+            ComputeStopObservation::Orphan(orphan) => {
+                orphan.validate().map_err(anyhow::Error::msg)?;
+                state
+                    .runtime()
+                    .confirm_builder_orphan_stopped(&orphan)
+                    .await?
+            }
+            ComputeStopObservation::Absent(_) => match record.scope {
                 UserAppOperationScope::Dev => state
                     .runtime()
                     .capture_builder_control(&context)
@@ -384,22 +381,16 @@ pub(crate) async fn recover_confirmed(
                     .is_none(),
                 UserAppOperationScope::Prod => state.runtime().app_compute_absent(&context).await?,
                 UserAppOperationScope::Application => false,
+            },
+            ComputeStopObservation::Builder(target) => {
+                state
+                    .runtime()
+                    .reconcile_builder_compute_stop(&target)
+                    .await?
             }
-        } else if record.scope == UserAppOperationScope::Dev {
-            let target: BuilderControlTarget =
-                BuilderControlTarget::from_observation_checkpoint(&record.checkpoint)?;
-            ensure!(
-                target.context == context,
-                "Builder stop recovery context differs"
-            );
-            state
-                .runtime()
-                .reconcile_builder_compute_stop(&target)
-                .await?
-        } else {
-            let target: UserAppMutationTarget = serde_json::from_value(record.checkpoint.clone())?;
-            ensure!(target.context == context, "Stop recovery context differs");
-            state.runtime().reconcile_app_compute_stop(&target).await?
+            ComputeStopObservation::Application(target) => {
+                state.runtime().reconcile_app_compute_stop(&target).await?
+            }
         };
         ensure!(
             confirmed,
