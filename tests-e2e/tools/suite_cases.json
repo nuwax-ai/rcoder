@@ -31,6 +31,7 @@
   ],
   "compose_userapp": [
     "userapp_compose_regression",
+    "userapp_deleted_recreate_lifecycle",
     "userapp_dev_compute_shared_contract",
     "userapp_prod_connection_recovery"
   ],

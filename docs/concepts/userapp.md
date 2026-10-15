@@ -29,8 +29,14 @@ dev 与 prod 各有独立的存储：删除 prod 运行容器默认保留数据�
 - **删除分三档**，存储语义明确：
   1. 删除 prod 运行容器（`{app_stage}/delete`）：默认保留存储；`purge=true` 连数据面一起销毁；
   2. 存储族接口（`storage` 查询/清空/销毁）：按需操作数据面；
-  3. **彻底删除**（`delete/app`）：dev+prod 容器、两侧 PVC 与元数据一步收敛，幂等，不可恢复。
+  3. **彻底删除**（`delete/app`）：删除 dev+prod 计算资源与两侧数据，保留 Deleted 生命周期和历史回执；删除的数据不可恢复。
 - 生命周期操作（受理、排队、执行到终态）有完整的操作身份传递；发布/删除类长任务经 SSE 任务事件暴露进度。
+
+### 删除后重新创建
+
+已彻底删除的应用不会因普通工作区 ensure 自动复活。需要继续使用同一 `app_id` 时，调用 `POST /api/v1/userapp/{app_id}/recreate`，提交原 `expected_lifecycle_id` 和本次稳定的 `request_id`。确认 dev/prod 计算资源均已缺失后，接口返回新的 Active 生命周期，`lifecycle_id` 改变、`lifecycle_epoch` 加一；后续操作使用新生命周期。
+
+缺失确认使用 Deleted tombstone 的原生命周期做只读物理查询，不要求它先变为 Active，也不会创建或接管 builder。零副本 StatefulSet 仍算保留资源，单次地址查询为空不能证明资源已删除；查询失败或身份变化如实返回错误。相同请求重试返回原重建结果，原删除历史保留，旧生命周期的迟到请求不会作用于新一代。重建身份不恢复旧数据，也不自动启动计算。
 
 ## 构建与发布链
 
@@ -92,7 +98,8 @@ DELETE /api/v1/admin/userapp/error-page   # 幂等恢复内置页
 | `POST /{app_id}/start` | 部署/启动应用（url 部署自动创建） |
 | `POST /{app_id}/stop` / `restart` | 停止（scale-to-zero，支持流量唤醒）/ 重启 |
 | `POST /{app_id}/{app_stage}/delete` | 删除 prod 运行容器（默认保留存储，`purge=true` 连数据面） |
-| `POST /{app_id}/delete/app` | 彻底删除：dev+prod 容器、两侧 PVC 与元数据一步收敛（幂等） |
+| `POST /{app_id}/delete/app` | 彻底删除计算与数据，保留 Deleted 生命周期和历史回执（幂等） |
+| `POST /{app_id}/recreate` | 已删除应用确认无计算资源后创建新生命周期，同请求重试返回原结果 |
 | `GET /{app_id}/{app_stage}/storage` 等存储族 | 存储查询/清空/销毁 |
 | `POST /{app_id}/{app_stage}/upload` 等文件族 | 文件上传/列表/删除 |
 | `GET /api/v1/userapp/proxy/app/{stage}/{user_id}/{app_id}/{*path}` | 应用访问代理（文档接口；数据面见下） |

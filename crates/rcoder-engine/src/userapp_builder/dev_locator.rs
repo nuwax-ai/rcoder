@@ -37,6 +37,54 @@ impl UserappDevLocator {
             .ok_or_else(|| "app state already dropped".to_string())
     }
 
+    /// Recreation asks whether old compute remains, not for an Active address.
+    /// Keep its Deleted tombstone as the capture identity and only prove absence
+    /// from stable physical observations. This never ensures or adopts compute.
+    async fn deleted_builder_exists(
+        state: &AppState,
+        app: &shared_types::UserAppLifecycleRecord,
+    ) -> anyhow::Result<bool> {
+        use container_runtime_api::UserAppRuntimeReadiness;
+        use shared_types::{UserAppExecutionContext, UserAppNoComputeState, UserappStage};
+
+        let context = UserAppExecutionContext {
+            app_id: app.app_id.clone(),
+            lifecycle_id: app.lifecycle_id.clone(),
+            operation_id: "read-only-recreation".into(),
+            executor_id: "reader".into(),
+            request_fingerprint: "0".repeat(64),
+        };
+        let before = super::adoption::capture_bound_target(state, &context).await?;
+        before.validate().map_err(anyhow::Error::msg)?;
+        let readiness = state
+            .runtime()
+            .observe_userapp_readiness(&app.app_id, UserappStage::Dev)
+            .await?;
+        let after = super::adoption::capture_bound_target(state, &context).await?;
+        after.validate().map_err(anyhow::Error::msg)?;
+        let current = state.userapp_store.get_application(&app.app_id).await?;
+        if current.as_ref() != Some(app)
+            || before.context != context
+            || after.context != context
+            || before != after
+        {
+            return Err(anyhow::anyhow!(
+                "Application or builder changed during recreation verification; retry the query"
+            ));
+        }
+        if after.workload.is_some() || after.pod.is_some() {
+            // A retained zero-replica controller is compute that must settle
+            // through its original cleanup; Missing discovery is insufficient.
+            return Ok(true);
+        }
+        if readiness == UserAppRuntimeReadiness::NotRunning(UserAppNoComputeState::Missing) {
+            return Ok(false);
+        }
+        Err(anyhow::anyhow!(
+            "Builder absence is unconfirmed during recreation verification"
+        ))
+    }
+
     /// Discovery parameters are filters, not an ownership proof. Compare two
     /// structured observations, then verify the captured physical resource and
     /// lifecycle before publishing the address. This path never ensures compute.
@@ -243,6 +291,19 @@ impl shared_types::UserappDevLocator for UserappDevLocator {
 
     async fn dev_container_alive(&self, app_id: &str) -> Result<bool, String> {
         let state = self.state()?;
+        if let Some(app) = state
+            .userapp_store
+            .get_application(app_id)
+            .await
+            .map_err(|error| format!("read builder lifecycle (app {app_id}): {error}"))?
+            && app.state == shared_types::UserAppLifecycleState::Deleted
+        {
+            return Self::deleted_builder_exists(&state, &app)
+                .await
+                .map_err(|error| {
+                    format!("verify deleted UserappBuilder (app {app_id}): {error:#}")
+                });
+        }
         self.verified_builder(&state, app_id)
             .await
             .map(|found| match found {

@@ -17,10 +17,23 @@ use std::sync::{
 
 const APP_ID: &str = "locator-app";
 
+#[path = "dev_locator_recreate_tests.rs"]
+mod recreate_tests;
+
+struct LocatorOperationLease;
+
+#[async_trait::async_trait]
+impl shared_types::AppOperationLease for LocatorOperationLease {
+    async fn release(self: Box<Self>) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 struct LocatorRuntime {
     observations: Mutex<Vec<Option<RuntimeContainerInfo>>>,
     reads: AtomicUsize,
     captures: AtomicUsize,
+    readiness_reads: AtomicUsize,
     credential_reads: AtomicUsize,
     writes: AtomicUsize,
     native_context: UserAppExecutionContext,
@@ -29,6 +42,9 @@ struct LocatorRuntime {
     docker: bool,
     store: Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore>,
     delete_on_capture: AtomicBool,
+    capture_fails: AtomicBool,
+    readiness_fails: AtomicBool,
+    recreate_on_readiness: AtomicBool,
     missing_native_identity: AtomicBool,
     workload_exists: AtomicBool,
     pod_exists: AtomicBool,
@@ -146,6 +162,11 @@ impl AgentContainerRuntime for LocatorRuntime {
         binding: Option<&UserAppResourceBinding>,
     ) -> ContainerRuntimeResult<BuilderControlTarget> {
         self.captures.fetch_add(1, Ordering::SeqCst);
+        if self.capture_fails.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::ConnectionError(
+                "controlled builder capture failure".into(),
+            ));
+        }
         let metadata = if self.missing_native_identity.load(Ordering::SeqCst) {
             std::collections::BTreeMap::new()
         } else {
@@ -181,6 +202,21 @@ impl AgentContainerRuntime for LocatorRuntime {
 impl WorkspaceRuntime for LocatorRuntime {}
 #[async_trait::async_trait]
 impl UserAppDeploymentRuntime for LocatorRuntime {
+    async fn get_deployment_status(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Option<container_runtime_api::DeploymentStatus>> {
+        assert_eq!(app_id, APP_ID);
+        Ok(None)
+    }
+
+    async fn acquire_app_operation(
+        &self,
+        _: &str,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        Ok(Some(Box::new(LocatorOperationLease)))
+    }
+
     async fn observe_userapp_readiness(
         &self,
         app_id: &str,
@@ -188,6 +224,22 @@ impl UserAppDeploymentRuntime for LocatorRuntime {
     ) -> ContainerRuntimeResult<container_runtime_api::UserAppRuntimeReadiness> {
         assert_eq!(app_id, APP_ID);
         assert_eq!(stage, shared_types::UserappStage::Dev);
+        self.readiness_reads.fetch_add(1, Ordering::SeqCst);
+        if self.readiness_fails.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::ConnectionError(
+                "controlled builder readiness failure".into(),
+            ));
+        }
+        if self.recreate_on_readiness.swap(false, Ordering::SeqCst) {
+            self.store
+                .recreate(
+                    APP_ID,
+                    &self.native_context.lifecycle_id,
+                    "concurrent-recreate",
+                )
+                .await
+                .expect("another request recreates the deleted lifecycle during observation");
+        }
         if self
             .remove_workload_on_readiness
             .swap(false, Ordering::SeqCst)
@@ -267,6 +319,7 @@ async fn fixture_on_application(
         observations: Mutex::new(observations),
         reads: AtomicUsize::new(0),
         captures: AtomicUsize::new(0),
+        readiness_reads: AtomicUsize::new(0),
         credential_reads: AtomicUsize::new(0),
         writes: AtomicUsize::new(0),
         native_context: UserAppExecutionContext {
@@ -285,6 +338,9 @@ async fn fixture_on_application(
         docker,
         store: store.clone(),
         delete_on_capture: AtomicBool::new(false),
+        capture_fails: AtomicBool::new(false),
+        readiness_fails: AtomicBool::new(false),
+        recreate_on_readiness: AtomicBool::new(false),
         missing_native_identity: AtomicBool::new(false),
         workload_exists: AtomicBool::new(workload_exists),
         pod_exists: AtomicBool::new(workload_exists && !docker),

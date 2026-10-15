@@ -793,5 +793,19 @@
     "K8s 本 case builder 清理成功",
     "停止 B 前阻塞工具实际在执行",
     "B 停止后不再存活且停止轮事件归属正确"
+  ],
+  "userapp_deleted_recreate_lifecycle": [
+    "recreate case starts with unused app and no compute",
+    "recreate workspace creates the case builder",
+    "recreate builder CID and lifecycle ownership captured",
+    "recreate old lifecycle deletion succeeds",
+    "recreate old CID is physically gone and lifecycle is Deleted",
+    "recreate tombstone ensure rejects without creating compute",
+    "recreate confirmed absence admits a new lifecycle",
+    "recreate changes life once and preserves compute absence",
+    "recreate same request replays the same life without compute",
+    "recreate old life with another request cannot replace current life",
+    "recreate lifecycle sequence completed",
+    "recreate explicit current lifecycle deletion leaves no compute"
   ]
 }

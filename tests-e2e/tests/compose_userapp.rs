@@ -6,9 +6,374 @@
 
 use std::time::{Duration, Instant};
 
+use anyhow::{Context as _, ensure};
 use rcoder_e2e::common::Env;
 use rcoder_e2e::common::report::JsonlReporter;
 use serde_json::{Value, json};
+
+async fn recreation_docker(args: &[&str]) -> anyhow::Result<String> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::process::Command::new("docker")
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("Docker evidence query timed out")?
+    .context("launch Docker evidence query")?;
+    ensure!(output.status.success(), "Docker evidence query failed");
+    String::from_utf8(output.stdout).context("decode Docker evidence")
+}
+
+async fn recreation_compute_ids(app: &str) -> anyhow::Result<Vec<String>> {
+    let mut ids = std::collections::BTreeSet::new();
+    for filter in [
+        format!("label=rcoder.io/application-id={app}"),
+        format!("name=^/rcoder-app-builder-{app}$"),
+        format!("name=^/rcoder-app-{app}$"),
+    ] {
+        let output = recreation_docker(&["ps", "-aq", "--no-trunc", "--filter", &filter]).await?;
+        for id in output.split_whitespace() {
+            ensure!(
+                id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "Docker did not return complete immutable container IDs"
+            );
+            ids.insert(id.to_owned());
+        }
+    }
+    Ok(ids.into_iter().collect())
+}
+
+async fn recreation_compute_absent(app: &str, original_id: Option<&str>) -> anyhow::Result<bool> {
+    let ids = recreation_compute_ids(app).await?;
+    if let Some(id) = original_id {
+        let original =
+            recreation_docker(&["ps", "-aq", "--no-trunc", "--filter", &format!("id={id}")])
+                .await?;
+        return Ok(ids.is_empty() && original.trim().is_empty());
+    }
+    Ok(ids.is_empty())
+}
+
+async fn recreation_json(
+    env: &Env,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<&Value>,
+) -> anyhow::Result<(reqwest::StatusCode, Value)> {
+    let mut request = env
+        .http
+        .request(method, format!("{}{path}", env.rcoder))
+        .timeout(Duration::from_secs(300));
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    let response = request
+        .send()
+        .await
+        .context("UserApp lifecycle HTTP request")?;
+    let status = response.status();
+    let body = response
+        .json()
+        .await
+        .context("UserApp lifecycle JSON response")?;
+    Ok((status, body))
+}
+
+fn recreation_success(status: reqwest::StatusCode, body: &Value) -> bool {
+    status == reqwest::StatusCode::OK && body["success"] == true && body["code"] == "0000"
+}
+
+async fn recreation_lifecycle(
+    env: &Env,
+    app: &str,
+) -> anyhow::Result<shared_types::UserAppLifecycleRecord> {
+    let (status, body) = recreation_json(
+        env,
+        reqwest::Method::GET,
+        &format!("/api/v1/userapp/{app}/lifecycle"),
+        None,
+    )
+    .await?;
+    ensure!(
+        recreation_success(status, &body),
+        "Lifecycle query failed: {body}"
+    );
+    let lifecycle: shared_types::UserAppLifecycleRecord =
+        serde_json::from_value(body["data"].clone()).context("decode lifecycle record")?;
+    ensure!(
+        lifecycle.app_id == app,
+        "Lifecycle query changed application identity"
+    );
+    Ok(lifecycle)
+}
+
+fn recreation_check(
+    report: &JsonlReporter,
+    name: &str,
+    ok: bool,
+    detail: Value,
+) -> anyhow::Result<()> {
+    ensure!(report.assert_hard(name, ok, detail.to_string()), "{name}");
+    Ok(())
+}
+
+/// Real HTTP/Docker regression for the Deleted -> recreate callback boundary.
+/// The old physical receipt stays unchanged; logical cleanup explicitly names
+/// the confirmed current lifecycle, including a new life with no compute.
+#[tokio::test]
+async fn userapp_deleted_recreate_lifecycle() {
+    use rcoder_e2e::common::resources;
+    use shared_types::UserAppLifecycleState;
+
+    rcoder_e2e::common::cross_bin_lock::acquire();
+    let scenario = "userapp_deleted_recreate_lifecycle";
+    let Some((env, report)) = Env::compose_or_skip(scenario, "compose").await else {
+        return;
+    };
+    let case = std::env::var("E2E_CASE_ID").expect("strict per-case identity");
+    let app = format!("e2erc{}", &case[..12]);
+    let user = env.scoped_user("recreate");
+    let name = format!("rcoder-app-builder-{app}");
+    let mut known_lifecycle: Option<shared_types::UserAppLifecycleRecord> = None;
+    let mut original_id: Option<String> = None;
+    let mut recreated_lifecycle: Option<shared_types::UserAppLifecycleRecord> = None;
+    let mut unused_namespace_verified = false;
+
+    let outcome: anyhow::Result<()> = async {
+        let (status, before) = recreation_json(
+            &env,
+            reqwest::Method::GET,
+            &format!("/api/v1/userapp/{app}/lifecycle"),
+            None,
+        )
+        .await?;
+        let compute_absent = recreation_compute_absent(&app, None).await?;
+        recreation_check(
+            &report,
+            "recreate case starts with unused app and no compute",
+            app.len() <= 22
+                && app.contains(&case[..10])
+                && status == reqwest::StatusCode::OK
+                && before["success"] == false
+                && before["code"] == "ERR_APP_NOT_FOUND"
+                && compute_absent,
+            json!({"app_id":app,"user_id":user,"status":status.as_u16(),"before":before,"no_compute":compute_absent}),
+        )?;
+        unused_namespace_verified = true;
+        let workspace = recreation_json(
+            &env,
+            reqwest::Method::POST,
+            "/api/v1/userapp/workspace",
+            Some(&json!({"app_id":app,"user_id":user})),
+        )
+        .await;
+        // Preserve real physical ownership evidence even if the HTTP outcome is
+        // uncertain; the strict launcher may clean only that captured resource.
+        resources::register_builder_attempt(&app, false).map_err(anyhow::Error::msg)?;
+        let (status, body) = workspace?;
+        recreation_check(
+            &report,
+            "recreate workspace creates the case builder",
+            recreation_success(status, &body)
+                && body["data"]["app_id"] == app
+                && body["data"]["container_name"] == name,
+            json!({"status":status.as_u16(),"response":body}),
+        )?;
+        let lifecycle = recreation_lifecycle(&env, &app).await?;
+        known_lifecycle = Some(lifecycle.clone());
+        let physical: Value = serde_json::from_str(
+            &recreation_docker(&[
+                "inspect",
+                "--format",
+                r#"{"id":{{json .Id}},"name":{{json .Name}},"running":{{json .State.Running}},"app_id":{{json (index .Config.Labels "rcoder.io/application-id")}},"lifecycle_id":{{json (index .Config.Labels "rcoder.io/lifecycle-id")}},"service_type":{{json (index .Config.Labels "service-type")}}}"#,
+                &name,
+            ])
+            .await?,
+        )
+        .context("decode physical builder identity")?;
+        let id = physical["id"].as_str().context("physical builder ID missing")?.to_owned();
+        original_id = Some(id.clone());
+        resources::register_created_container(&name).map_err(anyhow::Error::msg)?;
+        let receipt: Value = serde_json::from_slice(
+            &std::fs::read(
+                std::path::PathBuf::from(std::env::var_os("E2E_REPORT_DIR").context("strict report directory")?)
+                    .join("resources")
+                    .join(format!("{name}-ownership.json")),
+            )
+            .context("read captured physical ownership receipt")?,
+        )?;
+        let ids = recreation_compute_ids(&app).await?;
+        recreation_check(
+            &report,
+            "recreate builder CID and lifecycle ownership captured",
+            lifecycle.state == UserAppLifecycleState::Active
+                && ids.as_slice() == std::slice::from_ref(&id)
+                && physical["running"] == true
+                && physical["app_id"] == app
+                && physical["lifecycle_id"] == lifecycle.lifecycle_id
+                && physical["service_type"] == "user-app-builder"
+                && receipt["id"] == id
+                && receipt["case_id"] == case
+                && receipt["app_id"] == app
+                && receipt["lifecycle_id"] == lifecycle.lifecycle_id,
+            json!({"physical":physical,"lifecycle":lifecycle,"receipt":receipt}),
+        )?;
+
+        let delete_request = format!("recreate-delete-old-{case}");
+        let (status, deleted) = recreation_json(
+            &env,
+            reqwest::Method::POST,
+            &format!("/api/v1/userapp/{app}/delete/app"),
+            Some(&json!({"user_id":user,"lifecycle_id":lifecycle.lifecycle_id,"request_id":delete_request})),
+        )
+        .await?;
+        recreation_check(
+            &report,
+            "recreate old lifecycle deletion succeeds",
+            recreation_success(status, &deleted)
+                && deleted["operation_id"].as_str().is_some_and(|id| !id.is_empty()),
+            json!({"status":status.as_u16(),"response":deleted}),
+        )?;
+        let tombstone = recreation_lifecycle(&env, &app).await?;
+        known_lifecycle = Some(tombstone.clone());
+        let old_absent = recreation_compute_absent(&app, Some(&id)).await?;
+        recreation_check(
+            &report,
+            "recreate old CID is physically gone and lifecycle is Deleted",
+            old_absent
+                && tombstone.state == UserAppLifecycleState::Deleted
+                && tombstone.lifecycle_id == lifecycle.lifecycle_id
+                && tombstone.lifecycle_epoch == lifecycle.lifecycle_epoch,
+            json!({"old_cid":id,"no_compute":old_absent,"tombstone":tombstone}),
+        )?;
+        let (status, rejected) = recreation_json(
+            &env,
+            reqwest::Method::POST,
+            "/api/v1/userapp/workspace",
+            Some(&json!({"app_id":app,"user_id":user})),
+        )
+        .await?;
+        let absent_after_ensure = recreation_compute_absent(&app, Some(&id)).await?;
+        recreation_check(
+            &report,
+            "recreate tombstone ensure rejects without creating compute",
+            status == reqwest::StatusCode::OK
+                && rejected["success"] == false
+                && rejected["code"] == "ERR_CONFLICT"
+                && absent_after_ensure
+                && recreation_lifecycle(&env, &app).await? == tombstone,
+            json!({"status":status.as_u16(),"response":rejected,"no_compute":absent_after_ensure}),
+        )?;
+
+        let request = json!({"expected_lifecycle_id":tombstone.lifecycle_id,"request_id":format!("recreate-new-{case}")});
+        let (status, body) = recreation_json(
+            &env,
+            reqwest::Method::POST,
+            &format!("/api/v1/userapp/{app}/recreate"),
+            Some(&request),
+        )
+        .await?;
+        recreation_check(
+            &report,
+            "recreate confirmed absence admits a new lifecycle",
+            recreation_success(status, &body),
+            json!({"status":status.as_u16(),"response":body,"original_request":request}),
+        )?;
+        let next: shared_types::UserAppLifecycleRecord = serde_json::from_value(body["data"].clone())?;
+        known_lifecycle = Some(next.clone());
+        recreated_lifecycle = Some(next.clone());
+        recreation_check(
+            &report,
+            "recreate changes life once and preserves compute absence",
+            next.app_id == app
+                && next.state == UserAppLifecycleState::Active
+                && next.lifecycle_id != tombstone.lifecycle_id
+                && next.lifecycle_epoch == tombstone.lifecycle_epoch + 1
+                && recreation_lifecycle(&env, &app).await? == next
+                && recreation_compute_absent(&app, Some(&id)).await?,
+            json!({"old":tombstone,"new":next,"old_cid":id}),
+        )?;
+        let (status, replay) = recreation_json(
+            &env,
+            reqwest::Method::POST,
+            &format!("/api/v1/userapp/{app}/recreate"),
+            Some(&request),
+        )
+        .await?;
+        recreation_check(
+            &report,
+            "recreate same request replays the same life without compute",
+            recreation_success(status, &replay)
+                && replay["data"] == body["data"]
+                && recreation_lifecycle(&env, &app).await? == next
+                && recreation_compute_absent(&app, Some(&id)).await?,
+            json!({"original_request":request,"response":replay}),
+        )?;
+        let (status, stale) = recreation_json(
+            &env,
+            reqwest::Method::POST,
+            &format!("/api/v1/userapp/{app}/recreate"),
+            Some(&json!({"expected_lifecycle_id":tombstone.lifecycle_id,"request_id":format!("recreate-stale-{case}")})),
+        )
+        .await?;
+        recreation_check(
+            &report,
+            "recreate old life with another request cannot replace current life",
+            status == reqwest::StatusCode::OK
+                && stale["success"] == false
+                && stale["code"] == "ERR_CONFLICT"
+                && recreation_lifecycle(&env, &app).await? == next
+                && recreation_compute_absent(&app, Some(&id)).await?,
+            json!({"status":status.as_u16(),"response":stale,"current":next}),
+        )?;
+        Ok(())
+    }
+    .await;
+    report.assert_hard(
+        "recreate lifecycle sequence completed",
+        outcome.is_ok(),
+        outcome.err().map_or_else(
+            || "real HTTP/Docker lifecycle sequence completed".into(),
+            |error| format!("{error:#}"),
+        ),
+    );
+
+    // Always attempt the explicit cleanup of a confirmed lifecycle. Never use
+    // cleanup_builder: its original physical receipt intentionally names the old
+    // life and cannot authorize deleting the newly recreated, empty lifecycle.
+    let cleanup: anyhow::Result<()> = async {
+        ensure!(unused_namespace_verified, "case never proved an unused app namespace");
+        let known = known_lifecycle.as_ref().context("no confirmed lifecycle; preserve unknown creation outcome")?;
+        let current = recreation_lifecycle(&env, &app).await?;
+        ensure!(current.lifecycle_id == known.lifecycle_id, "cleanup lifecycle changed; preserve the unknown winner");
+        if current.state != UserAppLifecycleState::Deleted {
+            let (status, deleted) = recreation_json(
+                &env,
+                reqwest::Method::POST,
+                &format!("/api/v1/userapp/{app}/delete/app"),
+                Some(&json!({"user_id":user,"lifecycle_id":current.lifecycle_id,"request_id":format!("recreate-delete-current-{case}-{}",current.lifecycle_epoch)})),
+            )
+            .await?;
+            ensure!(recreation_success(status, &deleted), "explicit current-life cleanup failed: {deleted}");
+        }
+        let final_lifecycle = recreation_lifecycle(&env, &app).await?;
+        ensure!(final_lifecycle.state == UserAppLifecycleState::Deleted
+                && final_lifecycle.lifecycle_id == current.lifecycle_id,
+                "current lifecycle did not become Deleted");
+        ensure!(recreation_compute_absent(&app, original_id.as_deref()).await?, "case compute still exists or absence is unconfirmed");
+        report.diagnostic("recreate final lifecycle evidence", &json!({"lifecycle":final_lifecycle,"old_cid":original_id}).to_string(), "explicit scoped deletion; original physical receipt preserved");
+        Ok(())
+    }
+    .await;
+    report.assert_hard(
+        "recreate explicit current lifecycle deletion leaves no compute",
+        cleanup.is_ok() && recreated_lifecycle.is_some(),
+        json!({"confirmed_recreated_identity":recreated_lifecycle,"cleanup_error":cleanup.err().map(|error|format!("{error:#}"))}).to_string(),
+    );
+    assert!(report.finish(), "Deleted -> recreate regression failed");
+}
 
 /// Same Stop → Restart business contract as the deploy-host Docker/K8s suites.
 /// Compose keeps its own container/network assertions in the existing suites.

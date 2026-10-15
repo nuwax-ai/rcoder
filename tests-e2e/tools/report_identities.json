@@ -574,5 +574,11 @@
       "scenario": "lb_userapp_parallel_agents",
       "backend": "k8s"
     }
+  ],
+  "userapp_deleted_recreate_lifecycle": [
+    {
+      "scenario": "userapp_deleted_recreate_lifecycle",
+      "backend": "compose"
+    }
   ]
 }
