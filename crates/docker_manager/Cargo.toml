@@ -75,6 +75,7 @@ deploy-host = ["shared_types/deploy-host"]
 [dev-dependencies]
 rustls = { workspace = true }
 tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
