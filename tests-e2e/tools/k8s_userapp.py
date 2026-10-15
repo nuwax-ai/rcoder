@@ -46,11 +46,143 @@ REQUIRED = {'cluster_ready', 'concurrent_ensure', 'ensure_retry', 'builder_ident
             'tombstone_deleted', 'tombstone_old_ensure_rejected', 'recreate_new_lifecycle',
             'recreate_deleted', 'baseline_preserved', 'worker_artifact_contract', 'worker_process_running'}
 
+RESTART_ADMISSION_WAIT_SECONDS = 30
+RESTART_EXECUTION_TIMEOUT_SECONDS = 300
+# The formal /restart controller calls restart_app_enhanced/deploy_controlled,
+# including the no-URL request; it does not use the independent compute kind.
+RESTART_OPERATION_KIND = 'RestartDeployment'
+
+
+def wire_name(name):
+    """The existing operation view uses PascalCase; busy data uses snake_case."""
+    return re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()
+
+
+def operation_busy_data(status, envelope):
+    """Validate the structured busy contract without interpreting its message."""
+    if (status != 200 or not isinstance(envelope, dict)
+            or envelope.get('code') != 'ERR_OPERATION_IN_PROGRESS'
+            or envelope.get('success') is not False):
+        raise AssertionError('Not a formal UserApp operation-busy response')
+    data = envelope.get('data')
+    fields = ('holder_operation_id', 'holder_kind', 'holder_state', 'holder_step')
+    if (not isinstance(data, dict) or any(key not in data for key in fields)
+            or type(data.get('holder_traffic_wake')) is not bool
+            or type(data.get('retryable')) is not bool
+            or type(data.get('retry_after_seconds')) is not int
+            or data['retry_after_seconds'] < 0):
+        raise AssertionError('Operation-busy data is incomplete or has invalid types')
+    if all(data[key] is None for key in fields):
+        if data['holder_traffic_wake'] or data['retryable'] or data['retry_after_seconds'] != 0:
+            raise AssertionError('An unknown holder must not authorize retry')
+        return data
+    if not all(isinstance(data[key], str) and data[key] for key in fields):
+        raise AssertionError('Operation-busy holder identity is partially populated')
+    blocker = envelope.get('blocker')
+    if (not isinstance(blocker, dict)
+            or not all(isinstance(blocker.get(key), str) and blocker[key]
+                       for key in ('operation_id', 'kind', 'state', 'step', 'scope'))
+            or data['holder_operation_id'] != blocker['operation_id']
+            or data['holder_kind'] != wire_name(blocker['kind'])
+            or data['holder_state'] != wire_name(blocker['state'])
+            or data['holder_step'] != blocker['step']):
+        raise AssertionError('Operation-busy data and blocker describe different snapshots')
+    if not data['retryable'] and data['retry_after_seconds'] != 0:
+        raise AssertionError('Protected holder must not advertise a retry delay')
+    if data['retryable'] and (
+            data['holder_state'] not in ('pending', 'running', 'waiting_retry')
+            or data['retry_after_seconds'] <= 0
+            or envelope.get('operation_id')):
+        raise AssertionError('Accepted or protected operation must not authorize retry')
+    if data['retryable'] and (
+            (data['holder_traffic_wake'] and (data['holder_kind'] != 'start'
+                                             or data['retry_after_seconds'] != 20))
+            or (not data['holder_traffic_wake'] and (
+                data['holder_kind'] not in ('start_deployment', 'restart_deployment', 'hot_deploy', 'restart')
+                or data['retry_after_seconds'] != 45))):
+        raise AssertionError('Retry guidance does not match the verified holder kind')
+    return data
+
+
+def valid_busy_response(status, envelope):
+    try:
+        operation_busy_data(status, envelope)
+    except AssertionError:
+        return False
+    return True
+
+
+def busy_matches_holder(status, envelope, holder):
+    try:
+        data = operation_busy_data(status, envelope)
+    except AssertionError:
+        return False
+    # State/step are checked against the response's own blocker above. A live
+    # by-request query may have advanced since that snapshot.
+    return (data['holder_operation_id'] == holder.get('operation_id')
+            and data['holder_kind'] == wire_name(holder.get('kind', ''))
+            and envelope['blocker']['scope'] == holder.get('scope')
+            and data['holder_traffic_wake'] is False
+            and data['retryable'] is True and data['retry_after_seconds'] == 45)
+
+
+def restart_admission_after_holder(own, holder):
+    return own is None or (holder.get('state') == 'Succeeded'
+                           and own.get('operation_id') != holder.get('operation_id'))
+
+
+def restart_result_matches(status, envelope, holder, final_holder, own, elapsed):
+    if envelope.get('code') == 'ERR_OPERATION_IN_PROGRESS':
+        return (busy_matches_holder(status, envelope, holder) and own is None
+                and RESTART_ADMISSION_WAIT_SECONDS - 1 <= elapsed <= RESTART_ADMISSION_WAIT_SECONDS + 10)
+    return (status == 200 and envelope.get('code') == '0000' and envelope.get('success') is True
+            and own is not None and envelope.get('operation_id') == own.get('operation_id')
+            and final_holder.get('operation_id') == holder.get('operation_id')
+            and restart_admission_after_holder(own, final_holder)
+            and own.get('kind') == RESTART_OPERATION_KIND and own.get('scope') == 'Prod'
+            and own.get('state') == 'Succeeded')
+
+
+def remaining_timeout(deadline, limit):
+    if deadline is None:
+        return limit
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError('Original REST observation deadline expired')
+    return min(limit, remaining)
+
+
+def rejected_without_execution(view, kind):
+    return view is None or (view.get('kind') == kind and view.get('scope') == 'Prod'
+                            and view.get('state') == 'Failed'
+                            and view.get('error_code') == 'ERR_OPERATION_IN_PROGRESS')
+
+
+def restarted_pod_ready(pod, app_id, old_uid, operation_id):
+    labels = pod.get('labels') or {}
+    annotations = pod.get('annotations') or {}
+    images = pod.get('images') or []
+    return (pod.get('kind') == 'Pod'
+            and pod.get('name', '').startswith('rcoder-app-' + app_id + '-')
+            and labels.get('rcoder.io/app-id') == app_id
+            and labels.get('app.kubernetes.io/instance') == app_id
+            and labels.get('app.kubernetes.io/managed-by') == 'rcoder-app-manager'
+            and bool(pod.get('uid')) and pod['uid'] != old_uid
+            and annotations.get('rcoder.io/restart-operation') == operation_id
+            and not pod.get('deletionTimestamp') and pod.get('phase') == 'Running'
+            and any(condition.get('type') == 'Ready' and condition.get('status') == 'True'
+                    for condition in pod.get('conditions') or [])
+            and bool(images) and all(image.get('ready') is True for image in images))
+
 
 def compact_resource(row):
     meta = row['metadata']
     return {'kind': row.get('kind'), 'name': meta['name'], 'uid': meta['uid'],
-            'resourceVersion': meta.get('resourceVersion'), 'labels': meta.get('labels', {}),
+            'resourceVersion': meta.get('resourceVersion'), 'generation': meta.get('generation'),
+            'labels': meta.get('labels', {}),
+            'deletionTimestamp': meta.get('deletionTimestamp'),
+            'annotations': {key: value for key, value in (meta.get('annotations') or {}).items()
+                            if key in ('rcoder.io/restart-operation', 'rcoder.io/application-id', 'rcoder.io/lifecycle-id')},
             'phase': row.get('status', {}).get('phase'),
             'podIP': row.get('status', {}).get('podIP'),
             'conditions': row.get('status', {}).get('conditions', []),
@@ -88,16 +220,21 @@ class Run:
         self.save('summary.json', self.summary)
         print('Report: ' + str(self.root), flush=True)
 
-    def local(self, *args):
-        return subprocess.check_output(args, cwd=REPO, text=True, timeout=90)
+    def local(self, *args, deadline=None):
+        result = subprocess.check_output(args, cwd=REPO, text=True,
+                                         timeout=remaining_timeout(deadline, 90))
+        remaining_timeout(deadline, 90)
+        return result
 
-    def kube(self, *args):
+    def kube(self, *args, deadline=None):
         context = getattr(self.args, 'context', None)
         command = shlex.join(['kubectl', *(['--context', context] if context else []), '-n', self.args.namespace, *args])
-        return self.local('ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', self.args.ssh, command)
+        return self.local('ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', self.args.ssh, command,
+                          deadline=deadline)
 
-    def inventory(self):
-        data = json.loads(self.kube('get', 'pods,statefulsets,deployments,pvc,services,configmaps', '-o', 'json'))
+    def inventory(self, deadline=None):
+        data = json.loads(self.kube('get', 'pods,statefulsets,deployments,pvc,services,configmaps', '-o', 'json',
+                                    deadline=deadline))
         return [compact_resource(r) for r in data['items']]
 
     def owned(self, row):
@@ -152,18 +289,32 @@ class Run:
             raise AssertionError(f'{path}: HTTP {status}: {data}')
         return data['data']
 
-    def api_retry_conflict(self, path, body=None, timeout=180, attempts=40, interval=10):
-        """快失败语义的调用方重试模式：锁被进行中操作（如仍在收敛的后台
-        部署协调器——start 等就绪预算可达 30 分钟）持有时返回 ERR_CONFLICT
-        ——等待后重试（有界），其余业务错误立即上抛。"""
+    def api_retry_operation_busy(self, path, body=None, timeout=180, attempts=40, interval=10):
+        """Only structured, safely retryable busy rejection permits replay.
+
+        Keep one request ID/input and the existing bounded retry window. Genuine
+        ERR_CONFLICT and unknown/protected holder responses fail immediately.
+        """
+        body = dict(body or {})
+        body.setdefault('request_id', 'cleanup-retry-' + uuid.uuid4().hex)
+        deadline = time.monotonic() + attempts * interval
         last = None
         for _ in range(attempts):
-            status, envelope = self.request(path, body, timeout=timeout)
-            if status == 200 and envelope.get('code') == '0000':
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            status, envelope = self.request(path, body, timeout=min(timeout, remaining))
+            if status == 200 and envelope.get('code') == '0000' and envelope.get('success') is True:
                 return envelope['data']
-            if status == 200 and envelope.get('code') == 'ERR_CONFLICT':
+            if status == 200 and envelope.get('code') == 'ERR_OPERATION_IN_PROGRESS':
+                data = operation_busy_data(status, envelope)
+                if not data['retryable']:
+                    raise AssertionError(f'{path}: busy holder does not authorize retry: {envelope}')
                 last = envelope
-                time.sleep(interval)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(max(interval, data['retry_after_seconds']), remaining))
                 continue
             raise AssertionError(f'{path}: HTTP {status}: {envelope}')
         raise AssertionError(f'{path}: lock still held after {attempts} retries: {last}')
@@ -229,7 +380,10 @@ class Run:
             results = list(pool.map(lambda e: self.request('/api/v1/userapp/workspace', payload, e, timeout=240), self.entries[:2]))
         # One conflict is valid; neither request may destroy a successful winner.
         self.check('concurrent_ensure', any(s == 200 and b.get('code') == '0000' for s, b in results), results, fatal=False)
-        self.check('concurrent_error_contract', all(s == 200 and b.get('code') in ('0000', 'ERR_CONFLICT') for s, b in results), results, fatal=False)
+        self.check('concurrent_error_contract', all(
+            s == 200 and ((b.get('code') == '0000' and b.get('success') is True)
+                         or (b.get('code') == 'ERR_CONFLICT' and b.get('success') is False)
+                         or valid_busy_response(s, b)) for s, b in results), results, fatal=False)
         for entry in self.entries:
             self.api('/api/v1/userapp/workspace', payload, entry, timeout=240)
         self.check('ensure_retry', True)
@@ -321,14 +475,14 @@ startup_probe = "process"
             self.check('sse_past_terminal', not re.search(rb'^data:', past, re.M), past.decode())
         return {'url': self.args.internal_url.rstrip('/') + artifact, 'sha256': sha}, release
 
-    def prod_pod(self):
-        rows = self.inventory()
+    def prod_pod(self, deadline=None):
+        rows = self.inventory(deadline=deadline)
         pods = [r for r in rows if r['kind'] == 'Pod' and r['name'].startswith('rcoder-app-' + self.app + '-')]
         if len(pods) != 1:
             raise AssertionError('Expected one production pod: ' + str(pods))
         return pods[0]
 
-    # ===== 锁快失败真实场景（stop/restart/delete 忙锁 ERR_CONFLICT；start 等待） =====
+    # ===== 操作占用：Stop/Delete/Start 快失败；Restart 可受理前等待 =====
 
     def wait_deployment_quiesced(self, interval=3, budget=90):
         """等待应用 Deployment 的 resourceVersion 静默（连续两次读取不变）。
@@ -395,24 +549,23 @@ startup_probe = "process"
             rid = live['rid']
             if not rid:
                 return None
-            status, data = self.request(view_path_for(rid), base=self.entries[1])
-            operation = data.get('data') if isinstance(data, dict) else None
-            if status == 200 and operation and operation.get('operation_id'):
-                return operation
-            return None
+            return self.operation_view(rid)
 
         operation = self.poll(current_admitted, bool, 120)
         self.check(admitted_check,
-                   thread.is_alive() and operation.get('state') != 'Succeeded',
+                   thread.is_alive() and operation.get('state') in ('Pending', 'Running', 'WaitingRetry')
+                   and operation.get('app_id') == self.app and operation.get('lifecycle_id') == self.lifecycle_id
+                   and operation.get('request_id') == live['rid'] and operation.get('kind') == 'StartDeployment'
+                   and operation.get('scope') == 'Prod',
                    {'operation': operation, 'holder_http_pending': thread.is_alive()})
-        return thread, live['rid'], view_path_for(live['rid'] or ''), holder_outcome
+        return thread, live['rid'], view_path_for(live['rid'] or ''), holder_outcome, operation
 
     def lock_fail_fast(self, artifact_b):
-        """忙锁窗口：外部 stop/restart/delete 立即 ERR_CONFLICT（HTTP 200 信封），
+        """忙锁窗口：外部 Stop/Delete 立即 ERR_OPERATION_IN_PROGRESS，
         不等待持有者、无副作用、不排队；释放后不自动执行。"""
         stop_query = '/api/v1/userapp/' + self.app + '/stop?' + urllib.parse.urlencode(
             {'user_id': self.user, 'request_id': 'lock-stop-' + self.id[:16]})
-        thread, rid, view_path, holder_outcome = self.lock_window_holder(artifact_b, 'lock_holder_admitted')
+        thread, rid, view_path, holder_outcome, holder = self.lock_window_holder(artifact_b, 'lock_holder_admitted')
         timings = {}
         try:
             # 同实例：stop 打到持有者所在副本（进程内锁冲突）
@@ -420,28 +573,16 @@ startup_probe = "process"
             status, envelope = self.request(stop_query, {}, base=self.entries[0], timeout=30)
             timings['stop_same_replica_ms'] = int((time.monotonic() - started) * 1000)
             self.check('lock_busy_stop_conflict',
-                       status == 200 and envelope.get('code') == 'ERR_CONFLICT'
-                       and envelope.get('success') is False
-                       and 'in progress' in envelope.get('message', ''),
+                       busy_matches_holder(status, envelope, holder),
                        {'status': status, 'envelope': envelope, 'elapsed_ms': timings['stop_same_replica_ms']})
             # 跨副本：stop 打到另一 rcoder 实例（ConfigMap 租约互斥）
             started = time.monotonic()
             status, cross = self.request(stop_query, {}, base=self.entries[1], timeout=30)
             timings['stop_other_replica_ms'] = int((time.monotonic() - started) * 1000)
             self.check('lock_cross_replica_conflict',
-                       status == 200 and cross.get('code') == 'ERR_CONFLICT'
-                       and cross.get('success') is False,
+                       busy_matches_holder(status, cross, holder),
                        {'status': status, 'envelope': cross, 'elapsed_ms': timings['stop_other_replica_ms']})
-            # restart / delete 忙锁同样快失败
-            started = time.monotonic()
-            status, restarted = self.request('/api/v1/userapp/' + self.app + '/restart',
-                                             {'user_id': self.user, 'request_id': 'lock-restart-' + self.id[:16]},
-                                             base=self.entries[1], timeout=30)
-            timings['restart_ms'] = int((time.monotonic() - started) * 1000)
-            self.check('lock_busy_restart_conflict',
-                       status == 200 and restarted.get('code') == 'ERR_CONFLICT'
-                       and restarted.get('success') is False,
-                       {'status': status, 'envelope': restarted, 'elapsed_ms': timings['restart_ms']})
+            # Delete remains fail-fast; Restart has its own admission-wait case.
             started = time.monotonic()
             status, deleted = self.request('/api/v1/userapp/' + self.app + '/prod/delete',
                                            {'user_id': self.user, 'purge': False,
@@ -449,60 +590,205 @@ startup_probe = "process"
                                            base=self.entries[1], timeout=30)
             timings['delete_ms'] = int((time.monotonic() - started) * 1000)
             self.check('lock_busy_delete_conflict',
-                       status == 200 and deleted.get('code') == 'ERR_CONFLICT'
-                       and deleted.get('success') is False,
+                       busy_matches_holder(status, deleted, holder),
                        {'status': status, 'envelope': deleted, 'elapsed_ms': timings['delete_ms']})
             # 冲突请求已返回而持有者仍在途：证明没有等待持锁业务完成
             _, view = self.request(view_path, base=self.entries[1])
             operation = view.get('data') or {}
             self.check('lock_holder_still_inflight',
-                       bool(operation) and operation.get('state') != 'Succeeded'
+                       operation.get('operation_id') == holder['operation_id']
+                       and operation.get('state') in ('Pending', 'Running', 'WaitingRetry')
                        and thread.is_alive(),
                        {'operation': operation, 'holder_http_pending': thread.is_alive()})
         finally:
             thread.join(300)
         holder_status, holder_envelope, _ = holder_outcome[0] if holder_outcome else (0, {}, '')
         self.check('lock_holder_completes',
-                   holder_status == 200 and holder_envelope.get('code') == '0000',
+                   holder_status == 200 and holder_envelope.get('code') == '0000'
+                   and holder_envelope.get('operation_id') == holder['operation_id'],
                    {'status': holder_status, 'envelope': holder_envelope})
         # 释放后不自动执行被拒请求：给假想的排队 stop 一个执行窗口后，
         # 应用仍应 1 副本 Running、无 Stop 操作记录、内容不受影响
         time.sleep(2)
         pod = self.prod_pod()
-        status, rejected_view = self.request(
-            '/api/v1/userapp/' + self.app + '/operations/by-request?' + urllib.parse.urlencode(
-                {'user_id': self.user, 'request_id': 'lock-stop-' + self.id[:16]}), base=self.entries[1])
-        # 被拒请求允许留下**拒绝记录**（durable evidence，by-request 可查）；
-        # 无自动执行的判据 = pod 仍 Running 且该 request_id 绝无 Succeeded 的
-        # Stop 记录
-        view = rejected_view.get('data') or {}
-        stop_executed = (status == 200 and rejected_view.get('code') == '0000'
-                         and view.get('state') == 'Succeeded'
-                         and view.get('kind') == 'Stop')
+        rejected = []
+        for prefix, kind in [('lock-stop-', 'Stop'), ('lock-delete-', 'DeleteCompute')]:
+            view = self.operation_view(prefix + self.id[:16])
+            # Identity was verified by operation_view. A real rejected record
+            # may exist, but an accepted/executed or unrelated record may not pass.
+            rejected.append({'kind': kind, 'operation': view,
+                             'unexecuted': rejected_without_execution(view, kind)})
         self.check('lock_rejected_no_auto_execution',
-                   pod['phase'] == 'Running' and not stop_executed,
-                   {'pod': pod, 'by_request': rejected_view})
+                   pod['phase'] == 'Running' and all(row['unexecuted'] for row in rejected),
+                   {'pod': pod, 'rejected': rejected})
         self.check('lock_no_side_effects', self.content(self.id + '-B'))
         runtime = self.api('/api/v1/userapp/' + self.app + '?' + urllib.parse.urlencode({'user_id': self.user}))
         self.pre_stop_version = runtime.get('resource_version')
         self.save('lock-failfast.json', {'timings': timings, 'pre_stop_version': self.pre_stop_version})
 
+    def operation_view(self, request_id, deadline=None):
+        path = '/api/v1/userapp/' + self.app + '/operations/by-request?' + urllib.parse.urlencode(
+            {'user_id': self.user, 'request_id': request_id})
+        status, envelope = self.request(path, base=self.entries[1],
+                                        timeout=remaining_timeout(deadline, 10))
+        remaining_timeout(deadline, 10)
+        if (status != 200 or not isinstance(envelope, dict) or envelope.get('code') != '0000'
+                or envelope.get('success') is not True or 'data' not in envelope):
+            raise AssertionError('Original operation query failed: ' + str(envelope))
+        # For a known application by-request absence is an explicit successful
+        # null result. ERR_NOT_FOUND belongs to the explicit operation-ID route.
+        view = envelope['data']
+        if view is not None and (
+                not isinstance(view, dict) or not view.get('operation_id')
+                or view.get('app_id') != self.app or view.get('lifecycle_id') != self.lifecycle_id
+                or view.get('request_id') != request_id):
+            raise AssertionError('Original operation query changed identity: ' + str(view))
+        return view
+
+    def observe_restart_rollout(self, old_uid, operation_id, deadline):
+        path = f'/api/v1/userapp/proxy/app/prod/{self.user}/{self.app}/'
+        while True:
+            remaining_timeout(deadline, 90)
+            rows = self.inventory(deadline=deadline)
+            remaining_timeout(deadline, 90)
+            pods = [row for row in rows if row['kind'] == 'Pod'
+                    and row['name'].startswith('rcoder-app-' + self.app + '-') and self.owned(row)]
+            # This is an observation filter, not a grant to adopt or control a
+            # same-name object. The original successful operation owns replay.
+            if len(pods) == 1 and restarted_pod_ready(pods[0], self.app, old_uid, operation_id):
+                status, content = self.request(path, base=self.args.proxy_url.rstrip('/'), raw=True,
+                                               timeout=remaining_timeout(deadline, 75))
+                remaining_timeout(deadline, 75)
+                if status != 200:
+                    raise AssertionError(f'Restart content query failed: HTTP {status}')
+                if content.decode() == self.id + '-B':
+                    return pods[0]
+            time.sleep(remaining_timeout(deadline, .2))
+
+    def replay_deployment_view(self, deadline):
+        rows = self.inventory(deadline=deadline)
+        remaining_timeout(deadline, 90)
+        deployments = [row for row in rows if row['kind'] == 'Deployment'
+                       and row['name'] == 'rcoder-app-' + self.app and self.owned(row)]
+        if len(deployments) != 1:
+            raise AssertionError('Original production Deployment is not uniquely observable')
+        deployment = deployments[0]
+        annotations = deployment.get('annotations') or {}
+        labels = deployment.get('labels') or {}
+        if (not deployment.get('uid') or type(deployment.get('generation')) is not int
+                or labels.get('app.kubernetes.io/instance') != self.app
+                or labels.get('app.kubernetes.io/managed-by') != 'rcoder-app-manager'
+                or annotations.get('rcoder.io/application-id') != self.app
+                or annotations.get('rcoder.io/lifecycle-id') != self.lifecycle_id):
+            raise AssertionError('Original production Deployment identity changed')
+        # Status/RV may progress independently; a new rollout changes generation.
+        return {'uid': deployment['uid'], 'generation': deployment['generation'],
+                'app_id': self.app, 'lifecycle_id': self.lifecycle_id}
+
+    def lock_restart_wait(self, artifact_b):
+        """Restart may wait before admission; it must never overlap its holder.
+
+        A real hot deployment can finish inside the default 30-second admission
+        window. In that case this request must own a distinct successful Restart.
+        If the budget expires, it must remain unaccepted and never execute later.
+        """
+        thread, rid, _, holder_outcome, holder = self.lock_window_holder(artifact_b, 'lock_restart_holder_admitted')
+        request_id = 'lock-restart-' + self.id[:16]
+        body = {'user_id': self.user, 'request_id': request_id}
+        path = '/api/v1/userapp/' + self.app + '/restart'
+        timeout = RESTART_ADMISSION_WAIT_SECONDS + RESTART_EXECUTION_TIMEOUT_SECONDS
+        # Capture the original physical Pod before sending this Restart. Its
+        # normal rollout must converge before UID changes can diagnose a replay.
+        old_uid = self.prod_pod()['uid']
+        deadline = time.monotonic() + timeout
+        outcome, observations = [], []
+
+        def call():
+            started = time.monotonic()
+            status, envelope = self.request(path, body, base=self.entries[1],
+                                            timeout=remaining_timeout(deadline, timeout))
+            outcome.append((status, envelope, time.monotonic() - started))
+
+        restart = threading.Thread(target=call, daemon=True)
+        restart.start()
+        try:
+            while restart.is_alive():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('Restart exceeded admission plus execution budget')
+                own = self.operation_view(request_id, deadline=deadline)
+                if own is not None:
+                    current_holder = self.operation_view(rid, deadline=deadline)
+                    ordered = current_holder is not None and restart_admission_after_holder(own, current_holder)
+                    observations.append({'own': own, 'holder': current_holder, 'ordered': ordered})
+                    if not ordered:
+                        self.check('restart_never_overlaps_holder', False, observations[-1])
+                time.sleep(remaining_timeout(deadline, .2))
+            if not outcome:
+                raise AssertionError('Restart HTTP result was not confirmed')
+            status, envelope, elapsed = outcome[0]
+            own, final_holder = (self.operation_view(request_id, deadline=deadline),
+                                 self.operation_view(rid, deadline=deadline))
+            self.check('lock_busy_restart_conflict', final_holder is not None
+                       and restart_result_matches(status, envelope, holder, final_holder, own, elapsed),
+                       {'contract': 'wait then admit after holder, or exhaust budget without admission',
+                        'status': status, 'envelope': envelope, 'elapsed_s': elapsed,
+                        'holder': final_holder, 'own': own, 'admission_observations': observations})
+        finally:
+            for pending in (restart, thread):
+                pending.join(max(0, deadline - time.monotonic()))
+        holder_status, holder_envelope, _ = holder_outcome[0] if holder_outcome else (0, {}, '')
+        self.check('restart_holder_completes', holder_status == 200 and holder_envelope.get('code') == '0000'
+                   and holder_envelope.get('operation_id') == holder['operation_id'], holder_envelope)
+        if own is None:
+            time.sleep(remaining_timeout(deadline, 2))
+            self.check('restart_rejected_no_auto_execution', self.operation_view(request_id, deadline=deadline) is None
+                       and self.prod_pod(deadline=deadline)['phase'] == 'Running'
+                       and self.content(self.id + '-B', deadline=deadline))
+        else:
+            pod = self.observe_restart_rollout(old_uid, own['operation_id'], deadline)
+            before_replay = self.replay_deployment_view(deadline)
+            self.check('restart_original_rollout_ready', True,
+                       {'original_pod_uid': old_uid, 'restart_operation_id': own['operation_id'], 'pod': pod})
+            status, replay = self.request(path, body, base=self.entries[0],
+                                          timeout=remaining_timeout(deadline, timeout))
+            remaining_timeout(deadline, timeout)
+            replay_deployment = self.replay_deployment_view(deadline)
+            after_replay = self.observe_restart_rollout(old_uid, own['operation_id'], deadline)
+            self.check('restart_request_id_replay', status == 200 and replay.get('code') == '0000'
+                       and replay.get('success') is True and replay.get('operation_id') == own['operation_id']
+                       and before_replay == replay_deployment and after_replay['uid'] == pod['uid'],
+                       {'response': replay, 'deployment_before': before_replay,
+                        'deployment_after': replay_deployment, 'pod_uid_before': pod['uid'],
+                        'pod_uid_after': after_replay['uid']})
+            self.check('restart_wait_no_unrelated_effects', True,
+                       {'pod_uid': after_replay['uid'], 'content': self.id + '-B'})
+
     def lock_start_waits(self, artifact_b):
         """忙锁窗口的第二探测：无 url start（HTTP 面）同为快失败——外部生命
-        周期操作（deploy_controlled 批次语义）一致 ERR_CONFLICT 不排队；
+        周期操作（deploy_controlled 批次语义）返回 ERR_OPERATION_IN_PROGRESS 不排队；
         排队等待语义属于内部路径（流量唤醒/回收器/恢复），由组件测试覆盖
         （Docker flock 轮询 + K8s 租约轮询单测）与套件 wake 流程验证。"""
-        thread, rid, view_path, holder_outcome = self.lock_window_holder(artifact_b, 'lock_holder_admitted_2')
+        thread, rid, view_path, holder_outcome, holder = self.lock_window_holder(artifact_b, 'lock_holder_admitted_2')
+        request_id = 'lock-start-' + self.id[:16]
         started = time.monotonic()
         status, envelope = self.request('/api/v1/userapp/' + self.app + '/start',
-                                        {'user_id': self.user},
+                                        {'user_id': self.user, 'request_id': request_id},
                                         base=self.entries[1], timeout=30)
         elapsed_ms = int((time.monotonic() - started) * 1000)
+        current_holder = self.operation_view(rid)
+        still_pending = (thread.is_alive() and current_holder is not None
+                         and current_holder['operation_id'] == holder['operation_id']
+                         and current_holder.get('state') in ('Pending', 'Running', 'WaitingRetry'))
         thread.join(300)
         self.check('lock_busy_start_conflict',
-                   status == 200 and envelope.get('code') == 'ERR_CONFLICT'
-                   and envelope.get('success') is False,
-                   {'status': status, 'envelope': envelope, 'elapsed_ms': elapsed_ms})
+                   busy_matches_holder(status, envelope, holder) and still_pending,
+                   {'status': status, 'envelope': envelope, 'elapsed_ms': elapsed_ms, 'holder': current_holder})
+        holder_status, holder_envelope, _ = holder_outcome[0] if holder_outcome else (0, {}, '')
+        self.check('start_holder_completes', holder_status == 200 and holder_envelope.get('code') == '0000'
+                   and holder_envelope.get('operation_id') == holder['operation_id'], holder_envelope)
+        time.sleep(2)
+        self.check('start_rejected_no_auto_execution', self.operation_view(request_id) is None
+                   and self.prod_pod()['phase'] == 'Running' and self.content(self.id + '-B'))
 
     def lease_dead_holder_takeover(self):
         """死持有者租约接管（coordination.Lease TTL 语义，替代原 ConfigMap
@@ -593,14 +879,26 @@ startup_probe = "process"
                    {'deployment': deployment, 'pvcs': pvcs})
 
 
-    def content(self, expected):
+    def content(self, expected, deadline=None):
         path = f'/api/v1/userapp/proxy/app/prod/{self.user}/{self.app}/'
         def read():
             # Traffic wake queues the request until the replacement pod is
             # ready (~24s observed under load); a per-request timeout tighter
             # than that window aborts the whole case on a healthy wake path.
-            return self.request(path, base=self.args.proxy_url.rstrip('/'), raw=True, timeout=75)
-        result = self.poll(read, lambda r: r[0] == 200 and r[1].decode() == expected, 180)
+            return self.request(path, base=self.args.proxy_url.rstrip('/'), raw=True,
+                                timeout=remaining_timeout(deadline, 75))
+        if deadline is None:
+            result = self.poll(read, lambda r: r[0] == 200 and r[1].decode() == expected, 180)
+        else:
+            while True:
+                remaining_timeout(deadline, 75)
+                result = read()
+                remaining_timeout(deadline, 75)
+                if result[0] != 200:
+                    raise AssertionError(f'Original content query failed: HTTP {result[0]}')
+                if result[1].decode() == expected:
+                    break
+                time.sleep(remaining_timeout(deadline, 2))
         return result[0] == 200
 
     def worker_running(self, pod):
@@ -668,8 +966,9 @@ print(json.dumps(out))'''
                    and data.get('protocol_version') == 4 and operation.get('request_release_id') == hot['release_id']
                    and operation.get('phase') == 'running' and operation.get('deployment_generation_id')
                    and operation.get('deploy_stage') == 'succeeded' and operation.get('persisted') is True, data)
-        # 锁快失败/等待语义真实场景（持有者 = 热部署在途）
+        # 操作占用/受理等待真实场景（持有者 = 热部署在途）
         self.lock_fail_fast(artifact_b)
+        self.lock_restart_wait(artifact_b)
         self.lock_start_waits(artifact_b)
         self.lease_dead_holder_takeover()
         stop_request_id = 'stop-' + uuid.uuid4().hex
@@ -704,8 +1003,8 @@ print(json.dumps(out))'''
             if any(r['uid'] in baseline_uids for r in owned):
                 raise AssertionError('Refusing cleanup of a preexisting identity')
             if any(r['kind'] == 'Deployment' and r['name'] == 'rcoder-app-' + self.app for r in owned):
-                self.api_retry_conflict('/api/v1/userapp/' + self.app + '/prod/delete', {'user_id': self.user, 'purge': True})
-            self.api_retry_conflict('/api/v1/userapp/' + self.app + '/delete/app', {'user_id': self.user})
+                self.api_retry_operation_busy('/api/v1/userapp/' + self.app + '/prod/delete', {'user_id': self.user, 'purge': True})
+            self.api_retry_operation_busy('/api/v1/userapp/' + self.app + '/delete/app', {'user_id': self.user})
             if self.lifecycle_id is None:
                 remaining = self.poll(lambda: [r for r in self.inventory() if self.owned(r)], lambda r: not r, 180)
                 self.check('cleanup', not remaining, remaining)

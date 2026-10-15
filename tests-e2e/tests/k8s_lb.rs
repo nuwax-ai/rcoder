@@ -397,7 +397,7 @@ async fn scenario_new_session_cross_entry() {
         // 首轮 chat（新会话）
         let req1 = env.base_payload(
             Backend::Openai,
-            &format!("用一句话解释：{kw}"),
+            &format!("用一句话解释：{kw}。回答必须原样包含“{kw}”这个词。"),
             &format!("{}-n{i}", env.run_tag),
             &user,
         );
@@ -416,7 +416,7 @@ async fn scenario_new_session_cross_entry() {
         // 二轮补充（后台，同 session）
         let mut req2 = env.base_payload(
             Backend::Openai,
-            &format!("再补充一句关于{kw}的要点"),
+            &format!("再补充一句关于{kw}的要点，回答必须原样包含“{kw}”这个词。"),
             &format!("{}-n{i}b", env.run_tag),
             &user,
         );
